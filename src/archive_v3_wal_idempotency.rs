@@ -83,6 +83,13 @@ pub(crate) enum WalOperationKind {
     PushDelivery = 10,
     Retention = 11,
     ReviewerBackfill = 12,
+    /// One append-only product schema ladder step, applied under the owner's
+    /// own lease and published as an ordinary settled WAL commit
+    /// (`src/schema_ladder.rs`). The first ordinal added after the Phase-2
+    /// deletion: no signing ceremony backed it, deliberately -- the
+    /// compile-pinned mutation-set commitment is gone, and the reviewed-plan
+    /// seal plus this enum are the whole admission story now.
+    SchemaEpochAdvance = 13,
 }
 
 impl WalOperationKind {
@@ -100,6 +107,7 @@ impl WalOperationKind {
             10 => Ok(Self::PushDelivery),
             11 => Ok(Self::Retention),
             12 => Ok(Self::ReviewerBackfill),
+            13 => Ok(Self::SchemaEpochAdvance),
             _ => Err(WalIdempotencyError::Corrupt),
         }
     }
@@ -117,7 +125,8 @@ impl WalOperationKind {
             | Self::EmailDelivery
             | Self::PushDelivery
             | Self::Retention
-            | Self::ReviewerBackfill => 1,
+            | Self::ReviewerBackfill
+            | Self::SchemaEpochAdvance => 1,
         }
     }
 
@@ -1174,7 +1183,20 @@ mod tests {
             WalRequestFingerprint::derive(WalOperationKind::CaptureSessionFinish, b"x").unwrap();
         assert_ne!(one.as_bytes(), two.as_bytes());
         assert!(WalOperationKind::decode(0).is_err());
-        assert!(WalOperationKind::decode(13).is_err());
+        // Ordinal 13 is SchemaEpochAdvance — the first ordinal added after
+        // the Phase-2 deletion, with no signing ceremony behind it. It
+        // returns nothing to any caller, so it stays out of
+        // permits_canonical_response.
+        assert_eq!(
+            WalOperationKind::decode(13).unwrap(),
+            WalOperationKind::SchemaEpochAdvance
+        );
+        assert_eq!(WalOperationKind::SchemaEpochAdvance.codec_version(), 1);
+        assert!(
+            WalReplayResult::canonical_response(WalOperationKind::SchemaEpochAdvance, vec![1])
+                .is_err()
+        );
+        assert!(WalOperationKind::decode(14).is_err());
         assert!(
             WalReplayResult::canonical_response(WalOperationKind::FinalizationCommit, vec![1])
                 .is_err()
