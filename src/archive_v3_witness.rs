@@ -764,6 +764,19 @@ impl WitnessRecord {
             && self.lease_expires_at_tick == 0
     }
 
+    /// Released WalAuthoritative terminal shape predicate. Read-only and
+    /// strictly conjunctive: it grants no owner identity or lease
+    /// capability, and exists so control-plane ledger gates can refuse
+    /// owner-holding residue — an EXPIRED lease is still residue, and
+    /// `has_exact_active_wal_owner_lease` alone admits it.
+    pub(crate) fn is_exact_unleased_wal_authoritative_terminal(&self) -> bool {
+        self.valid()
+            && self.deletion == DeletionState::Active
+            && self.migration == MigrationState::WalAuthoritative
+            && self.owner_id.is_none()
+            && self.lease_expires_at_tick == 0
+    }
+
     pub(crate) fn exact_active_lease_for_wal_owner_bytes(
         &self,
         owner: &[u8; 16],
@@ -1791,6 +1804,19 @@ impl WitnessRecord {
         forged
     }
     #[cfg(test)]
+    /// Owner-holding EXPIRED residue: the shape a crashed ladder leaves when
+    /// its lease lapses before release. Not an active lease — and still not
+    /// the released terminal.
+    pub(crate) fn expired_wal_owner_residue_for_test(&self, owner: ObjectId) -> Self {
+        let mut residue = self.clone();
+        residue.migration = MigrationState::WalAuthoritative;
+        residue.owner_id = Some(owner);
+        residue.current_fencing_epoch = residue.current_fencing_epoch.max(1);
+        residue.lease_expires_at_tick = residue.last_server_tick.max(1);
+        residue.last_server_tick = residue.lease_expires_at_tick;
+        residue
+    }
+
     pub(crate) fn released_wal_owner_for_test(&self) -> Self {
         let mut released = self.clone();
         released.migration = MigrationState::WalAuthoritative;

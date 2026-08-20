@@ -10461,6 +10461,14 @@ fn wal_authoritative_selection_for_bound_user_conn(
             |row| row.get(0),
         )
         .optional()?;
+    // The two ledgers are mutually exclusive authorities: both present is
+    // corrupt state, and the genesis arm must never override a maintenance
+    // state such as manual_required (an operator hold).
+    if maintenance_stage.is_some() && genesis_stage.is_some() {
+        return Err(EnclaveError::Conflict(
+            "wal-authority persistence found both maintenance and genesis ledgers".into(),
+        ));
+    }
     if maintenance_stage.as_deref() != Some("wal_authoritative")
         && genesis_stage.as_deref() != Some("wal_authoritative")
     {
@@ -10501,10 +10509,13 @@ fn load_wal_authoritative_persistence_selections_conn(
                     SELECT 1 FROM archive_v3_maintenance_imports i
                     WHERE i.archive_id = b.archive_id AND i.format_version = 1
                       AND i.stage = 'wal_authoritative')
-                OR EXISTS(
-                    SELECT 1 FROM archive_v3_wal_genesis g
-                    WHERE g.archive_id = b.archive_id AND g.format_version = 1
-                      AND g.stage = 'wal_authoritative'))
+                OR (EXISTS(
+                        SELECT 1 FROM archive_v3_wal_genesis g
+                        WHERE g.archive_id = b.archive_id AND g.format_version = 1
+                          AND g.stage = 'wal_authoritative')
+                    AND NOT EXISTS(
+                        SELECT 1 FROM archive_v3_maintenance_imports m
+                        WHERE m.archive_id = b.archive_id AND m.format_version = 1)))
          ORDER BY b.user_id",
     )?;
     let user_ids: Vec<String> = statement
@@ -10693,13 +10704,27 @@ fn record_wal_genesis_stage_conn(
             "WAL genesis witness archive changed".into(),
         ));
     }
+    // The full released-terminal contract: owner None and lease tick 0 are
+    // load-bearing — `has_exact_active_wal_owner_lease` alone admits
+    // EXPIRED owner-holding crash residue, and a terminal recorded with
+    // residue can never be acquired (the WAL-owner predicate requires the
+    // unleased shape) while the ledger's no-overwrite arm would refuse the
+    // genuine released successor forever.
     if stage == WalGenesisStage::WalAuthoritative
-        && (decoded.migration() != crate::archive_v3_witness::MigrationState::WalAuthoritative
-            || decoded.deletion() != crate::archive_v3_witness::DeletionState::Active
-            || decoded.has_exact_active_wal_owner_lease())
+        && (!decoded.is_exact_unleased_wal_authoritative_terminal()
+            || decoded.root().root().sequence() != 2)
     {
         return Err(EnclaveError::Conflict(
             "WAL genesis terminal witness is not the released terminal".into(),
+        ));
+    }
+    if stage == WalGenesisStage::GenesisCreated
+        && (decoded.migration() != crate::archive_v3_witness::MigrationState::Legacy
+            || decoded.deletion() != crate::archive_v3_witness::DeletionState::Active
+            || decoded.root().root().sequence() != 0)
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis created witness is not the genesis record".into(),
         ));
     }
     let tx = conn.unchecked_transaction()?;
@@ -10707,6 +10732,20 @@ fn record_wal_genesis_stage_conn(
     if binding.archive_id != archive_id {
         return Err(EnclaveError::Conflict(
             "WAL genesis archive binding changed".into(),
+        ));
+    }
+    // Genesis is only for archives with NO maintenance history: the two
+    // ledgers are mutually exclusive selection authorities, and a genesis
+    // row must never be able to override a maintenance state (for example
+    // manual_required, an operator hold).
+    let maintenance_rows: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM archive_v3_maintenance_imports WHERE archive_id=?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if maintenance_rows != 0 {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis refused: a maintenance-import ledger exists for this archive".into(),
         ));
     }
     let terminal_witness_hash: [u8; 32] = Sha256::digest(terminal_witness).into();
@@ -10777,6 +10816,20 @@ fn record_wal_genesis_stage_conn(
         || stage != WalGenesisStage::WalAuthoritative
     {
         return Err(EnclaveError::Conflict("WAL genesis stage regressed".into()));
+    }
+    // Lineage binding: the terminal must descend from the pinned genesis
+    // record — same database epoch, epoch generation, and key registry.
+    // Without this, any valid-shaped terminal from an unrelated history
+    // advances the ledger on recorder trust alone.
+    let created = crate::archive_v3_witness::WitnessRecord::decode(&current.terminal_witness)
+        .map_err(|_| EnclaveError::Store("stored WAL genesis witness bytes are corrupt".into()))?;
+    if decoded.database_epoch() != created.database_epoch()
+        || decoded.database_epoch_generation() != created.database_epoch_generation()
+        || decoded.registry() != created.registry()
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis terminal lineage diverges from the created record".into(),
+        ));
     }
     let next_revision = stage.revision();
     let next_commitment = compute_wal_genesis_ledger_commitment(
@@ -11568,9 +11621,8 @@ fn reserve_wal_owner_from_genesis_conn(
     if binding_state != "active_legacy"
         || genesis_stage != "wal_authoritative"
         || expected.encode() != retained_terminal
-        || expected.deletion() != crate::archive_v3_witness::DeletionState::Active
-        || expected.migration() != crate::archive_v3_witness::MigrationState::WalAuthoritative
-        || expected.has_exact_active_wal_owner_lease()
+        || !expected.is_exact_unleased_wal_authoritative_terminal()
+        || expected.root().root().sequence() != 2
     {
         return Err(EnclaveError::Conflict("WAL genesis handoff changed".into()));
     }
@@ -29796,6 +29848,105 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reserve_wal_owner_from_genesis_conn(&conn, &terminal),
+            Err(EnclaveError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn wal_genesis_gate_refuses_residue_divergent_lineage_and_maintenance_overlap() {
+        let conn = account_conn();
+        let (archive_id, created, _alternate, terminal) =
+            genesis_terminal_fixture(&conn, GENESIS_USER_ID, 0x60);
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::GenesisCreated,
+            &created.encode(),
+        )
+        .unwrap();
+
+        // Expired owner-holding crash residue is refused: no ACTIVE lease
+        // exists on it, yet it is not the released terminal — recording it
+        // would wedge the reservation and block the genuine successor
+        // forever behind the no-overwrite arm.
+        let residue = terminal.expired_wal_owner_residue_for_test(ObjectId::from_bytes([0x61; 16]));
+        assert!(!residue.has_exact_active_wal_owner_lease());
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &residue.encode(),
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // A released terminal from a divergent lineage (different registry)
+        // is refused by the created -> terminal lineage pin.
+        let divergent =
+            terminal.with_registry_for_test(crate::archive_v3_witness::KeyRegistryReference::new(
+                terminal.registry().key_epoch(),
+                terminal.registry().rotation_generation(),
+                ObjectId::from_bytes([0x7B; 16]),
+                [0x7C; 32],
+            ));
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &divergent.encode(),
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The genuine released terminal still advances after the refusals.
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::WalAuthoritative,
+            &terminal.encode(),
+        )
+        .unwrap();
+
+        // An archive with maintenance history refuses genesis recording
+        // outright: the ledgers are mutually exclusive authorities.
+        let maintenance = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let overlap_created = created.with_archive_id_for_test(maintenance.archive_id);
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                USER_ID,
+                maintenance.archive_id,
+                WalGenesisStage::GenesisCreated,
+                &overlap_created.encode(),
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Both ledgers present (corruption injected below the gate) fails
+        // the per-user selection closed instead of OR-overriding a
+        // maintenance state.
+        conn.execute(
+            "INSERT INTO archive_v3_wal_genesis
+             (archive_id,format_version,user_id,terminal_witness,terminal_witness_hash,
+              stage,commitment,revision)
+             VALUES (?1,1,?2,?3,?4,'wal_authoritative',?5,2)",
+            rusqlite::params![
+                maintenance.archive_id.as_bytes().as_slice(),
+                USER_ID,
+                terminal.encode().as_slice(),
+                [0x11u8; 32].as_slice(),
+                [0x22u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
             Err(EnclaveError::Conflict(_))
         ));
     }
