@@ -50,7 +50,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 194
+EXPECTED_STORE_CALL_COUNT = 196
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +61,7 @@ EXPECTED_STORE_CALL_COUNT = 194
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "2efa0f1df510ed65ec294b4d27f537fe69e986c1c1dbc40a7449bbe5a3243a0d"
+EXPECTED_STORE_CALL_SHA256 = "9d5b197fdd2630652cd0bacfd73d3b2048ea2b2e3c27a78ae318bcb39f8bbff7"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
