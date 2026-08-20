@@ -69,12 +69,18 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
 # fails closed to WAL-logical). Every consult site keeps its exact refusal
 # comparison but reads the resolver instead of the field; only the resolver
 # and the construction chain touch `persistence_policy` directly.
-EXPECTED_POLICY_SITE_COUNT = 40
+EXPECTED_POLICY_SITE_COUNT = 42
 # Slice J-b3: owner-body hashes moved for the constructor (serving-authority
 # registry init), with_user (selected-user legacy-load refusal), and
 # save_user (selected-user provider-silent no-op); every policy expression
 # and count is unchanged.
-EXPECTED_POLICY_SITE_SHA256 = "45041a416a62fc398a3cbea6b65f7e07376e7fa0b48c426f6f333e4bc1a0f611"
+#
+# SEL slice 1a (+2): `StorePersistencePolicy::WalOwnerAuthoritative` — the
+# non-mutating owner open. `from_authenticated_staging` moved off
+# `LegacySnapshot` (-1/+1) and `open_db` gained the branch (+1) plus one more
+# read of `persistence_policy` (+1). No pre-existing site changed its target,
+# and `EXPECTED_WAL_LOGICAL_ONLY_KEYS` is byte-identical.
+EXPECTED_POLICY_SITE_SHA256 = "4de5dd9a4a8a6faa909925e8f07582f77ac7066c74bd77c3720c745ffbd9229b"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -93,6 +99,19 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user#0::WalLogicalOnly#1",
         "src/store.rs::with_user_if_changed#0::WalLogicalOnly#0",
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
+    }
+)
+# The non-mutating owner open runs NO DDL, so it can only ever be pointed at a
+# database whose schema is already established and pinned. Reaching it from any
+# other site -- a legacy load, a routed read, a test helper promoted to
+# production -- would silently skip `SCHEMA_SQL`, and with it the sole
+# production `PRAGMA foreign_keys = ON` for a user database, leaving every
+# `ON DELETE CASCADE` inert with no fingerprint or descriptor check to notice.
+# Enumerated rather than counted so a new site has to be named here in review.
+EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
+    {
+        "src/store.rs::from_authenticated_staging#0::StorePersistencePolicy::WalOwnerAuthoritative#0",
+        "src/store.rs::open_db#0::StorePersistencePolicy::WalOwnerAuthoritative#0",
     }
 )
 # Deliberate ADR-0022 Phase-2 re-pin (upstream: run_phase2's owned spawn) plus
@@ -997,6 +1016,14 @@ impl X {
                 if site.target == "WalLogicalOnly"
             },
             EXPECTED_WAL_LOGICAL_ONLY_KEYS,
+        )
+        self.assertEqual(
+            {
+                site.key
+                for site in exact_policy_sites
+                if site.target == "StorePersistencePolicy::WalOwnerAuthoritative"
+            },
+            EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS,
         )
         assert_inventory(
             worker_spawn_sites(),
