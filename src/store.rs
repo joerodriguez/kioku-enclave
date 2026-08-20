@@ -221,6 +221,15 @@ struct UserHandle {
 enum StorePersistencePolicy {
     LegacySnapshot,
     WalLogicalOnly,
+    /// The read-write connection a WAL owner serves from.
+    ///
+    /// Unlike [`Self::LegacySnapshot`] this open runs **no** DDL. An
+    /// archive-v3 owner pins its schema into checkpoint commitments, so any
+    /// page the open path wrote outside the publication protocol would
+    /// diverge the live database from the bytes the owner authenticated. The
+    /// schema is therefore established once, at genesis, and afterwards only
+    /// ever advanced by a sealed plan under the owner's own lease.
+    WalOwnerAuthoritative,
 }
 
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
@@ -1621,10 +1630,15 @@ impl SingleArchiveWalStoreOwner {
         let (connection, registration, migration_dirty) = open_db(
             &owned_path,
             Some(capture.as_ref()),
-            StorePersistencePolicy::LegacySnapshot,
+            StorePersistencePolicy::WalOwnerAuthoritative,
         )
         .map_err(|_| WalOwnerError::Corrupt)?;
         let registration = registration.ok_or(WalOwnerError::Capture)?;
+        // Kept as a tripwire. Under `WalOwnerAuthoritative` the open runs no
+        // DDL and asserts the database was untouched, so this is now
+        // unreachable by construction rather than by inspection — and it
+        // should stay here to catch a future open path that reintroduces a
+        // write.
         if migration_dirty {
             drop(connection);
             drop(registration);
@@ -7591,6 +7605,10 @@ fn deleted_user_error() -> EnclaveError {
     EnclaveError::Auth("user account is deleted".into())
 }
 
+fn wal_owner_open_error() -> EnclaveError {
+    EnclaveError::Store("wal owner database failed its open-time preconditions".into())
+}
+
 fn wal_logical_only_error() -> EnclaveError {
     EnclaveError::Store(
         "legacy snapshot mutation is disabled until a WAL logical operation is prepared".into(),
@@ -8862,6 +8880,37 @@ fn open_db(
         None => (Connection::open(path)?, None),
     };
     let before = database_mutation_fingerprint(&conn)?;
+    if persistence_policy == StorePersistencePolicy::WalOwnerAuthoritative {
+        // No DDL: see `StorePersistencePolicy::WalOwnerAuthoritative`. The two
+        // pragmas at the head of `SCHEMA_SQL` still have to be accounted for,
+        // because skipping the batch skips them too.
+        //
+        // `journal_mode` is persisted in the database header, so it is
+        // asserted rather than set — an owner database that is not in WAL mode
+        // did not come from the genesis materializer and must not be served.
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            return Err(wal_owner_open_error());
+        }
+        // `foreign_keys` is connection-scoped and defaults OFF, so it must be
+        // set on every connection. This is the only production site that
+        // enables foreign keys for a user database; without it roughly two
+        // dozen `ON DELETE CASCADE` clauses silently stop cascading and
+        // nothing downstream — not the fingerprint, not the schema descriptor
+        // — would ever notice.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if foreign_keys != 1 {
+            return Err(wal_owner_open_error());
+        }
+        // Neither pragma may perturb the database. Asserting it here is what
+        // makes the `migration_dirty` tripwire in the owner vacuously true
+        // instead of merely relaxed.
+        if database_mutation_fingerprint(&conn)? != before {
+            return Err(wal_owner_open_error());
+        }
+        return Ok((conn, registration, false));
+    }
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
     let migrated = database_mutation_fingerprint(&conn)? != before;
@@ -13518,6 +13567,83 @@ pub(crate) mod tests {
         assert_eq!(kms.unwraps.load(Ordering::SeqCst), 0);
         assert_eq!(gcs.put_attempts(), 0);
         assert_eq!(temp_count(), before_temp);
+    }
+
+    /// A database that has drifted from `SCHEMA_SQL`, so that reconciliation
+    /// is observable: the legacy open path recreates the dropped table, the
+    /// owner path must leave it missing.
+    #[cfg(test)]
+    fn drifted_owner_database(directory: &std::path::Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, create_empty_db(&Dek([9_u8; 32])).unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE email_deliveries;").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+        path
+    }
+
+    #[cfg(test)]
+    fn email_deliveries_exists(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'email_deliveries'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn wal_owner_open_runs_no_ddl_and_enables_foreign_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner_path = drifted_owner_database(directory.path(), "owner.db");
+        let (connection, _registration, migrated) = open_db(
+            &owner_path,
+            None,
+            StorePersistencePolicy::WalOwnerAuthoritative,
+        )
+        .unwrap();
+
+        // An archive-v3 owner pins its schema into checkpoint commitments, so
+        // a page written by the open path would diverge the live database from
+        // the bytes the owner authenticated.
+        assert!(!migrated);
+        assert!(
+            !email_deliveries_exists(&connection),
+            "the owner open reconciled the schema; it must run no DDL"
+        );
+        // Connection-scoped and OFF by default. `SCHEMA_SQL` is the only other
+        // place a user database turns this on, and the owner open skips it.
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        // The contrast that gives the assertion above its meaning: the same
+        // drift, opened the legacy way, is reconciled.
+        let legacy_path = drifted_owner_database(directory.path(), "legacy.db");
+        let (connection, _registration, migrated) =
+            open_db(&legacy_path, None, StorePersistencePolicy::LegacySnapshot).unwrap();
+        assert!(migrated);
+        assert!(email_deliveries_exists(&connection));
+    }
+
+    #[test]
+    fn wal_owner_open_refuses_a_database_that_is_not_in_wal_mode() {
+        // Journal mode lives in the database header, so a non-WAL file did not
+        // come from the genesis materializer. Serving it would put the owner's
+        // commits somewhere the publication protocol never reads.
+        let directory = tempfile::tempdir().unwrap();
+        let path = drifted_owner_database(directory.path(), "rollback.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = DELETE;").unwrap();
+        drop(conn);
+        assert!(open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_err());
     }
 
     #[test]
