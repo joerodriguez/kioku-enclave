@@ -2220,8 +2220,25 @@ where
                     // finishes the full apply-settle-advance ladder before
                     // taking the next message, so a reader can never observe
                     // an unacknowledged write.
+                    //
+                    // A read is additionally served only from a head this
+                    // owner still authenticates. Applies are fenced at every
+                    // step; reads were not, so an owner whose idle lease
+                    // expired and was reacquired by another process kept
+                    // answering from its frozen SQLite as though it were the
+                    // settled authority — unboundedly stale, with no error.
+                    // `require_fresh_head` re-reads the live witness and
+                    // requires the rebuilt binding to equal this owner's
+                    // binding; that commitment covers the whole record, so any
+                    // fence takeover or root advance fails it and poisons the
+                    // lane, and a superseded owner can never serve again.
+                    // Transient provider failures surface as Publication
+                    // without poisoning.
                     WalOwnerMessage::Read { read, response } => {
-                        let result = owner.store.read(read).await;
+                        let result = match owner.require_fresh_head().await {
+                            Ok(()) => owner.store.read(read).await,
+                            Err(error) => Err(error),
+                        };
                         let _ = response.send(result);
                     }
                     #[cfg(test)]
@@ -4211,6 +4228,53 @@ mod tests {
             handle.submit(plan(44, b"post-poison")).await,
             Err(WalOwnerError::Poisoned)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_fenced_out_owner_refuses_reads_instead_of_serving_stale_state() {
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new());
+        let publication = Arc::new(FakePublication::new(next));
+        let handle = SingleArchiveWalOwner::spawn(store, control, Arc::clone(&publication));
+
+        // While this owner still authenticates the live head, reads serve.
+        assert!(handle.read(|_| Ok(())).await.unwrap().is_ok());
+
+        // Another process reacquires after this owner's idle lease expires:
+        // the live head no longer authenticates this owner's binding. Reads
+        // must refuse rather than answer from frozen local SQLite — before
+        // this gate a fenced-out owner served unboundedly stale state as the
+        // settled authority, with no error and no staleness bound.
+        publication.reject_fresh();
+        assert!(matches!(
+            handle.read(|_| Ok(())).await,
+            Err(WalOwnerError::Conflict)
+        ));
+
+        // The refusal is persistent, and — the property that matters — the
+        // read closure NEVER runs, so no stale row can escape. (A fence
+        // takeover surfaces as Conflict rather than poisoning, because the
+        // head simply fails to authenticate; a transient provider blip must
+        // not permanently kill an owner that is still the rightful one.)
+        let served = Arc::new(AtomicBool::new(false));
+        let served_in_closure = Arc::clone(&served);
+        assert!(matches!(
+            handle
+                .read(move |_| {
+                    served_in_closure.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await,
+            Err(WalOwnerError::Conflict)
+        ));
+        assert!(
+            !served.load(Ordering::SeqCst),
+            "a fenced-out owner must never execute a read against its frozen state"
+        );
+        // Writes were already fenced and stay fenced.
+        assert!(handle.submit(plan(51, b"after-fence")).await.is_err());
     }
 
     #[tokio::test]
