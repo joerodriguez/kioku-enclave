@@ -15,11 +15,13 @@
 
 pub(super) mod embedding;
 mod visual_evidence;
+pub(in crate::cp) mod window;
 pub(in crate::cp) use embedding::EpisodeEmbedding;
 pub(crate) use embedding::{EpisodeEmbeddingBatchLedger, EpisodeEmbeddingBatchPlan};
 pub(crate) use visual_evidence::{
     VisualEvidenceBackfillBatchLedger, VisualEvidenceBackfillBatchPlan,
 };
+pub(crate) use window::{EpisodeWindowUpsertLedger, EpisodeWindowUpsertPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;

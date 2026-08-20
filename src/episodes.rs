@@ -68,7 +68,7 @@ pub struct MinuteBucket {
 /// bucket start (minute precision); a bucket from a newer window replaces an
 /// overlapping older one. Returns `None` when the union is empty, else the
 /// merged JSON array plus the plain-text gist projection for episodes_fts.
-fn merge_minute_summaries(
+pub(crate) fn merge_minute_summaries(
     existing_json: Option<&str>,
     new: &[MinuteBucket],
 ) -> Option<(String, String)> {
@@ -124,7 +124,7 @@ pub(crate) fn write_episode_embedding(
 
 // ── Upsert ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct EpisodeInput {
     /// Stable episode id (v2). When present and the row exists, the episode is
     /// UPDATED in place (id preserved). When absent (or stale), a new row is
@@ -176,7 +176,7 @@ pub(crate) fn validate_substance(value: &str) -> Option<&'static str> {
     }
 }
 
-fn normalized_substance(value: Option<&str>) -> &'static str {
+pub(crate) fn normalized_substance(value: Option<&str>) -> &'static str {
     value.and_then(validate_substance).unwrap_or("normal")
 }
 
@@ -206,7 +206,7 @@ pub(crate) fn validate_visual_evidence(value: &str) -> Option<&'static str> {
     }
 }
 
-fn normalized_visual_evidence(value: Option<&str>) -> &'static str {
+pub(crate) fn normalized_visual_evidence(value: Option<&str>) -> &'static str {
     value.and_then(validate_visual_evidence).unwrap_or("none")
 }
 

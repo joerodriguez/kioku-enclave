@@ -524,6 +524,8 @@ impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkReservationPl
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkReservationLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaJobResurrectionPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaJobResurrectionLedger {}
+impl sealed::DomainPlan for crate::cp::summarizer::wal::EpisodeWindowUpsertPlan {}
+impl sealed::DomainLedger for crate::cp::summarizer::wal::EpisodeWindowUpsertLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan {}

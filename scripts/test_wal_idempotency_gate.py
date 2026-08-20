@@ -50,7 +50,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 196
+EXPECTED_STORE_CALL_COUNT = 200
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +61,7 @@ EXPECTED_STORE_CALL_COUNT = 196
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "9d5b197fdd2630652cd0bacfd73d3b2048ea2b2e3c27a78ae318bcb39f8bbff7"
+EXPECTED_STORE_CALL_SHA256 = "52fbf75f89f3a33d898c101e678ea9d707820fc69d52ca34275fc74dbdb2a106"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -795,6 +795,7 @@ B_OWNERS = frozenset(
         "src/cp/model_usage.rs::drain_outbox#0",
         "src/cp/query.rs::rest_delete_webhook#0",
         "src/cp/summarizer.rs::summarize_user_window#0",
+        "src/cp/summarizer.rs::wal_authoritative_upsert#0",
         "src/cp/summarizer.rs::embed_episodes#0",
         "src/cp/webhook_worker.rs::set_delivery_state#0",
         "src/store.rs::update_email_delivery_state#0",
