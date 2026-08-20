@@ -112,6 +112,10 @@ pub struct TextGeneration {
     pub text: String,
     #[allow(dead_code)] // retained for callers that need provider metadata
     pub metadata: VertexMetadata,
+    /// The durable ADR-0022 F2 invocation identity ("vtx_…") this response
+    /// settled under; the finalization commit plan anchors on it.
+    #[allow(dead_code)]
+    pub event_id: String,
 }
 
 pub struct MediaGeneration {
@@ -387,7 +391,11 @@ pub async fn generate_custom(
             "unexpected Vertex response shape (finishReason: {finish})"
         )));
     }
-    Ok(TextGeneration { text, metadata })
+    Ok(TextGeneration {
+        text,
+        metadata,
+        event_id: invocation,
+    })
 }
 
 fn media_request_body(

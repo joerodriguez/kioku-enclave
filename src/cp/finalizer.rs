@@ -1938,6 +1938,319 @@ pub async fn finalize_user_episode(state: &CpState, user_id: &str, episode_id: i
     finalize_user_episodes_scoped(state, user_id, Some(episode_id)).await
 }
 
+/// The assembled inputs for one settled finalization commit: the model's
+/// versioned product plus the pre-minted delivery identities (provider
+/// facts, minted before the settle exactly as the legacy transaction does).
+struct SettledFinalizationInputs {
+    episode_id: i64,
+    vertex_event_id: String,
+    input_identity_revision: i64,
+    model_name: String,
+    analysis_revision: String,
+    title: String,
+    summary: String,
+    minute_summaries_json: String,
+    minutes_text: String,
+    action_items_json: String,
+    overview: String,
+    decisions_json: String,
+    important_links_json: String,
+    open_questions_json: String,
+    ranked_screens: Vec<RankedScreenAnalysis>,
+    elided_screen_ids: Vec<i64>,
+    utterance_members: Vec<i64>,
+    screenshot_members: Vec<i64>,
+    webhook_destinations: Vec<(String, String)>,
+    email_preference_include_content: Option<bool>,
+    push_destinations: Vec<(String, String, String, String)>,
+}
+
+/// ADR-0022: settle one finalization commit as the sealed plan. Mirrors the
+/// legacy optimistic transaction's outcomes: Ok(delivery count) on success,
+/// Ok(0) on an identity-revision discard, the legacy Config errors on
+/// already-current and membership-changed.
+async fn finalize_commit_settled(
+    state: &CpState,
+    user_id: &str,
+    inputs: SettledFinalizationInputs,
+) -> Result<usize> {
+    let user = user_id.to_string();
+    let probe_episode = inputs.episode_id;
+    let probe_event = inputs.vertex_event_id.clone();
+    let probe_model = inputs.model_name.clone();
+    let (predecessor, attempt_commitment, current_utts, current_scrs, identity_rev) = state
+        .store
+        .wal_authoritative_read(&user, move |conn| {
+            let predecessor = wal::observed_commit_predecessor(conn, probe_episode).map_err(
+                |error| match error {
+                    crate::archive_v3_wal_idempotency::WalIdempotencyError::Precondition => {
+                        EnclaveError::Config("episode already finalized at current version".into())
+                    }
+                    _ => EnclaveError::Store("finalization predecessor read failed".into()),
+                },
+            )?;
+            let commitment =
+                wal::current_vertex_attempt_commitment(conn, &probe_event, &probe_model)
+                    .map_err(|_| EnclaveError::Store("finalization attempt read failed".into()))?;
+            let utts = wal::load_members(conn, probe_episode, "utterance")
+                .map_err(|_| EnclaveError::Store("finalization member read failed".into()))?;
+            let scrs = wal::load_members(conn, probe_episode, "screenshot")
+                .map_err(|_| EnclaveError::Store("finalization member read failed".into()))?;
+            let identity_rev: i64 = conn
+                .query_row(
+                    "SELECT identity_revision FROM episodes WHERE id = ?1",
+                    [probe_episode],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok((predecessor, commitment, utts, scrs, identity_rev))
+        })
+        .await?;
+    let Some(predecessor) = predecessor else {
+        return Err(EnclaveError::Store(
+            "episode disappeared during finalization".into(),
+        ));
+    };
+    if identity_rev != inputs.input_identity_revision {
+        info!(
+            episode_id = inputs.episode_id,
+            "finalization discarded: identity revised during inference"
+        );
+        return Ok(0);
+    }
+    if current_utts != inputs.utterance_members || current_scrs != inputs.screenshot_members {
+        return Err(EnclaveError::Config(
+            "episode membership changed during finalization".into(),
+        ));
+    }
+    let map_construct =
+        |_| EnclaveError::Store("finalization commit plan construction failed".into());
+    let mut ranked = inputs.ranked_screens;
+    ranked.sort_by_key(|screen| screen.screenshot_id);
+    let screens = ranked
+        .into_iter()
+        .map(|screen| {
+            wal::FinalizationScreenResult::new(
+                screen.screenshot_id,
+                screen.observation_revision,
+                screen.literal_description,
+                screen.screen_state,
+                screen.content_type,
+                screen.visible_text_summary,
+                screen.notable_items_json,
+                screen.activity_summary,
+                screen.relevance_level,
+                screen.relevance_reason,
+                screen.milestone_type,
+                screen.base_score,
+                screen.key_rank,
+                screen.is_key_screen,
+                screen.semantic_group,
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_construct)?;
+    let initial = predecessor.is_initial();
+    let (webhooks, email, pushes) = if initial {
+        let webhooks = inputs
+            .webhook_destinations
+            .into_iter()
+            .map(|(subscription_id, event_id)| {
+                wal::FinalizationWebhookDelivery::new(subscription_id, event_id)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_construct)?;
+        let email = match inputs.email_preference_include_content {
+            Some(include_content) => Some(
+                wal::FinalizationEmailDelivery::new(
+                    format!("deliv_{}", super::tokens::random_token_hex()),
+                    include_content,
+                )
+                .map_err(map_construct)?,
+            ),
+            None => None,
+        };
+        let pushes = inputs
+            .push_destinations
+            .into_iter()
+            .map(
+                |(installation_id, delivery_id, handoff_handle, collapse_id)| {
+                    wal::FinalizationPushDelivery::new(
+                        installation_id,
+                        delivery_id,
+                        handoff_handle,
+                        collapse_id,
+                    )
+                },
+            )
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_construct)?;
+        (webhooks, email, pushes)
+    } else {
+        (Vec::new(), None, Vec::new())
+    };
+    let delivery_count = if initial {
+        webhooks.len() + pushes.len()
+    } else {
+        0
+    };
+    let committed_at = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let content = wal::FinalizationEpisodeContent::new(
+        inputs.title,
+        inputs.summary,
+        inputs.minute_summaries_json,
+        inputs.minutes_text,
+        inputs.action_items_json.clone(),
+    )
+    .map_err(map_construct)?;
+    let brief = wal::FinalizationBrief::new(
+        inputs.overview,
+        inputs.decisions_json,
+        inputs.action_items_json,
+        inputs.important_links_json,
+        inputs.open_questions_json,
+    )
+    .map_err(map_construct)?;
+    let plan = wal::FinalizationCommitPlan::new(
+        user.clone(),
+        inputs.vertex_event_id,
+        attempt_commitment,
+        inputs.episode_id,
+        committed_at,
+        predecessor,
+        inputs.utterance_members,
+        inputs.screenshot_members,
+        inputs.model_name,
+        inputs.analysis_revision,
+        content,
+        brief,
+        screens,
+        inputs.elided_screen_ids,
+        webhooks,
+        email,
+        pushes,
+    )
+    .map_err(map_construct)?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(map_construct)?;
+    state
+        .store
+        .wal_authoritative_submit(&user, prepared)
+        .await?;
+    Ok(delivery_count)
+}
+
+/// Evidence for the final brief model input. `reconcile_speakers` runs the
+/// legacy identity reconciliation (mints uuids); the WAL path passes false —
+/// identity mutations are the sanctioned exclusion and have no sealed plan.
+fn read_finalization_evidence(
+    conn: &rusqlite::Connection,
+    ep_id: i64,
+    reconcile_speakers: bool,
+) -> Result<(Vec<UtteranceEvidenceRow>, Vec<ScreenshotEvidenceRow>, i64)> {
+    if reconcile_speakers {
+        crate::cp::identity::reconcile_episode_speaker_slots(conn, ep_id)?;
+    }
+    let input_identity_revision: i64 = conn
+        .query_row(
+            "SELECT identity_revision FROM episodes WHERE id = ?1",
+            [ep_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let mut u_stmt = conn.prepare(
+        "SELECT u.id, a.started_at, u.start_offset_seconds, \
+                u.speaker_label, a.source_type, u.text \
+         FROM utterances u \
+         JOIN audio_segments a ON a.id = u.audio_segment_id \
+         JOIN episode_members m \
+           ON m.record_type = 'utterance' AND m.record_id = u.id \
+         WHERE m.episode_id = ?1 \
+         ORDER BY a.started_at ASC, u.start_offset_seconds ASC, u.id ASC",
+    )?;
+    let utterances = u_stmt
+        .query_map([ep_id], |row| {
+            let segment_started_at: String = row.get(1)?;
+            let start_offset_seconds: f64 = row.get(2)?;
+            let at = isotime::add_seconds(&segment_started_at, start_offset_seconds);
+            Ok(UtteranceEvidenceRow {
+                id: row.get(0)?,
+                at_ms: isotime::parse_epoch_millis(&at).unwrap_or(0),
+                at,
+                speaker: row.get(3)?,
+                source_type: row.get(4)?,
+                text: row.get(5)?,
+            })
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    let mut s_stmt = conn.prepare(
+        "SELECT s.id, s.captured_at, s.active_app, s.window_title, \
+                s.url, s.ocr_text, s.salient_ocr_text, s.is_duplicate, \
+                s.source_key, s.capture_status, s.visible_until, s.display_id, \
+                s.primary_bundle_id, s.visible_windows_json, s.visual_signals_json, \
+                s.browser_snapshot_source_key \
+         FROM screenshots s \
+         JOIN episode_members m \
+           ON m.record_type = 'screenshot' AND m.record_id = s.id \
+         WHERE m.episode_id = ?1 \
+         ORDER BY s.captured_at ASC, s.id ASC",
+    )?;
+    let screenshots = s_stmt
+        .query_map([ep_id], |row| {
+            let captured_at: String = row.get(1)?;
+            let visible_windows_json: Option<String> = row.get(13)?;
+            let visual_signals_json: Option<String> = row.get(14)?;
+            let browser_source_key: Option<String> = row.get(15)?;
+            let screenshot_id: i64 = row.get(0)?;
+            Ok(ScreenshotEvidenceRow {
+                id: screenshot_id,
+                captured_at_ms: isotime::parse_epoch_millis(&captured_at).unwrap_or(0),
+                captured_at,
+                active_app: row.get(2)?,
+                window_title: row.get(3)?,
+                url: row.get(4)?,
+                ocr_text: row.get(5)?,
+                salient_ocr_text: row.get(6)?,
+                is_duplicate: row.get::<_, i64>(7)? != 0,
+                elided: false,
+                source_key: row
+                    .get::<_, Option<String>>(8)?
+                    .unwrap_or_else(|| format!("legacy:{screenshot_id}")),
+                capture_status: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "legacy".into()),
+                visible_until: row.get(10)?,
+                display_id: row.get(11)?,
+                primary_bundle_id: row.get(12)?,
+                visible_windows: visible_windows_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or(Value::Null),
+                browser_context: browser_context(conn, browser_source_key.as_deref())?,
+                visual_signals: visual_signals_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or(Value::Null),
+                literal_description: None,
+                activity_summary: None,
+                relevance_reason: None,
+                milestone_type: None,
+                key_rank: None,
+            })
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    Ok((utterances, screenshots, input_identity_revision))
+}
+
 async fn finalize_user_episodes_scoped(
     state: &CpState,
     user_id: &str,
@@ -1993,7 +2306,7 @@ async fn finalize_user_episodes_scoped(
 
     // Fetch candidates from user content DB
     let now_iso = isotime::format_epoch_millis(now);
-    let candidates: Vec<EpisodeRow> = state.store.with_user(&user, move |conn| {
+    let candidates: Vec<EpisodeRow> = state.store.wal_authoritative_read(&user, move |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, ended_at, type, title, summary, participants, languages, action_items, model
              FROM episodes
@@ -2053,7 +2366,7 @@ async fn finalize_user_episodes_scoped(
         let ended_at_cloned = ep.ended_at.clone();
         let devices = state
             .store
-            .with_user(&user_cloned, move |conn| {
+            .wal_authoritative_read(&user_cloned, move |conn| {
                 episode_contributing_devices(conn, ep_id)
             })
             .await?;
@@ -2077,7 +2390,7 @@ async fn finalize_user_episodes_scoped(
             let user_cloned2 = user.clone();
             let ended_at_val = ended_at_cloned.clone();
             let device_list = devices.clone();
-            state.store.with_user(&user_cloned2, move |conn| {
+            state.store.wal_authoritative_read(&user_cloned2, move |conn| {
                 let mut gaps = Vec::new();
                 for (dev_id, modality) in device_list {
                     let watermark: Option<String> = conn.query_row(
@@ -2123,105 +2436,21 @@ async fn finalize_user_episodes_scoped(
             Vec<UtteranceEvidenceRow>,
             Vec<ScreenshotEvidenceRow>,
             i64,
-        ) = state
-            .store
-            .with_user(&user_cloned3, move |conn| {
-                crate::cp::identity::reconcile_episode_speaker_slots(conn, ep_id)?;
-                let input_identity_revision: i64 = conn
-                    .query_row(
-                        "SELECT identity_revision FROM episodes WHERE id = ?1",
-                        [ep_id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                let mut u_stmt = conn.prepare(
-                    "SELECT u.id, a.started_at, u.start_offset_seconds, \
-                            u.speaker_label, a.source_type, u.text \
-                     FROM utterances u \
-                     JOIN audio_segments a ON a.id = u.audio_segment_id \
-                     JOIN episode_members m \
-                       ON m.record_type = 'utterance' AND m.record_id = u.id \
-                     WHERE m.episode_id = ?1 \
-                     ORDER BY a.started_at ASC, u.start_offset_seconds ASC, u.id ASC",
-                )?;
-                let utterances = u_stmt
-                    .query_map([ep_id], |row| {
-                        let segment_started_at: String = row.get(1)?;
-                        let start_offset_seconds: f64 = row.get(2)?;
-                        let at = isotime::add_seconds(&segment_started_at, start_offset_seconds);
-                        Ok(UtteranceEvidenceRow {
-                            id: row.get(0)?,
-                            at_ms: isotime::parse_epoch_millis(&at).unwrap_or(0),
-                            at,
-                            speaker: row.get(3)?,
-                            source_type: row.get(4)?,
-                            text: row.get(5)?,
-                        })
-                    })?
-                    .filter_map(|x| x.ok())
-                    .collect();
-
-                let mut s_stmt = conn.prepare(
-                    "SELECT s.id, s.captured_at, s.active_app, s.window_title, \
-                            s.url, s.ocr_text, s.salient_ocr_text, s.is_duplicate, \
-                            s.source_key, s.capture_status, s.visible_until, s.display_id, \
-                            s.primary_bundle_id, s.visible_windows_json, s.visual_signals_json, \
-                            s.browser_snapshot_source_key \
-                     FROM screenshots s \
-                     JOIN episode_members m \
-                       ON m.record_type = 'screenshot' AND m.record_id = s.id \
-                     WHERE m.episode_id = ?1 \
-                     ORDER BY s.captured_at ASC, s.id ASC",
-                )?;
-                let screenshots = s_stmt
-                    .query_map([ep_id], |row| {
-                        let captured_at: String = row.get(1)?;
-                        let visible_windows_json: Option<String> = row.get(13)?;
-                        let visual_signals_json: Option<String> = row.get(14)?;
-                        let browser_source_key: Option<String> = row.get(15)?;
-                        let screenshot_id: i64 = row.get(0)?;
-                        Ok(ScreenshotEvidenceRow {
-                            id: screenshot_id,
-                            captured_at_ms: isotime::parse_epoch_millis(&captured_at).unwrap_or(0),
-                            captured_at,
-                            active_app: row.get(2)?,
-                            window_title: row.get(3)?,
-                            url: row.get(4)?,
-                            ocr_text: row.get(5)?,
-                            salient_ocr_text: row.get(6)?,
-                            is_duplicate: row.get::<_, i64>(7)? != 0,
-                            elided: false,
-                            source_key: row
-                                .get::<_, Option<String>>(8)?
-                                .unwrap_or_else(|| format!("legacy:{screenshot_id}")),
-                            capture_status: row
-                                .get::<_, Option<String>>(9)?
-                                .unwrap_or_else(|| "legacy".into()),
-                            visible_until: row.get(10)?,
-                            display_id: row.get(11)?,
-                            primary_bundle_id: row.get(12)?,
-                            visible_windows: visible_windows_json
-                                .as_deref()
-                                .and_then(|value| serde_json::from_str(value).ok())
-                                .unwrap_or(Value::Null),
-                            browser_context: browser_context(conn, browser_source_key.as_deref())?,
-                            visual_signals: visual_signals_json
-                                .as_deref()
-                                .and_then(|value| serde_json::from_str(value).ok())
-                                .unwrap_or(Value::Null),
-                            literal_description: None,
-                            activity_summary: None,
-                            relevance_reason: None,
-                            milestone_type: None,
-                            key_rank: None,
-                        })
-                    })?
-                    .filter_map(|x| x.ok())
-                    .collect();
-
-                Ok((utterances, screenshots, input_identity_revision))
-            })
-            .await?;
+        ) = if state.store.is_wal_authoritative(&user) {
+            state
+                .store
+                .wal_authoritative_read(&user_cloned3, move |conn| {
+                    read_finalization_evidence(conn, ep_id, false)
+                })
+                .await?
+        } else {
+            state
+                .store
+                .with_user(&user_cloned3, move |conn| {
+                    read_finalization_evidence(conn, ep_id, true)
+                })
+                .await?
+        };
 
         // 4. Extract URL candidates
         let utts = utterance_rows
@@ -2276,7 +2505,7 @@ async fn finalize_user_episodes_scoped(
             "generating unified episode analysis with Gemini"
         );
 
-        let model_resp = match vertex::generate_custom(
+        let generation = match vertex::generate_custom(
             state,
             user_id,
             vertex::VertexOperation::FinalEpisodeAnalysis,
@@ -2287,13 +2516,15 @@ async fn finalize_user_episodes_scoped(
         )
         .await
         {
-            Ok(r) => r.text,
+            Ok(r) => r,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini unified episode analysis failed");
                 let _ = record_finalization_failure(state, user_id, ep.id, &e.to_string()).await;
                 continue;
             }
         };
+        let vertex_event_id = generation.event_id;
+        let model_resp = generation.text;
 
         let parsed: GeminiEpisodeAnalysisResponse = match serde_json::from_str(&model_resp) {
             Ok(p) => p,
@@ -2334,6 +2565,19 @@ async fn finalize_user_episodes_scoped(
         let screenshot_ids: HashSet<i64> = scrs.iter().map(|s| s.0).collect();
         let screenshot_member_ids: HashSet<i64> =
             screenshot_rows.iter().map(|row| row.id).collect();
+        let mut utterance_members: Vec<i64> = utterance_ids.iter().copied().collect();
+        utterance_members.sort_unstable();
+        let mut screenshot_members: Vec<i64> = screenshot_member_ids.iter().copied().collect();
+        screenshot_members.sort_unstable();
+        let elided_screen_ids = {
+            let mut ids: Vec<i64> = screenshot_rows
+                .iter()
+                .filter(|row| row.elided && !row.is_duplicate)
+                .map(|row| row.id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
 
         let is_valid_evidence = |er: &EvidenceRef| -> bool {
             match er.record_type.as_str() {
@@ -2472,7 +2716,43 @@ async fn finalize_user_episodes_scoped(
         let important_links_json = serde_json::to_string(&important_links).unwrap_or_default();
         let model_name = state.config.vertex_model.clone();
 
-        let commit_res = state.store.with_user(&user_cloned4, move |conn| {
+        let commit_res: Result<usize> = if state.store.is_wal_authoritative(&user) {
+            // ADR-0022: the versioned finalization product settles as the
+            // sealed commit plan (constructed once, R5). Identity
+            // reconciliation and the identity-revision bookkeeping stay
+            // excluded on the WAL path — the sanctioned identity exclusion.
+            finalize_commit_settled(
+                state,
+                &user,
+                SettledFinalizationInputs {
+                    episode_id: ep_id,
+                    vertex_event_id,
+                    input_identity_revision,
+                    model_name,
+                    analysis_revision,
+                    title,
+                    summary,
+                    minute_summaries_json,
+                    minutes_text,
+                    action_items_json,
+                    overview,
+                    decisions_json,
+                    important_links_json,
+                    open_questions_json,
+                    ranked_screens,
+                    elided_screen_ids,
+                    utterance_members,
+                    screenshot_members,
+                    webhook_destinations,
+                    email_preference_include_content: email_preference
+                        .as_ref()
+                        .map(|pref| pref.include_content),
+                    push_destinations,
+                },
+            )
+            .await
+        } else {
+            state.store.with_user(&user_cloned4, move |conn| {
             let transaction = conn.unchecked_transaction()?;
 
             // Re-verify the current finalization version and identity revision.
@@ -2743,7 +3023,8 @@ async fn finalize_user_episodes_scoped(
             } else {
                 0
             })
-        }).await;
+        }).await
+        };
 
         match commit_res {
             Ok(webhook_delivery_count) => {

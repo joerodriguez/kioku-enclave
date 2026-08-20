@@ -29,6 +29,10 @@ use crate::archive_v3_wal_idempotency::{
 };
 
 const REQUEST_V1: u16 = 1;
+// v2 adds the episode content rewrite (title/summary/minutes/action items)
+// that the live commit performs; v1 never recorded an operation anywhere.
+const REQUEST_V2: u16 = 2;
+const MAX_CONTENT_FIELD_BYTES: usize = 1_048_576;
 const SUBTYPE: &[u8] = b"finalization-commit-v1";
 // Codec v1 is permanently tied to the reviewed v5 finalization/screen product.
 const TARGET_FINALIZATION_VERSION: i32 = 5;
@@ -135,6 +139,11 @@ impl FinalizationCommitPredecessor {
             CommitMode::Regeneration
         }
     }
+
+    /// Whether this predecessor admits first-finalization deliveries.
+    pub(super) const fn is_initial(&self) -> bool {
+        matches!(self.mode(), CommitMode::Initial)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -164,6 +173,51 @@ impl FinalizationBrief {
             action_items,
             important_links,
             open_questions,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct FinalizationEpisodeContent {
+    title: String,
+    summary: String,
+    minute_summaries_json: String,
+    minutes_text: String,
+    action_items_json: String,
+}
+
+impl FinalizationEpisodeContent {
+    /// The episode content rewrite the live commit performs: empty title or
+    /// summary keeps the stored value (the legacy CASE arms); the minute
+    /// timeline and action items are unconditional overwrites.
+    pub(super) fn new(
+        title: String,
+        summary: String,
+        minute_summaries_json: String,
+        minutes_text: String,
+        action_items_json: String,
+    ) -> Result<Self> {
+        validate_text(&title, MAX_CONTENT_FIELD_BYTES, false)?;
+        validate_text(&summary, MAX_CONTENT_FIELD_BYTES, false)?;
+        validate_text(&minutes_text, MAX_CONTENT_FIELD_BYTES, false)?;
+        // NOT validate_canonical_json_array: the live caller struct-serializes
+        // MinuteBucket (field order), while Value round-trips sort keys — the
+        // canonical check would refuse every real legacy value. These fields
+        // are hash-committed into the request, so structure + bounds suffice.
+        for value in [&minute_summaries_json, &action_items_json] {
+            validate_text(value, MAX_CONTENT_FIELD_BYTES, false)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(value).map_err(|_| WalIdempotencyError::Malformed)?;
+            if !parsed.is_array() {
+                return Err(WalIdempotencyError::Malformed);
+            }
+        }
+        Ok(Self {
+            title,
+            summary,
+            minute_summaries_json,
+            minutes_text,
+            action_items_json,
         })
     }
 }
@@ -367,8 +421,10 @@ pub(crate) struct FinalizationCommitPlan {
     screenshot_members: Vec<i64>,
     model_name: String,
     analysis_revision: String,
+    content: FinalizationEpisodeContent,
     brief: FinalizationBrief,
     screens: Vec<FinalizationScreenResult>,
+    elided_screen_ids: Vec<i64>,
     webhooks: Vec<FinalizationWebhookDelivery>,
     email: Option<FinalizationEmailDelivery>,
     pushes: Vec<FinalizationPushDelivery>,
@@ -387,8 +443,10 @@ impl FinalizationCommitPlan {
         screenshot_members: Vec<i64>,
         model_name: String,
         analysis_revision: String,
+        content: FinalizationEpisodeContent,
         brief: FinalizationBrief,
         screens: Vec<FinalizationScreenResult>,
+        elided_screen_ids: Vec<i64>,
         webhooks: Vec<FinalizationWebhookDelivery>,
         email: Option<FinalizationEmailDelivery>,
         pushes: Vec<FinalizationPushDelivery>,
@@ -421,6 +479,17 @@ impl FinalizationCommitPlan {
             .iter()
             .any(|id| screenshot_members.binary_search(id).is_err())
         {
+            return Err(WalIdempotencyError::Precondition);
+        }
+        // Evidence elision is a deterministic in-memory reduction the live
+        // ranker applies before the model call; the archive cannot observe
+        // it. Each elided member is declared explicitly so the canonical
+        // completeness pin stays exact: ranked ∪ elided == non-duplicate
+        // members, with no overlap.
+        validate_sorted_ids(&elided_screen_ids, MAX_SCREENS)?;
+        if elided_screen_ids.iter().any(|id| {
+            screenshot_members.binary_search(id).is_err() || screen_ids.binary_search(id).is_ok()
+        }) {
             return Err(WalIdempotencyError::Precondition);
         }
         validate_key_ranks(&screens)?;
@@ -460,8 +529,10 @@ impl FinalizationCommitPlan {
             screenshot_members,
             model_name,
             analysis_revision,
+            content,
             brief,
             screens,
+            elided_screen_ids,
             webhooks,
             email,
             pushes,
@@ -491,7 +562,7 @@ impl WalLogicalDomainPlan for FinalizationCommitPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::with_capacity(64 * 1024));
-        request.extend_from_slice(&REQUEST_V1.to_be_bytes());
+        request.extend_from_slice(&REQUEST_V2.to_be_bytes());
         encode_bytes(&mut request, SUBTYPE)?;
         encode_string(&mut request, &self.account_id)?;
         encode_string(&mut request, &self.vertex_event_id)?;
@@ -509,10 +580,23 @@ impl WalLogicalDomainPlan for FinalizationCommitPlan {
         encode_string(&mut request, &self.model_name)?;
         encode_string(&mut request, &self.analysis_revision)?;
         encode_brief(&mut request, &self.brief)?;
+        // Content fields are committed by hash (they are unbounded model
+        // output; embedding them verbatim risks the kit's request cap).
+        for value in [
+            &self.content.title,
+            &self.content.summary,
+            &self.content.minute_summaries_json,
+            &self.content.minutes_text,
+            &self.content.action_items_json,
+        ] {
+            let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+            encode_bytes(&mut request, &digest)?;
+        }
         encode_len(&mut request, self.screens.len())?;
         for screen in &self.screens {
             encode_screen(&mut request, screen)?;
         }
+        encode_i64_vec(&mut request, &self.elided_screen_ids)?;
         encode_len(&mut request, self.webhooks.len())?;
         for delivery in &self.webhooks {
             encode_string(&mut request, &delivery.subscription_id)?;
@@ -553,13 +637,14 @@ impl WalLogicalDomainPlan for FinalizationCommitPlan {
             return Err(WalIdempotencyError::Precondition);
         }
         let canonical_screens = load_canonical_screen_members(transaction, self.episode_id)?;
-        if canonical_screens
-            != self
-                .screens
-                .iter()
-                .map(|screen| screen.screenshot_id)
-                .collect::<Vec<_>>()
-        {
+        let mut covered = self
+            .screens
+            .iter()
+            .map(|screen| screen.screenshot_id)
+            .chain(self.elided_screen_ids.iter().copied())
+            .collect::<Vec<_>>();
+        covered.sort_unstable();
+        if canonical_screens != covered {
             return Err(WalIdempotencyError::Precondition);
         }
         if current_product_commitment(transaction, self.episode_id)?
@@ -584,7 +669,10 @@ impl WalLogicalDomainPlan for FinalizationCommitPlan {
         let changed = transaction
             .execute(
                 "UPDATE episodes
-                 SET finalized_at=COALESCE(finalized_at,?1),
+                 SET title=CASE WHEN length(?12)>0 THEN ?12 ELSE title END,
+                     summary=CASE WHEN length(?13)>0 THEN ?13 ELSE summary END,
+                     minute_summaries=?14,minutes_text=?15,action_items=?16,
+                     finalized_at=COALESCE(finalized_at,?1),
                      finalization_version=?2,finalization_status='complete',
                      finalization_error=NULL,finalization_attempt_count=0,
                      finalization_next_attempt_at=NULL,updated_at=?1
@@ -605,6 +693,11 @@ impl WalLogicalDomainPlan for FinalizationCommitPlan {
                     self.predecessor.attempt_count,
                     self.predecessor.next_attempt_at,
                     self.predecessor.updated_at,
+                    self.content.title,
+                    self.content.summary,
+                    self.content.minute_summaries_json,
+                    self.content.minutes_text,
+                    self.content.action_items_json,
                 ],
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -811,7 +904,11 @@ fn load_episode(connection: &Connection, episode_id: i64) -> Result<Option<Store
         .map_err(|_| WalIdempotencyError::Unavailable)
 }
 
-fn load_members(connection: &Connection, episode_id: i64, kind: &str) -> Result<Vec<i64>> {
+pub(super) fn load_members(
+    connection: &Connection,
+    episode_id: i64,
+    kind: &str,
+) -> Result<Vec<i64>> {
     let mut statement = connection
         .prepare(
             "SELECT record_id FROM episode_members
@@ -825,7 +922,10 @@ fn load_members(connection: &Connection, episode_id: i64, kind: &str) -> Result<
         .map_err(|_| WalIdempotencyError::Unavailable)
 }
 
-fn load_canonical_screen_members(connection: &Connection, episode_id: i64) -> Result<Vec<i64>> {
+pub(super) fn load_canonical_screen_members(
+    connection: &Connection,
+    episode_id: i64,
+) -> Result<Vec<i64>> {
     let mut statement = connection
         .prepare(
             "SELECT s.id FROM screenshots s
@@ -930,6 +1030,32 @@ pub(super) fn current_vertex_attempt_commitment(
         return Err(WalIdempotencyError::Corrupt);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Routed pre-submit read: the observed commit predecessor for one episode
+/// (None when the row is absent). Construction enforces the same
+/// processing-state and version admissibility the plan pins; an
+/// already-current episode surfaces as `Precondition`.
+pub(super) fn observed_commit_predecessor(
+    connection: &Connection,
+    episode_id: i64,
+) -> Result<Option<FinalizationCommitPredecessor>> {
+    let Some(stored) = load_episode(connection, episode_id)? else {
+        return Ok(None);
+    };
+    let commitment = current_product_commitment(connection, episode_id)?;
+    FinalizationCommitPredecessor::new(
+        stored.finalized_at,
+        stored.finalization_version,
+        stored.status,
+        stored.error,
+        stored.attempted_at,
+        stored.attempt_count,
+        stored.next_attempt_at,
+        stored.updated_at,
+        commitment,
+    )
+    .map(Some)
 }
 
 pub(super) fn current_product_commitment(
@@ -1316,6 +1442,38 @@ fn verify_final_state(transaction: &Transaction<'_>, plan: &FinalizationCommitPl
         || episode.attempt_count != 0
         || episode.next_attempt_at.is_some()
         || episode.updated_at.as_deref() != Some(&plan.committed_at)
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    type ContentColumns = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let (title, summary, minutes_json, minutes_text, action_items): ContentColumns = transaction
+        .query_row(
+            "SELECT title,summary,minute_summaries,minutes_text,action_items
+             FROM episodes WHERE id=?1",
+            [plan.episode_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    if (!plan.content.title.is_empty() && title.as_deref() != Some(plan.content.title.as_str()))
+        || (!plan.content.summary.is_empty()
+            && summary.as_deref() != Some(plan.content.summary.as_str()))
+        || minutes_json.as_deref() != Some(plan.content.minute_summaries_json.as_str())
+        || minutes_text.as_deref() != Some(plan.content.minutes_text.as_str())
+        || action_items.as_deref() != Some(plan.content.action_items_json.as_str())
     {
         return Err(WalIdempotencyError::Corrupt);
     }
@@ -2089,6 +2247,11 @@ mod tests {
                 "PRAGMA foreign_keys=ON;
                  CREATE TABLE episodes (
                     id INTEGER PRIMARY KEY,
+                    title TEXT,
+                    summary TEXT,
+                    minute_summaries TEXT,
+                    minutes_text TEXT,
+                    action_items TEXT,
                     finalized_at TEXT,
                     finalization_version INTEGER,
                     finalization_status TEXT NOT NULL,
@@ -2336,6 +2499,17 @@ mod tests {
         .unwrap()
     }
 
+    fn content(title: &str) -> FinalizationEpisodeContent {
+        FinalizationEpisodeContent::new(
+            title.into(),
+            "An exact final summary.".into(),
+            "[{\"start\":\"2026-08-01T10:00:00Z\",\"gist\":\"Reviewed.\"}]".into(),
+            "Reviewed.".into(),
+            "[]".into(),
+        )
+        .unwrap()
+    }
+
     fn screen(screenshot_id: i64) -> FinalizationScreenResult {
         FinalizationScreenResult::new(
             screenshot_id,
@@ -2374,8 +2548,10 @@ mod tests {
             vec![episode_id * 10, episode_id * 10 + 1],
             "gemini-2.5-flash".into(),
             ANALYSIS_REVISION.into(),
+            content("Finalized episode title"),
             brief(overview),
             vec![screen(episode_id * 10)],
+            vec![],
             vec![
                 FinalizationWebhookDelivery::new(SUBSCRIPTION.into(), WEBHOOK_EVENT.into())
                     .unwrap(),
@@ -2404,8 +2580,10 @@ mod tests {
             vec![episode_id * 10, episode_id * 10 + 1],
             "gemini-2.5-flash".into(),
             ANALYSIS_REVISION.into(),
+            content("Finalized episode title"),
             brief("Regenerated exact episode brief."),
             vec![screen(episode_id * 10)],
+            vec![],
             vec![],
             None,
             vec![],
@@ -2430,13 +2608,129 @@ mod tests {
             vec![episode_id * 10, episode_id * 10 + 1],
             "gemini-2.5-flash".into(),
             ANALYSIS_REVISION.into(),
+            content("Finalized episode title"),
             brief(overview),
             vec![screen(episode_id * 10)],
+            vec![],
             vec![],
             None,
             vec![],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn elided_evidence_must_be_declared_and_declared_elision_settles() {
+        // The live ranker elides evidence in memory before the model call;
+        // the archive only sees non-duplicate members. An undeclared gap in
+        // ranked coverage refuses; an explicit elision declaration settles.
+        let mut connection = connection();
+        seed_episode(&connection, 1, None, None);
+        connection
+            .execute(
+                "INSERT INTO screenshots (id,is_duplicate) VALUES (12,0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO episode_members (episode_id,record_type,record_id)
+                 VALUES (1,'screenshot',12)",
+                [],
+            )
+            .unwrap();
+        let build = |elided: Vec<i64>| {
+            FinalizationCommitPlan::new(
+                ACCOUNT.into(),
+                EVENT_ONE.into(),
+                current_vertex_attempt_commitment(&connection, EVENT_ONE, "gemini-2.5-flash")
+                    .unwrap(),
+                1,
+                COMMITTED_AT.into(),
+                predecessor(&connection, 1, None, None),
+                vec![100],
+                vec![10, 11, 12],
+                "gemini-2.5-flash".into(),
+                ANALYSIS_REVISION.into(),
+                content("Finalized episode title"),
+                brief("Exact episode brief."),
+                vec![screen(10)],
+                elided,
+                vec![],
+                None,
+                vec![],
+            )
+            .unwrap()
+        };
+        let undeclared = build(vec![]);
+        let declared = build(vec![12]);
+        assert_eq!(
+            execute_error(&mut connection, undeclared),
+            WalIdempotencyError::Precondition,
+            "an undeclared coverage gap refuses"
+        );
+        execute(&mut connection, declared).unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT finalization_status FROM episodes WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+    }
+
+    #[test]
+    fn the_content_rewrite_lands_and_empty_fields_keep_existing() {
+        let mut connection = connection();
+        seed_episode(&connection, 1, None, None);
+        connection
+            .execute(
+                "UPDATE episodes SET title='stored title', summary='stored summary' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let plan = FinalizationCommitPlan::new(
+            ACCOUNT.into(),
+            EVENT_ONE.into(),
+            current_vertex_attempt_commitment(&connection, EVENT_ONE, "gemini-2.5-flash").unwrap(),
+            1,
+            COMMITTED_AT.into(),
+            predecessor(&connection, 1, None, None),
+            vec![100],
+            vec![10, 11],
+            "gemini-2.5-flash".into(),
+            ANALYSIS_REVISION.into(),
+            FinalizationEpisodeContent::new(
+                String::new(),
+                "rewritten summary".into(),
+                "[{\"start\":\"2026-08-01T10:00:00Z\",\"gist\":\"Reviewed.\"}]".into(),
+                "Reviewed.".into(),
+                "[]".into(),
+            )
+            .unwrap(),
+            brief("Exact episode brief."),
+            vec![screen(10)],
+            vec![],
+            vec![],
+            None,
+            vec![],
+        )
+        .unwrap();
+        execute(&mut connection, plan).unwrap();
+        let (title, summary, minutes): (String, String, String) = connection
+            .query_row(
+                "SELECT title,summary,minute_summaries FROM episodes WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "stored title", "empty title keeps the stored value");
+        assert_eq!(summary, "rewritten summary");
+        assert_eq!(
+            minutes,
+            "[{\"start\":\"2026-08-01T10:00:00Z\",\"gist\":\"Reviewed.\"}]"
+        );
     }
 
     fn execute(
@@ -2862,8 +3156,10 @@ mod tests {
             vec![20, 21],
             "gemini-2.5-flash".into(),
             ANALYSIS_REVISION.into(),
+            content("Finalized episode title"),
             brief("Regenerated exact episode brief."),
             vec![screen(20)],
+            vec![],
             vec![
                 FinalizationWebhookDelivery::new(SUBSCRIPTION.into(), WEBHOOK_EVENT.into(),)
                     .unwrap()

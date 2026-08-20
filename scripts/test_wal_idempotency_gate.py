@@ -50,7 +50,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 208
+EXPECTED_STORE_CALL_COUNT = 211
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +61,7 @@ EXPECTED_STORE_CALL_COUNT = 208
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "c8aad674158e6ce521f59a8f337ca9e894dd02b2e5964a80410406926ece3c0e"
+EXPECTED_STORE_CALL_SHA256 = "5b56135cfc79cf26e67e5e882c478ad666c00864494032232e391c46e429120c"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -774,6 +774,7 @@ B_OWNERS = frozenset(
         "src/cp/email_worker.rs::cancel_user_email_deliveries_settled#0",
         "src/cp/push.rs::update_delivery#0",
         "src/cp/finalizer.rs::settle_lifecycle#0",
+        "src/cp/finalizer.rs::finalize_commit_settled#0",
         "src/cp/finalizer.rs::record_finalization_failure#0",
         "src/cp/finalizer.rs::defer_finalization_for_budget#0",
         "src/cp/media.rs::load_or_create_media_dek#0",
@@ -818,8 +819,10 @@ C_OWNERS = frozenset(
 
 CALL_OVERRIDES = {
     # Speaker-slot reconciliation allocates random participant keys and
-    # rewrites labels from live attribution state before the evidence reads.
-    "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#3": "B",
+    # rewrites labels from live attribution state before the evidence reads
+    # (the legacy evidence arm); the second with_user is the legacy commit.
+    "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#0": "B",
+    "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#1": "B",
     # Stable capture record, but the complete owner has the B dependency below.
     "src/cp/media.rs::upload_capture_event#0::with_user#0": "A",
     "src/cp/media.rs::upload_capture_event#0::with_user#1": "A",
@@ -1768,7 +1771,12 @@ impl X {
         )
         self.assertIn("DomainLedgerBounds::new", finalization_commit_domain)
         self.assertIn("WalIdempotencyError::Precondition", finalization_commit_domain)
-        self.assertNotIn("FinalizationCommitPlan::", finalizer)
+        # ADR-0022 slice 10: the finalization commit is WIRED - the owner
+        # settles the sealed plan (finalize_commit_settled) and keeps the
+        # legacy optimistic transaction for unselected users.
+        self.assertIn("FinalizationCommitPlan::new(", finalizer)
+        self.assertIn("observed_commit_predecessor", finalizer)
+        self.assertIn("read_finalization_evidence(conn, ep_id, true)", finalizer)
         self.assertNotIn("cp::finalizer::wal::", main)
         self.assertIn("pub(crate) mod wal;", media_worker)
         self.assertIn(
