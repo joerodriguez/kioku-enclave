@@ -974,6 +974,31 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_controller_runs (
         OR (stage IN ('aborted','manual_required') AND abort_reason IS NOT NULL)
     )
 );
+-- Durable genesis control ledger. One row per genesis archive pins first the
+-- created store's resolved witness bytes and then the released
+-- WalAuthoritative terminal the witness ladder ended at. The
+-- 'wal_authoritative' stage row is a WAL-owner selection authority equal to
+-- (and independent of) the maintenance-import terminal; it has no legacy
+-- source, generation, or import lineage because a genesis archive never had
+-- one. Rows contain only content-free authenticated witness bytes -- never
+-- SQL, captured frames, plaintext, or provider credentials.
+CREATE TABLE IF NOT EXISTS archive_v3_wal_genesis (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_bindings(archive_id)
+        CHECK (length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK (format_version=1),
+    user_id TEXT NOT NULL UNIQUE REFERENCES archive_bindings(user_id),
+    terminal_witness BLOB NOT NULL CHECK (length(terminal_witness)=724),
+    terminal_witness_hash BLOB NOT NULL
+        CHECK (length(terminal_witness_hash)=32 AND terminal_witness_hash!=zeroblob(32)),
+    stage TEXT NOT NULL CHECK (stage IN ('genesis_created','wal_authoritative')),
+    commitment BLOB NOT NULL CHECK (length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK (revision IN (1,2)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (
+        (stage='genesis_created' AND revision=1)
+        OR (stage='wal_authoritative' AND revision=2)
+    )
+);
 -- Inactive single-owner WAL publication protocol. These rows contain only
 -- content-free authenticated bindings and immutable-object facts. They never
 -- contain logical mutation results, SQL, captured frames, plaintext, provider
@@ -10405,10 +10430,14 @@ fn load_wal_authoritative_persistence_selection_conn(
 }
 
 /// Shared selection core: active archive binding plus the durable
-/// `wal_authoritative` terminal for exactly that archive. Deliberately does
-/// not check account status — the startup scan installs selections for
-/// suspended accounts too, because suspension already blocks serving while a
-/// later reactivation must never resurrect legacy snapshot persistence for a
+/// `wal_authoritative` terminal for exactly that archive. The terminal
+/// authority is EITHER the maintenance-import ledger OR the genesis control
+/// ledger — each individually exact (`format_version=1` and the
+/// `wal_authoritative` stage for exactly the bound archive); any other stage,
+/// or both rows missing, refuses content-free. Deliberately does not check
+/// account status — the startup scan installs selections for suspended
+/// accounts too, because suspension already blocks serving while a later
+/// reactivation must never resurrect legacy snapshot persistence for a
 /// WAL-authoritative archive.
 fn wal_authoritative_selection_for_bound_user_conn(
     conn: &Connection,
@@ -10416,7 +10445,7 @@ fn wal_authoritative_selection_for_bound_user_conn(
 ) -> Result<WalAuthoritativePersistenceSelection> {
     let binding = validate_active_archive_binding_conn(conn, user_id)?;
     let archive_id = binding.archive_id;
-    let stage: Option<String> = conn
+    let maintenance_stage: Option<String> = conn
         .query_row(
             "SELECT stage FROM archive_v3_maintenance_imports
              WHERE archive_id=?1 AND format_version=1",
@@ -10424,7 +10453,17 @@ fn wal_authoritative_selection_for_bound_user_conn(
             |row| row.get(0),
         )
         .optional()?;
-    if stage.as_deref() != Some("wal_authoritative") {
+    let genesis_stage: Option<String> = conn
+        .query_row(
+            "SELECT stage FROM archive_v3_wal_genesis
+             WHERE archive_id=?1 AND format_version=1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if maintenance_stage.as_deref() != Some("wal_authoritative")
+        && genesis_stage.as_deref() != Some("wal_authoritative")
+    {
         return Err(EnclaveError::Conflict(
             "wal-authority persistence requires the durable wal_authoritative terminal".into(),
         ));
@@ -10451,12 +10490,21 @@ fn load_wal_authoritative_persistence_selections_conn(
         // revalidation, fail the whole scan, and panic startup — before the
         // reconciler that clears the condition can run. A deleting account is
         // already refused at the auth layer, so dropping its selection cannot
-        // serve stale data.
+        // serve stale data. The terminal authority is EITHER the
+        // maintenance-import ledger OR the genesis control ledger, each
+        // individually exact; every candidate is still revalidated through
+        // the shared selection core below.
         "SELECT DISTINCT b.user_id
          FROM archive_bindings b
-         JOIN archive_v3_maintenance_imports i
-           ON i.archive_id = b.archive_id AND i.format_version = 1
-         WHERE i.stage = 'wal_authoritative' AND b.state = 'active_legacy'
+         WHERE b.state = 'active_legacy'
+           AND (EXISTS(
+                    SELECT 1 FROM archive_v3_maintenance_imports i
+                    WHERE i.archive_id = b.archive_id AND i.format_version = 1
+                      AND i.stage = 'wal_authoritative')
+                OR EXISTS(
+                    SELECT 1 FROM archive_v3_wal_genesis g
+                    WHERE g.archive_id = b.archive_id AND g.format_version = 1
+                      AND g.stage = 'wal_authoritative'))
          ORDER BY b.user_id",
     )?;
     let user_ids: Vec<String> = statement
@@ -10469,6 +10517,315 @@ fn load_wal_authoritative_persistence_selections_conn(
             wal_authoritative_selection_for_bound_user_conn(conn, user_id)
         })
         .collect()
+}
+
+const WAL_GENESIS_LEDGER_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/wal-genesis-ledger/v1\0";
+const WAL_GENESIS_LEDGER_FORMAT_VERSION: u32 = 1;
+
+/// Monotone genesis control-ledger stage: `genesis_created` pins the resolved
+/// bootstrap witness bytes after the store resolve; `wal_authoritative` pins
+/// the exact released terminal bytes the witness ladder ended at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalGenesisStage {
+    GenesisCreated,
+    WalAuthoritative,
+}
+
+impl WalGenesisStage {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::GenesisCreated => "genesis_created",
+            Self::WalAuthoritative => "wal_authoritative",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "genesis_created" => Some(Self::GenesisCreated),
+            "wal_authoritative" => Some(Self::WalAuthoritative),
+            _ => None,
+        }
+    }
+
+    /// The exact durable revision each stage row rests at; the schema CHECK
+    /// pins the same correlation, so a drifted pair cannot even be inserted.
+    const fn revision(&self) -> u64 {
+        match self {
+            Self::GenesisCreated => 1,
+            Self::WalAuthoritative => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WalGenesisLedgerRecord {
+    pub(crate) user_id: String,
+    pub(crate) archive_id: ArchiveId,
+    pub(crate) stage: WalGenesisStage,
+    pub(crate) terminal_witness: [u8; crate::archive_v3_witness::WITNESS_RECORD_BYTES],
+    pub(crate) terminal_witness_hash: [u8; 32],
+    pub(crate) commitment: [u8; 32],
+    pub(crate) revision: u64,
+}
+
+fn compute_wal_genesis_ledger_commitment(
+    user_id: &str,
+    archive_id: ArchiveId,
+    stage: WalGenesisStage,
+    terminal_witness: &[u8; crate::archive_v3_witness::WITNESS_RECORD_BYTES],
+    terminal_witness_hash: &[u8; 32],
+    revision: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(WAL_GENESIS_LEDGER_COMMITMENT_DOMAIN);
+    hasher.update(WAL_GENESIS_LEDGER_FORMAT_VERSION.to_be_bytes());
+    hasher.update((user_id.len() as u32).to_be_bytes());
+    hasher.update(user_id.as_bytes());
+    hasher.update(archive_id.as_bytes());
+    hasher.update(stage.as_str().as_bytes());
+    hasher.update(terminal_witness);
+    hasher.update(terminal_witness_hash);
+    hasher.update(revision.to_be_bytes());
+    hasher.finalize().into()
+}
+
+/// Exact-load the durable genesis ledger row for one archive with full
+/// hash and commitment recompute-and-compare validation.
+fn load_wal_genesis_ledger_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<WalGenesisLedgerRecord>> {
+    type GenesisLedgerRow = (i64, String, Vec<u8>, Vec<u8>, String, Vec<u8>, i64);
+    let row: Option<GenesisLedgerRow> = conn
+        .query_row(
+            "SELECT format_version,user_id,terminal_witness,terminal_witness_hash,
+                    stage,commitment,revision
+             FROM archive_v3_wal_genesis WHERE archive_id=?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.0 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported WAL genesis ledger format".into(),
+        ));
+    }
+    let user_id = row.1;
+    let terminal_witness = fixed_blob::<{ crate::archive_v3_witness::WITNESS_RECORD_BYTES }>(
+        &row.2,
+        "WAL genesis terminal witness",
+    )?;
+    let terminal_witness_hash = fixed_blob::<32>(&row.3, "WAL genesis terminal witness hash")?;
+    if terminal_witness_hash != <[u8; 32]>::from(Sha256::digest(terminal_witness)) {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis terminal witness hash mismatch".into(),
+        ));
+    }
+    let stage = WalGenesisStage::from_str(&row.4)
+        .ok_or_else(|| EnclaveError::Store("unsupported WAL genesis ledger stage".into()))?;
+    let commitment = fixed_blob::<32>(&row.5, "WAL genesis ledger commitment")?;
+    let revision = u64::try_from(row.6)
+        .map_err(|_| EnclaveError::Store("invalid WAL genesis ledger revision".into()))?;
+    if revision != stage.revision() {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis ledger revision mismatch".into(),
+        ));
+    }
+    if commitment
+        != compute_wal_genesis_ledger_commitment(
+            &user_id,
+            archive_id,
+            stage,
+            &terminal_witness,
+            &terminal_witness_hash,
+            revision,
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis ledger commitment mismatch".into(),
+        ));
+    }
+    Ok(Some(WalGenesisLedgerRecord {
+        user_id,
+        archive_id,
+        stage,
+        terminal_witness,
+        terminal_witness_hash,
+        commitment,
+        revision,
+    }))
+}
+
+/// Record (or exactly replay) one genesis control-ledger stage.
+///
+/// `genesis_created` is recorded after the store resolve; `wal_authoritative`
+/// is recorded with the exact released terminal bytes after the witness
+/// ladder. Re-recording the row's current stage with identical bytes is an
+/// idempotent replay; different bytes for a recorded stage — or any stage
+/// regression — is a hard Conflict, never an overwrite. The
+/// `genesis_created -> wal_authoritative` advance full-row-CASes stage,
+/// bytes, hash, commitment, and revision together.
+fn record_wal_genesis_stage_conn(
+    conn: &Connection,
+    user_id: &str,
+    archive_id: ArchiveId,
+    stage: WalGenesisStage,
+    terminal_witness: &[u8; crate::archive_v3_witness::WITNESS_RECORD_BYTES],
+) -> Result<(WalGenesisLedgerRecord, bool)> {
+    validate_user_id(user_id)?;
+    let decoded = crate::archive_v3_witness::WitnessRecord::decode(terminal_witness)
+        .map_err(|_| EnclaveError::Store("invalid WAL genesis witness bytes".into()))?;
+    if decoded.archive_id() != archive_id {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis witness archive changed".into(),
+        ));
+    }
+    if stage == WalGenesisStage::WalAuthoritative
+        && (decoded.migration() != crate::archive_v3_witness::MigrationState::WalAuthoritative
+            || decoded.deletion() != crate::archive_v3_witness::DeletionState::Active
+            || decoded.has_exact_active_wal_owner_lease())
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis terminal witness is not the released terminal".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let binding = validate_active_archive_binding_conn(&tx, user_id)?;
+    if binding.archive_id != archive_id {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis archive binding changed".into(),
+        ));
+    }
+    let terminal_witness_hash: [u8; 32] = Sha256::digest(terminal_witness).into();
+    let current = load_wal_genesis_ledger_conn(&tx, archive_id)?;
+    let Some(current) = current else {
+        if stage != WalGenesisStage::GenesisCreated {
+            return Err(EnclaveError::Conflict(
+                "WAL genesis terminal requires the recorded created stage".into(),
+            ));
+        }
+        let revision = stage.revision();
+        let commitment = compute_wal_genesis_ledger_commitment(
+            user_id,
+            archive_id,
+            stage,
+            terminal_witness,
+            &terminal_witness_hash,
+            revision,
+        );
+        if tx.execute(
+            "INSERT INTO archive_v3_wal_genesis
+             (archive_id,format_version,user_id,terminal_witness,terminal_witness_hash,
+              stage,commitment,revision)
+             VALUES (?1,1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                user_id,
+                terminal_witness.as_slice(),
+                terminal_witness_hash.as_slice(),
+                stage.as_str(),
+                commitment.as_slice(),
+                i64::try_from(revision)
+                    .map_err(|_| EnclaveError::Store("WAL genesis revision overflow".into()))?,
+            ],
+        )? != 1
+        {
+            return Err(EnclaveError::Conflict("WAL genesis record raced".into()));
+        }
+        tx.commit()?;
+        return Ok((
+            WalGenesisLedgerRecord {
+                user_id: user_id.to_owned(),
+                archive_id,
+                stage,
+                terminal_witness: *terminal_witness,
+                terminal_witness_hash,
+                commitment,
+                revision,
+            },
+            true,
+        ));
+    };
+    if current.user_id != user_id {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis ledger user changed".into(),
+        ));
+    }
+    if current.stage == stage {
+        if current.terminal_witness != *terminal_witness {
+            return Err(EnclaveError::Conflict(
+                "WAL genesis stage witness bytes changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((current, false));
+    }
+    if current.stage != WalGenesisStage::GenesisCreated
+        || stage != WalGenesisStage::WalAuthoritative
+    {
+        return Err(EnclaveError::Conflict("WAL genesis stage regressed".into()));
+    }
+    let next_revision = stage.revision();
+    let next_commitment = compute_wal_genesis_ledger_commitment(
+        user_id,
+        archive_id,
+        stage,
+        terminal_witness,
+        &terminal_witness_hash,
+        next_revision,
+    );
+    if tx.execute(
+        "UPDATE archive_v3_wal_genesis
+         SET stage=?1,terminal_witness=?2,terminal_witness_hash=?3,
+             commitment=?4,revision=?5,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?6 AND user_id=?7 AND stage=?8
+           AND terminal_witness=?9 AND commitment=?10 AND revision=?11",
+        rusqlite::params![
+            stage.as_str(),
+            terminal_witness.as_slice(),
+            terminal_witness_hash.as_slice(),
+            next_commitment.as_slice(),
+            i64::try_from(next_revision)
+                .map_err(|_| EnclaveError::Store("WAL genesis revision overflow".into()))?,
+            archive_id.as_bytes().as_slice(),
+            user_id,
+            current.stage.as_str(),
+            current.terminal_witness.as_slice(),
+            current.commitment.as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("WAL genesis revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL genesis advance raced".into()));
+    }
+    tx.commit()?;
+    Ok((
+        WalGenesisLedgerRecord {
+            user_id: user_id.to_owned(),
+            archive_id,
+            stage,
+            terminal_witness: *terminal_witness,
+            terminal_witness_hash,
+            commitment: next_commitment,
+            revision: next_revision,
+        },
+        true,
+    ))
 }
 
 fn load_phase2_authority_acquisition_conn(
@@ -11125,6 +11482,97 @@ fn reserve_wal_owner_conn(
         return Err(EnclaveError::Conflict(
             "WAL maintenance handoff changed".into(),
         ));
+    }
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_wal_owner_leases WHERE archive_id=?1)",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? == 1
+    {
+        let retained = load_reserved_wal_owner_conn(&tx, archive_id)?;
+        if retained.control_view(WalOwnerPersistenceContext(())).1 != expected {
+            return Err(EnclaveError::Conflict(
+                "WAL owner terminal witness changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((retained, false));
+    }
+    let owner = WalOwnerId::random_for_control(WalOwnerPersistenceContext(()))
+        .map_err(map_wal_owner_error)?;
+    let reserved = ReservedWalOwnerLease::new_for_control(
+        WalOwnerPersistenceContext(()),
+        owner,
+        expected.clone(),
+    )
+    .map_err(map_wal_owner_error)?;
+    let (owner, expected, revision, stage, commitment) =
+        reserved.control_view(WalOwnerPersistenceContext(()));
+    if tx.execute(
+        "INSERT INTO archive_v3_wal_owner_leases
+         (archive_id,format_version,owner_id,expected_witness,lease_predecessor_witness,observed_witness,
+          stage,commitment,revision)
+         VALUES (?1,1,?2,?3,NULL,NULL,?4,?5,?6)",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            owner.as_bytes().as_slice(),
+            expected.encode().as_slice(),
+            owner_lease_stage_as_db(stage),
+            commitment.as_slice(),
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("WAL owner revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL owner reserve raced".into()));
+    }
+    tx.commit()?;
+    Ok((reserved, true))
+}
+
+/// [`reserve_wal_owner_conn`] with the handoff authority retargeted from the
+/// maintenance-import ledger to the genesis control ledger. Every kept
+/// predicate is byte-for-byte the template's: the `active_legacy` binding,
+/// the Active deletion and WalAuthoritative migration states, the lease-free
+/// terminal, the existing-lease adoption arm, and the exact terminal-bytes
+/// comparison. Only the maintenance release lineage
+/// (`exact_maintenance_terminal_or_release_from` plus the importer-owner
+/// lease checks) is replaced — the genesis ledger's `wal_authoritative`
+/// stage row already pins the exact released terminal bytes, and a genesis
+/// archive has no importer owner — by exact byte equality against that row.
+fn reserve_wal_owner_from_genesis_conn(
+    conn: &Connection,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<(ReservedWalOwnerLease, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let archive_id = expected.archive_id();
+    let authenticated: Option<(String, String, Vec<u8>)> = tx
+        .query_row(
+            "SELECT b.state,g.stage,g.terminal_witness
+             FROM archive_bindings b JOIN archive_v3_wal_genesis g
+               ON g.archive_id=b.archive_id
+             WHERE b.archive_id=?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((binding_state, genesis_stage, terminal)) = authenticated else {
+        return Err(EnclaveError::Auth("WAL genesis handoff is absent".into()));
+    };
+    let retained_terminal = fixed_blob::<{ crate::archive_v3_witness::WITNESS_RECORD_BYTES }>(
+        &terminal,
+        "genesis terminal witness",
+    )?;
+    crate::archive_v3_witness::WitnessRecord::decode(&retained_terminal)
+        .map_err(|_| EnclaveError::Store("invalid genesis terminal witness".into()))?;
+    if binding_state != "active_legacy"
+        || genesis_stage != "wal_authoritative"
+        || expected.encode() != retained_terminal
+        || expected.deletion() != crate::archive_v3_witness::DeletionState::Active
+        || expected.migration() != crate::archive_v3_witness::MigrationState::WalAuthoritative
+        || expected.has_exact_active_wal_owner_lease()
+    {
+        return Err(EnclaveError::Conflict("WAL genesis handoff changed".into()));
     }
     if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM archive_v3_wal_owner_leases WHERE archive_id=?1)",
@@ -16727,6 +17175,48 @@ impl ControlStore {
     ) -> Result<Vec<WalAuthoritativePersistenceSelection>> {
         self.read(load_wal_authoritative_persistence_selections_conn)
             .await
+    }
+
+    /// Record (or exactly replay) one durable genesis control-ledger stage
+    /// for the user's actively bound archive. `genesis_created` pins the
+    /// resolved bootstrap witness bytes; `wal_authoritative` pins the exact
+    /// released terminal the witness ladder ended at. Different bytes for a
+    /// recorded stage refuse with a content-free Conflict, never overwrite.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed genesis launcher (Track G) wiring"
+    )]
+    pub(crate) async fn record_genesis_stage(
+        &self,
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        stage: WalGenesisStage,
+        terminal_witness: [u8; crate::archive_v3_witness::WITNESS_RECORD_BYTES],
+    ) -> Result<WalGenesisLedgerRecord> {
+        let user_id = user_id.to_owned();
+        self.write_owned_if_changed(move |conn| {
+            record_wal_genesis_stage_conn(conn, &user_id, archive_id, stage, &terminal_witness)
+        })
+        .await
+    }
+
+    /// Reserve (or exactly re-adopt) the WAL owner lease off the genesis
+    /// control ledger's durable `wal_authoritative` terminal, mirroring the
+    /// maintenance-backed [`WalPublisherControl::reserve_owner`] byte for
+    /// byte apart from the retargeted handoff authority.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed genesis launcher (Track G) wiring"
+    )]
+    pub(crate) async fn reserve_owner_from_genesis(
+        &self,
+        expected_terminal: &crate::archive_v3_witness::WitnessRecord,
+    ) -> std::result::Result<ReservedWalOwnerLease, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            reserve_wal_owner_from_genesis_conn(conn, expected_terminal)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
     }
 
     /// Exact-load the durable Phase-2 acquisition for one archive with full
@@ -29002,6 +29492,371 @@ mod tests {
             selections.is_empty(),
             "a tombstoned binding must be dropped, never fail the whole scan"
         );
+    }
+
+    const GENESIS_USER_ID: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// Genesis-only fixture: an active user with an active-legacy binding and
+    /// an in-memory witness chain ending at the released WalAuthoritative
+    /// terminal (root sequence 2, owner None, lease tick 0) — deliberately
+    /// WITHOUT any maintenance-import row, so the genesis ledger authority is
+    /// exercised alone. Returns the archive, the resolved bootstrap record
+    /// (the `genesis_created` bytes), an alternate released record satisfying
+    /// every terminal shape predicate with different bytes, and the terminal.
+    fn genesis_terminal_fixture(
+        conn: &Connection,
+        user_id: &str,
+        seed: u8,
+    ) -> (
+        ArchiveId,
+        crate::archive_v3_witness::WitnessRecord,
+        crate::archive_v3_witness::WitnessRecord,
+        crate::archive_v3_witness::WitnessRecord,
+    ) {
+        use crate::archive_v3::{ArchiveCipher, ArchiveDek, DatabaseEpoch, KeyEpoch};
+        use crate::archive_v3_witness::{
+            InMemoryWitness, KeyRegistryReference, MigrationState, RootCommitment, RootReference,
+            Witness, WitnessBootstrap,
+        };
+
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, google_sub, email)
+             VALUES (?1, ?2, 'owner@example.com')",
+            rusqlite::params![user_id, format!("google-subject-{user_id}")],
+        )
+        .unwrap();
+        let binding = create_active_archive_binding_conn(conn, user_id).unwrap();
+        let archive_id = binding.archive_id;
+        let owner_id = ObjectId::from_bytes([seed; 16]);
+        let database_epoch = DatabaseEpoch::from_bytes([seed.wrapping_add(1); 16]);
+        let key_epoch = KeyEpoch::from_bytes([seed.wrapping_add(2); 16]);
+        let registry = KeyRegistryReference::new(
+            key_epoch,
+            0,
+            ObjectId::from_bytes([seed.wrapping_add(3); 16]),
+            [seed.wrapping_add(4); 32],
+        );
+        let initial = RootCommitment::genesis(
+            database_epoch,
+            key_epoch,
+            RootReference::new(
+                0,
+                ObjectId::from_bytes([seed.wrapping_add(5); 16]),
+                [seed.wrapping_add(6); 32],
+            ),
+        );
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                initial,
+                registry,
+            ))
+            .unwrap();
+        witness
+            .acquire_lease(archive_id, database_epoch, key_epoch, owner_id, 900)
+            .unwrap();
+        let created = witness.read_current(archive_id).unwrap().unwrap();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([seed.wrapping_add(7); 32]));
+        let (_, shadow, _) = maintenance_root_candidate(
+            &created,
+            owner_id,
+            1,
+            ObjectId::from_bytes([seed.wrapping_add(8); 16]),
+            &cipher,
+            0,
+            MigrationState::ShadowWal,
+        );
+        let (_, authoritative, _) = maintenance_root_candidate(
+            &shadow,
+            owner_id,
+            2,
+            ObjectId::from_bytes([seed.wrapping_add(9); 16]),
+            &cipher,
+            0,
+            MigrationState::WalAuthoritative,
+        );
+        (
+            archive_id,
+            created,
+            shadow.released_wal_owner_for_test(),
+            authoritative.released_wal_owner_for_test(),
+        )
+    }
+
+    #[test]
+    fn wal_genesis_stage_ledger_is_monotone_idempotent_and_never_overwrites() {
+        let conn = account_conn();
+        let (archive_id, created, alternate, terminal) =
+            genesis_terminal_fixture(&conn, GENESIS_USER_ID, 0x30);
+        let created_bytes = created.encode();
+        let terminal_bytes = terminal.encode();
+
+        // The terminal stage cannot be recorded before the created stage.
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &terminal_bytes,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The first record pins the resolved bootstrap bytes at revision 1.
+        let (record, changed) = record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::GenesisCreated,
+            &created_bytes,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(record.stage, WalGenesisStage::GenesisCreated);
+        assert_eq!(record.revision, 1);
+        assert_eq!(record.terminal_witness, created_bytes);
+
+        // Identical bytes replay idempotently.
+        let (replayed, changed) = record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::GenesisCreated,
+            &created_bytes,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(replayed, record);
+
+        // Different bytes for the recorded stage are a hard Conflict.
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::GenesisCreated,
+                &terminal_bytes,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The terminal stage refuses non-terminal witness bytes (the created
+        // record is Legacy-migration and still holds its bootstrap lease).
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &created_bytes,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // A different user's binding cannot record this archive's ledger.
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                USER_ID,
+                archive_id,
+                WalGenesisStage::GenesisCreated,
+                &created_bytes,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The advance pins the exact terminal bytes at revision 2.
+        let (terminal_record, changed) = record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::WalAuthoritative,
+            &terminal_bytes,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(terminal_record.stage, WalGenesisStage::WalAuthoritative);
+        assert_eq!(terminal_record.revision, 2);
+        assert_eq!(terminal_record.terminal_witness, terminal_bytes);
+
+        // Terminal replay is idempotent.
+        let (replayed, changed) = record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::WalAuthoritative,
+            &terminal_bytes,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(replayed, terminal_record);
+
+        // Different bytes for the recorded terminal stage — even bytes that
+        // satisfy every terminal shape predicate — are a hard Conflict.
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &alternate.encode(),
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The created stage can never regress the terminal row.
+        assert!(matches!(
+            record_wal_genesis_stage_conn(
+                &conn,
+                GENESIS_USER_ID,
+                archive_id,
+                WalGenesisStage::GenesisCreated,
+                &created_bytes,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn reserve_owner_from_genesis_admits_only_the_exact_recorded_terminal() {
+        let conn = account_conn();
+        let (archive_id, created, alternate, terminal) =
+            genesis_terminal_fixture(&conn, GENESIS_USER_ID, 0x38);
+
+        // No genesis ledger row: the handoff is absent, not merely changed.
+        assert!(matches!(
+            reserve_wal_owner_from_genesis_conn(&conn, &terminal),
+            Err(EnclaveError::Auth(_))
+        ));
+
+        // A ledger resting at the created stage refuses the reservation.
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::GenesisCreated,
+            &created.encode(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reserve_wal_owner_from_genesis_conn(&conn, &terminal),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::WalAuthoritative,
+            &terminal.encode(),
+        )
+        .unwrap();
+
+        // Terminal-bytes mismatch refuses even when the supplied record
+        // satisfies every shape predicate (released, Active, terminal
+        // migration, no active WAL owner lease).
+        assert!(matches!(
+            reserve_wal_owner_from_genesis_conn(&conn, &alternate),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Happy reservation off the recorded genesis terminal.
+        let (reserved, changed) = reserve_wal_owner_from_genesis_conn(&conn, &terminal).unwrap();
+        assert!(changed);
+        let view = reserved.control_view(WalOwnerPersistenceContext::for_test());
+        assert_eq!(view.1, &terminal);
+        assert_eq!(view.3, OwnerLeaseStage::Reserved);
+
+        // Adoption arm: a restart that lost the reservation response
+        // converges to the exact retained lease instead of minting a second
+        // owner or burning the reservation.
+        let (adopted, changed) = reserve_wal_owner_from_genesis_conn(&conn, &terminal).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            adopted.control_view(WalOwnerPersistenceContext::for_test()),
+            reserved.control_view(WalOwnerPersistenceContext::for_test())
+        );
+        let lease_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_v3_wal_owner_leases WHERE archive_id=?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_rows, 1);
+
+        // A tombstoned binding refuses even over the recorded terminal.
+        conn.execute(
+            "UPDATE archive_bindings SET state='tombstoned' WHERE user_id=?1",
+            [GENESIS_USER_ID],
+        )
+        .unwrap();
+        assert!(matches!(
+            reserve_wal_owner_from_genesis_conn(&conn, &terminal),
+            Err(EnclaveError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn wal_authoritative_selections_admit_genesis_ledger_authority() {
+        let conn = account_conn();
+
+        // Maintenance-backed selection keeps working unchanged.
+        let maintenance = seed_maintenance_wal_authoritative(&conn).unwrap();
+
+        // A genesis ledger resting at the created stage is not selected.
+        let (archive_id, created, _alternate, terminal) =
+            genesis_terminal_fixture(&conn, GENESIS_USER_ID, 0x40);
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::GenesisCreated,
+            &created.encode(),
+        )
+        .unwrap();
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].user_id(), USER_ID);
+        assert!(matches!(
+            load_wal_authoritative_persistence_selection_conn(&conn, GENESIS_USER_ID),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The recorded genesis terminal mints the per-user selection...
+        record_wal_genesis_stage_conn(
+            &conn,
+            GENESIS_USER_ID,
+            archive_id,
+            WalGenesisStage::WalAuthoritative,
+            &terminal.encode(),
+        )
+        .unwrap();
+        let selection =
+            load_wal_authoritative_persistence_selection_conn(&conn, GENESIS_USER_ID).unwrap();
+        assert_eq!(selection.user_id(), GENESIS_USER_ID);
+        assert_eq!(selection.archive_id(), archive_id);
+
+        // ...and the startup scan returns both authorities' selections.
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].user_id(), USER_ID);
+        assert_eq!(selections[0].archive_id(), maintenance.archive_id);
+        assert_eq!(selections[1].user_id(), GENESIS_USER_ID);
+        assert_eq!(selections[1].archive_id(), archive_id);
+
+        // Tombstoning the genesis binding drops only that selection.
+        conn.execute(
+            "UPDATE archive_bindings SET state='tombstoned' WHERE user_id=?1",
+            [GENESIS_USER_ID],
+        )
+        .unwrap();
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].user_id(), USER_ID);
     }
 
     #[test]
