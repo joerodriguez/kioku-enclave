@@ -231,6 +231,25 @@ pub async fn record_response(
 ) {
     let user = user_id.to_string();
     let event_id = event_id.to_string();
+    if state.store.is_wal_authoritative(&user) {
+        // ADR-0022: the terminal outcome settles on the F2-minted event id's
+        // coordinate; the plan derives the metered/usage-missing fields from
+        // the same metadata and refreshes coverage inside apply(). Same
+        // best-effort semantics as the legacy arm.
+        let prepared = wal::VertexUsageOutcomePlan::response(event_id, metadata)
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+        match prepared {
+            Ok(prepared) => {
+                if let Err(error) = state.store.wal_authoritative_submit(&user, prepared).await {
+                    warn!(error = %error, "Vertex usage response persistence deferred");
+                }
+            }
+            Err(error) => {
+                warn!(?error, "Vertex usage response plan construction failed");
+            }
+        }
+        return;
+    }
     let (model, normalized) = normalized_billable_response(metadata);
     let outcome = if normalized.is_some() {
         "metered"
@@ -300,6 +319,21 @@ pub async fn record_ambiguous(
 ) {
     let user = user_id.to_string();
     let id = event_id.to_string();
+    if state.store.is_wal_authoritative(&user) {
+        let prepared = wal::VertexUsageOutcomePlan::ambiguous(id, http_status)
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+        match prepared {
+            Ok(prepared) => {
+                if let Err(error) = state.store.wal_authoritative_submit(&user, prepared).await {
+                    warn!(error = %error, "ambiguous Vertex usage persistence deferred");
+                }
+            }
+            Err(error) => {
+                warn!(?error, "ambiguous Vertex usage plan construction failed");
+            }
+        }
+        return;
+    }
     let result = state
         .store
         .with_user(&user, move |conn| {
@@ -325,6 +359,14 @@ pub async fn record_ambiguous(
 pub async fn record_not_billed(state: &CpState, user_id: &str, event_id: &str, http_status: u16) {
     let user = user_id.to_string();
     let id = event_id.to_string();
+    if state.store.is_wal_authoritative(&user) {
+        let prepared = wal::VertexUsageOutcomePlan::not_billed(id, http_status)
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+        if let Ok(prepared) = prepared {
+            let _ = state.store.wal_authoritative_submit(&user, prepared).await;
+        }
+        return;
+    }
     let result = state
         .store
         .with_user(&user, move |conn| {
