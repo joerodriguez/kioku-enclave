@@ -7695,7 +7695,7 @@ pub(crate) fn init_vec_extension() {
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 /// SQLite schema for the per-user encrypted index.
-const SCHEMA_SQL: &str = r#"
+pub(crate) const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -8148,7 +8148,7 @@ CREATE TABLE IF NOT EXISTS device_watermarks (
 /// blobs created with the old schema self-upgrade transparently.
 ///
 /// `CREATE UNIQUE INDEX IF NOT EXISTS` is truly idempotent.
-fn run_migrations(conn: &Connection) -> Result<()> {
+pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
     crate::cp::mcp_projection::init_projection_schema(conn)?;
     crate::cp::media::init_schema(conn)?;
     // utterances.source_key (sync idempotency key)
