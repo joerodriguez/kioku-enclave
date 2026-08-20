@@ -2665,6 +2665,92 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
 
 async fn prune_user_media_store(store: &Store, user_id: &str) {
     let now = now_iso();
+    if store.is_wal_authoritative(user_id) {
+        // ADR-0022: the local pruned receipt settles as the sealed
+        // RetentionSettlementPlan after the provider delete, pinning the
+        // exact observed row tuple. Scan through the routed read lane;
+        // provider deletion is Control/GCS-side and unchanged.
+        let probe_now = now.clone();
+        let due = store
+            .wal_authoritative_read(user_id, move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT event_id,object_key,object_generation,object_backend,sha256,\
+                     retain_until,processing_state FROM media_objects \
+                     WHERE deleted_at IS NULL AND retain_until<=?1 \
+                     AND processing_state IN ('ready','failed') ORDER BY retain_until LIMIT 100",
+                )?;
+                let rows = statement
+                    .query_map([&probe_now], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await;
+        let due = match due {
+            Ok(due) => due,
+            Err(error) => {
+                warn!(user_id, error = %error, "raw media retention scan failed");
+                return;
+            }
+        };
+        for (
+            event_id,
+            object_key,
+            object_generation,
+            object_backend,
+            sha256,
+            retain_until,
+            state,
+        ) in due
+        {
+            let delete_result = store
+                .delete_retained_media(
+                    user_id,
+                    &object_key,
+                    object_generation,
+                    object_backend.as_deref(),
+                    &sha256,
+                )
+                .await;
+            if let Err(error) = delete_result {
+                warn!(error = %error, "raw media retention delete failed");
+                continue;
+            }
+            let deleted_at = now_iso();
+            let prepared = wal::RetentionSettlementPlan::new(
+                user_id.to_owned(),
+                event_id,
+                object_key,
+                object_generation,
+                object_backend,
+                sha256,
+                retain_until,
+                state,
+                deleted_at,
+            )
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    warn!(?error, "raw media retention plan construction failed");
+                    continue;
+                }
+            };
+            if let Err(error) = store.wal_authoritative_submit(user_id, prepared).await {
+                warn!(error = %error, "raw media retention ledger update failed");
+            }
+        }
+        return;
+    }
     let due = store
         .with_user(user_id, |conn| {
             let mut statement = conn.prepare(
