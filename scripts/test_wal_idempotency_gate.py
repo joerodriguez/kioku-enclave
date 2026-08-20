@@ -111,7 +111,10 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # gate — the gate fails on a clean origin/main checkout. Reviewed against the
 # dumped inventory: the sole delta is that owner-body hash; the spawn count
 # stays 33 and every spawn expression is unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "27395dad540523467572f7286c3dba38b760b24d0e492819f9a8b42a2e30637e"
+# Audit fix: the actor loop's Read arm now authenticates a fresh head before
+# serving, so the owner-actor spawn closure's hash moves. Spawn count stays 33
+# and no new spawn site exists.
+EXPECTED_WORKER_SPAWN_SHA256 = "88c39bece20f9beb5698316e5771a79f630d2bd4568d32ef908fc95ec1741241"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
