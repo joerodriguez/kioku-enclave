@@ -19,7 +19,12 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Slice F-c: the only call-site delta is with_user_if_changed's owner body,
 # whose refusal now reads the per-user resolver; its call expression and C
 # classification are unchanged.
-EXPECTED_STORE_CALL_COUNT = 168
+# Plan-family slice 1 (F1): the DEK bootstrap's with_user READ became the
+# routed read (new A site in read_media_dek_wrapped) and the selected branch
+# gained the submit (new B site under the same owner); the legacy with_user
+# WRITE remains. 168 -> 169, diffed against pristine main, zero
+# reclassifications.
+EXPECTED_STORE_CALL_COUNT = 169
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -30,7 +35,7 @@ EXPECTED_STORE_CALL_COUNT = 168
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "6b5a8880b2be47620de7419bb62f38fd4a1a31cba5ab580d0672484c5abb415a"
+EXPECTED_STORE_CALL_SHA256 = "ecfa969828cd8102350d97baa0f6ec3ab7776e23ea870c0a643317271706e25f"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -666,6 +671,7 @@ A_OWNERS = frozenset(
     {
         "src/cp/delivery.rs::load_finalized_episode#0",
         "src/cp/finalizer.rs::finalize_user_episodes_scoped#0",
+        "src/cp/media.rs::read_media_dek_wrapped#0",
         "src/cp/media.rs::stream_ack#0",
         "src/cp/media.rs::capture_status#0",
         "src/cp/media.rs::capture_session_status#0",
@@ -1326,7 +1332,11 @@ impl X {
         self.assertIn("HmacSha256::new_from_slice", media_dek_domain)
         self.assertIn("wrapped_dek_commitment", media_dek_domain)
         self.assertIn("validate_installed_value", media_dek_domain)
-        self.assertNotIn("MediaDekInstallPlan::", media)
+        # Plan-family slice 1 (F1) WIRED the sealed install plan: the DEK
+        # bootstrap constructs it at exactly one site, above the converge
+        # path (R5). The former assertNotIn pinned the deliberate pre-wiring
+        # state; this pins the wired one just as exactly.
+        self.assertEqual(media.count("MediaDekInstallPlan::new("), 1)
         self.assertNotIn("cp::media::wal::", main)
         self.assertIn("pub(crate) mod wal;", model_usage)
         self.assertIn(

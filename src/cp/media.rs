@@ -2700,24 +2700,49 @@ async fn load_or_create_media_dek(
     state: &CpState,
     user_id: &str,
 ) -> Result<(crate::crypto::Dek, String)> {
-    let existing: Option<String> = state
-        .store
-        .with_user(user_id, |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT value FROM app_metadata WHERE key=?1",
-                    [MEDIA_DEK_METADATA_KEY],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .await?;
+    // Routed unconditionally: an unselected user falls through to the legacy
+    // read path, a selected user reads the settled lane.
+    let existing = read_media_dek_wrapped(state, user_id).await?;
     if let Some(wrapped) = existing {
         let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &wrapped).await?;
         return Ok((dek, wrapped));
     }
     let (candidate_dek, candidate_wrapped) =
         crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref()).await?;
+    if state.store.is_wal_authoritative(user_id) {
+        let plan = wal::MediaDekInstallPlan::new(
+            user_id.to_owned(),
+            candidate_wrapped.clone(),
+            &candidate_dek,
+        )
+        .map_err(|_| EnclaveError::Store("media DEK install plan construction failed".into()))?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                EnclaveError::Store("media DEK install plan construction failed".into())
+            })?;
+        return match state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await
+        {
+            // Settled: our candidate is durably the account DEK (an exact
+            // replay of a lost ack lands here too, with identical bytes).
+            Ok(_receipt) => Ok((candidate_dek, candidate_wrapped)),
+            // A different DEK won between our read and our submit. The plan
+            // fails closed on the mismatch; converge by loading the winner
+            // exactly as the legacy loser branch does.
+            Err(EnclaveError::Conflict(_)) => {
+                let winner = read_media_dek_wrapped(state, user_id)
+                    .await?
+                    .ok_or_else(|| {
+                        EnclaveError::Store("media DEK install lost a race to no winner".into())
+                    })?;
+                let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &winner).await?;
+                Ok((dek, winner))
+            }
+            Err(error) => Err(error),
+        };
+    }
     let winner = state
         .store
         .with_user(user_id, |conn| {
@@ -2730,6 +2755,23 @@ async fn load_or_create_media_dek(
         let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &winner).await?;
         Ok((dek, winner))
     }
+}
+
+/// The one production read of the account media-DEK row, routed through the
+/// dual-path read so both populations resolve it the same way.
+async fn read_media_dek_wrapped(state: &CpState, user_id: &str) -> Result<Option<String>> {
+    state
+        .store
+        .wal_authoritative_read(user_id, |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key=?1",
+                    [MEDIA_DEK_METADATA_KEY],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
 }
 
 async fn verify_existing_media(
@@ -4825,6 +4867,56 @@ mod tests {
             record_reference_event(&conn, "account-1", &v2, &"c".repeat(64)),
             Ok(RecordOutcome::Created)
         ));
+    }
+
+    #[test]
+    fn media_dek_route_is_exactly_dual_path() {
+        // ADR-0022 F1: the DEK bootstrap reads through the routed dual-path
+        // surface for BOTH populations, submits the sealed install plan for a
+        // selected user, and keeps the exact legacy compare-and-install for
+        // everyone else. A Conflict from the submit converges by re-reading
+        // the winner, never by rebuilding the plan (R5).
+        let source = include_str!("media.rs");
+        let start = source
+            .find(concat!("async fn load_or_create_", "media_dek"))
+            .unwrap();
+        let end = source
+            .find(concat!("async fn verify_existing_", "media"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("is_wal_", "authoritative(")).count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        // Exactly one legacy write install; every read goes through the
+        // routed helper (which itself is the only wal_authoritative_read).
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 1);
+        assert_eq!(
+            route
+                .matches(concat!("read_media_dek_", "wrapped(state, user_id)"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1
+        );
+        // The plan is constructed exactly once, above any retry/converge
+        // path, from the candidate the caller minted (R5).
+        assert_eq!(
+            route
+                .matches(concat!("MediaDekInstallPlan::", "new("))
+                .count(),
+            1
+        );
     }
 
     #[test]
