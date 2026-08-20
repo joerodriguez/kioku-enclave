@@ -42,10 +42,10 @@ use crate::{
 };
 
 use super::{
-    AuthenticatedWalOwnerHead, Result, WalOperationIdentity, WalOwnerAttempt, WalOwnerControl,
-    WalOwnerError, WalOwnerHandle, WalOwnerId, WalOwnerInstanceId, WalOwnerStoreBinding,
-    WalOwnerStoreContext, WalPublicationArtifact, WalPublicationAuthority, WalPublicationCandidate,
-    WitnessedWalCandidate,
+    AuthenticatedWalOwnerHead, FreshHead, Result, WalOperationIdentity, WalOwnerAttempt,
+    WalOwnerControl, WalOwnerError, WalOwnerHandle, WalOwnerId, WalOwnerInstanceId,
+    WalOwnerStoreBinding, WalOwnerStoreContext, WalPublicationArtifact, WalPublicationAuthority,
+    WalPublicationCandidate, WitnessedWalCandidate,
 };
 
 const OWNER_LEASE_FORMAT_V1: u16 = 1;
@@ -1746,10 +1746,7 @@ impl super::sealed::PublicationAuthority for SingleArchiveWalPublisher {}
 
 #[async_trait]
 impl WalPublicationAuthority for SingleArchiveWalPublisher {
-    async fn read_fresh_head(
-        &self,
-        binding: &WalOwnerStoreBinding,
-    ) -> Result<AuthenticatedWalOwnerHead> {
+    async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead> {
         let observed = self
             .runtime
             .read_current_exact(binding.archive_id())
