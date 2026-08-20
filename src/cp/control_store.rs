@@ -9764,10 +9764,14 @@ fn map_wal_owner_error(error: WalOwnerError) -> EnclaveError {
             EnclaveError::Store("WAL owner state is corrupt".into())
         }
         WalOwnerError::Conflict => EnclaveError::Conflict("WAL owner state conflicts".into()),
+        // Superseded is deliberately NOT a Conflict: another process holds
+        // the exact lease, so retrying can never succeed and the caller is
+        // better served by an unavailability than by an unbounded retry loop.
         WalOwnerError::Capture
         | WalOwnerError::Persistence
         | WalOwnerError::Publication
-        | WalOwnerError::Poisoned => EnclaveError::Store("WAL owner is unavailable".into()),
+        | WalOwnerError::Poisoned
+        | WalOwnerError::Superseded => EnclaveError::Store("WAL owner is unavailable".into()),
     }
 }
 

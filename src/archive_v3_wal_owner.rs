@@ -85,6 +85,13 @@ pub(crate) enum WalOwnerError {
     Publication,
     #[error("WAL owner actor is poisoned")]
     Poisoned,
+    /// Another process holds the exact owner lease. Distinct from
+    /// [`Self::Conflict`] because it is terminal for this owner rather than
+    /// retryable: no amount of retrying makes a superseded owner
+    /// authoritative again, and telling a caller to retry forever is worse
+    /// than telling it the lane is gone.
+    #[error("WAL owner has been superseded")]
+    Superseded,
 }
 
 pub(crate) type Result<T> = std::result::Result<T, WalOwnerError>;
@@ -1323,15 +1330,39 @@ pub(crate) struct AuthenticatedWalOwnerHead {
     binding_commitment: [u8; 32],
 }
 
+/// What a successful provider read of the live head actually said.
+///
+/// Kept separate from `Result` because the two failures are not the same
+/// event. A provider that could not be reached says nothing about who owns
+/// the lease, and must never cost a rightful owner its lane. A provider that
+/// answered, with a valid head belonging to someone else, is a *completed*
+/// takeover: this owner can never become authoritative again, and the only
+/// honest thing to tell a caller is that the lane is gone.
+///
+/// Collapsing both into `Err(Conflict)` is what left a fenced-out owner
+/// answering "conflict; retry" forever, to a retry that could never succeed.
+pub(crate) enum FreshHead {
+    /// The live head authenticates this owner's binding and exact lease.
+    Authenticated(AuthenticatedWalOwnerHead),
+    /// The provider answered, and the lease is no longer this owner's.
+    Superseded,
+}
+
 impl AuthenticatedWalOwnerHead {
-    fn from_authority(expected: &WalOwnerStoreBinding, observed: WitnessRecord) -> Result<Self> {
+    fn from_authority(
+        expected: &WalOwnerStoreBinding,
+        observed: WitnessRecord,
+    ) -> Result<FreshHead> {
         let actual = WalOwnerStoreBinding::from_authenticated_witness(&observed)?;
         if &actual != expected || !observed.has_exact_active_wal_owner_lease() {
-            return Err(WalOwnerError::Conflict);
+            // The provider answered and the answer is not ours. Note this is
+            // reached only on a *successful* read: a transport failure never
+            // gets here, which is precisely the distinction being preserved.
+            return Ok(FreshHead::Superseded);
         }
-        Ok(Self {
+        Ok(FreshHead::Authenticated(Self {
             binding_commitment: actual.commitment(),
-        })
+        }))
     }
 
     fn authenticates(&self, binding: &WalOwnerStoreBinding) -> bool {
@@ -1342,7 +1373,7 @@ impl AuthenticatedWalOwnerHead {
     pub(crate) fn for_test(
         expected: &WalOwnerStoreBinding,
         observed: WitnessRecord,
-    ) -> Result<Self> {
+    ) -> Result<FreshHead> {
         Self::from_authority(expected, observed)
     }
 }
@@ -1608,10 +1639,7 @@ mod sealed {
 pub(crate) trait WalPublicationAuthority:
     sealed::PublicationAuthority + Send + Sync + 'static
 {
-    async fn read_fresh_head(
-        &self,
-        binding: &WalOwnerStoreBinding,
-    ) -> Result<AuthenticatedWalOwnerHead>;
+    async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead>;
 
     async fn checkpoint_pending(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
 
@@ -2411,13 +2439,25 @@ where
     }
 
     async fn require_fresh_head(&mut self) -> Result<()> {
+        // A provider error propagates untouched and does NOT poison: a
+        // rightful owner must survive a transport blip.
         let fresh = self
             .publication
             .read_fresh_head(self.store.binding())
             .await?;
-        if !fresh.authenticates(self.store.binding()) {
+        let FreshHead::Authenticated(fresh) = fresh else {
+            // The provider answered and the lease is someone else's. This is
+            // terminal, so stop the lane rather than leaving it to answer
+            // "retry" to a retry that can never succeed.
             self.store.poison();
-            return Err(WalOwnerError::Conflict);
+            return Err(WalOwnerError::Superseded);
+        };
+        if !fresh.authenticates(self.store.binding()) {
+            // The actor's own check, not decoration: the outcome above is
+            // built by the provider implementation, and this is where the
+            // actor refuses to take that on trust.
+            self.store.poison();
+            return Err(WalOwnerError::Superseded);
         }
         Ok(())
     }
@@ -3381,6 +3421,7 @@ mod tests {
         next: WitnessRecord,
         fail_send_terminal: AtomicBool,
         reject_fresh: AtomicBool,
+        supersede_fresh: AtomicBool,
         generic_refreshes: AtomicUsize,
         checkpoint_refreshes: AtomicUsize,
         candidate_sends: AtomicUsize,
@@ -3393,6 +3434,7 @@ mod tests {
                 next,
                 fail_send_terminal: AtomicBool::new(false),
                 reject_fresh: AtomicBool::new(false),
+                supersede_fresh: AtomicBool::new(false),
                 generic_refreshes: AtomicUsize::new(0),
                 checkpoint_refreshes: AtomicUsize::new(0),
                 candidate_sends: AtomicUsize::new(0),
@@ -3409,8 +3451,14 @@ mod tests {
             self
         }
 
+        /// The provider cannot be reached. Says nothing about ownership.
         fn reject_fresh(&self) {
             self.reject_fresh.store(true, Ordering::SeqCst);
+        }
+
+        /// The provider answered, and another process holds the exact lease.
+        fn supersede_fresh(&self) {
+            self.supersede_fresh.store(true, Ordering::SeqCst);
         }
 
         fn fail_send_terminal(&self) {
@@ -3492,12 +3540,12 @@ mod tests {
     #[cfg(test)]
     #[async_trait]
     impl WalPublicationAuthority for FakePublication {
-        async fn read_fresh_head(
-            &self,
-            binding: &WalOwnerStoreBinding,
-        ) -> Result<AuthenticatedWalOwnerHead> {
+        async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead> {
             if self.reject_fresh.load(Ordering::SeqCst) {
                 return Err(WalOwnerError::Conflict);
+            }
+            if self.supersede_fresh.load(Ordering::SeqCst) {
+                return Ok(FreshHead::Superseded);
             }
             let observed = WitnessRecord::decode(binding.witness_bytes())
                 .map_err(|_| WalOwnerError::Corrupt)?;
@@ -3683,10 +3731,7 @@ mod tests {
 
     #[async_trait]
     impl WalPublicationAuthority for StatefulPublication {
-        async fn read_fresh_head(
-            &self,
-            binding: &WalOwnerStoreBinding,
-        ) -> Result<AuthenticatedWalOwnerHead> {
+        async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead> {
             AuthenticatedWalOwnerHead::from_authority(
                 binding,
                 self.state.lock().unwrap().current.clone(),
@@ -4231,6 +4276,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_superseded_owner_stops_instead_of_inviting_an_endless_retry() {
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new());
+        let publication = Arc::new(FakePublication::new(next));
+        let handle = SingleArchiveWalOwner::spawn(store, control, Arc::clone(&publication));
+
+        assert!(handle.read(|_| Ok(())).await.unwrap().is_ok());
+
+        // The provider ANSWERS, and the exact lease is someone else's. That
+        // is a completed takeover, not a blip: this owner can never become
+        // authoritative again.
+        publication.supersede_fresh();
+        let served = Arc::new(AtomicBool::new(false));
+        let served_in_closure = Arc::clone(&served);
+        assert!(matches!(
+            handle
+                .read(move |_| {
+                    served_in_closure.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await,
+            Err(WalOwnerError::Superseded)
+        ));
+        assert!(
+            !served.load(Ordering::SeqCst),
+            "a superseded owner must never execute a read against its frozen state"
+        );
+
+        // Superseded, not Conflict: mapping this to a retryable conflict is
+        // what left the caller retrying forever against a lease it will never
+        // hold again.
+        assert!(handle.submit(plan(52, b"after-supersede")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_provider_blip_must_not_kill_a_rightful_owner() {
+        // The property the supersede split exists to PRESERVE. A provider
+        // that cannot be reached says nothing about who owns the lease, so
+        // the owner must survive it and serve again once the provider
+        // recovers. If this ever starts failing, the split has collapsed the
+        // two cases back together in the dangerous direction.
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new());
+        let publication = Arc::new(FakePublication::new(next));
+        let handle = SingleArchiveWalOwner::spawn(store, control, Arc::clone(&publication));
+
+        publication.reject_fresh();
+        assert!(matches!(
+            handle.read(|_| Ok(())).await,
+            Err(WalOwnerError::Conflict)
+        ));
+
+        // The provider recovers. The lane is still alive and still ours.
+        publication.reject_fresh.store(false, Ordering::SeqCst);
+        assert!(
+            handle.read(|_| Ok(())).await.unwrap().is_ok(),
+            "a transient provider failure must not permanently kill the lane"
+        );
+    }
+
+    #[tokio::test]
     async fn a_fenced_out_owner_refuses_reads_instead_of_serving_stale_state() {
         let (current, next) = authoritative_records();
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
@@ -4254,10 +4364,15 @@ mod tests {
         ));
 
         // The refusal is persistent, and — the property that matters — the
-        // read closure NEVER runs, so no stale row can escape. (A fence
-        // takeover surfaces as Conflict rather than poisoning, because the
-        // head simply fails to authenticate; a transient provider blip must
-        // not permanently kill an owner that is still the rightful one.)
+        // read closure NEVER runs, so no stale row can escape.
+        //
+        // Note what `reject_fresh` actually stages: the provider REFUSING,
+        // which says nothing about who owns the lease. So Conflict without
+        // poisoning is right here, and a rightful owner survives it (see
+        // `a_provider_blip_must_not_kill_a_rightful_owner`). A provider that
+        // answers with someone else's lease is the other case entirely, and
+        // it is terminal — see
+        // `a_superseded_owner_stops_instead_of_inviting_an_endless_retry`.
         let served = Arc::new(AtomicBool::new(false));
         let served_in_closure = Arc::clone(&served);
         assert!(matches!(
@@ -4440,21 +4555,46 @@ mod tests {
     fn fresh_head_proof_rejects_deletion_root_key_and_fence_substitution() {
         let (current, next) = authoritative_records();
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
-        assert!(AuthenticatedWalOwnerHead::for_test(&binding, current.clone()).is_ok());
-        for alternate in [
-            current.with_deletion_for_test(DeletionState::Tombstoned),
+        assert!(matches!(
+            AuthenticatedWalOwnerHead::for_test(&binding, current.clone()),
+            Ok(FreshHead::Authenticated(_))
+        ));
+        // A substituted record must never authenticate. Rejection now takes
+        // one of two shapes, and the shape is pinned per case rather than
+        // left to "not authenticated", so a case that silently migrates from
+        // one arm to the other is caught:
+        //
+        // - a record that fails witness authentication outright is an `Err`
+        // - a record that authenticates but describes someone else's lease is
+        //   `Superseded`, which is terminal and poisons the lane
+        //
+        // Only an authenticated witness can reach `Superseded`, so a forged
+        // record cannot use the poison arm to kill a rightful owner.
+        let tombstoned = current.with_deletion_for_test(DeletionState::Tombstoned);
+        assert!(
+            AuthenticatedWalOwnerHead::for_test(&binding, tombstoned).is_err(),
+            "a deletion-marked record must fail authentication, not merely lose the lease"
+        );
+
+        for superseding in [
+            // The root advanced past ours: someone else wrote.
             next,
+            // The key registry rotated out from under this binding.
             current.with_registry_for_test(KeyRegistryReference::new(
                 KeyEpoch::from_bytes([70; 16]),
                 current.registry().rotation_generation() + 1,
                 ObjectId::from_bytes([71; 16]),
                 [72; 32],
             )),
+            // The fence moved on: a completed takeover.
             current.with_next_fencing_epoch_for_test(
                 current.root().owner_fencing_epoch().saturating_add(2),
             ),
         ] {
-            assert!(AuthenticatedWalOwnerHead::for_test(&binding, alternate).is_err());
+            assert!(matches!(
+                AuthenticatedWalOwnerHead::for_test(&binding, superseding),
+                Ok(FreshHead::Superseded)
+            ));
         }
     }
 
