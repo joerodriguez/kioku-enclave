@@ -31,7 +31,7 @@ EXPECTED_STORE_CALL_COUNT = 168
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
 EXPECTED_STORE_CALL_SHA256 = "6b5a8880b2be47620de7419bb62f38fd4a1a31cba5ab580d0672484c5abb415a"
-EXPECTED_STORE_SURFACE_COUNT = 16
+EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
 # surface was added or removed.
@@ -46,11 +46,14 @@ EXPECTED_STORE_SURFACE_COUNT = 16
 # (relaunched, unavailable) and the unavailable count is logged. Both
 # Store-construction call-site hashes and all 16 keys are byte-identical;
 # only the enclosing function body moved.
-EXPECTED_STORE_SURFACE_SHA256 = "15634bbf6155b61b1073f840f93dddd2c9fd21bce24cf762ba6099594567cd31"
+# Phase-2 deletion PR 1: the solo-canary argv branch built its OWN Store, so
+# removing it drops one construction site (16 -> 15). The surviving site is
+# the serving construction -- its call-site hash is byte-identical to the
+# second site before this change. async_main's owner body moves with it.
+EXPECTED_STORE_SURFACE_SHA256 = "6c9303d9b9b1eb7e7412a900bdc8ee4b19f474ce2c3ba034f0d76c815a852340"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
-        "src/main.rs::async_main#0::Store::new_with_media_and_legacy#1",
         "src/store.rs::new#2::Self::new_internal#0",
         "src/store.rs::new#2::factory_definition::new#0",
         "src/store.rs::new_internal#0::Self::new_internal_with_max_open#0",
@@ -140,7 +143,9 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # SEL slice 1b: async_main's owner body moved (the relaunch's unavailable
 # count). No spawn was added, removed, or reclassified; the count holds at 33
 # and every spawn's own call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "0e3c8ea0ef13d8c8eb9427b690b15e887d8dfc8056b0c6124c9bd25c09fd461e"
+# Phase-2 deletion PR 1: async_main owner body only; the spawn count holds
+# at 33 and every spawn call-site hash is byte-identical.
+EXPECTED_WORKER_SPAWN_SHA256 = "c230c4ecdccc5a1451b63bf79089c18a41c9324d752ca3b622c33bca3ae50738"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2347,22 +2352,18 @@ impl X {
         abort_reconcile_production = without_cfg_test_items(abort_reconcile)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
-        # The reviewed solo-operator canary argv branch (docs/adr/
-        # 0022-solo-operator-activation.md) is the only permitted advisory
-        # reference from main: exactly the solo_entry parse + run pair, gated
-        # behind the dedicated pre-serving subcommand. Every other advisory
-        # symbol remains banned from main.
-        self.assertIn('Some("--run-archive-v3-phase1-canary")', main)
-        self.assertEqual(
-            main.count("archive_v3_advisory_owner::solo_entry::SoloCanaryInvocation"), 1
-        )
-        self.assertEqual(
-            main.count("archive_v3_advisory_owner::solo_entry::run_solo_phase1_canary"), 1
-        )
-        self.assertNotIn(
-            "archive_v3_advisory_owner::",
-            main.replace("archive_v3_advisory_owner::solo_entry::", ""),
-        )
+        # The solo-operator canary argv branch was the ONLY non-token entry
+        # into the advisory-owner family. Under the genesis-first replan the
+        # family is being deleted, so the branch is severed first and this
+        # assertion is inverted to pin the severing: nothing in `main` may
+        # reference the family again, by any path.
+        #
+        # This is deliberately stricter than what it replaced. The previous
+        # form permitted exactly two solo_entry symbols; this one permits
+        # none, so a reintroduced entry point fails here rather than being
+        # waved through as "the permitted pair".
+        self.assertNotIn("--run-archive-v3-phase1-canary", main)
+        self.assertNotIn("archive_v3_advisory_owner::", main)
         self.assertIn("mod comparison;", advisory_production)
         self.assertIn("mod abort;", advisory_production)
         self.assertIn("mod abort_reconcile;", advisory_production)

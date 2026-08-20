@@ -810,59 +810,6 @@ async fn async_main() {
         println!("Voice evaluation release gates passed.");
         return;
     }
-    if args.get(1).map(String::as_str) == Some("--run-archive-v3-phase1-canary") {
-        // Reviewed solo-operator one-shot canary (docs/adr/0022-solo-operator-activation.md).
-        // Constructs the same KMS/GCS/Store/Control clients as serving, then returns
-        // before any listener binds: a serving replica never carries this path.
-        let invocation =
-            match archive_v3_advisory_owner::solo_entry::SoloCanaryInvocation::parse_args(
-                &args[2..],
-            ) {
-                Ok(invocation) => invocation,
-                Err(reason) => {
-                    eprintln!("refusing: {reason}");
-                    std::process::exit(2);
-                }
-            };
-        let concrete_kms =
-            Arc::new(crypto::GcpKmsClient::from_env().expect(
-                "KMS env vars (KMS_PROJECT, KMS_LOCATION, KMS_KEY_RING, KMS_KEY) must be set",
-            ));
-        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::clone(&concrete_kms) as _;
-        let gcs: Arc<dyn crate::store::GcsClient> =
-            Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
-        let media_bucket = std::env::var("GCS_MEDIA_BUCKET")
-            .expect("GCS_MEDIA_BUCKET must be baked into the image");
-        let legacy_media_bucket = std::env::var("GCS_LEGACY_MEDIA_BUCKET")
-            .expect("GCS_LEGACY_MEDIA_BUCKET must be baked into the image");
-        let media_gcs: Arc<dyn crate::store::GcsClient> =
-            Arc::new(GcpGcsClient::from_bucket(media_bucket));
-        let legacy_media_gcs: Arc<dyn crate::store::GcsClient> =
-            Arc::new(GcpGcsClient::from_bucket(legacy_media_bucket));
-        let store = Arc::new(Store::new_with_media_and_legacy(
-            Arc::clone(&kms),
-            Arc::clone(&gcs),
-            media_gcs,
-            legacy_media_gcs,
-        ));
-        let control_store = Arc::new(cp::control_store::ControlStore::new_with_store(
-            kms,
-            gcs,
-            Arc::clone(&store),
-        ));
-        control_store
-            .initialize_legacy_fence_key()
-            .await
-            .expect("initialize legacy fence key");
-        let code = archive_v3_advisory_owner::solo_entry::run_solo_phase1_canary(
-            invocation,
-            control_store,
-            store,
-            concrete_kms,
-        )
-        .await;
-        std::process::exit(code);
-    }
     // Structured logging; RUST_LOG overrides the default.
     tracing_subscriber::fmt()
         .with_env_filter(
