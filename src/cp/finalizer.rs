@@ -1981,14 +1981,8 @@ async fn finalize_commit_settled(
     let (predecessor, attempt_commitment, current_utts, current_scrs, identity_rev) = state
         .store
         .wal_authoritative_read(&user, move |conn| {
-            let predecessor = wal::observed_commit_predecessor(conn, probe_episode).map_err(
-                |error| match error {
-                    crate::archive_v3_wal_idempotency::WalIdempotencyError::Precondition => {
-                        EnclaveError::Config("episode already finalized at current version".into())
-                    }
-                    _ => EnclaveError::Store("finalization predecessor read failed".into()),
-                },
-            )?;
+            let predecessor = wal::observed_commit_predecessor(conn, probe_episode)
+                .map_err(|_| EnclaveError::Store("finalization predecessor read failed".into()))?;
             let commitment =
                 wal::current_vertex_attempt_commitment(conn, &probe_event, &probe_model)
                     .map_err(|_| EnclaveError::Store("finalization attempt read failed".into()))?;
@@ -2006,10 +2000,26 @@ async fn finalize_commit_settled(
             Ok((predecessor, commitment, utts, scrs, identity_rev))
         })
         .await?;
-    let Some(predecessor) = predecessor else {
-        return Err(EnclaveError::Store(
-            "episode disappeared during finalization".into(),
-        ));
+    let predecessor = match predecessor {
+        wal::ObservedCommitPredecessor::Admissible(predecessor) => *predecessor,
+        wal::ObservedCommitPredecessor::AlreadyCurrent => {
+            // The one arm the caller may treat as terminal completion.
+            return Err(EnclaveError::Config(
+                "episode already finalized at current version".into(),
+            ));
+        }
+        wal::ObservedCommitPredecessor::Inadmissible => {
+            // Not processing / stamped by another actor: retry-ladder
+            // material, never a completion.
+            return Err(EnclaveError::Store(
+                "finalization predecessor not admissible".into(),
+            ));
+        }
+        wal::ObservedCommitPredecessor::Absent => {
+            return Err(EnclaveError::Store(
+                "episode disappeared during finalization".into(),
+            ));
+        }
     };
     if identity_rev != inputs.input_identity_revision {
         info!(
@@ -2052,8 +2062,13 @@ async fn finalize_commit_settled(
         .map_err(map_construct)?;
     let initial = predecessor.is_initial();
     let (webhooks, email, pushes) = if initial {
-        let webhooks = inputs
-            .webhook_destinations
+        // The plan requires deliveries sorted by their stable ids; the
+        // Control listings arrive in created_at order.
+        let mut webhook_destinations = inputs.webhook_destinations;
+        webhook_destinations.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut push_destinations = inputs.push_destinations;
+        push_destinations.sort_by(|a, b| a.0.cmp(&b.0));
+        let webhooks = webhook_destinations
             .into_iter()
             .map(|(subscription_id, event_id)| {
                 wal::FinalizationWebhookDelivery::new(subscription_id, event_id)
@@ -2070,8 +2085,7 @@ async fn finalize_commit_settled(
             ),
             None => None,
         };
-        let pushes = inputs
-            .push_destinations
+        let pushes = push_destinations
             .into_iter()
             .map(
                 |(installation_id, delivery_id, handoff_handle, collapse_id)| {
@@ -2427,6 +2441,36 @@ async fn finalize_user_episodes_scoped(
             continue;
         }
 
+        if state.store.is_wal_authoritative(&user) {
+            // Identity-refresh regeneration is unreachable on the WAL path
+            // (the sanctioned identity exclusion): skip already-current
+            // episodes BEFORE the processing stamp and the paid model call
+            // instead of burning inference on a commit that cannot apply.
+            let probe_episode = ep.id;
+            let already_current = state
+                .store
+                .wal_authoritative_read(&user, move |conn| {
+                    let row: Option<(Option<String>, Option<i32>)> = conn
+                        .query_row(
+                            "SELECT finalized_at, finalization_version
+                             FROM episodes WHERE id = ?1",
+                            [probe_episode],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    Ok(row.is_some_and(|(finalized_at, version)| {
+                        finalized_at.is_some() && version.unwrap_or(1) >= FINALIZATION_VERSION
+                    }))
+                })
+                .await?;
+            if already_current {
+                info!(
+                    episode_id = ep.id,
+                    "finalization skipped: identity refresh is excluded on the WAL path"
+                );
+                continue;
+            }
+        }
         let _ = set_finalization_status(state, user_id, ep.id, "processing", None, true).await;
 
         // 3. Fetch evidence for final brief model input

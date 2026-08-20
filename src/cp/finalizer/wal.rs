@@ -390,7 +390,10 @@ impl FinalizationPushDelivery {
         handoff_handle: String,
         collapse_id: String,
     ) -> Result<Self> {
-        validate_uuid(&installation_id)?;
+        // Installation ids come from the Control push registry, which admits
+        // uppercase UUIDs; refusing them failed every finalization for an
+        // affected user while legacy inserted the same row verbatim.
+        validate_uuid_any_case(&installation_id)?;
         validate_uuid(&delivery_id)?;
         validate_uuid(&collapse_id)?;
         if handoff_handle.len() != 43
@@ -486,7 +489,9 @@ impl FinalizationCommitPlan {
         // it. Each elided member is declared explicitly so the canonical
         // completeness pin stays exact: ranked ∪ elided == non-duplicate
         // members, with no overlap.
-        validate_sorted_ids(&elided_screen_ids, MAX_SCREENS)?;
+        // Bounded by membership, not by the ranked cap: the ranker keeps a
+        // small fixed set and elides every other non-duplicate member.
+        validate_sorted_ids(&elided_screen_ids, MAX_MEMBERS)?;
         if elided_screen_ids.iter().any(|id| {
             screenshot_members.binary_search(id).is_err() || screen_ids.binary_search(id).is_ok()
         }) {
@@ -1032,19 +1037,34 @@ pub(super) fn current_vertex_attempt_commitment(
     Ok(hasher.finalize().into())
 }
 
-/// Routed pre-submit read: the observed commit predecessor for one episode
-/// (None when the row is absent). Construction enforces the same
-/// processing-state and version admissibility the plan pins; an
-/// already-current episode surfaces as `Precondition`.
+/// The classified probe outcome for one episode's commit predecessor. The
+/// distinction is load-bearing: only a genuinely already-current episode may
+/// take the caller's completion arm — every other inadmissibility goes to
+/// the retry ladder and must never be stamped 'complete'.
+pub(super) enum ObservedCommitPredecessor {
+    Absent,
+    AlreadyCurrent,
+    Inadmissible,
+    Admissible(Box<FinalizationCommitPredecessor>),
+}
+
+/// Routed pre-submit read: the observed commit predecessor for one episode,
+/// classified. Construction enforces the same processing-state admissibility
+/// the plan pins.
 pub(super) fn observed_commit_predecessor(
     connection: &Connection,
     episode_id: i64,
-) -> Result<Option<FinalizationCommitPredecessor>> {
+) -> Result<ObservedCommitPredecessor> {
     let Some(stored) = load_episode(connection, episode_id)? else {
-        return Ok(None);
+        return Ok(ObservedCommitPredecessor::Absent);
     };
+    if stored.finalized_at.is_some()
+        && stored.finalization_version.unwrap_or(1) >= TARGET_FINALIZATION_VERSION
+    {
+        return Ok(ObservedCommitPredecessor::AlreadyCurrent);
+    }
     let commitment = current_product_commitment(connection, episode_id)?;
-    FinalizationCommitPredecessor::new(
+    match FinalizationCommitPredecessor::new(
         stored.finalized_at,
         stored.finalization_version,
         stored.status,
@@ -1054,8 +1074,11 @@ pub(super) fn observed_commit_predecessor(
         stored.next_attempt_at,
         stored.updated_at,
         commitment,
-    )
-    .map(Some)
+    ) {
+        Ok(predecessor) => Ok(ObservedCommitPredecessor::Admissible(Box::new(predecessor))),
+        Err(WalIdempotencyError::Precondition) => Ok(ObservedCommitPredecessor::Inadmissible),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn current_product_commitment(
@@ -1854,6 +1877,18 @@ fn require_kind(prepared: &PreparedLogicalMutation<FinalizationCommitPlan>) -> R
         .ok_or(WalIdempotencyError::ResultUnsupported)
 }
 
+fn validate_uuid_any_case(value: &str) -> Result<()> {
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+    {
+        return Err(WalIdempotencyError::Malformed);
+    }
+    Ok(())
+}
+
 fn validate_uuid(value: &str) -> Result<()> {
     if value.len() != 36
         || !value.bytes().enumerate().all(|(index, byte)| match index {
@@ -2617,6 +2652,77 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn review_fixes_hold_for_uuid_case_elision_scale_and_probe_classes() {
+        // RC5: Control-registry installation ids may be uppercase.
+        assert!(FinalizationPushDelivery::new(
+            "11111111-1111-4111-8111-11111111111A".into(),
+            INSTALLATION.into(),
+            HANDOFF.into(),
+            COLLAPSE.into(),
+        )
+        .is_ok());
+        // RC1: the elided set is bounded by membership, not the ranked cap.
+        let members: Vec<i64> = (1..=700).collect();
+        let elided: Vec<i64> = (2..=700).collect();
+        let connection = connection();
+        seed_episode(&connection, 1, None, None);
+        let plan = FinalizationCommitPlan::new(
+            ACCOUNT.into(),
+            EVENT_ONE.into(),
+            current_vertex_attempt_commitment(&connection, EVENT_ONE, "gemini-2.5-flash").unwrap(),
+            1,
+            COMMITTED_AT.into(),
+            predecessor(&connection, 1, None, None),
+            vec![9_999],
+            members,
+            "gemini-2.5-flash".into(),
+            ANALYSIS_REVISION.into(),
+            content("Finalized episode title"),
+            brief("Exact episode brief."),
+            vec![screen(1)],
+            elided,
+            vec![],
+            None,
+            vec![],
+        );
+        assert!(plan.is_ok(), "600+ elided members must construct");
+        // RC3: the probe distinguishes already-current from inadmissible.
+        let probe = connection.unchecked_transaction().unwrap();
+        probe
+            .execute(
+                "UPDATE episodes SET finalization_status='queued' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            observed_commit_predecessor(&probe, 1).unwrap(),
+            ObservedCommitPredecessor::Inadmissible
+        ));
+        probe
+            .execute(
+                "UPDATE episodes SET finalization_status='processing',
+                 finalized_at='2026-08-01T10:00:00.000Z',
+                 finalization_version=9 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            observed_commit_predecessor(&probe, 1).unwrap(),
+            ObservedCommitPredecessor::AlreadyCurrent
+        ));
+        probe
+            .execute(
+                "UPDATE episodes SET finalized_at=NULL, finalization_version=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            observed_commit_predecessor(&probe, 1).unwrap(),
+            ObservedCommitPredecessor::Admissible(_)
+        ));
     }
 
     #[test]
