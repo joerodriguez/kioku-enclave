@@ -943,6 +943,20 @@ async fn summarize_user_window(
     // future bounded operator/user queue without competing with live capture.
 
     let summarized_until = state.control.summarized_until(user_id).await?;
+    // ADR-0022 F8: the archive progress row closes the Control/archive
+    // durability split. If a settled window's Control cursor write was lost,
+    // start from the archive-recorded cutoff instead of re-summarizing the
+    // same range into duplicate episodes.
+    let archive_cutoff = if state.store.is_wal_authoritative(user_id) {
+        state
+            .store
+            .wal_authoritative_read(user_id, |conn| {
+                Ok(wal::window::read_window_progress(conn)?.1)
+            })
+            .await?
+    } else {
+        None
+    };
     let now = now_ms();
     let (tail_cutoff, min_window_ms) = match mode {
         SummarizeMode::Scheduled => (
@@ -959,6 +973,10 @@ async fn summarize_user_window(
     let new_from = match &summarized_until {
         Some(c) => ms(c).max(max_lookback),
         None => max_lookback,
+    };
+    let new_from = match archive_cutoff.as_deref() {
+        Some(cutoff) => new_from.max(ms(cutoff)),
+        None => new_from,
     };
     let Some(win) = window_bounds(new_from, tail_cutoff, min_window_ms) else {
         // Live tail too short to possibly hold an episode — wait for it to
@@ -1248,10 +1266,33 @@ async fn summarize_user_window(
     let mut upserted = 0;
     if !to_upsert.is_empty() {
         let user = user_id.to_string();
-        let ids = state
-            .store
-            .with_user(&user, move |conn| upsert_episodes(conn, &to_upsert))
-            .await?;
+        let ids = if state.store.is_wal_authoritative(&user) {
+            // ADR-0022 F8: the window settles as one sealed plan; the ids
+            // come back from the assignment table it wrote. A deterministic
+            // refusal takes the error/window_to shape so the sweep's skip
+            // ladder can move past the window instead of freezing on it.
+            match wal_authoritative_upsert(
+                state,
+                &user,
+                &to_upsert,
+                &new_from_iso,
+                &new_to_iso,
+                &format_epoch_millis(effective_cutoff),
+            )
+            .await?
+            {
+                Ok(ids) => ids,
+                Err(reason) => {
+                    warn!(user_id, reason, "episode window plan refused");
+                    return Ok(serde_json::json!({ "error": reason, "window_to": new_to_iso }));
+                }
+            }
+        } else {
+            state
+                .store
+                .with_user(&user, move |conn| upsert_episodes(conn, &to_upsert))
+                .await?
+        };
         upserted = ids.len();
         // §G.2: embed the upserted episodes in-enclave BEFORE the save so the
         // vectors persist in the same GCS write.
@@ -1278,6 +1319,189 @@ async fn summarize_user_window(
         .await?;
     info!(user_id, upserted, dropped, "summarized");
     Ok(serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }))
+}
+
+/// ADR-0022 F8: settle one summarizer window as a sealed plan (constructed
+/// once, R5) and return the resulting episode ids in item order from the
+/// assignment table the plan wrote.
+///
+/// `Ok(Err(reason))` is a **deterministic refusal** (construction/prepare
+/// rejected the window itself): the caller reports it in the
+/// `{"error","window_to"}` shape so the sweep's MAX_WINDOW_FAILURES ladder
+/// skips the window instead of freezing the cursor and re-burning the
+/// Vertex call forever. Transient store/witness failures stay `Err`.
+async fn wal_authoritative_upsert(
+    state: &CpState,
+    user_id: &str,
+    items: &[EpisodeInput],
+    from_iso: &str,
+    to_iso: &str,
+    effective_cutoff: &str,
+) -> Result<std::result::Result<Vec<i64>, &'static str>> {
+    // Coalesce duplicate episode_refs to the state sequential legacy upserts
+    // net out to: later scalars win, the minute/tier merges accumulate
+    // (both tier merges are lattice joins, so folding here equals chaining
+    // there), members union. Two arms racing one row inside a single CAS'd
+    // batch is inexpressible, so the fold happens before construction.
+    let mut coalesced: Vec<EpisodeInput> = Vec::with_capacity(items.len());
+    for item in items {
+        let slot = item
+            .id
+            .and_then(|id| coalesced.iter().position(|seen| seen.id == Some(id)));
+        let Some(index) = slot else {
+            coalesced.push(item.clone());
+            continue;
+        };
+        let earlier = &coalesced[index];
+        let mut merged = item.clone();
+        let mut minutes = earlier.minute_summaries.clone().unwrap_or_default();
+        minutes.extend(merged.minute_summaries.unwrap_or_default());
+        merged.minute_summaries = Some(minutes);
+        merged.substance = Some(
+            crate::episodes::merge_substance(
+                earlier.substance.as_deref(),
+                item.substance.as_deref(),
+            )
+            .to_string(),
+        );
+        merged.visual_evidence = Some(
+            crate::episodes::merge_visual_evidence(
+                earlier.visual_evidence.as_deref(),
+                item.visual_evidence.as_deref(),
+            )
+            .to_string(),
+        );
+        let mut utterances = earlier.member_utterance_ids.clone();
+        for id in &item.member_utterance_ids {
+            if !utterances.contains(id) {
+                utterances.push(*id);
+            }
+        }
+        merged.member_utterance_ids = utterances;
+        let mut screenshots = earlier.member_screenshot_ids.clone();
+        for id in &item.member_screenshot_ids {
+            if !screenshots.contains(id) {
+                screenshots.push(*id);
+            }
+        }
+        merged.member_screenshot_ids = screenshots;
+        coalesced[index] = merged;
+    }
+
+    // One routed read snapshots the window sequence, the id-allocation pin,
+    // and every predecessor tuple; the plan is then constructed once.
+    let probe_ids: Vec<Option<i64>> = coalesced.iter().map(|item| item.id).collect();
+    let (window_seq, sequence_pin, predecessors) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let (window_seq, _) = wal::window::read_window_progress(conn)?;
+            let sequence_pin = wal::window::read_sequence_pin(conn)?;
+            let mut predecessors = Vec::with_capacity(probe_ids.len());
+            for id in probe_ids {
+                predecessors.push(match id {
+                    Some(id) => wal::window::read_episode_predecessor(conn, id)?
+                        .map(|predecessor| (id, predecessor)),
+                    None => None,
+                });
+            }
+            Ok((window_seq, sequence_pin, predecessors))
+        })
+        .await?;
+
+    let committed_at = format_epoch_millis(now_ms());
+    let mut episodes = Vec::with_capacity(coalesced.len());
+    for (item, predecessor) in coalesced.iter().zip(predecessors) {
+        let to_json = |values: Option<&[String]>| {
+            values.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))
+        };
+        let (existing_minutes, existing_substance, existing_visual) = match &predecessor {
+            Some((_, p)) => (
+                p.minute_summaries().map(str::to_owned),
+                Some(p.substance().to_owned()),
+                Some(p.visual_evidence().to_owned()),
+            ),
+            None => (None, None, None),
+        };
+        let merged = crate::episodes::merge_minute_summaries(
+            existing_minutes.as_deref(),
+            item.minute_summaries.as_deref().unwrap_or(&[]),
+        );
+        let (minutes_json, minutes_text) = match merged {
+            Some((json, text)) => (Some(json), Some(text)),
+            None => (None, None),
+        };
+        let substance = if predecessor.is_some() {
+            crate::episodes::merge_substance(
+                existing_substance.as_deref(),
+                item.substance.as_deref(),
+            )
+        } else {
+            crate::episodes::normalized_substance(item.substance.as_deref())
+        }
+        .to_string();
+        let visual_evidence = if predecessor.is_some() {
+            crate::episodes::merge_visual_evidence(
+                existing_visual.as_deref(),
+                item.visual_evidence.as_deref(),
+            )
+        } else {
+            crate::episodes::normalized_visual_evidence(item.visual_evidence.as_deref())
+        }
+        .to_string();
+        let target = wal::window::WindowEpisodeTarget {
+            started_at: item.started_at.clone(),
+            ended_at: item.ended_at.clone(),
+            episode_type: item.episode_type.clone(),
+            title: item.title.clone(),
+            summary: item.summary.clone(),
+            participants_json: to_json(item.participants.as_deref()),
+            languages_json: to_json(item.languages.as_deref()),
+            action_items_json: to_json(item.action_items.as_deref()),
+            model: item.model.clone(),
+            minutes_json,
+            minutes_text,
+            substance,
+            visual_evidence,
+            member_utterance_ids: item.member_utterance_ids.clone(),
+            member_screenshot_ids: item.member_screenshot_ids.clone(),
+        };
+        let episode = match predecessor {
+            Some((id, p)) => wal::window::WindowEpisode::update(id, p, target),
+            None => wal::window::WindowEpisode::insert(target),
+        };
+        let Ok(episode) = episode else {
+            return Ok(Err("episode window item refused"));
+        };
+        episodes.push(episode);
+    }
+    let Ok(plan) = wal::window::EpisodeWindowUpsertPlan::new(
+        user_id.to_owned(),
+        window_seq,
+        from_iso.to_owned(),
+        to_iso.to_owned(),
+        effective_cutoff.to_owned(),
+        sequence_pin,
+        committed_at,
+        episodes,
+    ) else {
+        return Ok(Err("episode window plan refused"));
+    };
+    let Ok(prepared) = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+    else {
+        return Ok(Err("episode window request refused"));
+    };
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await?;
+    let settled_seq = window_seq;
+    state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            Ok(wal::window::read_window_assignments(conn, settled_seq)?)
+        })
+        .await
+        .map(Ok)
 }
 
 /// In-enclave episode embeddings (ADR-0004 §G.2). Episodes are born in the
