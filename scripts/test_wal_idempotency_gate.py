@@ -50,7 +50,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 206
+EXPECTED_STORE_CALL_COUNT = 208
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +61,7 @@ EXPECTED_STORE_CALL_COUNT = 206
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "d098ddd1c46c2b53d0c95738637f4a9e9a0dda30220526dd879741697e68984b"
+EXPECTED_STORE_CALL_SHA256 = "c8aad674158e6ce521f59a8f337ca9e894dd02b2e5964a80410406926ece3c0e"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1839,7 +1839,11 @@ impl X {
         self.assertIn("archive_v3_wal_retention_operations", retention_domain)
         self.assertIn("DomainLedgerBounds::new", retention_domain)
         self.assertIn("WalIdempotencyError::Precondition", retention_domain)
-        self.assertNotIn("RetentionSettlementPlan::", media_worker)
+        # ADR-0022 slice 10: the retention receipt is WIRED - the prune
+        # sweep settles the sealed plan after the provider delete and
+        # keeps the legacy branch.
+        self.assertIn("RetentionSettlementPlan::new(", media_worker)
+        self.assertIn("delete_retained_media", media_worker)
         self.assertNotIn("cp::media_worker::wal::", main)
         self.assertIn("pub(crate) mod wal;", email_worker)
         self.assertIn(
