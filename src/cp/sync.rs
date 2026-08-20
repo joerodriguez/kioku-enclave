@@ -963,7 +963,14 @@ async fn delete_account_content(
     // Fail closed as PENDING instead: the reconciler keeps retrying and the
     // account is never falsely reported deleted. This resolves the moment the
     // archive-v3 deletion driver is wired.
-    if store.is_wal_authoritative(user_id) {
+    // The in-memory predicate alone is NOT restart-stable: deletion
+    // tombstones the binding first and the startup selection scan filters
+    // tombstoned bindings, so after a mid-deletion restart the map is empty
+    // and this branch would misroute a WAL-authoritative user into the
+    // legacy sweep — which succeeds vacuously for a genesis-born user and
+    // falsely stamps the account complete with the whole archive intact.
+    // The durable ledger-backed lane predicate closes that window.
+    if store.is_wal_authoritative(user_id) || control.wal_deletion_lane(user_id).await? {
         return Err(EnclaveError::DeletionPending(
             crate::error::DeletionPending {
                 reason: crate::error::DeletionPendingReason::ArchiveV3DeletionUnwired,
@@ -1247,6 +1254,45 @@ mod tests {
             EnclaveError::DeletionPending(pending) => {
                 assert_eq!(pending.reason.as_str(), "archive_v3_deletion_unwired");
                 assert_eq!(pending.retry_after_seconds, Some(30));
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
+    }
+
+    /// The live restart-misroute defect the deletion-driver design review
+    /// proved: deletion tombstones the binding first, the startup selection
+    /// scan filters tombstoned bindings, so after a mid-deletion restart the
+    /// in-memory map is empty and dispatch fell through to the LEGACY sweep,
+    /// which vacuously succeeds for a genesis-born user and falsely stamps
+    /// the account complete. The durable ledger-backed lane predicate must
+    /// route the WAL lane with NO selection installed.
+    #[tokio::test]
+    async fn restart_deletion_routes_the_wal_lane_from_the_durable_ledger() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_user(
+                "wal-deletion-restart-subject",
+                "owner@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        control
+            .seed_wal_genesis_terminal_for_test(&user.id)
+            .await
+            .unwrap();
+        // Deliberately NO install_wal_authority_persistence: this is the
+        // post-restart shape where the in-memory map proves nothing.
+        assert!(!store.is_wal_authoritative(&user.id));
+        let error = delete_account_content(control.as_ref(), store.as_ref(), &user.id)
+            .await
+            .expect_err("a durably WAL-authoritative archive must never take the legacy sweep");
+        match error {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(pending.reason.as_str(), "archive_v3_deletion_unwired");
             }
             other => panic!("expected a pending deletion, got {other:?}"),
         }
