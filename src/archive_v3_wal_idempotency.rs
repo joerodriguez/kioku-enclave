@@ -141,6 +141,52 @@ impl WalOperationKind {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct WalLogicalOperationId([u8; 16]);
 
+/// Length-prefixed framing for one canonical field.
+///
+/// Two distinct field vectors must never produce identical bytes by
+/// concatenation: `("ab","c")` and `("a","bc")` differ only because each field
+/// carries its own length. Every plan family authored after the ADR-0022
+/// genesis-first replan frames its canonical request and its stable operation
+/// source through this helper.
+pub(crate) fn hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
+    hasher.update(
+        u32::try_from(value.len())
+            .map_err(|_| WalIdempotencyError::Limit)?
+            .to_be_bytes(),
+    );
+    hasher.update(value);
+    Ok(())
+}
+
+/// Build a domain-separated, length-prefixed stable operation source.
+///
+/// Several plan families legitimately share one `WalOperationKind` ordinal
+/// (adding an ordinal is a reviewed, signed act). The existing families derive
+/// their operation id from a BARE durable id with no family prefix, and there
+/// is no global operation index to catch a collision — so two families sharing
+/// an ordinal and a natural key would silently collide on one ledger row.
+/// Every family added from now on derives its id through this: the subtype is
+/// framed first, then each field, so no combination of subtype and fields can
+/// alias another family's source.
+pub(crate) fn stable_operation_source(subtype: &[u8], fields: &[&[u8]]) -> Result<Vec<u8>> {
+    if subtype.is_empty() {
+        return Err(WalIdempotencyError::Malformed);
+    }
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, subtype)?;
+    for field in fields {
+        hash_field(&mut hasher, field)?;
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut source = Vec::with_capacity(1 + subtype.len() + 32);
+    // The subtype stays in the clear so a durable id remains attributable to
+    // its family during forensics; the digest binds every field exactly.
+    source.extend_from_slice(subtype);
+    source.push(0);
+    source.extend_from_slice(&digest);
+    Ok(source)
+}
+
 impl WalLogicalOperationId {
     pub(crate) fn from_bytes(value: [u8; 16]) -> Result<Self> {
         value
@@ -831,6 +877,49 @@ impl Drop for LocalMutationCancellationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stable_operation_sources_cannot_alias_across_families_or_fields() {
+        use super::{stable_operation_source, WalLogicalOperationId, WalOperationKind};
+
+        // The motivating hazard: two families that share one ordinal and one
+        // natural key must not derive the same operation id, or they collide
+        // on a single ledger row. Existing families derive from a BARE id, so
+        // without a framed subtype this is a real collision.
+        let a = stable_operation_source(b"family-a-v1", &[b"same-natural-key"]).unwrap();
+        let b = stable_operation_source(b"family-b-v1", &[b"same-natural-key"]).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(
+            WalLogicalOperationId::from_stable_source(WalOperationKind::VertexUsage, &a).unwrap(),
+            WalLogicalOperationId::from_stable_source(WalOperationKind::VertexUsage, &b).unwrap()
+        );
+
+        // Field framing: concatenation must not alias. Without per-field
+        // length prefixes ("ab","c") and ("a","bc") produce identical bytes.
+        assert_ne!(
+            stable_operation_source(b"f", &[b"ab", b"c"]).unwrap(),
+            stable_operation_source(b"f", &[b"a", b"bc"]).unwrap()
+        );
+        // The subtype is framed too, so it cannot absorb a leading field.
+        assert_ne!(
+            stable_operation_source(b"fa", &[b"b"]).unwrap(),
+            stable_operation_source(b"f", &[b"ab"]).unwrap()
+        );
+
+        // Caller-stability: identical inputs derive an identical id, which is
+        // what makes a client retry an exact replay rather than a second
+        // mutation.
+        assert_eq!(
+            stable_operation_source(b"family-a-v1", &[b"k", b"v"]).unwrap(),
+            stable_operation_source(b"family-a-v1", &[b"k", b"v"]).unwrap()
+        );
+
+        // The subtype stays in the clear so a durable id remains attributable
+        // to its family during forensics.
+        assert!(a.starts_with(b"family-a-v1"));
+        // Fail closed on an unnamed family.
+        assert!(stable_operation_source(b"", &[b"k"]).is_err());
+    }
     use super::*;
     use rusqlite::{params, OptionalExtension};
     use std::sync::{

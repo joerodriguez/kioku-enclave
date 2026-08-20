@@ -920,6 +920,34 @@ impl X {
         self.assertEqual(set(DEPENDENCY_CLASS.values()), {"B"})
         self.assertTrue(set(DEPENDENCY_CLASS).issubset({site.owner.key for site in store_call_sites()}))
 
+    def test_plan_family_subtypes_are_declared_and_pairwise_distinct(self) -> None:
+        """Every plan family's operation-id subtype must be unique.
+
+        Several families legitimately share one WalOperationKind ordinal
+        (adding an ordinal is a reviewed, signed act), and the ids are derived
+        from durable natural keys with no global operation index to catch a
+        clash. Two families sharing an ordinal and a key would silently
+        collide on one ledger row, so the subtype is the only thing keeping
+        them apart -- and a duplicated constant would be invisible in review.
+        """
+        declarations: dict[str, list[str]] = {}
+        for path, source in rust_sources():
+            if "/wal" not in path:
+                continue
+            production = without_cfg_test_items(source)
+            for match in re.finditer(
+                r'const\s+SUBTYPE\s*:\s*&\[u8\]\s*=\s*b"([^"]*)"', production
+            ):
+                declarations.setdefault(match.group(1), []).append(path)
+        self.assertTrue(declarations, "no plan-family subtype declarations found")
+        for value, paths in sorted(declarations.items()):
+            self.assertNotEqual(value, "", f"empty subtype in {paths}")
+            self.assertEqual(
+                len(paths),
+                1,
+                f"subtype {value!r} is declared in more than one family: {paths}",
+            )
+
     def test_store_construction_policy_and_worker_surfaces_are_pinned(self) -> None:
         exact_store_surface = store_surface_sites()
         assert_inventory(
