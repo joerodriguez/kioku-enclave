@@ -107,6 +107,10 @@ mod archive_v3_reachability;
 // Inactive ADR-0022 restart-safe genesis coordinator. It has no provider
 // construction or authority wiring; only deterministic fake-tested contracts.
 mod archive_v3_genesis;
+// Inactive ADR-0022 genesis backend adapter. It composes the encrypted
+// control-store lifecycle ledger with injected providers behind an unmintable
+// release token; nothing in startup constructs it.
+mod archive_v3_genesis_backend;
 // Inactive ADR-0022 deletion-driver seam. It accepts only witness-fenced
 // archive contexts and authenticated canonical metadata; no route, Store,
 // runtime/provider construction, or production authority is connected.

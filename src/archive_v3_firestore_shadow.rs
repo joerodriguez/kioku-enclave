@@ -61,6 +61,18 @@ impl FirestoreShadowWitness {
         Self { witness }
     }
 
+    /// Token-gated release of the underlying Firestore witness adapter for
+    /// the reviewed genesis backend composition; the adapter carries the
+    /// sealed commit-start-aware initial-witness create protocol. The token
+    /// has no production minter today, so this stays unreachable until that
+    /// module's launcher slice mints one.
+    pub(crate) fn genesis_firestore_witness(
+        &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Arc<FirestoreWitness> {
+        Arc::clone(&self.witness)
+    }
+
     pub(crate) async fn wal_owner_read_current_exact(
         &self,
         _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,

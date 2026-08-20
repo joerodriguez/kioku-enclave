@@ -12,7 +12,7 @@
 //! whole-blob persist-on-write is fine — unlike user indexes (see ADR-0002).
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -30,14 +30,14 @@ use crate::{
         ObjectRole,
     },
     archive_v3_inventory_coordinator::{
-        pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
+        canonical_page_plan, pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
         AuthenticatedPreWitnessInventoryPlan, DeletionInventoryControl, PreWitnessInventoryControl,
         RecoveredPreWitnessInventory,
     },
     archive_v3_journal::{CHECKPOINT_CHUNK_BYTES, MAX_CHECKPOINT_MANIFEST_FANOUT},
     archive_v3_lifecycle::{
-        ActiveCreateAdmission, ArtifactCreateState, BootstrapAttemptId, BootstrapPlan,
-        DeletionInventorySeal, DurableBootstrapReservation, DurableInventoryPage,
+        ActiveCreateAdmission, ArchiveLifecycleLedger, ArtifactCreateState, BootstrapAttemptId,
+        BootstrapPlan, DeletionInventorySeal, DurableBootstrapReservation, DurableInventoryPage,
         DurablePhysicalCompletion, ErasedInventoryPages, FrozenInventorySnapshot,
         FrozenPreWitnessInventorySnapshot, InventoryPage, InventoryPageReference,
         LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
@@ -2829,6 +2829,133 @@ fn prepare_archive_bootstrap_conn(
     }
     tx.commit()?;
     Ok(prepared)
+}
+
+/// Append or exactly re-adopt one create-ahead artifact for the active
+/// bootstrap attempt. The artifact tuple is revalidated against this archive
+/// before any durable write, an identical already-planned row replays
+/// idempotently at the current revision, and any divergence fails closed. New
+/// ordinals remain bounded by the CHECK constraint on
+/// `archive_lifecycle_bootstrap_creates`; a plan the schema forbids surfaces
+/// that constraint failure instead of weakening it.
+fn plan_exact_archive_artifact_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    artifact: &PlannedArtifact,
+) -> Result<u64> {
+    // Reconstruction through the validating constructor proves the canonical
+    // key, embedded object ID, role, and hash all bind to this archive.
+    PlannedArtifact::new(
+        archive_id,
+        artifact.attempt_id(),
+        artifact.ordinal(),
+        artifact.key().clone(),
+        artifact.role(),
+        artifact.ciphertext_hash(),
+        usize::try_from(artifact.encoded_len()).map_err(|_| {
+            EnclaveError::Store("archive lifecycle encoded length is invalid".into())
+        })?,
+        artifact.create_state(),
+    )
+    .map_err(lifecycle_store_error)?;
+    if artifact.create_state() != ArtifactCreateState::Planned {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle artifact plan must precede provider requests".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    lifecycle_archive_active_conn(&tx, archive_id)?;
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    if anchor.revision != expected_revision || !anchor.state.admits_creates() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle artifact plan is stale or frozen".into(),
+        ));
+    }
+    if artifact.attempt_id() != anchor.plan.attempt_id() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle artifact plan does not extend the active attempt".into(),
+        ));
+    }
+    let existing = tx
+        .query_row(
+            "SELECT canonical_key, object_id, object_role, ciphertext_hash, encoded_len,
+                    create_state, admission_revision
+             FROM archive_lifecycle_bootstrap_creates
+             WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2 AND artifact_ordinal = ?3",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                artifact.attempt_id().as_bytes().as_slice(),
+                i64::from(artifact.ordinal()),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((key, object_id, role, hash, encoded_len, state, admission)) = existing {
+        let exact = key == artifact.key().as_str()
+            && fixed_16(object_id)? == *artifact.key().object_id().as_bytes()
+            && role == i64::from(artifact.role() as u8)
+            && fixed_32(hash)? == artifact.ciphertext_hash()
+            && u32::try_from(encoded_len).ok() == Some(artifact.encoded_len())
+            && state == "planned"
+            && admission.is_none();
+        if !exact {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle artifact plan conflicts with durable state".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok(anchor.revision);
+    }
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2
+           AND state IN ('objects_prepared','witness_prepared','witnessed')",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle artifact plan lost its compare-and-swap".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO archive_lifecycle_bootstrap_creates
+         (archive_id, bootstrap_attempt_id, artifact_ordinal, canonical_key,
+          object_id, object_role, ciphertext_hash, encoded_len, create_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'planned')",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            artifact.attempt_id().as_bytes().as_slice(),
+            i64::from(artifact.ordinal()),
+            artifact.key().as_str(),
+            artifact.key().object_id().as_bytes().as_slice(),
+            i64::from(artifact.role() as u8),
+            artifact.ciphertext_hash().as_slice(),
+            i64::from(artifact.encoded_len()),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(next_revision)
 }
 
 fn recover_archive_bootstrap_conn(
@@ -6334,6 +6461,54 @@ fn load_sealed_archive_inventory_references_conn(
         ));
     }
     Ok(references)
+}
+
+/// Rebuild the exact sealed inventory pages from durable control state. The
+/// encrypted control anchor retains only bounded page references plus the
+/// exact create-ahead artifacts; a sealed chain whose pages carry anything
+/// beyond those artifacts exists only in the external encrypted page store
+/// and is refused here instead of being synthesized. Acceptance is
+/// hash-exact: every rebuilt page must reproduce the anchored reference
+/// (page hash, chain, ordinal, id, and length) byte for byte.
+fn load_sealed_archive_inventory_pages_conn(
+    conn: &Connection,
+    expected: &DeletionInventorySeal,
+) -> Result<Vec<InventoryPage>> {
+    let references = load_sealed_archive_inventory_references_conn(conn, expected)?;
+    let anchor = lifecycle_anchor_conn(conn, expected.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let create_ahead = lifecycle_create_ahead_conn(conn, anchor.plan)?;
+    let mut by_id = BTreeMap::new();
+    for artifact in &create_ahead {
+        let object = artifact.inventory_object().map_err(lifecycle_store_error)?;
+        match by_id.get(&object.key().object_id()) {
+            Some(existing) if existing == &object => {}
+            Some(_) => {
+                return Err(EnclaveError::Conflict(
+                    "archive lifecycle create-ahead identities conflict".into(),
+                ))
+            }
+            None => {
+                by_id.insert(object.key().object_id(), object);
+            }
+        }
+    }
+    let mut objects = by_id.into_values().collect::<Vec<_>>();
+    objects.sort();
+    let pages = canonical_page_plan(expected.archive_id(), objects).map_err(|_| {
+        EnclaveError::Conflict("archive lifecycle sealed pages are not control-derivable".into())
+    })?;
+    if pages.len() != references.len()
+        || pages
+            .iter()
+            .zip(&references)
+            .any(|(page, reference)| page.reference() != *reference)
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle sealed pages are not control-derivable".into(),
+        ));
+    }
+    Ok(pages)
 }
 
 fn validate_open_inventory_snapshot_conn(
@@ -19350,14 +19525,12 @@ impl ControlStore {
             .await
     }
 
-    /// Inactive archive-v3 lifecycle methods. They mutate only the encrypted
-    /// control ledger and are intentionally not called by startup, Store,
-    /// routes, or any provider adapter. Account deletion only atomically
-    /// freezes an already-existing inactive anchor; it constructs no runtime.
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
+    /// Archive-v3 lifecycle methods. They mutate only the encrypted control
+    /// ledger and are intentionally not called by startup, Store, or routes;
+    /// their sole consumer is this store's `ArchiveLifecycleLedger` impl,
+    /// which the inactive genesis backend composite delegates to. Account
+    /// deletion only atomically freezes an already-existing inactive anchor;
+    /// it constructs no runtime.
     pub(crate) async fn reserve_archive_bootstrap(
         &self,
         plan: BootstrapPlan,
@@ -19368,10 +19541,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn prepare_archive_bootstrap(
         &self,
         reservation: DurableBootstrapReservation,
@@ -19397,10 +19566,6 @@ impl ControlStore {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn prepare_archive_witness(
         &self,
         archive_id: ArchiveId,
@@ -19414,10 +19579,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn admit_archive_create(
         &self,
         archive_id: ArchiveId,
@@ -19431,10 +19592,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn reconcile_archive_create(
         &self,
         admission: ActiveCreateAdmission,
@@ -19447,10 +19604,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn adopt_existing_archive_witness(
         &self,
         archive_id: ArchiveId,
@@ -19469,10 +19622,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn freeze_archive_lifecycle(
         &self,
         archive_id: ArchiveId,
@@ -19486,10 +19635,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn freeze_archive_inventory_snapshot(
         &self,
         archive_id: ArchiveId,
@@ -19508,10 +19653,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn load_archive_inventory_snapshot(
         &self,
         archive_id: ArchiveId,
@@ -19523,10 +19664,6 @@ impl ControlStore {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn load_sealed_archive_inventory_references(
         &self,
         seal: DeletionInventorySeal,
@@ -19639,10 +19776,6 @@ impl ControlStore {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn revalidate_active_archive_lifecycle(
         &self,
         archive_id: ArchiveId,
@@ -19656,6 +19789,46 @@ impl ControlStore {
                 ));
             }
             Ok(revision)
+        })
+        .await
+    }
+
+    pub(crate) async fn plan_exact_archive_artifact(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        artifact: PlannedArtifact,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            plan_exact_archive_artifact_conn(conn, archive_id, expected_revision, &artifact)
+                .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    pub(crate) async fn load_sealed_archive_inventory_pages(
+        &self,
+        seal: DeletionInventorySeal,
+    ) -> Result<Vec<InventoryPage>> {
+        self.read(move |conn| load_sealed_archive_inventory_pages_conn(conn, &seal))
+            .await
+    }
+
+    /// Test-only fixture: an active user with an active legacy archive
+    /// binding, the durable precondition for every lifecycle-ledger method.
+    #[cfg(test)]
+    pub(crate) async fn create_genesis_test_binding(
+        &self,
+        user_id: &str,
+    ) -> Result<ArchiveBinding> {
+        let user_id = user_id.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, google_sub, email)
+                 VALUES (?1, ?2, 'owner@example.com')",
+                rusqlite::params![user_id, format!("google-subject-{user_id}")],
+            )?;
+            create_active_archive_binding_conn(conn, &user_id)
         })
         .await
     }
@@ -20342,6 +20515,151 @@ impl WitnessCreateDispatchLedger for ControlStore {
         })
         .await
         .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+/// Durable archive-lifecycle ledger over the encrypted control store. Every
+/// method delegates to one compare-and-swap control transaction; like the
+/// store's other lifecycle trait adapters, storage-layer failure detail is
+/// redacted to `LifecycleError::Unavailable` so callers reconcile only
+/// through exact durable rereads, never through error-variant guessing.
+#[async_trait::async_trait]
+impl ArchiveLifecycleLedger for ControlStore {
+    async fn reserve_bootstrap(
+        &self,
+        plan: BootstrapPlan,
+    ) -> std::result::Result<DurableBootstrapReservation, LifecycleError> {
+        self.reserve_archive_bootstrap(plan)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn prepare_bootstrap(
+        &self,
+        reservation: DurableBootstrapReservation,
+        exact_wrapped_registry: &[u8],
+        exact_root_envelope: &[u8],
+    ) -> std::result::Result<PreparedBootstrap, LifecycleError> {
+        self.prepare_archive_bootstrap(
+            reservation,
+            exact_wrapped_registry.to_vec(),
+            exact_root_envelope.to_vec(),
+        )
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn prepare_witness(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        expected_encoded_record: &[u8],
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.prepare_archive_witness(
+            archive_id,
+            expected_revision,
+            expected_encoded_record.to_vec(),
+        )
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn plan_exact_artifact(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        artifact: PlannedArtifact,
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.plan_exact_archive_artifact(archive_id, expected_revision, artifact)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn admit_exact_create(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        artifact_ordinal: u32,
+    ) -> std::result::Result<ActiveCreateAdmission, LifecycleError> {
+        self.admit_archive_create(archive_id, expected_revision, artifact_ordinal)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn reconcile_create(
+        &self,
+        admission: &ActiveCreateAdmission,
+        outcome: LifecycleCreateOutcome,
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.reconcile_archive_create(admission.clone(), outcome)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn adopt_existing_witness(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        exact_encoded_record: &[u8],
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.adopt_existing_archive_witness(
+            archive_id,
+            expected_revision,
+            exact_encoded_record.to_vec(),
+        )
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn freeze_for_deletion(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.freeze_archive_lifecycle(archive_id, expected_revision, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn freeze_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.freeze_archive_inventory_snapshot(archive_id, expected_revision, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn load_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<(u64, Vec<PlannedArtifact>), LifecycleError> {
+        self.load_archive_inventory_snapshot(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn load_sealed_inventory(
+        &self,
+        seal: &DeletionInventorySeal,
+    ) -> std::result::Result<Vec<InventoryPage>, LifecycleError> {
+        self.load_sealed_archive_inventory_pages(*seal)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn revalidate_active(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+    ) -> std::result::Result<u64, LifecycleError> {
+        self.revalidate_active_archive_lifecycle(archive_id, expected_revision)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
     }
 }
 
@@ -23869,6 +24187,212 @@ mod tests {
         )
         .unwrap();
         assert!(load_sealed_archive_inventory_references_conn(&conn, &seal).is_err());
+    }
+
+    #[test]
+    fn plan_exact_archive_artifact_replays_exactly_and_fails_closed_on_divergence() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let create_ahead = lifecycle_create_ahead_conn(&conn, plan).unwrap();
+        assert_eq!(create_ahead.len(), 2);
+        let registry = create_ahead[0].clone();
+        // An exact already-planned artifact replays idempotently at the
+        // current revision without a compare-and-swap advance.
+        assert_eq!(
+            plan_exact_archive_artifact_conn(
+                &conn,
+                plan.archive_id(),
+                prepared.revision(),
+                &registry,
+            )
+            .unwrap(),
+            prepared.revision()
+        );
+        // A stale revision fails closed.
+        assert!(plan_exact_archive_artifact_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision() + 1,
+            &registry,
+        )
+        .is_err());
+        // A divergent hash for an already-planned ordinal fails closed.
+        let divergent = PlannedArtifact::new(
+            plan.archive_id(),
+            registry.attempt_id(),
+            registry.ordinal(),
+            registry.key().clone(),
+            registry.role(),
+            [0x99; 32],
+            usize::try_from(registry.encoded_len()).unwrap(),
+            registry.create_state(),
+        )
+        .unwrap();
+        assert!(plan_exact_archive_artifact_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            &divergent,
+        )
+        .is_err());
+        // A foreign bootstrap attempt fails closed.
+        let foreign = PlannedArtifact::new(
+            plan.archive_id(),
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes([0x77; 16]).unwrap(),
+            registry.ordinal(),
+            registry.key().clone(),
+            registry.role(),
+            registry.ciphertext_hash(),
+            usize::try_from(registry.encoded_len()).unwrap(),
+            registry.create_state(),
+        )
+        .unwrap();
+        assert!(plan_exact_archive_artifact_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            &foreign,
+        )
+        .is_err());
+        // An ordinal the durable CHECK constraint forbids fails closed via
+        // that constraint, and the rejected transaction leaves no residue.
+        let forbidden_key = KeyRegistryContext::new(
+            plan.archive_id(),
+            crate::archive_v3::KeyKind::Archive,
+            crate::archive_v3::KeyEpoch::from_bytes([0x66; 16]),
+        )
+        .object_key(ObjectId::from_bytes([0x55; 16]));
+        let forbidden = PlannedArtifact::new(
+            plan.archive_id(),
+            registry.attempt_id(),
+            3,
+            forbidden_key,
+            ObjectRole::KeyRegistryV3,
+            [0x44; 32],
+            4,
+            ArtifactCreateState::Planned,
+        )
+        .unwrap();
+        assert!(plan_exact_archive_artifact_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            &forbidden,
+        )
+        .is_err());
+        let anchor = lifecycle_anchor_conn(&conn, plan.archive_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.revision, prepared.revision());
+        assert_eq!(lifecycle_create_ahead_conn(&conn, plan).unwrap().len(), 2);
+        // Once the artifact is admitted, replaying its plan fails closed.
+        let admission = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        assert!(plan_exact_archive_artifact_conn(
+            &conn,
+            plan.archive_id(),
+            admission.revision(),
+            &registry,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sealed_inventory_pages_rebuild_only_the_exact_control_derivable_chain() {
+        for superset in [false, true] {
+            let conn = account_conn();
+            let plan = lifecycle_plan(&conn);
+            let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+            let prepared =
+                prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+            let registry = admit_archive_create_conn(
+                &conn,
+                plan.archive_id(),
+                prepared.revision(),
+                LIFECYCLE_REGISTRY_ORDINAL,
+            )
+            .unwrap();
+            let revision =
+                reconcile_archive_create_conn(&conn, &registry, LifecycleCreateOutcome::Created)
+                    .unwrap();
+            let root = admit_archive_create_conn(
+                &conn,
+                plan.archive_id(),
+                revision,
+                LIFECYCLE_ROOT_ORDINAL,
+            )
+            .unwrap();
+            let revision =
+                reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created)
+                    .unwrap();
+            let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let ledger =
+                tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+            let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+            let revision =
+                freeze_archive_lifecycle_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+            let revision =
+                freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), revision, fence)
+                    .unwrap();
+            let mut objects = inventory_entries(lifecycle_create_ahead_conn(&conn, plan).unwrap());
+            if superset {
+                let extra_key = ObjectContext::new(
+                    plan.archive_id(),
+                    plan.database_epoch(),
+                    plan.key_epoch(),
+                    ObjectRole::RootV3,
+                    LogicalLocation::Root { root_seq: 0 },
+                    ObjectId::from_bytes([0x77; 16]),
+                    None,
+                )
+                .unwrap()
+                .object_key();
+                objects.push(
+                    crate::archive_v3_lifecycle::LifecycleInventoryObject::for_archive(
+                        plan.archive_id(),
+                        extra_key,
+                        ObjectRole::RootV3,
+                        [0xa6; 32],
+                    )
+                    .unwrap(),
+                );
+                objects.sort();
+            }
+            let built = canonical_page_plan(plan.archive_id(), objects).unwrap();
+            let durable = built
+                .iter()
+                .cloned()
+                .map(durable_inventory_page)
+                .collect::<Vec<_>>();
+            persist_lifecycle_page_creates(&conn, fence, &durable);
+            let seal =
+                seal_test_inventory_conn(&conn, plan.archive_id(), revision, fence, &durable)
+                    .unwrap();
+            if superset {
+                // Pages carrying entries beyond the retained create-ahead
+                // artifacts exist only in the external encrypted page store
+                // and must never be synthesized from control state.
+                assert!(load_sealed_archive_inventory_pages_conn(&conn, &seal).is_err());
+            } else {
+                let pages = load_sealed_archive_inventory_pages_conn(&conn, &seal).unwrap();
+                assert_eq!(pages, built);
+                assert_eq!(
+                    pages
+                        .iter()
+                        .map(InventoryPage::reference)
+                        .collect::<Vec<_>>(),
+                    load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
