@@ -2193,6 +2193,75 @@ async fn persist_actual_media_usage(
         WorkClass::Audio => vertex::MAX_MEDIA_OUTPUT_TOKENS,
         WorkClass::Screen => vertex::MAX_SCREEN_OUTPUT_TOKENS,
     };
+    if state.store.is_wal_authoritative(user_id) {
+        // ADR-0022: the terminal usage settles as the sealed plan on the
+        // same attempt anchor the reservation used; the bound storyboard
+        // result requires this row before it can apply. Probe shape mirrors
+        // the reservation wiring exactly.
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort_unstable();
+        let probe_work_id = work_id.clone();
+        let probe_ids = sorted_ids.clone();
+        let (attempt_count, retained, unit_usage, job_usage) = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                let (attempt_count, retained, unit_usage): (i64, i64, Option<String>) = conn
+                    .query_row(
+                        "SELECT attempt_count,reservation_retained,usage_json
+                         FROM media_work_units WHERE id=?1",
+                        [&probe_work_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                let mut job_usage = Vec::with_capacity(probe_ids.len());
+                for id in &probe_ids {
+                    job_usage.push(conn.query_row(
+                        "SELECT usage_json FROM media_processing_jobs WHERE id=?1",
+                        [id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )?);
+                }
+                Ok((attempt_count, retained, unit_usage, job_usage))
+            })
+            .await?;
+        let usage = generation.metadata.usage.as_ref();
+        let plan = wal::MediaUsageSettlementPlan::new(
+            user_id.to_owned(),
+            work_id,
+            class_name.to_owned(),
+            attempt_count,
+            sorted_ids,
+            wal::usage::MediaUsageFacts {
+                reserved_output_tokens: reserved,
+                prompt_tokens: usage.and_then(|usage| usage.prompt_tokens),
+                input_text_tokens: usage.and_then(|usage| usage.input_text_tokens),
+                input_audio_tokens: usage.and_then(|usage| usage.input_audio_tokens),
+                input_image_tokens: usage.and_then(|usage| usage.input_image_tokens),
+                cached_input_tokens: usage.and_then(|usage| usage.cached_input_tokens),
+                output_tokens: usage.and_then(|usage| usage.output_tokens),
+                thought_tokens: usage.and_then(|usage| usage.thought_tokens),
+                total_tokens: usage.and_then(|usage| usage.total_tokens),
+                returned_model: generation.metadata.model_version.clone(),
+                traffic_type: generation.metadata.traffic_type.clone(),
+                latency_ms: generation.latency_ms,
+            },
+            now_iso(),
+            retained,
+            unit_usage,
+            job_usage,
+        )
+        .map_err(|_| {
+            EnclaveError::Store("media usage settlement plan construction failed".into())
+        })?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                EnclaveError::Store("media usage settlement plan construction failed".into())
+            })?;
+        state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await?;
+        return Ok(());
+    }
     let usage = json!({
         "work_unit_id": work_id,
         "work_class": class_name,
