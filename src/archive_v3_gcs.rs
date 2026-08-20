@@ -491,9 +491,14 @@ impl GcsArchiveV3RegistryProvider {
     }
 
     /// Wrap one exact registry plaintext under the typed context. The KMS
-    /// implementation, not this caller, derives the canonical AAD.
+    /// implementation, not this caller, derives the canonical AAD. The
+    /// capability is token-gated because it does not survive the runtime
+    /// bundle's `Arc<dyn ExactKeyRegistryProvider>` erasure: only the
+    /// reviewed genesis backend composition (which alone can mint the token)
+    /// may reach it on a released concrete provider.
     pub(crate) async fn wrap_registry(
         &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
         context: &KeyRegistryContext,
         registry_plaintext: &[u8],
         destination: &mut [u8],
@@ -1322,7 +1327,12 @@ mod tests {
         let provider = GcsArchiveV3RegistryProvider::new(transport, kms);
         let mut wrapped_output = [0u8; MAX_WRAPPED_KEY_REGISTRY_BYTES];
         let wrapped_length = provider
-            .wrap_registry(&context, &plaintext, &mut wrapped_output)
+            .wrap_registry(
+                &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext::for_test(),
+                &context,
+                &plaintext,
+                &mut wrapped_output,
+            )
             .await
             .unwrap();
         assert_eq!(&wrapped_output[..wrapped_length], wrapped.as_slice());
@@ -1348,7 +1358,12 @@ mod tests {
         let mut rejected_wrap = [0x91; MAX_WRAPPED_KEY_REGISTRY_BYTES];
         assert_eq!(
             provider
-                .wrap_registry(&wrong_context, &plaintext, &mut rejected_wrap)
+                .wrap_registry(
+                    &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext::for_test(),
+                    &wrong_context,
+                    &plaintext,
+                    &mut rejected_wrap
+                )
                 .await,
             Err(ArchiveV3Error::InvalidContext)
         );
@@ -1385,7 +1400,12 @@ mod tests {
             );
             let mut wrapped = [0xa1; MAX_WRAPPED_KEY_REGISTRY_BYTES];
             let wrap_result = provider
-                .wrap_registry(&context, &plaintext, &mut wrapped)
+                .wrap_registry(
+                    &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext::for_test(),
+                    &context,
+                    &plaintext,
+                    &mut wrapped,
+                )
                 .await;
             assert_eq!(
                 wrap_result,

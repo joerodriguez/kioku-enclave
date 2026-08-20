@@ -607,7 +607,10 @@ fn insert_object(
     }
 }
 
-fn canonical_page_plan(
+/// Deterministic canonical paging of a sorted, deduplicated object set. Also
+/// used by the encrypted control store to rebuild (and hash-verify) sealed
+/// pages whose entries are exactly the retained create-ahead artifacts.
+pub(crate) fn canonical_page_plan(
     archive_id: ArchiveId,
     objects: Vec<LifecycleInventoryObject>,
 ) -> Result<Vec<InventoryPage>, InventoryCoordinatorError> {

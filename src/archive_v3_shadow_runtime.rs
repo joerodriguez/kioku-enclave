@@ -250,8 +250,13 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
 /// Private provider owner. It is never returned without exact durable binding.
 pub(crate) struct ArchiveV3ShadowRuntimeBundle {
     objects: Arc<dyn ImmutableObjectBackend>,
-    _roots: Arc<dyn ExactRootProvider>,
+    roots: Arc<dyn ExactRootProvider>,
     registries: Arc<dyn ExactKeyRegistryProvider>,
+    /// Concrete registry provider retained beside its erased trait handle so
+    /// the token-gated genesis accessor can release wrap/create capability
+    /// that does not survive the `Arc<dyn ExactKeyRegistryProvider>` erasure.
+    /// Only the production constructor populates it.
+    genesis_registries: Option<Arc<GcsArchiveV3RegistryProvider>>,
     _witness: Arc<dyn ShadowCheckpointWitnessProvider>,
     maintenance_witness: Option<Arc<dyn MaintenanceImportWitnessProvider>>,
     wal_owner_witness: Option<Arc<FirestoreShadowWitness>>,
@@ -292,10 +297,15 @@ impl ArchiveV3ShadowRuntimeBundle {
             FirestoreShadowWitness::new(witness_config)
                 .map_err(|_| ArchiveV3ShadowRuntimeConstructionError::Unavailable)?,
         );
+        let genesis_registries = Arc::new(GcsArchiveV3RegistryProvider::new(
+            Arc::clone(&transport),
+            registry_kms,
+        ));
         Ok(Self {
             objects,
-            _roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
-            registries: Arc::new(GcsArchiveV3RegistryProvider::new(transport, registry_kms)),
+            roots: Arc::new(GcsArchiveV3RootProvider::new(transport)),
+            registries: genesis_registries.clone(),
+            genesis_registries: Some(genesis_registries),
             _witness: witness.clone(),
             maintenance_witness: Some(witness.clone()),
             wal_owner_witness: Some(witness),
@@ -305,8 +315,9 @@ impl ArchiveV3ShadowRuntimeBundle {
     fn from_components(components: ShadowRuntimeComponents) -> Self {
         Self {
             objects: components.objects,
-            _roots: components.roots,
+            roots: components.roots,
             registries: components.registries,
+            genesis_registries: None,
             _witness: components.witness,
             maintenance_witness: None,
             wal_owner_witness: None,
@@ -332,6 +343,26 @@ impl ArchiveV3ShadowRuntimeBundle {
         _token: &MaintenanceRuntimeContext,
     ) -> Option<&Arc<dyn MaintenanceImportWitnessProvider>> {
         self.maintenance_witness.as_ref()
+    }
+
+    /// Token-gated release of the exact-root reader for the reviewed genesis
+    /// backend composition. The token has no production minter today, so this
+    /// stays unreachable until that module's launcher slice mints one.
+    pub(crate) fn genesis_exact_roots(
+        &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Arc<dyn ExactRootProvider> {
+        Arc::clone(&self.roots)
+    }
+
+    /// Token-gated release of the concrete registry provider (wrap/create
+    /// capability included) that the bundle's erased trait handle withholds.
+    /// `None` outside the production constructor.
+    pub(crate) fn genesis_registry_provider(
+        &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Option<Arc<GcsArchiveV3RegistryProvider>> {
+        self.genesis_registries.clone()
     }
 
     pub(crate) fn into_wal_publisher(
@@ -375,8 +406,9 @@ impl ArchiveV3ShadowRuntimeBundle {
         let maintenance_witness: Arc<dyn MaintenanceImportWitnessProvider> = witness.clone();
         Self {
             objects,
-            _roots: Arc::new(UnavailableRootProvider),
+            roots: Arc::new(UnavailableRootProvider),
             registries,
+            genesis_registries: None,
             _witness: Arc::new(UnavailableShadowWitnessProvider),
             maintenance_witness: Some(maintenance_witness),
             wal_owner_witness: None,
