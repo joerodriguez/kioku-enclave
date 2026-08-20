@@ -591,6 +591,10 @@ async fn send_media_request(
 /// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
 /// audio understanding API. The caller supplies a constrained JSON schema and
 /// validates the returned timestamps again before persistence.
+/// `pinned_invocation` carries an invocation identity a sealed ADR-0022
+/// pre-provider attempt boundary already durably fixed (its `started`
+/// billing intent is the durable intent); it is only accepted for a
+/// WAL-authoritative user and suppresses the F2 identity mint.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_media_custom(
     state: &CpState,
@@ -601,6 +605,7 @@ pub async fn generate_media_custom(
     media: &[u8],
     schema: Value,
     audio_timestamp: bool,
+    pinned_invocation: Option<String>,
 ) -> Result<MediaGeneration> {
     send_media_request(
         state,
@@ -608,7 +613,7 @@ pub async fn generate_media_custom(
         media_request_body(prompt, mime_type, media, schema, audio_timestamp),
         operation,
         MAX_MEDIA_OUTPUT_TOKENS,
-        None,
+        pinned_invocation,
     )
     .await
 }
@@ -809,6 +814,36 @@ mod tests {
         .await
         {
             Ok(_) => panic!("pinned invocation for an unselected user unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                EnclaveError::Store(ref message)
+                    if message == "pinned media invocation requires a WAL-authoritative user"
+            ),
+            "expected the pinned-invocation refusal, got: {error:?}"
+        );
+
+        // ADR-0022 slice 11: the audio entrypoint shares the same fail-closed
+        // pinned-invocation gate (and therefore the same F2-mint suppression)
+        // before any provider traffic.
+        let error = match generate_media_custom(
+            &state,
+            &user.id,
+            VertexOperation::AudioWindow,
+            "transcribe",
+            "audio/wav",
+            b"a",
+            json!({"type": "OBJECT"}),
+            true,
+            Some(format!("vtx_{}", "a".repeat(64))),
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("pinned audio invocation for an unselected user unexpectedly succeeded")
+            }
             Err(error) => error,
         };
         assert!(

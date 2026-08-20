@@ -9,19 +9,25 @@
 //! provider object before constructing this plan. The plan can only mark the
 //! matching local media row pruned and retain a permanent exact replay receipt.
 //! It cannot read, list, delete, or otherwise reach a provider, call Store,
-//! launch work, or acknowledge retention completion. A private B child fixes
-//! stable screen Vertex attempt identity and billing intent before provider I/O;
-//! the private production-facing result-v2 child covers only screen storyboards
-//! without person evidence and reauthenticates that exact binding before its
-//! local mutation. Audio and every person/identity/voice mutation remain
-//! unsupported.
+//! launch work, or acknowledge retention completion. Private B children fix
+//! stable screen and audio Vertex attempt identity and billing intent before
+//! provider I/O; the private production-facing result children cover only
+//! screen storyboards without person evidence and audio-window transcripts
+//! without identity rows, each reauthenticating its exact binding before its
+//! local mutation. Every person/identity/voice mutation remains unsupported
+//! — the audio transcript subtype has no constructor slot for speaker names,
+//! person facts, or quality flags and never writes voice tables.
 
 pub(super) mod attempt;
+pub(super) mod audio_attempt;
+pub(super) mod audio_result;
 pub(super) mod reservation;
 pub(super) mod result;
 pub(super) mod resurrection;
 pub(super) mod usage;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
+pub(crate) use audio_attempt::{AudioWindowAttemptLedger, AudioWindowAttemptPlan};
+pub(crate) use audio_result::{AudioWindowTranscriptLedger, AudioWindowTranscriptPlan};
 pub(crate) use reservation::{MediaWorkReservationLedger, MediaWorkReservationPlan};
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};

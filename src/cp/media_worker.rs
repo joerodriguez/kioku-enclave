@@ -2538,6 +2538,167 @@ async fn settle_screen_storyboard_result(
         .await
 }
 
+/// ADR-0022 slice 11: settle the sealed audio-window attempt boundary for a
+/// WAL-authoritative user. ONE routed read authenticates the complete
+/// reserved leased work topology at one caller-fixed attempt time —
+/// returning the exact predecessor and post-usage-stable attempt
+/// commitments — and reads the candidate-name vocabulary rows (R8: the
+/// legacy `candidate_name_vocabulary` keeps `with_user`, which refuses
+/// selected users). The sealed plan is then constructed ONCE (R5) and
+/// settled through the WAL lane AFTER the settled reservation and BEFORE
+/// any Vertex egress. The typed receipt carries the derived event id — the
+/// pinned invocation identity the usage settlements target — and the
+/// binding commitment the bound transcript plan later consumes.
+async fn settle_audio_window_attempt(
+    state: &CpState,
+    user_id: &str,
+    work: &MediaWorkUnit,
+) -> Result<(wal::audio_attempt::AudioWindowAttemptReceipt, Vec<String>)> {
+    let attempted_at = now_iso();
+    let probe_work_id = work.id.clone();
+    let probe_attempted_at = attempted_at.clone();
+    let (commitments, candidate_names) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let commitments = wal::audio_result::current_audio_work_attempt_commitments(
+                conn,
+                &probe_work_id,
+                &probe_attempted_at,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("audio window attempt predecessor read failed".into())
+            })?;
+            let mut statement = conn.prepare(
+                "SELECT name FROM person_name_claims WHERE status IN ('accepted','probationary') \
+                 GROUP BY normalized_name ORDER BY MAX(observed_at) DESC LIMIT 50",
+            )?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((commitments, names))
+        })
+        .await?;
+    let plan = wal::AudioWindowAttemptPlan::new(
+        user_id.to_owned(),
+        work.id.clone(),
+        commitments.predecessor(),
+        commitments.attempt(),
+        state.config.vertex_model.clone(),
+        state.config.vertex_location.clone(),
+        attempted_at,
+    )
+    .map_err(|_| EnclaveError::Store("audio window attempt plan construction failed".into()))?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| EnclaveError::Store("audio window attempt plan construction failed".into()))?;
+    let receipt = state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await?;
+    Ok((receipt, candidate_names))
+}
+
+/// ADR-0022 slice 11: settle the sealed bound audio-window transcript for a
+/// WAL-authoritative user — it replaces `persist_audio_window_result` on
+/// this lane. Every fact the plan carries comes from ONE routed
+/// immediately-pre-submit read (the terminal Vertex attempt commitment on
+/// the attempt's own event id, the exact terminal-stage work predecessor,
+/// and the four `sqlite_sequence` id-allocation pins) or is computed
+/// pre-submit (the transcript projection of the parsed turns — the
+/// identity fields are dropped HERE, at the seam — and one canonical
+/// commit time); the sealed plan is constructed ONCE (R5) and an owner
+/// Conflict resubmits the identical prepared object. A projection or turn
+/// failure surfaces as invalid model output; a Precondition propagates to
+/// the job ladder, which re-drives with an advanced attempt_count (a new
+/// identity, bounded by MAX_ATTEMPTS).
+async fn settle_audio_window_transcript(
+    state: &CpState,
+    user_id: &str,
+    work: &MediaWorkUnit,
+    receipt: &wal::audio_attempt::AudioWindowAttemptReceipt,
+    turns: Vec<AudioTurn>,
+) -> Result<()> {
+    let requested_model = state.config.vertex_model.clone();
+    let committed_at = now_iso();
+    let probe_event_id = receipt.event_id().to_owned();
+    let probe_model = requested_model.clone();
+    let probe_work_id = work.id.clone();
+    let (vertex_attempt_commitment, authenticated, seq_pins) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let vertex_attempt_commitment =
+                wal::audio_result::current_audio_vertex_attempt_commitment(
+                    conn,
+                    &probe_event_id,
+                    &probe_model,
+                )
+                .map_err(|_| {
+                    EnclaveError::Store("audio window terminal attempt read failed".into())
+                })?;
+            let authenticated = wal::audio_result::load_audio_work(conn, &probe_work_id)
+                .map_err(|_| EnclaveError::Store("audio window predecessor read failed".into()))?;
+            let seq_pins = wal::audio_result::read_audio_sequence_pins(conn)
+                .map_err(|_| EnclaveError::Store("audio window sequence pin read failed".into()))?;
+            Ok((vertex_attempt_commitment, authenticated, seq_pins))
+        })
+        .await?;
+    let facts = turns
+        .into_iter()
+        .map(|turn| {
+            wal::audio_result::AudioTurnFact::new(
+                turn.turn_id,
+                turn.start_ms,
+                turn.end_ms,
+                turn.speaker_local_id,
+                turn.text,
+                turn.language.filter(|language| !language.is_empty()),
+                turn.overlap,
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| EnclaveError::InvalidRequest("audio transcript turn is invalid".into()))?;
+    wal::audio_result::project_audio_window_for_owner(&authenticated, &facts).map_err(|_| {
+        EnclaveError::InvalidRequest("audio transcript projection is invalid".into())
+    })?;
+    let plan = wal::AudioWindowTranscriptPlan::new(
+        user_id.to_owned(),
+        receipt.event_id().to_owned(),
+        vertex_attempt_commitment,
+        receipt.binding_commitment(),
+        work.id.clone(),
+        authenticated.commitment(),
+        requested_model,
+        committed_at,
+        seq_pins,
+        facts,
+    )
+    .map_err(|_| EnclaveError::Store("audio window transcript plan construction failed".into()))?;
+    let retry = plan.clone();
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| {
+            EnclaveError::Store("audio window transcript plan construction failed".into())
+        })?;
+    match state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+    {
+        Err(EnclaveError::Conflict(_)) => {
+            let prepared =
+                crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(retry)
+                    .map_err(|_| {
+                        EnclaveError::Store(
+                            "audio window transcript plan construction failed".into(),
+                        )
+                    })?;
+            state
+                .store
+                .wal_authoritative_submit(user_id, prepared)
+                .await
+        }
+        other => other,
+    }
+}
+
 async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit) -> Result<()> {
     let mut media = Vec::with_capacity(work.jobs.len());
     for job in &work.jobs {
@@ -2547,6 +2708,53 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
     if work.class == WorkClass::Audio {
         let (window, sources, duration_ms) = assemble_audio_window(&work.jobs, &media)?;
         reserve_media_output(state, user_id, work).await?;
+        // ADR-0022 slice 11: for a WAL-authoritative user the sealed audio
+        // attempt boundary durably fixes the Vertex attempt identity and the
+        // exact `started` billing intent AFTER the settled reservation and
+        // BEFORE the audio request leaves; its routed read also carries the
+        // candidate-name vocabulary (the legacy read stays with_user, which
+        // refuses selected users). The receipt pins the invocation identity
+        // the usage settlements and the bound transcript plan consume, and
+        // the sealed transcript settle replaces the legacy audio
+        // persistence; voice fingerprinting has no permitted sink on this
+        // lane, so embed_turns stays legacy-only.
+        if state.store.is_wal_authoritative(user_id) {
+            let (receipt, candidate_names) =
+                settle_audio_window_attempt(state, user_id, work).await?;
+            let prompt = format!(
+                "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+                work.jobs[0].stream_kind,
+                serde_json::to_string(&candidate_names)?
+            );
+            let generation = vertex::generate_media_custom(
+                state,
+                user_id,
+                vertex::VertexOperation::AudioWindow,
+                &prompt,
+                "audio/wav",
+                &window,
+                audio_schema(),
+                true,
+                Some(receipt.event_id().to_owned()),
+            )
+            .await?;
+            // The bound transcript settle refuses without this attempt's
+            // terminal usage row, but record_response inside the generate
+            // path is best-effort. Re-drive it here as a required,
+            // idempotent settle — same rationale as the screen arm.
+            super::model_usage::settle_response_required(
+                state,
+                user_id,
+                receipt.event_id(),
+                &generation.metadata,
+            )
+            .await?;
+            persist_actual_media_usage(state, user_id, work, &generation).await?;
+            let turns = parse_audio_result(&generation.text, duration_ms)?;
+            // `save_user` is a lane no-op for a selected user, so returning
+            // here matches the legacy tail.
+            return settle_audio_window_transcript(state, user_id, work, &receipt, turns).await;
+        }
         let candidate_names = candidate_name_vocabulary(state, user_id).await?;
         let prompt = format!(
             "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
@@ -2562,6 +2770,7 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             &window,
             audio_schema(),
             true,
+            None,
         )
         .await?;
         persist_actual_media_usage(state, user_id, work, &generation).await?;
@@ -5243,21 +5452,28 @@ mod tests {
             .find(concat!("fn resurrect_failed_", "jobs"))
             .unwrap();
         let route = &source[start..end];
+        // ADR-0022 slice 11 re-pin: this region now also contains the audio
+        // settle helpers and the audio WAL arm, so the routed totals are the
+        // screen pair plus the audio pair — one lane branch per arm, two
+        // routed reads per family, and the audio transcript's single
+        // Conflict resubmission of the identical prepared object. The
+        // audio-specific counts are pinned separately in
+        // audio_window_route_is_exactly_dual_path.
         assert_eq!(
             route.matches(concat!("is_wal_", "authoritative(")).count(),
-            1
+            2
         );
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "read("))
                 .count(),
-            2
+            4
         );
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "submit("))
                 .count(),
-            2
+            5
         );
         assert_eq!(
             route
@@ -5305,6 +5521,145 @@ mod tests {
         // The egress carries the attempt receipt's derived identity, never a
         // second freshly minted intent for the same paid call.
         assert!(route.contains(concat!("receipt.event_", "id().to_owned()")));
+    }
+
+    #[test]
+    fn audio_window_route_is_exactly_dual_path() {
+        // ADR-0022 slice 11 (T25): for a WAL-authoritative user the sealed
+        // audio attempt boundary settles after the settled reservation and
+        // before the Vertex audio egress, the egress carries the pinned
+        // receipt identity, the required usage settle re-drives, and the
+        // sealed bound transcript replaces the legacy audio persistence;
+        // each plan is constructed exactly once (R5) inside its settle
+        // helper and the legacy branch survives byte-for-byte for
+        // unselected users.
+        let source = include_str!("media_worker.rs");
+        let helpers_start = source
+            .find(concat!("async fn settle_audio_window_", "attempt"))
+            .unwrap();
+        let helpers_end = source
+            .find(concat!("async fn process_work_", "unit"))
+            .unwrap();
+        let helpers = &source[helpers_start..helpers_end];
+        assert_eq!(
+            helpers
+                .matches(concat!("AudioWindowAttemptPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            helpers
+                .matches(concat!("AudioWindowTranscriptPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            helpers
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            2
+        );
+        // One submit per helper plus the single Conflict resubmission of
+        // the identical prepared transcript object.
+        assert_eq!(
+            helpers
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            3
+        );
+        assert_eq!(helpers.matches(concat!(".with_", "user(")).count(), 0);
+
+        let arm_start = source
+            .find(concat!("async fn process_work_", "unit"))
+            .unwrap();
+        let arm_end = source
+            .find(concat!("fn resurrect_failed_", "jobs"))
+            .unwrap();
+        let arm = &source[arm_start..arm_end];
+        // The WAL branch: reservation → attempt boundary → pinned egress →
+        // required usage settle → terminal usage → bound transcript, in
+        // that order, before the legacy branch's unpinned egress.
+        let reservation = arm.find(concat!("reserve_media_", "output(state")).unwrap();
+        let attempt = arm
+            .find(concat!("settle_audio_window_", "attempt(state"))
+            .unwrap();
+        let pinned_egress = arm
+            .find(concat!("Some(receipt.event_", "id().to_owned()),"))
+            .unwrap();
+        let required_settle = arm.find(concat!("settle_response_", "required")).unwrap();
+        let terminal_usage = arm
+            .find(concat!("persist_actual_media_", "usage(state"))
+            .unwrap();
+        let transcript = arm
+            .find(concat!("settle_audio_window_", "transcript(state"))
+            .unwrap();
+        let legacy_vocabulary = arm
+            .find(concat!("candidate_name_", "vocabulary(state"))
+            .unwrap();
+        let legacy_persist = arm
+            .find(concat!("persist_audio_window_", "result("))
+            .unwrap();
+        assert!(reservation < attempt);
+        assert!(attempt < pinned_egress);
+        assert!(pinned_egress < required_settle);
+        assert!(required_settle < terminal_usage);
+        assert!(terminal_usage < transcript);
+        assert!(transcript < legacy_vocabulary);
+        assert!(legacy_vocabulary < legacy_persist);
+        // The WAL branch (everything before the legacy vocabulary read)
+        // contains no with_user and no voice fingerprinting.
+        let wal_branch = &arm[..legacy_vocabulary];
+        assert_eq!(wal_branch.matches(concat!(".with_", "user(")).count(), 0);
+        assert_eq!(wal_branch.matches(concat!("embed_", "turns(")).count(), 0);
+        // The legacy branch keeps its embed_turns + with_user persistence.
+        let legacy_branch = &arm[legacy_vocabulary..];
+        assert_eq!(
+            legacy_branch.matches(concat!("embed_", "turns(")).count(),
+            1
+        );
+        assert!(legacy_branch.contains(concat!("persist_audio_window_", "result(")));
+    }
+
+    #[test]
+    fn pinned_audio_egress_carries_exactly_one_billing_intent() {
+        // ADR-0022 slice 11 (T26): the pinned audio path derives its ONE
+        // vertex_usage_events row from the sealed attempt boundary; the
+        // egress carries that identity (suppressing the F2 mint) and the
+        // legacy branch alone passes None.
+        let source = include_str!("media_worker.rs");
+        let arm_start = source
+            .find(concat!("async fn process_work_", "unit"))
+            .unwrap();
+        let arm_end = source
+            .find(concat!("fn resurrect_failed_", "jobs"))
+            .unwrap();
+        let arm = &source[arm_start..arm_end];
+        let audio_arm_end = arm.find(concat!("} else ", "{")).unwrap();
+        let audio_arm = &arm[..audio_arm_end];
+        // Exactly two audio egress calls: the pinned WAL branch and the
+        // None legacy branch.
+        assert_eq!(
+            audio_arm
+                .matches(concat!("generate_media_", "custom("))
+                .count(),
+            2
+        );
+        assert_eq!(
+            audio_arm
+                .matches(concat!("Some(receipt.event_", "id().to_owned()),"))
+                .count(),
+            1
+        );
+        assert_eq!(audio_arm.matches("\n            None,").count(), 1);
+        // The attempt plan is the only started-intent writer on this lane:
+        // its apply inserts exactly one vertex_usage_events row and a
+        // replay inserts zero more (proven functionally in
+        // audio_attempt.rs); here we pin that the audio arm never calls
+        // the F2 begin_invocation mint directly.
+        assert_eq!(
+            audio_arm.matches(concat!("begin_", "invocation")).count(),
+            0
+        );
     }
 
     #[test]
