@@ -1088,13 +1088,24 @@ impl CiphertextEnvelope {
 pub struct ArchiveDek([u8; 32]);
 
 impl ArchiveDek {
-    #[cfg(test)]
-    pub fn generate() -> Self {
+    /// Mint a fresh archive DEK from the system CSPRNG.
+    ///
+    /// Every production cipher until now came from `resolve_archive_cipher`,
+    /// which UNWRAPS an already-stored registry. A genesis archive has no
+    /// registry to unwrap, so this is the only production path to a first key.
+    ///
+    /// The caller cannot choose the key material: the bytes come from `OsRng`
+    /// here, and the chosen-key constructor below deliberately stays
+    /// `#[cfg(test)]` (enforced by the WAL gate), so injecting a selected key
+    /// would require a reviewed code change rather than a call.
+    pub(crate) fn generate() -> Self {
         let mut value = [0u8; 32];
         OsRng.fill_bytes(&mut value);
         Self(value)
     }
 
+    /// Test-only chosen-key constructor. MUST stay `#[cfg(test)]`: it is the
+    /// only way to obtain an `ArchiveDek` with attacker-selected bytes.
     #[cfg(test)]
     pub const fn from_bytes(value: [u8; 32]) -> Self {
         Self(value)
@@ -1114,8 +1125,12 @@ pub struct ArchiveCipher {
 }
 
 impl ArchiveCipher {
-    #[cfg(test)]
-    pub fn new(dek: ArchiveDek) -> Self {
+    /// Build a cipher over a freshly minted genesis DEK.
+    ///
+    /// Safe to expose because the only non-test way to obtain an `ArchiveDek`
+    /// is `ArchiveDek::generate`, whose bytes the caller cannot influence;
+    /// every other path unwraps a registry that was already authenticated.
+    pub(crate) fn new(dek: ArchiveDek) -> Self {
         Self::from_verified_dek(dek)
     }
 
