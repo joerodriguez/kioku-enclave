@@ -365,6 +365,20 @@ impl ArchiveV3ShadowRuntimeBundle {
         self.genesis_registries.clone()
     }
 
+    /// Token-gated release of the exact witness-advance provider for the
+    /// reviewed genesis witness ladder (G6). Like the two accessors above,
+    /// the token has no production minter today, so this stays unreachable
+    /// until the genesis backend module's launcher slice mints one. `None`
+    /// outside the production constructor.
+    pub(crate) fn genesis_witness_advance(
+        &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Option<Arc<dyn crate::archive_v3_root_advance::ArchiveWitnessAdvanceProvider>> {
+        self.wal_owner_witness.clone().map(|witness| {
+            witness as Arc<dyn crate::archive_v3_root_advance::ArchiveWitnessAdvanceProvider>
+        })
+    }
+
     pub(crate) fn into_wal_publisher(
         self,
         _token: crate::archive_v3_wal_owner::WalPublisherRuntimeContext,

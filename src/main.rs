@@ -185,7 +185,12 @@ mod archive_v3_maintenance_import;
 // authority wiring.
 mod archive_v3_root_advance;
 mod archive_v3_serving_relaunch;
+// Inactive ADR-0022 genesis bytes producer and witness-ladder driver (genesis
+// spine G5/G6). It consumes only injected released providers, is fake-tested
+// for kill-and-restart convergence, and has no Store, VFS, startup, route,
+// flag, provider-construction, or authority wiring.
 mod archive_v3_shadow_runtime;
+mod archive_v3_wal_genesis;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.
 mod archive_v3_shadow_checkpoint;

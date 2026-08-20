@@ -25,6 +25,8 @@ const MAINTENANCE_ZERO_WAL_BINDING_DOMAIN: &[u8] =
     b"kioku:archive:v3:maintenance-zero-wal-binding/v1\0";
 const WAL_OWNER_CHECKPOINT_BINDING_DOMAIN: &[u8] =
     b"kioku:archive:v3:wal-owner-checkpoint-binding/v1\0";
+const GENESIS_BOOTSTRAP_BINDING_DOMAIN: &[u8] = b"kioku:archive:v3:genesis-bootstrap-binding/v1\0";
+const GENESIS_PLANNED_ROOT_DOMAIN: &[u8] = b"kioku:archive:v3:genesis-planned-root/v1\0";
 pub const SHADOW_SESSION_RECORD_BYTES: usize = 344;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -460,6 +462,73 @@ impl ShadowSessionBinding {
             ) == (0, 0, 0))
             .then_some(binding)
             .ok_or(ShadowSessionError::Malformed("WAL checkpoint binding"))
+    }
+
+    /// Genesis-only canonical zero-WAL binding for one durable bootstrap
+    /// attempt. The pre-witness genesis publication has no witness record, no
+    /// lease, and no sealed base root yet, so identity binds to the durably
+    /// reserved plan and the exact wrapped-registry bytes: the reservation
+    /// CAS revision stands in for the owner fence, and the planned root
+    /// object ID with a domain-separated planned-root commitment stands in
+    /// for the not-yet-sealed base root envelope. Genesis retries never adopt
+    /// a prior attempt's staged objects, so this binding exists only to give
+    /// every attempt's inventory rows an exact, content-free identity; it
+    /// grants no witness, lease, or restart-adoption authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_genesis_bootstrap(
+        _token: crate::archive_v3_wal_genesis::GenesisZeroWalBindingContext,
+        archive_id: [u8; 16],
+        database_epoch: [u8; 16],
+        registry_epoch: [u8; 16],
+        registry_object_id: [u8; 16],
+        registry_ciphertext_hash: [u8; 32],
+        planned_root_object_id: [u8; 16],
+        bootstrap_attempt_id: [u8; 16],
+        reservation_revision: u64,
+    ) -> Result<Self> {
+        if !nonzero(&bootstrap_attempt_id) || reservation_revision == 0 {
+            return Err(ShadowSessionError::BindingConflict);
+        }
+        let mut request_fingerprint = Sha256::new();
+        request_fingerprint.update(GENESIS_BOOTSTRAP_BINDING_DOMAIN);
+        request_fingerprint.update(bootstrap_attempt_id);
+        request_fingerprint.update(registry_ciphertext_hash);
+        let request_fingerprint: [u8; 32] = request_fingerprint.finalize().into();
+        let mut planned_root = Sha256::new();
+        planned_root.update(GENESIS_PLANNED_ROOT_DOMAIN);
+        planned_root.update(archive_id);
+        planned_root.update(bootstrap_attempt_id);
+        planned_root.update(planned_root_object_id);
+        let planned_root: [u8; 32] = planned_root.finalize().into();
+        let binding = Self {
+            archive_id,
+            database_epoch,
+            // The initial genesis witness record is created at database-epoch
+            // generation 0 and migration Legacy; the binding pins both.
+            database_epoch_generation: 0,
+            registry_epoch,
+            registry_rotation_generation: 0,
+            registry_object_id,
+            registry_ciphertext_hash,
+            base_root_seq: 0,
+            base_root_object_id: planned_root_object_id,
+            base_root_ciphertext_hash: planned_root,
+            owner_fence: reservation_revision,
+            operation_id: bootstrap_attempt_id,
+            request_fingerprint,
+            migration_state: MigrationState::Legacy as u8,
+            wal_generation: 0,
+            first_frame_no: 0,
+            frame_count: 0,
+        };
+        (binding.valid_identity()
+            && (
+                binding.wal_generation,
+                binding.first_frame_no,
+                binding.frame_count,
+            ) == (0, 0, 0))
+            .then_some(binding)
+            .ok_or(ShadowSessionError::Malformed("genesis binding"))
     }
 
     fn matches_witness_identity(self, witness: &WitnessRecord) -> bool {
