@@ -516,6 +516,8 @@ impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
 impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}
 impl sealed::DomainLedger for crate::cp::finalizer::FinalizationCommitLedger {}
+impl sealed::DomainPlan for crate::cp::summarizer::wal::EpisodeEmbeddingBatchPlan {}
+impl sealed::DomainLedger for crate::cp::summarizer::wal::EpisodeEmbeddingBatchLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkReservationPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkReservationLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan {}

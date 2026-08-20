@@ -1298,7 +1298,7 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
     let id_list = ids.to_vec();
     let rows: Vec<(i64, String)> = match state
         .store
-        .with_user(user_id, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             let mut out = Vec::new();
             for id in id_list {
                 let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
@@ -1331,11 +1331,12 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
     };
 
     // CPU-bound inference (~10–50 ms each) — blocking pool, not the async worker.
-    let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+    let mut vectors: Vec<(i64, String, Vec<f32>)> = Vec::new();
     for (id, text) in rows {
         let eng = engine.clone();
-        match tokio::task::spawn_blocking(move || eng.embed(&text)).await {
-            Ok(Ok(v)) => vectors.push((id, v)),
+        let embed_text = text.clone();
+        match tokio::task::spawn_blocking(move || eng.embed(&embed_text)).await {
+            Ok(Ok(v)) => vectors.push((id, text, v)),
             Ok(Err(e)) => {
                 warn!(
                     episode_id = id,
@@ -1348,10 +1349,56 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
     if vectors.is_empty() {
         return;
     }
+    if state.store.is_wal_authoritative(user_id) {
+        // ADR-0022 F9: the batch settles as a sealed plan whose identity
+        // binds each episode's exact text and vector bytes, so the
+        // finalizer's re-embed of rewritten content is a NEW operation and a
+        // crash-retry of the same content replays. Best-effort, like the
+        // legacy branch: a refused settle leaves the episode FTS-only.
+        let mut entries = Vec::with_capacity(vectors.len());
+        vectors.sort_by_key(|(id, _, _)| *id);
+        for (id, text, vector) in &vectors {
+            let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            match wal::EpisodeEmbedding::new(
+                *id,
+                <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()).into(),
+                bytes,
+            ) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    warn!(episode_id = id, "episode embed: entry construction failed");
+                    return;
+                }
+            }
+        }
+        let plan = match wal::EpisodeEmbeddingBatchPlan::new(user_id.to_owned(), entries) {
+            Ok(plan) => plan,
+            Err(_) => {
+                warn!("episode embed: plan construction failed");
+                return;
+            }
+        };
+        let prepared =
+            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    warn!("episode embed: plan construction failed");
+                    return;
+                }
+            };
+        if let Err(e) = state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await
+        {
+            warn!(error = %e, "episode embed: settled vector write failed");
+        }
+        return;
+    }
     if let Err(e) = state
         .store
         .with_user(user_id, move |conn| {
-            for (id, v) in &vectors {
+            for (id, _, v) in &vectors {
                 write_episode_embedding(conn, *id, v)?;
             }
             Ok(())
