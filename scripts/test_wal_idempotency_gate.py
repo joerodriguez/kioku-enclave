@@ -56,7 +56,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # settle_screen_storyboard_result: terminal-attempt/predecessor/id-base read
 # + bound-result submit); rebased over the 10d finalization wiring, so the
 # combined pin covers both.
-EXPECTED_STORE_CALL_COUNT = 217
+EXPECTED_STORE_CALL_COUNT = 219
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -67,7 +67,7 @@ EXPECTED_STORE_CALL_COUNT = 217
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "ce1081120cc677d96d14f57679817833b743ac5e92c5911ab35c846454e33b4e"
+EXPECTED_STORE_CALL_SHA256 = "7e857793193cabcc8aa0376784d45dc6e1335bf04ddfa3fcea311bb352fe2f23"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
