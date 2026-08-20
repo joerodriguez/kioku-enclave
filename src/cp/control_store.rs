@@ -7312,6 +7312,26 @@ fn erase_archive_lifecycle_payload_conn(
     }
 }
 
+fn wal_deletion_lane_conn(conn: &Connection, user_id: &str) -> Result<bool> {
+    validate_user_id(user_id)?;
+    let lane: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_bindings b
+             WHERE b.user_id = ?1
+               AND (EXISTS(
+                        SELECT 1 FROM archive_v3_wal_genesis g
+                        WHERE g.archive_id = b.archive_id AND g.format_version = 1
+                          AND g.stage = 'wal_authoritative')
+                    OR EXISTS(
+                        SELECT 1 FROM archive_v3_maintenance_imports m
+                        WHERE m.archive_id = b.archive_id AND m.format_version = 1
+                          AND m.stage = 'wal_authoritative')))",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    Ok(lane == 1)
+}
+
 fn archive_binding_conn(conn: &Connection, user_id: &str) -> Result<Option<ArchiveBinding>> {
     conn.query_row(
         "SELECT archive_id FROM archive_bindings WHERE user_id = ?1",
@@ -17234,6 +17254,141 @@ impl ControlStore {
     /// resolved bootstrap witness bytes; `wal_authoritative` pins the exact
     /// released terminal the witness ladder ended at. Different bytes for a
     /// recorded stage refuse with a content-free Conflict, never overwrite.
+    /// Durable WAL-deletion-lane predicate. The in-memory selection map is
+    /// rebuilt at startup only for `active_legacy` bindings, and deletion
+    /// tombstones the binding FIRST — so after a mid-deletion restart the
+    /// map no longer proves anything, while routing a WAL-authoritative
+    /// user into the legacy sweep would vacuously succeed and falsely stamp
+    /// the account `physical_complete` with the entire archive intact. The
+    /// durable fact is the terminal `wal_authoritative` ledger row (either
+    /// ledger), which survives tombstoning and restarts; no binding-state
+    /// filter, deliberately.
+    pub(crate) async fn wal_deletion_lane(&self, user_id: &str) -> Result<bool> {
+        let user_id = user_id.to_owned();
+        self.read(move |conn| wal_deletion_lane_conn(conn, &user_id))
+            .await
+    }
+
+    /// Test-only: drive the user's existing binding to a recorded
+    /// `wal_authoritative` genesis terminal through the REAL ledger gate
+    /// (shape, lineage, and exclusivity checks all exercised). Requires the
+    /// user to exist with an active binding (upsert_user creates one).
+    #[cfg(test)]
+    pub(crate) async fn seed_wal_genesis_terminal_for_test(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::archive_v3::ArchiveId> {
+        let user_id = user_id.to_owned();
+        self.write_owned_if_changed(move |conn| {
+            use crate::archive_v3::{
+                ArchiveCipher, ArchiveDek, DatabaseEpoch, KeyEpoch, ParentReference,
+            };
+            use crate::archive_v3_witness::{
+                InMemoryWitness, KeyRegistryReference, MigrationState, RootCommitment,
+                RootReference, Witness, WitnessBootstrap,
+            };
+            let binding = archive_binding_conn(conn, &user_id)?
+                .ok_or_else(|| EnclaveError::Store("test user has no binding".into()))?;
+            let archive_id = binding.archive_id;
+            let seed: u8 = 0x50;
+            let owner_id = ObjectId::from_bytes([seed; 16]);
+            let database_epoch = DatabaseEpoch::from_bytes([seed.wrapping_add(1); 16]);
+            let key_epoch = KeyEpoch::from_bytes([seed.wrapping_add(2); 16]);
+            let registry = KeyRegistryReference::new(
+                key_epoch,
+                0,
+                ObjectId::from_bytes([seed.wrapping_add(3); 16]),
+                [seed.wrapping_add(4); 32],
+            );
+            let initial = RootCommitment::genesis(
+                database_epoch,
+                key_epoch,
+                RootReference::new(
+                    0,
+                    ObjectId::from_bytes([seed.wrapping_add(5); 16]),
+                    [seed.wrapping_add(6); 32],
+                ),
+            );
+            let witness = InMemoryWitness::new();
+            witness
+                .bootstrap(WitnessBootstrap::new(
+                    archive_id,
+                    database_epoch,
+                    initial,
+                    registry,
+                ))
+                .map_err(|_| EnclaveError::Store("fixture bootstrap".into()))?;
+            witness
+                .acquire_lease(archive_id, database_epoch, key_epoch, owner_id, 900)
+                .map_err(|_| EnclaveError::Store("fixture lease".into()))?;
+            let created = witness
+                .read_current(archive_id)
+                .map_err(|_| EnclaveError::Store("fixture read".into()))?
+                .ok_or_else(|| EnclaveError::Store("fixture record".into()))?;
+            let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([seed.wrapping_add(7); 32]));
+            let advance = |current: &crate::archive_v3_witness::WitnessRecord,
+                           sequence: u64,
+                           object_seed: u8,
+                           migration: MigrationState| {
+                let lease = current.exact_active_lease_for_owner(owner_id).unwrap();
+                let parent = current.root().root();
+                let context = crate::archive_v3::ObjectContext::new(
+                    current.archive_id(),
+                    current.database_epoch(),
+                    current.registry().key_epoch(),
+                    crate::archive_v3::ObjectRole::RootV3,
+                    crate::archive_v3::LogicalLocation::Root { root_seq: sequence },
+                    ObjectId::from_bytes([object_seed; 16]),
+                    Some(ParentReference {
+                        object_id: parent.object_id(),
+                        envelope_hash: parent.ciphertext_hash(),
+                    }),
+                )
+                .unwrap();
+                let envelope = cipher.seal(&context, b"genesis-test-root").unwrap();
+                let candidate_root = current
+                    .with_candidate_root_for_test(
+                        RootReference::new(sequence, context.object_id(), envelope.hash()),
+                        lease.fencing_epoch(),
+                    )
+                    .root();
+                let advance = crate::archive_v3_witness::RootAdvance::new(
+                    lease,
+                    current.root(),
+                    current.registry(),
+                    candidate_root,
+                );
+                current
+                    .exact_migration_candidate(&advance, migration)
+                    .unwrap()
+            };
+            let shadow = advance(&created, 1, seed.wrapping_add(8), MigrationState::ShadowWal);
+            let authoritative = advance(
+                &shadow,
+                2,
+                seed.wrapping_add(9),
+                MigrationState::WalAuthoritative,
+            );
+            let terminal = authoritative.released_wal_owner_for_test();
+            record_wal_genesis_stage_conn(
+                conn,
+                &user_id,
+                archive_id,
+                WalGenesisStage::GenesisCreated,
+                &created.encode(),
+            )?;
+            record_wal_genesis_stage_conn(
+                conn,
+                &user_id,
+                archive_id,
+                WalGenesisStage::WalAuthoritative,
+                &terminal.encode(),
+            )?;
+            Ok((archive_id, true))
+        })
+        .await
+    }
+
     #[allow(
         dead_code,
         reason = "reserved for the reviewed genesis launcher (Track G) wiring"
