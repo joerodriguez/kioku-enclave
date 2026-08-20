@@ -175,6 +175,11 @@ mod archive_v3_shadow_parity;
 // has no Store/VFS/lifecycle, route, health, admission, deletion, task, flag,
 // callback, operation, or authority wiring.
 mod archive_v3_maintenance_import;
+// ADR-0022's extracted root-advance core (genesis spine G1): the exact
+// witness-advance provider boundary and zero-WAL root-candidate builder. It
+// has no Store, VFS, startup, route, flag, provider-construction, or
+// authority wiring.
+mod archive_v3_root_advance;
 mod archive_v3_serving_relaunch;
 mod archive_v3_shadow_runtime;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no

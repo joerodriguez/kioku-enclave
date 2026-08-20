@@ -31,11 +31,11 @@ use thiserror::Error;
 
 use crate::{
     archive_v3::{
-        resolve_archive_cipher, ArchiveId, ArchiveRoot, CiphertextEnvelope,
-        ExactKeyRegistryProvider, ImmutableObjectBackend, KeyKind, KeyRegistryContext,
-        LogicalLocation, ObjectContext, ObjectId, ObjectRole, ParentReference,
-        VerifiedArchiveCipher, ARCHIVE_FORMAT_VERSION, SQLITE_PAGE_SIZE,
+        resolve_archive_cipher, ArchiveId, ArchiveRoot, ExactKeyRegistryProvider,
+        ImmutableObjectBackend, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext,
+        ObjectId, ObjectRole, ParentReference, VerifiedArchiveCipher,
     },
+    archive_v3_root_advance::{build_zero_wal_candidate, RootAdvanceError},
     archive_v3_shadow_checkpoint::{
         reconcile_reserved_shadow_objects, upload_checkpoint, MaintenanceCheckpointSource,
         ShadowObjectInventory, ShadowObjectStaging, UploadedCheckpoint,
@@ -46,9 +46,16 @@ use crate::{
     archive_v3_shadow_session::{ShadowSessionBinding, ShadowSessionId},
     archive_v3_shadow_wal::recover_owned_maintenance_staging,
     archive_v3_witness::{
-        DeletionState, ExactRootProvider, MigrationState, RecoveryRoot, RootAdvance, WitnessError,
-        WitnessLease, WitnessRecord,
+        DeletionState, MigrationState, RecoveryRoot, RootAdvance, WitnessError, WitnessLease,
+        WitnessRecord,
     },
+};
+
+/// The witness-advance boundary and its commit outcome moved to the extracted
+/// root-advance core; the importer-facing names remain as exact aliases.
+pub(crate) use crate::archive_v3_root_advance::{
+    ArchiveWitnessAdvanceProvider as MaintenanceImportWitnessProvider,
+    WitnessAdvanceCommitError as MaintenanceWitnessCommitError,
 };
 
 const IMPORT_OPERATION_DOMAIN: &[u8] = b"kioku/archive-v3/maintenance-import-operation/v1\0";
@@ -766,11 +773,13 @@ pub(crate) enum MaintenanceImportError {
     ParityMismatch,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MaintenanceWitnessCommitError {
-    Rejected,
-    DefinitelyFailed,
-    OutcomeUnknown,
+impl From<RootAdvanceError> for MaintenanceImportError {
+    fn from(error: RootAdvanceError) -> Self {
+        match error {
+            RootAdvanceError::Unavailable => Self::Unavailable,
+            RootAdvanceError::Corrupt => Self::Corrupt,
+        }
+    }
 }
 
 /// Non-cloneable exact migration candidate. It can only be built by applying
@@ -829,58 +838,6 @@ impl fmt::Debug for PreparedMaintenanceMigration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PreparedMaintenanceMigration(<opaque>)")
     }
-}
-
-/// Exact witness boundary used only by this inactive importer. Implementors
-/// may not return raw transports or accept a caller-created recovery root.
-#[async_trait]
-pub(crate) trait MaintenanceImportWitnessProvider: Send + Sync {
-    async fn read_current_exact(
-        &self,
-        archive_id: ArchiveId,
-    ) -> Result<WitnessRecord, WitnessError>;
-
-    async fn acquire_lease_exact(
-        &self,
-        record: &WitnessRecord,
-        owner: ObjectId,
-        duration_ticks: u64,
-    ) -> Result<WitnessLease, WitnessError>;
-
-    /// Re-read the exact stored record and evaluate its retained lease at the
-    /// provider's trusted read time without mutating the record bytes. This is
-    /// the only precondition that permits retrying a durable send candidate.
-    async fn validate_exact_lease(
-        &self,
-        record: &WitnessRecord,
-        owner: ObjectId,
-    ) -> Result<WitnessLease, WitnessError>;
-
-    async fn renew_lease_exact(
-        &self,
-        lease: WitnessLease,
-        duration_ticks: u64,
-    ) -> Result<WitnessLease, WitnessError>;
-
-    async fn release_terminal_lease_unresolved(
-        &self,
-        retained: WitnessRecord,
-        owner: ObjectId,
-    ) -> Result<(), MaintenanceWitnessCommitError>;
-
-    async fn release_advisory_lease_unresolved(
-        &self,
-        retained: WitnessRecord,
-        owner: ObjectId,
-    ) -> Result<(), MaintenanceWitnessCommitError>;
-
-    async fn advance_migration_unresolved(
-        &self,
-        expected: WitnessRecord,
-        candidate: WitnessRecord,
-        advance: RootAdvance,
-        next: MigrationState,
-    ) -> Result<(), MaintenanceWitnessCommitError>;
 }
 
 /// Durable state boundary. A concrete ControlStore implementation must use
@@ -2387,24 +2344,6 @@ async fn resolve_witness_cipher(
     .map_err(|_| MaintenanceImportError::Corrupt)
 }
 
-struct BackendRootReader<'a> {
-    backend: &'a dyn ImmutableObjectBackend,
-}
-
-#[async_trait]
-impl ExactRootProvider for BackendRootReader<'_> {
-    async fn read_exact(
-        &self,
-        context: &ObjectContext,
-    ) -> Result<CiphertextEnvelope, WitnessError> {
-        self.backend
-            .get(&context.object_key())
-            .await
-            .map_err(|_| WitnessError::Unavailable)?
-            .ok_or(WitnessError::MissingArchive)
-    }
-}
-
 async fn authenticate_current_root(
     backend: &dyn ImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
@@ -2446,76 +2385,6 @@ async fn authenticate_current_root(
         return Err(MaintenanceImportError::Corrupt);
     }
     Ok(root)
-}
-
-async fn build_zero_wal_candidate(
-    backend: &dyn ImmutableObjectBackend,
-    cipher: &VerifiedArchiveCipher,
-    current: &WitnessRecord,
-    lease: WitnessLease,
-    checkpoint: &UploadedCheckpoint,
-    staging: &ShadowObjectStaging<'_>,
-) -> Result<RootAdvance, MaintenanceImportError> {
-    let expected = current.root();
-    let root_seq = expected
-        .root()
-        .sequence()
-        .checked_add(1)
-        .ok_or(MaintenanceImportError::Corrupt)?;
-    let parent = ParentReference {
-        object_id: expected.root().object_id(),
-        envelope_hash: expected.root().ciphertext_hash(),
-    };
-    let context = ObjectContext::new(
-        current.archive_id(),
-        current.database_epoch(),
-        current.registry().key_epoch(),
-        ObjectRole::RootV3,
-        LogicalLocation::Root { root_seq },
-        ObjectId::random(),
-        Some(parent.clone()),
-    )
-    .map_err(|_| MaintenanceImportError::Corrupt)?;
-    let root = ArchiveRoot {
-        root_seq,
-        parent: Some(parent),
-        database_epoch: current.database_epoch(),
-        key_epoch: current.registry().key_epoch(),
-        owner_fencing_epoch: lease.fencing_epoch(),
-        sqlite_page_size: SQLITE_PAGE_SIZE,
-        checkpoint_logical_file_length: checkpoint.logical_file_length(),
-        logical_file_length: checkpoint.logical_file_length(),
-        user_schema_version: checkpoint.user_schema_version(),
-        storage_format_version: ARCHIVE_FORMAT_VERSION,
-        wal_generation: 0,
-        wal_commit_count: 0,
-        wal_segment_count: 0,
-        wal_tail_bytes: 0,
-        checkpoint_root: Some(checkpoint.root().clone()),
-        extent_tree_root: None,
-        wal_commit_tail: None,
-    };
-    let envelope = cipher
-        .seal(
-            &context,
-            &root.encode().map_err(|_| MaintenanceImportError::Corrupt)?,
-        )
-        .map_err(|_| MaintenanceImportError::Corrupt)?;
-    staging
-        .create_and_readback(backend, &context, envelope)
-        .await
-        .map_err(|_| MaintenanceImportError::Unavailable)?;
-    RootAdvance::from_authenticated_candidate(
-        lease,
-        expected,
-        current.registry(),
-        current.registry(),
-        &context,
-        &BackendRootReader { backend },
-        cipher,
-    )
-    .await
-    .map_err(|_| MaintenanceImportError::Corrupt)
 }
 
 fn validate_checkpoint_source(
@@ -2625,7 +2494,8 @@ pub(crate) mod tests {
     use crate::{
         archive_v3::{
             resolve_archive_cipher, ArchiveDek, ArchiveV3Error, DatabaseEpoch,
-            InMemoryImmutableBackend, KeyEpoch, KeyRegistryPlaintext,
+            InMemoryImmutableBackend, KeyEpoch, KeyRegistryPlaintext, ARCHIVE_FORMAT_VERSION,
+            SQLITE_PAGE_SIZE,
         },
         archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
         archive_v3_shadow_checkpoint::ShadowObjectInventoryError,

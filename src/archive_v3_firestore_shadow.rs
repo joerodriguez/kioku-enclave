@@ -23,9 +23,7 @@ use crate::{
         FirestoreWitness, FirestoreWitnessCommitError, FirestoreWitnessConfig,
         FirestoreWitnessTransportError,
     },
-    archive_v3_maintenance_import::{
-        MaintenanceImportWitnessProvider, MaintenanceWitnessCommitError,
-    },
+    archive_v3_root_advance::{ArchiveWitnessAdvanceProvider, WitnessAdvanceCommitError},
     archive_v3_shadow_coordinator::{ShadowCheckpointWitnessProvider, ShadowWitnessCommitError},
     archive_v3_witness::{
         DeletionState, MigrationState, RootAdvance, WitnessError, WitnessLease, WitnessReceipt,
@@ -187,7 +185,7 @@ impl ShadowCheckpointWitnessProvider for FirestoreShadowWitness {
 }
 
 #[async_trait]
-impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
+impl ArchiveWitnessAdvanceProvider for FirestoreShadowWitness {
     async fn read_current_exact(
         &self,
         archive_id: ArchiveId,
@@ -244,17 +242,17 @@ impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
         &self,
         retained: WitnessRecord,
         owner: crate::archive_v3::ObjectId,
-    ) -> Result<(), MaintenanceWitnessCommitError> {
+    ) -> Result<(), WitnessAdvanceCommitError> {
         self.witness
             .release_exact_maintenance_terminal_unresolved_async(retained, owner)
             .await
             .map_err(|error| match error {
-                FirestoreWitnessCommitError::Rejected(_) => MaintenanceWitnessCommitError::Rejected,
+                FirestoreWitnessCommitError::Rejected(_) => WitnessAdvanceCommitError::Rejected,
                 FirestoreWitnessCommitError::Failed(_) => {
-                    MaintenanceWitnessCommitError::DefinitelyFailed
+                    WitnessAdvanceCommitError::DefinitelyFailed
                 }
                 FirestoreWitnessCommitError::OutcomeUnknown => {
-                    MaintenanceWitnessCommitError::OutcomeUnknown
+                    WitnessAdvanceCommitError::OutcomeUnknown
                 }
             })
     }
@@ -263,17 +261,17 @@ impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
         &self,
         retained: WitnessRecord,
         owner: crate::archive_v3::ObjectId,
-    ) -> Result<(), MaintenanceWitnessCommitError> {
+    ) -> Result<(), WitnessAdvanceCommitError> {
         self.witness
             .release_exact_maintenance_advisory_unresolved_async(retained, owner)
             .await
             .map_err(|error| match error {
-                FirestoreWitnessCommitError::Rejected(_) => MaintenanceWitnessCommitError::Rejected,
+                FirestoreWitnessCommitError::Rejected(_) => WitnessAdvanceCommitError::Rejected,
                 FirestoreWitnessCommitError::Failed(_) => {
-                    MaintenanceWitnessCommitError::DefinitelyFailed
+                    WitnessAdvanceCommitError::DefinitelyFailed
                 }
                 FirestoreWitnessCommitError::OutcomeUnknown => {
-                    MaintenanceWitnessCommitError::OutcomeUnknown
+                    WitnessAdvanceCommitError::OutcomeUnknown
                 }
             })
     }
@@ -284,17 +282,17 @@ impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
         candidate: WitnessRecord,
         advance: RootAdvance,
         next: MigrationState,
-    ) -> Result<(), MaintenanceWitnessCommitError> {
+    ) -> Result<(), WitnessAdvanceCommitError> {
         self.witness
             .advance_exact_migration_candidate_unresolved_async(expected, candidate, advance, next)
             .await
             .map_err(|error| match error {
-                FirestoreWitnessCommitError::Rejected(_) => MaintenanceWitnessCommitError::Rejected,
+                FirestoreWitnessCommitError::Rejected(_) => WitnessAdvanceCommitError::Rejected,
                 FirestoreWitnessCommitError::Failed(_) => {
-                    MaintenanceWitnessCommitError::DefinitelyFailed
+                    WitnessAdvanceCommitError::DefinitelyFailed
                 }
                 FirestoreWitnessCommitError::OutcomeUnknown => {
-                    MaintenanceWitnessCommitError::OutcomeUnknown
+                    WitnessAdvanceCommitError::OutcomeUnknown
                 }
             })
     }
