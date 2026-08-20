@@ -44,8 +44,7 @@ use crate::{
     },
     archive_v3_maintenance_import::{
         AuthenticatedMaintenanceImportPlan, MaintenanceImportError,
-        MaintenanceImportWitnessProvider, SingleArchiveAdvisoryShadowImporter,
-        SingleArchiveMaintenanceImporter,
+        MaintenanceImportWitnessProvider, SingleArchiveMaintenanceImporter,
     },
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
@@ -255,8 +254,6 @@ pub(crate) struct ArchiveV3ShadowRuntimeBundle {
     registries: Arc<dyn ExactKeyRegistryProvider>,
     _witness: Arc<dyn ShadowCheckpointWitnessProvider>,
     maintenance_witness: Option<Arc<dyn MaintenanceImportWitnessProvider>>,
-    advisory_owner_witness:
-        Option<Arc<dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider>>,
     wal_owner_witness: Option<Arc<FirestoreShadowWitness>>,
 }
 
@@ -295,16 +292,12 @@ impl ArchiveV3ShadowRuntimeBundle {
             FirestoreShadowWitness::new(witness_config)
                 .map_err(|_| ArchiveV3ShadowRuntimeConstructionError::Unavailable)?,
         );
-        let advisory_owner_witness: Arc<
-            dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider,
-        > = witness.clone();
         Ok(Self {
             objects,
             _roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
             registries: Arc::new(GcsArchiveV3RegistryProvider::new(transport, registry_kms)),
             _witness: witness.clone(),
             maintenance_witness: Some(witness.clone()),
-            advisory_owner_witness: Some(advisory_owner_witness),
             wal_owner_witness: Some(witness),
         })
     }
@@ -316,7 +309,6 @@ impl ArchiveV3ShadowRuntimeBundle {
             registries: components.registries,
             _witness: components.witness,
             maintenance_witness: None,
-            advisory_owner_witness: None,
             wal_owner_witness: None,
         }
     }
@@ -364,9 +356,7 @@ impl ArchiveV3ShadowRuntimeBundle {
         wal_owner_witness: Arc<crate::archive_v3_firestore_shadow::FirestoreShadowWitness>,
     ) -> Self
     where
-        W: crate::archive_v3_maintenance_import::MaintenanceImportWitnessProvider
-            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
-            + 'static,
+        W: crate::archive_v3_maintenance_import::MaintenanceImportWitnessProvider + 'static,
     {
         let mut bundle = Self::from_maintenance_test_components(objects, registries, witness);
         bundle.wal_owner_witness = Some(wal_owner_witness);
@@ -380,153 +370,17 @@ impl ArchiveV3ShadowRuntimeBundle {
         witness: Arc<W>,
     ) -> Self
     where
-        W: MaintenanceImportWitnessProvider
-            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
-            + 'static,
+        W: MaintenanceImportWitnessProvider + 'static,
     {
         let maintenance_witness: Arc<dyn MaintenanceImportWitnessProvider> = witness.clone();
-        let advisory_owner_witness: Arc<
-            dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider,
-        > = witness;
         Self {
             objects,
             _roots: Arc::new(UnavailableRootProvider),
             registries,
             _witness: Arc::new(UnavailableShadowWitnessProvider),
             maintenance_witness: Some(maintenance_witness),
-            advisory_owner_witness: Some(advisory_owner_witness),
             wal_owner_witness: None,
         }
-    }
-
-    pub(crate) fn into_advisory_owner(
-        self,
-        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
-    ) -> Result<AdvisoryOwnerRuntimeOwner, ArchiveV3ShadowRuntimeConstructionError> {
-        if self.advisory_owner_witness.is_none() {
-            return Err(ArchiveV3ShadowRuntimeConstructionError::Unavailable);
-        }
-        Ok(AdvisoryOwnerRuntimeOwner { bundle: self })
-    }
-}
-
-/// Consuming Phase-1 runtime view. It exposes exact witness read, acquire, and
-/// same-owner maintain plus one token-gated exact-witness recovery into an
-/// opaque cleanup-owned staging value. Raw objects, registries, roots,
-/// ciphers, deletion, and provider coordinates remain unreachable.
-pub(crate) struct AdvisoryOwnerRuntimeOwner {
-    bundle: ArchiveV3ShadowRuntimeBundle,
-}
-
-impl AdvisoryOwnerRuntimeOwner {
-    fn witness(&self) -> &dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider {
-        self.bundle
-            .advisory_owner_witness
-            .as_deref()
-            .expect("validated by consuming constructor")
-    }
-
-    pub(crate) async fn read_advisory_owner_current_exact(
-        &self,
-        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
-        archive_id: ArchiveId,
-    ) -> Result<WitnessRecord, WitnessError> {
-        self.witness().read_current_exact(archive_id).await
-    }
-
-    pub(crate) async fn acquire_advisory_owner_lease_unresolved(
-        &self,
-        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
-        expected: WitnessRecord,
-        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
-        duration_ticks: u64,
-    ) -> Result<
-        (WitnessRecord, WitnessLease),
-        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
-    > {
-        self.witness()
-            .acquire_owner_lease(&expected, owner, duration_ticks)
-            .await
-    }
-
-    pub(crate) async fn maintain_advisory_owner_lease_unresolved(
-        &self,
-        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
-        previous: WitnessRecord,
-        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
-        duration_ticks: u64,
-    ) -> Result<
-        (WitnessRecord, WitnessLease),
-        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
-    > {
-        self.witness()
-            .maintain_owner_lease(&previous, owner, duration_ticks)
-            .await
-    }
-
-    pub(crate) async fn reacquire_advisory_owner_lease_unresolved(
-        &self,
-        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
-        previous: WitnessRecord,
-        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
-        duration_ticks: u64,
-    ) -> Result<
-        (WitnessRecord, WitnessLease),
-        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
-    > {
-        self.witness()
-            .reacquire_owner_lease(&previous, owner, duration_ticks)
-            .await
-    }
-
-    /// Recover only the immutable graph nominated by the exact active
-    /// ShadowWal witness into a cleanup-owned staging value. Provider and key
-    /// capabilities are consumed inside this wrapper and never cross into the
-    /// advisory owner or Store.
-    pub(crate) async fn recover_advisory_comparison_staging(
-        &self,
-        _token: &crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
-        expected: &crate::archive_v3_witness::WitnessRecord,
-    ) -> crate::archive_v3_shadow_wal::Result<
-        crate::archive_v3_shadow_wal::RecoveredMaintenanceStaging,
-    > {
-        if expected.migration() != crate::archive_v3_witness::MigrationState::ShadowWal
-            || expected.deletion() != crate::archive_v3_witness::DeletionState::Active
-        {
-            return Err(crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery);
-        }
-        let archive_id = expected.archive_id();
-        let registry = expected.registry();
-        let context = KeyRegistryContext::with_rotation_generation(
-            archive_id,
-            KeyKind::Archive,
-            registry.key_epoch(),
-            registry.rotation_generation(),
-        );
-        let cipher = resolve_archive_cipher(
-            &context,
-            registry.object_id(),
-            registry.ciphertext_hash(),
-            self.bundle.registries.as_ref(),
-        )
-        .await
-        .map(Arc::new)
-        .map_err(|_| crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery)?;
-        let recovery = crate::archive_v3_witness::RecoveryRoot::from_exact_active_record(expected)
-            .map_err(|_| crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery)?;
-        crate::archive_v3_shadow_wal::recover_owned_maintenance_staging(
-            recovery,
-            Arc::clone(&self.bundle.objects),
-            cipher,
-            archive_id,
-        )
-        .await
-    }
-}
-
-impl fmt::Debug for AdvisoryOwnerRuntimeOwner {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("AdvisoryOwnerRuntimeOwner(<inactive>)")
     }
 }
 
@@ -752,9 +606,7 @@ impl SealedSingleArchiveWalRuntime {
         witness: Arc<W>,
     ) -> Self
     where
-        W: MaintenanceImportWitnessProvider
-            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
-            + 'static,
+        W: MaintenanceImportWitnessProvider + 'static,
     {
         let bundle = ArchiveV3ShadowRuntimeBundle::from_maintenance_test_components(
             objects, registries, witness,
@@ -797,27 +649,6 @@ impl SealedSingleArchiveWalRuntime {
             witness.as_ref(),
         )
         .await
-    }
-
-    /// One-shot Phase-1 composition. The returned type can stop only at the
-    /// verified advisory ShadowWal handoff and exposes no WalAuthoritative
-    /// transition method.
-    pub(crate) fn into_advisory_shadow_importer(
-        self,
-        plan: AuthenticatedMaintenanceImportPlan,
-        persistence: Arc<ControlStore>,
-        store: Arc<crate::store::Store>,
-    ) -> Result<SingleArchiveAdvisoryShadowImporter, MaintenanceImportError> {
-        let importer = SingleArchiveMaintenanceImporter::from_sealed_runtime(
-            MaintenanceRuntimeContext(()),
-            self.binding.binding.archive_id(),
-            self.binding,
-            self.bundle,
-            persistence,
-            store,
-            plan,
-        )?;
-        Ok(SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(importer))
     }
 
     /// One-shot inactive composition. This has no startup caller and returns
