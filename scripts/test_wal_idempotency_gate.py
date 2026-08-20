@@ -28,7 +28,11 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # predecessor read and the sealed-plan submit, both under the existing B
 # owner. 169 -> 171, diffed against pristine main, zero reclassifications
 # and no removals -- the legacy write branch is intact.
-EXPECTED_STORE_CALL_COUNT = 171
+# Plan-family slice 3 (F2): begin_invocation_settled adds its routed
+# sequence-probe read and the sealed-plan submit (both B, new owner).
+# 171 -> 173 under the bracket-aware scanner fix, which is
+# inventory-neutral on the pre-slice tree (verified: 171 both ways).
+EXPECTED_STORE_CALL_COUNT = 173
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -39,7 +43,7 @@ EXPECTED_STORE_CALL_COUNT = 171
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "6155ec50d6ace5d857279d729f9136b08fe2d2006a2883cbbed59eb1b0c8d8a7"
+EXPECTED_STORE_CALL_SHA256 = "742e40b4bd388ec4f66a5660419a742a91c9f431afa5dc1f391a58e4cdd36065"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -375,8 +379,24 @@ def function_spans(path: str, source: str, code: str, exclusions: list[Span]) ->
         if _excluded(match.start(), exclusions):
             continue
         brace = code.find("{", match.end())
-        semicolon = code.find(";", match.end())
-        if brace == -1 or (semicolon != -1 and semicolon < brace):
+        # A declaration-only fn (trait signature) ends in `;` before any `{`
+        # -- but only a semicolon at bracket depth 0 counts. `[u8; 32]` in a
+        # parameter or return type contains one that does not end anything,
+        # and treating it as a terminator silently drops the fn from the
+        # owner list, orphaning every store call inside it.
+        semicolon = -1
+        depth = 0
+        scan_end = brace if brace != -1 else len(code)
+        for index in range(match.end(), scan_end):
+            char = code[index]
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth -= 1
+            elif char == ";" and depth <= 0:
+                semicolon = index
+                break
+        if brace == -1 or semicolon != -1:
             continue
         line_start = code.rfind("\n", 0, match.start()) + 1
         prefix = code[line_start : match.start()]
@@ -738,6 +758,7 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
         "src/cp/model_usage.rs::begin_invocation#0",
+        "src/cp/model_usage.rs::begin_invocation_settled#0",
         "src/cp/model_usage.rs::pending_events#0",
         "src/cp/model_usage.rs::pending_coverage#0",
         "src/cp/model_usage.rs::drain_coverage#0",
@@ -853,6 +874,10 @@ class WalIdempotencyGateTest(unittest.TestCase):
 mod tests { const X: &str = r#"{ .with_user("#; fn hidden() { x.with_user(1); } }
 impl X {
     #[cfg(test)] fn hidden_method(&self) { self.with_user(1); }
+    fn array_param(&self, value: &[u8; 32]) {
+        let _ = value;
+        self.with_user(4);
+    }
     fn live(&self) {
         // }.with_user(
         /* outer { /* nested .with_user( */ } */
@@ -870,6 +895,7 @@ impl X {
         self.assertEqual(
             [site.key for site in sites],
             [
+                "fixture.rs::array_param#0::with_user#0",
                 "fixture.rs::inner#0::with_user#0",
                 "fixture.rs::live#0::with_user#0",
             ],

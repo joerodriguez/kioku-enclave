@@ -10,6 +10,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::time::Instant;
 use tokio::sync::OwnedMutexGuard;
 
@@ -320,7 +321,13 @@ pub async fn generate_custom(
         }
     });
 
-    let invocation = model_usage::begin_invocation(state, user_id, operation, model).await?;
+    // ADR-0022 F2: the caller anchor is a pure function of the assembled
+    // request, so a crash-retry of the same logical call derives the same
+    // invocation identity while a genuinely different request cannot adopt
+    // an old intent.
+    let caller_anchor: [u8; 32] = sha2::Sha256::digest(body.to_string().as_bytes()).into();
+    let invocation =
+        model_usage::begin_invocation(state, user_id, operation, model, &caller_anchor).await?;
     let response = http.post(&url).bearer_auth(&token).json(&body).send().await;
 
     let resp = match response {
@@ -477,8 +484,15 @@ async fn send_media_request(
         "https://aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
         config.vertex_project, config.vertex_location, config.vertex_model
     );
-    let invocation =
-        model_usage::begin_invocation(state, user_id, operation, &config.vertex_model).await?;
+    let caller_anchor: [u8; 32] = sha2::Sha256::digest(body.to_string().as_bytes()).into();
+    let invocation = model_usage::begin_invocation(
+        state,
+        user_id,
+        operation,
+        &config.vertex_model,
+        &caller_anchor,
+    )
+    .await?;
     let started = Instant::now();
     let response = http.post(&url).bearer_auth(token).json(&body).send().await;
     let response = match response {
