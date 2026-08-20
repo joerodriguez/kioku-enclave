@@ -2458,7 +2458,16 @@ impl X {
         self.assertNotIn("operation_id: _", publisher)
         self.assertNotIn("source: _", publisher)
         self.assertIn("MaintenanceImportPersistence::load_exact", publisher)
-        self.assertIn("_maintenance_parity: CompletedMaintenanceParityEvidence", publisher)
+        # G8: the retained parity evidence is inert after construction and
+        # became Option — None only for the genesis-ledger lane, whose
+        # archive has no maintenance history to certify. The launch guard
+        # keeps the two lane authorities mutually exclusive.
+        self.assertIn(
+            "_maintenance_parity: Option<CompletedMaintenanceParityEvidence>", publisher
+        )
+        self.assertIn(
+            "genesis_reservation.is_some() == parity.is_some()", publisher
+        )
         self.assertIn("struct CompletedMaintenanceParityEvidence", maintenance)
         self.assertIn("reauthenticate_for_wal_owner", maintenance)
         for forbidden in (

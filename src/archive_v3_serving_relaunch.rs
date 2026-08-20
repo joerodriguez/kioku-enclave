@@ -2,7 +2,8 @@
 //! docs/adr/0022-solo-operator-activation.md).
 //!
 //! For every user whose archive durably reached the `wal_authoritative`
-//! terminal, serving startup reconstructs the WAL-owner handoff from durable
+//! terminal — on the maintenance-import ledger or the genesis control
+//! ledger — serving startup reconstructs the WAL-owner handoff from durable
 //! state through the image-baked runtime coordinates, launches the serving
 //! authority (owner reservation/renewal with lost-response adoption inside
 //! the publisher), and registers it with the Store so the routed dual-path
