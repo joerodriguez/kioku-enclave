@@ -13,6 +13,32 @@ use crate::{error::Result, store::Store};
 const FIXTURE_MARKER: &str = "openai-review-fixture-v1";
 
 pub async fn ensure_demo_archive(store: &Arc<Store>, user_id: &str) -> Result<bool> {
+    if store.is_wal_authoritative(user_id) {
+        // ADR-0022: the synthetic fixture settles as the sealed
+        // ReviewerFixturePlan (which writes the same marker); the probe uses
+        // the routed read lane and the settle replays exactly on retry.
+        let already_seeded = store
+            .wal_authoritative_read(user_id, |conn| {
+                Ok(conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key = ?1)",
+                    [FIXTURE_MARKER],
+                    |row| row.get::<_, bool>(0),
+                )?)
+            })
+            .await?;
+        if already_seeded {
+            return Ok(false);
+        }
+        let prepared = wal::ReviewerFixturePlan::new(user_id.to_owned())
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            .map_err(|_| {
+                crate::error::EnclaveError::Store(
+                    "reviewer fixture plan construction failed".into(),
+                )
+            })?;
+        store.wal_authoritative_submit(user_id, prepared).await?;
+        return Ok(true);
+    }
     let changed = store
         .with_user(user_id, |conn| {
             let already_seeded: bool = conn.query_row(

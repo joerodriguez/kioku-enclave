@@ -50,7 +50,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 200
+EXPECTED_STORE_CALL_COUNT = 203
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +61,7 @@ EXPECTED_STORE_CALL_COUNT = 200
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "52fbf75f89f3a33d898c101e678ea9d707820fc69d52ca34275fc74dbdb2a106"
+EXPECTED_STORE_CALL_SHA256 = "f9c6221ebc1fb77338c6d0df13733cad909b54fe2d101d2631ebb2416aa82af6"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -180,7 +180,7 @@ EXPECTED_WORKER_SPAWN_COUNT = 25
 # and every spawn's own call-site hash is byte-identical.
 # Phase-2 deletion PR 1: async_main owner body only; the spawn count holds
 # at 33 and every spawn call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "3fcda4e018525bea820ef003f1ca5ce97beb5d4ee8da3f278a0c1439c2d921b4"
+EXPECTED_WORKER_SPAWN_SHA256 = "5bdf138c1148ab8c39ea0942b8797b7a53d0fef7999ab77f57e9f71b587f1eb1"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1745,7 +1745,12 @@ impl X {
         )
         self.assertIn("DomainLedgerBounds::new", finalization_queue_domain)
         self.assertIn("WalIdempotencyError::Precondition", finalization_queue_domain)
-        self.assertNotIn("FinalizationQueuePlan::", query)
+        # ADR-0022 slice 10: the queue transition is WIRED - the route
+        # constructs the sealed plan and keeps the legacy UPDATE branch.
+        self.assertIn("FinalizationQueuePlan::new(", query)
+        self.assertIn("FinalizationQueuePredecessor::new(", query)
+        self.assertIn("finalization-queue-request-v1", query)
+        self.assertIn("finalization_status = 'queued'", query)
         self.assertNotIn("cp::query::wal::", main)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan",
@@ -1898,7 +1903,10 @@ impl X {
         self.assertIn("archive_v3_wal_reviewer_fixture_operations", reviewer_domain)
         self.assertIn("DomainLedgerBounds::new", reviewer_domain)
         self.assertIn("WalIdempotencyError::Precondition", reviewer_domain)
-        self.assertNotIn("ReviewerFixturePlan::", reviewer)
+        # ADR-0022 slice 10: the reviewer fixture is WIRED - the owner
+        # settles the sealed plan for WAL users and keeps the legacy seed.
+        self.assertIn("ReviewerFixturePlan::new(", reviewer)
+        self.assertIn("is_wal_authoritative", reviewer)
         self.assertNotIn("cp::reviewer::wal::", main)
         self.assertIn("pub(crate) mod wal;", summarizer)
         self.assertIn(

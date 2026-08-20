@@ -1436,11 +1436,16 @@ async fn rest_episode_finalize(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    // ADR-0022: the routed read serves both branches (it falls through to
+    // the legacy read lane for unselected users) and fetches the full
+    // predecessor row the sealed queue plan pins.
     let eligibility = s
         .store
-        .with_user(&user.0, move |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             conn.query_row(
-                "SELECT substance, finalized_at, finalization_version, finalization_status
+                "SELECT substance, finalized_at, finalization_version, finalization_status,
+                        finalization_error, finalization_attempted_at,
+                        finalization_attempt_count, finalization_next_attempt_at, updated_at
                  FROM episodes WHERE id = ?1",
                 [id],
                 |row| {
@@ -1449,6 +1454,11 @@ async fn rest_episode_finalize(
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<i32>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1456,7 +1466,17 @@ async fn rest_episode_finalize(
             .map_err(Into::into)
         })
         .await;
-    let Some((substance, finalized_at, version, status)) = (match eligibility {
+    let Some((
+        substance,
+        finalized_at,
+        version,
+        status,
+        finalization_error,
+        attempted_at,
+        attempt_count,
+        next_attempt_at,
+        row_updated_at,
+    )) = (match eligibility {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(%error, episode_id = id, "finalization retry lookup failed");
@@ -1466,7 +1486,8 @@ async fn rest_episode_finalize(
             )
                 .into_response();
         }
-    }) else {
+    })
+    else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "episode_not_found"})),
@@ -1497,29 +1518,114 @@ async fn rest_episode_finalize(
     }
 
     let user_id = user.0;
-    let queued = s
-        .store
-        .with_user(&user_id, move |conn| {
-            conn.execute(
-                "UPDATE episodes
-                 SET finalization_status = 'queued',
-                     finalization_error = NULL,
-                     finalization_attempt_count = 0,
-                     finalization_next_attempt_at = NULL,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE id = ?1",
-                [id],
-            )?;
-            Ok(())
-        })
-        .await;
-    if let Err(error) = queued {
-        tracing::warn!(%error, episode_id = id, "failed to queue episode finalization");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "enclave_unavailable"})),
+    if s.store.is_wal_authoritative(&user_id) {
+        // ADR-0022: the queue transition settles as the sealed
+        // FinalizationQueuePlan. The caller-stable request id is the
+        // predecessor commitment — re-queueing the same eligible row retries
+        // the same operation; once queued, the 202 short-circuit above
+        // answers instead, so a settled transition is never re-derived.
+        let queued_at = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+        let queue_request_id = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            for part in [
+                b"finalization-queue-request-v1".as_slice(),
+                user_id.as_bytes(),
+                &id.to_be_bytes(),
+                substance.as_bytes(),
+                finalized_at.as_deref().unwrap_or("").as_bytes(),
+                &i64::from(version.unwrap_or(0)).to_be_bytes(),
+                status.as_bytes(),
+                finalization_error.as_deref().unwrap_or("").as_bytes(),
+                attempted_at.as_deref().unwrap_or("").as_bytes(),
+                &attempt_count.to_be_bytes(),
+                next_attempt_at.as_deref().unwrap_or("").as_bytes(),
+                row_updated_at.as_deref().unwrap_or("").as_bytes(),
+            ] {
+                hasher.update((part.len() as u64).to_be_bytes());
+                hasher.update(part);
+            }
+            hasher
+                .finalize()
+                .iter()
+                .take(16)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let prepared = wal::FinalizationQueuePredecessor::new(
+            substance,
+            finalized_at,
+            version,
+            status,
+            finalization_error,
+            attempted_at,
+            attempt_count,
+            next_attempt_at,
+            row_updated_at,
         )
-            .into_response();
+        .and_then(|predecessor| {
+            wal::FinalizationQueuePlan::new(
+                user_id.clone(),
+                queue_request_id,
+                id,
+                queued_at,
+                predecessor,
+            )
+        })
+        .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    episode_id = id,
+                    "finalization queue plan construction failed"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "enclave_unavailable"})),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(error) = s.store.wal_authoritative_submit(&user_id, prepared).await {
+            tracing::warn!(%error, episode_id = id, "failed to queue episode finalization");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response();
+        }
+    } else {
+        let queued = s
+            .store
+            .with_user(&user_id, move |conn| {
+                conn.execute(
+                    "UPDATE episodes
+                     SET finalization_status = 'queued',
+                         finalization_error = NULL,
+                         finalization_attempt_count = 0,
+                         finalization_next_attempt_at = NULL,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .await;
+        if let Err(error) = queued {
+            tracing::warn!(%error, episode_id = id, "failed to queue episode finalization");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response();
+        }
     }
     if let Err(error) = s.store.save_user(&user_id).await {
         tracing::warn!(%error, episode_id = id, "failed to persist episode finalization queue");
