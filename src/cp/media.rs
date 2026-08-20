@@ -2696,7 +2696,7 @@ fn install_media_dek_candidate(conn: &Connection, candidate: &str) -> Result<Str
     )?)
 }
 
-async fn load_or_create_media_dek(
+pub(in crate::cp) async fn load_or_create_media_dek(
     state: &CpState,
     user_id: &str,
 ) -> Result<(crate::crypto::Dek, String)> {

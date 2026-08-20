@@ -64,7 +64,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # branch; every legacy call expression, ordinal, and classification is
 # byte-identical (diffed against pristine origin/main after 10e/10f:
 # 219 -> 225, zero reclassifications, zero removals).
-EXPECTED_STORE_CALL_COUNT = 225
+EXPECTED_STORE_CALL_COUNT = 227
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -75,7 +75,7 @@ EXPECTED_STORE_CALL_COUNT = 225
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "2c7f37b1f93a61cc29e554ac25be8ec42087e9f80f37f05249d56f80de9c5fb1"
+EXPECTED_STORE_CALL_SHA256 = "ba95e4879f13a9c04cdd7a7e80eeee111eef5b18b69f32ba1ea3406c3529de08"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1645,11 +1645,13 @@ impl X {
         self.assertIn("MAX_ROWS: u32 = 1_048_576", selected_send_domain)
         self.assertIn("DomainLedgerBounds::new", selected_send_domain)
         # ADR-0022 slice 10g: the send-start marker is WIRED through the
-        # WAL-owned factory only - the route obtains the opaque plan exactly
-        # once and still cannot name the plan type or the ciphertext-bearing
-        # marker loader, which stays WAL-private for the provider child.
+        # WAL-owned factory only - two sites: the resume probe (a settled
+        # candidate must resume WITHOUT re-encrypting) and the fresh-chain
+        # marker step. The route still cannot name the plan type or the
+        # ciphertext-bearing marker loader, which stays WAL-private for the
+        # provider child.
         self.assertEqual(
-            query.count("prepare_selected_screenshot_send_started("), 1
+            query.count("prepare_selected_screenshot_send_started("), 2
         )
         self.assertNotIn("SelectedScreenshotSendStartedPlan::", query)
         self.assertNotIn(
