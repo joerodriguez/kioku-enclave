@@ -42,7 +42,11 @@ EXPECTED_STORE_SURFACE_COUNT = 16
 # Slice J-b3b: async_main's owner body gained the pre-admission serving
 # relaunch call and the concrete-KMS split; constructor expressions
 # unchanged.
-EXPECTED_STORE_SURFACE_SHA256 = "16e23e3acd5de1a65060ff02e729caadecbaecf6e1375b3b9e77bbeba897cf87"
+# SEL slice 1b: async_main's owner body again -- the relaunch now returns
+# (relaunched, unavailable) and the unavailable count is logged. Both
+# Store-construction call-site hashes and all 16 keys are byte-identical;
+# only the enclosing function body moved.
+EXPECTED_STORE_SURFACE_SHA256 = "15634bbf6155b61b1073f840f93dddd2c9fd21bce24cf762ba6099594567cd31"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -133,7 +137,10 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # Audit fix: the actor loop's Read arm now authenticates a fresh head before
 # serving, so the owner-actor spawn closure's hash moves. Spawn count stays 33
 # and no new spawn site exists.
-EXPECTED_WORKER_SPAWN_SHA256 = "88c39bece20f9beb5698316e5771a79f630d2bd4568d32ef908fc95ec1741241"
+# SEL slice 1b: async_main's owner body moved (the relaunch's unavailable
+# count). No spawn was added, removed, or reclassified; the count holds at 33
+# and every spawn's own call-site hash is byte-identical.
+EXPECTED_WORKER_SPAWN_SHA256 = "0e3c8ea0ef13d8c8eb9427b690b15e887d8dfc8056b0c6124c9bd25c09fd461e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
