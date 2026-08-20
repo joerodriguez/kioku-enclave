@@ -2381,6 +2381,330 @@ async fn rest_screenshot_upload_plan(
     }
 }
 
+/// Maps a sealed-chain refusal onto the exact client statuses the legacy
+/// branch uses: precondition-class refusals are conflicts the client may
+/// resolve, malformed input is a bad request, and everything else stays
+/// opaque.
+fn wal_selected_screenshot_error(
+    error: crate::archive_v3_wal_idempotency::WalIdempotencyError,
+) -> crate::error::EnclaveError {
+    use crate::archive_v3_wal_idempotency::WalIdempotencyError;
+    match error {
+        WalIdempotencyError::Malformed => crate::error::EnclaveError::InvalidRequest(
+            "selected screenshot upload request is invalid".into(),
+        ),
+        WalIdempotencyError::Precondition
+        | WalIdempotencyError::FingerprintConflict
+        | WalIdempotencyError::Limit => crate::error::EnclaveError::Conflict(
+            "selected screenshot upload predecessor changed".into(),
+        ),
+        WalIdempotencyError::Corrupt
+        | WalIdempotencyError::ResultUnsupported
+        | WalIdempotencyError::Unavailable => {
+            crate::error::EnclaveError::Store("selected screenshot upload is unavailable".into())
+        }
+    }
+}
+
+/// ADR-0022 slice 10g: the sealed selected-screenshot chain for one
+/// WAL-authoritative upload. The durable pre-provider chain runs in order --
+/// eligibility+budget attempt, exact ciphertext candidate, `SendStarted`
+/// marker -- entirely through routed reads and sealed-plan submits, with the
+/// attempt durable BEFORE any encryption. The provider boundary's mandatory
+/// durable execution claim mutates inside its own immediate transaction, and
+/// a selected user has no routed lane that can admit it (the submit lane
+/// accepts only sealed logical plans; the serving read lane is query-only),
+/// so this route stops fail-closed after the durable `SendStarted` marker:
+/// no provider I/O happens, no object bytes leave the enclave, and the
+/// retained attempt/candidate/marker chain is exact restartable state for
+/// the provider slice's executor.
+async fn wal_selected_screenshot_image_upload(
+    s: &Arc<CpState>,
+    user_id: &str,
+    episode_id: i64,
+    source_key: &str,
+    captured_at: &str,
+    jpeg: &ValidatedJpeg,
+    image_bytes: &[u8],
+) -> Response {
+    enum WalScreenshotPreflight {
+        Existing(StoredScreenshotImage),
+        Ready {
+            target: wal::SelectedScreenshotAttemptTarget,
+            media_dek_receipt: crate::cp::media::wal::MediaDekInstallReceipt,
+            wrapped_dek_b64: String,
+        },
+    }
+
+    // 1. Routed preflight: the exact legacy eligibility/budget predicate plus
+    // the sealed predecessor binding and the installed media-DEK facts, all
+    // read from one settled snapshot. The attempt's apply re-derives and
+    // re-checks the same predecessor under the owner's own transaction.
+    let preflight = {
+        let account = user_id.to_owned();
+        let source_key = source_key.to_owned();
+        let captured_at = captured_at.to_owned();
+        let jpeg = jpeg.clone();
+        s.store
+            .wal_authoritative_read(user_id, move |conn| {
+                if let ScreenshotUploadTarget::Existing(existing) =
+                    validate_screenshot_upload_target(
+                        conn,
+                        episode_id,
+                        &source_key,
+                        &captured_at,
+                        &jpeg.sha256,
+                        jpeg.byte_length,
+                    )?
+                {
+                    return Ok(WalScreenshotPreflight::Existing(existing));
+                }
+                let target = wal::authenticate_selected_screenshot_upload_predecessor(
+                    conn,
+                    &account,
+                    episode_id,
+                    &source_key,
+                    &captured_at,
+                    &jpeg,
+                )
+                .map_err(wal_selected_screenshot_error)?;
+                // This route has no DEK-install authority (the media route
+                // owns the single sealed constructor site), so an absent
+                // sealed install fails closed before any budget reservation.
+                let media_dek_receipt =
+                    wal::load_authenticated_media_dek_install_receipt(conn, &account)
+                        .map_err(wal_selected_screenshot_error)?
+                        .ok_or_else(|| {
+                            crate::error::EnclaveError::Store(
+                                "selected screenshot upload requires the sealed media DEK install"
+                                    .into(),
+                            )
+                        })?;
+                let wrapped_dek_b64 = conn
+                    .query_row(
+                        "SELECT value FROM app_metadata WHERE key = ?1",
+                        [MEDIA_DEK_METADATA_KEY],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        crate::error::EnclaveError::Store(
+                            "selected screenshot upload requires an installed media DEK".into(),
+                        )
+                    })?;
+                Ok(WalScreenshotPreflight::Ready {
+                    target,
+                    media_dek_receipt,
+                    wrapped_dek_b64,
+                })
+            })
+            .await
+    };
+    let (target, media_dek_receipt, wrapped_dek_b64) = match preflight {
+        Ok(WalScreenshotPreflight::Existing(existing)) => {
+            return (StatusCode::OK, Json(existing.response_json())).into_response()
+        }
+        Ok(WalScreenshotPreflight::Ready {
+            target,
+            media_dek_receipt,
+            wrapped_dek_b64,
+        }) => (target, media_dek_receipt, wrapped_dek_b64),
+        Err(
+            e @ (crate::error::EnclaveError::InvalidRequest(_)
+            | crate::error::EnclaveError::Conflict(_)),
+        ) => return e.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "selected media upload preflight failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+
+    // 2. KMS-load the installed DEK and bind it to the sealed receipt before
+    // reserving any budget; a mismatch is corrupt state, never a new install.
+    let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_dek_b64).await {
+        Ok(dek) => dek,
+        Err(e) => {
+            tracing::error!(error = %e, "selected media upload DEK load failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+    if media_dek_receipt
+        .validate_plaintext_dek(user_id, &media_dek)
+        .is_err()
+    {
+        tracing::error!("selected media upload DEK does not match the sealed install receipt");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+    }
+
+    // 3. Caller-fixed opaque attempt identity, minted once before any durable
+    // step so the sealed chain binds one exact object identity end to end.
+    let mut random_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
+    let image_id: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // 4. Durable eligibility+budget attempt BEFORE any encryption or upload.
+    // The plan is constructed exactly once, from the routed facts above.
+    let attempt_prepared = wal::SelectedScreenshotAttemptPlan::new(
+        user_id.to_owned(),
+        image_id.clone(),
+        episode_id,
+        source_key.to_owned(),
+        captured_at.to_owned(),
+        jpeg.clone(),
+        target,
+    )
+    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+    let attempt_prepared = match attempt_prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "selected screenshot attempt plan construction failed"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+    let attempt_receipt = match s
+        .store
+        .wal_authoritative_submit(user_id, attempt_prepared)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(e @ crate::error::EnclaveError::Conflict(_)) => return e.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "selected screenshot attempt submit failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+
+    // 5. Encrypt in memory, bound to the attempt's exact account-derived
+    // object identity.
+    let object_key = attempt_receipt.object_key().to_owned();
+    let media_context = crate::store::media_blob_context(user_id, &object_key);
+    let encrypted_data =
+        match crate::crypto::encrypt_bound_blob(&media_dek, image_bytes, &media_context) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "selected media upload encryption failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+            }
+        };
+
+    // 6. Durable exact ciphertext candidate. The WAL-owned factory loads and
+    // reauthenticates the media-DEK receipt from the settled snapshot; the
+    // parent receives only the opaque plan.
+    let candidate_prepared = {
+        let account = user_id.to_owned();
+        let attempt_receipt = attempt_receipt.clone();
+        let source_key = source_key.to_owned();
+        let captured_at = captured_at.to_owned();
+        let jpeg = jpeg.clone();
+        let factory_dek = crate::crypto::Dek(media_dek.0);
+        let plaintext = image_bytes.to_vec();
+        s.store
+            .wal_authoritative_read(user_id, move |conn| {
+                wal::prepare_selected_screenshot_upload_candidate(
+                    conn,
+                    &account,
+                    &attempt_receipt,
+                    episode_id,
+                    &source_key,
+                    &captured_at,
+                    &jpeg,
+                    &factory_dek,
+                    &plaintext,
+                    encrypted_data,
+                )
+                .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+                .map_err(wal_selected_screenshot_error)
+            })
+            .await
+    };
+    let candidate_prepared = match candidate_prepared {
+        Ok(prepared) => prepared,
+        Err(
+            e @ (crate::error::EnclaveError::InvalidRequest(_)
+            | crate::error::EnclaveError::Conflict(_)),
+        ) => return e.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "selected screenshot candidate preparation failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+    if let Err(e) = s
+        .store
+        .wal_authoritative_submit(user_id, candidate_prepared)
+        .await
+    {
+        return match e {
+            e @ crate::error::EnclaveError::Conflict(_) => e.into_response(),
+            e => {
+                tracing::error!(error = %e, "selected screenshot candidate submit failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response()
+            }
+        };
+    }
+
+    // 7. Durable `SendStarted` marker from the WAL-owned factory. Only a
+    // future provider slice may consume the marker's send authority.
+    let send_prepared = {
+        let account = user_id.to_owned();
+        let image = image_id.clone();
+        let send_dek = crate::crypto::Dek(media_dek.0);
+        s.store
+            .wal_authoritative_read(user_id, move |conn| {
+                wal::prepare_selected_screenshot_send_started(conn, &account, &image, &send_dek)
+                    .map_err(wal_selected_screenshot_error)?
+                    .ok_or_else(|| {
+                        crate::error::EnclaveError::Store(
+                            "selected screenshot candidate is missing for send start".into(),
+                        )
+                    })
+                    .and_then(|plan| {
+                        crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+                            .map_err(wal_selected_screenshot_error)
+                    })
+            })
+            .await
+    };
+    let send_prepared = match send_prepared {
+        Ok(prepared) => prepared,
+        Err(e @ crate::error::EnclaveError::Conflict(_)) => return e.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "selected screenshot send-start preparation failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
+    if let Err(e) = s
+        .store
+        .wal_authoritative_submit(user_id, send_prepared)
+        .await
+    {
+        return match e {
+            e @ crate::error::EnclaveError::Conflict(_) => e.into_response(),
+            e => {
+                tracing::error!(error = %e, "selected screenshot send-start submit failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response()
+            }
+        };
+    }
+
+    // 8. STOP fail-closed BEFORE any provider side effect. The provider
+    // boundary requires its durable execution claim to be admitted first,
+    // and no routed lane can admit that claim for a selected user today, so
+    // performing the object PUT here would bypass the sealed single-execution
+    // guarantee. Nothing was sent and nothing needs cleanup; the durable
+    // chain is exact restartable state.
+    tracing::warn!(
+        "selected screenshot upload staged durably through send-start; provider send is not wired"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "selected_screenshot_provider_unavailable"})),
+    )
+        .into_response()
+}
+
 async fn rest_screenshot_image_upload(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -2529,6 +2853,23 @@ async fn rest_screenshot_image_upload(
         Ok(lease) => lease,
         Err(error) => return error.into_response(),
     };
+
+    // ADR-0022 slice 10g: a WAL-authoritative user's upload routes through
+    // the sealed selected-screenshot chain (attempt -> ciphertext candidate
+    // -> send-start marker) and stops fail-closed before any provider I/O.
+    // The legacy path below stays byte-identical for everyone else.
+    if s.store.is_wal_authoritative(&user_id) {
+        return wal_selected_screenshot_image_upload(
+            &s,
+            &user_id,
+            episode_id,
+            &source_key,
+            &captured_at,
+            &jpeg,
+            &image_bytes,
+        )
+        .await;
+    }
 
     // Reject ineligible bytes before KMS, encryption, or object storage. The
     // same predicate runs again under BEGIN IMMEDIATE when recording the row.
@@ -4733,5 +5074,101 @@ mod tests {
         let resp_test =
             rest_test_episode_email(State(s.clone()), Extension(AuthUser(user.id.clone()))).await;
         assert_eq!(resp_test.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn selected_screenshot_upload_route_is_dual_path_and_stops_before_provider_io() {
+        // ADR-0022 slice 10g: the WAL branch runs the sealed pre-provider
+        // chain in order (attempt before encryption, candidate, send-start),
+        // owns no legacy write and no provider I/O, and the legacy branch is
+        // byte-intact behind exactly one routing check.
+        let source = include_str!("query.rs");
+        let wal_start = source
+            .find(concat!("async fn wal_selected_screenshot_", "image_upload"))
+            .unwrap();
+        let wal_end = source
+            .find(concat!("async fn rest_screenshot_", "image_upload"))
+            .unwrap();
+        let wal_route = &source[wal_start..wal_end];
+        assert_eq!(
+            wal_route
+                .matches(concat!("SelectedScreenshotAttemptPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            wal_route
+                .matches(concat!("prepare_selected_screenshot_upload_", "candidate("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            wal_route
+                .matches(concat!("prepare_selected_screenshot_send_", "started("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            wal_route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            3
+        );
+        assert_eq!(
+            wal_route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            3
+        );
+        // The durable attempt precedes encryption; encryption precedes the
+        // candidate; the candidate precedes the send-start marker.
+        let attempt_at = wal_route
+            .find(concat!("SelectedScreenshotAttemptPlan::", "new("))
+            .unwrap();
+        let encrypt_at = wal_route.find(concat!("encrypt_bound_", "blob(")).unwrap();
+        let candidate_at = wal_route
+            .find(concat!("prepare_selected_screenshot_upload_", "candidate("))
+            .unwrap();
+        let send_at = wal_route
+            .find(concat!("prepare_selected_screenshot_send_", "started("))
+            .unwrap();
+        assert!(attempt_at < encrypt_at, "attempt must be durable first");
+        assert!(
+            encrypt_at < candidate_at,
+            "candidate consumes the ciphertext"
+        );
+        assert!(candidate_at < send_at, "send-start consumes the candidate");
+        // Fail-closed before any paid/irreversible provider side effect: the
+        // WAL branch owns no legacy write, no object PUT, and no cleanup
+        // delete.
+        assert_eq!(wal_route.matches(concat!(".with_", "user(")).count(), 0);
+        assert_eq!(wal_route.matches(concat!(".save_", "user(")).count(), 0);
+        assert_eq!(wal_route.matches(concat!("put_user_", "media(")).count(), 0);
+        assert_eq!(wal_route.matches(concat!("delete_", "media(")).count(), 0);
+        assert_eq!(wal_route.matches("SERVICE_UNAVAILABLE").count(), 1);
+
+        // The legacy route keeps its exact shape behind one routing check.
+        let legacy_end = source
+            .find(concat!("async fn rest_screenshot_", "image_content"))
+            .unwrap();
+        let legacy_route = &source[wal_end..legacy_end];
+        assert_eq!(
+            legacy_route
+                .matches(concat!("is_wal_", "authoritative("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            legacy_route
+                .matches(concat!("wal_selected_screenshot_", "image_upload("))
+                .count(),
+            1
+        );
+        assert_eq!(legacy_route.matches(concat!(".with_", "user(")).count(), 5);
+        assert_eq!(legacy_route.matches(concat!(".save_", "user(")).count(), 2);
+        assert_eq!(
+            legacy_route.matches(concat!("put_user_", "media(")).count(),
+            1
+        );
     }
 }

@@ -3,7 +3,9 @@
     reason = "inactive ADR-0022 selected-screenshot send-start marker is reviewed before provider or launcher ownership"
 )]
 
-//! Inactive durable send-start boundary for one selected-screenshot upload.
+//! Durable send-start boundary for one selected-screenshot upload (wired to
+//! the selected upload route by ADR-0022 slice 10g; the route stops
+//! fail-closed after this marker, before any provider I/O).
 //!
 //! Construction requires the exact-name, DEK-authenticated ciphertext
 //! candidate. This child derives one stable request identity and atomically
