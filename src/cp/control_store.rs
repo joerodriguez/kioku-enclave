@@ -2543,13 +2543,17 @@ fn lifecycle_anchor_conn(
 }
 
 fn lifecycle_binding_for_plan_conn(conn: &Connection, plan: BootstrapPlan) -> Result<()> {
+    lifecycle_binding_active_conn(conn, plan.archive_id())
+}
+
+fn lifecycle_binding_active_conn(conn: &Connection, archive_id: ArchiveId) -> Result<()> {
     let row = conn
         .query_row(
             "SELECT b.state, l.state
              FROM archive_bindings b
              JOIN archive_deletion_ledgers l ON l.archive_id = b.archive_id
              WHERE b.archive_id = ?1",
-            [plan.archive_id().as_bytes().as_slice()],
+            [archive_id.as_bytes().as_slice()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -19564,6 +19568,32 @@ impl ControlStore {
     ) -> Result<RecoveredBootstrap> {
         self.read(move |conn| recover_archive_bootstrap_conn(conn, archive_id))
             .await
+    }
+
+    /// Read-only recovery variant for the inactive genesis driver: `None`
+    /// before any durable reservation exists, otherwise exactly the state
+    /// [`Self::recover_archive_bootstrap`] would return. The genesis driver
+    /// must reuse the durably reserved random plan on retry instead of
+    /// minting a competing one, and only this variant lets it distinguish
+    /// "never reserved" from a durable anchor without matching error text.
+    /// The archive-active precondition still fails closed before the anchor
+    /// is consulted, so this grants nothing the existing method does not.
+    pub(crate) async fn recover_archive_bootstrap_if_reserved(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<RecoveredBootstrap>> {
+        self.read(move |conn| {
+            if lifecycle_anchor_conn(conn, archive_id)?.is_none() {
+                // Pre-anchor archives use the same active-binding predicate
+                // the reservation CAS itself enforces; anything inactive or
+                // deleting still fails closed instead of reading as "never
+                // reserved".
+                lifecycle_binding_active_conn(conn, archive_id)?;
+                return Ok(None);
+            }
+            recover_archive_bootstrap_conn(conn, archive_id).map(Some)
+        })
+        .await
     }
 
     pub(crate) async fn prepare_archive_witness(
