@@ -58,7 +58,7 @@ use axum::{
     Router,
 };
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod acme;
@@ -1002,7 +1002,7 @@ async fn async_main() {
     // durable state through the image-baked runtime coordinates, so the
     // routed read serves the settled lane from the first admitted request.
     // Off-config images with selected users fail startup closed here.
-    let relaunched_wal_serving_authorities =
+    let (relaunched_wal_serving_authorities, unavailable_wal_serving_authorities) =
         archive_v3_serving_relaunch::relaunch_wal_serving_authorities(
             || Ok(Arc::clone(&concrete_kms)),
             Arc::clone(&control_store),
@@ -1014,6 +1014,16 @@ async fn async_main() {
         info!(
             relaunched = relaunched_wal_serving_authorities,
             "relaunched WAL serving authorities before request admission"
+        );
+    }
+    if unavailable_wal_serving_authorities > 0 {
+        // Contained, not ignored: these users are refused rather than served a
+        // stale snapshot, and the rest of the fleet is admitted. Startup no
+        // longer dies for everyone because one archive could not be
+        // reconstructed.
+        error!(
+            unavailable = unavailable_wal_serving_authorities,
+            "WAL serving authorities failed to relaunch; those users are unavailable"
         );
     }
 

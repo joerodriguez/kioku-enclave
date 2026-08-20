@@ -40,13 +40,26 @@ fn require_config_agreement(selected_users: usize, deployment_active: bool) -> R
 }
 
 /// Relaunch every selected user's WAL serving authority before request
-/// admission. Returns the number relaunched; every refusal fails startup
-/// closed. Logging stays content-free: the caller reports the count only.
+/// admission. Returns `(relaunched, unavailable)`.
+///
+/// A refusal that is scoped to one selection contains itself: that user comes
+/// up unavailable and the rest of the fleet is admitted. This is safe rather
+/// than lenient because `install_wal_authority_persistence` has already run
+/// for *every* selection by the time this is called, so a user skipped here
+/// still resolves to the WAL-only persistence policy — reads are refused as
+/// routed, and the routed read finds no authority. Such a user can never be
+/// served the stale legacy snapshot, which is the property that matters.
+///
+/// Failures that are *not* scoped to one selection — config disagreement,
+/// loading the selections, reading the baked coordinates — still fail startup
+/// closed for the whole process.
+///
+/// Logging stays content-free: the caller reports the counts only.
 pub(crate) async fn relaunch_wal_serving_authorities(
     kms: impl FnOnce() -> Result<Arc<GcpKmsClient>>,
     control: Arc<ControlStore>,
     store: Arc<Store>,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let selections = control
         .load_wal_authoritative_persistence_selections()
         .await?;
@@ -57,50 +70,72 @@ pub(crate) async fn relaunch_wal_serving_authorities(
     if selections.is_empty() {
         // No WAL-authoritative user exists; active or off, the image serves
         // the legacy path for everyone and nothing relaunches.
-        return Ok(0);
+        return Ok((0, 0));
     }
     // KMS is consumed lazily: the no-op and refusal paths above never
     // construct it, which the unit tests pin.
     let kms = kms()?;
     let mut relaunched = 0usize;
+    let mut unavailable = 0usize;
     for selection in selections {
-        // One bound runtime per archive: the pending runtime is bind-once, so
-        // re-read the baked deployment for each selection.
-        let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
-            .map_err(|_| {
-                EnclaveError::Store("baked archive-v3 runtime coordinates are invalid".into())
-            })?
-            .ok_or_else(|| {
-                EnclaveError::Store("baked archive-v3 runtime coordinates changed".into())
-            })?;
-        let pending = PendingSingleArchiveWalRuntime::new(deployment, Arc::clone(&kms))
-            .map_err(|_| EnclaveError::Store("archive-v3 runtime construction failed".into()))?;
-        let binding = control.active_archive_binding(selection.user_id()).await?;
-        let sealed = pending
-            .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
-            .map_err(|_| {
-                EnclaveError::Conflict(
-                    "the bound archive does not match the image's baked binding commitment".into(),
-                )
-            })?;
-        let handoff = sealed
-            .reconstruct_wal_serving_handoff(Arc::clone(&control))
-            .await
-            .map_err(|_| {
-                EnclaveError::Conflict(
-                    "the durable WAL-owner handoff could not be reconstructed".into(),
-                )
-            })?;
-        let authority =
-            crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
-                .await
-                .map_err(|_| {
-                    EnclaveError::Store("the WAL serving authority failed to launch".into())
-                })?;
-        store.install_wal_serving_authority(selection.user_id(), Arc::new(authority))?;
-        relaunched += 1;
+        let outcome = relaunch_one(&kms, &control, &store, &selection).await;
+        count_outcome(outcome, &mut relaunched, &mut unavailable);
     }
-    Ok(relaunched)
+    Ok((relaunched, unavailable))
+}
+
+/// Fold one selection's outcome into the counts.
+///
+/// Extracted so the containment decision is testable on its own: a
+/// per-selection failure becomes a count, never an early return. The user is
+/// left without a serving authority, which the routed read refuses; every
+/// other selection still launches.
+fn count_outcome(outcome: Result<()>, relaunched: &mut usize, unavailable: &mut usize) {
+    match outcome {
+        Ok(()) => *relaunched += 1,
+        Err(_) => *unavailable += 1,
+    }
+}
+
+/// Relaunch exactly one selection. Every failure here is scoped to this user.
+async fn relaunch_one(
+    kms: &Arc<GcpKmsClient>,
+    control: &Arc<ControlStore>,
+    store: &Arc<Store>,
+    selection: &crate::cp::control_store::WalAuthoritativePersistenceSelection,
+) -> Result<()> {
+    // One bound runtime per archive: the pending runtime is bind-once, so
+    // re-read the baked deployment for each selection.
+    let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
+        .map_err(|_| {
+            EnclaveError::Store("baked archive-v3 runtime coordinates are invalid".into())
+        })?
+        .ok_or_else(|| {
+            EnclaveError::Store("baked archive-v3 runtime coordinates changed".into())
+        })?;
+    let pending = PendingSingleArchiveWalRuntime::new(deployment, Arc::clone(kms))
+        .map_err(|_| EnclaveError::Store("archive-v3 runtime construction failed".into()))?;
+    let binding = control.active_archive_binding(selection.user_id()).await?;
+    let sealed = pending
+        .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
+        .map_err(|_| {
+            EnclaveError::Conflict(
+                "the bound archive does not match the image's baked binding commitment".into(),
+            )
+        })?;
+    let handoff = sealed
+        .reconstruct_wal_serving_handoff(Arc::clone(control))
+        .await
+        .map_err(|_| {
+            EnclaveError::Conflict(
+                "the durable WAL-owner handoff could not be reconstructed".into(),
+            )
+        })?;
+    let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
+        .await
+        .map_err(|_| EnclaveError::Store("the WAL serving authority failed to launch".into()))?;
+    store.install_wal_serving_authority(selection.user_id(), Arc::new(authority))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -129,14 +164,67 @@ mod tests {
         // The test environment has no baked coordinates (mode off) and no
         // selected users: the relaunch is an exact no-op. KMS is consumed
         // lazily and this closure proves the no-op path never constructs it.
-        let relaunched = relaunch_wal_serving_authorities(
+        let (relaunched, unavailable) = relaunch_wal_serving_authorities(
             || panic!("the no-op relaunch path must not construct KMS"),
             control,
             store,
         )
         .await
         .unwrap();
-        assert_eq!(relaunched, 0);
+        assert_eq!((relaunched, unavailable), (0, 0));
+    }
+
+    #[test]
+    fn a_failed_selection_is_counted_unavailable_and_never_propagates() {
+        let (mut relaunched, mut unavailable) = (0usize, 0usize);
+        count_outcome(Ok(()), &mut relaunched, &mut unavailable);
+        count_outcome(
+            Err(EnclaveError::Conflict("reconstruction failed".into())),
+            &mut relaunched,
+            &mut unavailable,
+        );
+        count_outcome(
+            Err(EnclaveError::Store("the authority failed to launch".into())),
+            &mut relaunched,
+            &mut unavailable,
+        );
+        count_outcome(Ok(()), &mut relaunched, &mut unavailable);
+        // Two users are unavailable and two are serving. Before containment
+        // the first failure ended startup for the entire fleet.
+        assert_eq!((relaunched, unavailable), (2, 2));
+    }
+
+    #[test]
+    fn per_selection_failures_are_contained_rather_than_fleet_fatal() {
+        // The containment is structural, so it is asserted structurally: the
+        // loop must dispatch to `relaunch_one` and turn its `Err` into a
+        // count, never into an early return. A `?` on per-selection work
+        // inside the loop would take startup down for every user, including
+        // users who are not WAL-authoritative at all.
+        let source = include_str!("archive_v3_serving_relaunch.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let loop_body = &production[production
+            .find("for selection in selections {")
+            .expect("the per-selection loop moved")..];
+        let loop_body = &loop_body[..loop_body
+            .find("\n    Ok((relaunched, unavailable))")
+            .unwrap()];
+        assert!(loop_body.contains("relaunch_one("));
+        assert!(
+            loop_body.contains("count_outcome(outcome, &mut relaunched, &mut unavailable)"),
+            "a per-selection failure must be counted, not propagated"
+        );
+        assert!(
+            !loop_body.contains('?'),
+            "no per-selection failure may propagate out of the relaunch loop"
+        );
+        // What must stay fleet-fatal: an off-config image with selected users,
+        // and loading the selections at all. Both sit before the loop.
+        let preamble = &production[..production.find("for selection in selections {").unwrap()];
+        assert!(
+            preamble.contains("require_config_agreement(selections.len(), deployment.is_some())?")
+        );
+        assert!(preamble.contains("load_wal_authoritative_persistence_selections()"));
     }
 
     #[test]
