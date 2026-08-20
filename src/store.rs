@@ -7121,6 +7121,30 @@ impl IdentityRebindTransition {
             .as_mut()
             .ok_or_else(|| EnclaveError::Store("rebind source actor disappeared".into()))?;
         let had_local_changes = handle.dirty || handle.blob_meta.retry_save_before_access;
+        // A WAL-authoritative user's legacy snapshot is frozen and
+        // non-authoritative: every legacy writer is refused, so there is no
+        // in-flight remote writer for the generation-CAS bump to race. Forcing
+        // the bump anyway makes the flush refuse with a `Store` error — not the
+        // `Conflict` the recovery branch below expects — so the transition is
+        // dropped without `complete()`, leaving BOTH identities fenced and the
+        // live user told their account is deleted for the process lifetime.
+        if self.store.wal_selected(&self.old_user_id) {
+            if had_local_changes {
+                // Unflushed legacy mutations cannot exist for a selected user.
+                // If one somehow does, fail closed rather than silently
+                // discarding state we cannot account for.
+                return Err(EnclaveError::Store(
+                    "wal-authoritative rebind source carries unflushed legacy changes".into(),
+                ));
+            }
+            let frozen = Self::snapshot_handle(handle).await?;
+            if frozen.source_generation <= 0 || &frozen.commitment != expected_commitment {
+                return Err(EnclaveError::Conflict(
+                    "legacy rebind source changed after durable prepare".into(),
+                ));
+            }
+            return Ok(frozen);
+        }
         if !had_local_changes {
             // Always perform a same-plaintext generation-CAS bump after the
             // durable provider fence appears. A remote writer that checked
@@ -13575,6 +13599,48 @@ pub(crate) mod tests {
         let again = initialize_genesis_store(&second).unwrap();
         assert_eq!(again.user_version, facts.user_version);
         assert_eq!(again.logical_file_length, facts.logical_file_length);
+    }
+
+    #[tokio::test]
+    async fn wal_authoritative_rebind_freezes_the_frozen_snapshot_without_flushing() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_current_user_object(&gcs, "rebind-selected-old");
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "rebind-selected-old",
+                    crate::archive_v3::ArchiveId::from_bytes([0x71; 16]),
+                ),
+            )
+            .unwrap();
+
+        let mut transition = store
+            .begin_identity_rebind("rebind-selected-old", "rebind-selected-new")
+            .await
+            .unwrap();
+        let snapshot = transition.source_snapshot().await.unwrap();
+        let puts_before = gcs.put_attempts();
+
+        // The legacy snapshot of a selected user is frozen and
+        // non-authoritative: every legacy writer is refused, so there is no
+        // in-flight writer for the generation-CAS bump to race. Before this
+        // branch existed the forced bump made the flush refuse with a `Store`
+        // error — not the `Conflict` the recovery path expects — so the
+        // transition was dropped without `complete()` and BOTH identities
+        // stayed fenced, telling a live user their account was deleted.
+        let frozen = transition
+            .freeze_source(
+                snapshot.base_generation,
+                &snapshot.commitment,
+                &test_rebind_authority(9),
+            )
+            .await
+            .expect("a selected user's rebind must freeze without flushing");
+        assert_eq!(frozen.commitment, snapshot.commitment);
+        assert!(frozen.source_generation > 0);
+        // No provider write happened: the frozen snapshot was not re-uploaded.
+        assert_eq!(gcs.put_attempts(), puts_before);
     }
 
     #[tokio::test]
