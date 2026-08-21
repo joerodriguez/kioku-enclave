@@ -33,6 +33,23 @@
 //! the existing inventory/reachability family can enumerate them by exact
 //! canonical key instead of facing unnameable residue.
 //!
+//! Which side of that boundary a pass is on is decided by the DURABLE anchor,
+//! not by the pass: [`run_durable_genesis`] recovers before it produces, and a
+//! recovered `Prepared` anchor skips byte production and the prepare entirely.
+//! Stating only "replay is byte-exact" would be materially incomplete, because
+//! a post-boundary pass does not produce-then-replay — it produces nothing.
+//! That is load-bearing rather than merely thrifty. `prepare_archive_bootstrap`
+//! returns the STORED payloads at `objects_prepared`, `witness_prepared`, and
+//! `witnessed`, so bytes produced after the boundary are discarded; but a fresh
+//! `ArchiveDek` yields a different wrapped registry, and the staging binding is
+//! derived from that registry's hash. Producing anyway would latch the
+//! producer's staging phase to a binding the witness ladder — which builds its
+//! binding from the stored hash — could never present, wedging every later
+//! pass. It would also cost one DEK, one full checkpoint upload, and several
+//! encrypted control-DB generations on every `token_refresh` that reached a
+//! non-terminal archive, and would eventually exhaust the deliberately bounded
+//! `staging_ordinal` domain.
+//!
 //! * **C0 — after the sign-in transaction commits the binding, before (or
 //!   instead of) the convergence pass.** Nothing genesis-durable exists. The
 //!   binding is `active_legacy` with no genesis ledger row; the next sign-in
@@ -45,35 +62,44 @@
 //!   CAS refuses any competing plan for the same archive, so one archive can
 //!   never acquire two bootstrap attempts.
 //! * **C2 — during byte production, after one or more checkpoint objects were
-//!   created.** This is the pre-boundary window quoted above. The retry
-//!   re-adopts the same reservation, mints a fresh DEK, and stages new object
-//!   identities at new staging ordinals; the staging log is append-only and
-//!   never rewrites the dead attempt's rows, so the orphans stay enumerable.
-//!   No witness exists yet, so there is nothing to duplicate.
+//!   created.** This is the pre-boundary window quoted above, and the only
+//!   window in which a pass produces bytes twice: the anchor is still merely
+//!   `Reserved`, so the retry re-adopts the same reservation, mints a fresh
+//!   DEK, and stages new object identities at new staging ordinals under a
+//!   fresh producer inventory. The staging log is append-only and never
+//!   rewrites the dead attempt's rows, so the orphans stay enumerable. No
+//!   witness exists yet, so there is nothing to duplicate.
 //! * **C3 — at `prepare_archive_bootstrap` with the outcome unknown.** The
 //!   prepare is one encrypted-control transaction: it either durably recorded
 //!   both exact byte payloads under the reservation or it did not. If it did,
-//!   the retry replays those exact bytes and a divergent payload is refused
-//!   rather than overwritten; if it did not, the retry prepares fresh bytes.
-//!   Either way exactly one prepared bootstrap survives.
+//!   the retry recovers a `Prepared` anchor and resumes from those exact
+//!   stored bytes, producing none of its own; if it did not, the anchor is
+//!   still `Reserved` and the retry produces and prepares fresh bytes. Either
+//!   way exactly one prepared bootstrap survives, and the retry never holds
+//!   bytes that disagree with it.
 //! * **C4 — during genesis resolution (registry object, root object, initial
-//!   witness).** Every object create is create-if-absent plus byte-exact
-//!   readback, and the witness create runs the sealed send-started protocol.
-//!   Replay is byte-exact from the prepared payloads, so the retry converges
-//!   on the same registry, the same root, and the same witness. Never two
-//!   witnesses.
+//!   witness).** The anchor is `Prepared`, so the retry resumes from the
+//!   stored payloads rather than producing. Every object create is
+//!   create-if-absent plus byte-exact readback, and the witness create runs
+//!   the sealed send-started protocol, so the retry converges on the same
+//!   registry, the same root, and the same witness. Never two witnesses, and
+//!   never a second DEK.
 //! * **C5 — after resolution, before the `genesis_created` ledger stage.**
 //!   The witness rests at `Legacy`/root sequence 0 and no ledger row exists.
-//!   The retry re-resolves (idempotent), reads the same sequence-0 record, and
-//!   records the stage. Recording `genesis_created` strictly before the ladder
-//!   is entered is what makes this safe: a witness observed beyond genesis
-//!   therefore always has a ledger row to resume from, and can never demand
-//!   the sequence-0 bytes the ladder has already overwritten.
+//!   The retry resumes from the same `Prepared` anchor, re-resolves
+//!   (idempotent), reads the same sequence-0 record, and records the stage.
+//!   Recording `genesis_created` strictly before the ladder is entered is what
+//!   makes this safe: a witness observed beyond genesis therefore always has a
+//!   ledger row to resume from, and can never demand the sequence-0 bytes the
+//!   ladder has already overwritten.
 //! * **C6 — between the two ladder advances (witness at `ShadowWal`, root
 //!   sequence 1).** The ladder re-reads the witness and resumes at the second
 //!   advance. Its owner identity is derived from the durably reserved attempt,
 //!   so a restarted driver validates and reuses its own retained lease instead
-//!   of fencing itself out. Exactly two ladder roots are ever published.
+//!   of fencing itself out. Its staging binding is derived from the anchor's
+//!   stored wrapped-registry hash, which the resumed pass carries unchanged,
+//!   so the rung stages against the one binding its own inventory instance
+//!   latches. Exactly two ladder roots are ever published.
 //! * **C7 — after the terminal advance, before or during the terminal lease
 //!   release.** The ladder re-reads, sees `WalAuthoritative`, and either
 //!   releases its own retained lease or adopts an already-released terminal.
@@ -116,8 +142,9 @@ use crate::{
         PendingSingleArchiveWalRuntime,
     },
     archive_v3_wal_genesis::{
-        prepare_genesis_bootstrap, produce_genesis_bytes, reserve_genesis_bootstrap,
-        resolve_genesis, run_witness_ladder, ReleasedGenesisRegistryWrap, WalGenesisAuthority,
+        prepare_genesis_bootstrap, produce_genesis_bytes, resolve_genesis, run_witness_ladder,
+        start_genesis_bootstrap, GenesisBootstrapStart, ReleasedGenesisRegistryWrap,
+        WalGenesisAuthority,
     },
     cp::control_store::{ControlStore, GenesisStagingInventory, WalGenesisStage},
     crypto::GcpKmsClient,
@@ -340,10 +367,13 @@ async fn run_durable_genesis(
         Arc::clone(&parts.registries),
     );
 
-    // The staging inventory binds to the reserved bootstrap attempt, so the
-    // reservation must be taken first. Reservation itself stages no object and
-    // therefore touches no inventory.
-    let reservation = {
+    // Recover before producing anything. Only the durable bootstrap anchor can
+    // say whether this archive is still short of the prepare crash boundary;
+    // this pass's own memory cannot, because it may be the first pass after a
+    // crash or an ordinary `token_refresh` on a half-built archive. Recovery
+    // and the reservation compare-and-swap both stage zero objects, so neither
+    // touches a staging inventory.
+    let start = {
         let authority = WalGenesisAuthority {
             recovery: control.as_ref(),
             backend: &backend,
@@ -352,33 +382,62 @@ async fn run_durable_genesis(
             inventory: &UnstagedGenesisInventory,
             witness_advance: parts.witness_advance.as_ref(),
         };
-        reserve_genesis_bootstrap(&authority, archive_id)
+        start_genesis_bootstrap(&authority, archive_id)
             .await
             .map_err(map_genesis)?
     };
-    let inventory = GenesisStagingInventory::new(
-        Arc::clone(control),
-        archive_id,
-        reservation.plan().attempt_id(),
-    );
+    let prepared = match start {
+        // Past the boundary. The prepared payloads are the only correct bytes
+        // for this archive — a post-boundary prepare replays them and discards
+        // whatever it is handed — so this pass produces nothing: no second DEK,
+        // no second checkpoint upload, no staging binding the ladder could
+        // never rebuild. See C3-C6.
+        GenesisBootstrapStart::Resume(prepared) => prepared,
+        GenesisBootstrapStart::Produce(reservation) => {
+            // The producer's staging phase gets its own inventory instance.
+            // Its binding carries THIS attempt's freshly wrapped registry
+            // hash, and the latch exists to pin one staging phase to one
+            // binding — not to force two phases that legitimately carry
+            // different bindings through a single latch.
+            let producer_inventory = GenesisStagingInventory::new(
+                Arc::clone(control),
+                archive_id,
+                reservation.plan().attempt_id(),
+            );
+            let authority = WalGenesisAuthority {
+                recovery: control.as_ref(),
+                backend: &backend,
+                objects: parts.objects.as_ref(),
+                registry_wrap: &registry_wrap,
+                inventory: &producer_inventory,
+                witness_advance: parts.witness_advance.as_ref(),
+            };
+            let produced = produce_genesis_bytes(&authority, &std::env::temp_dir(), reservation)
+                .await
+                .map_err(map_genesis)?;
+            // ◄── CRASH BOUNDARY.
+            prepare_genesis_bootstrap(&authority, produced)
+                .await
+                .map_err(map_genesis)?
+        }
+    };
+    let plan = prepared.reservation().plan();
+    let wrapped_registry_hash = prepared.wrapped_registry_hash();
+    // The ladder is a second staging phase, and its binding is built from the
+    // DURABLY PREPARED registry hash, which is the producer's only on a pass
+    // that produced. It gets its own instance so the two phases never contend
+    // for one latch; both still record into the same durable append-only
+    // staging log under the same reserved attempt.
+    let ladder_inventory =
+        GenesisStagingInventory::new(Arc::clone(control), archive_id, plan.attempt_id());
     let authority = WalGenesisAuthority {
         recovery: control.as_ref(),
         backend: &backend,
         objects: parts.objects.as_ref(),
         registry_wrap: &registry_wrap,
-        inventory: &inventory,
+        inventory: &ladder_inventory,
         witness_advance: parts.witness_advance.as_ref(),
     };
-
-    let produced = produce_genesis_bytes(&authority, &std::env::temp_dir(), reservation)
-        .await
-        .map_err(map_genesis)?;
-    // ◄── CRASH BOUNDARY.
-    let prepared = prepare_genesis_bootstrap(&authority, produced)
-        .await
-        .map_err(map_genesis)?;
-    let plan = prepared.reservation().plan();
-    let wrapped_registry_hash = prepared.wrapped_registry_hash();
     let (_resolution, record) = resolve_genesis(&authority, prepared)
         .await
         .map_err(map_genesis)?;
@@ -617,6 +676,42 @@ mod tests {
         let produce = body.find("produce_genesis_bytes(").unwrap();
         let prepare = body.find("prepare_genesis_bootstrap(").unwrap();
         assert!(produce < prepare && prepare < created);
+    }
+
+    /// The C3-C6 convergence claim is structural as well: byte production must
+    /// sit BEHIND the durable recovery decision, never in front of it. A pass
+    /// that produced first would mint a second DEK on every resume, hash a
+    /// second wrapped registry, and stage its checkpoint under a binding the
+    /// witness ladder — which derives its own from the durably stored hash —
+    /// can never present, wedging the ladder permanently (G9-1) while burning
+    /// a checkpoint upload per request (G9-2).
+    #[test]
+    fn byte_production_sits_behind_the_durable_recovery_decision() {
+        let source = include_str!("archive_v3_genesis_trigger.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let body = &production[production
+            .find("async fn run_durable_genesis(")
+            .expect("the durable genesis driver moved")..];
+        let recover = body
+            .find("start_genesis_bootstrap(")
+            .expect("the durable recovery decision moved");
+        let resume = body
+            .find("GenesisBootstrapStart::Resume(prepared) => prepared")
+            .expect("the resume arm must adopt the recovered prepared bootstrap as-is");
+        let produce = body
+            .find("produce_genesis_bytes(")
+            .expect("the byte producer moved");
+        assert!(
+            recover < resume && resume < produce,
+            "byte production must sit inside the not-yet-prepared arm"
+        );
+        // Two staging phases, two inventory instances. The producer's binding
+        // carries this attempt's freshly wrapped registry hash and the ladder's
+        // carries the durably prepared one; on a resumed pass only the ladder
+        // stages at all. The latch still pins each phase to one binding.
+        assert_eq!(body.matches("GenesisStagingInventory::new(").count(), 2);
+        assert!(body.contains("inventory: &producer_inventory"));
+        assert!(body.contains("inventory: &ladder_inventory"));
     }
 
     /// Sign-in must never block on, or fail because of, genesis. The trigger
