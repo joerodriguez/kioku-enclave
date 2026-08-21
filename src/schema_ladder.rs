@@ -197,13 +197,21 @@ fn hash_framed(hasher: &mut Sha256, value: &[u8]) {
 
 /// The frozen epoch-0 baseline digest.
 ///
-/// Recorded once, from the `SCHEMA_SQL` text and `run_migrations` body that
-/// existed when the ladder was introduced. The gate recomputes it and fails if
-/// the baseline is edited: after the ladder exists, schema changes are steps,
-/// never baseline edits.
+/// Recorded from the `SCHEMA_SQL` text, the `run_migrations` body, and the
+/// bodies of the two functions `run_migrations` delegates to —
+/// `cp::mcp_projection::init_projection_schema` and `cp::media::init_schema`.
+/// The gate recomputes it and fails if any of them is edited: after the ladder
+/// exists, schema changes are steps, never baseline edits.
+///
+/// The delegated bodies are covered because they are baseline DDL in every
+/// sense that matters — between them they create 37 of the epoch-0 tables. The
+/// original pin hashed only `store.rs`, so all of that DDL could be edited
+/// without tripping the freeze; the digest then described one file rather than
+/// the baseline it claims to freeze. Re-pinning to close that is a change of
+/// the recorded VALUE under an unchanged, strictly stronger RULE.
 pub(crate) const BASELINE_DIGEST: [u8; 32] = [
-    0xc9, 0xf2, 0x77, 0xfa, 0xac, 0x14, 0x19, 0x96, 0x4b, 0x3f, 0x8f, 0x3c, 0x6a, 0x3c, 0x25, 0x78,
-    0x08, 0xa4, 0x3b, 0x72, 0x10, 0x49, 0x0f, 0x28, 0xfd, 0xcb, 0x3e, 0x42, 0xa2, 0xb9, 0xc5, 0x51,
+    0xbc, 0x90, 0x06, 0x1e, 0xca, 0x42, 0xec, 0xba, 0xb9, 0xaf, 0xd9, 0x33, 0x49, 0xaf, 0xe1, 0x50,
+    0x6c, 0x8c, 0xce, 0x63, 0x8e, 0xcb, 0x81, 0x83, 0x6a, 0xc1, 0xb4, 0xe8, 0xba, 0x9c, 0x3f, 0x66,
 ];
 
 #[cfg(test)]
