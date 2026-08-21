@@ -207,6 +207,40 @@ class SchemaLadderGateTest(unittest.TestCase):
             "editing init_projection_schema must change the baseline digest",
         )
 
+    def test_delegated_bodies_extract_cleanly(self) -> None:
+        """Diagnose a mis-terminated body directly, not as a digest mismatch.
+
+        `function_body` counts braces without skipping string literals, so an
+        unbalanced brace inside SQL would make it stop early or run past the
+        function. That still fails closed — the digest moves and the freeze
+        trips — but it fails as an inscrutable mismatch. Assert the shape
+        here so the real cause is named.
+        """
+        for label, source, marker in (
+            (
+                "cp::media::init_schema",
+                self.media,
+                "pub fn init_schema(conn: &Connection) -> Result<()> {",
+            ),
+            (
+                "init_projection_schema",
+                self.projection,
+                "pub fn init_projection_schema(conn: &Connection) -> SqlResult<()> {",
+            ),
+        ):
+            body = function_body(source, marker)
+            self.assertEqual(
+                body.count("{"),
+                body.count("}"),
+                f"{label}: extracted body is not brace-balanced, so the "
+                f"baseline digest is hashing the wrong span",
+            )
+            self.assertTrue(
+                body.rstrip().endswith("Ok(())"),
+                f"{label}: extracted body does not end at the function's "
+                f"return, so the baseline digest is hashing the wrong span",
+            )
+
     def test_raw_string_steps_are_scanned_for_forbidden_sql(self) -> None:
         """A raw-string step must not bypass the additive-only rule."""
         plain = 'SchemaStep { epoch: 1, id: "a", sql: "ALTER TABLE t ADD COLUMN c TEXT" }'
