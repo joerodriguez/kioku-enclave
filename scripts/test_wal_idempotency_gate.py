@@ -162,7 +162,16 @@ EXPECTED_STORE_CALL_COUNT = 228
 # wrapper over with_user_read). Legacy reads reached through read_user
 # are therefore invisible here — worth a sweep of Store's public
 # surface for with_user delegation.
-EXPECTED_STORE_CALL_SHA256 = "bb8acbdf4031368853a73fed7d10adbbf28c7f07a671bfc1570677c3e2cec414"
+# Capture/session/people reads routed: seven one-for-one swaps of
+# `with_user` -> `wal_authoritative_read` within owners that were already
+# classified, so the count HOLDS at 228. Re-derived against a pristine
+# origin/main (ea2bf62) tree with this module's own helpers after the
+# rebase over the billing routed read; the pristine dump reproduced the
+# prior 228/bb8acbdf pin exactly before anything was written. 12 added,
+# 12 removed, zero reclassifications, zero call-expression hash moves.
+# The five non-swap deltas are owner-body hashes on the two owners whose
+# D4 gates were deliberately RETAINED (upload_capture_event, stream_ack).
+EXPECTED_STORE_CALL_SHA256 = "77f2419105ad055b965ef75f869dbb4612e0547159dd39b30c694c1b4d9a5c42"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -355,7 +364,11 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # the sole delta is `upload_capture_event`'s owner body, whose gate sits
 # above the route's detached media-put spawn; every spawn call-site
 # expression hash is unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "5fb928cba829ee4592fa14f4e07bbc00dfe6eddfef25331dc512344f68b53ffe"
+# Capture reads routed: count HOLDS at 26 with zero additions and zero
+# removals; the sole delta is `upload_capture_event`'s owner body, whose
+# retained D4 gate sits above the route's detached media-put spawn. Same
+# pristine origin/main (ea2bf62) baseline and same helpers as above.
+EXPECTED_WORKER_SPAWN_SHA256 = "46f5e0104296d2996ffadd288be9ae3cda96c37afa88b88bf3da65eaaed18c11"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
