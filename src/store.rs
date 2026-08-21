@@ -3077,6 +3077,22 @@ impl Store {
         guard.installed_generations = guard.installed_generations.saturating_add(1);
         guard.backoff = WAL_RELAUNCH_BACKOFF_MIN;
         guard.next_attempt_at = None;
+        // The wall deadline bounds ONE healing incident, so a successful heal
+        // ends the incident and the next fault starts its own clock. Without
+        // this the deadline ran from the process's first-ever relaunch, and a
+        // second independent fault more than WAL_RELAUNCH_WALL_DEADLINE later
+        // was quarantined with ZERO rebuild attempts — degrading the lane to
+        // exactly the permanent outage this driver exists to end.
+        //
+        // `installed_generations` is deliberately NOT reset here, and must not
+        // be. It is cumulative for the life of the lane because Control bumps
+        // an operation's durable attempt each time it observes a new
+        // owner_instance_id, so a long-pending operation accrues one attempt
+        // per successful generation. Only a cumulative count keeps
+        // MAX_WAL_SERVING_GENERATIONS strictly under MAX_WAL_OWNER_ATTEMPTS.
+        // Resetting it would let repeated heals cross the durable cap and turn
+        // a transient fault into restart-proof write-death.
+        guard.first_attempt_at = None;
         lane.generation.fetch_add(1, AtomicOrdering::AcqRel);
         lane.relaunches_total.fetch_add(1, AtomicOrdering::AcqRel);
         Ok(WalRecoveryOutcome::Replaced)
@@ -13560,6 +13576,78 @@ pub(crate) mod tests {
                 .unwrap()
                 .generation_for_test(),
             1
+        );
+    }
+
+    /// A successful heal ENDS the incident, so a later fault gets the full
+    /// wall budget again — but the generation count stays cumulative.
+    ///
+    /// The wall deadline bounds ONE healing incident. Measuring it from the
+    /// process's first-ever relaunch instead made the driver disarm itself:
+    /// a second, independent fault more than `WAL_RELAUNCH_WALL_DEADLINE`
+    /// later was quarantined `DeadlineExceeded` with ZERO rebuild attempts,
+    /// degrading the lane to exactly the permanent outage this driver exists
+    /// to end. In a long-lived enclave that made self-heal a
+    /// fifteen-minutes-after-the-first-fault feature.
+    ///
+    /// The other half is just as load-bearing in the opposite direction:
+    /// `installed_generations` must NOT reset. Control bumps an operation's
+    /// durable attempt each time it observes a new `owner_instance_id`, so a
+    /// long-pending operation accrues one attempt per successful generation.
+    /// Only a cumulative count keeps `MAX_WAL_SERVING_GENERATIONS` strictly
+    /// under `MAX_WAL_OWNER_ATTEMPTS`; resetting it would let repeated heals
+    /// cross the durable cap and turn a transient fault into restart-proof
+    /// write-death. So this test pins BOTH: the clock resets, the budget does
+    /// not.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_incident_gets_a_fresh_wall_budget_but_not_a_fresh_generation_budget() {
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        // Terminal rebuilds hand back a successor that is itself terminal, so
+        // a second incident is reachable without any extra machinery.
+        let driver = CountingRelaunch::new(FakeRebuild::Terminal);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+
+        // Incident 1 heals.
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Replaced
+        );
+        assert_eq!(lane.relaunches_total.load(AtomicOrdering::Acquire), 1);
+
+        // ...and the enclave serves for longer than one healing budget.
+        tokio::time::advance(WAL_RELAUNCH_WALL_DEADLINE + Duration::from_secs(60)).await;
+
+        // Incident 2 must still get its own budget.
+        let outcome = store
+            .recover_wal_serving_authority(RELAUNCH_USER)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            WalRecoveryOutcome::Replaced,
+            "a later independent fault must heal, not inherit the first \
+             incident's expired wall deadline"
+        );
+        assert_eq!(
+            store.wal_serving_health().quarantined,
+            0,
+            "the lane must not be quarantined by a deadline it never spent"
+        );
+        assert_eq!(driver.calls(), 2);
+
+        // The generation budget, by contrast, is cumulative across incidents.
+        assert_eq!(
+            lane.relaunches_total.load(AtomicOrdering::Acquire),
+            2,
+            "generations must accumulate across incidents; resetting them \
+             would let repeated heals cross the durable attempt cap"
         );
     }
 
