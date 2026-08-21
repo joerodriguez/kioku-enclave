@@ -52,11 +52,49 @@
 //! The ladder is empty and every epoch constant is 0, so this module changes
 //! no behaviour. What it establishes is the pin: `BASELINE_DIGEST` fixes the
 //! epoch-0 text, and the gate fails the build if anyone edits it.
+//!
+//! # The one-time non-additive sweep (2026-08-21)
+//!
+//! The sealed re-baseline is the **last** moment a non-additive baseline
+//! defect is fixable: after the seal the only expressible change is an
+//! additive ladder step, and `AUTOINCREMENT`, a dropped column, a relaxed
+//! CHECK and a changed DEFAULT are all non-additive. So all four frozen DDL
+//! sources were swept once, deliberately, while the window was open. What the
+//! sweep found and what was decided:
+//!
+//! - **Allocator ids that are deleted from.** Exactly three:
+//!   `audio_segments`, `utterances`, `screenshots`. All three now carry
+//!   `AUTOINCREMENT`. Every other plain `INTEGER PRIMARY KEY` in the baseline
+//!   is a *borrowed* key (`screenshot_id`/`episode_id` on a cascade child) or
+//!   a projection mirror (`mcp_safe_*`, whose id is copied from its source
+//!   row); none of them allocates, so `AUTOINCREMENT` would be wrong there,
+//!   and the mirrors inherit non-reuse from the source tables above.
+//!   `browser_snapshots` and `episodes` already had it — the baseline was
+//!   internally inconsistent, and this is what made it consistent.
+//! - **Foreign keys with no explicit `ON DELETE`.** None. Every `REFERENCES`
+//!   in all four sources already names an action.
+//! - **`strftime` DEFAULTs.** 42 tables carry one, and seven sealed-plan
+//!   `INSERT`s still omit such a column. Deliberately **not** changed here:
+//!   the fix is to bind the column in the plan, which is a plan change
+//!   expressible at any time, not a baseline change. Removing a DEFAULT would
+//!   be the non-additive act, and nothing wants it removed.
+//! - **The duplicate dead declarations** in `cp::media::init_schema` for
+//!   `audio_segments` and `utterances` are now **frozen in both directions**:
+//!   they sit behind `CREATE TABLE IF NOT EXISTS` for tables `SCHEMA_SQL`
+//!   already created, so they execute nothing, and they are inside the
+//!   digest, so they can no longer be edited either. They happen to agree
+//!   with the live baseline now that it declares `AUTOINCREMENT`. Deleting
+//!   them is a separate baseline change and there will be no window for it —
+//!   that is the accepted cost of leaving them.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::error::Result;
+use crate::error::{EnclaveError, Result};
+
+fn epoch_marker_error(detail: &str) -> EnclaveError {
+    EnclaveError::Store(format!("schema epoch marker: {detail}"))
+}
 
 /// Domain separation for every digest in this module. Changing it invalidates
 /// the recorded baseline, which is exactly the intended blast radius.
@@ -189,6 +227,122 @@ pub(crate) fn build_canonical(epoch: u32) -> Result<Connection> {
     Ok(conn)
 }
 
+/// The single step that carries `from` to `from + 1`, or `None`.
+pub(crate) fn step_at(to_epoch: u32) -> Option<&'static SchemaStep> {
+    SCHEMA_LADDER.iter().find(|step| step.epoch == to_epoch)
+}
+
+/// The epoch marker a live archive records, plus the ladder chain it reached
+/// it by.
+///
+/// This is a **birth witness**: every path that materializes a servable
+/// archive writes it, epoch 0 included. There is no "absent means zero"
+/// reading anywhere — see [`read_archive_epoch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArchiveEpoch {
+    pub(crate) epoch: u32,
+    pub(crate) chain: [u8; 32],
+}
+
+/// Read the marker.
+///
+/// An **absent row is a refusal, never a coercion to epoch 0.** Coercing would
+/// make "absent" ambiguous between an archive this binary built at epoch 0 and
+/// an archive some other binary built without the marker at all — and the
+/// second is exactly the plain-primary-key archive a rolled-back or mid-deploy
+/// image can still produce. A malformed row (extra rows, out-of-range epoch,
+/// wrong digest length) is likewise a refusal.
+pub(crate) fn read_archive_epoch(conn: &Connection) -> Result<ArchiveEpoch> {
+    let mut statement =
+        conn.prepare("SELECT epoch, chain_digest FROM schema_epoch WHERE singleton = 1")?;
+    let row = statement
+        .query_row([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .optional()?;
+    let Some((epoch, chain)) = row else {
+        return Err(epoch_marker_error(
+            "archive carries no epoch marker; it was not born under this baseline",
+        ));
+    };
+    let epoch = u32::try_from(epoch)
+        .map_err(|_| epoch_marker_error("recorded epoch is out of range for this binary"))?;
+    let chain: [u8; 32] = chain
+        .try_into()
+        .map_err(|_| epoch_marker_error("recorded chain digest is not 32 bytes"))?;
+    Ok(ArchiveEpoch { epoch, chain })
+}
+
+/// Write the marker for `epoch`, unconditionally — epoch 0 included.
+///
+/// Seeding at epoch 0 is what makes the row a birth witness rather than a
+/// record that only appears once the ladder has moved. The upsert is asserted
+/// (`changes() == 1`) and then re-read and compared, so a CHECK that silently
+/// declined the write cannot pass for a success.
+pub(crate) fn seed_epoch_marker(conn: &Connection, epoch: u32) -> Result<()> {
+    let chain = chain_digest(epoch);
+    let changed = conn.execute(
+        "INSERT INTO schema_epoch (singleton, epoch, chain_digest) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET epoch = excluded.epoch,
+                                              chain_digest = excluded.chain_digest",
+        rusqlite::params![epoch, &chain[..]],
+    )?;
+    if changed != 1 {
+        return Err(epoch_marker_error("upsert did not write exactly one row"));
+    }
+    let readback = read_archive_epoch(conn)?;
+    if readback != (ArchiveEpoch { epoch, chain }) {
+        return Err(epoch_marker_error("marker did not read back as written"));
+    }
+    Ok(())
+}
+
+/// Refuse unless this binary can serve the archive's recorded epoch.
+///
+/// Two conjuncts:
+///   `SCHEMA_EPOCH_MIN_SERVABLE <= marker.epoch <= SCHEMA_EPOCH_HEAD`
+/// and `marker.chain == chain_digest(marker.epoch)`.
+///
+/// The second is what makes the marker non-self-certifying: the chain is
+/// recomputed from **this** binary's `BASELINE_DIGEST` + `SCHEMA_LADDER`, so an
+/// archive cannot vouch for its own history. At epoch 0 the chain is exactly
+/// the baseline anchor, which is what carries the re-baselined digest into
+/// every archive at birth.
+#[allow(
+    clippy::absurd_extreme_comparisons,
+    reason = "the lower bound is vacuous while SCHEMA_EPOCH_MIN_SERVABLE is 0 and becomes \
+              meaningful the moment it is raised; writing the range check as half a range \
+              would make raising the floor a silent no-op"
+)]
+pub(crate) fn validate_servable_epoch(marker: ArchiveEpoch) -> Result<()> {
+    if marker.epoch < SCHEMA_EPOCH_MIN_SERVABLE || marker.epoch > SCHEMA_EPOCH_HEAD {
+        return Err(epoch_marker_error(
+            "recorded epoch is outside this binary's servable range",
+        ));
+    }
+    if marker.chain != chain_digest(marker.epoch) {
+        return Err(epoch_marker_error(
+            "recorded chain does not match this binary's baseline and ladder",
+        ));
+    }
+    Ok(())
+}
+
+/// Verbatim product-schema equality against `build_canonical(marker.epoch)`.
+///
+/// Shares [`crate::store::schema_descriptor`] with the read path on purpose: a
+/// second descriptor query here would be a second definition of "the same
+/// schema", which is precisely the divergence the ladder exists to prevent.
+pub(crate) fn assert_canonical_at(conn: &Connection, marker: ArchiveEpoch) -> Result<()> {
+    let canonical = build_canonical(marker.epoch)?;
+    if crate::store::schema_descriptor(conn)? != crate::store::schema_descriptor(&canonical)? {
+        return Err(epoch_marker_error(
+            "archive schema is not what this binary would build at its recorded epoch",
+        ));
+    }
+    Ok(())
+}
+
 fn hash_framed(hasher: &mut Sha256, value: &[u8]) {
     // Length-prefixed so ("ab","c") cannot alias ("a","bc").
     hasher.update((value.len() as u64).to_be_bytes());
@@ -209,9 +363,33 @@ fn hash_framed(hasher: &mut Sha256, value: &[u8]) {
 /// without tripping the freeze; the digest then described one file rather than
 /// the baseline it claims to freeze. Re-pinning to close that is a change of
 /// the recorded VALUE under an unchanged, strictly stronger RULE.
+///
+/// # Re-pin history
+///
+/// The recorded value has moved three times. The RULE — "the recorded digest
+/// must describe the live baseline" — has never moved, and never may.
+///
+/// 1. `c9f277fa…c551`, 2026-08-19 — genesis (#282/#286), `store.rs` only.
+/// 2. `bc90061e…3f66`, 2026-08-20 — #316, extended to the four DDL sources.
+/// 3. `d5ff84db…2dfb`, 2026-08-21 — **the sealed re-baseline.** Taken inside
+///    the zero-archive window under the proof obligation in
+///    `docs/adr/0022/zero-archive-proof.md`. It made `audio_segments.id`,
+///    `utterances.id` and `screenshots.id` `AUTOINCREMENT` and added the
+///    `schema_epoch` birth witness. This is a **non-additive** baseline change
+///    and therefore not expressible as a ladder step — `AUTOINCREMENT` cannot
+///    be added to an existing table by any additive DDL, and
+///    `CREATE TABLE IF NOT EXISTS` makes the edit a permanent silent no-op on
+///    any archive that already exists. It was legitimate only because the set
+///    of existing archives was provably empty, and it is the **last** such
+///    change: `scripts/schema_baseline_seal.json` records the window and
+///    closes it.
+///
+/// Recompute, never transcribe: `python3 scripts/test_schema_ladder_gate.py
+/// --print-digest` emits this literal from the same `baseline_digest` the gate
+/// asserts against.
 pub(crate) const BASELINE_DIGEST: [u8; 32] = [
-    0xbc, 0x90, 0x06, 0x1e, 0xca, 0x42, 0xec, 0xba, 0xb9, 0xaf, 0xd9, 0x33, 0x49, 0xaf, 0xe1, 0x50,
-    0x6c, 0x8c, 0xce, 0x63, 0x8e, 0xcb, 0x81, 0x83, 0x6a, 0xc1, 0xb4, 0xe8, 0xba, 0x9c, 0x3f, 0x66,
+    0xd5, 0xff, 0x84, 0xdb, 0x4c, 0x22, 0xac, 0x09, 0x3b, 0x52, 0x64, 0x0a, 0xca, 0x6e, 0xad, 0x6d,
+    0x1d, 0xb5, 0xd9, 0x72, 0x6f, 0x27, 0x92, 0x7d, 0xe7, 0x01, 0xd7, 0x91, 0xb1, 0x79, 0x2d, 0xfb,
 ];
 
 #[cfg(test)]
@@ -439,5 +617,147 @@ mod tests {
         let before = descriptor(&conn);
         apply_steps(&conn, 0, SCHEMA_EPOCH_HEAD).unwrap();
         assert_eq!(descriptor(&conn), before);
+    }
+
+    // ── The epoch marker: a birth witness, not an absence ──────────────────
+
+    #[test]
+    fn seeding_at_epoch_zero_writes_a_row_rather_than_nothing() {
+        // The whole amendment. If epoch 0 were encoded as "no row", then
+        // "no row" would also be what a pre-marker binary leaves behind, and
+        // the two would be indistinguishable at open — which is exactly the
+        // plain-primary-key archive the re-baseline exists to refuse.
+        let conn = build_canonical(0).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM schema_epoch", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "build_canonical is a schema reference, not an archive: it must \
+             NOT seed the marker, or the canonical stops describing a fresh \
+             baseline"
+        );
+
+        seed_epoch_marker(&conn, 0).unwrap();
+        let marker = read_archive_epoch(&conn).unwrap();
+        assert_eq!(marker.epoch, 0);
+        assert_eq!(marker.chain, chain_digest(0));
+        validate_servable_epoch(marker).unwrap();
+    }
+
+    #[test]
+    fn an_absent_marker_is_a_refusal_and_never_epoch_zero() {
+        let conn = build_canonical(0).unwrap();
+        let error = read_archive_epoch(&conn).unwrap_err().to_string();
+        assert!(
+            error.contains("no epoch marker"),
+            "absent marker must refuse, not coerce: {error}"
+        );
+    }
+
+    #[test]
+    fn a_marker_whose_chain_is_not_this_binarys_baseline_is_refused() {
+        // Closes D3: the archive supplies the value that would otherwise
+        // select its own comparand. The chain is recomputed here, from THIS
+        // binary's BASELINE_DIGEST, so an archive cannot certify itself.
+        let conn = build_canonical(0).unwrap();
+        seed_epoch_marker(&conn, 0).unwrap();
+        conn.execute(
+            "UPDATE schema_epoch SET chain_digest = ?1 WHERE singleton = 1",
+            [&[7_u8; 32][..]],
+        )
+        .unwrap();
+        let marker = read_archive_epoch(&conn).unwrap();
+        assert_ne!(marker.chain, chain_digest(0));
+        let error = validate_servable_epoch(marker).unwrap_err().to_string();
+        assert!(error.contains("chain does not match"), "{error}");
+    }
+
+    #[test]
+    fn an_epoch_this_binary_cannot_serve_is_refused() {
+        let above = ArchiveEpoch {
+            epoch: SCHEMA_EPOCH_HEAD + 1,
+            chain: chain_digest(SCHEMA_EPOCH_HEAD + 1),
+        };
+        assert!(validate_servable_epoch(above).is_err());
+    }
+
+    #[test]
+    fn a_malformed_marker_row_is_a_refusal() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Without the baseline CHECKs, so the malformed shapes are reachable.
+        conn.execute_batch(
+            "CREATE TABLE schema_epoch (singleton INTEGER PRIMARY KEY, \
+             epoch INTEGER NOT NULL, chain_digest BLOB NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_epoch VALUES (1, 0, ?1)",
+            [&[0_u8; 8][..]],
+        )
+        .unwrap();
+        assert!(read_archive_epoch(&conn)
+            .unwrap_err()
+            .to_string()
+            .contains("32 bytes"));
+
+        conn.execute("UPDATE schema_epoch SET epoch = -1", [])
+            .unwrap();
+        assert!(read_archive_epoch(&conn).is_err());
+    }
+
+    #[test]
+    fn the_baseline_checks_refuse_a_zero_or_short_chain_digest() {
+        // The CHECK constraints are the in-database half of the same refusal.
+        let conn = build_canonical(0).unwrap();
+        for bad in [vec![0_u8; 32], vec![1_u8; 31]] {
+            assert!(
+                conn.execute("INSERT INTO schema_epoch VALUES (1, 0, ?1)", [&bad[..]])
+                    .is_err(),
+                "baseline CHECK admitted a malformed chain digest"
+            );
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO schema_epoch VALUES (2, 0, ?1)",
+                [&[1_u8; 32][..]]
+            )
+            .is_err(),
+            "baseline CHECK admitted a second marker row"
+        );
+    }
+
+    #[test]
+    fn seeding_is_an_upsert_that_reads_back() {
+        let conn = build_canonical(0).unwrap();
+        seed_epoch_marker(&conn, 0).unwrap();
+        seed_epoch_marker(&conn, 0).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM schema_epoch", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the singleton must stay a singleton across re-seeds"
+        );
+    }
+
+    #[test]
+    fn assert_canonical_at_pins_the_archive_against_its_recorded_epoch() {
+        let conn = build_canonical(0).unwrap();
+        seed_epoch_marker(&conn, 0).unwrap();
+        let marker = read_archive_epoch(&conn).unwrap();
+        // The marker row itself is data, not schema, so a seeded archive is
+        // still descriptor-identical to the canonical.
+        assert_canonical_at(&conn, marker).unwrap();
+
+        conn.execute_batch("CREATE TABLE interloper (x INTEGER);")
+            .unwrap();
+        assert!(assert_canonical_at(&conn, marker).is_err());
+    }
+
+    #[test]
+    fn step_at_selects_the_single_step_that_reaches_an_epoch() {
+        assert!(step_at(1).is_none(), "vacuous while the ladder is empty");
+        assert!(step_at(0).is_none());
     }
 }
