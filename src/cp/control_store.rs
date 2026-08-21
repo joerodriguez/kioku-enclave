@@ -14868,6 +14868,19 @@ fn inspect_wal_owner_operation_conn(
         || fingerprint.as_slice() != identity.request_fingerprint().as_bytes()
         || kind != identity.kind() as i64
     {
+        // A stranded 'prepared' row is provably non-authoritative: the
+        // schema CHECK forces capture_commitment, candidate_root_seq, and
+        // observed_witness NULL at 'prepared', and every root-advance path
+        // requires a candidate — nothing durable can descend from it.
+        // Report the head settled for THIS identity; the mutating prepare
+        // abandons the stale row under a stage-pinned delete. Justified by
+        // candidate-absence — never by owner-death (owner_instance_id
+        // re-randomizes on lane replacement) and never by the false lemma
+        // "prepared means record_captured never ran" (two production paths
+        // rewrite captured back to prepared).
+        if stage == "prepared" {
+            return Ok(WalOwnerAdmission::SettledHead);
+        }
         return Err(EnclaveError::Conflict(
             "another WAL operation is unresolved".into(),
         ));
@@ -14996,15 +15009,52 @@ fn prepare_wal_owner_operation_conn(
             tx.commit()?;
             return Ok((attempt, changed));
         }
-        if stage != "witnessed" {
+        if stage == "prepared" {
+            // Abandon the stranded non-authoritative row (candidate-absence;
+            // see inspect_wal_owner_operation_conn). Stage-pinned so a
+            // concurrent capture of the same row refuses instead of being
+            // silently dropped; 'captured' rows are NEVER abandoned here —
+            // they carry reserved artifacts.
+            //
+            // The attempt is retired to 'superseded', never deleted: the
+            // artifact rows foreign-key the attempt, so deleting it would
+            // either fail or strand uploaded objects outside the reachability
+            // walk. Superseding also clears the one-active-attempt partial
+            // index so the displacing operation can insert its own attempt —
+            // the same mechanism the witnessed arm gets from its earlier
+            // transition to 'witnessed'. Any reserved artifacts stay parented
+            // by the superseded attempt: that is the already-disclosed
+            // superseded-attempt residue, not a new leak.
+            if tx.execute(
+                "UPDATE archive_v3_wal_publication_attempts SET state='superseded'
+                 WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+                   AND state='active'",
+                rusqlite::params![
+                    binding.archive_id().as_bytes().as_slice(),
+                    kind,
+                    operation.as_slice(),
+                ],
+            )? != 1
+                || tx.execute(
+                    "DELETE FROM archive_v3_wal_publications
+                     WHERE archive_id=?1 AND stage='prepared'",
+                    [binding.archive_id().as_bytes().as_slice()],
+                )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "WAL publication abandon raced".into(),
+                ));
+            }
+        } else if stage != "witnessed" {
             return Err(EnclaveError::Conflict(
                 "another WAL operation is active".into(),
             ));
+        } else {
+            tx.execute(
+                "DELETE FROM archive_v3_wal_publications WHERE archive_id=?1",
+                [binding.archive_id().as_bytes().as_slice()],
+            )?;
         }
-        tx.execute(
-            "DELETE FROM archive_v3_wal_publications WHERE archive_id=?1",
-            [binding.archive_id().as_bytes().as_slice()],
-        )?;
     }
     let owner = validate_wal_owner_binding_conn(&tx, binding)?
         .ok_or_else(|| EnclaveError::Auth("durable WAL owner lease is absent".into()))?;
@@ -31843,6 +31893,185 @@ mod tests {
             assert!(!replay.1);
             assert_eq!(replay.0.attempt_id(), next.0.attempt_id());
         }
+    }
+
+    /// A publication row stranded at `'prepared'` is provably
+    /// non-authoritative: the table CHECK forces `expected_wal_generation`,
+    /// `capture_commitment`, `candidate_root_seq` and `observed_witness` all
+    /// NULL at that stage, and every root-advance path requires a candidate.
+    /// So a different operation may report the head settled and abandon it.
+    ///
+    /// This is justified by candidate-absence ONLY. It is emphatically NOT
+    /// justified by the lemma "a 'prepared' row proves record_captured never
+    /// ran" — that lemma is FALSE: `rebase_wal_owner_pre_send_rows_conn` and
+    /// `prepare_wal_owner_operation_conn` both rewrite a captured row back to
+    /// 'prepared'. The `'captured'` case is covered by the negative test
+    /// below, which must keep refusing: captured rows carry reserved
+    /// artifacts that abandoning would orphan.
+    #[test]
+    fn a_stranded_prepared_publication_never_wedges_the_next_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("stranded-prepared-publication.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (_terminal, _acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
+
+        let stranded_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0x41,
+            0x42,
+        );
+        let stranded = prepare_wal_owner_operation_conn(
+            &conn,
+            &binding,
+            wal_owner_instance(0x43),
+            stranded_identity,
+        )
+        .unwrap();
+        assert!(stranded.1);
+        assert_eq!(
+            conn.query_row("SELECT stage FROM archive_v3_wal_publications", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "prepared"
+        );
+
+        // A different operation must be admitted, not wedged.
+        let next_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::CaptureSessionFinish,
+            0x44,
+            0x45,
+        );
+        assert!(matches!(
+            inspect_wal_owner_operation_conn(&conn, &binding, next_identity).unwrap(),
+            WalOwnerAdmission::SettledHead
+        ));
+
+        let next_instance = wal_owner_instance(0x46);
+        let next = prepare_wal_owner_operation_conn(&conn, &binding, next_instance, next_identity)
+            .unwrap();
+        assert!(next.1);
+
+        // The stranded row is gone and the head is now the new operation.
+        let (rows, stage, operation): (i64, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT count(*),
+                        (SELECT stage FROM archive_v3_wal_publications),
+                        (SELECT operation_id FROM archive_v3_wal_publications)
+                 FROM archive_v3_wal_publications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(stage, "prepared");
+        assert_eq!(
+            operation.as_slice(),
+            next_identity.operation_id().as_bytes(),
+            "the abandoned row must be replaced by the admitted operation"
+        );
+        assert_ne!(
+            operation.as_slice(),
+            stranded_identity.operation_id().as_bytes()
+        );
+
+        // The stranded ATTEMPT is retired, never deleted: artifact rows
+        // foreign-key it, and the reachability walk enumerates residue
+        // through it. Exactly one active attempt remains — the new one.
+        let (stranded_state, active): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT state FROM archive_v3_wal_publication_attempts
+                          WHERE operation_id=?1),
+                        (SELECT count(*) FROM archive_v3_wal_publication_attempts
+                          WHERE state='active')",
+                [stranded_identity.operation_id().as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stranded_state, "superseded");
+        assert_eq!(active, 1);
+        // Replay of the admitted operation still returns the same attempt.
+        let replay =
+            prepare_wal_owner_operation_conn(&conn, &binding, next_instance, next_identity)
+                .unwrap();
+        assert!(!replay.1);
+        assert_eq!(replay.0.attempt_id(), next.0.attempt_id());
+    }
+
+    /// The companion negative: a `'captured'` row has reserved artifacts and a
+    /// non-null capture commitment, so it is NOT abandonable. Both the
+    /// read-only admission and the mutating prepare must keep refusing a
+    /// different operation, exactly as they did before the 'prepared'
+    /// tolerance was added.
+    #[test]
+    fn a_captured_publication_still_refuses_a_different_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captured-publication-refuses.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (_terminal, _acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
+
+        let held_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0x51,
+            0x52,
+        );
+        let held_instance = wal_owner_instance(0x53);
+        let held = prepare_wal_owner_operation_conn(&conn, &binding, held_instance, held_identity)
+            .unwrap();
+        assert!(held.1);
+
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            held_identity,
+            held.0.owner_id(),
+            held_instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0x54; 16]),
+            held.0,
+            1,
+        )
+        .unwrap();
+        record_wal_captured_conn(&conn, &context, [0x55; 32], 1, 1).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT stage FROM archive_v3_wal_publications", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "captured"
+        );
+
+        let next_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::CaptureSessionFinish,
+            0x56,
+            0x57,
+        );
+        assert!(matches!(
+            inspect_wal_owner_operation_conn(&conn, &binding, next_identity),
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert!(matches!(
+            prepare_wal_owner_operation_conn(
+                &conn,
+                &binding,
+                wal_owner_instance(0x58),
+                next_identity,
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The captured row survives untouched — nothing was orphaned.
+        let (rows, stage): (i64, String) = conn
+            .query_row(
+                "SELECT count(*), (SELECT stage FROM archive_v3_wal_publications)
+                 FROM archive_v3_wal_publications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(stage, "captured");
     }
 
     fn reserve_one_wal_test_segment(
