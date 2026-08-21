@@ -86,6 +86,89 @@
 //!   with the live baseline now that it declares `AUTOINCREMENT`. Deleting
 //!   them is a separate baseline change and there will be no window for it —
 //!   that is the accepted cost of leaving them.
+//!
+//! # RUNBOOK — adding a new table, column or index
+//!
+//! **This is the standing answer, and after the seal it is the only
+//! procedure.** Follow it rather than reinventing one; every numbered step
+//! below exists because skipping it has a specific failure mode, named
+//! inline. The mechanism that executes it is
+//! [`crate::cp::schema_epoch::wal::advance_one_epoch`].
+//!
+//! 1. **Confirm the seal.** `python3 scripts/test_schema_ladder_gate.py`
+//!    passes and `scripts/schema_baseline_seal.json` reads `"sealed": true`.
+//!    If it reads `false` you are inside the zero-archive window — stop and
+//!    read `docs/adr/0022/zero-archive-proof.md` instead. The window is not a
+//!    convenience: using it requires discharging the full proof obligation.
+//!    Gate rule **G4** enforces this and will fail the build if you append a
+//!    step over an unsealed baseline, because `chain_digest` anchors on
+//!    `BASELINE_DIGEST` and a step over a movable anchor produces a chain that
+//!    changes retroactively — every archive that recorded the old chain would
+//!    be refused.
+//!
+//! 2. **Write the DDL as exactly one transaction-safe statement.**
+//!    - New table → `CREATE TABLE <name> (...)`, [`StepClass::Table`].
+//!    - New column → `ALTER TABLE <t> ADD COLUMN <c> <type>`,
+//!      [`StepClass::Column`]. The column lands **last** in declaration order,
+//!      and its `DEFAULT` must be a **constant**: SQLite refuses
+//!      `ALTER ... ADD COLUMN` with a non-constant default, and a `strftime`
+//!      default would inject a clock into a replayed plan. This program has
+//!      shipped four defects of exactly that shape.
+//!    - New index → `CREATE INDEX` / `CREATE UNIQUE INDEX`,
+//!      [`StepClass::Index`].
+//!    - Anything else — dropping a column, changing a constraint, adding
+//!      `AUTOINCREMENT` to an existing table — is **not expressible**. There is
+//!      no rebuild step class and there must not be one: `FORBIDDEN_STEP_SQL`
+//!      in the gate rejects `drop table`, `drop index`, `drop column`,
+//!      `rename to`, `rename column` and `alter table drop` for every step,
+//!      and the re-baseline was chosen over a rebuild precisely so that rule
+//!      would never need relaxing.
+//!    - **Never write the step with `IF NOT EXISTS`.** A silently idempotent
+//!      step would let a second application pass unnoticed, which is exactly
+//!      what the `from_epoch` precondition exists to catch.
+//!
+//! 3. **Append one [`SchemaStep`]** to [`SCHEMA_LADDER`] with
+//!    `epoch: SCHEMA_EPOCH_HEAD + 1`, a fresh never-reused `id` of the form
+//!    `"NNNN_snake_name"`, its class, and the SQL as a plain double-quoted Rust
+//!    literal. **Never edit, reorder or renumber a shipped step** — its digest
+//!    is recorded in the chain every archive carries.
+//!
+//! 4. **Bump [`SCHEMA_EPOCH_HEAD`]** to the new epoch. Leave
+//!    [`SCHEMA_EPOCH_TARGET`] and [`SCHEMA_EPOCH_MIN_SERVABLE`] alone. Ship.
+//!    This deploys a binary that *knows* the step and applies nothing. The
+//!    rollout gap is deliberate: the step is observed in service before
+//!    anything acts on it.
+//!
+//! 5. **Add the three required tests:** `build_canonical(N)` succeeds; an
+//!    archive advanced `N-1 → N` by the driver has a product descriptor
+//!    byte-identical to `build_canonical(N)`; and the descriptor delta versus
+//!    `N-1` is exactly the intended object and nothing else, asserted as a
+//!    diff. The end-to-end tests in this module and in
+//!    `crate::cp::schema_epoch::wal::advance` are written to be copied.
+//!
+//! 6. **Verify the fleet is on the new binary** — every serving replica
+//!    reports `SCHEMA_EPOCH_HEAD == N`. Only then, in a **second** PR, bump
+//!    [`SCHEMA_EPOCH_TARGET`] to `N`. Ship.
+//!
+//! 7. **The driver advances each archive by one epoch** under its own lease at
+//!    next admission. Progress is observable as the `schema_epoch` row. No
+//!    manual action, and no batch job: every intermediate epoch is a complete,
+//!    servable state, which is the structural property a drop-and-recreate
+//!    rebuild does not have.
+//!
+//! 8. **When every archive reports `epoch >= N`** and no binary older than the
+//!    step is in service, bump [`SCHEMA_EPOCH_MIN_SERVABLE`] to `N` in a
+//!    **third** PR. Only after this may reading code assume the new object
+//!    exists.
+//!
+//! 9. **Until step 8 completes, product code must tolerate `epoch < N`.**
+//!    Absence of the new column or table is a legal servable state. Degrade,
+//!    never error.
+//!
+//! **Never, at any point after the seal:** edit `SCHEMA_SQL`, the
+//! `run_migrations` body, `cp::media::init_schema`, or
+//! `cp::mcp_projection::init_projection_schema`. All four are frozen by
+//! [`BASELINE_DIGEST`], and the gate recomputes it on every run.
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -127,6 +210,46 @@ pub(crate) struct SchemaStep {
 
 /// The ladder. **Append only** — editing or reordering a shipped step changes
 /// its digest, which the gate rejects and which a live archive would refuse.
+///
+/// # Still empty, and why
+///
+/// Not because nothing wants a step. Gate rule **G4** refuses any entry here
+/// while `scripts/schema_baseline_seal.json` reads `"sealed": false`, and it
+/// still does: the zero-archive proof in `docs/adr/0022/zero-archive-proof.md`
+/// declares itself undischarged. Appending a step now would fail CI, and
+/// satisfying the gate by flipping the seal without the proof is the exact act
+/// the seal exists to prevent. So the first step ships in the PR that follows
+/// the cutover, not before.
+///
+/// The mechanism that will apply it is finished and tested:
+/// [`crate::cp::schema_epoch::wal`]. Its end-to-end tests drive a real archive
+/// from epoch 0 to epoch 1 through the production plan, ledger and canonical
+/// comparison, over a fixture ladder carrying the reviewed step below.
+///
+/// # The reviewed candidate for step 1
+///
+/// ```ignore
+/// SchemaStep {
+///     epoch: 1,
+///     id: "0001_capture_events_stream_sequence",
+///     class: StepClass::Index,
+///     sql: "CREATE INDEX idx_capture_events_stream_sequence \
+///           ON capture_events (stream_id, sequence);",
+/// }
+/// ```
+///
+/// `cp::media::advance_contiguous_ack` probes
+/// `capture_events WHERE stream_id=?1 AND sequence=?2` inside a loop, on every
+/// capture-event ingest, from both insert paths. The table's
+/// `UNIQUE(device_id, stream_id, sequence)` cannot serve that predicate — its
+/// leading column is `device_id`, which the query never binds — so every probe
+/// is a full scan, and `capture_events` has no production `DELETE`, so the
+/// scanned table only grows. Deliberately **not** `UNIQUE`: nothing forces
+/// `capture_events.device_id` to agree with its stream's device, so a unique
+/// step could fail at apply time on a live archive, and a step must never be
+/// able to do that. An index also needs no "tolerate `epoch < N`" branch in
+/// product code, which makes it the cheapest possible first rung of the
+/// runbook above.
 pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[];
 
 /// Highest epoch this binary knows how to build.
@@ -157,6 +280,149 @@ const _: () = assert!(SCHEMA_EPOCH_TARGET <= SCHEMA_EPOCH_HEAD);
 )]
 const _: () = assert!(SCHEMA_EPOCH_MIN_SERVABLE <= SCHEMA_EPOCH_TARGET);
 
+/// One coherent (ladder, epoch-constants) pair.
+///
+/// [`LadderView::PRODUCTION`] is the only view any production path ever names,
+/// and every free function below is a thin binding to it, so production
+/// behaviour is byte-for-byte what it was before this type existed. The type
+/// is a strict generalisation, never a relaxation: it adds no way to reach a
+/// different ladder from production code.
+///
+/// # Why the seam exists
+///
+/// Gate rule **G4** (`scripts/test_schema_ladder_gate.py`) refuses any step in
+/// `SCHEMA_LADDER` while `scripts/schema_baseline_seal.json` still reads
+/// `"sealed": false`, because a step shipped over a movable `BASELINE_DIGEST`
+/// anchor produces a chain that changes retroactively. The seal flips at
+/// cutover, under the zero-archive proof — not here. So the production ladder
+/// must stay empty for now, and an empty ladder cannot exercise a single line
+/// of the advance machinery: every check would pass vacuously.
+///
+/// The test-only constructor closes that gap. A fixture view carries a real
+/// step and real epoch constants, and the advance plan, the driver, the
+/// canonical builder and the descriptor comparison all run over it through
+/// **exactly** the production code path — the same `apply_each`, the same
+/// `schema_descriptor`, the same marker writes. The only thing a fixture
+/// changes is *which* DDL is in the ladder. It also buys coverage a shipped
+/// step never could: a step that fails mid-batch, so the whole-transaction
+/// rollback is provable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LadderView {
+    steps: &'static [SchemaStep],
+    head: u32,
+    target: u32,
+    min_servable: u32,
+}
+
+impl LadderView {
+    /// The one view production uses.
+    pub(crate) const PRODUCTION: Self = Self {
+        steps: SCHEMA_LADDER,
+        head: SCHEMA_EPOCH_HEAD,
+        target: SCHEMA_EPOCH_TARGET,
+        min_servable: SCHEMA_EPOCH_MIN_SERVABLE,
+    };
+
+    /// A fixture view. Test-only on purpose: promoting it would turn "which
+    /// ladder is authoritative" from a compile-time fact into a parameter.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        steps: &'static [SchemaStep],
+        head: u32,
+        target: u32,
+        min_servable: u32,
+    ) -> Self {
+        assert!(target <= head, "fixture view drives past what it can build");
+        assert!(
+            min_servable <= target,
+            "fixture view refuses an epoch it would create"
+        );
+        Self {
+            steps,
+            head,
+            target,
+            min_servable,
+        }
+    }
+
+    pub(crate) fn head(self) -> u32 {
+        self.head
+    }
+
+    pub(crate) fn target(self) -> u32 {
+        self.target
+    }
+
+    /// The single step that carries `to_epoch - 1` to `to_epoch`, or `None`.
+    pub(crate) fn step_at(self, to_epoch: u32) -> Option<&'static SchemaStep> {
+        self.steps.iter().find(|step| step.epoch == to_epoch)
+    }
+
+    /// Digest of this ladder's prefix through `epoch`, chained from the
+    /// baseline. See [`chain_digest`].
+    pub(crate) fn chain_digest(self, epoch: u32) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(LADDER_DOMAIN);
+        hasher.update(BASELINE_DIGEST);
+        let mut digest: [u8; 32] = hasher.finalize().into();
+        for step in self.steps.iter().filter(|step| step.epoch <= epoch) {
+            let mut hasher = Sha256::new();
+            hasher.update(digest);
+            hasher.update(step_digest(step));
+            digest = hasher.finalize().into();
+        }
+        digest
+    }
+
+    /// The steps that carry an archive from `from` to `to`.
+    pub(crate) fn steps_between(
+        self,
+        from: u32,
+        to: u32,
+    ) -> impl Iterator<Item = &'static SchemaStep> {
+        self.steps
+            .iter()
+            .filter(move |step| step.epoch > from && step.epoch <= to)
+    }
+
+    /// Execute the steps carrying an already-open database from `from` to `to`.
+    pub(crate) fn apply_steps(self, conn: &Connection, from: u32, to: u32) -> Result<()> {
+        apply_each(conn, self.steps_between(from, to))
+    }
+
+    /// Build, in memory, the canonical database for `epoch` over this ladder.
+    pub(crate) fn build_canonical(self, epoch: u32) -> Result<Connection> {
+        // The baseline declares a vec0 virtual table, so the extension has to
+        // be registered before the connection opens. Idempotent (Once guard).
+        crate::store::init_vec_extension();
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(crate::store::SCHEMA_SQL)?;
+        crate::store::run_migrations(&conn)?;
+        self.apply_steps(&conn, 0, epoch)?;
+        Ok(conn)
+    }
+
+    /// See [`validate_servable_epoch`].
+    pub(crate) fn validate_servable(self, marker: ArchiveEpoch) -> Result<()> {
+        // Written as a full range even though the lower bound is vacuous while
+        // `SCHEMA_EPOCH_MIN_SERVABLE` is 0. Writing it as half a range would
+        // make raising the floor a silent no-op. (No `absurd_extreme_comparisons`
+        // allow is needed here, unlike the module-level const assertions: these
+        // are runtime fields, so the lint cannot see a constant to fold.)
+        if marker.epoch < self.min_servable || marker.epoch > self.head {
+            return Err(epoch_marker_error(
+                "recorded epoch is outside this binary's servable range",
+            ));
+        }
+        if marker.chain != self.chain_digest(marker.epoch) {
+            return Err(epoch_marker_error(
+                "recorded chain does not match this binary's baseline and ladder",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Digest of one step, binding its epoch, identity and exact SQL.
 pub(crate) fn step_digest(step: &SchemaStep) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -173,24 +439,12 @@ pub(crate) fn step_digest(step: &SchemaStep) -> [u8; 32] {
 /// edited after shipping produces a different chain and is refused rather than
 /// silently applied on top of a divergent history.
 pub(crate) fn chain_digest(epoch: u32) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(LADDER_DOMAIN);
-    hasher.update(BASELINE_DIGEST);
-    let mut digest: [u8; 32] = hasher.finalize().into();
-    for step in SCHEMA_LADDER.iter().filter(|step| step.epoch <= epoch) {
-        let mut hasher = Sha256::new();
-        hasher.update(digest);
-        hasher.update(step_digest(step));
-        digest = hasher.finalize().into();
-    }
-    digest
+    LadderView::PRODUCTION.chain_digest(epoch)
 }
 
 /// The steps that carry an archive from `from` to `to`.
 pub(crate) fn steps_between(from: u32, to: u32) -> impl Iterator<Item = &'static SchemaStep> {
-    SCHEMA_LADDER
-        .iter()
-        .filter(move |step| step.epoch > from && step.epoch <= to)
+    LadderView::PRODUCTION.steps_between(from, to)
 }
 
 /// Execute the steps that carry an already-open database from `from` to `to`.
@@ -199,7 +453,7 @@ pub(crate) fn steps_between(from: u32, to: u32) -> impl Iterator<Item = &'static
 /// [`build_canonical`] executes them — the identical-text property depends on
 /// the order being the same on both sides, not merely the set.
 pub(crate) fn apply_steps(conn: &Connection, from: u32, to: u32) -> Result<()> {
-    apply_each(conn, steps_between(from, to))
+    LadderView::PRODUCTION.apply_steps(conn, from, to)
 }
 
 /// The executor both [`apply_steps`] and the tests share, so a fixture ladder
@@ -217,19 +471,12 @@ fn apply_each<'a>(conn: &Connection, steps: impl Iterator<Item = &'a SchemaStep>
 /// `epoch` the same way an archive does: the frozen baseline first, then the
 /// ladder steps in order. Never the baseline "as it would look today".
 pub(crate) fn build_canonical(epoch: u32) -> Result<Connection> {
-    // The baseline declares a vec0 virtual table, so the extension has to be
-    // registered before the connection opens. Idempotent (Once guard).
-    crate::store::init_vec_extension();
-    let conn = Connection::open_in_memory()?;
-    conn.execute_batch(crate::store::SCHEMA_SQL)?;
-    crate::store::run_migrations(&conn)?;
-    apply_steps(&conn, 0, epoch)?;
-    Ok(conn)
+    LadderView::PRODUCTION.build_canonical(epoch)
 }
 
 /// The single step that carries `from` to `from + 1`, or `None`.
 pub(crate) fn step_at(to_epoch: u32) -> Option<&'static SchemaStep> {
-    SCHEMA_LADDER.iter().find(|step| step.epoch == to_epoch)
+    LadderView::PRODUCTION.step_at(to_epoch)
 }
 
 /// The epoch marker a live archive records, plus the ladder chain it reached
@@ -280,7 +527,23 @@ pub(crate) fn read_archive_epoch(conn: &Connection) -> Result<ArchiveEpoch> {
 /// (`changes() == 1`) and then re-read and compared, so a CHECK that silently
 /// declined the write cannot pass for a success.
 pub(crate) fn seed_epoch_marker(conn: &Connection, epoch: u32) -> Result<()> {
-    let chain = chain_digest(epoch);
+    write_epoch_marker(conn, epoch, chain_digest(epoch))
+}
+
+/// Write an explicitly supplied `(epoch, chain)` marker.
+///
+/// The advance plan commits through here rather than through
+/// [`seed_epoch_marker`] on purpose. `seed_epoch_marker` *recomputes* the chain
+/// from whatever ladder the running binary happens to carry; a sealed plan must
+/// write the value it was constructed with and that its own preconditions
+/// verified, so that a replay of the identical plan writes identical bytes. A
+/// recomputation inside apply is the same class of defect as a clock DEFAULT
+/// firing inside apply: it makes the committed bytes a function of the
+/// executing binary instead of a function of the plan.
+///
+/// The upsert is asserted (`changes() == 1`) and then re-read and compared, so
+/// a CHECK that silently declined the write cannot pass for a success.
+pub(crate) fn write_epoch_marker(conn: &Connection, epoch: u32, chain: [u8; 32]) -> Result<()> {
     let changed = conn.execute(
         "INSERT INTO schema_epoch (singleton, epoch, chain_digest) VALUES (1, ?1, ?2)
          ON CONFLICT(singleton) DO UPDATE SET epoch = excluded.epoch,
@@ -308,24 +571,8 @@ pub(crate) fn seed_epoch_marker(conn: &Connection, epoch: u32) -> Result<()> {
 /// archive cannot vouch for its own history. At epoch 0 the chain is exactly
 /// the baseline anchor, which is what carries the re-baselined digest into
 /// every archive at birth.
-#[allow(
-    clippy::absurd_extreme_comparisons,
-    reason = "the lower bound is vacuous while SCHEMA_EPOCH_MIN_SERVABLE is 0 and becomes \
-              meaningful the moment it is raised; writing the range check as half a range \
-              would make raising the floor a silent no-op"
-)]
 pub(crate) fn validate_servable_epoch(marker: ArchiveEpoch) -> Result<()> {
-    if marker.epoch < SCHEMA_EPOCH_MIN_SERVABLE || marker.epoch > SCHEMA_EPOCH_HEAD {
-        return Err(epoch_marker_error(
-            "recorded epoch is outside this binary's servable range",
-        ));
-    }
-    if marker.chain != chain_digest(marker.epoch) {
-        return Err(epoch_marker_error(
-            "recorded chain does not match this binary's baseline and ladder",
-        ));
-    }
-    Ok(())
+    LadderView::PRODUCTION.validate_servable(marker)
 }
 
 /// Verbatim product-schema equality against `build_canonical(marker.epoch)`.

@@ -108,7 +108,41 @@ async fn relaunch_one(
     let (archive_id, authority) =
         build_wal_serving_authority(kms, control, selection.user_id()).await?;
     store.install_wal_serving_authority(selection.user_id(), archive_id, Arc::new(authority))?;
+    advance_to_target_epoch(store, selection.user_id()).await?;
     Ok(())
+}
+
+/// Carry this archive to the epoch this binary drives to, one step per
+/// transaction, before any product request is admitted.
+///
+/// Placed here and not on the request path on purpose: the authority is
+/// installed immediately above, so the routed submit has somewhere to go, and
+/// a failure is still scoped to this one selection — `count_outcome` folds it
+/// into `unavailable` and every other user still launches. A user left at a
+/// stale epoch comes up without a serving authority, which the routed read
+/// refuses; they can never be served the stale legacy snapshot.
+///
+/// The loop is bounded by the ladder, not by a retry budget: each iteration
+/// advances exactly one epoch, and `AlreadyAtTarget` is reached in at most
+/// `SCHEMA_EPOCH_TARGET` steps. `RefusedNotServable` stops immediately — an
+/// archive this binary cannot describe must never be driven.
+async fn advance_to_target_epoch(store: &Arc<Store>, user_id: &str) -> Result<()> {
+    use crate::cp::schema_epoch::wal::{advance_one_epoch, AdvanceOutcome};
+
+    // Every intermediate epoch is a complete, servable state, so an
+    // interruption anywhere in this loop leaves a servable archive at a
+    // well-defined epoch and the next relaunch resumes from its marker.
+    loop {
+        match advance_one_epoch(store, user_id).await? {
+            AdvanceOutcome::Advanced { .. } => continue,
+            AdvanceOutcome::AlreadyAtTarget(_) => return Ok(()),
+            AdvanceOutcome::RefusedNotServable(_) => {
+                return Err(EnclaveError::Conflict(
+                    "archive records a schema epoch this binary cannot serve".into(),
+                ))
+            }
+        }
+    }
 }
 
 /// Build one user's serving authority from durable state.

@@ -221,6 +221,42 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # indentation-only call-expression moves re-verified line by line, and the
 # relative order of every surviving key still unchanged. The store-surface
 # (15/a2904b58) and policy-site (42/7b4d1591) digests did not move.
+#
+# ---- ADR-0022 Part B rebased ON TOP of the ingest delta above ----
+# Both branches independently moved 229 -> 232 by adding DIFFERENT call
+# sites, so the merged tree is a THIRD state: 229 + 3 (ingest, net of one
+# rename) + 3 (this branch) = 235, and NEITHER predecessor digest is
+# correct here. Re-derived below against the merged tree.
+#
+# ADR-0022 Part B (the owner-side schema-ladder driver): exactly THREE
+# additions and nothing else. 229 -> 232.
+#
+# BASELINE: a pristine `git archive origin/main | tar -x` tree at commit
+# 9d78c46 ("Route the summarizer window's evidence reads (unblocks the merged
+# upsert plan) (#330)"), dumped with THIS module's own store_call_sites() /
+# classify_store_call() / inventory_row() / digest() helpers before anything
+# was written. That pristine dump reproduced 9d78c46's own 229/8eb21ded pin
+# byte-for-byte, so the delta below is against a verified baseline.
+#
+# DELTA, exactly:
+#   * THREE additions, all under the ONE new B owner
+#     `src/cp/schema_epoch/wal/advance.rs::advance_one_epoch#0`:
+#     `wal_authoritative_read#0` (the single marker read -- `read_archive_epoch`
+#     and nothing else; a second read would open a window in which the epoch
+#     the plan is built for is not the epoch it is submitted against),
+#     `wal_authoritative_submit#0` (the sealed step), and
+#     `wal_authoritative_submit#1` (the ONE Conflict resubmission of the
+#     identical prepared object). Three sites for two logical operations is the
+#     same shape slice 11's settle_audio_window_transcript already carries.
+#   * ZERO removals, ZERO reclassifications, ZERO moved call-EXPRESSION hashes,
+#     and ZERO moved OWNER-BODY hashes anywhere -- diffed key by key against
+#     the pristine dump. The relative order of every surviving key is
+#     identical.
+#
+# Note what did NOT move and why: `archive_v3_serving_relaunch.rs::relaunch_one`
+# gained the `advance_to_target_epoch` call, but neither that function nor
+# `install_wal_serving_authority` is a tracked Store target, so relaunch_one
+# owns no row here and its body hash is invisible to this inventory.
 EXPECTED_STORE_CALL_COUNT = 232
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
@@ -356,7 +392,7 @@ EXPECTED_STORE_CALL_COUNT = 232
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "3f71214e9a734420607ae5c625ff92c9430f9b090f250d523c36b429033594f6"
+EXPECTED_STORE_CALL_SHA256 = "PENDING_REDERIVATION"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1192,6 +1228,11 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::settle_audio_window_transcript#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_attempt#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_result#0",
+        # ADR-0022 Part B: the owner-side schema-ladder driver. Reads the
+        # archive's own epoch marker, then submits ONE sealed step. It is the
+        # only writer of `schema_epoch` after birth, so it classifies with the
+        # other settle owners rather than as a read.
+        "src/cp/schema_epoch/wal/advance.rs::advance_one_epoch#0",
         "src/cp/model_usage.rs::begin_invocation#0",
         "src/cp/model_usage.rs::settle_response_required#0",
         "src/cp/model_usage.rs::begin_invocation_settled#0",

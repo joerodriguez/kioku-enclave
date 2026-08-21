@@ -35,6 +35,7 @@ pub mod oauth;
 pub mod push;
 pub mod query;
 pub mod reviewer;
+pub(crate) mod schema_epoch;
 // Retained for legacy-index migrations and focused regression tests after
 // local screenshot ingestion was retired.
 #[allow(dead_code)]
