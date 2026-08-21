@@ -137,18 +137,31 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
 /// user with audio. The probe runs BEFORE the claim, so a blocked lane makes
 /// no claim, no reservation and no paid call.
 ///
-/// A missing `sqlite_sequence` (an archive with no AUTOINCREMENT table at all)
-/// is itself the blocked condition, so a query error fails closed.
+/// The probe asks whether the two tables ARE `AUTOINCREMENT`, by reading their
+/// DDL — never whether they currently HAVE `sqlite_sequence` rows.
+///
+/// That distinction is the whole correctness of this gate. SQLite creates a
+/// table's `sqlite_sequence` row on its FIRST INSERT, not at `CREATE TABLE`.
+/// Counting rows would therefore be shut on a freshly created archive even
+/// once the tables are AUTOINCREMENT, and because a shut gate makes no claim,
+/// nothing would ever insert the row that opens it — a permanent deadlock of
+/// the audio lane on every genesis archive, which under genesis-first is
+/// every archive. Reading the DDL is true from `CREATE TABLE` onward and is
+/// the same fact the sequence gate test pins.
+///
+/// A missing table, or DDL that cannot be read, is itself the blocked
+/// condition, so any query error fails closed.
 pub(in crate::cp::media_worker) fn audio_sequence_gate_open(connection: &Connection) -> bool {
-    connection
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM sqlite_sequence WHERE name='audio_segments') \
-                  + (SELECT COUNT(*) FROM sqlite_sequence WHERE name='utterances')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|present| present >= 2)
-        .unwrap_or(false)
+    ["audio_segments", "utterances"].iter().all(|table| {
+        connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|ddl| ddl.to_ascii_uppercase().contains("AUTOINCREMENT"))
+            .unwrap_or(false)
+    })
 }
 
 /// The work-unit id digest, extracted verbatim from `lease_work_unit` so the
@@ -1867,33 +1880,80 @@ mod tests {
     }
 
     #[test]
-    fn the_audio_lane_is_gated_until_the_sequence_pins_exist() {
+    fn the_audio_lane_is_gated_on_autoincrement_not_on_existing_rows() {
         // T24 / R1. Without AUTOINCREMENT on audio_segments and utterances the
         // sealed transcript family's four sqlite_sequence pins read 0 forever
         // and every settle fails closed -- after a PAID Vertex call.
+        //
+        // The gate must key on whether the tables ARE AUTOINCREMENT, never on
+        // whether they HAVE sqlite_sequence rows. SQLite writes a table's
+        // sqlite_sequence row on its first INSERT, not at CREATE TABLE, so a
+        // row-counting gate is shut on a freshly created archive -- and since
+        // a shut gate makes no claim, nothing ever inserts the row that would
+        // open it. That is a permanent deadlock of the audio lane on every
+        // genesis archive, which under genesis-first is every archive.
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         assert!(
             !audio_sequence_gate_open(&connection),
-            "no sqlite_sequence rows at all is the blocked condition"
+            "tables absent entirely is the blocked condition"
         );
+
+        // Plain INTEGER PRIMARY KEY: blocked, however many rows exist.
         connection
             .execute_batch(
-                "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 INSERT INTO audio_segments(x) VALUES ('a');",
+                "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY,x TEXT);
+                 INSERT INTO audio_segments(x) VALUES ('a');
+                 INSERT INTO utterances(x) VALUES ('u');",
             )
             .unwrap();
         assert!(
             !audio_sequence_gate_open(&connection),
-            "one of the two pins is not enough"
+            "plain INTEGER PRIMARY KEY stays blocked even with rows present"
         );
+
+        // One of the two converted is not enough.
+        let connection = Connection::open_in_memory().unwrap();
+        install_schema(&connection);
         connection
             .execute_batch(
-                "CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 INSERT INTO utterances(x) VALUES ('a');",
+                "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY,x TEXT);",
             )
             .unwrap();
-        assert!(audio_sequence_gate_open(&connection));
+        assert!(
+            !audio_sequence_gate_open(&connection),
+            "one of the two tables is not enough"
+        );
+
+        // THE DEADLOCK CASE: both AUTOINCREMENT, and EMPTY. sqlite_sequence
+        // holds no row for either table yet, and the gate must still open.
+        let connection = Connection::open_in_memory().unwrap();
+        install_schema(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+            )
+            .unwrap();
+        let sequence_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_sequence \
+                 WHERE name IN ('audio_segments','utterances')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sequence_rows, 0,
+            "precondition: an unwritten AUTOINCREMENT table has no sequence row"
+        );
+        assert!(
+            audio_sequence_gate_open(&connection),
+            "a fresh AUTOINCREMENT archive must open the lane; gating on row \
+             presence here deadlocks audio forever"
+        );
     }
 
     #[test]
