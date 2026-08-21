@@ -17,6 +17,19 @@
 //! Kind 6 (`DeterministicMediaWorkResult`) is reused: this is the media
 //! job/work bookkeeping family that ordinal 6 already owns. The subtype keeps
 //! the ledgers disjoint.
+//!
+//! ## Why the eligibility WHERE clause could be widened after sealing
+//!
+//! The query below is shared by construction between the owner and `apply`,
+//! so changing it changes replay semantics for every committed operation —
+//! normally forbidden. Slice 10i adds
+//! `AND j.error_code IS NOT 'transcript_target_conflict'`, and that is safe
+//! for exactly one reason: `transcript_target_conflict` is a brand-new error
+//! code that **cannot exist in any archive written before this slice ships**,
+//! so the added predicate is a no-op over all existing WAL history and every
+//! committed operation replays identically. The exclusion and the owner code
+//! that can produce the code therefore ship in the SAME change — never the
+//! producer first. Re-check this argument before widening the clause again.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
@@ -64,6 +77,7 @@ pub(in crate::cp::media_worker) fn enumerate_resurrectable(
          JOIN capture_events e ON e.event_id = j.event_id \
          WHERE j.processor_version = ?1 AND j.state = 'failed_terminal' \
            AND j.error_code IS NOT 'media_integrity' \
+           AND j.error_code IS NOT 'transcript_target_conflict' \
            AND j.attempt_count < ?2 \
            AND j.updated_at <= ?3 \
            AND e.started_at >= ?4 \
@@ -744,6 +758,66 @@ mod tests {
         assert_ne!(
             first.operation_id(),
             build(advanced, COMMITTED_AT).operation_id()
+        );
+    }
+
+    #[test]
+    fn the_transcript_conflict_exclusion_is_history_neutral() {
+        // Widening a sealed family's shared eligibility query changes replay
+        // semantics for every committed operation. It is safe here for
+        // exactly one reason: `transcript_target_conflict` cannot exist in
+        // any archive written before slice 10i, so the added predicate is a
+        // no-op over all existing WAL history. This test is that argument.
+        let connection = Connection::open_in_memory().unwrap();
+        install_schema(&connection);
+        for (id, code) in [
+            (10_i64, "processing_error"),
+            (11, "invalid_model_output"),
+            (12, "vertex_quota"),
+            (13, "vertex_daily_budget"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO media_processing_jobs VALUES
+                     (?1,'ev-a',1,'failed_terminal',?2,1,NULL,'2026-08-20T10:00:00.000Z')",
+                    params![id, code],
+                )
+                .unwrap();
+        }
+        let baseline = enumerate_resurrectable(
+            &connection,
+            1,
+            ATTEMPT_CAP,
+            STALE_BEFORE,
+            WINDOW_START,
+            SWEEP_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1, 10, 11, 12, 13],
+            "every pre-existing error code is still resurrectable"
+        );
+        connection
+            .execute(
+                "UPDATE media_processing_jobs SET error_code='transcript_target_conflict' \
+                 WHERE id=12",
+                [],
+            )
+            .unwrap();
+        let excluded = enumerate_resurrectable(
+            &connection,
+            1,
+            ATTEMPT_CAP,
+            STALE_BEFORE,
+            WINDOW_START,
+            SWEEP_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            excluded.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1, 10, 11, 13],
+            "a target conflict can never recover, so it is never resurrected"
         );
     }
 
