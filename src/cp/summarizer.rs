@@ -37,7 +37,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
-use crate::error::{wal_domain, EnclaveError, Result};
+use crate::error::{EnclaveError, Result};
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
 use super::CpState;
@@ -929,20 +929,15 @@ async fn summarize_user_window(
     user_id: &str,
     mode: SummarizeMode,
 ) -> Result<Value> {
-    // ADR-0022 D4: the window's evidence reads (`fetch_range`,
-    // `fetch_open_episodes`) are still legacy, so the window cannot complete
-    // for a WAL-authoritative user however far it gets — the F8 upsert at its
-    // tail IS migrated, but it is unreachable until the reads are. Skipping
-    // before the serializing lock keeps the deferral off other users' path,
-    // and the `skipped` shape lands on `summarize_all`'s `Ok(_) => break`, so
-    // one sweep produces exactly one counted skip and no Vertex call.
-    if state.wal_domain_skipped(user_id, wal_domain::SUMMARIZER_WINDOW) {
-        return Ok(serde_json::json!({
-            "skipped": true,
-            "reason": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-            "domain": wal_domain::SUMMARIZER_WINDOW,
-        }));
-    }
+    // ADR-0022: the whole window is now WAL-authoritative for a selected user.
+    // Its evidence reads (`fetch_range`, `fetch_open_episodes`, and the
+    // recoverable-media cursor hold) route through `wal_authoritative_read`,
+    // the F8 upsert at its tail settles as a sealed plan, and `save_user` is a
+    // provider-silent no-op — so the D4 deferral this domain used to take is
+    // gone. A routed lane that cannot serve REFUSES, and that refusal must
+    // reach `summarize_all` as `Err`: flattening it into an empty span would
+    // advance the forward-only cursor past evidence nobody read.
+    //
     // Serialize runs: the scheduler's catch-up loop and the session-settled
     // kick (ADR-0034) can fire concurrently for the same user, and two
     // racing runs would summarize the same window and double-create episodes
@@ -1711,6 +1706,11 @@ fn compact_tail_excerpt(text: &str, max_chars: usize) -> String {
 
 /// Cursor-hold check (see `media_worker::span_has_recoverable_media`): reads
 /// only; the decision it feeds is to *not* write the cursor this run.
+///
+/// ADR-0022: routed. A selected user reads the settled-only lane; an
+/// unselected one falls through to the same legacy read. A refusal propagates
+/// — the caller advances its forward-only cursor on `Ok(false)`, so a
+/// flattened failure here would strand recoverable media behind the cursor.
 async fn span_holds_recoverable_media(
     state: &CpState,
     user_id: &str,
@@ -1723,7 +1723,7 @@ async fn span_holds_recoverable_media(
     );
     state
         .store
-        .with_user(user_id, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             super::media_worker::span_has_recoverable_media(
                 conn,
                 &f,
@@ -1734,6 +1734,10 @@ async fn span_holds_recoverable_media(
         .await
 }
 
+/// The window's primary evidence read. ADR-0022: routed, so a selected user's
+/// utterances and screens come from the settled-only lane instead of the stale
+/// legacy snapshot; an unselected user falls through to the identical legacy
+/// read. Never flatten a refusal into an empty span — see the caller.
 async fn fetch_range(
     state: &CpState,
     user_id: &str,
@@ -1743,7 +1747,7 @@ async fn fetch_range(
     let (f, t) = (from.to_string(), to.to_string());
     state
         .store
-        .with_user(user_id, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             let mut us = conn.prepare(
                 "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text \
                  FROM utterances u JOIN audio_segments s ON s.id = u.audio_segment_id \
@@ -1788,6 +1792,10 @@ async fn fetch_range(
         .await
 }
 
+/// The extend-by-ref digest read. ADR-0022: routed. The episodes it lists are
+/// the ones the F8 upsert may extend, so it must see the same authority that
+/// upsert settles into — reading a stale legacy snapshot here would offer the
+/// model refs to rows the sealed plan's predecessor tuples do not match.
 async fn fetch_open_episodes(
     state: &CpState,
     user_id: &str,
@@ -1798,7 +1806,7 @@ async fn fetch_open_episodes(
     let (ls, le) = (list_start.to_string(), list_end.to_string());
     let mut eps = state
         .store
-        .with_user(user_id, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary, \
                         e.participants, e.action_items, e.minutes_text, \
@@ -1988,18 +1996,18 @@ pub fn kick_session_settled(user_id: &str) {
 /// still queued, in flight, or awaiting retry. Anything pending means a later
 /// kick (or the sweep) will retry; running early would summarize a window
 /// whose transcript is still forming and could consume it.
+///
+/// ADR-0022: routed. The predicate reads `capture_sessions`/`media_objects`
+/// from the settled-only lane for a selected user and falls through to the
+/// identical legacy read otherwise. The `strftime('now')` recency bound is a
+/// read-time comparison, not a stored default, so nothing here binds a clock
+/// into a write. An unavailable lane keeps the pre-existing failure handler:
+/// "not settled" holds the kick, which is the conservative answer — claiming
+/// "settled" would summarize a transcript that is still forming.
 async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
-    // ADR-0022 D4: the settled predicate reads capture_sessions/media_objects
-    // through the legacy per-user store. Report "not settled" so the kick
-    // path stops here with exactly one counted skip instead of falling
-    // through to the window (which would skip again) — the deferral is inert
-    // either way, but only one of them is counted.
-    if state.wal_domain_skipped(user_id, wal_domain::SUMMARIZER_SESSION_SETTLED) {
-        return false;
-    }
     let result = state
         .store
-        .with_user(user_id, |conn| {
+        .wal_authoritative_read(user_id, |conn| {
             let (open_recent, media_pending) = conn.query_row(
                 "SELECT \
                   (SELECT COUNT(*) FROM capture_sessions WHERE ended_at IS NULL \
@@ -2470,76 +2478,265 @@ mod tests {
         assert_ne!(VISUAL_EVIDENCE_BACKFILL_KEY, SUBSTANCE_BACKFILL_KEY);
     }
 
-    /// ADR-0022 D4. The window's evidence reads are deferred, so a sweep pass
-    /// must be inert: the `skipped` shape (which lands on `summarize_all`'s
-    /// `Ok(_) => break`, so the sweep stops after one), exactly one counted
-    /// skip, and no Vertex call — the gate returns before the range fetch that
-    /// assembles the prompt, so no request can be built at all.
+    /// ADR-0022. The window's evidence reads are routed now, so the D4
+    /// deferral that made this domain inert is gone — and the failure it
+    /// masked must not return in a worse shape. A routed lane that cannot
+    /// serve REFUSES, and every read on the window path has to surface that
+    /// refusal unchanged: the caller advances its forward-only cursor whenever
+    /// a span comes back empty, so ONE flattened refusal would march the
+    /// cursor through a seven-day backlog reporting `no_new_records` over
+    /// evidence nobody ever read. That is unrecoverable — the cursor only
+    /// moves forward.
     #[tokio::test]
-    async fn a_deferred_summarizer_window_skips_once_and_never_calls_vertex() {
+    async fn a_routed_evidence_refusal_reaches_the_caller_and_never_advances_the_cursor() {
         use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-        use crate::error::wal_domain;
 
         let state = state();
-        let user_id = "summarizer-deferred-user";
-        select_wal_authoritative(&state.store, user_id);
-
-        let (captured, guard) = capture_events();
-        let outcome = summarize_user(&state, user_id)
+        let user = state
+            .control
+            .upsert_user(
+                "google-sub-wal-summarizer",
+                "routed@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
-            .expect("a deferred domain defers; it must not fail the sweep");
-        drop(guard);
-
-        assert_eq!(outcome["skipped"], true);
-        assert_eq!(
-            outcome["reason"],
-            crate::error::WAL_DOMAIN_UNMIGRATED_REASON
+            .expect("the harness creates the account");
+        // Far enough back that a scheduled window really is available: the
+        // refusal, not a short tail, has to be what stops the run.
+        let cursor = format_epoch_millis(now_ms() - 3 * 60 * 60 * 1000);
+        state
+            .control
+            .set_summarized_until(&user.id, &cursor)
+            .await
+            .expect("the baseline cursor is written");
+        assert!(
+            window_bounds(
+                ms(&cursor),
+                now_ms() - TAIL_MINUTES * 60 * 1000,
+                MIN_WINDOW_MINUTES * 60 * 1000,
+            )
+            .is_some(),
+            "the fixture must offer a window, or this proves nothing"
         );
-        assert_eq!(outcome["domain"], wal_domain::SUMMARIZER_WINDOW);
-        // `summarize_all` continues only on an advanced cursor; this shape is
-        // neither `to` nor `no_new_records`, so the pass ends after one skip.
-        assert!(outcome.get("to").is_none());
-        assert_ne!(outcome["reason"], "no_new_records");
-        assert_eq!(
-            captured.skips(wal_domain::SUMMARIZER_WINDOW),
-            1,
-            "exactly one counted skip per pass: {}",
-            captured.text()
+
+        // Selected with no serving authority registered: the routed lane is
+        // unavailable, exactly as it is while one is quarantined or
+        // relaunching. Nothing legacy may answer in its place.
+        select_wal_authoritative(&state.store, &user.id);
+        let from = format_epoch_millis(now_ms() - 2 * 60 * 60 * 1000);
+        let to = format_epoch_millis(now_ms() - 60 * 60 * 1000);
+
+        assert!(
+            fetch_range(&state, &user.id, &from, &to).await.is_err(),
+            "an unavailable lane must refuse, never report an empty span"
         );
         assert!(
-            !captured.text().contains("summarized"),
-            "a gated pass must not report work: {}",
+            fetch_open_episodes(&state, &user.id, &from, &to, 0)
+                .await
+                .is_err(),
+            "an unavailable lane must refuse, never report zero open episodes"
+        );
+        assert!(
+            span_holds_recoverable_media(&state, &user.id, &from, &to)
+                .await
+                .is_err(),
+            "an unavailable lane must refuse, never report 'nothing to hold for'"
+        );
+
+        let (captured, guard) = capture_events();
+        let outcome = summarize_user(&state, &user.id).await;
+        drop(guard);
+
+        assert!(
+            outcome.is_err(),
+            "the refusal must reach the sweep as an error, not become a \
+             status the sweep treats as progress: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .control
+                .summarized_until(&user.id)
+                .await
+                .expect("the cursor is readable"),
+            Some(cursor),
+            "a refused window must never advance the forward-only cursor"
+        );
+        assert_eq!(
+            captured.total_skips(),
+            0,
+            "the domain is migrated; nothing may still report a D4 deferral: {}",
             captured.text()
         );
     }
 
-    /// The ADR-0034 kick's settled gate is deferred too, and reports
-    /// "not settled" so the kick stops there with its own counted skip.
+    /// The legacy path is untouched: `wal_authoritative_read` falls through to
+    /// the ordinary guarded per-user read for an unselected user, so the same
+    /// SQL returns the same rows it did before the routing branch existed.
     #[tokio::test]
-    async fn the_deferred_settled_gate_holds_the_kick_with_one_counted_skip() {
+    async fn the_routed_evidence_reads_still_serve_an_unselected_user_from_the_legacy_store() {
+        use crate::cp::wal_gate_test_support::state;
+
+        let state = state();
+        let user_id = "summarizer-legacy-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute_batch(
+                    "INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) \
+                       VALUES (1, '2026-08-01T10:00:00.000Z', '2026-08-01T10:05:00.000Z', 300.0, 'mic'); \
+                     INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, language, speaker_label) \
+                       VALUES (1, 1, 0.0, 12.0, 'the legacy row is still readable', 'en', 'Me'); \
+                     INSERT INTO screenshots (id, captured_at, active_app, window_title) \
+                       VALUES (1, '2026-08-01T10:01:00.000Z', 'Editor', 'notes'); \
+                     INSERT INTO episodes (id, started_at, ended_at, type, title, summary) \
+                       VALUES (1, '2026-08-01T10:00:00.000Z', '2026-08-01T10:05:00.000Z', 'coding', 'Legacy', '- kept');",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("the legacy store accepts the seed");
+
+        const FROM: &str = "2026-08-01T09:00:00.000Z";
+        const TO: &str = "2026-08-01T11:00:00.000Z";
+
+        let (utterances, screenshots) = fetch_range(&state, user_id, FROM, TO)
+            .await
+            .expect("an unselected user keeps the legacy read");
+        assert_eq!(utterances.len(), 1);
+        assert_eq!(utterances[0].text, "the legacy row is still readable");
+        assert_eq!(utterances[0].started_at, "2026-08-01T10:00:00.000Z");
+        assert_eq!(screenshots.len(), 1);
+        assert_eq!(screenshots[0].captured_at, "2026-08-01T10:01:00.000Z");
+
+        let open = fetch_open_episodes(&state, user_id, FROM, TO, 0)
+            .await
+            .expect("an unselected user keeps the legacy read");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, 1);
+        assert_eq!(open[0].title, "Legacy");
+
+        assert!(
+            !span_holds_recoverable_media(&state, user_id, FROM, TO)
+                .await
+                .expect("an unselected user keeps the legacy read"),
+            "no capture media was seeded, so nothing holds the cursor"
+        );
+        assert!(
+            session_tail_is_settled(&state, user_id).await,
+            "no open session and no pending media: the legacy gate still settles"
+        );
+    }
+
+    /// The ADR-0034 kick's settled gate is routed too. An unavailable lane
+    /// keeps the pre-existing failure handler's conservative answer — "not
+    /// settled" holds the kick rather than summarizing a transcript that may
+    /// still be forming — and it stays LOUD, so an unservable lane can never
+    /// pass for a quiet, finished tail.
+    #[tokio::test]
+    async fn an_unavailable_settled_gate_holds_the_kick_and_says_so() {
         use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-        use crate::error::wal_domain;
 
         let state = state();
         let user_id = "summarizer-settled-user";
         select_wal_authoritative(&state.store, user_id);
 
         let (captured, guard) = capture_events();
-        assert!(!session_tail_is_settled(&state, user_id).await);
+        assert!(
+            !session_tail_is_settled(&state, user_id).await,
+            "an unreadable tail is never 'settled'"
+        );
         drop(guard);
 
-        assert_eq!(
-            captured.skips(wal_domain::SUMMARIZER_SESSION_SETTLED),
-            1,
-            "{}",
-            captured.text()
-        );
         assert!(
-            !captured
+            captured
                 .text()
                 .contains("session-settled gate check failed"),
-            "the gate replaces the legacy refusal, it does not add to it: {}",
+            "an unservable lane must be reported, never silently read as \
+             merely unsettled: {}",
             captured.text()
+        );
+        assert_eq!(
+            captured.total_skips(),
+            0,
+            "the domain is migrated; nothing may still report a D4 deferral: {}",
+            captured.text()
+        );
+    }
+
+    /// Placement pin, in production source. Both summarizer domains migrated,
+    /// so no D4 gate may survive here — a gate left standing over a migrated
+    /// domain silently disables live work — and every read the window depends
+    /// on must go through the routed helper rather than the legacy per-user
+    /// store. The two historical backfills keep their legacy `with_user`
+    /// calls deliberately: they have no production caller and are explicitly
+    /// out of this migration's scope.
+    #[test]
+    fn the_window_reads_route_and_no_deferral_gate_survives_in_production_source() {
+        let whole = include_str!("summarizer.rs");
+        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
+
+        assert_eq!(
+            source.matches(concat!("wal_domain_", "skipped(")).count(),
+            0,
+            "a migrated domain must not keep the gate that deferred it"
+        );
+        assert_eq!(
+            source.matches(concat!("wal_", "domain")).count(),
+            0,
+            "no deferred-domain name may remain in the summarizer"
+        );
+
+        for (start, end) in [
+            (
+                concat!("async fn span_holds_recoverable_", "media("),
+                concat!("async fn fetch_", "range("),
+            ),
+            (
+                concat!("async fn fetch_", "range("),
+                concat!("async fn fetch_open_", "episodes("),
+            ),
+            (
+                concat!("async fn fetch_open_", "episodes("),
+                concat!("pub async fn summarize_", "all("),
+            ),
+            (
+                concat!("async fn session_tail_is_", "settled("),
+                concat!("async fn summarize_session_", "settled("),
+            ),
+        ] {
+            let from = source
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} must exist"));
+            let to = source
+                .find(end)
+                .unwrap_or_else(|| panic!("{end} must exist"));
+            let body = &source[from..to];
+            assert!(
+                body.contains(concat!(".wal_authoritative_", "read(")),
+                "{start} must read through the routed lane"
+            );
+            assert!(
+                !body.contains(concat!(".with_", "user(")),
+                "{start} must not reach the legacy per-user store"
+            );
+        }
+
+        // The callerless historical backfills keep theirs, and the window's
+        // upsert/embed tails keep their unselected-user legacy branches.
+        let backfills = source
+            .find(concat!("async fn run_substance_", "backfill("))
+            .unwrap()
+            ..source.find(concat!("fn derive_", "membership(")).unwrap();
+        assert!(
+            source[backfills].contains(concat!(".with_", "user(")),
+            "the callerless backfills are deliberately not migrated"
+        );
+        assert!(
+            source[source
+                .find(concat!("pub(crate) async fn embed_", "episodes("))
+                .unwrap()..]
+                .contains(concat!(".with_", "user(")),
+            "the embed tail keeps its legacy write branch for unselected users"
         );
     }
 }
