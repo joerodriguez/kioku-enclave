@@ -222,11 +222,32 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # relative order of every surviving key still unchanged. The store-surface
 # (15/a2904b58) and policy-site (42/7b4d1591) digests did not move.
 #
-# ---- ADR-0022 Part B rebased ON TOP of the ingest delta above ----
-# Both branches independently moved 229 -> 232 by adding DIFFERENT call
-# sites, so the merged tree is a THIRD state: 229 + 3 (ingest, net of one
-# rename) + 3 (this branch) = 235, and NEITHER predecessor digest is
-# correct here. Re-derived below against the merged tree.
+# ---- ADR-0022 Part B REBASED ON TOP of the ingest delta above (2026-08-21) ----
+# Both branches independently moved 229 -> 232 by adding DIFFERENT call sites,
+# so the merged tree is a THIRD state and NEITHER predecessor digest is correct
+# here: ingest's 232/3f71214e and this branch's 232/ec8373dd are both wrong on
+# the merged tree. Re-derived rather than resolved by picking a side.
+#
+# MERGED BASELINE: a pristine `git archive origin/main | tar -x` tree at
+# 0d51bc8 ("Route capture-event ingest ... (#331)"), extracted under ~/.cache
+# outside every worktree, and dumped with THAT tree's own store_call_sites() /
+# classify_store_call() / inventory_row() / digest() helpers. It reproduced all
+# FOUR of 0d51bc8's own declared pins byte-for-byte first -- store 232/3f71214e,
+# surface 15/a2904b58, spawn 26/1741534d, policy 42/7b4d1591 -- so the delta
+# below is against a verified baseline, not an assumed one.
+#
+# MERGED DELTA, exactly: 232 -> 235. THREE additions, all the advance_one_epoch
+# sites enumerated below. ZERO removals, ZERO reclassifications, ZERO moved
+# call-EXPRESSION hashes and ZERO moved owner-body hashes in this inventory --
+# diffed key by key against the pristine dump. Ingest's own rows are already in
+# the baseline and are untouched by this branch.
+#
+# The other three inventories on the merged tree: store-surface 15 with ONE
+# owner-body move (async_main, from destructuring RelaunchCounts) -> 6f80aa29;
+# worker-spawn 26 with the SAME single async_main owner-body move -> c821c699,
+# which is NOT this branch's pre-rebase 34a018b2, because that value was derived
+# against 85b83e0 before ingest landed and ingest had itself moved a spawn owner
+# body; policy 42 completely unmoved at 7b4d1591.
 #
 # ADR-0022 Part B (the owner-side schema-ladder driver): exactly THREE
 # additions and nothing else. 229 -> 232.
@@ -257,7 +278,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # gained the `advance_to_target_epoch` call, but neither that function nor
 # `install_wal_serving_authority` is a tracked Store target, so relaunch_one
 # owns no row here and its body hash is invisible to this inventory.
-EXPECTED_STORE_CALL_COUNT = 232
+EXPECTED_STORE_CALL_COUNT = 235
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -392,7 +413,7 @@ EXPECTED_STORE_CALL_COUNT = 232
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "PENDING_REDERIVATION"
+EXPECTED_STORE_CALL_SHA256 = "7ce82572243f92af5ffe08830f7f05eef77830d589a7994d2d27364c1094e34f"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -655,7 +676,7 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the pins
 # above; both reproduced their own 26/e6dac368 pin byte-for-byte, and their
 # inventories are byte-identical to each other, before anything was written.
-EXPECTED_WORKER_SPAWN_SHA256 = "PENDING_REDERIVATION"
+EXPECTED_WORKER_SPAWN_SHA256 = "c821c6993a7d244bfc53e143795aad5017ca48b167913dfb09570365576c2e1e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
