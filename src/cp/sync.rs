@@ -1006,6 +1006,21 @@ async fn delete_account_content(
                 },
             ));
         };
+        // Freeze the media inventory here too, not only in the DELETE route.
+        // The route's freeze runs under `account_status == "active"`, so every
+        // account that reached `deleting` without one — which is every
+        // WAL-authoritative account on today's no-lane images — would
+        // otherwise arrive at a media rung it can never satisfy. This call is
+        // mint-once and idempotent, and it still succeeds for any account
+        // whose in-memory serving authority is installed in this process,
+        // because the tombstone filters the startup selection scan rather than
+        // the live map. A failure is deliberately not fatal: `drive` re-reads
+        // the durable inventory and classifies its absence honestly, either as
+        // a retryable rung or as `ManualRequired` when nothing can ever mint
+        // it. Turning it into an error here would hide that classification.
+        if let Err(error) = lane.freeze_media_inventory(control, store, user_id).await {
+            warn!(error = %error, "media inventory freeze unavailable on the deletion lane");
+        }
         return match lane.drive(control, store, user_id).await? {
             crate::archive_v3_deletion_lane::WalDeletionOutcome::Complete(residue) => {
                 // Disclosure is part of completion, not a footnote to it: the
@@ -1415,18 +1430,136 @@ mod tests {
             other => panic!("expected a pending deletion, got {other:?}"),
         }
 
-        // Once the ledger is tombstoned the ladder advances to the media rung,
-        // which is the one that must be satisfied before anything destructive.
+        // Once the ledger is tombstoned this account is on the media rung with
+        // no serving authority left to satisfy it: its binding is tombstoned
+        // and the startup selection scan filters tombstoned bindings, so
+        // nothing can ever enumerate its media. That is NOT progress — it is
+        // an account no retry can erase — so it must surface as the terminal
+        // `failed_retryable` class an operator is shown, not as a `pending`
+        // rung that re-drives every 30 seconds forever.
         control.begin_user_deletion(&user.id).await.unwrap();
+        assert!(!store.is_wal_authoritative(&user.id));
         match delete_account_content(&control, store.as_ref(), &user.id)
             .await
-            .expect_err("the media inventory has not been frozen")
+            .expect_err("the media inventory can never be frozen for this account")
+        {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(pending.reason.as_str(), "archive_v3_manual_required");
+                assert_eq!(pending.retry_after_seconds, None);
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
+        let operation = control
+            .update_user_deletion_status(&user.id, "archive_v3_manual_required", None, None)
+            .await
+            .unwrap();
+        assert_eq!(operation.status, "failed_retryable");
+        assert!(deletion_operation_requires_remediation(&operation));
+    }
+
+    /// The reconciler's WAL branch must freeze the media inventory *before* it
+    /// drives the ladder, so an account that reached `deleting` without one —
+    /// which is every WAL-authoritative account on an image with no lane — is
+    /// rescued while its selection is still installed rather than stranded on
+    /// a rung nothing can satisfy.
+    ///
+    /// A successful freeze cannot be reached end to end from here: it needs a
+    /// launched serving authority, and nothing in this crate can build one in
+    /// a test. So pin the wiring at the source level — the same technique the
+    /// lifecycle module already uses for its anti-wiring gate — scanning only
+    /// the WAL branch's own body so a deleted call cannot be masked by the
+    /// literals in this test.
+    #[test]
+    fn the_wal_branch_freezes_the_media_inventory_before_it_drives() {
+        let source = include_str!("sync.rs");
+        let (_, after_lane) = source
+            .split_once("let Some(lane) = store.wal_deletion_lane() else {")
+            .expect("the WAL branch resolves the installed lane");
+        let (branch, _) = after_lane
+            .split_once("let operation = control.identity_rebind_operation_for_user")
+            .expect("the WAL branch ends before the identity-rebind path");
+        let freeze = branch
+            .find("lane.freeze_media_inventory(")
+            .expect("the WAL branch must freeze the media inventory");
+        let drive = branch
+            .find("lane.drive(")
+            .expect("the WAL branch must drive the ladder");
+        assert!(
+            freeze < drive,
+            "the media inventory must be frozen before the ladder is driven"
+        );
+    }
+
+    /// The same rung stays retryable while the account's selection is still
+    /// installed in this process: `delete_account_content` now runs the
+    /// pre-tombstone freeze itself, so an account the route never froze is
+    /// rescued here instead of being stranded — and when the freeze cannot
+    /// complete, the rung it reports is the retryable one, because a later
+    /// pass genuinely can satisfy it.
+    #[tokio::test]
+    async fn the_reconciler_freezes_the_media_inventory_before_driving_the_ladder() {
+        struct NeverBuildsRuntime;
+
+        #[async_trait::async_trait]
+        impl crate::archive_v3_deletion_lane::ArchiveDeletionRuntimeFactory for NeverBuildsRuntime {
+            async fn runtime_for(
+                &self,
+                _archive_id: crate::archive_v3::ArchiveId,
+            ) -> EnclaveResult<Arc<dyn crate::archive_v3_deletion_lane::ArchiveDeletionRuntime>>
+            {
+                panic!("this rung must not construct an archive-v3 deletion runtime")
+            }
+        }
+
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_user(
+                "wal-lane-freeze",
+                "wal-lane-freeze@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        let archive_id = control
+            .seed_wal_genesis_terminal_for_test(&user.id)
+            .await
+            .unwrap();
+        store
+            .install_wal_deletion_lane(Arc::new(
+                crate::archive_v3_deletion_lane::WalDeletionLane::new(
+                    Arc::new(
+                        crate::archive_v3_witness::DeletionPrincipalKey::derive_from_control_root(
+                            &[0x42; 32],
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(NeverBuildsRuntime),
+                ),
+            ))
+            .unwrap();
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    &user.id, archive_id,
+                ),
+            )
+            .unwrap();
+        control.begin_user_deletion(&user.id).await.unwrap();
+
+        assert!(store.is_wal_authoritative(&user.id));
+        match delete_account_content(&control, store.as_ref(), &user.id)
+            .await
+            .expect_err("the ladder has not completed")
         {
             EnclaveError::DeletionPending(pending) => {
                 assert_eq!(
                     pending.reason.as_str(),
                     "archive_v3_media_inventory_pending"
                 );
+                assert_eq!(pending.retry_after_seconds, Some(30));
             }
             other => panic!("expected a pending deletion, got {other:?}"),
         }

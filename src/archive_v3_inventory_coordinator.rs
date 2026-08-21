@@ -60,11 +60,23 @@ pub(crate) enum InventoryCoordinatorError {
     Limit,
     #[error("archive-v3 inventory changed across a freshness boundary")]
     Freshness,
+    /// The lifecycle control plane refused permanently. No retry can clear it,
+    /// so the caller must park the operation for a human rather than report it
+    /// as transient.
+    #[error("archive-v3 lifecycle durable state permanently conflicts")]
+    PermanentConflict,
 }
 
 impl From<LifecycleError> for InventoryCoordinatorError {
-    fn from(_: LifecycleError) -> Self {
-        Self::Lifecycle
+    fn from(error: LifecycleError) -> Self {
+        match error {
+            // Only the control plane's own permanent-conflict classification
+            // is promoted here. Every other variant keeps its existing
+            // retryable meaning, so a genuinely transient failure is never
+            // parked.
+            LifecycleError::Conflict => Self::PermanentConflict,
+            _ => Self::Lifecycle,
+        }
     }
 }
 

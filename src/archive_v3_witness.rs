@@ -3090,6 +3090,16 @@ impl InMemoryWitness {
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
     }
+    /// An in-memory witness that accepts a real deletion authority, so a test
+    /// can drive the deletion ladder with the same
+    /// [`ControlDeletionAuthenticator`] production would install rather than a
+    /// bespoke always-yes stub.
+    #[cfg(test)]
+    pub(crate) fn with_deletion_authenticator_for_test(
+        deletion_authenticator: Arc<dyn DeletionWorkerAuthenticator>,
+    ) -> Self {
+        Self::with_clock_and_authenticator(Arc::new(SystemClock), deletion_authenticator)
+    }
     #[cfg(test)]
     pub(crate) fn with_incrementing_clock_for_test(start_tick: u64) -> Self {
         struct IncrementingClock(std::sync::atomic::AtomicU64);

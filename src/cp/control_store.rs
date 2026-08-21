@@ -7707,7 +7707,24 @@ fn wal_deletion_already_complete_conn(conn: &Connection, archive_id: ArchiveId) 
     Ok(complete == 1)
 }
 
-fn tear_down_wal_bookkeeping_conn(conn: &Connection, archive_id: ArchiveId) -> Result<()> {
+/// Tear down the WAL bookkeeping whose `object_key` columns must not outlive
+/// completion, and record the account's residue disclosure in the same
+/// transaction.
+///
+/// The disclosure travels with `SET drained = 1` deliberately. This statement
+/// list also deletes `archive_v3_wal_genesis`, which is one of the two durable
+/// facts that keep a WAL-authoritative account off the legacy sweep, so a
+/// crash between an already-committed teardown and a separate disclosure write
+/// would leave the next reconcile pass routing to the legacy sweep with no
+/// record that this account ever took the archive-v3 lane. One transaction
+/// removes that window: either both land or neither does.
+fn tear_down_wal_bookkeeping_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    user_id: &str,
+    residue_flags: &str,
+) -> Result<()> {
+    validate_user_id(user_id)?;
     let tx = conn.unchecked_transaction()?;
     let complete: i64 = tx.query_row(
         "SELECT EXISTS(
@@ -7744,6 +7761,14 @@ fn tear_down_wal_bookkeeping_conn(conn: &Connection, archive_id: ArchiveId) -> R
     tx.execute(
         "UPDATE archive_media_deletion_stages SET drained = 1 WHERE archive_id = ?1",
         [archive],
+    )?;
+    tx.execute(
+        "INSERT INTO account_deletion_residue_disclosures (user_id, flags)
+         VALUES (?1, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET
+             flags = excluded.flags,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        rusqlite::params![user_id, residue_flags],
     )?;
     tx.commit()?;
     Ok(())
@@ -18215,6 +18240,37 @@ impl ControlStore {
             .await
     }
 
+    /// Test-only: drive an archive's lifecycle anchor from nothing to a
+    /// witnessed bootstrap through the REAL ladder — reserve, prepare, then
+    /// admit and reconcile both create-ahead artifacts — so a deletion test
+    /// starts from an anchor the freeze compare-and-swap actually accepts and
+    /// from create-ahead rows whose canonical keys and ciphertext hashes are
+    /// the ones the reachability walk will meet. Returns the anchor revision.
+    #[cfg(test)]
+    pub(crate) async fn seed_archive_lifecycle_for_test(
+        &self,
+        plan: BootstrapPlan,
+        wrapped_registry: Vec<u8>,
+        root_envelope: Vec<u8>,
+    ) -> Result<u64> {
+        let archive_id = plan.archive_id();
+        let reserved = self.reserve_archive_bootstrap(plan).await?;
+        let prepared = self
+            .prepare_archive_bootstrap(reserved, wrapped_registry, root_envelope)
+            .await?;
+        let registry = self
+            .admit_archive_create(archive_id, prepared.revision(), LIFECYCLE_REGISTRY_ORDINAL)
+            .await?;
+        let revision = self
+            .reconcile_archive_create(registry, LifecycleCreateOutcome::Created)
+            .await?;
+        let root = self
+            .admit_archive_create(archive_id, revision, LIFECYCLE_ROOT_ORDINAL)
+            .await?;
+        self.reconcile_archive_create(root, LifecycleCreateOutcome::Created)
+            .await
+    }
+
     /// Test-only: drive the user's existing binding to a recorded
     /// `wal_authoritative` genesis terminal through the REAL ledger gate
     /// (shape, lineage, and exclusivity checks all exercised). Requires the
@@ -21408,17 +21464,33 @@ impl ControlStore {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
+    /// The durable sealed-deletion state a re-entering ladder must adopt
+    /// instead of re-freezing.
+    ///
+    /// `None` means no seal exists yet, so the caller's first pass must run the
+    /// freeze-and-seal path. `Some` means W5 already landed and the seal (plus
+    /// its physical completion, when the drain receipt is already durable) is
+    /// rebuilt from the anchor and its retained page-reference chain. An `Err`
+    /// is a real authority failure — a fence that does not match, a broken
+    /// revision chain, an unreadable reference chain — and must never be read
+    /// as "not sealed yet", because the freeze compare-and-swap cannot leave
+    /// `inventory_sealed` or `physical_complete` and would only wedge.
     pub(crate) async fn recover_archive_deletion_lifecycle(
         &self,
         archive_id: ArchiveId,
         deletion_fence: ObjectId,
-    ) -> Result<RecoveredDeletionLifecycle> {
+    ) -> Result<Option<RecoveredDeletionLifecycle>> {
         self.read(move |conn| {
-            recover_archive_deletion_lifecycle_conn(conn, archive_id, deletion_fence)
+            let Some(anchor) = lifecycle_anchor_conn(conn, archive_id)? else {
+                return Ok(None);
+            };
+            if !matches!(
+                anchor.state,
+                ArchiveLifecycleState::InventorySealed | ArchiveLifecycleState::PhysicalComplete
+            ) {
+                return Ok(None);
+            }
+            recover_archive_deletion_lifecycle_conn(conn, archive_id, deletion_fence).map(Some)
         })
         .await
     }
@@ -21584,10 +21656,20 @@ impl ControlStore {
     }
 
     /// Remove the WAL bookkeeping whose `object_key` columns are names, once
-    /// the archive is physically complete.
-    pub(crate) async fn tear_down_wal_bookkeeping(&self, archive_id: ArchiveId) -> Result<()> {
+    /// the archive is physically complete, and durably disclose the residue
+    /// classes in the same transaction.
+    pub(crate) async fn tear_down_wal_bookkeeping(
+        &self,
+        archive_id: ArchiveId,
+        user_id: &str,
+        residue_flags: &[&'static str],
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        let user_id = user_id.to_owned();
+        let residue_flags = residue_flags.join(",");
         self.write_if_changed(move |conn| {
-            tear_down_wal_bookkeeping_conn(conn, archive_id).map(|()| ((), true))
+            tear_down_wal_bookkeeping_conn(conn, archive_id, &user_id, &residue_flags)
+                .map(|()| ((), true))
         })
         .await
     }
@@ -23362,6 +23444,34 @@ impl WalPublisherControl for ControlStore {
     }
 }
 
+/// Classify a control-store failure for the deletion inventory boundary.
+///
+/// The deletion inventory is frozen *after* the archive binding is tombstoned,
+/// so there is no owner and no serving authority left to settle conflicting
+/// work: a `Conflict` here — the widened union's "names one object twice" and
+/// "exceeded its bound" refusals, an inventory branch conflict, unresolved
+/// create work, or a snapshot whose commitment no longer recomputes — is
+/// permanent, and reporting it as `Unavailable` would loop the deletion on a
+/// 30s retry that no operator is ever paged for. Everything else keeps its
+/// transient classification.
+const fn map_deletion_inventory_error(error: &EnclaveError) -> LifecycleError {
+    match error {
+        EnclaveError::Conflict(_) => LifecycleError::Conflict,
+        _ => LifecycleError::Unavailable,
+    }
+}
+
+/// A durable snapshot that fails structural validation is permanent for the
+/// same reason: the bound it exceeded (`create_ahead + widened >
+/// MAX_LIFECYCLE_ARTIFACTS`) can only shrink through work that requires the
+/// owner this deletion already revoked. Never truncate the inventory — park it.
+const fn map_frozen_snapshot_error(error: LifecycleError) -> LifecycleError {
+    match error {
+        LifecycleError::Malformed | LifecycleError::Limit => LifecycleError::Conflict,
+        other => other,
+    }
+}
+
 #[async_trait::async_trait]
 impl DeletionInventoryControl for ControlStore {
     async fn freeze_snapshot(
@@ -23373,11 +23483,11 @@ impl DeletionInventoryControl for ControlStore {
         let revision = self
             .freeze_archive_inventory_snapshot(archive_id, expected_revision, deletion_fence)
             .await
-            .map_err(|_| LifecycleError::Unavailable)?;
+            .map_err(|error| map_deletion_inventory_error(&error))?;
         let (loaded_revision, create_ahead, widened) = self
             .load_archive_inventory_snapshot(archive_id, deletion_fence)
             .await
-            .map_err(|_| LifecycleError::Unavailable)?;
+            .map_err(|error| map_deletion_inventory_error(&error))?;
         if revision != loaded_revision {
             return Err(LifecycleError::StaleRevision);
         }
@@ -23389,6 +23499,7 @@ impl DeletionInventoryControl for ControlStore {
             create_ahead,
             widened,
         )
+        .map_err(map_frozen_snapshot_error)
     }
 
     async fn load_snapshot(
@@ -23399,7 +23510,7 @@ impl DeletionInventoryControl for ControlStore {
         let (revision, create_ahead, widened) = self
             .load_archive_inventory_snapshot(archive_id, deletion_fence)
             .await
-            .map_err(|_| LifecycleError::Unavailable)?;
+            .map_err(|error| map_deletion_inventory_error(&error))?;
         FrozenInventorySnapshot::from_persisted(
             &LifecyclePersistenceContext::validated(),
             archive_id,
@@ -23408,6 +23519,7 @@ impl DeletionInventoryControl for ControlStore {
             create_ahead,
             widened,
         )
+        .map_err(map_frozen_snapshot_error)
     }
 
     async fn recover_page_plan(
@@ -23417,7 +23529,7 @@ impl DeletionInventoryControl for ControlStore {
     ) -> std::result::Result<RecoveredPageCreatePlan, LifecycleError> {
         self.recover_lifecycle_page_create_plan(archive_id, deletion_fence)
             .await
-            .map_err(|_| LifecycleError::Unavailable)
+            .map_err(|error| map_deletion_inventory_error(&error))
     }
 
     async fn seal_authenticated_pages(
@@ -23428,7 +23540,7 @@ impl DeletionInventoryControl for ControlStore {
             seal_archive_inventory_conn(conn, &plan).map(|seal| (seal, true))
         })
         .await
-        .map_err(|_| LifecycleError::Unavailable)
+        .map_err(|error| map_deletion_inventory_error(&error))
     }
 
     async fn load_sealed_references(
@@ -23437,7 +23549,7 @@ impl DeletionInventoryControl for ControlStore {
     ) -> std::result::Result<Vec<InventoryPageReference>, LifecycleError> {
         self.load_sealed_archive_inventory_references(*seal)
             .await
-            .map_err(|_| LifecycleError::Unavailable)
+            .map_err(|error| map_deletion_inventory_error(&error))
     }
 }
 

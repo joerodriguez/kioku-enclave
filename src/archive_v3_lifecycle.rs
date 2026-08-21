@@ -2078,6 +2078,15 @@ pub(crate) enum LifecycleError {
     ChainMismatch,
     #[error("archive lifecycle inventory has conflicting object identity")]
     DuplicateConflict,
+    /// The durable state permanently refuses the operation: a bound was
+    /// exceeded, a name was inventoried twice, a branch conflicts, or a
+    /// retained snapshot no longer matches its commitment. Distinct from
+    /// [`Self::Unavailable`] because no retry can clear it — after the
+    /// deletion tombstone there is no owner and no serving authority left to
+    /// settle the conflicting work, so reporting it as transient would loop an
+    /// operation nobody is ever paged for.
+    #[error("archive lifecycle durable state permanently conflicts")]
+    Conflict,
     #[error("archive lifecycle durable store is unavailable")]
     Unavailable,
 }

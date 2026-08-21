@@ -101,6 +101,53 @@ impl crate::archive_v3::ExactKeyRegistryProvider for CoordinatorTestRegistryProv
     }
 }
 
+/// The registry binding, its resolved cipher, and the exact wrapped-registry
+/// bytes behind it, for a test that must drive a whole deletion ladder: the
+/// witness record, the lifecycle create-ahead rows and the graph walk all have
+/// to agree on the same registry object ID and ciphertext hash, and only the
+/// wrapped bytes make the lifecycle row's `Sha256` match.
+#[cfg(test)]
+pub(crate) async fn registry_binding_for_deletion_test(
+    archive_id: ArchiveId,
+    key_epoch: crate::archive_v3::KeyEpoch,
+    registry_object_id: ObjectId,
+) -> (
+    crate::archive_v3_witness::KeyRegistryReference,
+    VerifiedArchiveCipher,
+    Vec<u8>,
+) {
+    let context = KeyRegistryContext::new(archive_id, KeyKind::Archive, key_epoch);
+    let wrapped = vec![0x62, 0x63, 0x64];
+    let wrapped_hash: [u8; 32] = Sha256::digest(&wrapped).into();
+    let plaintext = crate::archive_v3::KeyRegistryPlaintext::encode_archive(
+        &context,
+        &crate::archive_v3::ArchiveDek::from_bytes([0x65; 32]),
+    )
+    .unwrap()
+    .to_vec();
+    let cipher = crate::archive_v3::resolve_archive_cipher(
+        &context,
+        registry_object_id,
+        wrapped_hash,
+        &CoordinatorTestRegistryProvider {
+            wrapped: wrapped.clone(),
+            plaintext,
+        },
+    )
+    .await
+    .unwrap();
+    (
+        crate::archive_v3_witness::KeyRegistryReference::new(
+            key_epoch,
+            0,
+            registry_object_id,
+            wrapped_hash,
+        ),
+        cipher,
+        wrapped,
+    )
+}
+
 #[cfg(test)]
 pub(crate) async fn verified_cipher_for_coordinator_test(
     archive_id: ArchiveId,
