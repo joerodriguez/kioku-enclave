@@ -119,6 +119,11 @@ mod archive_v3_genesis_trigger;
 // archive contexts and authenticated canonical metadata; no route, Store,
 // runtime/provider construction, or production authority is connected.
 mod archive_v3_deletion;
+// ADR-0022 archive-v3 deletion drive ladder. It orchestrates the reviewed
+// witness FSM, inventory coordinator and deletion driver for a
+// WAL-authoritative account; it mints no destructive authority of its own and
+// is reachable only when an archive-v3 deletion runtime is installed.
+mod archive_v3_deletion_lane;
 // Inactive ADR-0022 immutable sparse-extent tree. It is fake-tested only and
 // has no Store/VFS/provider/witness/route/flag/authority wiring.
 mod archive_v3_extent;

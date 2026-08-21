@@ -59,6 +59,18 @@ pub struct DeletionWorkerCredential {
     provider_assertion: Zeroizing<Vec<u8>>,
 }
 impl DeletionWorkerCredential {
+    /// Minting is gated by a producer token only [`DeletionPrincipal`] can
+    /// construct, so persistence — or any caller holding an archive ID — can
+    /// never fabricate a deletion capability.
+    fn minted(_producer: &DeletionPrincipalMint, provider_assertion: Vec<u8>) -> Result<Self> {
+        if provider_assertion.is_empty() {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self {
+            provider_assertion: Zeroizing::new(provider_assertion),
+        })
+    }
+
     #[cfg(test)]
     fn new(provider_assertion: &[u8]) -> Result<Self> {
         if provider_assertion.is_empty() {
@@ -85,6 +97,18 @@ pub struct DeletionStageProof {
     provider_drain_commitment: Option<[u8; 32]>,
 }
 impl DeletionStageProof {
+    /// Minting is gated by the same producer token as the credential.
+    fn minted(_producer: &DeletionPrincipalMint, provider_assertion: Vec<u8>) -> Result<Self> {
+        if provider_assertion.is_empty() {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self {
+            provider_assertion: Zeroizing::new(provider_assertion),
+            inventory_commitment: None,
+            provider_drain_commitment: None,
+        })
+    }
+
     #[cfg(test)]
     fn new(provider_assertion: &[u8]) -> Result<Self> {
         if provider_assertion.is_empty() {
@@ -149,7 +173,7 @@ impl fmt::Debug for DeletionStageProof {
 /// principal on every destructive transition. Persistence alone never mints a
 /// deletion capability.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct DeletionWorkerIdentity {
+pub(crate) struct DeletionWorkerIdentity {
     worker_id: ObjectId,
     operation_id: ObjectId,
 }
@@ -166,7 +190,7 @@ impl DeletionWorkerIdentity {
 }
 
 #[derive(Clone, Copy)]
-struct DeletionStageContext {
+pub(crate) struct DeletionStageContext {
     archive_id: ArchiveId,
     identity: DeletionWorkerIdentity,
     deletion_fencing_epoch: u64,
@@ -177,7 +201,7 @@ struct DeletionStageContext {
     provider_drain_commitment: Option<[u8; 32]>,
 }
 
-trait DeletionWorkerAuthenticator: Send + Sync {
+pub(crate) trait DeletionWorkerAuthenticator: Send + Sync {
     fn authenticate(
         &self,
         archive_id: ArchiveId,
@@ -191,6 +215,295 @@ trait DeletionWorkerAuthenticator: Send + Sync {
         proof: &DeletionStageProof,
     ) -> Result<[u8; 32]>;
 }
+
+// ── Production deletion principal ───────────────────────────────────────────
+
+/// Domain separators. Every assertion and every derived identity is bound to
+/// exactly one of these, so no byte string minted for one purpose can ever be
+/// replayed for another.
+const DELETION_PRINCIPAL_KEY_INFO: &[u8] = b"kioku:v3:deletion-principal-key\0";
+const DELETION_WORKER_ID_DOMAIN: &[u8] = b"kioku:v3:deletion-worker\0";
+const DELETION_CREDENTIAL_DOMAIN: &[u8] = b"kioku:v3:deletion-credential\0";
+const DELETION_STAGE_DOMAIN: &[u8] = b"kioku:v3:deletion-stage\0";
+const DELETION_PROVIDER_COMMITMENT_DOMAIN: &[u8] = b"kioku:v3:deletion-provider-commitment\0";
+/// `deletion_fence(16) || tag(32)`.
+const DELETION_ASSERTION_BYTES: usize = 48;
+
+/// Producer token: only [`DeletionPrincipal`] constructs one, and only a
+/// holder of one can mint a [`DeletionWorkerCredential`] or a
+/// [`DeletionStageProof`].
+struct DeletionPrincipalMint(());
+
+/// The 32-byte deletion-principal key. Derived once from the control root and
+/// held only in memory; it is never persisted and never leaves the enclave.
+pub(crate) struct DeletionPrincipalKey(Zeroizing<[u8; 32]>);
+
+impl fmt::Debug for DeletionPrincipalKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeletionPrincipalKey(<opaque>)")
+    }
+}
+
+impl DeletionPrincipalKey {
+    /// Derive the principal key from the control root (the KMS-unwrapped
+    /// control-store DEK). Deterministic, so every instance that can read the
+    /// same control root derives the same key — which is what makes the worker
+    /// identity re-derivable after a restart.
+    pub(crate) fn derive_from_control_root(control_root: &[u8; 32]) -> Result<Self> {
+        if control_root.iter().all(|byte| *byte == 0) {
+            return Err(WitnessError::Malformed);
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf::Hkdf::<Sha256>::new(None, control_root.as_slice())
+            .expand(DELETION_PRINCIPAL_KEY_INFO, key.as_mut_slice())
+            .map_err(|_| WitnessError::Malformed)?;
+        if key.iter().all(|byte| *byte == 0) {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self(key))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(material: [u8; 32]) -> Self {
+        Self(Zeroizing::new(material))
+    }
+
+    fn tag(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(&self.0[..])
+            .expect("HMAC-SHA256 accepts a 32-byte key");
+        for part in parts {
+            hmac::Mac::update(&mut mac, part);
+        }
+        hmac::Mac::finalize(mac).into_bytes().into()
+    }
+
+    /// The deterministic worker identity for one archive's deletion. Both
+    /// halves derive from control-durable facts alone — the archive ID and the
+    /// deletion fence minted in the transaction that tombstoned the binding —
+    /// so a restarted worker re-derives the exact pinned identity that
+    /// `resume_deletion` demands. A random identity would wedge the deletion
+    /// forever.
+    fn identity(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<DeletionWorkerIdentity> {
+        if !nonzero_id(deletion_fence.as_bytes()) {
+            return Err(WitnessError::Malformed);
+        }
+        let derived = self.tag(&[DELETION_WORKER_ID_DOMAIN, archive_id.as_bytes()]);
+        let mut worker = [0u8; 16];
+        worker.copy_from_slice(&derived[..16]);
+        DeletionWorkerIdentity::new(ObjectId::from_bytes(worker), deletion_fence)
+    }
+
+    fn credential_tag(&self, archive_id: ArchiveId, deletion_fence: ObjectId) -> [u8; 32] {
+        self.tag(&[
+            DELETION_CREDENTIAL_DOMAIN,
+            archive_id.as_bytes(),
+            deletion_fence.as_bytes(),
+        ])
+    }
+
+    fn stage_tag(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        target: DeletionState,
+    ) -> [u8; 32] {
+        self.tag(&[
+            DELETION_STAGE_DOMAIN,
+            archive_id.as_bytes(),
+            deletion_fence.as_bytes(),
+            &[target as u8],
+        ])
+    }
+
+    fn assertion(fence: ObjectId, tag: [u8; 32]) -> Vec<u8> {
+        let mut assertion = Vec::with_capacity(DELETION_ASSERTION_BYTES);
+        assertion.extend_from_slice(fence.as_bytes());
+        assertion.extend_from_slice(&tag);
+        assertion
+    }
+
+    /// Split an assertion into its fence and tag halves without leaking which
+    /// half failed.
+    fn split_assertion(assertion: &[u8]) -> Result<(ObjectId, [u8; 32])> {
+        if assertion.len() != DELETION_ASSERTION_BYTES {
+            return Err(WitnessError::Unauthorized);
+        }
+        let mut fence = [0u8; 16];
+        fence.copy_from_slice(&assertion[..16]);
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&assertion[16..]);
+        if !nonzero_id(&fence) {
+            return Err(WitnessError::Unauthorized);
+        }
+        Ok((ObjectId::from_bytes(fence), tag))
+    }
+}
+
+fn constant_time_tag_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    use subtle::ConstantTimeEq;
+    left.ct_eq(right).unwrap_u8() == 1
+}
+
+/// Mints the deletion capability for exactly one `(archive_id,
+/// deletion_fence)` pair. The fence is minted by the same control transaction
+/// that tombstoned the archive binding, so there is no caller-chosen identity
+/// anywhere on this path.
+pub(crate) struct DeletionPrincipal {
+    key: Arc<DeletionPrincipalKey>,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+}
+
+impl DeletionPrincipal {
+    pub(crate) fn new(
+        key: Arc<DeletionPrincipalKey>,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<Self> {
+        if !nonzero_id(archive_id.as_bytes()) || !nonzero_id(deletion_fence.as_bytes()) {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self {
+            key,
+            archive_id,
+            deletion_fence,
+        })
+    }
+
+    pub(crate) fn credential(&self) -> Result<DeletionWorkerCredential> {
+        DeletionWorkerCredential::minted(
+            &DeletionPrincipalMint(()),
+            DeletionPrincipalKey::assertion(
+                self.deletion_fence,
+                self.key
+                    .credential_tag(self.archive_id, self.deletion_fence),
+            ),
+        )
+    }
+
+    /// One proof per witness rung. The commitments the driver later binds onto
+    /// it are checked separately by `verify_stage`'s commitment discipline.
+    pub(crate) fn stage_proof(&self, target: DeletionState) -> Result<DeletionStageProof> {
+        if target == DeletionState::Active {
+            return Err(WitnessError::InvalidTransition);
+        }
+        DeletionStageProof::minted(
+            &DeletionPrincipalMint(()),
+            DeletionPrincipalKey::assertion(
+                self.deletion_fence,
+                self.key
+                    .stage_tag(self.archive_id, self.deletion_fence, target),
+            ),
+        )
+    }
+
+    pub(crate) fn authenticator(&self) -> Arc<dyn DeletionWorkerAuthenticator> {
+        Arc::new(ControlDeletionAuthenticator {
+            key: Arc::clone(&self.key),
+        })
+    }
+}
+
+impl fmt::Debug for DeletionPrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeletionPrincipal(<opaque>)")
+    }
+}
+
+/// The production deletion authority. It replaces [`DenyDeletionWorkers`] on
+/// every witness reconstruction that must accept a real deletion worker.
+pub(crate) struct ControlDeletionAuthenticator {
+    key: Arc<DeletionPrincipalKey>,
+}
+
+impl DeletionWorkerAuthenticator for ControlDeletionAuthenticator {
+    fn authenticate(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+    ) -> Result<DeletionWorkerIdentity> {
+        let (fence, tag) = DeletionPrincipalKey::split_assertion(credential.provider_assertion())?;
+        if !constant_time_tag_eq(&tag, &self.key.credential_tag(archive_id, fence)) {
+            return Err(WitnessError::Unauthorized);
+        }
+        self.key
+            .identity(archive_id, fence)
+            .map_err(|_| WitnessError::Unauthorized)
+    }
+
+    fn verify_stage(
+        &self,
+        credential: &DeletionWorkerCredential,
+        context: DeletionStageContext,
+        proof: &DeletionStageProof,
+    ) -> Result<[u8; 32]> {
+        if self.authenticate(context.archive_id, credential)? != context.identity {
+            return Err(WitnessError::Unauthorized);
+        }
+        let (fence, tag) = DeletionPrincipalKey::split_assertion(proof.provider_assertion())?;
+        // The stage proof is bound to the same fence the credential carries,
+        // which `authenticate` already pinned as the operation identity.
+        if fence != context.identity.operation_id
+            || !constant_time_tag_eq(
+                &tag,
+                &self
+                    .key
+                    .stage_tag(context.archive_id, fence, context.target),
+            )
+        {
+            return Err(WitnessError::Unauthorized);
+        }
+        // The exact commitment discipline the FSM's own evidence rules pin: a
+        // stage may carry neither more nor fewer commitments than its rung.
+        match (
+            context.target,
+            context.inventory_commitment,
+            context.provider_drain_commitment,
+        ) {
+            (DeletionState::Active, _, _) => return Err(WitnessError::InvalidTransition),
+            (DeletionState::CryptographicallyErased, Some(inventory), None)
+                if nonzero_hash(&inventory) => {}
+            (DeletionState::CryptographicallyErased, _, _) => {
+                return Err(WitnessError::Unauthorized)
+            }
+            (DeletionState::PhysicalComplete, Some(inventory), Some(drain))
+                if nonzero_hash(&inventory) && nonzero_hash(&drain) => {}
+            (DeletionState::PhysicalComplete, _, _) => return Err(WitnessError::Unauthorized),
+            (DeletionState::Tombstoned | DeletionState::LogicalObjectsAbsent, None, None) => {}
+            (DeletionState::Tombstoned | DeletionState::LogicalObjectsAbsent, _, _) => {
+                return Err(WitnessError::Unauthorized)
+            }
+        }
+        let commitment = self.key.tag(&[
+            DELETION_PROVIDER_COMMITMENT_DOMAIN,
+            context.archive_id.as_bytes(),
+            fence.as_bytes(),
+            &[context.target as u8],
+            context.identity.worker_id.as_bytes(),
+            &context.deletion_fencing_epoch.to_be_bytes(),
+            &context.inventory_commitment.unwrap_or([0; 32]),
+            &context.provider_drain_commitment.unwrap_or([0; 32]),
+        ]);
+        // A zero commitment can never be evidence; the FSM refuses it anyway,
+        // but refusing here keeps the failure at the authority.
+        if !nonzero_hash(&commitment) {
+            return Err(WitnessError::Unauthorized);
+        }
+        Ok(commitment)
+    }
+}
+
+/// The deny-by-default authority every non-deletion witness reconstruction
+/// keeps. Exposed so a concrete adapter can name it as its default without
+/// gaining any way to authorize a deletion.
+pub(crate) fn deny_deletion_workers() -> Arc<dyn DeletionWorkerAuthenticator> {
+    Arc::new(DenyDeletionWorkers)
+}
+
 struct DenyDeletionWorkers;
 impl DeletionWorkerAuthenticator for DenyDeletionWorkers {
     fn authenticate(
@@ -2777,6 +3090,16 @@ impl InMemoryWitness {
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
     }
+    /// An in-memory witness that accepts a real deletion authority, so a test
+    /// can drive the deletion ladder with the same
+    /// [`ControlDeletionAuthenticator`] production would install rather than a
+    /// bespoke always-yes stub.
+    #[cfg(test)]
+    pub(crate) fn with_deletion_authenticator_for_test(
+        deletion_authenticator: Arc<dyn DeletionWorkerAuthenticator>,
+    ) -> Self {
+        Self::with_clock_and_authenticator(Arc::new(SystemClock), deletion_authenticator)
+    }
     #[cfg(test)]
     pub(crate) fn with_incrementing_clock_for_test(start_tick: u64) -> Self {
         struct IncrementingClock(std::sync::atomic::AtomicU64);
@@ -2833,13 +3156,33 @@ impl InMemoryWitness {
         record: Option<[u8; WITNESS_RECORD_BYTES]>,
         tick: u64,
     ) -> Result<Self> {
+        Self::from_provider_record_at_tick_with_authenticator(
+            record,
+            tick,
+            Arc::new(DenyDeletionWorkers),
+        )
+    }
+
+    /// The deletion-capable reconstruction seam. Every non-deletion caller
+    /// keeps the deny-by-default authenticator; only the four deletion
+    /// operations reconstruct with a real authority, and only when one has
+    /// been installed on the concrete witness.
+    pub(crate) fn from_provider_record_at_tick_with_authenticator(
+        record: Option<[u8; WITNESS_RECORD_BYTES]>,
+        tick: u64,
+        deletion_authenticator: Arc<dyn DeletionWorkerAuthenticator>,
+    ) -> Result<Self> {
         struct FixedClock(u64);
         impl TrustedClock for FixedClock {
             fn now_tick(&self) -> Result<u64> {
                 Ok(self.0)
             }
         }
-        Self::from_records(Arc::new(FixedClock(tick)), record.into_iter().collect())
+        Self::from_records_with_authenticator(
+            Arc::new(FixedClock(tick)),
+            deletion_authenticator,
+            record.into_iter().collect(),
+        )
     }
 
     /// WAL-publisher-only exact acquisition. The byte-exact unleased terminal
@@ -5933,5 +6276,376 @@ mod tests {
             Err(WitnessError::Unavailable)
         );
         assert!(!format!("{r:?} {l:?}").contains("01"));
+    }
+
+    // ── Production deletion authority (ADR-0022 group D, spec §1) ───────────
+
+    fn principal_fixture() -> (
+        InMemoryWitness,
+        ArchiveId,
+        ObjectId,
+        Arc<DeletionPrincipalKey>,
+    ) {
+        let archive_id = ArchiveId::from_bytes([91; 16]);
+        let database_epoch = DatabaseEpoch::from_bytes([92; 16]);
+        let key_epoch = KeyEpoch::from_bytes([93; 16]);
+        let registry =
+            KeyRegistryReference::new(key_epoch, 0, ObjectId::from_bytes([94; 16]), [95; 32]);
+        let root = RootCommitment::genesis(
+            database_epoch,
+            key_epoch,
+            RootReference::new(0, ObjectId::from_bytes([96; 16]), [97; 32]),
+        );
+        let key = Arc::new(
+            DeletionPrincipalKey::derive_from_control_root(&[0x5a; 32])
+                .expect("principal key derives"),
+        );
+        let witness = InMemoryWitness::with_clock_and_authenticator(
+            Arc::new(SystemClock),
+            Arc::new(ControlDeletionAuthenticator {
+                key: Arc::clone(&key),
+            }),
+        );
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                root,
+                registry,
+            ))
+            .expect("principal fixture bootstrap");
+        (witness, archive_id, ObjectId::from_bytes([98; 16]), key)
+    }
+
+    #[test]
+    fn deletion_ops_are_unauthorized_without_the_principal_and_authorized_with_it() {
+        let (witness, archive_id, fence, key) = principal_fixture();
+        let principal = DeletionPrincipal::new(Arc::clone(&key), archive_id, fence).unwrap();
+
+        // A witness that still carries the deny-by-default authority refuses
+        // the very same credential.
+        let denying = InMemoryWitness::from_provider_record_at_tick(
+            Some(witness.read_current(archive_id).unwrap().unwrap().encode()),
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            denying
+                .resume_deletion(archive_id, &principal.credential().unwrap())
+                .err(),
+            Some(WitnessError::Unauthorized)
+        );
+
+        let record = witness.read_current(archive_id).unwrap().unwrap();
+        let advance = TombstoneAdvance::from_current(&record).unwrap();
+        let receipt = witness
+            .tombstone_current(
+                advance,
+                &principal.credential().unwrap(),
+                &principal.stage_proof(DeletionState::Tombstoned).unwrap(),
+            )
+            .expect("the production authority authorizes the tombstone");
+        assert_eq!(
+            receipt.receipt().record().deletion(),
+            DeletionState::Tombstoned
+        );
+    }
+
+    #[test]
+    fn worker_identity_is_deterministic_so_a_restarted_worker_resumes() {
+        let (witness, archive_id, fence, key) = principal_fixture();
+        let principal = DeletionPrincipal::new(Arc::clone(&key), archive_id, fence).unwrap();
+        let record = witness.read_current(archive_id).unwrap().unwrap();
+        witness
+            .tombstone_current(
+                TombstoneAdvance::from_current(&record).unwrap(),
+                &principal.credential().unwrap(),
+                &principal.stage_proof(DeletionState::Tombstoned).unwrap(),
+            )
+            .unwrap();
+        let tombstoned = witness.read_current(archive_id).unwrap().unwrap().encode();
+
+        // A fresh process: the principal key is re-derived from the same
+        // control root, nothing about the identity is remembered in memory.
+        let restarted_key = Arc::new(
+            DeletionPrincipalKey::derive_from_control_root(&[0x5a; 32])
+                .expect("principal key re-derives"),
+        );
+        let restarted = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+            Some(tombstoned),
+            50,
+            Arc::new(ControlDeletionAuthenticator {
+                key: Arc::clone(&restarted_key),
+            }),
+        )
+        .unwrap();
+        let restarted_principal = DeletionPrincipal::new(restarted_key, archive_id, fence).unwrap();
+        restarted
+            .resume_deletion(archive_id, &restarted_principal.credential().unwrap())
+            .expect("the re-derived identity matches the pinned worker/operation");
+
+        // A different control root derives a different worker identity, which
+        // `resume_deletion`'s exact-match refuses.
+        let other_key =
+            Arc::new(DeletionPrincipalKey::derive_from_control_root(&[0x77; 32]).unwrap());
+        let other = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+            Some(tombstoned),
+            51,
+            Arc::new(ControlDeletionAuthenticator {
+                key: Arc::clone(&other_key),
+            }),
+        )
+        .unwrap();
+        let other_principal = DeletionPrincipal::new(other_key, archive_id, fence).unwrap();
+        assert_eq!(
+            other
+                .resume_deletion(archive_id, &other_principal.credential().unwrap())
+                .err(),
+            Some(WitnessError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn a_credential_minted_for_another_archive_or_fence_is_refused() {
+        let (witness, archive_id, fence, key) = principal_fixture();
+        let foreign_archive =
+            DeletionPrincipal::new(Arc::clone(&key), ArchiveId::from_bytes([13; 16]), fence)
+                .unwrap();
+        let foreign_fence =
+            DeletionPrincipal::new(Arc::clone(&key), archive_id, ObjectId::from_bytes([14; 16]))
+                .unwrap();
+        let record = witness.read_current(archive_id).unwrap().unwrap();
+        let advance = TombstoneAdvance::from_current(&record).unwrap();
+        assert_eq!(
+            witness
+                .tombstone_current(
+                    advance.clone(),
+                    &foreign_archive.credential().unwrap(),
+                    &foreign_archive
+                        .stage_proof(DeletionState::Tombstoned)
+                        .unwrap(),
+                )
+                .err(),
+            Some(WitnessError::Unauthorized)
+        );
+        // A credential for a different fence authenticates as a different
+        // operation identity, and its stage proof no longer matches.
+        assert!(witness
+            .tombstone_current(
+                advance,
+                &foreign_fence.credential().unwrap(),
+                &foreign_archive
+                    .stage_proof(DeletionState::Tombstoned)
+                    .unwrap(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn stage_proofs_are_not_interchangeable_between_rungs() {
+        let (_witness, archive_id, fence, key) = principal_fixture();
+        let principal = DeletionPrincipal::new(Arc::clone(&key), archive_id, fence).unwrap();
+        let authenticator = ControlDeletionAuthenticator {
+            key: Arc::clone(&key),
+        };
+        let credential = principal.credential().unwrap();
+        let Ok(identity) = authenticator.authenticate(archive_id, &credential) else {
+            panic!("the production authority authenticates its own credential")
+        };
+        let context = |target, inventory, drain| DeletionStageContext {
+            archive_id,
+            identity,
+            deletion_fencing_epoch: 1,
+            target,
+            root: RootCommitment::genesis(
+                DatabaseEpoch::from_bytes([92; 16]),
+                KeyEpoch::from_bytes([93; 16]),
+                RootReference::new(0, ObjectId::from_bytes([96; 16]), [97; 32]),
+            ),
+            registry: KeyRegistryReference::new(
+                KeyEpoch::from_bytes([93; 16]),
+                0,
+                ObjectId::from_bytes([94; 16]),
+                [95; 32],
+            ),
+            inventory_commitment: inventory,
+            provider_drain_commitment: drain,
+        };
+        let tombstone = principal.stage_proof(DeletionState::Tombstoned).unwrap();
+        // The Tombstoned proof cannot stand in for the CE rung.
+        assert_eq!(
+            authenticator
+                .verify_stage(
+                    &credential,
+                    context(DeletionState::CryptographicallyErased, Some([9; 32]), None),
+                    &tombstone.bind_inventory_only([9; 32]).unwrap(),
+                )
+                .unwrap_err(),
+            WitnessError::Unauthorized
+        );
+        // And the correct rung's proof succeeds.
+        let erasure = principal
+            .stage_proof(DeletionState::CryptographicallyErased)
+            .unwrap();
+        authenticator
+            .verify_stage(
+                &credential,
+                context(DeletionState::CryptographicallyErased, Some([9; 32]), None),
+                &erasure.bind_inventory_only([9; 32]).unwrap(),
+            )
+            .expect("the CE rung's own proof verifies");
+    }
+
+    #[test]
+    fn every_rung_pins_its_exact_commitment_discipline() {
+        let (_witness, archive_id, fence, key) = principal_fixture();
+        let principal = DeletionPrincipal::new(Arc::clone(&key), archive_id, fence).unwrap();
+        let authenticator = ControlDeletionAuthenticator {
+            key: Arc::clone(&key),
+        };
+        let credential = principal.credential().unwrap();
+        let Ok(identity) = authenticator.authenticate(archive_id, &credential) else {
+            panic!("the production authority authenticates its own credential")
+        };
+        let context = |target, inventory, drain| DeletionStageContext {
+            archive_id,
+            identity,
+            deletion_fencing_epoch: 1,
+            target,
+            root: RootCommitment::genesis(
+                DatabaseEpoch::from_bytes([92; 16]),
+                KeyEpoch::from_bytes([93; 16]),
+                RootReference::new(0, ObjectId::from_bytes([96; 16]), [97; 32]),
+            ),
+            registry: KeyRegistryReference::new(
+                KeyEpoch::from_bytes([93; 16]),
+                0,
+                ObjectId::from_bytes([94; 16]),
+                [95; 32],
+            ),
+            inventory_commitment: inventory,
+            provider_drain_commitment: drain,
+        };
+        // Tombstoned and LogicalObjectsAbsent carry no commitments.
+        for rung in [
+            DeletionState::Tombstoned,
+            DeletionState::LogicalObjectsAbsent,
+        ] {
+            let proof = principal.stage_proof(rung).unwrap();
+            authenticator
+                .verify_stage(&credential, context(rung, None, None), &proof)
+                .expect("a bare rung verifies");
+            assert_eq!(
+                authenticator
+                    .verify_stage(
+                        &credential,
+                        context(rung, Some([9; 32]), None),
+                        &proof.bind_inventory_only([9; 32]).unwrap(),
+                    )
+                    .unwrap_err(),
+                WitnessError::Unauthorized,
+                "a bare rung must refuse an inventory commitment"
+            );
+        }
+        // CryptographicallyErased carries the inventory commitment only.
+        let erasure = principal
+            .stage_proof(DeletionState::CryptographicallyErased)
+            .unwrap();
+        assert_eq!(
+            authenticator
+                .verify_stage(
+                    &credential,
+                    context(DeletionState::CryptographicallyErased, None, None),
+                    &erasure,
+                )
+                .unwrap_err(),
+            WitnessError::Unauthorized
+        );
+        assert_eq!(
+            authenticator
+                .verify_stage(
+                    &credential,
+                    context(
+                        DeletionState::CryptographicallyErased,
+                        Some([9; 32]),
+                        Some([8; 32]),
+                    ),
+                    &erasure.bind_inventory_drain([9; 32], [8; 32]).unwrap(),
+                )
+                .unwrap_err(),
+            WitnessError::Unauthorized
+        );
+        // PhysicalComplete carries both, and a zero commitment is never
+        // evidence.
+        let retention = principal
+            .stage_proof(DeletionState::PhysicalComplete)
+            .unwrap();
+        assert_eq!(
+            authenticator
+                .verify_stage(
+                    &credential,
+                    context(DeletionState::PhysicalComplete, Some([9; 32]), None),
+                    &retention.bind_inventory_only([9; 32]).unwrap(),
+                )
+                .unwrap_err(),
+            WitnessError::Unauthorized
+        );
+        assert_eq!(
+            authenticator
+                .verify_stage(
+                    &credential,
+                    context(
+                        DeletionState::PhysicalComplete,
+                        Some([0; 32]),
+                        Some([8; 32])
+                    ),
+                    &retention,
+                )
+                .unwrap_err(),
+            WitnessError::Unauthorized
+        );
+        authenticator
+            .verify_stage(
+                &credential,
+                context(
+                    DeletionState::PhysicalComplete,
+                    Some([9; 32]),
+                    Some([8; 32]),
+                ),
+                &retention.bind_inventory_drain([9; 32], [8; 32]).unwrap(),
+            )
+            .expect("the PhysicalComplete rung verifies with both commitments");
+    }
+
+    #[test]
+    fn a_truncated_or_zero_fence_assertion_is_refused_without_panicking() {
+        let (_witness, archive_id, _fence, key) = principal_fixture();
+        let authenticator = ControlDeletionAuthenticator {
+            key: Arc::clone(&key),
+        };
+        for assertion in [
+            vec![0u8; 47],
+            vec![0u8; 49],
+            vec![0u8; 48],
+            b"driver-worker".to_vec(),
+        ] {
+            assert_eq!(
+                authenticator
+                    .authenticate(
+                        archive_id,
+                        &DeletionWorkerCredential::new(&assertion).unwrap(),
+                    )
+                    .err(),
+                Some(WitnessError::Unauthorized)
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_control_root_never_derives_a_principal_key() {
+        assert_eq!(
+            DeletionPrincipalKey::derive_from_control_root(&[0; 32]).err(),
+            Some(WitnessError::Malformed)
+        );
     }
 }

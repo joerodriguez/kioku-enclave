@@ -631,13 +631,13 @@ impl fmt::Debug for CompletePreWitnessDeletionInventory {
 /// Opaque deletion session reconstructed only from a witness tombstone receipt
 /// or deletion-only restart authorization.
 #[derive(Clone)]
-struct DeletionSession {
+pub(crate) struct DeletionSession {
     record: WitnessRecord,
     authorization: DeletionAuthorization,
 }
 
 impl DeletionSession {
-    fn from_tombstone(receipt: &TombstoneReceipt) -> Result<Self> {
+    pub(crate) fn from_tombstone(receipt: &TombstoneReceipt) -> Result<Self> {
         let record = receipt.receipt().record().clone();
         (record.deletion() == DeletionState::Tombstoned)
             .then_some(Self {
@@ -647,7 +647,7 @@ impl DeletionSession {
             .ok_or(ArchiveDeletionError::InvalidDeletionState)
     }
 
-    fn from_recovery(recovery: &DeletionRecovery) -> Result<Self> {
+    pub(crate) fn from_recovery(recovery: &DeletionRecovery) -> Result<Self> {
         let record = recovery.receipt().record().clone();
         matches!(
             record.deletion(),
@@ -671,20 +671,34 @@ impl fmt::Debug for DeletionSession {
 }
 
 /// Provider-authenticated proofs for the three post-tombstone witness stages.
-struct DeletionStageProofs<'a> {
-    key_erasure: &'a DeletionStageProof,
-    inventory: &'a DeletionStageProof,
-    retention_assertion: &'a DeletionStageProof,
+pub(crate) struct DeletionStageProofs<'a> {
+    pub(crate) key_erasure: &'a DeletionStageProof,
+    pub(crate) inventory: &'a DeletionStageProof,
+    pub(crate) retention_assertion: &'a DeletionStageProof,
 }
 
 /// Constructs dependencies only. It performs no storage, witness, KMS, or
 /// provider I/O. No production caller constructs this inactive coordinator.
-struct ArchiveV3DeletionDriver {
+pub(crate) struct ArchiveV3DeletionDriver {
     metadata: Arc<dyn SealedArchiveInventoryLedger>,
     provider: Arc<dyn ArchiveV3ExactDeletionProvider>,
 }
 
 impl ArchiveV3DeletionDriver {
+    /// The production driver: exact-generation GCS deletion behind the sealed
+    /// lifecycle inventory. The concrete provider type stays private, so no
+    /// caller outside this module can construct a destructive provider or
+    /// forge the per-entry capabilities it consumes.
+    pub(crate) fn for_gcs(
+        metadata: Arc<dyn SealedArchiveInventoryLedger>,
+        transport: Arc<dyn ArchiveV3GcsTransport>,
+    ) -> Self {
+        Self::new(
+            metadata,
+            Arc::new(GcsArchiveV3DeletionProvider::new(transport)),
+        )
+    }
+
     fn new(
         metadata: Arc<dyn SealedArchiveInventoryLedger>,
         provider: Arc<dyn ArchiveV3ExactDeletionProvider>,
@@ -697,7 +711,7 @@ impl ArchiveV3DeletionDriver {
     /// if anything remains or differs, the method returns an opaque error and
     /// a restarted worker must reconstruct a new `DeletionSession` from the
     /// witness rather than guessing/replaying a generation mutation.
-    async fn run(
+    pub(crate) async fn run(
         &self,
         witness: &dyn Witness,
         mut session: DeletionSession,
@@ -1751,6 +1765,159 @@ mod tests {
                 .deletion(),
             DeletionState::LogicalObjectsAbsent
         );
+    }
+
+    /// A residual object under `archive/v3/{archive}/` must make physical
+    /// completion impossible, through the *concrete* provider rather than a
+    /// fake that simply answers "not drained".
+    ///
+    /// This is the property the whole lane exists to guarantee: the witness
+    /// may only reach `PhysicalComplete` when every inventoried name is proven
+    /// absent by an exact read. The transport below deletes everything and
+    /// reports every object absent except one, exactly as a provider whose
+    /// delete silently failed would.
+    #[tokio::test]
+    async fn a_residual_archive_object_can_never_reach_physical_completion() {
+        struct OneObjectSurvivesTransport {
+            surviving_key: String,
+            deletes: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveV3GcsTransport for OneObjectSurvivesTransport {
+            async fn claim_object_id(
+                &self,
+                _canonical_archive_prefix: &str,
+                _object_id: ObjectId,
+                _canonical_key: &str,
+                _ciphertext_hash: [u8; 32],
+            ) -> std::result::Result<GcsArchiveV3ClaimResult, GcsArchiveV3TransportError>
+            {
+                unreachable!("deletion never claims an object id")
+            }
+
+            async fn mark_object_id_materialized(
+                &self,
+                _canonical_archive_prefix: &str,
+                _object_id: ObjectId,
+                _canonical_key: &str,
+                _ciphertext_hash: [u8; 32],
+            ) -> std::result::Result<(), GcsArchiveV3TransportError> {
+                unreachable!("deletion never materializes an object id")
+            }
+
+            async fn create_if_absent(
+                &self,
+                _canonical_key: &str,
+                _bytes: &[u8],
+            ) -> std::result::Result<GcsArchiveV3CreateResult, GcsArchiveV3TransportError>
+            {
+                unreachable!("deletion never creates")
+            }
+
+            async fn read_exact(
+                &self,
+                _canonical_key: &str,
+                _max_bytes: usize,
+            ) -> std::result::Result<Option<Vec<u8>>, GcsArchiveV3TransportError> {
+                unreachable!("deletion never reads object bodies")
+            }
+
+            async fn list_after(
+                &self,
+                _canonical_prefix: &str,
+                _after: Option<&str>,
+                _limit: usize,
+            ) -> std::result::Result<GcsArchiveV3Page, GcsArchiveV3TransportError> {
+                panic!("the deletion driver must never list a prefix")
+            }
+
+            async fn delete_all_generations_exact(
+                &self,
+                canonical_key: &str,
+            ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError>
+            {
+                self.deletes.lock().unwrap().push(canonical_key.to_owned());
+                Ok(GcsArchiveV3DeleteResult::DeletedAllGenerations)
+            }
+
+            async fn verify_all_generations_absent_exact(
+                &self,
+                canonical_key: &str,
+            ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+                Ok(canonical_key != self.surviving_key)
+            }
+
+            async fn delete_claim_all_generations_exact(
+                &self,
+                _canonical_archive_prefix: &str,
+                _object_id: ObjectId,
+            ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError>
+            {
+                Ok(GcsArchiveV3DeleteResult::DeletedAllGenerations)
+            }
+
+            async fn verify_claim_all_generations_absent_exact(
+                &self,
+                _canonical_archive_prefix: &str,
+                _object_id: ObjectId,
+            ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+                Ok(true)
+            }
+        }
+
+        let fixture = deletion_driver_test_fixture();
+        let session = DeletionSession::from_tombstone(&fixture.tombstone).unwrap();
+        let context = AuthenticatedDeletionContext::from_record(&session.record);
+        // Pick a non-registry inventory entry as the object whose delete is
+        // silently lost. A surviving registry would fail earlier, at the
+        // key-erasure rung, which is a different (also correct) refusal.
+        let surviving = key(&context, 8);
+        assert!(surviving
+            .as_str()
+            .starts_with(ArchivePrefix::for_archive(context.archive_id()).as_str()));
+        let transport = Arc::new(OneObjectSurvivesTransport {
+            surviving_key: surviving.as_str().to_owned(),
+            deletes: Mutex::new(Vec::new()),
+        });
+        let metadata = Arc::new(FakeMetadata {
+            key: surviving.clone(),
+            calls: Mutex::new(0),
+        });
+        let driver = ArchiveV3DeletionDriver::for_gcs(metadata, transport.clone());
+        let outcome = driver
+            .run(
+                &fixture.witness,
+                session,
+                &fixture.credential,
+                DeletionStageProofs {
+                    key_erasure: &fixture.key_erasure,
+                    inventory: &fixture.inventory,
+                    retention_assertion: &fixture.retention,
+                },
+                &deletion_seal(&context),
+            )
+            .await;
+        assert_eq!(outcome, Err(ArchiveDeletionError::ProviderDrainPending));
+        // The witness stopped one rung short: never PhysicalComplete, and so
+        // no receipt exists for the control cleanup to consume.
+        assert_eq!(
+            fixture
+                .witness
+                .read_current(context.archive_id())
+                .unwrap()
+                .unwrap()
+                .deletion(),
+            DeletionState::LogicalObjectsAbsent
+        );
+        // The residual object was in fact targeted by an exact-name delete —
+        // this refusal is "the provider did not honour it", not "we never
+        // tried".
+        assert!(transport
+            .deletes
+            .lock()
+            .unwrap()
+            .contains(&surviving.as_str().to_owned()));
     }
 
     #[tokio::test]

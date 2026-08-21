@@ -15,9 +15,24 @@ pub enum DeletionPendingReason {
     LegacyWriteIntentUnsettled,
     /// The archive reached the ADR-0022 `wal_authoritative` terminal, so the
     /// authoritative data lives in the archive-v3 keyspace that the legacy
-    /// sweep cannot see. Deletion stays pending — never falsely complete —
-    /// until the archive-v3 deletion driver is wired.
+    /// sweep cannot see, and this image has no archive-v3 deletion authority
+    /// installed. Deletion stays pending — never falsely complete.
     ArchiveV3DeletionUnwired,
+    /// The archive-v3 lane's rungs. Each one means "this stage is durable, the
+    /// next is not yet" — the untouched reconciler retries and the account is
+    /// never reported complete in between.
+    ArchiveV3MediaInventoryPending,
+    ArchiveV3TombstonePending,
+    ArchiveV3InventoryPending,
+    ArchiveV3ErasurePending,
+    ArchiveV3MediaErasurePending,
+    ArchiveV3DrainPending,
+    ArchiveV3ControlCleanupPending,
+    /// A class no retry can clear: an inventory bound was exceeded, the frozen
+    /// archive could not be enumerated before key erasure, or the frozen
+    /// billing ledger still holds an unsettleable intent. Keys are left intact
+    /// for manual recovery and the operation parks.
+    ArchiveV3ManualRequired,
 }
 
 impl DeletionPendingReason {
@@ -29,6 +44,14 @@ impl DeletionPendingReason {
             Self::LegacyInventoryIncomplete => "legacy_inventory_incomplete",
             Self::LegacyWriteIntentUnsettled => "legacy_write_intent_unsettled",
             Self::ArchiveV3DeletionUnwired => "archive_v3_deletion_unwired",
+            Self::ArchiveV3MediaInventoryPending => "archive_v3_media_inventory_pending",
+            Self::ArchiveV3TombstonePending => "archive_v3_tombstone_pending",
+            Self::ArchiveV3InventoryPending => "archive_v3_inventory_pending",
+            Self::ArchiveV3ErasurePending => "archive_v3_erasure_pending",
+            Self::ArchiveV3MediaErasurePending => "archive_v3_media_erasure_pending",
+            Self::ArchiveV3DrainPending => "archive_v3_drain_pending",
+            Self::ArchiveV3ControlCleanupPending => "archive_v3_control_cleanup_pending",
+            Self::ArchiveV3ManualRequired => "archive_v3_manual_required",
         }
     }
 }

@@ -281,6 +281,17 @@ pub struct Store {
     /// production this is the KMS-unwrapped control-store DEK, installed only
     /// after that exact encrypted control generation is durable.
     legacy_fence_key: StdRwLock<Option<Zeroizing<[u8; 32]>>>,
+    /// The archive-v3 deletion lane, installed once at startup when the image
+    /// carries an archive-v3 runtime. Absent in every production constructor
+    /// today, which is exactly why `delete_account_content` still fails closed
+    /// as `archive_v3_deletion_unwired` for a WAL-authoritative account rather
+    /// than letting the legacy sweep vacuously succeed.
+    ///
+    /// It is not per-user: deletion tombstones the archive binding first, so a
+    /// mid-deletion restart has no selection to key off and the lane must be
+    /// constructible for an archive that no longer appears in any startup
+    /// scan.
+    wal_deletion_lane: StdRwLock<Option<Arc<crate::archive_v3_deletion_lane::WalDeletionLane>>>,
 }
 
 /// One explicitly named, non-default VFS installation and its bounded path
@@ -2492,6 +2503,7 @@ impl Store {
             storage_metrics: StorageMetrics::default(),
             legacy_checkpoint_reconciliation: Mutex::new(LegacyCheckpointReconciliation::default()),
             legacy_fence_key: StdRwLock::new(initial_legacy_fence_key()),
+            wal_deletion_lane: StdRwLock::new(None),
         }
     }
 
@@ -4339,6 +4351,134 @@ impl Store {
         // remains nonterminal and prevents finalization until reconciled.
         self.drain_legacy_write_intents(user_id).await?;
 
+        Ok(())
+    }
+
+    /// Install the archive-v3 deletion lane. Install-once, like the serving
+    /// authority: a second install refuses rather than replacing a lane that a
+    /// deletion may already be driving.
+    #[allow(
+        dead_code,
+        reason = "installed once the production archive-v3 deletion runtime factory exists; absent, the WAL deletion branch fails closed"
+    )]
+    pub(crate) fn install_wal_deletion_lane(
+        &self,
+        lane: Arc<crate::archive_v3_deletion_lane::WalDeletionLane>,
+    ) -> Result<()> {
+        let mut installed = self
+            .wal_deletion_lane
+            .write()
+            .map_err(|_| EnclaveError::Store("deletion lane registry is poisoned".into()))?;
+        if installed.is_some() {
+            return Err(EnclaveError::Conflict(
+                "an archive-v3 deletion lane is already installed".into(),
+            ));
+        }
+        *installed = Some(lane);
+        Ok(())
+    }
+
+    /// The installed archive-v3 deletion lane, if this image has one. A
+    /// poisoned registry answers `None`, which routes to the honest pending
+    /// refusal rather than to the legacy sweep.
+    pub(crate) fn wal_deletion_lane(
+        &self,
+    ) -> Option<Arc<crate::archive_v3_deletion_lane::WalDeletionLane>> {
+        self.wal_deletion_lane
+            .read()
+            .ok()
+            .and_then(|lane| lane.clone())
+    }
+
+    /// Freeze the exact media inventory of a WAL-authoritative account
+    /// *before* deletion tombstones its archive binding.
+    ///
+    /// This runs in the pre-`begin_user_deletion` window on purpose. After the
+    /// tombstone the binding is filtered out of the startup selection scan, no
+    /// serving authority is ever re-registered, and this read could never
+    /// succeed again — freezing it afterwards would wedge media enumeration
+    /// forever on the first crash. Here the selection is still installed, so a
+    /// crash simply re-reads the same rows.
+    ///
+    /// Unlike the legacy inventory this deliberately keeps pruned and
+    /// soft-deleted rows: `media_keys` filters `deleted_at`/`processing_state`
+    /// because it is answering "what is live", while deletion is answering
+    /// "what was ever named" — a pruner that crashed between the provider
+    /// delete and the row update leaves an object the filtered query hides.
+    pub(crate) async fn freeze_wal_authoritative_media_keys(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<String>> {
+        validate_user_id(user_id)?;
+        self.wal_authoritative_read(user_id, deletion_media_keys)
+            .await
+    }
+
+    /// Erase a WAL-authoritative account's media from a frozen exact-name
+    /// inventory, then prove the result.
+    ///
+    /// Exact names are the completeness proof: every frozen key is deleted
+    /// across every media provider's live and noncurrent generations and then
+    /// re-checked for soft-delete residue. The two user-scoped prefix sweeps
+    /// are additive erasure only — byte-identical to the legacy path's — and
+    /// are never treated as evidence that an unnamed object is gone.
+    ///
+    /// Every key is validated against this account's own `raw/{user}/` and
+    /// `media/{user}/` namespaces before it can reach a destructive call. That
+    /// is the blast-radius bound for this lane, standing in for the archive
+    /// prefix check the driver applies to its own entries: a corrupted frozen
+    /// inventory can name nothing outside the account being deleted.
+    pub(crate) async fn delete_wal_authoritative_media(
+        &self,
+        user_id: &str,
+        frozen_keys: &[String],
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        let owned = [media_prefix(user_id), legacy_media_prefix(user_id)];
+        for key in frozen_keys {
+            if !owned.iter().any(|prefix| key.starts_with(prefix.as_str())) {
+                return Err(EnclaveError::Store(
+                    "frozen media inventory named an object outside the account".into(),
+                ));
+            }
+        }
+        self.block_content_writes_for_deletion(user_id).await;
+
+        let mut soft_deleted = self
+            .soft_deleted_account_inventory(user_id, frozen_keys)
+            .await?;
+        for media_gcs in self.unique_media_providers() {
+            for prefix in &owned {
+                self.delete_all_versions_under(media_gcs, prefix).await?;
+            }
+        }
+        for key in frozen_keys {
+            for media_gcs in self.unique_media_providers() {
+                self.delete_all_versions_for_name(media_gcs, key).await?;
+            }
+        }
+        soft_deleted.merge(
+            self.soft_deleted_account_inventory(user_id, frozen_keys)
+                .await?,
+        );
+        if soft_deleted.found {
+            return Err(soft_deleted_account_objects_error(soft_deleted));
+        }
+        // Fail closed on the exact names: absence must be proven, never
+        // inferred from the delete having returned Ok.
+        for key in frozen_keys {
+            for media_gcs in self.unique_media_providers() {
+                if !list_all_object_versions(media_gcs.as_ref(), key)
+                    .await?
+                    .into_iter()
+                    .all(|version| version.name != *key)
+                {
+                    return Err(EnclaveError::Store(
+                        "a frozen media object is still present after deletion".into(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -8708,6 +8848,38 @@ fn media_keys(conn: &Connection) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// The deletion variant of [`media_keys`]: no `deleted_at` /
+/// `processing_state` filter.
+///
+/// `media_keys` answers "which objects does the live database still
+/// reference"; deletion must answer "which objects were ever named". A pruner
+/// that crashed after deleting the provider object but before updating the row
+/// — or after marking the row pruned but before deleting the object — leaves
+/// exactly the rows the filtered query hides. Reporting an account physically
+/// complete on the filtered set would be a false completion.
+fn deletion_media_keys(conn: &Connection) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for table in ["screenshot_images", "media_objects"] {
+        let table_exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if table_exists == 0 {
+            continue;
+        }
+        let mut statement = conn.prepare(&format!("SELECT object_key FROM {table}"))?;
+        keys.extend(
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 #[cfg(test)]
 fn historical_media_keys(conn: &Connection, user_id: &str) -> Result<Vec<String>> {
     let raw_prefix = format!("raw/{user_id}/");
@@ -12513,6 +12685,127 @@ pub(crate) mod tests {
         // ever loaded, and nothing may ever persist.
         store.save_user("wal-seeded-selected").await.unwrap();
         assert_eq!(gcs.put_attempts(), puts_before);
+    }
+
+    /// The exact-name requirement must actually bite: a frozen media
+    /// inventory that names an object outside the account's own namespaces is
+    /// refused *before* any destructive provider call.
+    ///
+    /// This is the blast-radius bound for the media lane, standing in for the
+    /// archive-prefix check the deletion driver applies to its own entries. A
+    /// prefix-only design cannot supply it, which is precisely why media —
+    /// whose keys live outside the archive prefix — gets its own exact-name
+    /// lane rather than being smuggled into the driver's inventory.
+    #[tokio::test]
+    async fn a_foreign_media_key_is_refused_before_any_provider_deletion() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        for (name, body) in [
+            ("raw/victim/keep.enc", &b"victim"[..]),
+            ("raw/other-account/keep.enc", &b"other"[..]),
+            ("indexes/other-account.db.enc", &b"index"[..]),
+        ] {
+            gcs.put_object(name, body, "wrapped", 0).await.unwrap();
+        }
+
+        for foreign in [
+            "raw/other-account/keep.enc".to_string(),
+            "indexes/other-account.db.enc".to_string(),
+            "media/other-account/keep.enc".to_string(),
+            // A prefix-shaped near-miss: `raw/victim-other/` shares the
+            // account's name as a string prefix but is a different account.
+            "raw/victim-other/keep.enc".to_string(),
+            String::new(),
+        ] {
+            let error = store
+                .delete_wal_authoritative_media(
+                    "victim",
+                    &["raw/victim/keep.enc".to_string(), foreign.clone()],
+                )
+                .await
+                .expect_err("a key outside the account must be refused");
+            assert!(
+                matches!(error, EnclaveError::Store(ref message)
+                    if message.contains("outside the account")),
+                "unexpected error for {foreign:?}: {error:?}"
+            );
+        }
+
+        // Nothing was deleted: the refusal precedes every provider call, so
+        // even the account's own legitimate key survives the refused batch.
+        assert_eq!(gcs.version_count("raw/victim/"), 1);
+        assert_eq!(gcs.version_count("raw/other-account/"), 1);
+        assert_eq!(gcs.version_count("indexes/other-account.db.enc"), 1);
+    }
+
+    /// The account's own frozen names are erased across every generation, and
+    /// completion is only reported once each one is proven absent.
+    #[tokio::test]
+    async fn frozen_media_names_are_erased_and_proven_absent() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        for name in [
+            "raw/subject/live.enc",
+            "raw/subject/pruned.enc",
+            "media/subject/legacy.enc",
+        ] {
+            let created = gcs.put_object(name, b"first", "wrapped", 0).await.unwrap();
+            gcs.put_object(name, b"second", "wrapped", created)
+                .await
+                .unwrap();
+        }
+        gcs.put_object("raw/bystander/keep.enc", b"keep", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store
+            .delete_wal_authoritative_media(
+                "subject",
+                &[
+                    "raw/subject/live.enc".to_string(),
+                    "raw/subject/pruned.enc".to_string(),
+                    "media/subject/legacy.enc".to_string(),
+                ],
+            )
+            .await
+            .expect("every frozen name is erasable");
+
+        assert_eq!(gcs.version_count("raw/subject/"), 0);
+        assert_eq!(gcs.version_count("media/subject/"), 0);
+        assert_eq!(gcs.version_count("raw/bystander/"), 1);
+    }
+
+    /// The deletion inventory must keep rows the live-media query hides. A
+    /// pruner that crashed between the provider delete and the row update
+    /// leaves exactly these, and reporting completion on the filtered set
+    /// would be a false completion.
+    #[test]
+    fn the_deletion_media_inventory_keeps_pruned_and_soft_deleted_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE screenshot_images (object_key TEXT);
+             CREATE TABLE media_objects (object_key TEXT, deleted_at TEXT, processing_state TEXT);
+             INSERT INTO screenshot_images VALUES ('raw/u/shot.enc');
+             INSERT INTO media_objects VALUES ('raw/u/live.enc', NULL, 'ready');
+             INSERT INTO media_objects VALUES ('raw/u/pruned.enc', NULL, 'pruned');
+             INSERT INTO media_objects VALUES ('raw/u/deleted.enc', '2026-01-01', 'ready');",
+        )
+        .unwrap();
+        assert_eq!(
+            media_keys(&conn).unwrap(),
+            vec!["raw/u/live.enc".to_string(), "raw/u/shot.enc".to_string()],
+            "the live query hides pruned and soft-deleted rows"
+        );
+        assert_eq!(
+            deletion_media_keys(&conn).unwrap(),
+            vec![
+                "raw/u/deleted.enc".to_string(),
+                "raw/u/live.enc".to_string(),
+                "raw/u/pruned.enc".to_string(),
+                "raw/u/shot.enc".to_string(),
+            ],
+            "the deletion query must name everything that was ever recorded"
+        );
     }
 
     #[tokio::test]

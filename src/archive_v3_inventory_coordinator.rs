@@ -60,11 +60,23 @@ pub(crate) enum InventoryCoordinatorError {
     Limit,
     #[error("archive-v3 inventory changed across a freshness boundary")]
     Freshness,
+    /// The lifecycle control plane refused permanently. No retry can clear it,
+    /// so the caller must park the operation for a human rather than report it
+    /// as transient.
+    #[error("archive-v3 lifecycle durable state permanently conflicts")]
+    PermanentConflict,
 }
 
 impl From<LifecycleError> for InventoryCoordinatorError {
-    fn from(_: LifecycleError) -> Self {
-        Self::Lifecycle
+    fn from(error: LifecycleError) -> Self {
+        match error {
+            // Only the control plane's own permanent-conflict classification
+            // is promoted here. Every other variant keeps its existing
+            // retryable meaning, so a genuinely transient failure is never
+            // parked.
+            LifecycleError::Conflict => Self::PermanentConflict,
+            _ => Self::Lifecycle,
+        }
     }
 }
 
@@ -562,6 +574,14 @@ fn canonical_union(
     }
     for planned in snapshot.create_ahead() {
         insert_object(&mut by_id, planned.inventory_object()?)?;
+    }
+    // Every frozen create-ahead row that is not a genesis bootstrap artifact:
+    // unconsumed WAL publication/checkpoint artifacts, and the durably staged
+    // genesis objects a pre-boundary crash leaves behind. Without this union a
+    // crashed attempt's uploaded object is unreachable from every root, never
+    // enters the sealed inventory, and survives erasure with no disclosure.
+    for object in snapshot.widened() {
+        insert_object(&mut by_id, object.clone())?;
     }
     let mut objects = by_id.into_values().collect::<Vec<_>>();
     objects.sort();
