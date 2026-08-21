@@ -508,7 +508,33 @@ EXPECTED_STORE_CALL_COUNT = 236
 # remains byte-identical. The construction-context refactor lives outside a
 # tracked Store owner. The resulting inventory is still 236 rows with the same
 # one B addition, zero removals and zero reclassifications.
-EXPECTED_STORE_CALL_SHA256 = "3fbe72eafbf2236494f9b960d40366c8431f5fee9b7c331ed679eea47c90b89b"
+#
+# Push outbox D4 lift, rebased onto origin/main a3737ff (2026-08-21). The
+# pristine `git archive origin/main | tar -x` tree was extracted under
+# /private/tmp, outside every worktree, and dumped with THAT tree's own
+# store_call_sites()/classify_store_call()/inventory_row()/digest() helpers.
+# It reproduced a3737ff's own 235/7ce82572 pin byte-for-byte BEFORE this value
+# was written.
+#
+# The push delta is exactly ONE one-for-one key swap under the same A owner:
+# `src/store.rs::next_push_delivery#0::with_user#0` is removed and
+# `::wal_authoritative_read#0` is added. Count holds at 235 and classification
+# stays A. There are ZERO reclassifications and ZERO moved expression hashes
+# on every shared key. The three shared owner-body hash moves in the dump are
+# exactly the already-documented answerable-gate audit delta above
+# (rest_episode_members, rest_feed, sync_status); this push change adds none on
+# a shared key. Its gate deletion is in deliver_user_pushes, which owns no
+# tracked Store call, and its finalizer-backed drain fixture is cfg(test), so
+# neither creates a hidden production row.
+#
+# Final PR derivation against pristine origin/main 1a55872 used a fresh
+# `git archive origin/main | tar -x` tree under /private/tmp, outside every
+# worktree, and that archive's own helpers. The pristine dump first reproduced
+# origin/main's own 236/3fbe72ea pin byte-for-byte. The merged dump is
+# 236/e9867dde and its complete delta is exactly the one A-to-A key swap above:
+# one addition, one removal, zero reclassifications, zero shared expression
+# hash moves and zero shared owner-body hash moves.
+EXPECTED_STORE_CALL_SHA256 = "e9867dde4274461b3f7d5be9e7c23ebc607fb40b765e1957af79c8312a76a567"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction

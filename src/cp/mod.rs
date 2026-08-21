@@ -953,17 +953,17 @@ mod tests {
         let state = state();
         let (captured, guard) = capture_events();
         assert!(
-            !state.wal_domain_skipped("unselected-user", wal_domain::PUSH_OUTBOX),
+            !state.wal_domain_skipped("unselected-user", wal_domain::EMAIL_WORKER_OUTBOX),
             "an unselected user keeps the legacy path"
         );
         assert_eq!(captured.total_skips(), 0, "{}", captured.text());
 
         select_wal_authoritative(&state.store, "selected-user");
-        assert!(state.wal_domain_skipped("selected-user", wal_domain::PUSH_OUTBOX));
+        assert!(state.wal_domain_skipped("selected-user", wal_domain::EMAIL_WORKER_OUTBOX));
         drop(guard);
 
         assert_eq!(
-            captured.skips(wal_domain::PUSH_OUTBOX),
+            captured.skips(wal_domain::EMAIL_WORKER_OUTBOX),
             1,
             "{}",
             captured.text()

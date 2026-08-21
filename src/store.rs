@@ -5322,14 +5322,13 @@ impl Store {
     // ── Push Outbox ────────────────────────────────────────────────────────────
 
     pub async fn next_push_delivery(&self, user_id: &str) -> Result<Option<PushDeliveryRow>> {
-        let user = user_id.to_string();
         let now = crate::cp::isotime::format_epoch_millis(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
         );
-        self.with_user(&user, move |conn| {
+        self.wal_authoritative_read(user_id, move |conn| {
             Ok(conn
                 .query_row(
                     "SELECT episode_id,installation_id,delivery_version,delivery_id, \

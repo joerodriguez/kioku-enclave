@@ -136,7 +136,7 @@ pub mod wal_domain {
     // left standing over a live domain.
     // ── The delivery group ──────────────────────────────────────────────────
     //
-    // These four are NOT answerability gates, and the distinction matters
+    // These three are NOT answerability gates, and the distinction matters
     // because the answerability rule stated below is what lifted seven of
     // their neighbours. The outbox genuinely FILLS for a selected user: the
     // finalizer's sealed `FinalizationCommitPlan` writes the brief and the
@@ -146,18 +146,19 @@ pub mod wal_domain {
     // branch at `finalizer.rs`. There is no gate anywhere on that enqueue
     // path. So the rows are there and the reads below could answer them.
     //
-    // What blocks all four is MECHANICAL, not evidential: every one of them
+    // What blocks all three is MECHANICAL, not evidential: every one of them
     // still reaches its rows through `Store::with_user`, which refuses a
     // selected user outright. Lifting a gate above an unrouted read does not
     // produce an answer, it produces an `Err` on every worker pass — the
     // pathological spin this registry exists to convert into an inert skip.
     //
     // Operational consequence worth knowing, and NOT a reason to lift: for a
-    // selected user these rows accumulate in `state='pending'` and nothing
-    // drains them. That is a deferral backlog, not loss — the rows are
-    // durable and a migrated drain will find them. The per-worker comments
-    // that say "nothing below this line is reachable" are true of the DRAIN
-    // and were written when the enqueue was believed dead too; it is not.
+    // selected user the email and webhook rows accumulate in `state='pending'`
+    // and nothing drains them. That is a deferral backlog, not loss — the rows
+    // are durable and a migrated drain will find them. Push was the fourth
+    // member of this group until `Store::next_push_delivery` routed through
+    // `wal_authoritative_read`; its sweep had no second legacy touch, so its
+    // gate and registry constant were deleted together.
 
     /// The email outbox scan (`Store::next_email_delivery`). The email
     /// settlement (`email_worker::settle_email_delivery`) and cancellation
@@ -176,18 +177,6 @@ pub mod wal_domain {
     /// exactly when a delivery row outlives its brief, and on the WAL lane it
     /// would refuse and abort the sweep mid-flight, after the provider send.
     pub const EMAIL_WORKER_OUTBOX: &str = "email_worker.outbox";
-    /// The push outbox scan (`Store::next_push_delivery`). The push
-    /// settlement (`push::update_delivery`) behind it IS migrated, and so is
-    /// the enqueue in front of it.
-    ///
-    /// **Lift condition.** `Store::next_push_delivery` reads through
-    /// `Store::wal_authoritative_read`. That is the whole of it — this is the
-    /// only one of the four whose sweep has no second legacy touch: every
-    /// other call in `push::deliver_user_pushes` is either the migrated
-    /// settlement or a control-store lookup, neither of which consults the
-    /// per-user archive. It is therefore the cheapest of the four to migrate,
-    /// and the right one to do first.
-    pub const PUSH_OUTBOX: &str = "push.outbox";
     /// The webhook outbox scan (`webhook_worker::next_delivery` — a private
     /// free function, not a `Store` method). The delivery-state settlement
     /// (`::set_delivery_state`) and the subscription-delete cascade behind it
@@ -641,7 +630,7 @@ mod tests {
     async fn a_deferred_domain_never_falls_into_the_generic_internal_error() {
         for domain in [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
-            wal_domain::PUSH_OUTBOX,
+            wal_domain::WEBHOOK_WORKER_OUTBOX,
             wal_domain::MEDIA_PEOPLE,
             wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
         ] {
@@ -670,7 +659,6 @@ mod tests {
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
             wal_domain::EMAIL_WORKER_OUTBOX,
-            wal_domain::PUSH_OUTBOX,
             wal_domain::WEBHOOK_WORKER_OUTBOX,
             wal_domain::DELIVERY_FINALIZED_EPISODE,
             wal_domain::QUERY_EPISODE_DELETE,

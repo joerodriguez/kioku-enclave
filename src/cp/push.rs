@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::cp::auth::AuthUser;
 use crate::cp::control_store::PushInstallation;
 use crate::cp::CpState;
-use crate::error::{wal_domain, EnclaveError, Result};
+use crate::error::{EnclaveError, Result};
 
 const IOS_TOPIC: &str = "com.kioku.ios";
 const MACOS_TOPIC: &str = "com.kiokuu.app";
@@ -399,14 +399,6 @@ pub async fn deliver_user_pushes(
     transport: &dyn PushTransport,
     user_id: &str,
 ) -> Result<()> {
-    // ADR-0022 D4: the outbox scan is not migrated (`next_push_delivery` goes
-    // through the legacy per-user store), so no delivery can be selected and
-    // nothing in the sweep is reachable — including the migrated settlement
-    // in `update_delivery`, which only ever runs on a selected delivery.
-    // Returning here leaves exactly one counted skip and no APNs call.
-    if state.wal_domain_skipped(user_id, wal_domain::PUSH_OUTBOX) {
-        return Ok(());
-    }
     for _ in 0..MAX_DELIVERIES_PER_SWEEP {
         let Some(delivery) = state.store.next_push_delivery(user_id).await? else {
             break;
@@ -743,41 +735,112 @@ mod tests {
         );
     }
 
-    /// ADR-0022 D4. The outbox scan is deferred, so the pass must be inert:
-    /// Ok, exactly one counted skip, and zero APNs calls — the transport here
-    /// panics if it is ever reached.
+    /// ADR-0022 D4: a selected user's real finalizer-enqueued row is selected,
+    /// sent, and durably settled through the WAL lane. Merely deleting the
+    /// skip would fail this test before the provider call or leave the row due.
     #[tokio::test]
-    async fn a_deferred_push_outbox_never_reaches_the_provider() {
-        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-        use crate::error::wal_domain;
+    async fn a_selected_user_push_sweep_drains_a_real_pending_row() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
 
-        struct NeverSend;
+        const USER_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const DELIVERY_ID: &str = "22222222-2222-4222-8222-222222222222";
+        const COLLAPSE_ID: &str = "33333333-3333-4333-8333-333333333333";
+        const HANDOFF: &str = "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh";
+
+        #[derive(Default)]
+        struct AcceptingTransport(std::sync::Mutex<Vec<PushRequest>>);
+
         #[async_trait]
-        impl PushTransport for NeverSend {
+        impl PushTransport for AcceptingTransport {
             async fn send(
                 &self,
-                _request: PushRequest,
+                request: PushRequest,
             ) -> std::result::Result<u16, PushTransportError> {
-                panic!("a gated pass must make zero provider calls");
+                self.0.lock().expect("request capture lock").push(request);
+                Ok(200)
             }
         }
 
-        let state = state();
-        let user_id = "push-deferred-user";
-        select_wal_authoritative(&state.store, user_id);
-
-        let (captured, guard) = capture_events();
-        deliver_user_pushes(&state, &NeverSend, user_id)
+        let archive = answerable_wal_archive(USER_ID).await;
+        archive
+            .state
+            .control
+            .upsert_push_installation(installation(archive.user_id.clone(), INSTALLATION_ID, 'a'))
             .await
-            .expect("a deferred domain defers; it must not fail the sweep");
-        drop(guard);
+            .expect("the control-store installation is active");
+        let episode_id = crate::cp::finalizer::enqueue_push_delivery_for_gate_test(
+            &archive.state,
+            &archive.user_id,
+            INSTALLATION_ID,
+            DELIVERY_ID,
+            HANDOFF,
+            COLLAPSE_ID,
+        )
+        .await
+        .expect("the production finalization plan enqueues the push row");
+
+        let pending = archive
+            .state
+            .store
+            .next_push_delivery(&archive.user_id)
+            .await
+            .expect("the routed outbox read answers")
+            .expect("the real pending row is selectable");
+        assert_eq!(pending.episode_id, episode_id);
+        assert_eq!(pending.delivery_id, DELIVERY_ID);
+
+        let transport = AcceptingTransport::default();
+        deliver_user_pushes(&archive.state, &transport, &archive.user_id)
+            .await
+            .expect("the selected-user sweep settles");
+
+        {
+            let requests = transport.0.lock().expect("request capture lock");
+            assert_eq!(
+                requests.len(),
+                1,
+                "the real row must reach APNs exactly once"
+            );
+            assert_eq!(requests[0].apns_id, DELIVERY_ID);
+            assert_eq!(requests[0].collapse_id, COLLAPSE_ID);
+            assert_eq!(requests[0].handoff_handle, HANDOFF);
+        }
 
         assert_eq!(
-            captured.skips(wal_domain::PUSH_OUTBOX),
-            1,
-            "exactly one counted skip per pass: {}",
-            captured.text()
+            archive
+                .state
+                .store
+                .wal_authoritative_read(&archive.user_id, move |conn| {
+                    conn.query_row(
+                        "SELECT state,attempt_count,response_status,error_code \
+                         FROM push_deliveries WHERE delivery_id=?1",
+                        [DELIVERY_ID],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(EnclaveError::from)
+                })
+                .await
+                .expect("the settled row remains readable"),
+            ("accepted".into(), 1, Some(200), None),
+            "the sweep must durably drain the row, not merely call the provider"
         );
-        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
+        assert!(
+            archive
+                .state
+                .store
+                .next_push_delivery(&archive.user_id)
+                .await
+                .expect("the routed outbox read still answers")
+                .is_none(),
+            "an accepted delivery must no longer be due"
+        );
     }
 }

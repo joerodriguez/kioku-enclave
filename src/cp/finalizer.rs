@@ -2159,6 +2159,160 @@ async fn finalize_commit_settled(
     Ok(delivery_count)
 }
 
+/// Build the push gate's regression fixture through the same sealed episode,
+/// lifecycle, Vertex-intent, and finalization plans production uses. The
+/// returned episode owns one real pending push row in the selected archive.
+#[cfg(test)]
+pub(in crate::cp) async fn enqueue_push_delivery_for_gate_test(
+    state: &CpState,
+    user_id: &str,
+    installation_id: &str,
+    delivery_id: &str,
+    handoff_handle: &str,
+    collapse_id: &str,
+) -> Result<i64> {
+    let (window_seq, sequence_pin) = state
+        .store
+        .wal_authoritative_read(user_id, |conn| {
+            let progress_table_exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+                 AND name='archive_v3_wal_episode_window_progress'",
+                [],
+                |row| row.get(0),
+            )?;
+            let window_seq = if progress_table_exists == 0 {
+                0
+            } else {
+                conn.query_row(
+                    "SELECT window_seq FROM archive_v3_wal_episode_window_progress \
+                     WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?
+            };
+            let sequence_pin = conn
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='episodes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            Ok((window_seq, sequence_pin))
+        })
+        .await?;
+
+    let committed_at = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let from_iso = isotime::add_seconds(&committed_at, -120.0);
+    let to_iso = isotime::add_seconds(&committed_at, -60.0);
+    let episode = super::summarizer::wal::window::WindowEpisode::insert(
+        super::summarizer::wal::window::WindowEpisodeTarget {
+            started_at: from_iso.clone(),
+            ended_at: to_iso.clone(),
+            episode_type: Some("test".into()),
+            title: "Push delivery gate fixture".into(),
+            summary: Some("A finalized episode with one APNs delivery.".into()),
+            participants_json: Some("[]".into()),
+            languages_json: Some("[]".into()),
+            action_items_json: Some("[]".into()),
+            model: Some("gate-fixture".into()),
+            minutes_json: Some("[]".into()),
+            minutes_text: Some(String::new()),
+            substance: "normal".into(),
+            visual_evidence: "none".into(),
+            member_utterance_ids: Vec::new(),
+            member_screenshot_ids: Vec::new(),
+        },
+    )
+    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    let window = super::summarizer::wal::EpisodeWindowUpsertPlan::new(
+        user_id.to_owned(),
+        window_seq,
+        from_iso,
+        to_iso.clone(),
+        to_iso,
+        sequence_pin,
+        committed_at,
+        vec![episode],
+    )
+    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, window)
+        .await?;
+    let episode_id = sequence_pin
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("push gate episode id overflow".into()))?;
+
+    set_finalization_status(state, user_id, episode_id, "processing", None, true).await?;
+    let model_name = state.config.vertex_model.clone();
+    let vertex_event_id = super::model_usage::begin_invocation(
+        state,
+        user_id,
+        super::vertex::VertexOperation::FinalEpisodeAnalysis,
+        &model_name,
+        &[0x71; 32],
+    )
+    .await?;
+    super::model_usage::settle_response_required(
+        state,
+        user_id,
+        &vertex_event_id,
+        &super::vertex::VertexMetadata {
+            usage: None,
+            model_version: Some(model_name.clone()),
+            traffic_type: None,
+        },
+    )
+    .await?;
+
+    let delivery_count = finalize_commit_settled(
+        state,
+        user_id,
+        SettledFinalizationInputs {
+            episode_id,
+            vertex_event_id,
+            input_identity_revision: 0,
+            model_name,
+            analysis_revision: "a".repeat(64),
+            title: "Push delivery gate fixture".into(),
+            summary: "A finalized episode with one APNs delivery.".into(),
+            minute_summaries_json: "[]".into(),
+            minutes_text: String::new(),
+            action_items_json: "[]".into(),
+            overview: "The finalizer enqueued one push delivery.".into(),
+            decisions_json: "[]".into(),
+            important_links_json: "[]".into(),
+            open_questions_json: "[]".into(),
+            ranked_screens: Vec::new(),
+            elided_screen_ids: Vec::new(),
+            utterance_members: Vec::new(),
+            screenshot_members: Vec::new(),
+            webhook_destinations: Vec::new(),
+            email_preference_include_content: None,
+            push_destinations: vec![(
+                installation_id.to_owned(),
+                delivery_id.to_owned(),
+                handoff_handle.to_owned(),
+                collapse_id.to_owned(),
+            )],
+        },
+    )
+    .await?;
+    if delivery_count != 1 {
+        return Err(EnclaveError::Store(
+            "push gate finalization did not enqueue exactly one delivery".into(),
+        ));
+    }
+    Ok(episode_id)
+}
+
 /// Evidence for the final brief model input. `reconcile_speakers` runs the
 /// legacy identity reconciliation (mints uuids); the WAL path passes false —
 /// identity mutations are the sanctioned exclusion and have no sealed plan.
