@@ -159,11 +159,14 @@ pub mod wal_domain {
     pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
     pub const QUERY_SCREENSHOT_IMAGE_CONTENT: &str = "query.screenshot_image_content";
     pub const MEDIA_CAPTURE_EVENTS: &str = "media.capture_events";
-    pub const MEDIA_CAPTURE_EVENT_STATUS: &str = "media.capture_event_status";
-    pub const MEDIA_CAPTURE_SESSIONS: &str = "media.capture_sessions";
-    pub const MEDIA_CAPTURE_SESSION_STATUS: &str = "media.capture_session_status";
     pub const MEDIA_STREAM_ACK: &str = "media.stream_ack";
-    pub const MEDIA_PEOPLE: &str = "media.people";
+    // `media.capture_event_status`, `media.capture_sessions`,
+    // `media.capture_session_status` and `media.people` were retired when
+    // `cp::media`'s capture-status, session-status, session-list and the four
+    // people read routes moved onto `wal_authoritative_read`. Per this
+    // module's own rule, a constant is deleted exactly when its domain
+    // migrates: leaving one behind is dead gate surface that `-D warnings`
+    // rejects, and re-adding one would re-defer a domain that now routes.
     pub const SYNC_STATUS: &str = "sync.status";
     pub const SYNC_EXPORT: &str = "sync.export";
 }
@@ -410,11 +413,7 @@ mod tests {
             wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,
             wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
             wal_domain::MEDIA_CAPTURE_EVENTS,
-            wal_domain::MEDIA_CAPTURE_EVENT_STATUS,
-            wal_domain::MEDIA_CAPTURE_SESSIONS,
-            wal_domain::MEDIA_CAPTURE_SESSION_STATUS,
             wal_domain::MEDIA_STREAM_ACK,
-            wal_domain::MEDIA_PEOPLE,
             wal_domain::SYNC_STATUS,
             wal_domain::SYNC_EXPORT,
         ];

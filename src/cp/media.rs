@@ -1311,12 +1311,41 @@ async fn upload_capture_event(
             );
         }
     }
-    // ADR-0022 D4: capture ingest is a B domain and is NOT migrated -- the
-    // preflight and the durable write below both go through the legacy
-    // per-user store. Refuse before the limiter burns a token or the multipart
-    // body is read, with the distinguishable 503 rather than a generic 500.
-    // The sibling reference-batch and session-finish routes ARE migrated and
-    // are deliberately not gated.
+    // ADR-0022 D4: capture ingest is a B domain and is NOT migrated. Refuse
+    // before the limiter burns a token or the multipart body is read, with the
+    // distinguishable 503 rather than a generic 500. The sibling
+    // reference-batch and session-finish routes ARE migrated and are
+    // deliberately not gated, as are this module's capture/session/people READ
+    // routes.
+    //
+    // The gate stays because this ONE route serves BOTH media dispositions and
+    // only one of them has a sealed family:
+    //   * canonical  -- `wal::CanonicalCaptureEventPlan` covers it exactly
+    //                   (subtype 2 of `WalOperationKind::MediaCaptureEvent`),
+    //                   taking the object key and positive provider generation
+    //                   the B upload boundary below already produces.
+    //   * reference  -- NOT covered, and NOT trivially coverable. The canonical
+    //                   plan rejects a non-canonical disposition outright.
+    //                   `MediaReferenceBatchPlan` is closer than it looks --
+    //                   a Reference event is always `mac_screen`, so a
+    //                   one-event batch validates -- but its operation id is
+    //                   derived from `reference_batch_id`, a pure function of
+    //                   the ordered (event_id, sequence) pairs. A single-event
+    //                   POST for event E would therefore ALIAS the one-event
+    //                   batch POST for the same E onto one operation id while
+    //                   committing a different bounded result (`CaptureAccepted`
+    //                   vs the batch's counts). Whichever route landed second
+    //                   would replay the other's result, fail `validate_replay`
+    //                   as Corrupt, and wedge the lane. Reusing that family
+    //                   here needs a subtype separation and a reviewed identity
+    //                   argument, not a call site.
+    // Routing only the canonical arm would leave a WAL-authoritative client's
+    // interleaved reference events refusing mid-stream, and `capture_streams`'
+    // contiguous acknowledgement would wedge at the first hole. Moving the
+    // gate below the disposition branch to do that would also spend a limiter
+    // token and read the whole multipart body before refusing. Both are
+    // strictly worse than deferring the route, so the gate is retained until a
+    // reviewed single-event reference family exists.
     if let Some(error) = state.wal_domain_refusal(&user_id, wal_domain::MEDIA_CAPTURE_EVENTS) {
         return capture_error_response(started_at, None, error);
     }
@@ -1723,6 +1752,21 @@ async fn stream_ack(
     if let Err(error) = validate_id("stream_id", &stream_id) {
         return error.into_response();
     }
+    // ADR-0022 D4: RETAINED deliberately, and NOT because this handler writes
+    // -- it is a pure SELECT over `capture_streams`, classified A by the
+    // idempotency gate's own inventory, and it would route as mechanically as
+    // the capture/session/people reads below.
+    //
+    // It stays gated because of what a routed answer would MEAN. The migrated
+    // reference-batch route does advance a reference stream's acknowledgement,
+    // but every canonical stream is created by `upload_capture_event`, which is
+    // still deferred above. So a WAL-authoritative client asking about its own
+    // audio stream would get `NotFound` -> 404 "no such stream" when the truth
+    // is "ingest for your account is deferred" -- a deferral wearing the shape
+    // of an authoritative absence, which is precisely the failure D4 exists to
+    // prevent. The 503 keeps the client's durable outbox retrying instead of
+    // concluding its stream was lost. This gate lifts with the capture-events
+    // gate, not before it.
     if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_STREAM_ACK) {
         return error.into_response();
     }
@@ -1748,12 +1792,14 @@ async fn capture_status(
     if let Err(error) = validate_id("event_id", &event_id) {
         return error.into_response();
     }
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_EVENT_STATUS) {
-        return error.into_response();
-    }
+    // ADR-0022 per-domain routing: an unselected user falls through to the
+    // ordinary guarded legacy read; a WAL-authoritative user reads the
+    // settled-only lane. A user with no registered serving authority refuses
+    // as unavailable rather than being served the stale legacy snapshot or an
+    // authoritative-looking 404.
     match state
         .store
-        .with_user(&user.0, |conn| load_capture_status(conn, &event_id))
+        .wal_authoritative_read(&user.0, move |conn| load_capture_status(conn, &event_id))
         .await
     {
         Ok(Some(status)) => Json(status).into_response(),
@@ -1782,14 +1828,14 @@ async fn capture_session_status(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSION_STATUS)
-    {
-        return error.into_response();
-    }
+    // ADR-0022 per-domain routing: unselected users keep the guarded legacy
+    // read; a WAL-authoritative user reads the settled-only lane — the same
+    // read `finish_capture_session` already routes for its post-settlement
+    // status.
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
         .store
-        .with_user(&user.0, move |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             load_capture_session_status(conn, &capture_session_id, cursor_ms)
         })
         .await
@@ -1808,15 +1854,15 @@ async fn list_capture_sessions(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<CaptureSessionListQuery>,
 ) -> Response {
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSIONS) {
-        return error.into_response();
-    }
     let window_hours = query.window_hours.unwrap_or(8).clamp(1, 24);
     let max_sessions = query.max_sessions.unwrap_or(5).clamp(1, 10);
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
+    // ADR-0022 per-domain routing: same per-user facts as the single-session
+    // endpoint, so it routes the same way — legacy fallthrough for unselected
+    // users, settled-only lane for WAL-authoritative ones.
     match state
         .store
-        .with_user(&user.0, move |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             let ids = load_recent_capture_session_ids(conn, window_hours, max_sessions)?;
             let mut sessions = Vec::with_capacity(ids.len());
             for id in ids {
@@ -2165,9 +2211,6 @@ async fn list_people(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<PeopleListQuery>,
 ) -> Response {
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
     let after_id = query.after_id.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let search = query
@@ -2176,9 +2219,13 @@ async fn list_people(
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .map(|query| format!("%{}%", query.to_lowercase()));
+    // ADR-0022 per-domain routing: the people read domain routes through the
+    // dual-path read. Unselected users keep the guarded legacy path; a
+    // WAL-authoritative user reads the settled-only lane and refuses as
+    // unavailable rather than reporting an empty roster it cannot support.
     match state
         .store
-        .with_user(&user.0, |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             let mut statement = conn.prepare(
                 "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
                  FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
@@ -2224,12 +2271,9 @@ async fn person_profile(
     if person_id <= 0 {
         return bad_request("person_id must be positive");
     }
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
     match state
         .store
-        .with_user(&user.0, |conn| load_person_profile(conn, person_id))
+        .wal_authoritative_read(&user.0, move |conn| load_person_profile(conn, person_id))
         .await
     {
         Ok(profile) => Json(profile).into_response(),
@@ -2246,16 +2290,13 @@ async fn person_evidence(
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
     }
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let before_id = query.before_id;
     match state
         .store
-        .with_user(&user.0, |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             ensure_identified_person(conn, person_id)?;
-            let (evidence, next_cursor) =
-                load_person_evidence(conn, person_id, query.before_id, limit)?;
+            let (evidence, next_cursor) = load_person_evidence(conn, person_id, before_id, limit)?;
             Ok(PersonEvidencePage {
                 evidence,
                 next_cursor,
@@ -2277,16 +2318,14 @@ async fn person_statements(
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
     }
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let before_id = query.before_id;
     match state
         .store
-        .with_user(&user.0, |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             ensure_identified_person(conn, person_id)?;
             let (statements, next_cursor) =
-                load_person_statements(conn, person_id, query.before_id, limit)?;
+                load_person_statements(conn, person_id, before_id, limit)?;
             Ok(PersonStatementPage {
                 statements,
                 next_cursor,
@@ -6228,32 +6267,167 @@ mod tests {
         assert!(status["ended_at"].is_string());
     }
 
-    /// ADR-0022 D4: a deferred capture-read route names its domain in a 503.
-    /// The sibling session-finish and reference-batch routes ARE migrated and
-    /// keep their own paths; see `finish_capture_session`'s tests.
+    /// ADR-0022 D4: the still-deferred stream-acknowledgement read names its
+    /// domain in a 503. Its sibling capture/session/people reads ARE migrated
+    /// and route instead; see the routed tests below.
+    ///
+    /// The point of the assertion is the *shape* of the refusal: a deferred
+    /// stream must answer `wal_domain_unmigrated`, never the `NotFound` 404 a
+    /// routed read would produce for a stream that ingest was never allowed to
+    /// create.
     #[tokio::test]
-    async fn a_deferred_capture_status_answers_a_named_503() {
+    async fn a_deferred_stream_ack_answers_a_named_503() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
         use axum::extract::{Path, State};
         use axum::Extension;
 
         let state = finish_test_state();
-        let user_id = "media-status-deferred";
+        let user_id = "media-stream-ack-deferred";
         select_wal_authoritative(&state.store, user_id);
 
-        let response = capture_status(
+        let response = stream_ack(
             State(Arc::clone(&state)),
             Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("evt-1".to_string()),
+            Path("stream-1".to_string()),
         )
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
         let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_CAPTURE_EVENT_STATUS);
+        assert_eq!(body["domain"], wal_domain::MEDIA_STREAM_ACK);
+    }
+
+    /// ADR-0022 per-domain routing, capture-status domain. Both halves of the
+    /// dual-path read in one test, because each is only meaningful against the
+    /// other:
+    ///
+    /// * an UNSELECTED user still reads their own legacy snapshot, unchanged;
+    /// * a WAL-AUTHORITATIVE user with no registered serving authority
+    ///   REFUSES. It must not silently fall through to the legacy blob (the
+    ///   neighbour's row proves the legacy store is loadable and populated),
+    ///   and it must not answer 404 — an unavailable lane reporting "no such
+    ///   event" is an authoritative-looking empty result, exactly what the
+    ///   routing is supposed to make impossible.
+    #[tokio::test]
+    async fn a_routed_capture_status_serves_legacy_and_refuses_an_unavailable_lane() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let state = finish_test_state();
+        let legacy_user = "media-status-legacy";
+        state
+            .store
+            .with_user(legacy_user, |conn| {
+                conn.execute(
+                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                     last_event_at,schema_version) \
+                     VALUES('session-1','device-1','install-1',\
+                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_streams(id,capture_session_id,device_id,stream_kind) \
+                     VALUES('stream-1','session-1','device-1','mic')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_events(event_id,device_id,install_id,\
+                     capture_session_id,stream_id,stream_kind,sequence,source_wall_at,\
+                     source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
+                     clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+                     VALUES('evt-1','device-1','install-1','session-1','stream-1','mic',0,\
+                     '2026-08-14T18:00:00.000Z','1','2026-08-14T18:00:00.000Z',\
+                     '2026-08-14T18:00:05.000Z','UTC',0,0,'asset-1','digest-1','canonical')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let response = capture_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
+            Path("evt-1".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["event_id"], "evt-1");
+
+        let selected_user = "media-status-selected";
+        select_wal_authoritative(&state.store, selected_user);
+        let refused = capture_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
+            Path("evt-1".to_string()),
+        )
+        .await;
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The same two-sided proof for the people domain, which carries four
+    /// routes behind one former gate. `list_people` answers a collection, so
+    /// its failure mode is the one that matters most: an unavailable lane must
+    /// never degrade into an empty-but-successful roster.
+    #[tokio::test]
+    async fn a_routed_people_list_serves_legacy_and_never_answers_an_empty_roster() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Query, State};
+        use axum::Extension;
+
+        let state = finish_test_state();
+        let legacy_user = "media-people-legacy";
+        state
+            .store
+            .with_user(legacy_user, |conn| {
+                conn.execute(
+                    // No explicit id: `init_schema` already seeds the owner
+                    // row ('owner','Me'), which stays out of this listing
+                    // because its status is 'unknown', not 'identified'.
+                    "INSERT INTO people(display_name,status,updated_at) \
+                     VALUES('Ada','identified','2026-08-14T18:00:00.000Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let response = list_people(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
+            Query(PeopleListQuery::default()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["people"].as_array().unwrap().len(), 1);
+        assert_eq!(body["people"][0]["display_name"], "Ada");
+
+        let selected_user = "media-people-selected";
+        select_wal_authoritative(&state.store, selected_user);
+        let refused = list_people(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
+            Query(PeopleListQuery::default()),
+        )
+        .await;
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
