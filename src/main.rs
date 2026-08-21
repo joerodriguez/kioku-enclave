@@ -41,7 +41,7 @@
 //!
 //! | Method | Path                       | Description                                  |
 //! |--------|----------------------------|----------------------------------------------|
-//! | GET    | /health                    | Liveness probe; returns `{"ok":true}`        |
+//! | GET    | /health                    | Liveness probe; `{"ok":true}` + WAL counts   |
 //! | ANY    | /v1/* data routes          | Authenticated `410 Gone`; permanently retired|
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
@@ -600,10 +600,14 @@ fn legacy_data_plane_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let progress = state.store.legacy_checkpoint_reconciliation().await;
-    Json(health_json(progress))
+    let wal_serving = state.store.wal_serving_health();
+    Json(health_json(progress, wal_serving))
 }
 
-fn health_json(progress: store::LegacyCheckpointReconciliation) -> serde_json::Value {
+fn health_json(
+    progress: store::LegacyCheckpointReconciliation,
+    wal_serving: store::WalServingHealth,
+) -> serde_json::Value {
     json!({
         "ok": true,
         "service": "kioku-enclave",
@@ -614,6 +618,18 @@ fn health_json(progress: store::LegacyCheckpointReconciliation) -> serde_json::V
             "live_archives_checked": progress.live_archives_checked,
             "checkpoints_verified": progress.checkpoints_verified,
             "failures": progress.failures,
+        },
+        // Counts only, never a user id or an archive id. The three `_total`
+        // fields are EVENT counters: a lane that keeps dying and healing under
+        // budget shows a steady `serving: 1` but a climbing `relaunches_total`,
+        // so a genuine-corruption heal loop cannot hide behind a green probe.
+        "wal_serving": {
+            "serving": wal_serving.serving,
+            "terminal": wal_serving.terminal,
+            "quarantined": wal_serving.quarantined,
+            "relaunches_total": wal_serving.relaunches_total,
+            "launch_failures_total": wal_serving.launch_failures_total,
+            "quarantines_total": wal_serving.quarantines_total,
         }
     })
 }
@@ -992,6 +1008,22 @@ async fn async_main() {
             "WAL serving authorities failed to relaunch; those users are unavailable"
         );
     }
+
+    // ADR-0022 Group C: supervise the slots startup just registered. A
+    // transient publication failure after a local commit used to take a user
+    // 100% offline for reads and writes until the process restarted; the
+    // driver replaces a proven-dead authority in place through the identical
+    // ladder above. It fabricates nothing and re-submits nothing.
+    store
+        .install_wal_serving_relaunch(Arc::new(
+            archive_v3_serving_relaunch::StartupWalServingRelaunch::new(
+                Arc::clone(&concrete_kms),
+                Arc::clone(&control_store),
+            ),
+        ))
+        .unwrap_or_else(|error| {
+            panic!("Failed to install the WAL serving relaunch driver: {error}")
+        });
 
     // ADR-0022 genesis spine (G9): validate the new-user genesis gate against
     // the image before any request is admitted. An armed gate on an image with
@@ -1406,7 +1438,7 @@ async fn serve_tls(
 #[cfg(test)]
 mod email_startup_tests {
     use super::{health_json, resolve_apns_identifiers, resolve_resend_api_key};
-    use crate::store::LegacyCheckpointReconciliation;
+    use crate::store::{self, LegacyCheckpointReconciliation};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1494,14 +1526,17 @@ mod email_startup_tests {
 
     #[test]
     fn health_serializes_only_aggregate_checkpoint_readiness() {
-        let health = health_json(LegacyCheckpointReconciliation {
-            ready: true,
-            completed_scans: 2,
-            listed_live_objects: 3,
-            live_archives_checked: 3,
-            checkpoints_verified: 3,
-            failures: 0,
-        });
+        let health = health_json(
+            LegacyCheckpointReconciliation {
+                ready: true,
+                completed_scans: 2,
+                listed_live_objects: 3,
+                live_archives_checked: 3,
+                checkpoints_verified: 3,
+                failures: 0,
+            },
+            store::WalServingHealth::default(),
+        );
         assert_eq!(health["ok"], true);
         assert_eq!(health["service"], "kioku-enclave");
         assert_eq!(health["legacy_checkpoint_reconciliation_ready"], true);
@@ -1514,6 +1549,41 @@ mod email_startup_tests {
             .unwrap()
             .keys()
             .all(|key| !key.contains("user")));
+    }
+
+    #[test]
+    fn health_reflects_relaunch_events_and_stays_content_free() {
+        // State counts alone would let a genuine-corruption -> heal loop run
+        // under budget while the probe kept reporting a steady `serving: 1`.
+        // The three `_total` fields are event counters for exactly that case.
+        let health = health_json(
+            LegacyCheckpointReconciliation::default(),
+            store::WalServingHealth {
+                serving: 1,
+                terminal: 0,
+                quarantined: 2,
+                relaunches_total: 7,
+                launch_failures_total: 3,
+                quarantines_total: 2,
+            },
+        );
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["wal_serving"]["serving"], 1);
+        assert_eq!(health["wal_serving"]["terminal"], 0);
+        assert_eq!(health["wal_serving"]["quarantined"], 2);
+        assert_eq!(health["wal_serving"]["relaunches_total"], 7);
+        assert_eq!(health["wal_serving"]["launch_failures_total"], 3);
+        assert_eq!(health["wal_serving"]["quarantines_total"], 2);
+        // Content-free: the payload is counts, never an identity. Serialize
+        // the whole document and assert no identifier-shaped key exists at any
+        // depth, not merely at the top level.
+        let rendered = serde_json::to_string(&health).unwrap();
+        for forbidden in ["user_id", "archive_id", "user\":", "archive\":"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "health leaked {forbidden}: {rendered}"
+            );
+        }
     }
 }
 

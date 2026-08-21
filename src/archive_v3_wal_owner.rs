@@ -69,6 +69,24 @@ const MAX_WAL_OWNER_COMMANDS: usize = 1;
 const CHECKPOINT_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const MAX_WAL_OWNER_ATTEMPTS: u32 = 16;
 pub(crate) const MAX_WAL_OWNER_ARTIFACTS: u32 = MAX_WAL_SEGMENTS_PER_COMMIT + 2;
+/// Bound on how many serving generations one archive's in-process relaunch
+/// driver may install before the lane is quarantined.
+///
+/// Strictly less than `MAX_WAL_OWNER_ATTEMPTS` so driver-driven relaunches can
+/// never exhaust the *durable* per-operation attempt cap and turn a transient
+/// fault into a restart-proof write-death: Control bumps an operation's
+/// attempt only when `prepare_wal_owner_operation_conn` observes a different
+/// `owner_instance_id`, and the instance id changes only when a new lane is
+/// built -- so attempt burn is bounded by the successful-generation count, not
+/// by client retries.
+///
+/// At least 3 because a send-sensitive retained commit costs two generations
+/// to settle: generation N+1 resumes the candidate, advances the witness, and
+/// then deliberately poisons; generation N+2 recovers from the advanced root
+/// and acknowledges the client's retry by replay.
+pub(crate) const MAX_WAL_SERVING_GENERATIONS: u32 = 8;
+const _: () = assert!(MAX_WAL_SERVING_GENERATIONS < MAX_WAL_OWNER_ATTEMPTS);
+const _: () = assert!(MAX_WAL_SERVING_GENERATIONS >= 3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub(crate) enum WalOwnerError {
@@ -1701,8 +1719,10 @@ pub(crate) struct WalCheckpointSettlement {
 }
 
 impl WalCheckpointSettlement {
-    async fn into_lane(self) -> Result<WalStoreLane> {
-        WalStoreLane::spawn_authenticated(self.staged, self.binding, self.capture).await
+    /// The successor lane inherits the predecessor's liveness census: a
+    /// replacement must never reset the proof of death for this authority.
+    async fn into_lane(self, liveness: LaneLiveness) -> Result<WalStoreLane> {
+        WalStoreLane::spawn_authenticated(self.staged, self.binding, self.capture, liveness).await
     }
 }
 
@@ -1766,6 +1786,112 @@ enum WalStoreLaneCommand {
     },
 }
 
+/// Live blocking-lane census for one serving authority.
+///
+/// A serving authority does not own one lane thread for its whole life: a
+/// checkpoint consumes the current lane and `WalCheckpointSettlement::into_lane`
+/// spawns its successor, so a `JoinHandle` captured at launch names a thread
+/// that may already be gone while a different one still holds the writable
+/// SQLite connection. The census counts *every* lane thread this authority has
+/// ever started and has not yet finished, and the successor inherits it, so
+/// "quiet" means no thread of this authority is still running -- not merely
+/// that the first one returned.
+///
+/// The residency guard is dropped by the lane thread's own closure, strictly
+/// after `run_wal_store_lane` has returned and therefore strictly after the
+/// `SingleArchiveWalStoreOwner` it owned has been dropped: the SQLite
+/// `Connection` is closed and `CaptureRegistration::drop` has run
+/// `retire_and_scrub()` and freed the registry slot. That ordering holds on a
+/// panic unwind exactly as it does on an ordinary return, which is the whole
+/// point -- an unwinding lane thread must not be able to look quiet before its
+/// plaintext is scrubbed.
+#[derive(Clone)]
+struct LaneLiveness {
+    census: Arc<LaneCensus>,
+}
+
+struct LaneCensus {
+    live: std::sync::Mutex<usize>,
+    quiet: std::sync::Condvar,
+}
+
+/// Proof-of-exit guard held by one lane thread. Dropping it -- on return or on
+/// unwind -- retires that thread from the census.
+struct LaneResidency {
+    census: Arc<LaneCensus>,
+}
+
+impl LaneLiveness {
+    fn new() -> Self {
+        Self {
+            census: Arc::new(LaneCensus {
+                live: std::sync::Mutex::new(0),
+                quiet: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// Enrol a lane thread that is about to be spawned. The returned guard is
+    /// moved into the thread closure and is the only way to leave the census.
+    fn enter(&self) -> LaneResidency {
+        // A poisoned census mutex means some lane thread unwound while holding
+        // it. That is exactly the case where the count must still be trusted,
+        // so recover the guard rather than losing the census.
+        let mut live = self
+            .census
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *live += 1;
+        drop(live);
+        LaneResidency {
+            census: Arc::clone(&self.census),
+        }
+    }
+
+    /// Block until no lane thread of this authority is still running. Returns
+    /// false on deadline expiry, which callers MUST treat as "still alive",
+    /// never as death.
+    fn wait_until_quiet(&self, deadline: std::time::Duration) -> bool {
+        let live = self
+            .census
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (live, timeout) = self
+            .census
+            .quiet
+            .wait_timeout_while(live, deadline, |live| *live > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !timeout.timed_out() && *live == 0
+    }
+
+    #[cfg(test)]
+    fn live_for_test(&self) -> usize {
+        *self
+            .census
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for LaneResidency {
+    fn drop(&mut self) {
+        let mut live = self
+            .census
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *live = live.saturating_sub(1);
+        let quiet = *live == 0;
+        drop(live);
+        if quiet {
+            self.census.quiet.notify_all();
+        }
+    }
+}
+
 /// Dedicated blocking lane. The writable SQLite connection and VFS capture
 /// registration never enter a Tokio worker; only sealed commands and opaque
 /// results cross this boundary.
@@ -1774,25 +1900,40 @@ struct WalStoreLane {
     binding: WalOwnerStoreBinding,
     instance_id: WalOwnerInstanceId,
     poisoned: Arc<AtomicBool>,
+    /// Inherited by every successor lane this authority mints, so a checkpoint
+    /// cannot hide a still-running predecessor from the proof of death.
+    liveness: LaneLiveness,
     _thread: std::thread::JoinHandle<()>,
 }
 
 impl WalStoreLane {
-    fn spawn(store: crate::store::SingleArchiveWalStoreOwner) -> Result<Self> {
+    fn spawn(
+        store: crate::store::SingleArchiveWalStoreOwner,
+        liveness: LaneLiveness,
+    ) -> Result<Self> {
         let binding = store.binding().clone();
         let instance_id = store.instance_id();
         let poisoned = Arc::new(AtomicBool::new(false));
         let thread_poisoned = Arc::clone(&poisoned);
         let (sender, receiver) = std::sync::mpsc::channel();
+        // Enrolled before the spawn so a lane can never be observed quiet in
+        // the window between construction and the thread's first instruction.
+        let residency = liveness.enter();
         let thread = std::thread::Builder::new()
             .name("kioku-archive-v3-wal-store".into())
-            .spawn(move || run_wal_store_lane(store, receiver, thread_poisoned))
+            .spawn(move || {
+                // Declared first, so it is dropped last: strictly after
+                // `run_wal_store_lane` has dropped the store owner.
+                let _residency = residency;
+                run_wal_store_lane(store, receiver, thread_poisoned);
+            })
             .map_err(|_| WalOwnerError::Persistence)?;
         Ok(Self {
             sender,
             binding,
             instance_id,
             poisoned,
+            liveness,
             _thread: thread,
         })
     }
@@ -1801,19 +1942,23 @@ impl WalStoreLane {
         staged: crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
         binding: WalOwnerStoreBinding,
         capture: Arc<crate::store::StoreShadowCapture>,
+        liveness: LaneLiveness,
     ) -> Result<Self> {
-        Self::spawn_with_builder(move || {
-            crate::store::SingleArchiveWalStoreOwner::from_authenticated_staging(
-                WalOwnerStoreContext(()),
-                staged,
-                binding,
-                capture,
-            )
-        })
+        Self::spawn_with_builder(
+            move || {
+                crate::store::SingleArchiveWalStoreOwner::from_authenticated_staging(
+                    WalOwnerStoreContext(()),
+                    staged,
+                    binding,
+                    capture,
+                )
+            },
+            liveness,
+        )
         .await
     }
 
-    async fn spawn_with_builder<F>(builder: F) -> Result<Self>
+    async fn spawn_with_builder<F>(builder: F, liveness: LaneLiveness) -> Result<Self>
     where
         F: FnOnce() -> Result<crate::store::SingleArchiveWalStoreOwner> + Send + 'static,
     {
@@ -1821,9 +1966,14 @@ impl WalStoreLane {
         let thread_poisoned = Arc::clone(&poisoned);
         let (sender, receiver) = std::sync::mpsc::channel();
         let (ready, opened) = oneshot::channel();
+        let residency = liveness.enter();
         let thread = std::thread::Builder::new()
             .name("kioku-archive-v3-wal-store".into())
             .spawn(move || {
+                // Declared first, so it is dropped last: strictly after every
+                // early return below and after `run_wal_store_lane` has
+                // dropped the store owner.
+                let _residency = residency;
                 let mut store = match builder() {
                     Ok(store) => store,
                     Err(error) => {
@@ -1851,8 +2001,16 @@ impl WalStoreLane {
             binding,
             instance_id,
             poisoned,
+            liveness,
             _thread: thread,
         })
+    }
+
+    /// The census a successor lane must inherit. Never mint a fresh one for a
+    /// replacement lane: that would let a checkpoint erase a still-running
+    /// predecessor from the proof of death.
+    fn liveness(&self) -> LaneLiveness {
+        self.liveness.clone()
     }
 
     const fn binding(&self) -> &WalOwnerStoreBinding {
@@ -1961,11 +2119,33 @@ impl WalStoreLane {
     }
 }
 
+/// Raises the lane's poison flag when the lane thread leaves, whether it
+/// returns or unwinds.
+///
+/// Before this guard existed a panic inside any lane command -- a domain plan,
+/// rusqlite, the capture VFS -- skipped the trailing `thread_poisoned` store,
+/// so `is_poisoned()` stayed false, the actor loop's poison check never broke,
+/// and the actor future never completed. Every subsequent `sender.send(...)`
+/// failed with `Poisoned` because the receiver had been dropped, but nothing
+/// in the process could observe that the lane was gone: the user was 100%
+/// offline for reads and writes, in-process, undetected, with no recovery
+/// short of a restart. The guard makes an unwinding lane a *detected* dead
+/// lane. It strengthens a failure handler and weakens nothing -- every
+/// conditional store in the loop below is still in place.
+struct LanePoisonOnExit(Arc<AtomicBool>);
+
+impl Drop for LanePoisonOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 fn run_wal_store_lane(
     mut store: crate::store::SingleArchiveWalStoreOwner,
     receiver: std::sync::mpsc::Receiver<WalStoreLaneCommand>,
     thread_poisoned: Arc<AtomicBool>,
 ) {
+    let _exit = LanePoisonOnExit(Arc::clone(&thread_poisoned));
     while let Ok(command) = receiver.recv() {
         match command {
             WalStoreLaneCommand::Lookup { prepared, response } => {
@@ -2032,7 +2212,8 @@ fn run_wal_store_lane(
             }
         }
     }
-    thread_poisoned.store(true, Ordering::Release);
+    // The trailing store is now `_exit`'s job, so the ordinary and the
+    // unwinding exit raise the same flag through the same statement.
 }
 
 /// Crate-visible serving authority for one WAL-authoritative archive: the
@@ -2076,6 +2257,46 @@ impl SingleArchiveWalServingAuthority {
     {
         self.launcher.read(read).await
     }
+
+    /// The sanctioned relaunch trigger for the serving slot: the actor task's
+    /// own termination, never the lane's poison flag.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.launcher.is_terminal()
+    }
+
+    /// Proof of death for the whole authority. See
+    /// `WalOwnerHandle::join_terminated`. `Err` means "still alive or
+    /// unprovable" and MUST be quarantined, never treated as death.
+    pub(crate) async fn join_terminated(&self, deadline: std::time::Duration) -> Result<()> {
+        self.launcher.join_terminated(deadline).await
+    }
+
+    /// Test-only serving authority over an actor whose lane has already
+    /// exited: the shape the relaunch driver must observe as terminal.
+    #[cfg(test)]
+    pub(crate) async fn terminal_for_relaunch_test() -> Self {
+        Self {
+            launcher: launcher::SingleArchiveWalLauncherOwner::terminal_for_relaunch_test().await,
+        }
+    }
+
+    /// Test-only serving authority that is alive and answering. The relaunch
+    /// driver must leave it strictly alone.
+    #[cfg(test)]
+    pub(crate) fn live_for_relaunch_test() -> Self {
+        Self {
+            launcher: launcher::SingleArchiveWalLauncherOwner::live_for_relaunch_test(),
+        }
+    }
+
+    /// Test-only serving authority whose blocking lane thread never returns.
+    /// The returned release handle unblocks it; the test MUST call it.
+    #[cfg(test)]
+    pub(crate) fn stuck_for_relaunch_test() -> (Self, StuckLaneRelease) {
+        let (launcher, release) =
+            launcher::SingleArchiveWalLauncherOwner::stuck_for_relaunch_test();
+        (Self { launcher }, release)
+    }
 }
 
 impl std::fmt::Debug for SingleArchiveWalServingAuthority {
@@ -2084,15 +2305,100 @@ impl std::fmt::Debug for SingleArchiveWalServingAuthority {
     }
 }
 
+/// Raises the actor's termination flag when the actor future leaves, whether
+/// it completes or unwinds on a task panic.
+struct ActorTerminationOnExit(Arc<AtomicBool>);
+
+impl Drop for ActorTerminationOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Non-cloneable handle owning the actor queue and task. A submitted plan is
 /// moved into the queue before awaiting its response; cancellation of that
 /// caller therefore cannot cancel post-commit publication work.
 pub(crate) struct WalOwnerHandle {
     sender: mpsc::Sender<WalOwnerMessage>,
-    _task: tokio::task::JoinHandle<()>,
+    /// Monotone false -> true, set by a drop guard inside the actor future so
+    /// it is raised on completion *and* on task-panic unwind. This is the ONLY
+    /// sanctioned relaunch trigger.
+    ///
+    /// A trigger must never be derived from the lane's poison flag:
+    /// `WalStoreLaneCommand::Checkpoint` raises that flag unconditionally on
+    /// the ordinary checkpoint path, and `take_checkpoint_source` raises it on
+    /// its success path, while the actor goes on to `checkpoint_and_recover`
+    /// and a full witness root advance. A poison-derived trigger would fire
+    /// mid-root-advance and spawn a second owner.
+    terminated: Arc<AtomicBool>,
+    /// Census of this authority's still-running blocking lane threads,
+    /// including every checkpoint successor.
+    liveness: LaneLiveness,
+    /// Held, never detached. `join_terminated` borrows the handle rather than
+    /// taking it, so a deadline expiry cannot silently drop the join right and
+    /// leave a later call believing the task was reaped.
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl WalOwnerHandle {
+    /// Cheap, lock-free peek at the sanctioned relaunch trigger.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    /// Prove this owner is dead before anything constructs its successor.
+    ///
+    /// Completing proves two things. First, the actor `JoinHandle` resolved:
+    /// the future returned, so no publication await is suspended and none can
+    /// ever be issued again (surviving `Arc` clones of the handle can only
+    /// enqueue onto a channel whose receiver died with the future), and the
+    /// actor's `SingleArchiveWalOwner` was dropped along with its lane,
+    /// Control handle, publication authority and store fence. Second, every
+    /// blocking lane thread this authority ever started has left: each one's
+    /// `SingleArchiveWalStoreOwner` was dropped on its own thread, closing the
+    /// writable SQLite connection and running `CaptureRegistration::drop`,
+    /// which scrubs the plaintext and frees the registry slot.
+    ///
+    /// `Err(Persistence)` on deadline expiry. The caller MUST quarantine on
+    /// that error and MUST NOT proceed: a timeout is never treated as death.
+    /// Refusing is always safe; forcing never is.
+    ///
+    /// A task panic is *completion*, not stuckness -- `JoinError::is_panic()`
+    /// still means the future is over and its resources are released -- so it
+    /// resolves the join rather than quarantining.
+    pub(crate) async fn join_terminated(&self, deadline: std::time::Duration) -> Result<()> {
+        let started = std::time::Instant::now();
+        let remaining = || deadline.saturating_sub(started.elapsed());
+        let mut slot = tokio::time::timeout(remaining(), self.task.lock())
+            .await
+            .map_err(|_| WalOwnerError::Persistence)?;
+        if let Some(handle) = slot.as_mut() {
+            match tokio::time::timeout(remaining(), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_panic() => {}
+                // A cancelled task is not a task this process can prove
+                // finished releasing its resources; refuse.
+                Ok(Err(_)) => return Err(WalOwnerError::Persistence),
+                // The handle is still in the slot: nothing was detached, so a
+                // later call can still join it.
+                Err(_) => return Err(WalOwnerError::Persistence),
+            }
+            // Awaiting a resolved JoinHandle again would panic, and the join
+            // right has been fully exercised, so retire the slot.
+            *slot = None;
+        }
+        drop(slot);
+        let liveness = self.liveness.clone();
+        let lane_deadline = remaining();
+        let quiet = tokio::task::spawn_blocking(move || liveness.wait_until_quiet(lane_deadline))
+            .await
+            .map_err(|_| WalOwnerError::Persistence)?;
+        if quiet {
+            Ok(())
+        } else {
+            Err(WalOwnerError::Persistence)
+        }
+    }
     pub(crate) async fn submit<P: WalLogicalDomainPlan>(
         &self,
         prepared: PreparedLogicalMutation<P>,
@@ -2159,6 +2465,137 @@ impl fmt::Debug for WalOwnerHandle {
     }
 }
 
+/// Release handle for a test lane thread that is deliberately wedged. Dropping
+/// it unwedges and joins the thread, so a failing assertion cannot leak one.
+#[cfg(test)]
+pub(crate) struct StuckLaneRelease {
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl StuckLaneRelease {
+    pub(crate) fn release(self) {
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StuckLaneRelease {
+    fn drop(&mut self) {
+        {
+            let (lock, condvar) = &*self.gate;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            condvar.notify_all();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+impl WalOwnerHandle {
+    /// A handle whose actor future has already returned and which never owned
+    /// a blocking lane. Terminal, and provably dead.
+    pub(crate) async fn terminated_for_relaunch_test() -> Self {
+        let (sender, receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
+        let terminated = Arc::new(AtomicBool::new(false));
+        let actor_terminated = Arc::clone(&terminated);
+        let task = tokio::spawn(async move {
+            let _terminated = ActorTerminationOnExit(actor_terminated);
+            drop(receiver);
+        });
+        let handle = Self {
+            sender,
+            terminated,
+            liveness: LaneLiveness::new(),
+            task: tokio::sync::Mutex::new(Some(task)),
+        };
+        while !handle.is_terminal() {
+            tokio::task::yield_now().await;
+        }
+        handle
+    }
+
+    /// A handle whose actor future is still running and answering. Never
+    /// terminal, so the relaunch driver must leave it strictly alone.
+    pub(crate) fn live_for_relaunch_test() -> Self {
+        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
+        let terminated = Arc::new(AtomicBool::new(false));
+        let actor_terminated = Arc::clone(&terminated);
+        let task = tokio::spawn(async move {
+            let _terminated = ActorTerminationOnExit(actor_terminated);
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    WalOwnerMessage::Apply(command) => {
+                        let _ = command.response.send(Err(WalOwnerError::Persistence));
+                    }
+                    WalOwnerMessage::Read { response, .. } => {
+                        let _ = response.send(Err(WalOwnerError::Persistence));
+                    }
+                    WalOwnerMessage::CheckpointedPlaintext { response } => {
+                        let _ = response.send(Err(WalOwnerError::Persistence));
+                    }
+                }
+            }
+        });
+        Self {
+            sender,
+            terminated,
+            liveness: LaneLiveness::new(),
+            task: tokio::sync::Mutex::new(Some(task)),
+        }
+    }
+
+    /// A handle whose actor future has ended but whose blocking lane thread is
+    /// still running. Terminal, but NOT provably dead: `join_terminated` must
+    /// refuse it rather than let a successor be constructed over it.
+    pub(crate) fn stuck_lane_for_relaunch_test() -> (Self, StuckLaneRelease) {
+        let (sender, receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
+        let terminated = Arc::new(AtomicBool::new(false));
+        let actor_terminated = Arc::clone(&terminated);
+        let task = tokio::spawn(async move {
+            let _terminated = ActorTerminationOnExit(actor_terminated);
+            drop(receiver);
+        });
+        let liveness = LaneLiveness::new();
+        let residency = liveness.enter();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread_gate = Arc::clone(&gate);
+        let thread = std::thread::Builder::new()
+            .name("kioku-archive-v3-wal-store-stuck-test".into())
+            .spawn(move || {
+                let _residency = residency;
+                let (lock, condvar) = &*thread_gate;
+                let mut released = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = condvar
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            })
+            .expect("test lane thread spawns");
+        (
+            Self {
+                sender,
+                terminated,
+                liveness,
+                task: tokio::sync::Mutex::new(Some(task)),
+            },
+            StuckLaneRelease {
+                gate,
+                thread: Some(thread),
+            },
+        )
+    }
+}
+
 /// Sole local actor. It owns the writable staged SQLite connection, capture
 /// registration, and one publication authority. It is intentionally private.
 struct SingleArchiveWalOwner<A>
@@ -2211,7 +2648,7 @@ where
         control: Arc<dyn WalOwnerControl>,
         publication: Arc<A>,
     ) -> WalOwnerHandle {
-        match WalStoreLane::spawn(store) {
+        match WalStoreLane::spawn(store, LaneLiveness::new()) {
             Ok(store) => Self::spawn_lane(store, control, publication),
             Err(_) => Self::spawn_failed(),
         }
@@ -2232,7 +2669,13 @@ where
         store_fence: Option<crate::store::StoreWalAuthorityFence>,
     ) -> WalOwnerHandle {
         let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
+        let terminated = Arc::new(AtomicBool::new(false));
+        let liveness = store.liveness();
+        let actor_terminated = Arc::clone(&terminated);
         let task = tokio::spawn(async move {
+            // Declared first, dropped last: raised when this future completes
+            // and when it unwinds on a task panic.
+            let _terminated = ActorTerminationOnExit(actor_terminated);
             let mut owner = Self {
                 store,
                 control,
@@ -2285,13 +2728,21 @@ where
         });
         WalOwnerHandle {
             sender,
-            _task: task,
+            terminated,
+            liveness,
+            task: tokio::sync::Mutex::new(Some(task)),
         }
     }
 
     fn spawn_failed() -> WalOwnerHandle {
         let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
+        let terminated = Arc::new(AtomicBool::new(false));
+        // No lane was ever built, so this authority's census is empty and
+        // `join_terminated` reduces to awaiting the refusal loop.
+        let liveness = LaneLiveness::new();
+        let actor_terminated = Arc::clone(&terminated);
         let task = tokio::spawn(async move {
+            let _terminated = ActorTerminationOnExit(actor_terminated);
             while let Some(command) = receiver.recv().await {
                 match command {
                     WalOwnerMessage::Apply(command) => {
@@ -2309,7 +2760,9 @@ where
         });
         WalOwnerHandle {
             sender,
-            _task: task,
+            terminated,
+            liveness,
+            task: tokio::sync::Mutex::new(Some(task)),
         }
     }
 
@@ -2328,7 +2781,7 @@ where
                 .publication
                 .checkpoint_and_recover(&binding, owner_instance_id, source)
                 .await?;
-            self.store = settlement.into_lane().await?;
+            self.store = settlement.into_lane(self.store.liveness()).await?;
             self.require_fresh_head().await?;
         }
         let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
@@ -2408,7 +2861,7 @@ where
                 .publication
                 .checkpoint_and_recover(&binding, owner_instance_id, source)
                 .await?;
-            self.store = settlement.into_lane().await?;
+            self.store = settlement.into_lane(self.store.liveness()).await?;
             self.require_fresh_head().await?;
         }
         let attempt = self
@@ -2659,6 +3112,14 @@ mod tests {
             &self,
             transaction: &Transaction<'_>,
         ) -> std::result::Result<WalReplayResult, WalIdempotencyError> {
+            // Sentinel for the lane-thread panic regression. Raised before any
+            // SQL so the unwind crosses no FFI frame, and kept a value sentinel
+            // rather than a new field so every other plan constructor stays
+            // byte-identical.
+            assert!(
+                self.value != LANE_PANIC_SENTINEL,
+                "deliberate lane-thread panic"
+            );
             if let Some(stall) = self.stall.as_ref() {
                 stall.wait();
             }
@@ -2790,6 +3251,9 @@ mod tests {
             Ok(LogicalMutationResult::Applied(result))
         }
     }
+
+    /// A plan carrying this value panics on the blocking lane thread.
+    const LANE_PANIC_SENTINEL: &[u8] = b"kioku-test-panic-the-lane-thread";
 
     fn plan(id: u8, value: &[u8]) -> PreparedLogicalMutation<TestPlan> {
         plan_kind(WalOperationKind::MediaCaptureEvent, id, value)
@@ -3657,7 +4121,7 @@ mod tests {
                 crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding.clone())
                     .unwrap();
             store.stall_checkpoint_for_wal_owner_test(Arc::clone(&stall));
-            let lane = WalStoreLane::spawn(store).unwrap();
+            let lane = WalStoreLane::spawn(store, LaneLiveness::new()).unwrap();
             let publication = Arc::new(
                 FakePublication::new(successor).with_checkpoint_observation(retained, observed),
             );
@@ -3929,13 +4393,16 @@ mod tests {
         let (entered_sender, entered) = oneshot::channel();
         let (release, release_receiver) = std::sync::mpsc::channel();
         let construction = tokio::spawn(async move {
-            WalStoreLane::spawn_with_builder(move || {
-                let _ = entered_sender.send(());
-                release_receiver
-                    .recv()
-                    .map_err(|_| WalOwnerError::Persistence)?;
-                Ok(store)
-            })
+            WalStoreLane::spawn_with_builder(
+                move || {
+                    let _ = entered_sender.send(());
+                    release_receiver
+                        .recv()
+                        .map_err(|_| WalOwnerError::Persistence)?;
+                    Ok(store)
+                },
+                LaneLiveness::new(),
+            )
             .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), entered)
@@ -4925,7 +5392,10 @@ mod tests {
             );
         }
         assert!(source.contains(concat!("spawn_", "authenticated")));
-        assert!(source.contains(concat!("settlement.into_", "lane().await")));
+        assert!(source.contains(concat!(
+            "settlement.into_",
+            "lane(self.store.liveness()).await"
+        )));
         assert_eq!(
             source
                 .matches(concat!("send(WalStoreLaneCommand::", "Read"))
@@ -4933,5 +5403,348 @@ mod tests {
             1,
             "lane reads must dispatch only through the actor-called wrapper"
         );
+    }
+
+    // ── Group C: in-process relaunch trigger and proof of death ─────────────
+
+    async fn terminal_within(handle: &WalOwnerHandle, label: &str) {
+        let deadline = std::time::Duration::from_secs(10);
+        tokio::time::timeout(deadline, async {
+            while !handle.is_terminal() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label}: the authority never became terminal"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_thread_panic_makes_the_authority_terminal() {
+        // Before the lane's exit guard existed this was a silent, total,
+        // in-process outage: the trailing `thread_poisoned` store was skipped
+        // by the unwind, `is_poisoned()` stayed false, the actor loop's poison
+        // check never broke, and the actor future never completed. Every
+        // subsequent send failed with `Poisoned` because the receiver had died
+        // with the thread, and nothing in the process could observe it.
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let handle = SingleArchiveWalOwner::spawn(
+            store,
+            Arc::new(FakeControl::new()),
+            Arc::new(FakePublication::new(next)),
+        );
+        assert!(!handle.is_terminal(), "a fresh authority is not terminal");
+
+        let panicked = handle.submit(plan(91, LANE_PANIC_SENTINEL)).await;
+        assert!(
+            matches!(panicked, Err(WalOwnerError::Poisoned)),
+            "the panicked lane must refuse rather than acknowledge: {panicked:?}"
+        );
+
+        // The actor loop's poison check now sees the raised flag and breaks on
+        // that very message, so the drop guard inside the actor future raises
+        // the termination flag.
+        terminal_within(&handle, "lane panic").await;
+
+        // And the successor may be constructed: the actor task resolved and
+        // the panicked lane thread left the census after its store owner was
+        // dropped, so the SQLite connection is closed and the capture
+        // registration is retired and scrubbed.
+        handle
+            .join_terminated(std::time::Duration::from_secs(10))
+            .await
+            .expect("a panicked lane is provably dead");
+
+        // Poison remains reachable and fail-closed: the lane is still refusing.
+        assert!(matches!(
+            handle.submit(plan(92, b"after-the-panic")).await,
+            Err(WalOwnerError::Poisoned)
+        ));
+    }
+
+    struct WedgedCheckpointPublication {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        pending: AtomicBool,
+    }
+
+    impl WedgedCheckpointPublication {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                pending: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl sealed::PublicationAuthority for WedgedCheckpointPublication {}
+
+    #[async_trait]
+    impl WalPublicationAuthority for WedgedCheckpointPublication {
+        async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead> {
+            let observed = WitnessRecord::decode(binding.witness_bytes())
+                .map_err(|_| WalOwnerError::Corrupt)?;
+            AuthenticatedWalOwnerHead::from_authority(binding, observed)
+        }
+
+        async fn checkpoint_required(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn checkpoint_pending(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(self.pending.swap(false, Ordering::SeqCst))
+        }
+
+        async fn refresh_live_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn refresh_checkpoint_source_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn checkpoint_and_recover(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+            _source: crate::store::WalOwnerCheckpointSource,
+        ) -> Result<WalCheckpointSettlement> {
+            // The actor is now mid-root-advance: the lane has been consumed
+            // and its poison flag raised, and the successor lane does not
+            // exist yet.
+            self.entered.notify_waiters();
+            self.release.notified().await;
+            // A transient publication failure here is the second, independent
+            // terminal path (`self.store = settlement.into_lane(..).await?`
+            // early-returning onto the consumed, exited lane).
+            Err(WalOwnerError::Publication)
+        }
+
+        async fn create_candidate(
+            &self,
+            _context: &WalOwnerContext,
+            _captured: &CapturedWalCommit,
+            _control: &dyn WalOwnerControl,
+        ) -> Result<WalPublicationCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+
+        async fn send_candidate(
+            &self,
+            _context: &WalOwnerContext,
+            _candidate: &WalPublicationCandidate,
+        ) -> Result<WitnessedWalCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+
+        async fn resume_candidate(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _identity: WalOperationIdentity,
+            _attempt: &WalOwnerAttempt,
+            _candidate: &WalPublicationCandidate,
+        ) -> Result<WitnessedWalCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkpoint_in_flight_never_makes_the_authority_terminal() {
+        // The poison flag is NOT a safe relaunch trigger.
+        // `WalStoreLaneCommand::Checkpoint` raises it unconditionally on the
+        // ordinary checkpoint path, and `take_checkpoint_source` raises it on
+        // its SUCCESS path, while the actor goes on to `checkpoint_and_recover`
+        // and a full witness root advance. A trigger derived from the flag
+        // would fire there and spawn a second owner over a live one.
+        let source = include_str!("archive_v3_wal_owner.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let checkpoint_arm = &production[production
+            .find("WalStoreLaneCommand::Checkpoint { response } => {")
+            .expect("the lane checkpoint arm moved")..];
+        let checkpoint_arm = &checkpoint_arm[..checkpoint_arm.find("break;").unwrap()];
+        assert!(
+            checkpoint_arm.contains("thread_poisoned.store(true, Ordering::Release);")
+                && !checkpoint_arm.contains("if store.is_poisoned()"),
+            "the checkpoint arm must still raise the poison flag unconditionally, \
+             which is exactly why the flag cannot be the relaunch trigger"
+        );
+
+        let (current, _) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let publication = Arc::new(WedgedCheckpointPublication::new());
+        let entered = publication.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let handle = Arc::new(SingleArchiveWalOwner::spawn(
+            store,
+            Arc::new(FakeControl::new()),
+            Arc::clone(&publication),
+        ));
+        let submission = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.submit(plan(93, b"checkpointing")).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .expect("the actor reaches the root advance");
+        // The lane is poisoned right now and the actor is still working. A
+        // relaunch here would construct a second owner for this archive.
+        assert!(
+            !handle.is_terminal(),
+            "an in-flight checkpoint must never look terminal"
+        );
+
+        publication.release.notify_waiters();
+        assert!(matches!(
+            submission.await.unwrap(),
+            Err(WalOwnerError::Publication)
+        ));
+        // Only once the actor itself has finished is the slot replaceable.
+        terminal_within(&handle, "post-checkpoint").await;
+        handle
+            .join_terminated(std::time::Duration::from_secs(10))
+            .await
+            .expect("the consumed lane is provably dead");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_terminated_refuses_a_wedged_lane_and_never_proves_death() {
+        // Fencing is absolute: a relaunch that races the dying owner must be
+        // impossible, not merely unlikely. `is_terminal()` alone does not
+        // establish that — the actor future can be over while a blocking lane
+        // thread still holds the writable SQLite connection and the capture
+        // registration. Refusing is always safe; forcing never is.
+        let (handle, release) = WalOwnerHandle::stuck_lane_for_relaunch_test();
+        terminal_within(&handle, "wedged lane").await;
+        assert!(handle.is_terminal());
+        let refused = handle
+            .join_terminated(std::time::Duration::from_millis(250))
+            .await;
+        assert!(
+            matches!(refused, Err(WalOwnerError::Persistence)),
+            "a wedged lane must refuse the proof of death: {refused:?}"
+        );
+        // The refusal is not a one-shot: nothing was detached, so once the
+        // lane really leaves, the same handle can still be proven dead.
+        release.release();
+        handle
+            .join_terminated(std::time::Duration::from_secs(10))
+            .await
+            .expect("the released lane is provably dead");
+    }
+
+    #[tokio::test]
+    async fn a_terminated_authority_is_provably_dead_and_repeatably_joinable() {
+        let handle = WalOwnerHandle::terminated_for_relaunch_test().await;
+        assert!(handle.is_terminal());
+        for _ in 0..3 {
+            handle
+                .join_terminated(std::time::Duration::from_secs(10))
+                .await
+                .expect("joining an already-reaped actor is idempotent");
+        }
+    }
+
+    #[test]
+    fn the_relaunch_trigger_is_never_derived_from_the_poison_flag() {
+        let source = include_str!("archive_v3_wal_owner.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let bodies: Vec<&str> = production
+            .match_indices("pub(crate) fn is_terminal(&self) -> bool {")
+            .map(|(offset, _)| {
+                let tail = &production[offset..];
+                &tail[..tail.find('}').unwrap()]
+            })
+            .collect();
+        assert!(!bodies.is_empty(), "the trigger moved");
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("self.terminated.load(Ordering::Acquire)")),
+            "the trigger must read the actor termination flag"
+        );
+        for body in &bodies {
+            assert!(
+                !body.contains("poison"),
+                "the trigger must never consult the poison flag: {body}"
+            );
+        }
+        // The flag is raised by a drop guard, so it is set on completion AND
+        // on unwind, and it is monotone.
+        for required in [
+            "struct ActorTerminationOnExit(Arc<AtomicBool>);",
+            "let _terminated = ActorTerminationOnExit(actor_terminated);",
+            "struct LanePoisonOnExit(Arc<AtomicBool>);",
+            "let _exit = LanePoisonOnExit(Arc::clone(&thread_poisoned));",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
+        // ACCEPTED-5: `spawn_failed` loops forever and is production-unreachable.
+        // Every `SingleArchiveWalOwner::spawn(` call site must stay in tests.
+        let boundary = source.find(concat!("mod ", "tests")).unwrap();
+        for offset in source.match_indices("SingleArchiveWalOwner::spawn(") {
+            assert!(
+                offset.0 > boundary,
+                "SingleArchiveWalOwner::spawn was wired into production"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_successor_inherits_the_lane_census() {
+        // A successor lane must inherit the predecessor's census. Minting a
+        // fresh one would let a checkpoint erase a still-running predecessor
+        // from the proof of death — the exact hole a per-launch JoinHandle
+        // would leave.
+        let source = include_str!("archive_v3_wal_owner.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        assert_eq!(
+            production
+                .matches("settlement.into_lane(self.store.liveness()).await?")
+                .count(),
+            2,
+            "both checkpoint arms must hand the successor the inherited census"
+        );
+
+        let (current, _) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let liveness = LaneLiveness::new();
+        assert_eq!(liveness.live_for_test(), 0);
+        {
+            let lane = WalStoreLane::spawn(
+                crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding.clone())
+                    .unwrap(),
+                liveness.clone(),
+            )
+            .unwrap();
+            assert_eq!(liveness.live_for_test(), 1);
+            let successor = WalStoreLane::spawn(
+                crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap(),
+                lane.liveness(),
+            )
+            .unwrap();
+            // Two lanes of one authority are alive at once, and the census
+            // sees both.
+            assert_eq!(liveness.live_for_test(), 2);
+            drop(successor);
+            drop(lane);
+        }
+        let quiet = tokio::task::spawn_blocking(move || {
+            liveness.wait_until_quiet(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        assert!(quiet, "both lanes must retire from the census");
     }
 }

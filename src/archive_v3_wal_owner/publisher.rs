@@ -1563,6 +1563,7 @@ impl SingleArchiveWalPublisher {
             staged,
             binding,
             Arc::clone(&publisher.capture),
+            super::LaneLiveness::new(),
         )
         .await?;
         let control: Arc<dyn WalOwnerControl> = publisher.control.clone();
@@ -1771,10 +1772,8 @@ impl SingleArchiveWalPublisher {
         .await
         .map_err(|_| WalOwnerError::Publication)?;
         #[cfg(not(test))]
-        let capture = Arc::new(
-            crate::store::StoreShadowCapture::install("kioku-archive-v3-wal-owner-v1")
-                .map_err(|_| WalOwnerError::Capture)?,
-        );
+        let capture = crate::store::StoreShadowCapture::shared_for_wal_owner()
+            .map_err(|_| WalOwnerError::Capture)?;
         #[cfg(test)]
         let capture = crate::store::StoreShadowCapture::shared_for_test();
         let publisher = Self {
