@@ -162,7 +162,39 @@ EXPECTED_STORE_CALL_COUNT = 228
 # wrapper over with_user_read). Legacy reads reached through read_user
 # are therefore invisible here — worth a sweep of Store's public
 # surface for with_user delegation.
-EXPECTED_STORE_CALL_SHA256 = "bb8acbdf4031368853a73fed7d10adbbf28c7f07a671bfc1570677c3e2cec414"
+# Capture/session/people reads routed, D4 gates RETAINED. The count HOLDS
+# at 228.
+#
+# BASELINE: a pristine `git worktree add --detach` checkout of origin/main
+# at commit ea2bf62 ("fix(billing): route the margin-dashboard read instead
+# of swallowing its refusal (#327)"), dumped with THIS module's own
+# store_call_sites()/classify_store_call()/digest() helpers before anything
+# was written. That pristine dump reproduced ea2bf62's own 228/bb8acbdf pin
+# byte-for-byte, so the diff below is against a verified baseline.
+#
+# DELTA, 12 changed rows out of 228, count unchanged:
+#   * SEVEN one-for-one key swaps, `with_user#0` -> `wal_authoritative_read#0`,
+#     in capture_status, capture_session_status, list_capture_sessions,
+#     list_people, person_profile, person_evidence and person_statements.
+#     Every one keeps classification A. The routed call is retained on
+#     purpose: it is strictly better than the bare `with_user` it replaced
+#     (the legacy fallthrough is `with_user_read`, so an unselected user's
+#     read now runs under SQLite's query_only guard), and it makes lifting
+#     each gate a one-line deletion later.
+#   * FIVE owner-body hash moves with byte-identical call-EXPRESSION hashes:
+#     upload_capture_event's four rows and stream_ack's one. Both owners keep
+#     their D4 gates; only the prose above those gates was rewritten, and
+#     this scanner blanks comments in place, so a comment whose LENGTH
+#     changes moves the owner-body hash without touching any call site.
+#
+# Zero reclassifications, zero call-expression hash moves on any surviving
+# key, and the surviving-key order is identical.
+#
+# The digest does NOT return to ea2bf62's bb8acbdf even though all seven D4
+# gates are back: the gates live above the call sites, and the call sites
+# themselves stay routed. The count returning to the pre-PR 228 and the
+# seven rows keeping classification A is the shape to expect here.
+EXPECTED_STORE_CALL_SHA256 = "b68a7595455720610d9be302f7c1f460206afe6239a991f9aa9524b18e94703a"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -355,7 +387,16 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # the sole delta is `upload_capture_event`'s owner body, whose gate sits
 # above the route's detached media-put spawn; every spawn call-site
 # expression hash is unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "5fb928cba829ee4592fa14f4e07bbc00dfe6eddfef25331dc512344f68b53ffe"
+# Capture reads routed, D4 gates RETAINED: count HOLDS at 26 with zero
+# additions, zero removals, zero reclassifications and zero spawn
+# call-EXPRESSION hash moves. The sole delta is `upload_capture_event`'s
+# owner body, whose RETAINED D4 gate sits above the route's detached
+# media-put spawn and whose rationale prose was rewritten in place. Same
+# pristine origin/main (ea2bf62) worktree and the same
+# worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the
+# store-call pin above; that pristine dump reproduced ea2bf62's own
+# 26/5fb928cb pin byte-for-byte before anything was written.
+EXPECTED_WORKER_SPAWN_SHA256 = "fe52045d89ce8bd08c6fe28012c080b531e5184df5c6727a6fb853c50c4ed715"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

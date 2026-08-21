@@ -158,11 +158,61 @@ pub mod wal_domain {
     pub const QUERY_FEED: &str = "query.feed";
     pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
     pub const QUERY_SCREENSHOT_IMAGE_CONTENT: &str = "query.screenshot_image_content";
+    // ── The media read domains ──────────────────────────────────────────────
+    //
+    // THE ANSWERABILITY RULE (ADR-0022 D4, and the reason the six constants
+    // below outlive their routing):
+    //
+    //   A read stays gated while every production writer of the tables it
+    //   reads is itself a deferred domain. Such a read cannot answer anything
+    //   but an absence, and an absence is indistinguishable from a truthful
+    //   empty archive — which is the exact failure the deferral registry
+    //   exists to prevent. These reads lift **together with** the domain that
+    //   fills their tables, never before it.
+    //
+    // The rule is about ANSWERABILITY, not about mechanism. A read whose call
+    // site already routes through `Store::wal_authoritative_read` satisfies
+    // the mechanical half of the migration and is still not migrated: routing
+    // decides *which store* answers, and the rule decides *whether an answer
+    // exists to give*. Every constant below therefore names a domain whose
+    // route is already written and whose gate fires above it, so lifting one
+    // is a one-line deletion at the gate site — never a rewrite.
+    //
+    // The registry's "delete a constant only when its domain actually
+    // migrates" instruction is read through this rule: a domain migrates when
+    // its writers migrate, not when its readers are re-plumbed. Deleting one
+    // of these early does not merely leave dead gate surface; it converts a
+    // deferral into a 200 with an empty collection or a 404, which is the one
+    // outcome no refusal is allowed to wear.
+    //
+    /// Capture ingest itself: the sole production writer of `capture_events`,
+    /// `capture_streams` and every canonical `capture_sessions` row. Every
+    /// other media read gate below is answerability-blocked on THIS one.
     pub const MEDIA_CAPTURE_EVENTS: &str = "media.capture_events";
-    pub const MEDIA_CAPTURE_EVENT_STATUS: &str = "media.capture_event_status";
-    pub const MEDIA_CAPTURE_SESSIONS: &str = "media.capture_sessions";
-    pub const MEDIA_CAPTURE_SESSION_STATUS: &str = "media.capture_session_status";
+    /// `stream_ack`'s contiguous-acknowledgement read over `capture_streams`.
+    /// A pure SELECT, so it is not gated for writing — it is gated because
+    /// every canonical stream it could name is created by
+    /// `MEDIA_CAPTURE_EVENTS` above, so a routed answer is `NotFound` -> 404
+    /// "no such stream" when the truth is "your ingest is deferred".
     pub const MEDIA_STREAM_ACK: &str = "media.stream_ack";
+    /// `capture_status`'s single-event read over `capture_events`, whose only
+    /// production writer is `MEDIA_CAPTURE_EVENTS`.
+    pub const MEDIA_CAPTURE_EVENT_STATUS: &str = "media.capture_event_status";
+    /// `list_capture_sessions`' bounded session listing. It answers a
+    /// COLLECTION, so its ungated failure mode is the worst shape the rule
+    /// names: `200 {"sessions": []}`, a refusal wearing a truthful-empty face.
+    pub const MEDIA_CAPTURE_SESSIONS: &str = "media.capture_sessions";
+    /// `capture_session_status`' single-session read. Its rows and its whole
+    /// evidence rollup are written by ingest.
+    pub const MEDIA_CAPTURE_SESSION_STATUS: &str = "media.capture_session_status";
+    /// The four people reads (`list_people`, `person_profile`,
+    /// `person_evidence`, `person_statements`). Every `people` and
+    /// `person_facts` row is derived by `media_worker`'s result lanes from
+    /// evidence that capture ingest supplies, so with `MEDIA_CAPTURE_EVENTS`
+    /// deferred there is no work unit to derive a person from; and the
+    /// `voice_profiles` the listing joins are written only by the deferred
+    /// `MEDIA_WORKER_VOICE_EMBEDDING` and `MEDIA_WORKER_VOICE_PROFILES` lanes.
+    /// No live writer reaches these tables.
     pub const MEDIA_PEOPLE: &str = "media.people";
     pub const SYNC_STATUS: &str = "sync.status";
     pub const SYNC_EXPORT: &str = "sync.export";
