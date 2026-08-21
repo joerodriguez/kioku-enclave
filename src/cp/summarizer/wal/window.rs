@@ -509,12 +509,17 @@ impl WalLogicalDomainPlan for EpisodeWindowUpsertPlan {
                 EpisodeArm::Insert => {
                     transaction
                         .execute(
+                            // created_at is explicit because the frozen
+                            // baseline declares it with a strftime DEFAULT
+                            // (store.rs), and a clock inside apply would
+                            // break byte-exact replay. Same value as
+                            // updated_at, as this row is being created now.
                             "INSERT INTO episodes
                                  (started_at, ended_at, type, title, summary,
                                   participants, languages, action_items, model,
                                   minute_summaries, minutes_text, substance,
-                                  visual_evidence, updated_at)
-                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                                  visual_evidence, updated_at, created_at)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
                             params![
                                 episode.started_at,
                                 episode.ended_at,
@@ -1080,6 +1085,11 @@ mod tests {
                                   CHECK (substance IN ('none','low','normal')),
                     visual_evidence TEXT NOT NULL DEFAULT 'none'
                                   CHECK (visual_evidence IN ('none','useful')),
+                    -- Declared exactly as the frozen baseline does, clock
+                    -- DEFAULT included, so an apply that fails to bind it is
+                    -- observable here instead of silently absent.
+                    created_at    TEXT NOT NULL
+                                  DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     updated_at    TEXT
                  );
                  CREATE TABLE episode_members (
@@ -1154,15 +1164,22 @@ mod tests {
         ));
         let ids = read_window_assignments(&connection, 0).unwrap();
         assert_eq!(ids, vec![1, 2], "ids are a pure function of the pin");
-        let (title, updated): (String, String) = connection
+        let (title, updated, created): (String, String, String) = connection
             .query_row(
-                "SELECT title,updated_at FROM episodes WHERE id=2",
+                "SELECT title,updated_at,created_at FROM episodes WHERE id=2",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(title, "second");
         assert_eq!(updated, COMMITTED_AT, "the carried stamp replaces strftime");
+        // created_at carries its own strftime DEFAULT in the baseline, so it
+        // needs its own binding and its own assertion. Checking updated_at
+        // alone left the clock running in this very row.
+        assert_eq!(
+            created, COMMITTED_AT,
+            "the carried stamp replaces strftime for created_at too"
+        );
         let members: i64 = connection
             .query_row("SELECT COUNT(*) FROM episode_members", [], |row| row.get(0))
             .unwrap();
