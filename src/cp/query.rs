@@ -36,7 +36,24 @@ use super::CpState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
+/// The combined episode + utterance search behind `GET /api/search`.
+///
+/// This returns a `Result` and its caller must keep it that way. It used to be
+/// `tool_search_transcripts`, which flattened every read failure into a bare
+/// `Value` carrying `{"error": "search is unavailable"}`; `rest_search` handed
+/// that straight to `Json(..).into_response()`, so a refusal shipped under HTTP
+/// 200 and any client that switches on the status before the body read it as a
+/// successful, empty search.
+///
+/// The name changed with the signature because the `tool_` prefix was already
+/// wrong. MCP's own `search_transcripts` is served by
+/// `mcp_query::search_safe_transcripts` through `dispatch_tool`; this function
+/// had exactly one caller, the REST route, and no MCP path at all.
+async fn query_transcripts_value(
+    s: &CpState,
+    user_id: &str,
+    args: &Value,
+) -> crate::error::Result<Value> {
     let raw_query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -81,26 +98,26 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     // A failed read must never be reported as "nothing found". An empty
     // payload here is indistinguishable from a true negative, so the assistant
     // would tell the user their data does not exist — while it is present and
-    // merely unreadable (a transient DB error today, or a routed-read refusal
-    // once the user's archive is WAL-authoritative). Surfacing an `error` key
-    // sets `isError` on the tool result and makes the failure observable.
-    let (episodes, utterances) = match s
+    // merely unreadable (a transient DB error, or a routed read whose serving
+    // authority is unavailable). Propagating the error is what lets each
+    // caller answer loudly in its own idiom.
+    //
+    // ADR-0022: the routed read serves both branches — a WAL-authoritative
+    // user reads through their serving authority's settled-only lane, and an
+    // unselected user falls through to the ordinary guarded legacy read.
+    let (episodes, utterances) = s
         .store
-        .with_user(user_id, |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             Ok((
                 crate::search::search_episodes(conn, &ep_req)?,
                 search_all(conn, &utt_req)?,
             ))
         })
-        .await
-    {
-        Ok(found) => found,
-        Err(_) => return json!({ "error": "search is unavailable" }),
-    };
-    json!({
+        .await?;
+    Ok(json!({
         "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
         "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
-    })
+    }))
 }
 const MAX_SCREENSHOT_IMAGE_BYTES: usize = 150 * 1024;
 const MAX_SCREENSHOT_MULTIPART_BYTES: usize = MAX_SCREENSHOT_IMAGE_BYTES + 16 * 1024;
@@ -208,10 +225,11 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         query_embedding,
     };
     // See the note in the combined search above: an unreadable archive must
-    // not be answered with an authoritative-looking empty result set.
+    // not be answered with an authoritative-looking empty result set. The
+    // routed read serves the WAL-authoritative and legacy branches alike.
     let hits = match s
         .store
-        .with_user(user_id, |conn| search_all(conn, &req))
+        .wal_authoritative_read(user_id, move |conn| search_all(conn, &req))
         .await
     {
         Ok(hits) => hits,
@@ -229,7 +247,12 @@ async fn tool_list_episodes(s: &Arc<CpState>, user_id: &str, args: &Value) -> Va
         .unwrap_or(20)
         .clamp(1, 50) as i64;
     let include_low = args.get("include_low").is_some_and(value_is_truthy);
-    list_episodes_value(s, user_id, from, to, max, include_low).await
+    // See `query_episodes_value`: a failed read answers with an `error` key,
+    // never with the empty list that reads as "you have no memories".
+    match query_episodes_value(s, user_id, from, to, max, include_low, None).await {
+        Ok(value) => value,
+        Err(_) => json!({ "error": "episode list is unavailable" }),
+    }
 }
 
 fn value_is_truthy(value: &Value) -> bool {
@@ -259,22 +282,19 @@ fn url_domain(url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
 }
 
-async fn list_episodes_value(
-    s: &CpState,
-    user_id: &str,
-    from: Option<String>,
-    to: Option<String>,
-    max: i64,
-    include_low: bool,
-) -> Value {
-    query_episodes_value(s, user_id, from, to, max, include_low, None)
-        .await
-        .unwrap_or_else(|_| json!({ "episode_count": 0, "hidden_count": 0, "episodes": [] }))
-}
-
 /// Shared list/detail query. Keeping the optional id filter here ensures the
 /// direct detail endpoint cannot drift from the list row's fields, visibility
 /// rules, derived counts, or final-brief shape.
+///
+/// This returns a `Result` and every caller must keep it that way. The
+/// `list_episodes_value` wrapper that used to sit in front of it flattened ANY
+/// error into `{"episode_count":0,"hidden_count":0,"episodes":[]}` — an
+/// authoritative-looking empty list for an archive that is fully present and
+/// merely unreadable. A transient database error, a routed read whose serving
+/// authority is unavailable, and a genuinely empty account were indis-
+/// tinguishable, so both callers told the user they had no memories. The
+/// wrapper is deleted rather than repaired: there is now no seam that can
+/// quietly reintroduce the flattening.
 async fn query_episodes_value(
     s: &CpState,
     user_id: &str,
@@ -291,7 +311,7 @@ async fn query_episodes_value(
     let to = to.map(|s| super::isotime::normalize_to_utc(&s));
 
     s.store
-        .with_user(user_id, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             // Episodes are the ONLY mode (the Mac's local heuristic grouping is
             // gone) — this response carries everything the debugger card needs:
             // LLM fields (participants/languages/action_items) plus per-type
@@ -463,16 +483,24 @@ async fn query_episodes_value(
 
 async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {
     s.store
-        .with_user(user_id, |conn| {
+        .wal_authoritative_read(user_id, |conn| {
             let utt: i64 = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
             let scr: i64 = conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?;
             let eps: i64 = conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?;
+            // `.optional()`, never `.ok()`. `.ok()` collapses EVERY error into
+            // `None`, so a corrupt index or a failed statement reported the
+            // same "no captures yet" as a genuinely empty archive — the exact
+            // absence-for-a-refusal this whole surface exists to prevent. Only
+            // "no rows" and a NULL timestamp are absences; anything else is a
+            // read failure and must reach the caller's failure arm.
             let last_u: Option<String> = conn
-                .query_row("SELECT s.started_at FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id ORDER BY s.started_at DESC LIMIT 1", [], |r| r.get(0))
-                .ok();
+                .query_row("SELECT s.started_at FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id ORDER BY s.started_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
             let last_s: Option<String> = conn
-                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get(0))
-                .ok();
+                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
             Ok(json!({
                 "total_utterances": utt,
                 "total_screenshots": scr,
@@ -593,11 +621,22 @@ fn object_array_schema(properties: Value) -> Value {
 
 /// Every tool name `dispatch_tool` answers, in `tool_definitions()` order.
 ///
-/// The ADR-0022 D4 gate consults this list so an *unknown* name still falls
-/// through to the JSON-RPC "unknown tool" error instead of being refused as a
-/// deferred domain. `mcp_tool_names_match_the_published_definitions` pins it
-/// against `tool_definitions()`, so a seventh tool cannot silently escape the
-/// gate.
+/// The ADR-0022 D4 `mcp.tools` gate in `mcp_endpoint` consults this list, so an
+/// *unknown* name still falls through to the JSON-RPC "unknown tool" error
+/// instead of being refused as a deferred domain.
+///
+/// Two real tests pin it, and a seventh tool cannot silently escape the gate
+/// without failing one of them:
+///
+/// * `mcp_tool_names_match_the_published_definitions` compares this list to
+///   `tool_definitions()` in both directions, so a published tool must appear
+///   here.
+/// * `mcp_reads_report_an_unreadable_archive_instead_of_empty_results` sweeps
+///   this list through `dispatch_tool` and its
+///   `unwrap_or_else(|| panic!("{tool} should dispatch"))` fails on any name
+///   here that has no dispatch arm. That assertion — not a separate
+///   `every_published_tool_dispatches`, which does not exist — is what pins
+///   this list against `dispatch_tool`.
 const MCP_TOOL_NAMES: &[&str] = &[
     "search_transcripts",
     "search_screenshots",
@@ -821,43 +860,44 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
     if let Some(refusal) = super::mcp_safety::refusal_for_args(name, args) {
         return Some(refusal);
     }
-    // ADR-0022 D4: none of the six tools below is migrated -- every one reads
-    // through the legacy per-user store. The gate sits at the single dispatch
-    // point and answers with an `error` key, which sets `isError` on the tool
-    // result. It must never be an empty payload: `list_episodes` and
-    // `get_capture_status` both flatten a failed read into a result with no
-    // `error` key, which the assistant would report as "you have no data"
-    // while the archive is fully present and merely unmigrated.
-    if MCP_TOOL_NAMES.contains(&name) && s.store.is_wal_authoritative(user_id) {
-        tracing::warn!(
-            user_id,
-            metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-            domain = wal_domain::MCP_TOOLS,
-            tool = name,
-            "not migrated to WAL; refusing tool"
-        );
-        return Some(json!({
-            "error": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-            "domain": wal_domain::MCP_TOOLS,
-        }));
-    }
+    // ADR-0022: every one of the six tools now reads through the routed
+    // `wal_authoritative_read`, which serves a WAL-authoritative user from
+    // their serving authority's settled-only lane and falls through to the
+    // ordinary guarded legacy read for everyone else. The D4 `mcp.tools` gate
+    // that stood here is retired with the migration.
+    //
+    // Whichever lane answers, a failure must surface an `error` key: that is
+    // what sets `isError` on the tool result, and it is the only thing that
+    // distinguishes "unreadable" from "you have no data".
     let result = match name {
         "search_transcripts" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let from = args.get("from").and_then(|v| v.as_str());
-            let to = args.get("to").and_then(|v| v.as_str());
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
+            let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             s.store
-                .with_user(user_id, |conn| {
+                .wal_authoritative_read(user_id, move |conn| {
                     Ok(super::mcp_query::search_safe_transcripts(
-                        conn, query, from, to, limit,
+                        conn,
+                        &query,
+                        from.as_deref(),
+                        to.as_deref(),
+                        limit,
                     )?)
                 })
                 .await
                 .unwrap_or_else(|_| json!({ "error": "transcript search is unavailable" }))
         }
         "get_context" => {
-            let at = args.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let at = args
+                .get("at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let window = args
                 .get("window_seconds")
                 .and_then(|v| v.as_u64())
@@ -867,25 +907,33 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
             s.store
-                .with_user(user_id, |conn| {
+                .wal_authoritative_read(user_id, move |conn| {
                     Ok(super::mcp_query::fetch_safe_context(
-                        conn, at, window, limit,
+                        conn, &at, window, limit,
                     )?)
                 })
                 .await
                 .unwrap_or_else(|_| json!({ "error": "context lookup is unavailable" }))
         }
         "summarize_time_range" => {
-            let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
-            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let from = args
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let to = args
+                .get("to")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
             s.store
-                .with_user(user_id, |conn| {
+                .wal_authoritative_read(user_id, move |conn| {
                     Ok(super::mcp_query::summarize_safe_time_range(
-                        conn, from, to, limit,
+                        conn, &from, &to, limit,
                     )?)
                 })
                 .await
@@ -917,10 +965,55 @@ async fn mcp_endpoint(
 ) -> Response {
     let user_id = user.0;
 
-    // A volatile rate limit protects the service without making read-only tool
-    // calls persist usage or query-log state.
-    if rpc.method == "tools/call" && !s.mcp_limiter.consume(&user_id).await {
-        return rpc_error(&rpc.id, -32000, "rate_limited");
+    if rpc.method == "tools/call" {
+        let name = rpc
+            .params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // ADR-0022 D4: none of the six tools can be answered for a
+        // WAL-authoritative archive — see `wal_domain`'s read-lane note for
+        // the writer-by-writer argument. The gate consults `MCP_TOOL_NAMES` so
+        // an UNKNOWN name still falls through to the JSON-RPC "unknown tool"
+        // error rather than being reported as a deferred domain.
+        //
+        // It sits here, ahead of the limiter, and not in `dispatch_tool` where
+        // it used to: a deferral must not consume the caller's rate-limit
+        // budget for a call that was never going to touch the archive. The
+        // cost is that it now preempts `mcp_safety::refusal_for_args`, which
+        // runs inside `dispatch_tool`. Both are refusals and neither returns
+        // any archive content, and "your archive is unreadable" is the more
+        // specific fact — the safety boundary is unweakened for every request
+        // that reaches the store.
+        if MCP_TOOL_NAMES.contains(&name) && s.store.is_wal_authoritative(&user_id) {
+            tracing::warn!(
+                user_id,
+                metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+                domain = wal_domain::MCP_TOOLS,
+                tool = name,
+                "not migrated to WAL; refusing tool"
+            );
+            // An `error` key is what sets `isError` on the tool result. It must
+            // never be an empty payload: the assistant reports that as "you
+            // have no data" while the archive is fully present.
+            let refusal = json!({
+                "error": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+                "domain": wal_domain::MCP_TOOLS,
+            });
+            let text = serde_json::to_string(&refusal).unwrap_or_else(|_| "{}".into());
+            return rpc_ok(
+                &rpc.id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": true
+                }),
+            );
+        }
+        // A volatile rate limit protects the service without making read-only
+        // tool calls persist usage or query-log state.
+        if !s.mcp_limiter.consume(&user_id).await {
+            return rpc_error(&rpc.id, -32000, "rate_limited");
+        }
     }
 
     match rpc.method.as_str() {
@@ -1012,7 +1105,16 @@ async fn rest_search(
     }
     let args =
         json!({ "query": q, "from": p.from, "to": p.to, "limit": p.limit.unwrap_or(10).min(50) });
-    Json(tool_search_transcripts(&s, &user.0, &args).await).into_response()
+    // The same treatment `rest_episodes` gets, and for the same reason: this
+    // route used to call the MCP wrapper and hand its flattened `Value`
+    // straight to `Json(..).into_response()`, an unconditional 200. A failed
+    // read shipped `{"error": "search is unavailable"}` under a success
+    // status, so a client that switches on the status read a refusal as an
+    // empty result set.
+    match query_transcripts_value(&s, &user.0, &args).await {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => super::routed_read_unavailable("api.search", &e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1029,23 +1131,29 @@ async fn rest_episodes(
     Query(p): Query<EpisodesParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
-    // ADR-0022 D4: `list_episodes_value` flattens any read failure into an
-    // empty list, so an unmigrated archive would be reported as "no episodes".
     if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODES) {
         return error.into_response();
     }
-    Json(
-        list_episodes_value(
-            &s,
-            &user.0,
-            p.from,
-            p.to,
-            p.max_episodes.unwrap_or(50),
-            include_low,
-        )
-        .await,
+    // A read that fails answers 503, never 200 with an empty list: "no
+    // episodes" and "your episodes are unreadable" are different facts, and
+    // the debugger renders the first as an account with no memories. The gate
+    // above covers the deferred population; this arm covers the legacy lane,
+    // where a transient database error produced the same false empty and no
+    // gate was ever going to catch it.
+    match query_episodes_value(
+        &s,
+        &user.0,
+        p.from,
+        p.to,
+        p.max_episodes.unwrap_or(50),
+        include_low,
+        None,
     )
-    .into_response()
+    .await
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => super::routed_read_unavailable("api.episodes", &e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1080,14 +1188,7 @@ async fn rest_episode(
             )
                 .into_response(),
         },
-        Err(e) => {
-            tracing::error!(error = %e, episode_id = id, "episode detail query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
+        Err(e) => super::routed_read_unavailable("api.episode", &e),
     }
 }
 
@@ -1101,6 +1202,16 @@ async fn rest_episode_delete(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    // ADR-0022 D4 — deliberately NOT migrated with the rest of the read lane.
+    //
+    // This route only looks like a read. It is a three-step durable purge:
+    // enumerate the episode's media keys, delete those objects from GCS, then
+    // `purge_episode` the rows. The purge is a durable mutation, so it needs a
+    // sealed plan family of its own; routing only the lookup would be strictly
+    // worse than deferring, because a WAL-authoritative user would pass the
+    // routed read, have their media objects irreversibly deleted from GCS, and
+    // then fail on the legacy purge — media gone, rows intact, no retry that
+    // can repair it. The gate stays until that plan family exists.
     if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODE_DELETE) {
         return error.into_response();
     }
@@ -1216,7 +1327,7 @@ async fn rest_episode_members(
     }
     let result = s
         .store
-        .with_user(&user.0, move |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             // Legacy source keys let the Mac-selected evidence flow join a
             // member to screenshot_images. Cloud Capture v2 source keys bind
             // canonical screenshots to their retained encrypted media object.
@@ -1404,11 +1515,7 @@ async fn rest_episode_members(
         .await;
     match result {
         Ok(v) => Json(v).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "enclave_unavailable"})),
-        )
-            .into_response(),
+        Err(e) => super::routed_read_unavailable("api.episode_members", &e),
     }
 }
 
@@ -1422,7 +1529,7 @@ async fn rest_browser_snapshot(
     }
     let result = s
         .store
-        .with_user(&user.0, move |conn| {
+        .wal_authoritative_read(&user.0, move |conn| {
             let snapshot = conn
                 .query_row(
                     "SELECT id, source_key, captured_at, browser_bundle_id, browser_name,
@@ -1485,11 +1592,7 @@ async fn rest_browser_snapshot(
     match result {
         Ok(Some(snapshot)) => Json(snapshot).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "enclave_unavailable"})),
-        )
-            .into_response(),
+        Err(e) => super::routed_read_unavailable("api.browser_snapshot", &e),
     }
 }
 
@@ -1540,14 +1643,7 @@ async fn rest_episode_finalize(
         row_updated_at,
     )) = (match eligibility {
         Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, episode_id = id, "finalization retry lookup failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "enclave_unavailable"})),
-            )
-                .into_response();
-        }
+        Err(error) => return super::routed_read_unavailable("api.episode_finalize", &error),
     })
     else {
         return (
@@ -1945,19 +2041,12 @@ async fn rest_feed(
     }
     let result = s
         .store
-        .with_user(&user.0, move |conn| query_feed(conn, &p))
+        .wal_authoritative_read(&user.0, move |conn| query_feed(conn, &p))
         .await;
 
     match result {
         Ok(val) => Json(val).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "feed query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
+        Err(e) => super::routed_read_unavailable("api.feed", &e),
     }
 }
 
@@ -2428,24 +2517,24 @@ async fn rest_screenshot_upload_plan(
             .into_response();
     }
 
+    // Despite the name this route plans nothing durably: it returns the
+    // eligible candidate set and the remaining per-episode budgets so the Mac
+    // can rank them. Nothing is reserved, and the transactional check inside
+    // the upload route stays authoritative — so this is an ordinary routed
+    // read, not a mutation needing a sealed plan family. It is gated anyway,
+    // for the data reason, not the mutation one: its candidate set is drawn
+    // from `episodes`/`screenshots`, which no live writer can fill.
     if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN) {
         return error.into_response();
     }
     let result = s
         .store
-        .with_user(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
+        .wal_authoritative_read(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
         .await;
 
     match result {
         Ok(val) => Json(val).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "screenshot upload plan failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
+        Err(e) => super::routed_read_unavailable("api.screenshot_upload_plan", &e),
     }
 }
 
@@ -3288,7 +3377,7 @@ async fn rest_screenshot_image_content(
     let user_id_cloned = user_id.clone();
     let query_res = s
         .store
-        .with_user(&user_id_cloned, {
+        .wal_authoritative_read(&user_id_cloned, {
             let id_clone = id.clone();
             move |conn| screenshot_image_object_key(conn, &id_clone)
         })
@@ -3296,7 +3385,12 @@ async fn rest_screenshot_image_content(
 
     let object_key = match query_res {
         Ok(Some(ok)) => ok,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        // A failed read is NOT an absence. This arm used to be byte-identical
+        // to the `Ok(None)` arm below and unlogged, so an unreadable archive
+        // told the caller their screenshot does not exist and nothing recorded
+        // that it had happened. The DEK read further down already answered
+        // loudly; this one now matches it.
+        Err(e) => return super::routed_read_unavailable("api.screenshot_image_content.lookup", &e),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
     };
 
@@ -3310,20 +3404,28 @@ async fn rest_screenshot_image_content(
     let user_id_cloned = user_id.clone();
     let wrapped_opt_res = s
         .store
-        .with_user(&user_id_cloned, |conn| {
+        .wal_authoritative_read(&user_id_cloned, |conn| {
             let mut stmt =
                 conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
-            let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
+            // `.optional()`, never `.ok()`. This is not a timestamp whose
+            // absence is cosmetic: `None` becomes a 404 four lines below, so
+            // `.ok()` turned every read error into "that screenshot does not
+            // exist". Only a missing row (or a NULL value) is an absence; a
+            // read failure falls through to the failure arm.
+            let val: Option<String> = stmt
+                .query_row([], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
             Ok(val)
         })
         .await;
 
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
-        Err(e) => {
-            tracing::error!(error = %e, "media download database lookup failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        // Was a 500. It is a routed-read failure like any other and moves to
+        // the lane's 503 under `super::routed_read_unavailable`'s rule; the
+        // two crypto arms below keep 500 because they are not retryable.
+        Err(e) => return super::routed_read_unavailable("api.screenshot_image_content.dek", &e),
     };
 
     let wrapped_b64 = match wrapped_opt {
@@ -3804,16 +3906,23 @@ mod tests {
     use crate::store::tests::{FakeGcs, FakeKms};
     use crate::store::Store;
 
-    /// A WAL-authoritative user's archive is unreadable through the legacy
-    /// path. These MCP tools must say so, not answer "nothing found".
+    /// A read that fails must never present as "nothing found".
     ///
-    /// Before this, every read error — a transient DB failure today, or the
-    /// routed-read refusal once a user's archive is WAL-authoritative — was
-    /// flattened into an empty payload with no `error` key, so `isError` was
-    /// never set and nothing was logged. The assistant would tell the user
-    /// authoritatively that their screenshot or transcript does not exist
-    /// while the data was fully present, and error-rate monitoring could not
-    /// see it.
+    /// All six tools now read through `wal_authoritative_read`. The D4
+    /// `mcp.tools` gate that used to stand in front of `dispatch_tool` is
+    /// gone, so this property is no longer held up by a gate — it is held up
+    /// by each tool's own failure handler, which is exactly why it is pinned
+    /// here. The harness selects the user WITHOUT registering a serving
+    /// authority, so the routed read refuses: the same shape as an authority
+    /// that is unavailable or quarantined, and the same shape a transient
+    /// database error takes on the legacy lane.
+    ///
+    /// Every tool must answer with an `error` key — that is what sets
+    /// `isError` on the tool result — and must NOT also answer an empty
+    /// evidence payload. `list_episodes` is the one that used to fail this:
+    /// the deleted `list_episodes_value` wrapper flattened any error into
+    /// `{"episode_count":0,"hidden_count":0,"episodes":[]}`, so the assistant
+    /// told the user their archive was empty while it was fully present.
     #[tokio::test]
     async fn mcp_reads_report_an_unreadable_archive_instead_of_empty_results() {
         let state = query_test_state();
@@ -3828,30 +3937,27 @@ mod tests {
             )
             .unwrap();
 
-        // ADR-0022 D4 extends this to EVERY tool. Exactly ONE of them --
-        // `list_episodes` -- still flattened a failed read into a payload with
-        // no `error` key, via `list_episodes_value`'s
-        // `{"episode_count":0,"hidden_count":0,"episodes":[]}` fallback: an
-        // authoritative-looking empty result, which is the defect this test
-        // exists to prevent. `get_capture_status` was NOT such a case; it
-        // already answered `{"error":"stats failed"}`, so the gate upgrades it
-        // from prose to the stable machine-readable reason rather than fixing
-        // a swallow. Stated precisely because an earlier revision of this
-        // comment claimed two, and a miscount here misleads exactly the
-        // reviewer who is relying on it.
         for tool in MCP_TOOL_NAMES {
             let args = json!({"query": "invoice total", "at": "2026-08-20T00:00:00Z",
                               "from": "2026-08-19T00:00:00Z", "to": "2026-08-20T00:00:00Z"});
             let result = dispatch_tool(&state, user_id, tool, &args)
                 .await
                 .unwrap_or_else(|| panic!("{tool} should dispatch"));
-            assert_eq!(
-                result["error"],
-                crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-                "{tool} answered an unmigrated archive without the stable reason: {result}"
+            assert!(
+                result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty()),
+                "{tool} answered an unreadable archive without an error key: {result}"
             );
-            assert_eq!(result["domain"], wal_domain::MCP_TOOLS, "{tool}");
-            for empty_shape in ["episodes", "results", "utterances", "screenshots"] {
+            for empty_shape in [
+                "episodes",
+                "results",
+                "utterances",
+                "screenshots",
+                "episode_count",
+                "total_utterances",
+            ] {
                 assert!(
                     result.get(empty_shape).is_none(),
                     "{tool} must not also answer an empty {empty_shape} payload: {result}"
@@ -3859,15 +3965,104 @@ mod tests {
             }
         }
 
-        // An unknown name still falls through to the JSON-RPC error rather
-        // than being reported as a deferred domain.
+        // An unknown name still falls through to the JSON-RPC error.
         assert!(dispatch_tool(&state, user_id, "not_a_tool", &json!({}))
             .await
             .is_none());
     }
 
-    /// The D4 gate consults `MCP_TOOL_NAMES`, so a seventh tool that is not
-    /// listed there would escape the gate and answer from the legacy store.
+    /// Every routed tool read is served identically for an unselected user:
+    /// `wal_authoritative_read` falls through to the ordinary guarded legacy
+    /// read, so the legacy lane keeps answering with the same rows. Paired
+    /// with the refusal test above, this is the dual-path contract.
+    ///
+    /// It also pins the redaction boundary end to end. `dispatch_tool`
+    /// applies `mcp_safety::sanitize_result(project_mcp_result(..))` at a
+    /// single tail, AFTER the match that produced the value, so both lanes of
+    /// the routed read are sanitised by construction. The retired D4 gate
+    /// used to `return` before that tail; nothing does now, and the seeded
+    /// credential below must come back redacted through the routed read.
+    #[tokio::test]
+    async fn mcp_reads_still_serve_an_unselected_user_from_the_legacy_lane() {
+        let state = query_test_state();
+        let user_id = "mcp-legacy-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, active_app, ocr_text, is_duplicate) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    rusqlite::params![
+                        "2026-08-20T10:00:00Z",
+                        "Ledger",
+                        "quarterly invoice total, api key sk-exampleexampleexample"
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT INTO episodes (started_at, ended_at, title, substance, \
+                     visual_evidence, finalization_status) \
+                     VALUES (?1, ?2, ?3, 'normal', 'useful', 'none')",
+                    rusqlite::params![
+                        "2026-08-20T09:00:00Z",
+                        "2026-08-20T11:00:00Z",
+                        "Quarterly review"
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let status = dispatch_tool(&state, user_id, "get_capture_status", &json!({}))
+            .await
+            .expect("get_capture_status dispatches");
+        assert!(status.get("error").is_none(), "{status}");
+        assert_eq!(status["total_screenshots"], 1);
+
+        let listed = dispatch_tool(&state, user_id, "list_episodes", &json!({}))
+            .await
+            .expect("list_episodes dispatches");
+        assert!(listed.get("error").is_none(), "{listed}");
+        assert_eq!(listed["episode_count"], 1);
+        assert_eq!(listed["episodes"][0]["title"], "Quarterly review");
+
+        let hits = dispatch_tool(
+            &state,
+            user_id,
+            "search_screenshots",
+            &json!({"query": "invoice"}),
+        )
+        .await
+        .expect("search_screenshots dispatches");
+        assert!(hits.get("error").is_none(), "{hits}");
+        let results = hits["results"].as_array().expect("search answers an array");
+        assert_eq!(results.len(), 1);
+        // The routed read is sanitised by exactly the boundary the legacy
+        // read went through: the stored bytes are untouched, but the
+        // credential never reaches the assistant.
+        let ocr = results[0]["ocr_text"]
+            .as_str()
+            .expect("the hit carries its OCR text");
+        assert!(
+            ocr.contains("[REDACTED") && !ocr.contains("sk-exampleexampleexample"),
+            "a routed MCP read must be redacted like the legacy read: {ocr}"
+        );
+        let stored: String = state
+            .store
+            .with_user(user_id, |conn| {
+                Ok(conn.query_row("SELECT ocr_text FROM screenshots", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            stored.contains("sk-exampleexampleexample"),
+            "redaction is a response boundary, never a rewrite of the archive"
+        );
+    }
+
+    /// `MCP_TOOL_NAMES` is the roster the tests above sweep, so a seventh
+    /// published tool that is not listed there would never be swept for the
+    /// empty-result property.
     #[test]
     fn mcp_tool_names_match_the_published_definitions() {
         let tools = tool_definitions();
@@ -5381,43 +5576,314 @@ mod tests {
             1
         );
     }
-
-    /// The REST twin of the empty-result defect: `list_episodes_value`
-    /// flattens a failed read into `{"episodes": []}`, so before the D4 gate
-    /// `/api/episodes` answered a WAL-authoritative user 200 with an empty
-    /// list — indistinguishable from an account with no memories.
+    /// **Every routed REST read in this module, as one table.**
+    ///
+    /// The property: when the archive behind a read cannot be read, the route
+    /// answers a non-2xx that carries no data-shaped key. Not a 200 with an
+    /// error body, not a 404, not an empty collection. See
+    /// `wal_gate_test_support::assert_refuses_without_data`, which is
+    /// deliberately status-agnostic — a D4 deferral and a store fault are both
+    /// legitimate answers here and each surface picks its own.
+    ///
+    /// This exists because the read-lane review found TWO regressions, and
+    /// both lived in the six surfaces that had no failure-arm test at all:
+    /// `/api/search` shipped `{"error": ...}` under HTTP 200, and
+    /// `/api/screenshot-images/{id}/content` collapsed a failed lookup into a
+    /// bare unlogged 404 byte-identical to genuine absence. Per-route tests
+    /// get written for the routes someone was already thinking about; a table
+    /// is what covers the ones nobody was.
+    ///
+    /// Two lanes, and BOTH are load-bearing:
+    ///
+    /// * **selected** — the archive is WAL-authoritative with no serving
+    ///   authority, the shape of an authority that is unavailable or
+    ///   quarantined. On a gated surface the D4 gate answers; on an ungated
+    ///   one (`/api/episodes/{id}/finalize`) the routed read's own arm does.
+    /// * **unreadable legacy** — the archive is NOT selected, so no gate can
+    ///   fire, and the guarded legacy load that `wal_authoritative_read` falls
+    ///   through to cannot open it. This is the lane that sees a failure arm
+    ///   hiding behind a gate, and it is the lane both blockers were in. A
+    ///   selected-only test would have passed with both defects present.
     #[tokio::test]
-    async fn a_deferred_episode_list_answers_503_instead_of_an_empty_200() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+    async fn every_routed_rest_read_refuses_without_reporting_an_empty_archive() {
+        use crate::cp::wal_gate_test_support::{
+            assert_refuses_without_data, make_legacy_archive_unreadable, select_wal_authoritative,
+        };
+        use axum::extract::{Path, Query, State};
+        use axum::Extension;
+
+        async fn routed_rest_reads(
+            state: &Arc<CpState>,
+            user_id: &str,
+        ) -> Vec<(&'static str, Response)> {
+            let user = || crate::cp::auth::AuthUser(user_id.to_string());
+            vec![
+                (
+                    "GET /api/search",
+                    rest_search(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Query(SearchParams {
+                            q: Some("invoice".into()),
+                            from: None,
+                            to: None,
+                            limit: None,
+                        }),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/episodes",
+                    rest_episodes(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Query(EpisodesParams {
+                            from: None,
+                            to: None,
+                            max_episodes: None,
+                            include_low: None,
+                        }),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/episodes/{id}",
+                    rest_episode(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Path(1),
+                        Query(EpisodeParams { include_low: None }),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/episodes/{id}/members",
+                    rest_episode_members(State(Arc::clone(state)), Extension(user()), Path(1))
+                        .await,
+                ),
+                (
+                    "GET /api/browser-snapshots/{key}",
+                    rest_browser_snapshot(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Path("device:1".to_string()),
+                    )
+                    .await,
+                ),
+                (
+                    "POST /api/episodes/{id}/finalize",
+                    rest_episode_finalize(State(Arc::clone(state)), Extension(user()), Path(1))
+                        .await,
+                ),
+                (
+                    "GET /api/feed",
+                    rest_feed(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Query(FeedParams {
+                            from: None,
+                            to: None,
+                            limit: None,
+                            before: None,
+                        }),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/screenshot-images/plan",
+                    rest_screenshot_upload_plan(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Query(PlanParams {
+                            device_id: "device".into(),
+                            after: None,
+                        }),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/screenshot-images/{id}/content",
+                    rest_screenshot_image_content(
+                        State(Arc::clone(state)),
+                        Extension(user()),
+                        Path("abc123".to_string()),
+                    )
+                    .await,
+                ),
+            ]
+        }
+
+        let state = query_test_state();
+
+        // The table must stay complete. If a tenth routed read is bound in
+        // `router()` and nobody adds it here, this fails rather than letting
+        // the next `/api/search` ship untested.
+        let source = include_str!("query.rs");
+        let router_body = source
+            .split_once("pub fn router()")
+            .expect("router() is defined in this module")
+            .1
+            .split_once("\n}\n")
+            .expect("router() has a body")
+            .0;
+        let routed_read_handlers = [
+            "rest_search",
+            "rest_episodes",
+            "rest_episode)",
+            "rest_episode_members",
+            "rest_browser_snapshot",
+            "rest_episode_finalize",
+            "rest_feed",
+            "rest_screenshot_upload_plan",
+            "rest_screenshot_image_content",
+        ];
+        for handler in routed_read_handlers {
+            assert!(
+                router_body.contains(handler),
+                "{handler} is in the table but no longer bound by router()"
+            );
+        }
+        assert_eq!(
+            routed_rest_reads(&state, "coverage-probe").await.len(),
+            routed_read_handlers.len(),
+            "the table and the routed-read handler roster disagree"
+        );
+
+        let selected = "table-selected-user";
+        select_wal_authoritative(&state.store, selected);
+        for (label, response) in routed_rest_reads(&state, selected).await {
+            assert_refuses_without_data(&format!("{label} [selected]"), response).await;
+        }
+
+        let unreadable = "table-unreadable-user";
+        make_legacy_archive_unreadable(&state.store, unreadable).await;
+        for (label, response) in routed_rest_reads(&state, unreadable).await {
+            assert_refuses_without_data(&format!("{label} [unreadable legacy]"), response).await;
+        }
+    }
+
+    /// The other half of the dual-path contract for the REST lane: an
+    /// unselected user with a readable archive is served by exactly the same
+    /// routed call, through the guarded legacy read, and gets the same rows.
+    /// Without this, the table above could be satisfied by a route that
+    /// refuses everyone.
+    #[tokio::test]
+    async fn the_routed_feed_still_serves_an_unselected_user_from_the_legacy_lane() {
         use axum::extract::{Query, State};
         use axum::Extension;
 
         let state = query_test_state();
-        let user_id = "rest-episodes-deferred";
-        select_wal_authoritative(&state.store, user_id);
+        let legacy_user = "feed-legacy-user";
+        state
+            .store
+            .with_user(legacy_user, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, active_app, is_duplicate) \
+                     VALUES (?1, ?2, 0)",
+                    rusqlite::params!["2026-08-20T12:00:00Z", "Ledger"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        let response = rest_episodes(
+        let served = rest_feed(
             State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Query(EpisodesParams {
+            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
+            Query(FeedParams {
                 from: None,
                 to: None,
-                max_episodes: None,
-                include_low: None,
+                limit: None,
+                before: None,
             }),
         )
         .await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+        assert_eq!(served.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(served.into_body(), 64 * 1024)
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::QUERY_EPISODES);
-        assert!(
-            body.get("episodes").is_none(),
-            "a deferral must never carry an authoritative-looking empty list: {body}"
-        );
+        let records = body["records"]
+            .as_array()
+            .expect("the feed carries records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["active_app"], "Ledger");
+    }
+
+    /// The D4 `mcp.tools` gate at the level it actually runs.
+    ///
+    /// It moved out of `dispatch_tool` and into `mcp_endpoint`, ahead of the
+    /// rate limiter, so a deferral no longer spends the caller's budget. This
+    /// pins the three things that move could have broken: the refusal still
+    /// names the domain, it still sets `isError` (an empty payload is reported
+    /// to the user as "you have no data"), and an UNKNOWN tool name still
+    /// falls through to the JSON-RPC error instead of being reported as a
+    /// deferred domain.
+    #[tokio::test]
+    async fn the_mcp_gate_refuses_before_the_rate_limiter_and_lets_unknown_tools_through() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::State;
+        use axum::Extension;
+
+        let state = query_test_state();
+        let user_id = "mcp-gate-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        for tool in MCP_TOOL_NAMES {
+            let response = mcp_endpoint(
+                State(Arc::clone(&state)),
+                Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+                Json(JsonRpcRequest {
+                    id: json!(1),
+                    method: "tools/call".into(),
+                    params: json!({"name": tool, "arguments": {"query": "invoice"}}),
+                }),
+            )
+            .await;
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["result"]["isError"], json!(true), "{tool}: {body}");
+            let text = body["result"]["content"][0]["text"]
+                .as_str()
+                .expect("the refusal carries text");
+            let refusal: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(refusal["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
+            assert_eq!(refusal["domain"], wal_domain::MCP_TOOLS);
+            assert!(
+                body["result"].get("structuredContent").is_none(),
+                "{tool} must not also answer a structured payload: {body}"
+            );
+        }
+
+        // The whole point of consulting MCP_TOOL_NAMES rather than gating
+        // every `tools/call`.
+        let unknown = mcp_endpoint(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Json(JsonRpcRequest {
+                id: json!(2),
+                method: "tools/call".into(),
+                params: json!({"name": "not_a_tool", "arguments": {}}),
+            }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(unknown.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], json!(-32601));
+
+        // The gate ran ahead of the limiter, so none of the calls above spent
+        // budget. The harness limiter is 10 tokens refilling at 1/s, so a
+        // spent budget would show here.
+        let unselected = "mcp-gate-unselected";
+        for _ in 0..10 {
+            assert!(
+                state.mcp_limiter.consume(unselected).await,
+                "the deferral must not have spent the service's rate-limit budget"
+            );
+        }
     }
 }

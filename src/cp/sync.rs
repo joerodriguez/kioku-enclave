@@ -21,6 +21,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use rusqlite::OptionalExtension;
+
 use crate::{
     error::{wal_domain, EnclaveError, Result as EnclaveResult},
     store::Store,
@@ -66,30 +68,44 @@ async fn sync_status(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
-    // ADR-0022 D4: the counts below read the per-user content DB through the
-    // legacy path. `err503()` already answers 503 for a generic failure, but a
-    // deferral must be distinguishable from a fault, so it names the domain.
+    // ADR-0022 D4 — first, ahead of the control-store round trip below. A
+    // deferred domain must spend nothing: `user_email` is a GCS-backed load,
+    // and a refusal that pays for it is a refusal that can be turned into a
+    // load generator. `routed_read_unavailable()` already answers a generic
+    // 503, but a deferral must be distinguishable from a fault, so it names
+    // the domain instead.
     if let Some(error) = s.wal_domain_refusal(&user_id, wal_domain::SYNC_STATUS) {
         return error.into_response();
     }
     let email = s.control.user_email(&user_id).await.ok().flatten();
 
+    // ADR-0022: the counts route through the settled-only serving lane for a
+    // WAL-authoritative user and fall through to the guarded legacy read for
+    // everyone else. A failure still answers 503 — never zeroed counts, which
+    // would read as an emptied archive.
     let stats = s
         .store
-        .with_user(&user_id, |conn| {
+        .wal_authoritative_read(&user_id, |conn| {
             let utt: i64 = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
             let scr: i64 = conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?;
             let eps: i64 = conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?;
+            // `.optional()`, never `.ok()` — see the identical pair in
+            // `query.rs::tool_get_capture_status`. `.ok()` made a failed
+            // statement indistinguishable from an archive that has never
+            // captured anything, and this route's whole job is to report
+            // freshness truthfully.
             let last_u: Option<String> = conn
                 .query_row(
                     "SELECT s.started_at FROM utterances u JOIN audio_segments s ON s.id = u.audio_segment_id ORDER BY s.started_at DESC LIMIT 1",
                     [],
-                    |r| r.get(0),
+                    |r| r.get::<_, Option<String>>(0),
                 )
-                .ok();
+                .optional()?
+                .flatten();
             let last_s: Option<String> = conn
-                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get(0))
-                .ok();
+                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten();
             Ok((utt, scr, eps, last_u, last_s))
         })
         .await;
@@ -101,25 +117,34 @@ async fn sync_status(
             "latest": { "utterance_at": last_u, "screenshot_at": last_s },
         }))
         .into_response(),
-        Err(_) => err503(),
+        Err(e) => super::routed_read_unavailable("api.sync_status", &e),
     }
 }
 
 // ── Export ──────────────────────────────────────────────────────────────────────
 
 async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUser>) -> Response {
-    // ADR-0022 D4: `read_user` delegates to the legacy per-user load, which a
-    // WAL-authoritative user's archive refuses. Without this the route answers
-    // 500 `export_failed`, which reads as data loss rather than a deferral.
+    // ADR-0022 D4. Without this the route answers `export_failed`, which reads
+    // as "your export is broken" rather than "this is deferred" — and if the
+    // routed read ever DID succeed for a selected user it would be worse: a
+    // complete-looking export document with every array empty, which is
+    // indistinguishable from an erased archive.
     if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::SYNC_EXPORT) {
         return error.into_response();
     }
     match dump_user_export(&s.store, &user.0).await {
         Ok(data) => export_success_response(data),
         Err(e) => {
-            warn!(error = %e, "export failed");
+            // `export_failed` is a client contract and stays, but the status
+            // moves 500 -> 503 under the read lane's rule (see
+            // `super::routed_read_unavailable`): the only thing behind this
+            // arm is one routed read, so the failure is retryable, and a 500
+            // told the caller their export was broken rather than to try
+            // again. The distinct reason string is kept rather than folded
+            // into `enclave_unavailable` because callers already switch on it.
+            warn!(error = %e, metric = super::ROUTED_READ_UNAVAILABLE_REASON, context = "api.export", "export failed");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "export_failed"})),
             )
                 .into_response()
@@ -144,9 +169,18 @@ fn export_success_response(data: serde_json::Value) -> Response {
         .into_response()
 }
 
+/// ADR-0022: the export routes through `wal_authoritative_read`, which serves
+/// a WAL-authoritative user from their serving authority's settled-only lane
+/// and falls through to the ordinary guarded legacy read otherwise. It is the
+/// same pure `canonical_logical_export` value either way, so the versioned
+/// logical-export digest the inactive shadow verification hashes is unchanged.
+/// An unreadable archive still propagates its error to the route's 500 rather
+/// than exporting a truncated or empty document.
 async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_json::Value> {
     crate::store::validate_user_id(user_id)?;
-    store.read_user(user_id, canonical_logical_export).await
+    store
+        .wal_authoritative_read(user_id, canonical_logical_export)
+        .await
 }
 
 /// Version of the logical user export representation.  It is deliberately
@@ -1906,50 +1940,128 @@ mod tests {
         assert!(gcs.get_object(historical_media).await.is_ok());
     }
 
-    /// ADR-0022 D4 end to end through a real handler. `/api/export` answered
-    /// 500 `export_failed` for a WAL-authoritative user, which reads as data
-    /// loss; `/api/sync/status` answered a generic 503 indistinguishable from
-    /// a fault. Both must name the deferred domain instead.
+    /// The sync twin of `query.rs`'s routed-read table. Same property, same
+    /// two lanes, same status-agnostic assertion: an archive that cannot be
+    /// read is answered with a non-2xx carrying no data.
+    ///
+    /// `/api/sync/status` must never answer 200 with zeroed counts (an emptied
+    /// archive) and `/api/export` must never answer 200 with an empty or
+    /// truncated document (a lost archive). The `[selected]` lane is answered
+    /// by the D4 gate; the `[unreadable legacy]` lane, where no gate can fire,
+    /// is answered by each route's own failure arm.
     #[tokio::test]
-    async fn deferred_sync_routes_answer_a_named_503_not_a_generic_failure() {
-        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state as gate_state};
-        use crate::error::WAL_DOMAIN_UNMIGRATED_REASON;
+    async fn both_routed_sync_reads_refuse_without_reporting_an_empty_archive() {
+        use crate::cp::wal_gate_test_support::{
+            assert_refuses_without_data, make_legacy_archive_unreadable, select_wal_authoritative,
+            state as gate_state,
+        };
+        use axum::extract::State;
+
+        async fn routed_sync_reads(
+            state: &Arc<CpState>,
+            user_id: &str,
+        ) -> Vec<(&'static str, Response)> {
+            vec![
+                (
+                    "GET /api/sync/status",
+                    sync_status(
+                        State(Arc::clone(state)),
+                        Extension(AuthUser(user_id.to_string())),
+                    )
+                    .await,
+                ),
+                (
+                    "GET /api/export",
+                    export(
+                        State(Arc::clone(state)),
+                        Extension(AuthUser(user_id.to_string())),
+                    )
+                    .await,
+                ),
+            ]
+        }
+
+        let state = gate_state();
+
+        let selected = "sync-selected-user";
+        select_wal_authoritative(&state.store, selected);
+        for (label, response) in routed_sync_reads(&state, selected).await {
+            assert_refuses_without_data(&format!("{label} [selected]"), response).await;
+        }
+
+        let unreadable = "sync-unreadable-user";
+        make_legacy_archive_unreadable(&state.store, unreadable).await;
+        for (label, response) in routed_sync_reads(&state, unreadable).await {
+            assert_refuses_without_data(&format!("{label} [unreadable legacy]"), response).await;
+        }
+
+        // The export keeps its own machine-readable reason — clients switch on
+        // it — but answers it at 503, not the 500 it used to: there is exactly
+        // one routed read behind that arm and its failure is retryable.
+        let failed = export(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(unreadable.to_string())),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(failed.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "export_failed");
+    }
+
+    /// The other half of the dual-path contract: an unselected user is served
+    /// by exactly the same routed call, through the ordinary guarded legacy
+    /// read. Same rows, same shape — the legacy lane is untouched.
+    #[tokio::test]
+    async fn routed_sync_reads_still_serve_an_unselected_user_from_the_legacy_lane() {
+        use crate::cp::wal_gate_test_support::state as gate_state;
         use axum::extract::State;
 
         let state = gate_state();
-        let user_id = "sync-deferred-user";
-        select_wal_authoritative(&state.store, user_id);
+        let user_id = "sync-legacy-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES (?1)",
+                    ["2026-08-20T09:00:00Z"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        for (response, domain) in [
-            (
-                export(
-                    State(Arc::clone(&state)),
-                    Extension(AuthUser(user_id.to_string())),
-                )
-                .await,
-                wal_domain::SYNC_EXPORT,
-            ),
-            (
-                sync_status(
-                    State(Arc::clone(&state)),
-                    Extension(AuthUser(user_id.to_string())),
-                )
-                .await,
-                wal_domain::SYNC_STATUS,
-            ),
-        ] {
-            assert_eq!(
-                response.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{domain} must defer, not fault"
-            );
-            let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON, "{domain}");
-            assert_eq!(body["domain"], domain);
-            assert_ne!(body["error"], "export_failed", "{domain}");
-        }
+        let status = sync_status(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.to_string())),
+        )
+        .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(status.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["counts"]["screenshots"], 1);
+        assert_eq!(body["latest"]["screenshot_at"], "2026-08-20T09:00:00Z");
+
+        let exported = export(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.to_string())),
+        )
+        .await;
+        assert_eq!(exported.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(exported.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["screenshots"]
+                .as_array()
+                .expect("the export carries a screenshots array")
+                .len(),
+            1
+        );
     }
 }

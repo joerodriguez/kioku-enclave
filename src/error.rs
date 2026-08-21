@@ -146,17 +146,92 @@ pub mod wal_domain {
     /// The shared finalized-episode body loader every outbound channel reads.
     pub const DELIVERY_FINALIZED_EPISODE: &str = "delivery.finalized_episode";
 
-    // ── Request paths ───────────────────────────────────────────────────────
-    /// Every `/mcp` tool read. None of the six is migrated, so the gate sits
-    /// at the single dispatch point.
+    // ── Request paths: the read lane ────────────────────────────────────────
+    //
+    // Every constant in this block now names a surface whose call site routes
+    // through `Store::wal_authoritative_read`, and whose D4 gate is RETAINED
+    // above it. That is the ANSWERABILITY RULE stated in full below, applied
+    // here; read that first. Routing is kept because it is strictly better for
+    // the unselected population — the fallthrough is `with_user_read`, so
+    // their reads now run under SQLite's `query_only` guard, which the raw
+    // `with_user` it replaced did not apply — and because it turns lifting
+    // each gate into a one-line deletion at the gate site.
+    //
+    // The dependency graph was walked writer by writer, not assumed:
+    //
+    //   * `MEDIA_CAPTURE_EVENTS` defers the only route that produces a
+    //     `media_disposition='canonical'` `capture_events` row and its
+    //     `media_objects` sibling. Its migrated replacement,
+    //     `CanonicalCaptureEventPlan`, has NO production constructor — every
+    //     `::new` is inside a test module. So both tables start empty and stay
+    //     empty.
+    //   * With no `media_objects`/`media_processing_jobs` rows there is
+    //     nothing for `MediaWorkClaimPlan` to claim, so `media_work_units`
+    //     never gets a first row.
+    //   * `utterances` and `screenshots` therefore stay empty. Note their WAL
+    //     writers are LIVE, not deferred: `media_worker/wal/audio_result.rs`
+    //     inserts `utterances`, `media_worker/wal/result.rs` inserts
+    //     `screenshots`, and the audio lane's T24 `sqlite_sequence` gate now
+    //     OPENS on a genesis archive because the sealed re-baseline added
+    //     AUTOINCREMENT to `audio_segments`/`utterances`/`screenshots`. They
+    //     are starved, not fenced — which is exactly why these gates cannot be
+    //     inferred from "no writer exists" and have to be reasoned about.
+    //   * With no evidence, `SUMMARIZER_WINDOW` (deferred) has nothing to
+    //     build `episodes` from, and `summarizer/wal/window.rs` holds the only
+    //     non-fixture `INSERT INTO episodes` in the tree.
+    //
+    // Three live writers touch these tables without refuting any of that: the
+    // migrated ADR-0032 screen-reference-batch route inserts `capture_events`
+    // but only a `reference` row bound to an existing canonical event, and
+    // refuses `CanonicalUnavailable` before reaching any INSERT; the migrated
+    // `CaptureSessionFinishPlan` only UPDATEs an existing session's
+    // `ended_at`; and the finalizer and `query/wal/finalization_queue.rs` only
+    // UPDATE an existing `episodes` row. None can write a first row.
+
+    /// Every `/mcp` tool read. The gate sits at the single dispatch point, and
+    /// answers with an `error` key so `isError` is set on the tool result —
+    /// never an empty payload, which the assistant reports to the user as "you
+    /// have no data" for an archive that is fully present.
+    ///
+    /// **The one known exception to the answerability rule below.**
+    /// `reviewer::ensure_demo_archive` (production caller: `oauth.rs`) is a
+    /// LIVE, migrated writer: for a WAL-authoritative user it settles
+    /// `ReviewerFixturePlan` through `wal_authoritative_submit`, inserting
+    /// `audio_segments`, `utterances`, `screenshots`, `episodes`,
+    /// `episode_members` and `episode_final_briefs`. For exactly one account —
+    /// the namespaced App Store reviewer identity — these reads would have
+    /// real rows to answer with, and the gate refuses them.
+    ///
+    /// The gate stays anyway, because it is per DOMAIN and cannot be lifted
+    /// for one account: lifting it ungates every ordinary selected user, whose
+    /// archive is genuinely empty, and a false "you have no memories" is worse
+    /// than a 503 that says to retry. Narrowing this to the reviewer identity
+    /// is a separate, reviewed change.
     pub const MCP_TOOLS: &str = "mcp.tools";
     pub const QUERY_SEARCH: &str = "query.search";
     pub const QUERY_EPISODES: &str = "query.episodes";
+    /// `DELETE /api/episodes/{id}`. The ONE read-lane route that is not a
+    /// read, and the one gate here that does NOT rest on the answerability
+    /// rule: it enumerates the episode's media keys, deletes those objects
+    /// from GCS, then purges the rows. The purge is a durable mutation needing
+    /// a sealed plan family of its own, so routing only its lookup would be
+    /// strictly worse than deferring — a selected user would pass the routed
+    /// read, have their media irreversibly deleted, and then fail on the
+    /// legacy purge. Media gone, rows intact, no retry that repairs it.
     pub const QUERY_EPISODE_DELETE: &str = "query.episode_delete";
     pub const QUERY_EPISODE_MEMBERS: &str = "query.episode_members";
     pub const QUERY_BROWSER_SNAPSHOT: &str = "query.browser_snapshot";
     pub const QUERY_FEED: &str = "query.feed";
     pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
+    /// `GET /api/screenshot-images/{id}/content`. Its identity tables —
+    /// `screenshot_images` (legacy evidence) and `media_objects` (Cloud
+    /// Capture v2) — have no live writer, so the route can only ever answer
+    /// 404 for a selected user: an absence indistinguishable from a screenshot
+    /// that was never captured. `app_metadata`, the third table it reads, DOES
+    /// have a live writer (the migrated media-DEK install, reachable through
+    /// the ungated `POST /api/screenshot-images`), but a wrapped key is not
+    /// content and cannot make an image resolvable. The rule is applied to the
+    /// tables that decide the answer.
     pub const QUERY_SCREENSHOT_IMAGE_CONTENT: &str = "query.screenshot_image_content";
     // ── The media read domains ──────────────────────────────────────────────
     //
@@ -214,7 +289,15 @@ pub mod wal_domain {
     /// `MEDIA_WORKER_VOICE_EMBEDDING` and `MEDIA_WORKER_VOICE_PROFILES` lanes.
     /// No live writer reaches these tables.
     pub const MEDIA_PEOPLE: &str = "media.people";
+    /// `GET /api/sync/status` — counts and freshness over `utterances`,
+    /// `screenshots` and `episodes`. Ungated it answers `200 {"counts":
+    /// {"utterances": 0, ...}}`, which is not "unavailable", it is "your
+    /// archive is empty".
     pub const SYNC_STATUS: &str = "sync.status";
+    /// `GET /api/export` — the widest read in the lane, dumping every logical
+    /// table, so the answerability rule holds for it a fortiori. An ungated
+    /// export hands the user a complete-looking document with every array
+    /// empty and invites them to conclude their archive is gone.
     pub const SYNC_EXPORT: &str = "sync.export";
 }
 
