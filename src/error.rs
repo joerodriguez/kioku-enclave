@@ -134,21 +134,89 @@ pub mod wal_domain {
     // window reads, the F8 episode upsert at its tail, and the F9 embedding
     // batch all reach the WAL lane — so the constants are deleted rather than
     // left standing over a live domain.
+    // ── The delivery group ──────────────────────────────────────────────────
+    //
+    // These four are NOT answerability gates, and the distinction matters
+    // because the answerability rule stated below is what lifted seven of
+    // their neighbours. The outbox genuinely FILLS for a selected user: the
+    // finalizer's sealed `FinalizationCommitPlan` writes the brief and the
+    // three delivery rows in one `apply`
+    // (`finalizer/wal.rs::write_brief`, `::write_deliveries`), reached from
+    // `finalizer::finalize_commit_settled` on the `is_wal_authoritative`
+    // branch at `finalizer.rs`. There is no gate anywhere on that enqueue
+    // path. So the rows are there and the reads below could answer them.
+    //
+    // What blocks all four is MECHANICAL, not evidential: every one of them
+    // still reaches its rows through `Store::with_user`, which refuses a
+    // selected user outright. Lifting a gate above an unrouted read does not
+    // produce an answer, it produces an `Err` on every worker pass — the
+    // pathological spin this registry exists to convert into an inert skip.
+    //
+    // Operational consequence worth knowing, and NOT a reason to lift: for a
+    // selected user these rows accumulate in `state='pending'` and nothing
+    // drains them. That is a deferral backlog, not loss — the rows are
+    // durable and a migrated drain will find them. The per-worker comments
+    // that say "nothing below this line is reachable" are true of the DRAIN
+    // and were written when the enqueue was believed dead too; it is not.
+
     /// The email outbox scan (`Store::next_email_delivery`). The email
-    /// settlement and cancellation ladders behind it ARE migrated.
+    /// settlement (`email_worker::settle_email_delivery`) and cancellation
+    /// (`::cancel_user_email_deliveries_settled`) ladders behind it ARE
+    /// migrated, and so is the enqueue in front of it.
+    ///
+    /// **Lift condition — all three, each checkable at a named call site.**
+    /// (1) `Store::next_email_delivery` reads through
+    /// `Store::wal_authoritative_read` instead of `with_user`. (2)
+    /// `delivery::load_finalized_episode` does too — see
+    /// [`DELIVERY_FINALIZED_EPISODE`]; the sweep calls it on every delivery.
+    /// (3) The missing-brief arm of `email_worker::deliver_user_emails` stops
+    /// calling `Store::update_email_delivery_state`, which is a durable
+    /// `with_user` UPDATE with NO sealed family behind it. That arm is the
+    /// one an audit skips because it looks like error handling: it fires
+    /// exactly when a delivery row outlives its brief, and on the WAL lane it
+    /// would refuse and abort the sweep mid-flight, after the provider send.
     pub const EMAIL_WORKER_OUTBOX: &str = "email_worker.outbox";
     /// The push outbox scan (`Store::next_push_delivery`). The push
-    /// settlement behind it IS migrated.
+    /// settlement (`push::update_delivery`) behind it IS migrated, and so is
+    /// the enqueue in front of it.
+    ///
+    /// **Lift condition.** `Store::next_push_delivery` reads through
+    /// `Store::wal_authoritative_read`. That is the whole of it — this is the
+    /// only one of the four whose sweep has no second legacy touch: every
+    /// other call in `push::deliver_user_pushes` is either the migrated
+    /// settlement or a control-store lookup, neither of which consults the
+    /// per-user archive. It is therefore the cheapest of the four to migrate,
+    /// and the right one to do first.
     pub const PUSH_OUTBOX: &str = "push.outbox";
-    /// The webhook outbox scan. The delivery-state settlement and the
-    /// subscription-delete cascade behind it ARE migrated.
+    /// The webhook outbox scan (`webhook_worker::next_delivery` — a private
+    /// free function, not a `Store` method). The delivery-state settlement
+    /// (`::set_delivery_state`) and the subscription-delete cascade behind it
+    /// ARE migrated, and so is the enqueue in front of it.
+    ///
+    /// **Lift condition — both.** (1) `webhook_worker::next_delivery` reads
+    /// through `Store::wal_authoritative_read`. (2)
+    /// `delivery::load_finalized_episode` does too; the webhook sweep reads
+    /// `None` from it as `event_data_missing` and TERMINALISES the delivery,
+    /// so this one must be migrated before the scan is, never after.
     pub const WEBHOOK_WORKER_OUTBOX: &str = "webhook_worker.outbox";
-    /// The shared finalized-episode body loader every outbound channel reads.
+    /// The shared finalized-episode body loader every outbound channel reads
+    /// (`delivery::load_finalized_episode`). Its two tables, `episodes` and
+    /// `episode_final_briefs`, are both written for a selected user by the
+    /// sealed `FinalizationCommitPlan`, so the join has rows to return.
+    ///
+    /// **Lift condition.** The loader reads through
+    /// `Store::wal_authoritative_read`. Note what the gate is protecting
+    /// meanwhile: it must keep answering `Err`, never `Ok(None)`, because the
+    /// webhook worker converts `None` into a terminal `event_data_missing`
+    /// and would destroy the outbox instead of deferring it. Any migration
+    /// that routes this read has to preserve that asymmetry — a routed read
+    /// whose archive is unavailable must still surface as `Err`, not as a
+    /// missing brief.
     pub const DELIVERY_FINALIZED_EPISODE: &str = "delivery.finalized_episode";
 
     // ── Request paths: the read lane ────────────────────────────────────────
     //
-    // Every constant in this block now names a surface whose call site routes
+    // Every constant in this block names a surface whose call site routes
     // through `Store::wal_authoritative_read`, and whose D4 gate is RETAINED
     // above it. That is the ANSWERABILITY RULE stated in full below, applied
     // here; read that first. Routing is kept because it is strictly better for
@@ -157,59 +225,41 @@ pub mod wal_domain {
     // `with_user` it replaced did not apply — and because it turns lifting
     // each gate into a one-line deletion at the gate site.
     //
-    // The dependency graph was walked writer by writer, not assumed:
+    // **The evidence chain is LIVE end to end, and that is why this block is
+    // now short.** It was walked writer by writer, per line, not per file:
     //
-    //   * `MEDIA_CAPTURE_EVENTS` defers the only route that produces a
-    //     `media_disposition='canonical'` `capture_events` row and its
-    //     `media_objects` sibling. Its migrated replacement,
-    //     `CanonicalCaptureEventPlan`, has NO production constructor — every
-    //     `::new` is inside a test module. So both tables start empty and stay
-    //     empty.
-    //   * With no `media_objects`/`media_processing_jobs` rows there is
-    //     nothing for `MediaWorkClaimPlan` to claim, so `media_work_units`
-    //     never gets a first row.
-    //   * `utterances` and `screenshots` therefore stay empty. Note their WAL
-    //     writers are LIVE, not deferred: `media_worker/wal/audio_result.rs`
-    //     inserts `utterances`, `media_worker/wal/result.rs` inserts
-    //     `screenshots`, and the audio lane's T24 `sqlite_sequence` gate now
-    //     OPENS on a genesis archive because the sealed re-baseline added
-    //     AUTOINCREMENT to `audio_segments`/`utterances`/`screenshots`. They
-    //     are starved, not fenced — which is exactly why these gates cannot be
-    //     inferred from "no writer exists" and have to be reasoned about.
-    //   * With no evidence, `SUMMARIZER_WINDOW` (deferred) has nothing to
-    //     build `episodes` from, and `summarizer/wal/window.rs` holds the only
-    //     non-fixture `INSERT INTO episodes` in the tree.
+    //   * `upload_capture_event` (`cp/media.rs`) settles
+    //     `CanonicalCaptureEventPlan`, whose `apply` calls
+    //     `media::record_source_event_in_transaction` — the sole production
+    //     writer of a canonical `capture_events` row, its `media_objects`
+    //     sibling, its `capture_sessions`/`capture_streams` parents and its
+    //     `media_processing_jobs` job.
+    //   * Those jobs give `MediaWorkClaimPlan` something to claim, so
+    //     `media_work_units` fills.
+    //   * `process_work_unit` returns early for a selected user into
+    //     `settle_audio_window_transcript` / `settle_screen_storyboard_result`
+    //     (`media_worker.rs`), whose sealed families write the evidence:
+    //     `media_worker/wal/audio_result.rs::write_turns` inserts
+    //     `audio_segments`, `speaker_observations` and `utterances`;
+    //     `media_worker/wal/result.rs::write_frame` inserts `screenshots` and
+    //     `screen_observations` and flips `media_objects.processing_state` to
+    //     `'ready'`. Both are reached ONLY on the WAL lane, so the early
+    //     return is what makes them live, not what fences them.
+    //   * `summarizer::wal_authoritative_upsert` settles
+    //     `EpisodeWindowUpsertPlan`, whose `apply`
+    //     (`summarizer/wal/window.rs`) holds the only non-fixture
+    //     `INSERT INTO episodes` AND `INSERT ... INTO episode_members` in the
+    //     tree.
     //
-    // Three live writers touch these tables without refuting any of that: the
-    // migrated ADR-0032 screen-reference-batch route inserts `capture_events`
-    // but only a `reference` row bound to an existing canonical event, and
-    // refuses `CanonicalUnavailable` before reaching any INSERT; the migrated
-    // `CaptureSessionFinishPlan` only UPDATEs an existing session's
-    // `ended_at`; and the finalizer and `query/wal/finalization_queue.rs` only
-    // UPDATE an existing `episodes` row. None can write a first row.
+    // Classify such a hit by its nearest enclosing `#[cfg(test)]`, never by
+    // its file: `summarizer/wal.rs` and `summarizer.rs` each carry a
+    // convincing `INSERT INTO episodes` inside a test `seed()` helper, and
+    // both have been mistaken for production writers.
+    //
+    // What survives in this block is therefore NOT "the chain is starved". It
+    // is three specific reads whose own predicates or own tables the live
+    // chain still cannot satisfy, each said exactly once below.
 
-    /// Every `/mcp` tool read. The gate sits at the single dispatch point, and
-    /// answers with an `error` key so `isError` is set on the tool result —
-    /// never an empty payload, which the assistant reports to the user as "you
-    /// have no data" for an archive that is fully present.
-    ///
-    /// **The one known exception to the answerability rule below.**
-    /// `reviewer::ensure_demo_archive` (production caller: `oauth.rs`) is a
-    /// LIVE, migrated writer: for a WAL-authoritative user it settles
-    /// `ReviewerFixturePlan` through `wal_authoritative_submit`, inserting
-    /// `audio_segments`, `utterances`, `screenshots`, `episodes`,
-    /// `episode_members` and `episode_final_briefs`. For exactly one account —
-    /// the namespaced App Store reviewer identity — these reads would have
-    /// real rows to answer with, and the gate refuses them.
-    ///
-    /// The gate stays anyway, because it is per DOMAIN and cannot be lifted
-    /// for one account: lifting it ungates every ordinary selected user, whose
-    /// archive is genuinely empty, and a false "you have no memories" is worse
-    /// than a 503 that says to retry. Narrowing this to the reviewer identity
-    /// is a separate, reviewed change.
-    pub const MCP_TOOLS: &str = "mcp.tools";
-    pub const QUERY_SEARCH: &str = "query.search";
-    pub const QUERY_EPISODES: &str = "query.episodes";
     /// `DELETE /api/episodes/{id}`. The ONE read-lane route that is not a
     /// read, and the one gate here that does NOT rest on the answerability
     /// rule: it enumerates the episode's media keys, deletes those objects
@@ -219,24 +269,84 @@ pub mod wal_domain {
     /// read, have their media irreversibly deleted, and then fail on the
     /// legacy purge. Media gone, rows intact, no retry that repairs it.
     pub const QUERY_EPISODE_DELETE: &str = "query.episode_delete";
-    pub const QUERY_EPISODE_MEMBERS: &str = "query.episode_members";
+    /// `GET /api/browser-snapshots/{source_key}`. Not starved — **orphaned**.
+    /// Its two tables, `browser_snapshots` and `browser_tabs`, have NO writer
+    /// anywhere in this tree, on either lane: grep them and every hit is a
+    /// `CREATE TABLE`, a `SELECT`, or a foreign key. Cloud Capture v2 records
+    /// the same facts in DIFFERENT tables —
+    /// `media::record_browser_observation` writes `browser_states_v2` and
+    /// `browser_observations_v2` — and nothing backfills the v1 pair.
+    ///
+    /// The client cannot even reach a key for it: the only producer of the
+    /// `source_key` this route takes is `screenshots.browser_snapshot_source_key`,
+    /// and the sealed screen-result family
+    /// (`media_worker/wal/result.rs::write_frame`) binds that column to
+    /// `NULL` unconditionally.
+    ///
+    /// **Lift condition.** A live writer of `browser_snapshots`/`browser_tabs`
+    /// (or this route re-pointed at the `_v2` pair it can actually be answered
+    /// from), AND a live writer of
+    /// `screenshots.browser_snapshot_source_key`. Both, because either alone
+    /// leaves a route that can only 404. Migrating capture ingest did NOT lift
+    /// this one and no amount of further evidence will: the gap is a schema
+    /// rename nobody finished, not a missing upstream domain.
     pub const QUERY_BROWSER_SNAPSHOT: &str = "query.browser_snapshot";
-    pub const QUERY_FEED: &str = "query.feed";
+    /// `GET /api/screenshot-images/plan`. Its tables fill now — `episodes`,
+    /// `episode_members` and `screenshots` all have live migrated writers —
+    /// and the route still cannot answer, because its own PREDICATE excludes
+    /// every row the WAL lane can produce.
+    ///
+    /// `query_screenshot_upload_plan` selects candidates with
+    /// `c.source_key LIKE '<device_id>:%'`, the shape the retired device-sync
+    /// path minted (`dev1:7`). The only WAL-lane writer of `screenshots`,
+    /// `media_worker/wal/result.rs::write_frame`, mints
+    /// `format!("cloud-v2:{event_id}")` unconditionally, and
+    /// `POST /api/sync/batch` — the source of every device-prefixed key — is a
+    /// 410 tombstone. So the candidate set is structurally empty and the
+    /// answer is always `200 {"episodes": []}`: the exact refusal-wearing-a-
+    /// truthful-empty-face shape the rule forbids. Its budget half is starved
+    /// independently: `screenshot_images` has no WAL-lane writer either,
+    /// because `wal_selected_screenshot_image_upload` stops fail-closed at the
+    /// durable `SendStarted` marker, before any row is recorded.
+    ///
+    /// **Lift condition.** A live writer that produces `screenshots` rows
+    /// whose `source_key` a real caller's `device_id` prefix matches — or the
+    /// predicate re-derived so `cloud-v2:` candidates are eligible, which is a
+    /// product decision (those images are already in GCS as `media_objects`
+    /// and the Mac has nothing to upload for them), not a mechanical one.
+    /// Checkable either way: seed through the WAL lane and assert the route
+    /// returns a non-empty `episodes` array.
     pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
-    /// `GET /api/screenshot-images/{id}/content`. Its identity tables —
-    /// `screenshot_images` (legacy evidence) and `media_objects` (Cloud
-    /// Capture v2) — have no live writer, so the route can only ever answer
-    /// 404 for a selected user: an absence indistinguishable from a screenshot
-    /// that was never captured. `app_metadata`, the third table it reads, DOES
-    /// have a live writer (the migrated media-DEK install, reachable through
-    /// the ungated `POST /api/screenshot-images`), but a wrapped key is not
-    /// content and cannot make an image resolvable. The rule is applied to the
-    /// tables that decide the answer.
+    /// `GET /api/screenshot-images/{id}/content`. **The closest of the
+    /// remaining gates to liftable, and the one whose old rationale is now
+    /// wrong** — it claimed `media_objects` had no live writer. It does:
+    /// canonical capture ingest inserts the row and
+    /// `media_worker/wal/result.rs` flips its `processing_state` to `'ready'`,
+    /// both sealed families on the WAL lane, and ingest encrypts the object
+    /// under the same `store::media_blob_context(user_id, object_key)` this
+    /// route decrypts with. So the `capture-v2:<asset_id>` arm of
+    /// `screenshot_image_object_key` genuinely resolves for a selected user.
+    ///
+    /// It is retained on the weaker of the two grounds, said plainly rather
+    /// than dressed up as the answerability rule: the legacy
+    /// `screenshot_images` arm still has NO WAL-lane writer (see
+    /// [`QUERY_SCREENSHOT_UPLOAD_PLAN`]), and nobody has yet built the
+    /// end-to-end fixture that proves the v2 arm serves BYTES rather than
+    /// merely resolving a key — the route's answer also depends on the GCS
+    /// object, the `app_metadata` DEK install and an AEAD open, none of which
+    /// a table-shaped test exercises.
+    ///
+    /// **Lift condition.** A test that settles a canonical screen capture and
+    /// its storyboard result through `wal_authoritative_submit` for a selected
+    /// user, then asserts this route answers `200 image/jpeg` with the exact
+    /// plaintext. Not "asserts it is no longer 503" — this route has a
+    /// legitimate 404 (`Ok(None)`) and two legitimate 500s (DEK unwrap, AEAD
+    /// open) that a weaker assertion would pass straight through.
     pub const QUERY_SCREENSHOT_IMAGE_CONTENT: &str = "query.screenshot_image_content";
     // ── The media read domains ──────────────────────────────────────────────
     //
-    // THE ANSWERABILITY RULE (ADR-0022 D4, and the reason the six constants
-    // below outlive their routing):
+    // THE ANSWERABILITY RULE (ADR-0022 D4). It is the criterion every gate in
+    // this registry is judged by, in BOTH directions:
     //
     //   A read stays gated while every production writer of the tables it
     //   reads is itself a deferred domain. Such a read cannot answer anything
@@ -245,20 +355,23 @@ pub mod wal_domain {
     //   exists to prevent. These reads lift **together with** the domain that
     //   fills their tables, never before it.
     //
-    // The rule is about ANSWERABILITY, not about mechanism. A read whose call
-    // site already routes through `Store::wal_authoritative_read` satisfies
-    // the mechanical half of the migration and is still not migrated: routing
-    // decides *which store* answers, and the rule decides *whether an answer
-    // exists to give*. Every constant below therefore names a domain whose
-    // route is already written and whose gate fires above it, so lifting one
-    // is a one-line deletion at the gate site — never a rewrite.
+    // The rule is about ANSWERABILITY, not about mechanism, and the two halves
+    // are independent. Routing decides *which store* answers; the rule decides
+    // *whether an answer exists to give*. A read can satisfy one and fail the
+    // other, and each failure has its own signature:
+    //
+    //   * answerable but UNROUTED — lifting yields a `with_user` refusal on
+    //     every call. That is the delivery group above, and it is why "the
+    //     rows exist now" is not on its own a reason to delete a constant.
+    //   * routed but UNANSWERABLE — lifting yields `200` with an empty
+    //     collection or a bare 404. That is the three read gates above.
     //
     // The registry's "delete a constant only when its domain actually
     // migrates" instruction is read through this rule: a domain migrates when
-    // its writers migrate, not when its readers are re-plumbed. Deleting one
-    // of these early does not merely leave dead gate surface; it converts a
-    // deferral into a 200 with an empty collection or a 404, which is the one
-    // outcome no refusal is allowed to wear.
+    // its writers migrate AND its readers are re-plumbed. Deleting one early
+    // does not merely leave dead gate surface; it converts a deferral into a
+    // 200 with an empty collection or a 404, which is the one outcome no
+    // refusal is allowed to wear.
     //
     // Capture ingest (`media.capture_events`) and the four reads that were
     // answerability-blocked on it — `media.stream_ack`,
@@ -269,6 +382,19 @@ pub mod wal_domain {
     // `MediaReferenceEventPlan`), so it is a live writer of `capture_events`,
     // `capture_streams` and every canonical `capture_sessions` row, and the
     // absences those four reads report are truthful again.
+    //
+    // Downstream of that, the whole evidence chain came alive, and the reads
+    // that were blocked on it lifted with it: `mcp.tools`, `query.search`,
+    // `query.episodes`, `query.episode_members`, `query.feed`, `sync.status`
+    // and `sync.export` are gone from this registry. Each was answerable
+    // (`utterances`, `screenshots`, `episodes`, `episode_members`,
+    // `audio_segments` and `episode_final_briefs` all have live sealed
+    // writers) AND already routed, so each lifted as the one-line deletion
+    // this block promised. `sync.export` is the widest of them and lifted on
+    // the same evidence rather than a fortiori against it: its dominant
+    // collections carry rows, and the arrays that stay empty (`people`,
+    // `person_facts`, `voice_profiles`) are empty because those rows do not
+    // exist, which is what an export is for.
     //
     /// The four people reads (`list_people`, `person_profile`,
     /// `person_evidence`, `person_statements`). Ingest migrating does NOT lift
@@ -314,16 +440,6 @@ pub mod wal_domain {
     /// `GET /api/v2/people` permanently answering an authoritative-looking
     /// empty roster.
     pub const MEDIA_PEOPLE: &str = "media.people";
-    /// `GET /api/sync/status` — counts and freshness over `utterances`,
-    /// `screenshots` and `episodes`. Ungated it answers `200 {"counts":
-    /// {"utterances": 0, ...}}`, which is not "unavailable", it is "your
-    /// archive is empty".
-    pub const SYNC_STATUS: &str = "sync.status";
-    /// `GET /api/export` — the widest read in the lane, dumping every logical
-    /// table, so the answerability rule holds for it a fortiori. An ungated
-    /// export hands the user a complete-looking document with every array
-    /// empty and invites them to conclude their archive is gone.
-    pub const SYNC_EXPORT: &str = "sync.export";
 }
 
 /// The stable machine-readable reason a refused deferred domain reports. It is
@@ -510,11 +626,12 @@ mod tests {
     /// can retry rather than conclude the data is gone.
     #[tokio::test]
     async fn a_deferred_domain_answers_503_naming_the_domain() {
-        let response = EnclaveError::wal_domain_unmigrated(wal_domain::QUERY_FEED).into_response();
+        let response =
+            EnclaveError::wal_domain_unmigrated(wal_domain::QUERY_BROWSER_SNAPSHOT).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response_body(response).await;
         assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::QUERY_FEED);
+        assert_eq!(body["domain"], wal_domain::QUERY_BROWSER_SNAPSHOT);
     }
 
     /// The generic arm answers an opaque 500 `internal error`. A deferral
@@ -526,7 +643,7 @@ mod tests {
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::PUSH_OUTBOX,
             wal_domain::MEDIA_PEOPLE,
-            wal_domain::SYNC_EXPORT,
+            wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
         ] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
             assert_eq!(
@@ -556,18 +673,11 @@ mod tests {
             wal_domain::PUSH_OUTBOX,
             wal_domain::WEBHOOK_WORKER_OUTBOX,
             wal_domain::DELIVERY_FINALIZED_EPISODE,
-            wal_domain::MCP_TOOLS,
-            wal_domain::QUERY_SEARCH,
-            wal_domain::QUERY_EPISODES,
             wal_domain::QUERY_EPISODE_DELETE,
-            wal_domain::QUERY_EPISODE_MEMBERS,
             wal_domain::QUERY_BROWSER_SNAPSHOT,
-            wal_domain::QUERY_FEED,
             wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,
             wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
             wal_domain::MEDIA_PEOPLE,
-            wal_domain::SYNC_STATUS,
-            wal_domain::SYNC_EXPORT,
         ];
         let unique = domains.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), domains.len(), "domain names must be unique");

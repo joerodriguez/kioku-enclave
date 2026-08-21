@@ -413,7 +413,40 @@ EXPECTED_STORE_CALL_COUNT = 235
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "7ce82572243f92af5ffe08830f7f05eef77830d589a7994d2d27364c1094e34f"
+#
+# Seven answerable D4 gates LIFTED (mcp.tools, query.search, query.episodes,
+# query.episode_members, query.feed, sync.status, sync.export): count HOLDS at
+# 235, with zero additions, zero removals, zero reorders, zero renames and zero
+# reclassifications. Every call-EXPRESSION hash is byte-identical to the
+# pristine dump; the delta is THREE owner-BODY hashes only --
+# rest_episode_members#0, rest_feed#0 and sync_status#0, each of which had its
+# `wal_domain_refusal` gate deleted and a comment added inside the same
+# function body that owns its wal_authoritative_read#0 call. body_hash is taken
+# over raw source, so a deleted gate and replacement prose both move it.
+#
+# The four other lifted surfaces move NO row, and that is the expected shape
+# rather than a missed scan: rest_search, rest_episodes, rest_episode, export
+# and mcp_endpoint own no tracked Store call at all -- their reads live one
+# frame down in query_transcripts_value, query_episodes_value and
+# dump_user_export, whose bodies this change does not touch.
+#
+# This is the inverse of #328's note and worth stating so the two are not read
+# as contradicting: there, the digest moved while every gate was RETAINED,
+# because the call sites moved under the gates. Here the digest moves while the
+# gates are DELETED, because the gates sat inside three owner bodies. Neither
+# direction is inferable from the digest; both have to be read row by row.
+#
+# Re-derived against pristine origin/main (2a5bca5, schema-epoch ladder Part B)
+# with this module's own store_call_sites()/classify_store_call()/
+# inventory_row()/digest() helpers, in a `git archive | tar -x` tree extracted
+# outside every worktree; that pristine dump reproduced 2a5bca5's own
+# 235/7ce82572 pin byte-for-byte BEFORE this value was written.
+# NOTE this baseline is 2a5bca5, NOT 8a6f948: #332 merged while this branch was
+# being written, and the FIRST derivation here was done against the stale
+# 0d51bc8 base and produced 232 rows against a 235-row pin -- three
+# src/cp/schema_epoch/*.rs files that only exist on the merged tree. The
+# mismatch is what surfaced the moved base. Rebase first, derive second.
+EXPECTED_STORE_CALL_SHA256 = "24fcfb447716d7a1628647c350782e7f57c437e4c4ee868059e240c8699d282c"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
