@@ -424,11 +424,12 @@ EXPECTED_STORE_CALL_COUNT = 235
 # function body that owns its wal_authoritative_read#0 call. body_hash is taken
 # over raw source, so a deleted gate and replacement prose both move it.
 #
-# The four other lifted surfaces move NO row, and that is the expected shape
-# rather than a missed scan: rest_search, rest_episodes, rest_episode, export
-# and mcp_endpoint own no tracked Store call at all -- their reads live one
-# frame down in query_transcripts_value, query_episodes_value and
-# dump_user_export, whose bodies this change does not touch.
+# The five other route functions, representing four lifted domains, move NO
+# row, and that is the expected shape rather than a missed scan: rest_search,
+# rest_episodes, rest_episode, export and mcp_endpoint own no tracked Store call
+# at all -- their reads live one frame down in query_transcripts_value,
+# query_episodes_value and dump_user_export, whose bodies this change does not
+# touch.
 #
 # This is the inverse of #328's note and worth stating so the two are not read
 # as contradicting: there, the digest moved while every gate was RETAINED,
@@ -446,6 +447,15 @@ EXPECTED_STORE_CALL_COUNT = 235
 # 0d51bc8 base and produced 232 rows against a 235-row pin -- three
 # src/cp/schema_epoch/*.rs files that only exist on the merged tree. The
 # mismatch is what surfaced the moved base. Rebase first, derive second.
+#
+# Final post-review derivation against pristine origin/main (c834012, the T24
+# claim refresh plus test-only Store liveness fix) used this module's own
+# helpers after the final rebase. The pristine dump reproduced c834012's own
+# 235/7ce82572 pin byte-for-byte first. The merged dump again held at 235 rows
+# with no additions, removals, renames, reclassifications or call-expression
+# moves; only the same three owner-body hashes moved, and the merged digest
+# remained 24fcfb44. This appends the final third-state provenance rather than
+# replacing the earlier derivations that explain how the pin arrived here.
 EXPECTED_STORE_CALL_SHA256 = "24fcfb447716d7a1628647c350782e7f57c437e4c4ee868059e240c8699d282c"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
