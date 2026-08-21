@@ -35,6 +35,19 @@ pub struct PlanningEvent {
 pub struct WorkPlan {
     pub class: WorkClass,
     pub member_job_ids: Vec<i64>,
+    /// The candidate this plan was anchored on — the minimum of
+    /// `(started_ms, sequence, job_id)` — reported even when it was REJECTED
+    /// and `member_job_ids` came back empty.
+    ///
+    /// An empty plan over a non-empty candidate list means the head could not
+    /// enter a window of its own: an audio event longer than
+    /// `MAX_AUDIO_WINDOW_MS` (ingest admits up to eight hours) or a frame over
+    /// `MAX_SCREEN_BYTES`/`MAX_SCREEN_PIXELS`. That is a DETERMINISTIC refusal
+    /// — the same head is re-selected by every sweep — so the claim boundary
+    /// has to be able to name it. Deriving it a second time from the sort key
+    /// would be a drift hazard; it is reported from the same `first` the fold
+    /// already uses.
+    pub head_job_id: i64,
     pub started_ms: i64,
     pub ended_ms: i64,
     pub total_bytes: i64,
@@ -84,6 +97,7 @@ pub fn plan_first(candidates: &[PlanningEvent]) -> WorkPlan {
     WorkPlan {
         class: first.class,
         member_job_ids: members,
+        head_job_id: first.job_id,
         started_ms: first.started_ms,
         ended_ms,
         total_bytes,
@@ -292,6 +306,47 @@ mod tests {
         assert_eq!(plan.ended_ms, 77_001);
         assert!(plan.total_bytes <= MAX_SCREEN_BYTES);
         assert!(plan.total_pixels <= MAX_SCREEN_PIXELS);
+    }
+
+    /// A head candidate that cannot enter a window of its OWN yields an empty
+    /// plan, and the head is still named.
+    ///
+    /// This is not hypothetical. `CaptureEventManifest::validate` admits an
+    /// audio event up to eight hours long and `validate_media` bounds only its
+    /// bytes, so a single event longer than `MAX_AUDIO_WINDOW_MS` is ingested,
+    /// is `pending` forever, and is re-selected as the head by every sweep.
+    /// Without `head_job_id` the claim boundary sees only "no members" and
+    /// cannot tell that apart from "nothing claimable", which is the
+    /// difference between a quarantine and a permanent silent wedge.
+    #[test]
+    fn an_unwindowable_head_yields_an_empty_plan_that_still_names_it() {
+        let long_audio = vec![event(
+            7,
+            WorkClass::Audio,
+            "a",
+            0,
+            0,
+            MAX_AUDIO_WINDOW_MS + 1_000,
+        )];
+        let plan = plan_first(&long_audio);
+        assert!(plan.member_job_ids.is_empty());
+        assert_eq!(plan.head_job_id, 7);
+
+        let huge_frame = vec![PlanningEvent {
+            byte_length: MAX_SCREEN_BYTES + 1,
+            ..event(9, WorkClass::Screen, "s", 0, 0, 1)
+        }];
+        let plan = plan_first(&huge_frame);
+        assert!(plan.member_job_ids.is_empty());
+        assert_eq!(plan.head_job_id, 9);
+
+        // The head is the sort-key minimum, not the first element given.
+        let ordered = plan_first(&[
+            event(3, WorkClass::Screen, "s", 2, 20_000, 20_001),
+            event(1, WorkClass::Screen, "s", 0, 0, 1),
+        ]);
+        assert_eq!(ordered.head_job_id, 1);
+        assert_eq!(ordered.member_job_ids, vec![1, 3]);
     }
 
     #[test]

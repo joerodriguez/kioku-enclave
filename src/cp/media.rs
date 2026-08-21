@@ -26,6 +26,15 @@ use super::{auth::AuthUser, limits, CpState};
 const MAX_AUDIO_BYTES: i64 = 20 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: i64 = 5 * 1024 * 1024;
 const MAX_ID_LEN: usize = 128;
+/// The ingest length bound on the device-supplied `started_at`/`ended_at`.
+///
+/// It is the SAME 64 that every media settle family spells `MAX_TIMESTAMP_BYTES`
+/// (`media_worker::wal::failure`, `::result`, `::claim`). Ingest admitting a
+/// stamp a settle can never accept is the shape that gets a work unit claimed
+/// and PAID FOR with no path to settle it; keeping the two numbers equal is
+/// what makes that unreachable. Pinned by
+/// `ingest_bounds_the_device_capture_stamps_at_the_settle_families_bound`.
+pub(crate) const MAX_DEVICE_TIMESTAMP_BYTES: usize = 64;
 // Re-exported pub(crate) so the ADR-0022 audio transcript plan can never
 // drift from the caps `parse_audio_result` enforces (the text cap counts
 // CHARS, not bytes).
@@ -272,6 +281,56 @@ impl CaptureEventManifest {
             return Err(EnclaveError::InvalidRequest(
                 "source_wall_at must be ISO-8601".into(),
             ));
+        }
+        // A LENGTH bound, which is a different question from the FORMAT bound
+        // the paragraph above declines to add, and the two must not be
+        // conflated.
+        //
+        // `capture_events.started_at`/`ended_at` are device-supplied and are
+        // the only manifest timestamps that reach a settle predicate which
+        // bounds their LENGTH: `media_worker::wal::failure`'s `FailureMember`
+        // and `media_worker::wal::result`'s `valid_timestamp` both refuse a
+        // `capture_started_at` over `MAX_TIMESTAMP_BYTES` (64). Nothing on the
+        // claim path bounded them, so an over-long `started_at` was admitted
+        // here, claimed, PAID FOR with a billed Vertex call, and then refused
+        // by every settle — success and failure alike — leaving the members in
+        // `processing` for the lease to reclaim and re-pay, forever.
+        // `parse_epoch_millis` makes this reachable with a stamp that denotes
+        // the correct instant: it ignores fractional digits past the third, so
+        // `...T14:00:00.<45 zeroes>Z` parses to exactly the same millisecond as
+        // the canonical form.
+        //
+        // This cannot strand a client, and that is the whole reason it is a
+        // length bound and not a format one:
+        //
+        //   * Every timestamp shape `parse_epoch_millis` was widened to accept
+        //     on purpose still fits. Canonical `YYYY-MM-DDTHH:MM:SS.mmmZ` is 24
+        //     bytes; the `±HH:MM` offset form is 29; nanosecond precision with
+        //     an offset is 35. The bound is 64 — nearly double the longest
+        //     stamp any real client can emit — so no shipped Mac or iOS build
+        //     loses an event it can currently deliver, and the durable outbox
+        //     has nothing to rebase.
+        //   * It is the contract this manifest ALREADY applies to every other
+        //     string field. `validate_id` 400s over-long ids and `timezone_id`
+        //     is capped at 128; `started_at`/`ended_at` were the outliers.
+        //
+        // `source_wall_at` is deliberately NOT bounded here. It reaches no
+        // length-bounded settle predicate (the storyboard result carries it
+        // only inside a full-tuple equality CAS), and the commit-stamp path
+        // that once poisoned `updated_at` is closed structurally by
+        // `wal::is_canonical_commit_stamp`. Adding a bound it does not need
+        // would break a stamp a client can send for no gain — and would
+        // silently retire the `ExceedsTimestampBound` case in
+        // `a_poisoned_device_wall_clock_cannot_wedge_the_claim_lane`.
+        for (name, value) in [
+            ("started_at", self.started_at.as_str()),
+            ("ended_at", self.ended_at.as_str()),
+        ] {
+            if value.len() > MAX_DEVICE_TIMESTAMP_BYTES {
+                return Err(EnclaveError::InvalidRequest(format!(
+                    "{name} exceeds {MAX_DEVICE_TIMESTAMP_BYTES} bytes"
+                )));
+            }
         }
         let duration_ms = self.duration_ms()?;
         if duration_ms > 8 * 60 * 60 * 1000 {
@@ -5597,6 +5656,46 @@ mod tests {
             manifest.context.unwrap().active_url.as_deref(),
             Some("https://meet.google.com/abc-defg-hij?authuser=0")
         );
+    }
+
+    #[test]
+    fn ingest_bounds_device_capture_stamps_at_the_settle_families_bound() {
+        let bounded = |prefix: &str| {
+            let fractional_digits = MAX_DEVICE_TIMESTAMP_BYTES - prefix.len() - 1;
+            format!("{prefix}{}Z", "0".repeat(fractional_digits))
+        };
+
+        for (field, exact) in [
+            ("started_at", bounded("2026-07-31T18:00:00.")),
+            ("ended_at", bounded("2026-07-31T18:00:05.")),
+        ] {
+            assert_eq!(exact.len(), MAX_DEVICE_TIMESTAMP_BYTES);
+            let mut manifest = valid_manifest();
+            if field == "started_at" {
+                manifest.started_at.clone_from(&exact);
+            } else {
+                manifest.ended_at.clone_from(&exact);
+            }
+            manifest
+                .validate()
+                .unwrap_or_else(|error| panic!("{field} at the bound must remain valid: {error}"));
+
+            let overlong = format!("{}0Z", exact.trim_end_matches('Z'));
+            assert_eq!(overlong.len(), MAX_DEVICE_TIMESTAMP_BYTES + 1);
+            if field == "started_at" {
+                manifest.started_at = overlong;
+            } else {
+                manifest.ended_at = overlong;
+            }
+            assert!(
+                matches!(
+                    manifest.validate(),
+                    Err(EnclaveError::InvalidRequest(ref message))
+                        if message.contains(field)
+                ),
+                "{field} over the settle bound must be rejected before storage"
+            );
+        }
     }
 
     #[test]
