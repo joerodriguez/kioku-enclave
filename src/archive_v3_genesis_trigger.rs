@@ -124,6 +124,21 @@
 //!   the routed read refuses as unavailable, so such a user is never served
 //!   the stale legacy snapshot.
 //!
+//! One consequence of C9/C10 is worth stating plainly, because the
+//! end-to-end smoke is where it was first observed rather than reasoned
+//! about: a restart that follows the crash of an owner which had **already
+//! published** cannot relaunch immediately. The dead owner's own WAL-owner
+//! lease is still standing in the witness, and the restart cannot distinguish
+//! its own corpse from a live competitor. `exact_wal_owner_renewal_from`
+//! cannot apply — the live record and the durable owner binding are the same
+//! bytes, so no tick inside the record advanced — which leaves only the
+//! provider reacquire, and `exact_wal_owner_reacquire_from` admits that only
+//! once trusted time is past the dead lease's expiry. Such a user is refused
+//! as unavailable for at most one owner-lease duration and then converges on
+//! the next pass. That is the designed fencing cost of a restart, not a
+//! wedge, and it is why the startup relaunch counts a scoped failure instead
+//! of failing the fleet.
+//!
 //! Logging here stays content-free: counts and outcomes only, never a user
 //! identifier, archive identifier, or provider detail.
 
@@ -284,18 +299,23 @@ pub(crate) async fn converge_genesis_for_user(
     store: &Arc<Store>,
     user_id: &str,
 ) -> std::result::Result<GenesisConvergence, GenesisTriggerError> {
+    converge_genesis_over(&BakedImageGenesisRuntime, control, store, user_id).await
+}
+
+/// Convergence over an explicit provider source. Production has exactly one
+/// source, [`BakedImageGenesisRuntime`]; see [`GenesisRuntimeSource`] for why
+/// the seam exists at all.
+async fn converge_genesis_over(
+    source: &dyn GenesisRuntimeSource,
+    control: &Arc<ControlStore>,
+    store: &Arc<Store>,
+    user_id: &str,
+) -> std::result::Result<GenesisConvergence, GenesisTriggerError> {
     // The gate is read first so a disabled image does exactly nothing: no
     // coordinate parsing, no control-store read, no task-local state.
-    if !genesis_wal_native_from_baked_env()? {
+    if !source.armed()? {
         return Ok(GenesisConvergence::Disabled);
     }
-    let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
-        .map_err(|_| GenesisTriggerError::Config)?;
-    let Some(deployment) = deployment else {
-        // Startup already refuses this combination; refuse here too rather
-        // than trusting that startup ran in this build.
-        return Err(GenesisTriggerError::Config);
-    };
     // One pass per user per process. Concurrent sign-ins would otherwise both
     // launch a serving authority, and the loser's WAL-owner lease acquisition
     // would fence the winner. Cross-process concurrency is still handled by
@@ -315,14 +335,159 @@ pub(crate) async fn converge_genesis_for_user(
         .map_err(map_control)?
         == Some(WalGenesisStage::WalAuthoritative);
     if !already_terminal {
-        run_durable_genesis(control, deployment, binding, user_id, archive_id).await?;
+        run_durable_genesis(control, source, binding, user_id, archive_id).await?;
     }
-    install_and_launch(control, store, user_id).await?;
+    install_and_launch(control, store, source, user_id).await?;
     Ok(if already_terminal {
         GenesisConvergence::AlreadyTerminal
     } else {
         GenesisConvergence::Converged
     })
+}
+
+/// The provider set one genesis pass drives, already released and bound to
+/// exactly one archive. It carries no witness record, no lease and no durable
+/// authority: every handle still enforces its own exact-context, CAS and
+/// readback predicates, exactly as [`GenesisRuntimeParts`] does.
+///
+/// [`GenesisRuntimeParts`]: crate::archive_v3_shadow_runtime::GenesisRuntimeParts
+struct GenesisDriverProviders {
+    archive_id: ArchiveId,
+    backend: Box<dyn crate::archive_v3_genesis::ArchiveGenesisBackend>,
+    objects: Arc<dyn crate::archive_v3::ImmutableObjectBackend>,
+    registry_wrap: Box<dyn crate::archive_v3_wal_genesis::GenesisRegistryWrapAuthority>,
+    witness_advance: Arc<dyn crate::archive_v3_root_advance::ArchiveWitnessAdvanceProvider>,
+}
+
+impl std::fmt::Debug for GenesisDriverProviders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GenesisDriverProviders(<opaque>)")
+    }
+}
+
+/// The seam between the reviewed convergence driver below and the image's
+/// real GCS/KMS/Firestore coordinates.
+///
+/// It exists for exactly one reason: without it neither
+/// [`run_durable_genesis`] nor [`install_and_launch`] can be executed by any
+/// test in the tree, because both reach a live bucket, a live KMS key
+/// version and a live Firestore database on their first statement. Everything
+/// downstream of the seam — the durable recovery decision, the crash
+/// boundary, the ledger stages, the witness ladder, the owner reservation and
+/// the launch — is unchanged and is what the end-to-end smoke (G10) actually
+/// runs.
+///
+/// The seam moves composition, never a predicate. `armed` is the same pair of
+/// fail-closed reads it replaced, in the same order; the durable
+/// compare-and-swaps, the witness predicates and the CHECK constraints below
+/// are untouched and are enforced by the same production code either way.
+/// Production has exactly one implementation, and the alternative one is
+/// `#[cfg(test)]` — the same containment `for_publisher_test` and
+/// `create_genesis_test_binding` already rely on one layer down.
+#[async_trait::async_trait]
+trait GenesisRuntimeSource: Send + Sync {
+    /// Whether new-user genesis is armed for this image. Fails closed.
+    fn armed(&self) -> std::result::Result<bool, GenesisTriggerError>;
+
+    /// Release the provider set for one archive's genesis run.
+    fn genesis_providers(
+        &self,
+        control: &Arc<ControlStore>,
+        binding: crate::cp::control_store::ArchiveBinding,
+    ) -> std::result::Result<GenesisDriverProviders, GenesisTriggerError>;
+
+    /// Reconstruct the launchable WAL serving handoff for one archive from
+    /// durable state alone.
+    async fn serving_handoff(
+        &self,
+        control: Arc<ControlStore>,
+        binding: crate::cp::control_store::ArchiveBinding,
+    ) -> std::result::Result<crate::archive_v3_shadow_runtime::WalServingHandoff, GenesisTriggerError>;
+}
+
+/// The one production source: the image-baked gate and coordinates.
+struct BakedImageGenesisRuntime;
+
+impl BakedImageGenesisRuntime {
+    /// The image's archive-v3 runtime coordinates, or a fail-closed refusal.
+    /// Re-read per composition because the pending runtime is bind-once, in
+    /// the same shape the startup relaunch re-reads them per selection.
+    fn deployment() -> std::result::Result<ArchiveV3ShadowRuntimeDeployment, GenesisTriggerError> {
+        ArchiveV3ShadowRuntimeDeployment::from_baked_env()
+            .map_err(|_| GenesisTriggerError::Config)?
+            .ok_or(GenesisTriggerError::Config)
+    }
+
+    /// One bound, inert runtime capability for this archive.
+    fn sealed(
+        binding: crate::cp::control_store::ArchiveBinding,
+    ) -> std::result::Result<
+        crate::archive_v3_shadow_runtime::SealedSingleArchiveWalRuntime,
+        GenesisTriggerError,
+    > {
+        let kms = Arc::new(GcpKmsClient::from_env().map_err(|_| GenesisTriggerError::Unavailable)?);
+        PendingSingleArchiveWalRuntime::new(Self::deployment()?, kms)
+            .map_err(|_| GenesisTriggerError::Unavailable)?
+            .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
+            .map_err(|_| GenesisTriggerError::Config)
+    }
+}
+
+#[async_trait::async_trait]
+impl GenesisRuntimeSource for BakedImageGenesisRuntime {
+    fn armed(&self) -> std::result::Result<bool, GenesisTriggerError> {
+        if !genesis_wal_native_from_baked_env()? {
+            return Ok(false);
+        }
+        // Startup already refuses this combination; refuse here too rather
+        // than trusting that startup ran in this build.
+        Self::deployment().map(|_| true)
+    }
+
+    fn genesis_providers(
+        &self,
+        control: &Arc<ControlStore>,
+        binding: crate::cp::control_store::ArchiveBinding,
+    ) -> std::result::Result<GenesisDriverProviders, GenesisTriggerError> {
+        let parts = Self::sealed(binding)?
+            .into_genesis_parts(&GenesisBackendRuntimeContext::for_genesis_trigger(
+                &GenesisTriggerContext(()),
+            ))
+            .map_err(|_| GenesisTriggerError::Unavailable)?;
+        let registries: Arc<dyn GenesisRegistryStore> =
+            Arc::<_>::clone(&parts.registries) as Arc<_>;
+        let backend = ControlPlaneGenesisBackend::new(
+            GenesisBackendRuntimeContext::for_genesis_trigger(&GenesisTriggerContext(())),
+            Arc::clone(control),
+            Arc::clone(&parts.objects),
+            Arc::clone(&parts.roots),
+            registries,
+            Arc::clone(&parts.witness),
+        );
+        let registry_wrap = ReleasedGenesisRegistryWrap::new(
+            GenesisBackendRuntimeContext::for_genesis_trigger(&GenesisTriggerContext(())),
+            Arc::clone(&parts.registries),
+        );
+        Ok(GenesisDriverProviders {
+            archive_id: parts.archive_id,
+            backend: Box::new(backend),
+            objects: parts.objects,
+            registry_wrap: Box::new(registry_wrap),
+            witness_advance: parts.witness_advance,
+        })
+    }
+
+    async fn serving_handoff(
+        &self,
+        control: Arc<ControlStore>,
+        binding: crate::cp::control_store::ArchiveBinding,
+    ) -> std::result::Result<crate::archive_v3_shadow_runtime::WalServingHandoff, GenesisTriggerError>
+    {
+        Self::sealed(binding)?
+            .reconstruct_wal_serving_handoff(control)
+            .await
+            .map_err(|_| GenesisTriggerError::Conflict)
+    }
 }
 
 /// Drive the durable half of the spine: reserve, produce, prepare, resolve,
@@ -335,37 +500,17 @@ pub(crate) async fn converge_genesis_for_user(
 /// its own. See C5 in the module documentation.
 async fn run_durable_genesis(
     control: &Arc<ControlStore>,
-    deployment: ArchiveV3ShadowRuntimeDeployment,
+    source: &dyn GenesisRuntimeSource,
     binding: crate::cp::control_store::ArchiveBinding,
     user_id: &str,
     archive_id: ArchiveId,
 ) -> std::result::Result<(), GenesisTriggerError> {
-    let kms = Arc::new(GcpKmsClient::from_env().map_err(|_| GenesisTriggerError::Unavailable)?);
-    let sealed = PendingSingleArchiveWalRuntime::new(deployment, kms)
-        .map_err(|_| GenesisTriggerError::Unavailable)?
-        .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
-        .map_err(|_| GenesisTriggerError::Config)?;
-    let parts = sealed
-        .into_genesis_parts(&GenesisBackendRuntimeContext::for_genesis_trigger(
-            &GenesisTriggerContext(()),
-        ))
-        .map_err(|_| GenesisTriggerError::Unavailable)?;
+    let parts = source.genesis_providers(control, binding)?;
     if parts.archive_id != archive_id {
         return Err(GenesisTriggerError::Conflict);
     }
-    let registries: Arc<dyn GenesisRegistryStore> = Arc::<_>::clone(&parts.registries) as Arc<_>;
-    let backend = ControlPlaneGenesisBackend::new(
-        GenesisBackendRuntimeContext::for_genesis_trigger(&GenesisTriggerContext(())),
-        Arc::clone(control),
-        Arc::clone(&parts.objects),
-        Arc::clone(&parts.roots),
-        registries,
-        Arc::clone(&parts.witness),
-    );
-    let registry_wrap = ReleasedGenesisRegistryWrap::new(
-        GenesisBackendRuntimeContext::for_genesis_trigger(&GenesisTriggerContext(())),
-        Arc::clone(&parts.registries),
-    );
+    let backend = parts.backend.as_ref();
+    let registry_wrap = parts.registry_wrap.as_ref();
 
     // Recover before producing anything. Only the durable bootstrap anchor can
     // say whether this archive is still short of the prepare crash boundary;
@@ -376,9 +521,9 @@ async fn run_durable_genesis(
     let start = {
         let authority = WalGenesisAuthority {
             recovery: control.as_ref(),
-            backend: &backend,
+            backend,
             objects: parts.objects.as_ref(),
-            registry_wrap: &registry_wrap,
+            registry_wrap,
             inventory: &UnstagedGenesisInventory,
             witness_advance: parts.witness_advance.as_ref(),
         };
@@ -406,9 +551,9 @@ async fn run_durable_genesis(
             );
             let authority = WalGenesisAuthority {
                 recovery: control.as_ref(),
-                backend: &backend,
+                backend,
                 objects: parts.objects.as_ref(),
-                registry_wrap: &registry_wrap,
+                registry_wrap,
                 inventory: &producer_inventory,
                 witness_advance: parts.witness_advance.as_ref(),
             };
@@ -432,9 +577,9 @@ async fn run_durable_genesis(
         GenesisStagingInventory::new(Arc::clone(control), archive_id, plan.attempt_id());
     let authority = WalGenesisAuthority {
         recovery: control.as_ref(),
-        backend: &backend,
+        backend,
         objects: parts.objects.as_ref(),
-        registry_wrap: &registry_wrap,
+        registry_wrap,
         inventory: &ladder_inventory,
         witness_advance: parts.witness_advance.as_ref(),
     };
@@ -482,6 +627,7 @@ async fn run_durable_genesis(
 async fn install_and_launch(
     control: &Arc<ControlStore>,
     store: &Arc<Store>,
+    source: &dyn GenesisRuntimeSource,
     user_id: &str,
 ) -> std::result::Result<(), GenesisTriggerError> {
     if store.has_wal_serving_authority(user_id) {
@@ -494,21 +640,11 @@ async fn install_and_launch(
     store
         .install_wal_authority_persistence(selection)
         .map_err(map_control)?;
-    let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
-        .map_err(|_| GenesisTriggerError::Config)?
-        .ok_or(GenesisTriggerError::Config)?;
-    let kms = Arc::new(GcpKmsClient::from_env().map_err(|_| GenesisTriggerError::Unavailable)?);
     let binding = control
         .active_archive_binding(user_id)
         .await
         .map_err(map_control)?;
-    let handoff = PendingSingleArchiveWalRuntime::new(deployment, kms)
-        .map_err(|_| GenesisTriggerError::Unavailable)?
-        .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
-        .map_err(|_| GenesisTriggerError::Config)?
-        .reconstruct_wal_serving_handoff(Arc::clone(control))
-        .await
-        .map_err(|_| GenesisTriggerError::Conflict)?;
+    let handoff = source.serving_handoff(Arc::clone(control), binding).await?;
     let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
         .await
         .map_err(|_| GenesisTriggerError::Unavailable)?;
@@ -609,7 +745,7 @@ fn map_genesis(error: crate::archive_v3_wal_genesis::WalGenesisError) -> Genesis
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -769,5 +905,392 @@ mod tests {
         );
         let trigger = include_str!("archive_v3_genesis_trigger.rs");
         assert!(trigger.contains("pub(crate) struct GenesisTriggerContext(());"));
+    }
+
+    /// The composition seam moves composition only, and the alternative
+    /// source is structurally confined to test builds. Both halves are
+    /// asserted structurally because both are the kind of thing a later edit
+    /// erodes silently: a second production source, or a test source that
+    /// stops being `#[cfg(test)]`, would each turn the seam into a way to run
+    /// genesis against providers no reviewer chose.
+    #[test]
+    fn the_runtime_seam_has_one_production_source_and_moves_no_predicate() {
+        let source = include_str!("archive_v3_genesis_trigger.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        // Exactly one production implementation of the seam.
+        assert_eq!(
+            production
+                .matches(concat!("impl GenesisRuntimeSource ", "for "))
+                .count(),
+            1
+        );
+        assert!(production.contains(concat!(
+            "impl GenesisRuntimeSource ",
+            "for BakedImageGenesisRuntime"
+        )));
+        // The production source still reads the gate and the coordinates
+        // itself, in that order, and still fails closed on both.
+        let armed = &production[production
+            .find("fn armed(&self) -> std::result::Result<bool, GenesisTriggerError> {")
+            .expect("the production arming decision moved")..];
+        let armed = &armed[..armed.find("\n    }\n").unwrap()];
+        let gate = armed
+            .find("genesis_wal_native_from_baked_env()?")
+            .expect("the gate read moved out of the production source");
+        let coordinates = armed
+            .find("Self::deployment()")
+            .expect("the coordinate agreement moved out of the production source");
+        assert!(gate < coordinates);
+        assert!(armed.contains("return Ok(false)"));
+        // Every alternative source lives behind `cfg(test)`.
+        assert!(
+            !production.contains("SmokeGenesisRuntime"),
+            "the smoke source must not be reachable from production"
+        );
+        assert!(
+            source.contains(concat!("#[cfg(test)]\npub(crate) mod ", "tests {")),
+            "the smoke source's whole module must stay cfg(test)"
+        );
+        // The durable driver takes the seam, never a raw provider graph.
+        assert!(production.contains("source: &dyn GenesisRuntimeSource"));
+        assert!(production.contains("converge_genesis_over(&BakedImageGenesisRuntime,"));
+        // The seam widens nothing. Every type it introduces is private to
+        // this module, so the only production surface that leaves the file is
+        // still exactly what left it before the seam existed.
+        for private in [
+            concat!("struct GenesisDriver", "Providers {"),
+            concat!("trait GenesisRuntime", "Source: Send + Sync {"),
+            concat!("struct BakedImageGenesis", "Runtime;"),
+        ] {
+            assert!(production.contains(private), "missing {private}");
+            assert!(
+                !production.contains(&format!("pub(crate) {private}")),
+                "{private} must stay private to this module"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // G10: the end-to-end smoke harness.
+    //
+    // `run_durable_genesis` and `install_and_launch` reach a live bucket, a
+    // live KMS key version and a live Firestore database on their first
+    // statement, so until this harness existed neither had ever been
+    // executed by a test — only compile-checked and structurally pinned.
+    // Everything below composes the tree's existing in-memory providers into
+    // the exact shapes the seam releases, so the reviewed driver runs
+    // unchanged. The smoke test that drives it lives with the probe it
+    // submits, in `cp/reviewer.rs`.
+    // ------------------------------------------------------------------
+
+    use crate::{
+        archive_v3::{
+            ArchiveV3Error, CiphertextEnvelope, CreateIfAbsent, ExactKeyRegistryProvider,
+            ImmutableObjectBackend, InMemoryImmutableBackend, KeyRegistryContext, ObjectContext,
+            ObjectId, ObjectRole,
+        },
+        archive_v3_firestore_shadow::FirestoreShadowWitness,
+        archive_v3_firestore_witness::{test_transport, FirestoreWitness},
+        archive_v3_genesis_backend::GenesisRegistryStore as _GenesisRegistryStore,
+        archive_v3_wal_genesis::GenesisRegistryWrapAuthority,
+        archive_v3_witness::{ExactRootProvider, WitnessError},
+        store::tests::{FakeGcs, FakeKms},
+    };
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    const SMOKE_WRAP_PREFIX: &[u8] = b"smoke-kms-wrap:";
+
+    /// Round-tripping registry provider over an exact-bytes CAS, mirroring
+    /// the production create-if-absent and wrap/unwrap semantics. It stands
+    /// in for the archive bucket's wrapped-registry object plus the KMS key
+    /// version that wraps it, and it is durable substrate: a process death
+    /// leaves it exactly as it was.
+    #[derive(Default)]
+    pub(crate) struct SmokeRegistryStore {
+        objects: Mutex<BTreeMap<ObjectId, Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExactKeyRegistryProvider for SmokeRegistryStore {
+        async fn read_exact_wrapped(
+            &self,
+            _context: &KeyRegistryContext,
+            object_id: ObjectId,
+            destination: &mut [u8],
+        ) -> crate::archive_v3::Result<usize> {
+            let value = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(&object_id)
+                .cloned()
+                .ok_or(ArchiveV3Error::Unavailable)?;
+            if value.len() > destination.len() {
+                return Err(ArchiveV3Error::TooLarge("wrapped key registry"));
+            }
+            destination[..value.len()].copy_from_slice(&value);
+            Ok(value.len())
+        }
+
+        async fn kms_unwrap_exact(
+            &self,
+            _context: &KeyRegistryContext,
+            wrapped: &[u8],
+            destination: &mut [u8],
+        ) -> crate::archive_v3::Result<usize> {
+            let plaintext = wrapped
+                .strip_prefix(SMOKE_WRAP_PREFIX)
+                .ok_or(ArchiveV3Error::InvalidContext)?;
+            if plaintext.len() > destination.len() {
+                return Err(ArchiveV3Error::TooLarge("key registry plaintext"));
+            }
+            destination[..plaintext.len()].copy_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl _GenesisRegistryStore for SmokeRegistryStore {
+        async fn create_wrapped_if_absent(
+            &self,
+            _context: &KeyRegistryContext,
+            object_id: ObjectId,
+            wrapped_registry_ciphertext: &[u8],
+        ) -> crate::archive_v3::Result<CreateIfAbsent> {
+            let mut objects = self.objects.lock().unwrap();
+            if let Some(existing) = objects.get(&object_id) {
+                return if existing == wrapped_registry_ciphertext {
+                    Ok(CreateIfAbsent::AlreadyPresentIdentical)
+                } else {
+                    Err(ArchiveV3Error::Conflict)
+                };
+            }
+            objects.insert(object_id, wrapped_registry_ciphertext.to_vec());
+            Ok(CreateIfAbsent::Created)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GenesisRegistryWrapAuthority for SmokeRegistryStore {
+        async fn wrap_registry(
+            &self,
+            _context: &KeyRegistryContext,
+            registry_plaintext: &[u8],
+            destination: &mut [u8],
+        ) -> crate::archive_v3::Result<usize> {
+            let length = SMOKE_WRAP_PREFIX.len() + registry_plaintext.len();
+            if length > destination.len() {
+                return Err(ArchiveV3Error::TooLarge("wrapped key registry"));
+            }
+            destination[..SMOKE_WRAP_PREFIX.len()].copy_from_slice(SMOKE_WRAP_PREFIX);
+            destination[SMOKE_WRAP_PREFIX.len()..length].copy_from_slice(registry_plaintext);
+            Ok(length)
+        }
+    }
+
+    /// Exact-root reads over the same immutable object store the composite
+    /// writes through.
+    struct SmokeRootProvider(Arc<InMemoryImmutableBackend>);
+
+    #[async_trait::async_trait]
+    impl ExactRootProvider for SmokeRootProvider {
+        async fn read_exact(
+            &self,
+            context: &ObjectContext,
+        ) -> std::result::Result<CiphertextEnvelope, WitnessError> {
+            if context.role() != ObjectRole::RootV3 {
+                return Err(WitnessError::Malformed);
+            }
+            match self.0.get(&context.object_key()).await {
+                Ok(Some(envelope)) => Ok(envelope),
+                Ok(None) => Err(WitnessError::MissingRootObject),
+                Err(ArchiveV3Error::Unavailable) => Err(WitnessError::Unavailable),
+                Err(_) => Err(WitnessError::Malformed),
+            }
+        }
+    }
+
+    /// Everything a process death leaves behind: the encrypted control
+    /// object, the user object store, the archive's immutable objects, the
+    /// wrapped-registry CAS and the witness database. A relaunch rebuilds
+    /// every in-memory handle from exactly this and nothing else.
+    pub(crate) struct GenesisSmokeSubstrate {
+        control_gcs: Arc<FakeGcs>,
+        store_gcs: Arc<FakeGcs>,
+        objects: Arc<InMemoryImmutableBackend>,
+        registries: Arc<SmokeRegistryStore>,
+        witness_transport: Arc<test_transport::FakeTransport>,
+    }
+
+    /// One process's worth of in-memory handles. Dropping it is the harness's
+    /// stand-in for process death: the control store, the user store, every
+    /// launched serving authority and every provider client go with it.
+    pub(crate) struct GenesisSmokeProcess {
+        pub(crate) control: Arc<ControlStore>,
+        pub(crate) store: Arc<Store>,
+    }
+
+    impl Default for GenesisSmokeSubstrate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl GenesisSmokeSubstrate {
+        pub(crate) fn new() -> Self {
+            Self {
+                control_gcs: Arc::new(FakeGcs::new()),
+                store_gcs: Arc::new(FakeGcs::new()),
+                objects: Arc::new(InMemoryImmutableBackend::new()),
+                registries: Arc::new(SmokeRegistryStore::default()),
+                witness_transport: Arc::new(test_transport::FakeTransport::new(None, [])),
+            }
+        }
+
+        /// Boot a process over the durable substrate. Nothing carries over
+        /// from a previous one.
+        pub(crate) fn boot(&self) -> GenesisSmokeProcess {
+            GenesisSmokeProcess {
+                control: Arc::new(ControlStore::new(
+                    Arc::new(FakeKms),
+                    Arc::clone(&self.control_gcs) as Arc<dyn crate::store::GcsClient>,
+                )),
+                store: Arc::new(Store::new(
+                    Arc::new(FakeKms),
+                    Arc::clone(&self.store_gcs) as Arc<dyn crate::store::GcsClient>,
+                )),
+            }
+        }
+
+        /// Advance the witness database's trusted clock.
+        ///
+        /// A real restart takes wall time; the fake transport's clock is
+        /// otherwise frozen at one instant. Without this a crashed owner's
+        /// lease can never expire, and the restarted owner is correctly —
+        /// but permanently — fenced by its own corpse. Moving the clock is
+        /// the harness modelling elapsed time, not relaxing a predicate: the
+        /// reacquire still goes through the provider compare-and-swap and
+        /// `exact_wal_owner_reacquire_from` unchanged.
+        pub(crate) fn advance_witness_clock(&self, rfc3339_millis: &str) {
+            self.witness_transport.0.lock().unwrap().time = rfc3339_millis.to_owned();
+        }
+
+        /// A fresh witness client over the durable witness database.
+        fn witness(&self) -> Arc<FirestoreWitness> {
+            Arc::new(test_transport::witness_over_fake(Arc::clone(
+                &self.witness_transport,
+            )))
+        }
+
+        /// The provider source this process hands the reviewed driver.
+        pub(crate) fn runtime(&self) -> SmokeGenesisRuntime {
+            SmokeGenesisRuntime {
+                objects: Arc::clone(&self.objects),
+                registries: Arc::clone(&self.registries),
+                witness: self.witness(),
+            }
+        }
+    }
+
+    /// The `#[cfg(test)]` provider source. It composes the same reviewed
+    /// production types the baked source does — `ControlPlaneGenesisBackend`
+    /// over the encrypted control store, `FirestoreShadowWitness` for the
+    /// witness ladder, `SealedSingleArchiveWalRuntime` for the serving
+    /// handoff — with in-memory providers underneath instead of GCS, KMS and
+    /// Firestore. No predicate, CAS, gate or failure handler differs.
+    pub(crate) struct SmokeGenesisRuntime {
+        objects: Arc<InMemoryImmutableBackend>,
+        registries: Arc<SmokeRegistryStore>,
+        witness: Arc<FirestoreWitness>,
+    }
+
+    impl SmokeGenesisRuntime {
+        fn shadow_witness(&self) -> Arc<FirestoreShadowWitness> {
+            Arc::new(FirestoreShadowWitness::from_witness_for_test(Arc::clone(
+                &self.witness,
+            )))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GenesisRuntimeSource for SmokeGenesisRuntime {
+        fn armed(&self) -> std::result::Result<bool, GenesisTriggerError> {
+            Ok(true)
+        }
+
+        fn genesis_providers(
+            &self,
+            control: &Arc<ControlStore>,
+            binding: crate::cp::control_store::ArchiveBinding,
+        ) -> std::result::Result<GenesisDriverProviders, GenesisTriggerError> {
+            let archive_id = binding.archive_id();
+            let objects: Arc<dyn ImmutableObjectBackend> = Arc::clone(&self.objects) as Arc<_>;
+            let backend = ControlPlaneGenesisBackend::new(
+                GenesisBackendRuntimeContext::for_test(),
+                Arc::clone(control),
+                Arc::clone(&objects),
+                Arc::new(SmokeRootProvider(Arc::clone(&self.objects))),
+                Arc::clone(&self.registries) as Arc<dyn GenesisRegistryStore>,
+                Arc::clone(&self.witness),
+            );
+            Ok(GenesisDriverProviders {
+                archive_id,
+                backend: Box::new(backend),
+                objects,
+                registry_wrap: Box::new(SmokeRegistryWrap(Arc::clone(&self.registries))),
+                witness_advance: self.shadow_witness()
+                    as Arc<dyn crate::archive_v3_root_advance::ArchiveWitnessAdvanceProvider>,
+            })
+        }
+
+        async fn serving_handoff(
+            &self,
+            control: Arc<ControlStore>,
+            binding: crate::cp::control_store::ArchiveBinding,
+        ) -> std::result::Result<
+            crate::archive_v3_shadow_runtime::WalServingHandoff,
+            GenesisTriggerError,
+        > {
+            crate::archive_v3_shadow_runtime::SealedSingleArchiveWalRuntime::for_publisher_test(
+                binding,
+                Arc::clone(&self.objects) as Arc<dyn ImmutableObjectBackend>,
+                Arc::clone(&self.registries) as Arc<dyn ExactKeyRegistryProvider>,
+                self.shadow_witness(),
+                self.shadow_witness(),
+            )
+            .reconstruct_wal_serving_handoff(control)
+            .await
+            .map_err(|_| GenesisTriggerError::Conflict)
+        }
+    }
+
+    /// Owned wrap authority over the shared registry CAS, mirroring what
+    /// `ReleasedGenesisRegistryWrap` is on the production source.
+    struct SmokeRegistryWrap(Arc<SmokeRegistryStore>);
+
+    #[async_trait::async_trait]
+    impl GenesisRegistryWrapAuthority for SmokeRegistryWrap {
+        async fn wrap_registry(
+            &self,
+            context: &KeyRegistryContext,
+            registry_plaintext: &[u8],
+            destination: &mut [u8],
+        ) -> crate::archive_v3::Result<usize> {
+            self.0
+                .wrap_registry(context, registry_plaintext, destination)
+                .await
+        }
+    }
+
+    /// Converge one user over an explicit source. This is the production
+    /// entry point with the seam made visible; `converge_genesis_for_user`
+    /// is exactly this over [`BakedImageGenesisRuntime`].
+    pub(crate) async fn converge_for_smoke(
+        source: &SmokeGenesisRuntime,
+        control: &Arc<ControlStore>,
+        store: &Arc<Store>,
+        user_id: &str,
+    ) -> std::result::Result<GenesisConvergence, GenesisTriggerError> {
+        converge_genesis_over(source, control, store, user_id).await
     }
 }

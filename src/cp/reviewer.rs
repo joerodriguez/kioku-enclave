@@ -198,6 +198,65 @@ mod tests {
     use super::*;
     use crate::store::tests::{FakeGcs, FakeKms};
 
+    /// The G10 gate's user. It never signs in through Google, but its archive
+    /// binding is minted by the same `create_active_archive_binding_conn` the
+    /// sign-in transaction runs, which is the durable precondition genesis
+    /// hangs off.
+    const SMOKE_USER: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// Every fixture fact the serving lane can be asked for, read through the
+    /// routed WAL-authoritative read path and rendered as exact text.
+    ///
+    /// The six `created_at`/`updated_at` columns are deliberately IN this
+    /// comparison. `ReviewerFixturePlan` omits all six from its INSERTs and
+    /// each carries `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`, so a
+    /// wall clock runs inside `apply`. Excluding them would build a test that
+    /// cannot fail on the one axis it exists to check; including them turns
+    /// the before/after equality below into a real proof that the clock ran
+    /// exactly once and its answer was carried durably, rather than being
+    /// re-derived by whatever rebuilt the archive.
+    async fn fixture_facts_through_serving_lane(store: &Arc<Store>, user_id: &str) -> Vec<String> {
+        store
+            .wal_authoritative_read(user_id, |conn| {
+                let mut facts = Vec::new();
+                for sql in [
+                    "SELECT id || '|' || transcription_status || '|' || created_at
+                     FROM audio_segments ORDER BY id",
+                    "SELECT id || '|' || text || '|' || speaker_label || '|' || created_at
+                     FROM utterances ORDER BY id",
+                    "SELECT id || '|' || url || '|' || created_at
+                     FROM screenshots ORDER BY id",
+                    "SELECT id || '|' || title || '|' || finalization_status || '|' || created_at
+                     FROM episodes ORDER BY id",
+                    "SELECT episode_id || '|' || record_type || '|' || record_id
+                     FROM episode_members ORDER BY episode_id, record_type, record_id",
+                    "SELECT episode_id || '|' || overview || '|' || created_at
+                     FROM episode_final_briefs ORDER BY episode_id",
+                    "SELECT device_id || '|' || modality || '|' || watermark_at || '|' || updated_at
+                     FROM device_watermarks ORDER BY modality",
+                    "SELECT key || '|' || value || '|' || updated_at
+                     FROM app_metadata ORDER BY key",
+                    // The FTS shadow tables are maintained by triggers on
+                    // `utterances`, so a matching row here proves the WAL
+                    // capture carried the trigger-written shadow pages too,
+                    // not just the base table.
+                    "SELECT 'fts-depuis|' || COUNT(*) FROM utterances_fts
+                     WHERE utterances_fts MATCH 'depuis'",
+                    "SELECT 'fts-invalidation|' || COUNT(*) FROM utterances_fts
+                     WHERE utterances_fts MATCH 'invalidation'",
+                ] {
+                    let mut statement = conn.prepare(sql)?;
+                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                    for row in rows {
+                        facts.push(row?);
+                    }
+                }
+                Ok(facts)
+            })
+            .await
+            .expect("the routed serving read must answer")
+    }
+
     #[tokio::test]
     async fn reviewer_fixture_is_idempotent_and_contains_expected_evidence() {
         let kms = Arc::new(FakeKms);
@@ -228,5 +287,211 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// **G10 — the genesis spine's end-to-end gate.**
+    ///
+    /// Create a user, converge genesis, launch the owner, submit
+    /// `ReviewerFixturePlan`, kill the process, relaunch, and read the
+    /// fixture back through the routed serving lane.
+    ///
+    /// Until this test existed, `run_durable_genesis` and `install_and_launch`
+    /// had never been executed by anything: both reach a live bucket, a live
+    /// KMS key version and a live Firestore database on their first
+    /// statement, so G9 could only compile-check and structurally pin them.
+    /// This runs the composition itself, over in-memory providers behind the
+    /// module's `#[cfg(test)]` runtime source.
+    ///
+    /// What "kill the process" means here, precisely: every in-memory handle
+    /// is dropped — the control store, the user store, the launched serving
+    /// authority and its publisher lane, the WAL owner's private staged
+    /// SQLite copy, the provider clients — and process two is rebuilt from
+    /// the durable substrate alone (the encrypted control object, the
+    /// archive's immutable objects, the wrapped-registry CAS and the witness
+    /// database). It is not a real `fork`/`SIGKILL`: the harness shares one
+    /// address space, so it cannot prove that nothing survives in a static,
+    /// a leaked thread, or the allocator. It does prove that nothing the
+    /// serving lane needs is reconstructed from anything but durable state.
+    #[tokio::test]
+    async fn genesis_launch_submit_kill_relaunch_and_read_the_fixture_back() {
+        use crate::archive_v3_genesis_trigger::{
+            tests::{converge_for_smoke, GenesisSmokeSubstrate},
+            GenesisConvergence,
+        };
+        use crate::cp::control_store::WalGenesisStage;
+
+        let substrate = GenesisSmokeSubstrate::new();
+
+        // ---- process one: create the user, converge genesis, serve ----
+        let first = substrate.boot();
+        let binding = first
+            .control
+            .create_genesis_test_binding(SMOKE_USER)
+            .await
+            .unwrap();
+        let archive_id = binding.archive_id();
+        assert!(
+            !first.store.is_wal_authoritative(SMOKE_USER),
+            "a freshly bound user is on the ordinary legacy path"
+        );
+
+        let outcome = converge_for_smoke(
+            &substrate.runtime(),
+            &first.control,
+            &first.store,
+            SMOKE_USER,
+        )
+        .await
+        .expect("genesis convergence must reach the durable terminal");
+        assert_eq!(outcome, GenesisConvergence::Converged);
+
+        // The terminal contract, from the durable ledger rather than from the
+        // pass that wrote it. `is_exact_unleased_wal_authoritative_terminal`
+        // is the tree's own conjunction of the four facts the spine promises
+        // — valid, `Active`, `WalAuthoritative`, no owner, lease tick zero —
+        // and it is the exact `expected`-side conjunct set that
+        // `exact_wal_owner_acquire_from` demands. That function is not
+        // edited, and the launch below runs it for real.
+        let terminal = first
+            .control
+            .wal_genesis_authoritative_terminal_for_archive(archive_id)
+            .await
+            .unwrap()
+            .expect("the genesis ledger must hold the released terminal");
+        assert!(terminal.is_exact_unleased_wal_authoritative_terminal());
+        assert_eq!(
+            terminal.root().root().sequence(),
+            2,
+            "Variant B publishes exactly two ladder roots, satisfying \
+             archive_v3_wal_owners.root_seq CHECK (root_seq > 0)"
+        );
+        assert_eq!(
+            first
+                .control
+                .wal_genesis_ledger_stage(archive_id)
+                .await
+                .unwrap(),
+            Some(WalGenesisStage::WalAuthoritative)
+        );
+        assert!(first.store.is_wal_authoritative(SMOKE_USER));
+        assert!(first.store.has_wal_serving_authority(SMOKE_USER));
+
+        // ---- submit the probe through its real entry point ----
+        assert!(
+            ensure_demo_archive(&first.store, SMOKE_USER).await.unwrap(),
+            "the first settle must submit the plan"
+        );
+        assert!(
+            !ensure_demo_archive(&first.store, SMOKE_USER).await.unwrap(),
+            "the routed probe must see its own settled write"
+        );
+        let before_kill = fixture_facts_through_serving_lane(&first.store, SMOKE_USER).await;
+        assert!(
+            before_kill
+                .iter()
+                .any(|fact| fact == "fts-depuis|2" || fact == "fts-depuis|1"),
+            "the FTS shadow tables must have been populated by the triggers: {before_kill:?}"
+        );
+
+        // Guard against the equality below being vacuous. The plan supplies
+        // `app_metadata.updated_at` explicitly, and omits the six other
+        // timestamp columns, which therefore carry whatever
+        // `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))` returned inside
+        // `apply`. Contrasting the two proves the compared timestamps are a
+        // live clock reading rather than another constant — without pinning
+        // the test to the machine's actual date.
+        let marker_fact = before_kill
+            .iter()
+            .find(|fact| fact.starts_with("openai-review-fixture-v1|seeded|"))
+            .expect("the plan's own explicit marker timestamp")
+            .clone();
+        assert!(
+            marker_fact.ends_with("|2026-07-22T16:00:00.000Z"),
+            "the plan sets this one itself: {marker_fact}"
+        );
+        let clock_written: Vec<&String> = before_kill
+            .iter()
+            .filter(|fact| fact.starts_with("910001|") || fact.starts_with("920001|"))
+            .collect();
+        assert_eq!(clock_written.len(), 2);
+        for fact in clock_written {
+            assert!(
+                !fact.ends_with("|2026-07-22T16:00:00.000Z"),
+                "a column the plan omits must carry the default clock, not a \
+                 constant, or the survival check below proves nothing: {fact}"
+            );
+        }
+
+        // ---- kill ----
+        drop(first);
+
+        // A crashed owner leaves its own WAL-owner lease standing in the
+        // witness, and the restart cannot tell "I crashed" from "I am a
+        // zombie": `exact_wal_owner_renewal_from` cannot apply (the live
+        // record and the durable binding are the same bytes, so no tick
+        // advanced in the record), so the only remaining arm is the provider
+        // reacquire, which `exact_wal_owner_reacquire_from` admits only once
+        // trusted time is past the dead lease's expiry. That is the designed
+        // fencing cost of a restart, and it is real in production too: such a
+        // user is `unavailable` until the lease lapses, and converges on the
+        // next sign-in or token refresh. The harness's witness clock is
+        // frozen, so it has to be moved for the restart to be able to happen
+        // at all; no predicate is relaxed to get there.
+        substrate.advance_witness_clock("2026-01-02T03:20:05.123Z");
+
+        // ---- process two: rebuild from durable state alone ----
+        let second = substrate.boot();
+        assert!(
+            !second.store.is_wal_authoritative(SMOKE_USER),
+            "a fresh process starts with no selection installed"
+        );
+        assert!(!second.store.has_wal_serving_authority(SMOKE_USER));
+
+        // This is the production resumption point: `cp/oauth.rs` runs exactly
+        // this on the next sign-in or token refresh. It observes the durable
+        // terminal stage, skips the whole durable half, re-adopts the same
+        // owner reservation and relaunches the serving authority.
+        let outcome = converge_for_smoke(
+            &substrate.runtime(),
+            &second.control,
+            &second.store,
+            SMOKE_USER,
+        )
+        .await
+        .expect("the relaunch must reconstruct the serving authority");
+        assert_eq!(outcome, GenesisConvergence::AlreadyTerminal);
+        assert!(second.store.has_wal_serving_authority(SMOKE_USER));
+
+        // ---- read the fixture back through the serving read path ----
+        // `ensure_demo_archive` answering `false` is itself the readback: the
+        // reviewer probe routes through `wal_authoritative_read`, so a `false`
+        // means the relaunched lane served the settled marker.
+        assert!(
+            !ensure_demo_archive(&second.store, SMOKE_USER)
+                .await
+                .unwrap(),
+            "the relaunched serving lane must already hold the fixture"
+        );
+        let after_relaunch = fixture_facts_through_serving_lane(&second.store, SMOKE_USER).await;
+        assert_eq!(
+            before_kill, after_relaunch,
+            "every fixture fact, including the six default-clock timestamp \
+             columns the plan omits, must survive the kill byte-identically"
+        );
+        assert!(
+            after_relaunch.len() > 20,
+            "the readback must be the whole fixture, not an empty agreement"
+        );
+
+        // The ledger is unchanged by a relaunch: no third root, no second
+        // witness, no second genesis.
+        let relaunched_terminal = second
+            .control
+            .wal_genesis_authoritative_terminal_for_archive(archive_id)
+            .await
+            .unwrap()
+            .expect("the terminal must survive the kill");
+        assert_eq!(relaunched_terminal.encode(), terminal.encode());
+        assert_eq!(relaunched_terminal.root().root().sequence(), 2);
     }
 }
