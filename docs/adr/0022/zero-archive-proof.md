@@ -137,10 +137,35 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   which defaults FALSE and additionally requires baked archive-v3
   coordinates.
   Two consequences for this runbook. First, step 5 depends on flipping that
-  gate, not on building a caller. Second, `GENESIS_WAL_NATIVE` is currently
-  read from the process environment rather than being a baked, attested image
-  key — promoting it is cutover-prep and must land before the flip, or the
-  thing standing between production and archive creation is an env var.
+  gate, not on building a caller. Second, the gate is now a **baked, attested
+  image key**, so flipping it is a build-time act:
+  - `GENESIS_WAL_NATIVE` is on `BAKED_IMAGE_CONFIGURATION_KEYS` in
+    `src/main.rs` and on the `allowed_keys` allowlist in
+    `scripts/assemble_image_config.sh`. The image file is read before any
+    provider construction and **overwrites** the ambient value, and an image
+    missing any allowlisted key panics at startup. Setting
+    `GENESIS_WAL_NATIVE` on the running service therefore cannot arm genesis
+    on an image built `off`; it has no effect at all.
+  - The value is supplied per profile by the operator as
+    `PRODUCTION_GENESIS_WAL_NATIVE` (`EVALUATION_` for eval images) and is
+    required and non-empty: `require_value` in
+    `scripts/select_build_configuration.py` names the key if it is absent,
+    and only the exact words `off` and `on` are accepted. Empty is no longer
+    a spelling of "shut".
+  - `on` is refused at build time unless the image also carries an active
+    `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, in both the selector and the assembler,
+    mirroring `require_genesis_config_agreement` at startup. Since a `main`
+    build always selects the off runtime, the cutover image is necessarily an
+    exact `vX.Y.Z-archive-v3-wal.N` tag build.
+
+  **Flipping the gate is an image rebuild and redeploy under a new attested
+  digest — not a restart, not an environment change, not a Cloud Run variable
+  edit.** Step 5 must be planned as a release: change the operator profile
+  value to `on`, rebuild against the WAL release tag, push, re-verify the
+  digest against the attestation, and roll. The old digest remains the
+  rollback, and rolling back the gate is likewise a redeploy of that digest.
+  This bullet records that the *mechanism* is in place. It does **not**
+  discharge anything else in this document.
 - The transcripts lane must merge before the cutover: running this family is
   the first thing the new archives do.
 

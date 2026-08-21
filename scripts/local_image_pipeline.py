@@ -1192,7 +1192,7 @@ def runtime_config(configuration: dict[str, str], profile: str) -> dict[str, str
         "ARCHIVE_V3_ARCHIVE_BUCKET", "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
         "ARCHIVE_V3_REGISTRY_KMS_VERSION", "ARCHIVE_V3_WITNESS_PROJECT_ID",
         "ARCHIVE_V3_WITNESS_PROJECT_NUMBER", "ARCHIVE_V3_WITNESS_DATABASE_ID",
-        "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
+        "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT", "GENESIS_WAL_NATIVE",
     ):
         mapping[name] = name
     values: dict[str, str] = {}

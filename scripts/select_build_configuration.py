@@ -58,6 +58,7 @@ PROFILE_KEYS = (
     "ENCLAVE_ACME",
     "ENCLAVE_ACME_DIRECTORY",
     "ENCLAVE_ACME_CONTACT",
+    "GENESIS_WAL_NATIVE",
 )
 
 OPTIONAL_PROFILE_GROUPS = (
@@ -231,6 +232,26 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         raise SystemExit(
             "BILLING_ENFORCEMENT_MODE must be either shadow or enforce"
         )
+
+    # The genesis cutover gate is baked into the image, so flipping it is a
+    # rebuild rather than a restart. Pre-cutover the only correct value is the
+    # explicit `off`: an empty value is already refused by require_value, and
+    # is deliberately not a third spelling of "shut" at build time.
+    if configuration["GENESIS_WAL_NATIVE"] not in ("off", "on"):
+        raise SystemExit("GENESIS_WAL_NATIVE must be either off or on")
+    # Refuse at build time what require_genesis_config_agreement would refuse
+    # at startup: genesis mints a real archive through real providers, so a
+    # gate claimed without archive-v3 coordinates has nothing to mint it with.
+    # Catching it here turns a startup refusal into a named build error.
+    if (
+        configuration["GENESIS_WAL_NATIVE"] == "on"
+        and configuration["ARCHIVE_V3_SHADOW_RUNTIME_MODE"] == "off"
+    ):
+        raise SystemExit(
+            "GENESIS_WAL_NATIVE=on requires an active archive-v3 shadow runtime mode"
+        )
+
+
 def selected_configuration(
     profile: str,
     environment: dict[str, str],

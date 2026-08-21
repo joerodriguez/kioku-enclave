@@ -14,7 +14,12 @@
 //!    coordinates. Production images bake `ARCHIVE_V3_SHADOW_RUNTIME_MODE=off`
 //!    (the release tooling refuses to roll otherwise), so on a production
 //!    image today the gate is structurally false no matter what the ambient
-//!    environment says. Flipping it is a cutover act, not a deploy accident.
+//!    environment says. `GENESIS_WAL_NATIVE` is itself an allowlisted baked
+//!    image key: `load_baked_image_configuration` overwrites the ambient value
+//!    with the image's before any of this runs, and refuses to start an image
+//!    that omits it. Flipping the gate is therefore an image rebuild and
+//!    redeploy under a new attested digest — not a restart, not an env change,
+//!    and not a deploy accident.
 //! 2. **Never blocking.** [`spawn_genesis_convergence`] detaches. Sign-in
 //!    completes on the ordinary path whether genesis succeeds, fails, or never
 //!    runs at all. A wedged, unavailable, or refused genesis costs a user
@@ -204,12 +209,20 @@ pub(crate) enum GenesisConvergence {
     Converged,
 }
 
-/// Read the genesis cutover gate from the image environment.
+/// Read the genesis cutover gate from the baked image configuration.
 ///
-/// The grammar mirrors the archive-v3 runtime mode exactly: an absent or empty
-/// value is the pre-cutover image shape and yields FALSE, `off` is the same
-/// answer said explicitly, `on` is the cutover, and anything else fails closed
-/// rather than being guessed at.
+/// `GENESIS_WAL_NATIVE` is an allowlisted baked image key, so on any real
+/// image `load_baked_image_configuration` has already overwritten the ambient
+/// value with the image's own and has already refused to start an image that
+/// omits it. The pre-cutover image shape is the explicit `off`; the build
+/// tooling rejects an empty value outright.
+///
+/// The grammar mirrors the archive-v3 runtime mode: `off` is shut, `on` is the
+/// cutover, and anything else fails closed rather than being guessed at. The
+/// empty arm is retained deliberately and is *not* an image shape — it is the
+/// answer for the only callers that can still reach it (unit tests, and any
+/// invocation outside the image where the baked loader never ran). Its value
+/// is FALSE, the shut position, so keeping it cannot arm anything.
 pub(crate) fn genesis_wal_native_from_baked_env() -> std::result::Result<bool, GenesisTriggerError>
 {
     genesis_wal_native_from_mode(&std::env::var("GENESIS_WAL_NATIVE").unwrap_or_default())
@@ -754,8 +767,11 @@ pub(crate) mod tests {
 
     #[test]
     fn the_gate_defaults_to_false_and_refuses_anything_it_cannot_read() {
-        // The pre-cutover image shape (absent or empty) is FALSE, and so is an
-        // explicit `off`. Only the exact cutover value arms genesis.
+        // The pre-cutover image shape is the explicit `off`; the baked-key
+        // build tooling refuses an empty value, so the empty arm is no longer
+        // reachable from an image at all. It stays FALSE because FALSE is the
+        // shut position: the callers that can still reach it are unit tests
+        // and out-of-image invocations, and neither may arm genesis.
         assert_eq!(genesis_wal_native_from_mode(""), Ok(false));
         assert_eq!(genesis_wal_native_from_mode("off"), Ok(false));
         assert_eq!(genesis_wal_native_from_mode("on"), Ok(true));

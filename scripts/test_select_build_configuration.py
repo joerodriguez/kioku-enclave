@@ -56,6 +56,7 @@ CONFIGURATION = {
     "ENCLAVE_ACME": "1",
     "ENCLAVE_ACME_DIRECTORY": "https://acme-v02.api.letsencrypt.org/directory",
     "ENCLAVE_ACME_CONTACT": "mailto:owner@example.com",
+    "GENESIS_WAL_NATIVE": "off",
 }
 
 APPLE_CONFIGURATION = {
@@ -551,6 +552,94 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
         self.assertNotIn("f" * 64, selected)
+
+    def test_genesis_gate_is_a_baked_key_and_cannot_be_set_at_launch(self) -> None:
+        # The gate travels the same path as every other baked name: the
+        # selector takes it from the profile-prefixed operator value, the
+        # assembler allowlists it at the image boundary, and the binary's
+        # allowlist makes the baked file overwrite whatever the process
+        # environment says. Every link is asserted, because the property only
+        # holds if all of them do.
+        selector = SELECTOR.read_text(encoding="utf-8")
+        pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
+        assembler = (ROOT / "scripts" / "assemble_image_config.sh").read_text(
+            encoding="utf-8"
+        )
+        main = MAIN.read_text(encoding="utf-8")
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn('"GENESIS_WAL_NATIVE",', selector)
+        self.assertIn("GENESIS_WAL_NATIVE", assembler)
+        self.assertIn('"GENESIS_WAL_NATIVE",', main)
+        self.assertIn('"GENESIS_WAL_NATIVE"', pipeline)
+        self.assertIn("GENESIS_WAL_NATIVE", dockerfile)
+        # The gate must not be a Docker build argument: those are recorded in
+        # image history and are an operator-supplied launch-time surface.
+        self.assertNotIn("ARG GENESIS_WAL_NATIVE", dockerfile)
+        # The baked file overwrites ambient values and an image that omits any
+        # allowlisted key refuses to start; both are what make a launch-time
+        # GENESIS_WAL_NATIVE unable to arm an image built `off`.
+        self.assertIn("std::env::set_var(name, value);", main)
+        self.assertIn('panic!("baked image configuration is incomplete")', main)
+
+        # The bare name in the process environment is never a source. An
+        # operator who exports GENESIS_WAL_NATIVE=on at build time still gets
+        # the profile's baked `off`, and the selector never reads the value.
+        hostile = environment()
+        hostile["GENESIS_WAL_NATIVE"] = "on"
+        completed, selected_env = self.run_selector("production", hostile)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("GENESIS_WAL_NATIVE=off\n", selected_env)
+        self.assertNotIn("GENESIS_WAL_NATIVE=on\n", selected_env)
+
+    def test_genesis_gate_value_is_required_explicit_and_agrees_with_archive_v3(
+        self,
+    ) -> None:
+        # Empty is not a third spelling of "shut" once the name is a required
+        # baked key, and an unknown value is never guessed at in either
+        # direction. Both refusals must name the key for the operator.
+        for value in ("", "  ", "0", "1", "true", "false", "On", "ON", "yes", " off"):
+            with self.subTest(value=value):
+                env = environment()
+                env["PRODUCTION_GENESIS_WAL_NATIVE"] = value
+                completed, content = self.run_selector("production", env)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+                self.assertIn("GENESIS_WAL_NATIVE", completed.stderr)
+
+        # Claiming the gate on an image with no archive-v3 coordinates is
+        # refused at build time, mirroring require_genesis_config_agreement.
+        # `main` always selects the off runtime, so this is the shape an
+        # operator would actually hit by flipping the value alone.
+        armed = environment()
+        armed["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
+        completed, content = self.run_selector("production", armed)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("GENESIS_WAL_NATIVE", completed.stderr)
+        self.assertIn("archive-v3", completed.stderr)
+
+        # The gate is still flippable: with the archive-v3 coordinates the
+        # cutover actually requires, `on` selects cleanly. This PR arms
+        # nothing, but it must not have made the cutover unbuildable either.
+        completed, content = self.run_selector(
+            "production",
+            armed,
+            source_ref="v1.2.3-archive-v3-wal.1",
+            shadow_runtime_config={
+                "schema_version": 2,
+                "mode": "single-archive-wal-v1",
+                "archive_bucket": "archive-bucket-1",
+                "archive_gcs_project_number": "123456789",
+                "registry_kms_version": "7",
+                "witness_project_id": "project-1",
+                "witness_project_number": "987654321",
+                "witness_database_id": "witness-db",
+                "archive_binding_commitment": "a" * 64,
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("GENESIS_WAL_NATIVE=on\n", content)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", content)
 
 
 if __name__ == "__main__":

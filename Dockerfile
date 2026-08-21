@@ -42,7 +42,16 @@
 # ARCHIVE_V3_SHADOW_RUNTIME_MODE ARCHIVE_V3_ARCHIVE_BUCKET
 # ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER ARCHIVE_V3_REGISTRY_KMS_VERSION
 # ARCHIVE_V3_WITNESS_PROJECT_ID ARCHIVE_V3_WITNESS_PROJECT_NUMBER
-# ARCHIVE_V3_WITNESS_DATABASE_ID ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT.
+# ARCHIVE_V3_WITNESS_DATABASE_ID ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT
+# GENESIS_WAL_NATIVE.
+#
+# GENESIS_WAL_NATIVE is the ADR-0022 cutover gate and is baked for the same
+# reason as the rest: it is covered by the attested image digest, so it cannot
+# be set at launch. It is `off` or `on`, never empty, and `on` additionally
+# requires an active ARCHIVE_V3_SHADOW_RUNTIME_MODE. Flipping the gate is a
+# rebuild and redeploy of a new attested digest, not a restart or an env
+# change. The operator supplies it per profile as PRODUCTION_GENESIS_WAL_NATIVE
+# / EVALUATION_GENESIS_WAL_NATIVE; the selector names the key if it is absent.
 #
 # Required build args (a non-secret config-content hash; CONFIG_SHA256 is
 # declared only in the late image-config stage):
