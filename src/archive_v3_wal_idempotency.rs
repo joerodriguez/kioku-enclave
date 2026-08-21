@@ -532,6 +532,10 @@ impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResult
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardAttemptLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowAttemptPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowAttemptLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowTranscriptPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowTranscriptLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
 impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailDeliverySettlementPlan {}
@@ -958,6 +962,73 @@ mod tests {
         assert!(a.starts_with(b"family-a-v1"));
         // Fail closed on an unnamed family.
         assert!(stable_operation_source(b"", &[b"k"]).is_err());
+
+        // ADR-0022 slice 11 registration: the audio-transcript family's
+        // identity byte strings are pairwise distinct — against each other
+        // AND against the sealed screen family they were cloned from — so
+        // the two kind-sharing families can never collide on a ledger row
+        // and no hash domain doubles as an operation-id source.
+        let registered: &[&[u8]] = &[
+            // audio family
+            b"audio-window-vertex-attempt-v1\0",
+            b"archive-v3-audio-window-vertex-event-v1\0",
+            b"archive-v3-audio-window-vertex-binding-v1\0",
+            b"audio-window-transcript-v1-bound-attempt",
+            b"audio-window-transcript-bound-v1\0",
+            b"archive-v3-audio-window-predecessor-v1\0",
+            b"archive-v3-audio-window-work-attempt-v1\0",
+            b"archive-v3-audio-window-vertex-attempt-row-v1\0",
+            // sealed screen siblings sharing kinds 6 and 7
+            b"screen-storyboard-vertex-attempt-v1\0",
+            b"archive-v3-screen-storyboard-vertex-event-v1\0",
+            b"archive-v3-screen-storyboard-vertex-binding-v1\0",
+            b"screen-storyboard-no-people-v2-bound-attempt",
+            b"screen-storyboard-result-bound-v2\0",
+            b"archive-v3-screen-storyboard-predecessor-v1\0",
+            b"archive-v3-screen-storyboard-work-attempt-v1\0",
+            b"archive-v3-screen-storyboard-vertex-attempt-v1\0",
+        ];
+        for (left_index, left) in registered.iter().enumerate() {
+            for right in &registered[left_index + 1..] {
+                assert_ne!(left, right, "duplicate registered domain byte string");
+            }
+        }
+        // No subtype-framed derivation may equal a bare-id derivation: the
+        // historical v1 screen result derives from the bare vertex event id
+        // on the SAME kind the audio transcript uses.
+        let event = b"vtx_0000000000000000000000000000000000000000000000000000000000000000";
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"audio-window-transcript-bound-v1\0");
+        framed.extend_from_slice(event);
+        let mut screen_framed = Vec::new();
+        screen_framed.extend_from_slice(b"screen-storyboard-result-bound-v2\0");
+        screen_framed.extend_from_slice(event);
+        let kind = WalOperationKind::DeterministicMediaWorkResult;
+        let bare = WalLogicalOperationId::from_stable_source(kind, event).unwrap();
+        let audio_bound = WalLogicalOperationId::from_stable_source(kind, &framed).unwrap();
+        let screen_bound = WalLogicalOperationId::from_stable_source(kind, &screen_framed).unwrap();
+        assert_ne!(audio_bound, bare);
+        assert_ne!(audio_bound, screen_bound);
+        assert_ne!(screen_bound, bare);
+        // Kind 7 attempt sources are likewise family-separated.
+        let mut audio_attempt = Vec::new();
+        audio_attempt.extend_from_slice(b"audio-window-vertex-attempt-v1\0");
+        audio_attempt.extend_from_slice(event);
+        let mut screen_attempt = Vec::new();
+        screen_attempt.extend_from_slice(b"screen-storyboard-vertex-attempt-v1\0");
+        screen_attempt.extend_from_slice(event);
+        assert_ne!(
+            WalLogicalOperationId::from_stable_source(
+                WalOperationKind::VertexUsage,
+                &audio_attempt
+            )
+            .unwrap(),
+            WalLogicalOperationId::from_stable_source(
+                WalOperationKind::VertexUsage,
+                &screen_attempt
+            )
+            .unwrap()
+        );
     }
     use super::*;
     use rusqlite::{params, OptionalExtension};

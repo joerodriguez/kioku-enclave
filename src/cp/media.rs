@@ -26,8 +26,11 @@ use super::{auth::AuthUser, limits, CpState};
 const MAX_AUDIO_BYTES: i64 = 20 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: i64 = 5 * 1024 * 1024;
 const MAX_ID_LEN: usize = 128;
-const MAX_TEXT_LEN: usize = 20_000;
-const MAX_TURNS: usize = 10_000;
+// Re-exported pub(crate) so the ADR-0022 audio transcript plan can never
+// drift from the caps `parse_audio_result` enforces (the text cap counts
+// CHARS, not bytes).
+pub(crate) const MAX_TEXT_LEN: usize = 20_000;
+pub(crate) const MAX_TURNS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_MULTIPART_BYTES: usize = MAX_AUDIO_BYTES as usize + MAX_MANIFEST_BYTES + 64 * 1024;
 const MAX_REFERENCE_BATCH_BYTES: usize = 1024 * 1024;

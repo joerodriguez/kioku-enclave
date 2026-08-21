@@ -64,7 +64,22 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # branch; every legacy call expression, ordinal, and classification is
 # byte-identical (diffed against pristine origin/main after 10e/10f:
 # 219 -> 225, zero reclassifications, zero removals).
-EXPECTED_STORE_CALL_COUNT = 227
+# Plan-family slice 11 (audio-window transcripts): the audio arm's settled
+# halves add five routed sites under two new B owners --
+# settle_audio_window_attempt (the merged commitments+candidate-vocabulary
+# read, then the attempt submit) and settle_audio_window_transcript (the
+# immediately-pre-submit terminal-attempt/predecessor/sequence-pin read, the
+# bound-transcript submit, and the single Conflict resubmission of the
+# identical prepared object). 227 -> 232, dumped and diffed against a
+# pristine origin/main (a475422) tree with the gate's own helpers: exactly
+# five additions, zero removals, zero reclassifications, and zero moved
+# call-expression hashes anywhere. The ONE other row delta is
+# process_work_unit#0's OWNER-BODY hash, which moves because the audio WAL
+# branch was added inside it; its three legacy call expressions
+# (with_user#0, with_user#1, save_user#0) are byte-identical, so the legacy
+# audio tail -- candidate_name_vocabulary via with_user, persist via
+# with_user, save_user -- is intact for unselected users.
+EXPECTED_STORE_CALL_COUNT = 232
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -75,7 +90,7 @@ EXPECTED_STORE_CALL_COUNT = 227
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "ba95e4879f13a9c04cdd7a7e80eeee111eef5b18b69f32ba1ea3406c3529de08"
+EXPECTED_STORE_CALL_SHA256 = "82b83dab43df61a64d1d9102d3db8e46635a8931908ace703fc75f778adb0b6b"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -799,6 +814,8 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
+        "src/cp/media_worker.rs::settle_audio_window_attempt#0",
+        "src/cp/media_worker.rs::settle_audio_window_transcript#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_attempt#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_result#0",
         "src/cp/model_usage.rs::begin_invocation#0",
@@ -1341,6 +1358,13 @@ impl X {
             encoding="utf-8"
         )
         result_production = without_cfg_test_items(result_domain)
+        audio_attempt_domain = (
+            ROOT / "src/cp/media_worker/wal/audio_attempt.rs"
+        ).read_text(encoding="utf-8")
+        audio_result_domain = (
+            ROOT / "src/cp/media_worker/wal/audio_result.rs"
+        ).read_text(encoding="utf-8")
+        audio_result_production = without_cfg_test_items(audio_result_domain)
         email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -1915,6 +1939,89 @@ impl X {
             "persist_storyboard_results(conn, &work.id, &work.jobs, results)",
             media_worker,
         )
+        # ADR-0022 slice 11: the audio-window transcript family is WIRED --
+        # a kind-7 attempt boundary and a kind-6 bound transcript, mirroring
+        # the sealed screen chain, with the audio-specific facts the design
+        # requires: the member bound is the lease LIMIT (128, never the
+        # screen family's 12-frame cap) and the four AUTOINCREMENT ids come
+        # from fingerprinted sqlite_sequence pins, never MAX(id)+1.
+        self.assertIn("pub(super) mod audio_attempt;", retention_domain)
+        self.assertIn("pub(super) mod audio_result;", retention_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowAttemptPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowAttemptLedger",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowTranscriptPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowTranscriptLedger",
+            gate,
+        )
+        self.assertIn("struct AudioWindowAttemptPlan", audio_attempt_domain)
+        self.assertIn("struct AudioWindowAttemptLedger", audio_attempt_domain)
+        self.assertIn(
+            "archive_v3_wal_audio_vertex_attempt_operations", audio_attempt_domain
+        )
+        self.assertIn("audio-window-vertex-attempt-v1", audio_attempt_domain)
+        self.assertIn(
+            "current_audio_work_attempt_commitments", audio_attempt_domain
+        )
+        self.assertIn(
+            "authenticate_audio_window_attempt_binding", audio_attempt_domain
+        )
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", audio_attempt_domain)
+        self.assertIn("DomainLedgerBounds::new", audio_attempt_domain)
+        self.assertIn("WalIdempotencyError::Precondition", audio_attempt_domain)
+        self.assertIn("struct AudioWindowTranscriptPlan", audio_result_domain)
+        self.assertIn("struct AudioWindowTranscriptLedger", audio_result_domain)
+        self.assertIn(
+            "archive_v3_wal_audio_transcript_result_operations", audio_result_domain
+        )
+        self.assertIn(
+            "audio-window-transcript-v1-bound-attempt", audio_result_domain
+        )
+        # The member bound is the audio lease LIMIT. MAX_SCREEN_FRAMES (12)
+        # is not an audio cap; pinning 128 keeps a future edit from importing
+        # the screen number and terminal-failing every wider window.
+        self.assertIn("const MAX_AUDIO_MEMBERS: usize = 128;", audio_result_domain)
+        self.assertIn("MIN_PROVIDER_ATTEMPT_WINDOW_MILLIS", audio_result_domain)
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", audio_result_domain)
+        self.assertIn("DomainLedgerBounds::new", audio_result_domain)
+        self.assertIn("WalIdempotencyError::Precondition", audio_result_domain)
+        self.assertIn("read_audio_sequence_pins", audio_result_domain)
+        # The sealed identity/voice exclusion is structural, not a comment:
+        # the production half of the transcript domain must contain no voice
+        # or identity table, no embedding-job enqueue, and no MAX(id)
+        # allocation. Scanned with comments and string literals blanked so a
+        # doc-comment mention cannot satisfy or trip the pin. Any change here
+        # re-opens F8's sealed recalculate-exclusion review.
+        audio_result_code = sanitize_rust(audio_result_production)
+        for forbidden in (
+            "voice_embedding_jobs",
+            "voice_samples",
+            "voice_profiles",
+            "enqueue_embedding_job",
+            "identity_evidence",
+            "person_name_claims",
+            "resolve_speaker_attribution",
+            "MAX(id)",
+        ):
+            self.assertNotIn(forbidden, audio_result_code)
+        # The audio arm is wired end to end and the legacy tail survives for
+        # unselected users.
+        self.assertIn("AudioWindowAttemptPlan::new(", media_worker)
+        self.assertIn("settle_audio_window_attempt", media_worker)
+        self.assertIn("AudioWindowTranscriptPlan::new(", media_worker)
+        self.assertIn("settle_audio_window_transcript", media_worker)
+        self.assertIn("current_audio_vertex_attempt_commitment", media_worker)
+        self.assertIn("read_audio_sequence_pins", media_worker)
+        self.assertIn("persist_audio_window_result(", media_worker)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
             gate,
