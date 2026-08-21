@@ -399,16 +399,39 @@ class SchemaLadderGateTest(unittest.TestCase):
             "gate script, so the act cannot happen in the seal file alone",
         )
 
-    def test_seal_never_unseals(self) -> None:
-        """G-SEAL-3. Sealing is only honest once the window was actually used.
+    def test_seal_is_latched_to_its_own_evidence(self) -> None:
+        """G-SEAL-3. A seal may only be set once its proof records a take.
+
+        The consequent this rule used to carry — `len(history) >= 2` — was
+        provably DEAD, not merely vacuous: G-SEAL-2 already asserts
+        `len == SEALED_HISTORY_LEN` (3) unconditionally and G-SEAL-4a forces
+        the same, so it could never fail. Meanwhile the honesty property the
+        rule is named for went unenforced: the chain binds the proof
+        FILENAME, never the document, so `sealed: true` could be set with no
+        `docs/` directory at all. That is a seal which asserts rather than
+        latches — the exact defect this whole seal block exists to correct.
 
         Note what this does NOT do: it does not forbid `true` -> `false`.
-        That claim used to be attached to this test and was simply false —
-        unsealing left every length and digest rule satisfied. G-SEAL-5 is
-        what forbids it, by pinning the bit itself.
+        G-SEAL-5 is what forbids it, by pinning the bit itself.
         """
-        if self.seal["sealed"]:
-            self.assertGreaterEqual(len(self.seal["history"]), 2)
+        if not self.seal["sealed"]:
+            return
+        proof = ROOT / self.seal["history"][-1]["proof"]
+        self.assertTrue(
+            proof.is_file(),
+            f"sealed, but the proof it names does not exist: {proof}",
+        )
+        recorded = proof.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "NO TAKE HAS BEEN RECORDED",
+            recorded,
+            f"sealed, but {proof} still declares the obligation undischarged",
+        )
+        self.assertNotIn(
+            "*Not taken.*",
+            recorded,
+            f"sealed, but {proof} still has an untaken measurement",
+        )
 
     def test_seal_history_is_append_only(self) -> None:
         """G-SEAL-4a. Every entry but the last is pinned verbatim here."""

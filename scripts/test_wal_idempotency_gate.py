@@ -181,9 +181,13 @@ EXPECTED_POLICY_SITE_COUNT = 42
 # the epoch-marker latch — `read_archive_epoch` + `validate_servable_epoch`,
 # refusing via `wal_owner_open_error()`. That branch previously performed no
 # schema comparison at all, so an archive built by a pre-re-baseline binary
-# was served rather than refused. **Exactly one row changed and it changed
-# only in the owner-body field:** the count stays 42, no call site was added,
-# removed or reclassified, and every policy expression hash is byte-identical.
+# was served rather than refused. **Six rows changed — every
+# `src/store.rs::open_db#0::*` row — and each changed ONLY in its owner-body
+# field:** the count stays 42, the key set is byte-identical, no call site was
+# added, removed or reclassified, and every policy expression hash is
+# unchanged. (An earlier revision of this comment said "exactly one row";
+# that was wrong, and these comments are the whole audit trail a reviewer
+# has for a pinned security value.)
 EXPECTED_POLICY_SITE_SHA256 = "11194ee709351375f51bc224823f0dbb1130e4c8380290c0c3d43e8dfcb29bf8"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {

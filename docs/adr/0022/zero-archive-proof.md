@@ -127,10 +127,20 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
 
 ## Prerequisites that are not yet met
 
-- The genesis spine must be **live** before step 5.
-  `initialize_genesis_store` still carries `#[allow(dead_code)]` for want of a
-  production caller. Deploy before genesis is live and step 7 cannot run, so
-  signup cannot reopen.
+- The genesis spine is **wired but gated**, and the gate must be flipped
+  before step 5. This corrects an earlier revision of this document, which
+  claimed `initialize_genesis_store` had no production caller: it does. G9
+  (#317) hung genesis off the sign-in path, so the live chain is
+  `oauth.rs` sign-in / token refresh -> `spawn_genesis_convergence` ->
+  `converge_genesis_for_user` -> `run_durable_genesis` ->
+  `initialize_genesis_store`. What holds it shut is `GENESIS_WAL_NATIVE`,
+  which defaults FALSE and additionally requires baked archive-v3
+  coordinates.
+  Two consequences for this runbook. First, step 5 depends on flipping that
+  gate, not on building a caller. Second, `GENESIS_WAL_NATIVE` is currently
+  read from the process environment rather than being a baked, attested image
+  key — promoting it is cutover-prep and must land before the flip, or the
+  thing standing between production and archive creation is an env var.
 - The transcripts lane must merge before the cutover: running this family is
   the first thing the new archives do.
 

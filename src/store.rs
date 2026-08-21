@@ -7270,10 +7270,6 @@ pub(crate) struct GenesisStoreFacts {
 /// that gets measured, so the length and hash published here would disagree
 /// with the bytes the owner authenticates on open, and the archive would be
 /// unopenable from birth.
-#[allow(
-    dead_code,
-    reason = "reserved for the reviewed genesis composition; no production caller exists yet"
-)]
 pub(crate) fn initialize_genesis_store(path: &Path) -> Result<GenesisStoreFacts> {
     init_vec_extension();
     let conn = Connection::open(path)?;
@@ -11979,8 +11975,12 @@ pub(crate) mod tests {
 
     #[test]
     fn baseline_declares_autoincrement_for_every_deleting_allocator_table() {
-        let conn = Connection::open_in_memory().unwrap();
+        // Registration is a sqlite3_auto_extension hook, so it must precede
+        // the open or SCHEMA_SQL's vec0 virtual tables fail with "no such
+        // module". Inverted, these passed only when an alphabetically earlier
+        // test happened to fire the Once first.
         init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         run_migrations(&conn).unwrap();
         for table in ALLOCATOR_TABLES {
@@ -12004,8 +12004,12 @@ pub(crate) mod tests {
         // The single most important assertion in the re-baseline. On the
         // pre-edit baseline every one of these reissues id 1, which is the
         // killed MAX(id)+1 allocator with its guardrail removed.
-        let conn = Connection::open_in_memory().unwrap();
+        // Registration is a sqlite3_auto_extension hook, so it must precede
+        // the open or SCHEMA_SQL's vec0 virtual tables fail with "no such
+        // module". Inverted, these passed only when an alphabetically earlier
+        // test happened to fire the Once first.
         init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         run_migrations(&conn).unwrap();
         conn.execute_batch(

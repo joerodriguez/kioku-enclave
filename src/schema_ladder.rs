@@ -701,9 +701,27 @@ mod tests {
             .to_string()
             .contains("32 bytes"));
 
+        // Restore a well-formed digest first. Leaving the 8-byte one in place
+        // made this assertion unfalsifiable on its own axis: the read would
+        // have failed on the digest whatever the epoch said.
+        conn.execute(
+            "UPDATE schema_epoch SET chain_digest = ?1",
+            [&chain_digest(0)[..]],
+        )
+        .unwrap();
+        assert!(
+            read_archive_epoch(&conn).is_ok(),
+            "precondition: with a well-formed row the read must succeed, or \
+             the epoch assertion below proves nothing"
+        );
+
         conn.execute("UPDATE schema_epoch SET epoch = -1", [])
             .unwrap();
-        assert!(read_archive_epoch(&conn).is_err());
+        let refusal = read_archive_epoch(&conn).unwrap_err().to_string();
+        assert!(
+            !refusal.contains("32 bytes"),
+            "the refusal must be attributable to the epoch, not the digest: {refusal}"
+        );
     }
 
     #[test]
