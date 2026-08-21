@@ -365,6 +365,29 @@ impl ArchiveV3ShadowRuntimeBundle {
         self.genesis_registries.clone()
     }
 
+    /// Token-gated release of the immutable-object backend for the reviewed
+    /// genesis producer. It is the same handle the maintenance importer
+    /// receives; the separate accessor exists so the genesis composition never
+    /// has to mint a maintenance token to reach it.
+    pub(crate) fn genesis_objects(
+        &self,
+        _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Arc<dyn ImmutableObjectBackend> {
+        Arc::clone(&self.objects)
+    }
+
+    /// Token-gated release of the Firestore witness adapter the genesis
+    /// backend needs for the sealed initial-witness create protocol. `None`
+    /// outside the production constructor.
+    pub(crate) fn genesis_firestore_witness(
+        &self,
+        token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Option<Arc<crate::archive_v3_firestore_witness::FirestoreWitness>> {
+        self.wal_owner_witness
+            .as_ref()
+            .map(|witness| witness.genesis_firestore_witness(token))
+    }
+
     /// Token-gated release of the exact witness-advance provider for the
     /// reviewed genesis witness ladder (G6). Like the two accessors above,
     /// the token has no production minter today, so this stays unreachable
@@ -752,6 +775,39 @@ impl SealedSingleArchiveWalRuntime {
         .map(WalServingHandoff::Maintenance)
     }
 
+    /// Genesis composition: consume the seal and release exactly the provider
+    /// handles the reviewed genesis producer and witness ladder need, bound to
+    /// this sealed runtime's own archive. Like the serving handoff, this
+    /// consumes `self`, so one sealed runtime can be spent on genesis or on
+    /// serving, never both. The token has one production minter, held by the
+    /// reviewed genesis sign-in trigger.
+    pub(crate) fn into_genesis_parts(
+        self,
+        token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Result<GenesisRuntimeParts, ArchiveV3ShadowRuntimeConstructionError> {
+        let archive_id = self.binding.binding.archive_id();
+        let registries = self
+            .bundle
+            .genesis_registry_provider(token)
+            .ok_or(ArchiveV3ShadowRuntimeConstructionError::Unavailable)?;
+        let witness = self
+            .bundle
+            .genesis_firestore_witness(token)
+            .ok_or(ArchiveV3ShadowRuntimeConstructionError::Unavailable)?;
+        let witness_advance = self
+            .bundle
+            .genesis_witness_advance(token)
+            .ok_or(ArchiveV3ShadowRuntimeConstructionError::Unavailable)?;
+        Ok(GenesisRuntimeParts {
+            archive_id,
+            objects: self.bundle.genesis_objects(token),
+            roots: self.bundle.genesis_exact_roots(token),
+            registries,
+            witness,
+            witness_advance,
+        })
+    }
+
     /// One-shot inactive composition. This has no startup caller and returns
     /// only the private maintenance state machine, never raw providers.
     pub(crate) fn into_maintenance_importer(
@@ -775,6 +831,25 @@ impl SealedSingleArchiveWalRuntime {
 impl fmt::Debug for SealedSingleArchiveWalRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SealedSingleArchiveWalRuntime(<inactive>)")
+    }
+}
+
+/// Released provider set for exactly one archive's genesis run. It carries no
+/// witness record, no lease, and no durable authority: every one of these
+/// handles still enforces its own exact-context, CAS, and readback predicates.
+pub(crate) struct GenesisRuntimeParts {
+    pub(crate) archive_id: ArchiveId,
+    pub(crate) objects: Arc<dyn ImmutableObjectBackend>,
+    pub(crate) roots: Arc<dyn ExactRootProvider>,
+    pub(crate) registries: Arc<GcsArchiveV3RegistryProvider>,
+    pub(crate) witness: Arc<crate::archive_v3_firestore_witness::FirestoreWitness>,
+    pub(crate) witness_advance:
+        Arc<dyn crate::archive_v3_root_advance::ArchiveWitnessAdvanceProvider>,
+}
+
+impl fmt::Debug for GenesisRuntimeParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GenesisRuntimeParts(<opaque>)")
     }
 }
 

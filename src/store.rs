@@ -2614,6 +2614,19 @@ impl Store {
         }
     }
 
+    /// True exactly when this process has already registered a launched WAL
+    /// serving authority for the user. `install_wal_serving_authority` is
+    /// install-once, so a launcher must ask this before launching: a second
+    /// launch would acquire a competing WAL-owner lease and fence the
+    /// authority that is already serving. A poisoned registry answers "yes",
+    /// which refuses a new launch rather than racing one.
+    pub(crate) fn has_wal_serving_authority(&self, user_id: &str) -> bool {
+        match self.wal_serving_authorities.read() {
+            Ok(authorities) => authorities.contains_key(user_id),
+            Err(_) => true,
+        }
+    }
+
     fn wal_serving_authority(
         &self,
         user_id: &str,

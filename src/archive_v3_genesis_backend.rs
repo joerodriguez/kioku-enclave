@@ -42,8 +42,18 @@ use crate::{
 /// has no public or sibling constructor and no production minter today.
 pub(crate) struct GenesisBackendRuntimeContext(());
 
-#[cfg(test)]
 impl GenesisBackendRuntimeContext {
+    /// The single production minter. It consumes the genesis sign-in
+    /// trigger's own private token, which that module alone can construct, so
+    /// the bundle accessors this token gates stay reachable from exactly one
+    /// reviewed launcher and from nowhere else in startup, Store, or routes.
+    pub(crate) const fn for_genesis_trigger(
+        _token: &crate::archive_v3_genesis_trigger::GenesisTriggerContext,
+    ) -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
         Self(())
     }
