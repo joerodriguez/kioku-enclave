@@ -3922,17 +3922,24 @@ pub(super) mod tests {
     // (store.rs SCHEMA_SQL + run_migrations), save/reload, shadow parity,
     // and fingerprint re-validation.
     //
-    // VERDICT: the gate FAILS the family. The frozen epoch-0 baseline
-    // creates `audio_segments` and `utterances` WITHOUT AUTOINCREMENT
-    // (media.rs's AUTOINCREMENT DDL is a no-op `IF NOT EXISTS` behind it),
-    // so those two tables never allocate `sqlite_sequence` rows, the
-    // carried pins are the constant 0, and the first transcript apply on a
-    // real archive fails closed at the post-state pin re-validation. This
-    // test pins the blocking facts — the family is BLOCKED, not shipped,
-    // until a separately reviewed schema treatment gives both tables
-    // explicit sequences.
+    // VERDICT (original): the gate FAILED the family. The frozen epoch-0
+    // baseline created `audio_segments` and `utterances` WITHOUT
+    // AUTOINCREMENT (media.rs's AUTOINCREMENT DDL is a no-op `IF NOT EXISTS`
+    // behind it), so those two tables never allocated `sqlite_sequence` rows,
+    // the carried pins were the constant 0, and the first transcript apply on
+    // a real archive failed closed at the post-state pin re-validation.
+    //
+    // VERDICT (now): the sealed re-baseline gave both tables explicit
+    // sequences, so the blocking facts are inverted rather than deleted —
+    // deleting the test that found the defect would delete the only record of
+    // what "fixed" means here. Blocking fact 1 and blocking fact 2 below now
+    // assert the opposite of what they used to, on the same real baseline.
+    //
+    // The remaining §5.6.1 work — the full apply/replay window, the second
+    // window's pre-state pins, and killing the divergent `install_schema`
+    // fixture — belongs to the transcripts lane, which owns this file.
     #[test]
-    fn t24_sequence_gate_blocks_the_family_on_the_production_baseline() {
+    fn t24_sequence_gate_admits_the_family_on_the_production_baseline() {
         crate::store::init_vec_extension();
         let directory = tempdir().unwrap();
         let path = directory.path().join("t24-production.sqlite");
@@ -3945,7 +3952,9 @@ pub(super) mod tests {
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
 
-        // Blocking fact 1: the baseline DDL splits the four pinned tables.
+        // Blocking fact 1, INVERTED: the baseline DDL now declares all four
+        // pinned tables AUTOINCREMENT. It used to declare only two, and that
+        // split is what blocked the family.
         let ddl = |table: &str| -> String {
             connection
                 .query_row(
@@ -3955,13 +3964,15 @@ pub(super) mod tests {
                 )
                 .unwrap()
         };
-        assert!(!ddl("audio_segments").contains("AUTOINCREMENT"));
-        assert!(!ddl("utterances").contains("AUTOINCREMENT"));
+        assert!(ddl("audio_segments").contains("AUTOINCREMENT"));
+        assert!(ddl("utterances").contains("AUTOINCREMENT"));
         assert!(ddl("speaker_clusters").contains("AUTOINCREMENT"));
         assert!(ddl("speaker_observations").contains("AUTOINCREMENT"));
 
-        // Blocking fact 2: inserts into the two plain tables never move
-        // sqlite_sequence, so the pin discipline cannot observe them.
+        // Blocking fact 2, INVERTED: inserts into all four tables now move
+        // sqlite_sequence, so the pin discipline observes them — and, the
+        // point of the whole change, DELETING every row leaves the high-water
+        // standing so an id can never be reissued.
         connection
             .execute(
                 "INSERT INTO audio_segments
@@ -3981,13 +3992,22 @@ pub(super) mod tests {
         let pins = read_audio_sequence_pins(&connection).unwrap();
         assert_eq!(
             pins,
-            AudioSequencePins::new(0, 0, 0, 0),
-            "plain INTEGER PRIMARY KEY tables must not appear in sqlite_sequence"
+            AudioSequencePins::new(1, 0, 0, 1),
+            "AUTOINCREMENT tables must appear in sqlite_sequence after one insert"
         );
         connection.execute("DELETE FROM utterances", []).unwrap();
         connection
             .execute("DELETE FROM audio_segments", [])
             .unwrap();
+        // The id-reuse proof, and the most important assertion in this file:
+        // the pins do NOT rewind. On the pre-re-baseline plain-PK tables the
+        // next insert reissued id 1 — the killed MAX(id)+1 allocator with its
+        // guardrail removed.
+        assert_eq!(
+            read_audio_sequence_pins(&connection).unwrap(),
+            AudioSequencePins::new(1, 0, 0, 1),
+            "DELETE must not rewind the high-water; ids are never reissued"
+        );
 
         // Explicit sequences that DO exist survive an archive save/reload.
         connection
@@ -4079,10 +4099,12 @@ pub(super) mod tests {
             crate::archive_v3_shadow_parity::ShadowParityResult::Mismatch(_)
         ));
 
-        // Blocking fact 3: the FIRST transcript apply on the production
-        // baseline fails closed (Corrupt at the post-state pin
-        // re-validation) and rolls back completely — fingerprint
-        // re-validation then refuses to adopt anything.
+        // Blocking fact 3, INVERTED: the FIRST transcript apply on the
+        // production baseline now SUCCEEDS. It used to fail closed (Corrupt at
+        // the post-state pin re-validation) because the carried pins were the
+        // constant 0 while the tables allocated real ids, so the re-validation
+        // could never be satisfied. Nothing in the family changed to fix that;
+        // the baseline did.
         let mut connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
@@ -4097,33 +4119,53 @@ pub(super) mod tests {
             WORK_ONE,
             &receipt,
             1,
-            vec![fact("turn-1", 0, 900, "speaker_0", "blocked family")],
+            vec![fact("turn-1", 0, 900, "speaker_0", "admitted family")],
         );
+        let before = read_audio_sequence_pins(&connection).unwrap();
         let plan = transcript_plan(
             &connection,
             WORK_ONE,
             &receipt,
             1,
-            vec![fact("turn-1", 0, 900, "speaker_0", "blocked family")],
+            vec![fact("turn-1", 0, 900, "speaker_0", "admitted family")],
         );
         assert_eq!(
-            execute_error(&mut connection, plan),
-            WalIdempotencyError::Corrupt,
-            "the production baseline must fail the pin re-validation"
+            execute(&mut connection, plan).unwrap().disposition(),
+            LogicalMutationDisposition::Applied,
+            "the re-baselined production baseline must admit the family"
         );
-        nothing_written(&connection);
+        // The pins advanced by exactly 1 / cluster_count / turn_count /
+        // turn_count. One turn, one cluster. Never "advanced by at least".
+        let after = read_audio_sequence_pins(&connection).unwrap();
+        assert_eq!(
+            after,
+            AudioSequencePins::new(
+                before.audio_segments + 1,
+                before.speaker_clusters + 1,
+                before.speaker_observations + 1,
+                before.utterances + 1,
+            ),
+            "pins must advance by the exact per-table deltas"
+        );
+        assert_eq!(count_of(&connection, "SELECT COUNT(*) FROM utterances"), 1);
         assert_eq!(
             count_of(
                 &connection,
-                "SELECT COUNT(*) FROM media_work_units WHERE state='processing'"
+                "SELECT COUNT(*) FROM media_work_units WHERE state='succeeded'"
             ),
             1
         );
-        // Nothing was admitted to the ledger, so the identical plan is
-        // still un-replayable — it fails the same way, never diverging.
+        // The identical plan replays from the ledger without re-advancing
+        // anything: the operation is settled, not re-applied.
         assert_eq!(
-            execute_error(&mut connection, replay),
-            WalIdempotencyError::Corrupt
+            execute(&mut connection, replay).unwrap().disposition(),
+            LogicalMutationDisposition::Replayed
         );
+        assert_eq!(
+            read_audio_sequence_pins(&connection).unwrap(),
+            after,
+            "a replay must not move the sequences"
+        );
+        assert_eq!(count_of(&connection, "SELECT COUNT(*) FROM utterances"), 1);
     }
 }

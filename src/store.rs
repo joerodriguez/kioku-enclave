@@ -225,6 +225,11 @@ enum StorePersistencePolicy {
     /// diverge the live database from the bytes the owner authenticated. The
     /// schema is therefore established once, at genesis, and afterwards only
     /// ever advanced by a sealed plan under the owner's own lease.
+    ///
+    /// "No DDL" is a prohibition on mutation, not on inspection: the open path
+    /// is *required* to read the archive's epoch marker and refuse an archive
+    /// this binary cannot describe, and it asserts the mutation fingerprint on
+    /// both sides of doing so.
     WalOwnerAuthoritative,
 }
 
@@ -5974,7 +5979,7 @@ PRAGMA foreign_keys = ON;
 
 -- Audio segments (carrier of utterances)
 CREATE TABLE IF NOT EXISTS audio_segments (
-    id                  INTEGER PRIMARY KEY,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at          TEXT NOT NULL,
     ended_at            TEXT NOT NULL,
     duration_seconds    REAL NOT NULL,
@@ -5990,7 +5995,7 @@ CREATE TABLE IF NOT EXISTS audio_segments (
 
 -- Utterances / transcript segments
 CREATE TABLE IF NOT EXISTS utterances (
-    id                      INTEGER PRIMARY KEY,
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     audio_segment_id        INTEGER NOT NULL REFERENCES audio_segments(id) ON DELETE CASCADE,
     start_offset_seconds    REAL NOT NULL,
     end_offset_seconds      REAL NOT NULL,
@@ -6009,7 +6014,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS utterances_fts
 
 -- Screenshots + OCR text
 CREATE TABLE IF NOT EXISTS screenshots (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     captured_at  TEXT NOT NULL,
     active_app   TEXT,
     window_title TEXT,
@@ -6411,6 +6416,25 @@ CREATE TABLE IF NOT EXISTS device_watermarks (
     watermark_at TEXT NOT NULL, -- ISO 8601
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (device_id, modality)
+);
+
+-- ADR-0022 schema ladder: this archive's own record of the numbered epoch it
+-- has reached and the ladder chain it reached it by.
+--
+-- The row is a BIRTH WITNESS. Every path that materializes an archive seeds it
+-- unconditionally, epoch 0 included, so a served archive always carries one
+-- row. An ABSENT row is therefore a REFUSAL, never "epoch 0" -- absence means
+-- the file was created by a binary older than this table, or by a path that is
+-- not allowed to produce a servable archive, and neither may be coerced into a
+-- servable epoch. `build_canonical` leaves it empty on purpose: the canonical
+-- is a schema reference, not an archive.
+--
+-- After birth only the owner-side SchemaEpochAdvance plan ever writes it --
+-- product code never does.
+CREATE TABLE IF NOT EXISTS schema_epoch (
+    singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    epoch        INTEGER NOT NULL CHECK (epoch >= 0),
+    chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32 AND chain_digest != zeroblob(32))
 );
 "#;
 
@@ -7154,9 +7178,17 @@ fn open_db(
     };
     let before = database_mutation_fingerprint(&conn)?;
     if persistence_policy == StorePersistencePolicy::WalOwnerAuthoritative {
-        // No DDL: see `StorePersistencePolicy::WalOwnerAuthoritative`. The two
-        // pragmas at the head of `SCHEMA_SQL` still have to be accounted for,
-        // because skipping the batch skips them too.
+        // **No DDL; read-only assertions are required.** The prohibition here
+        // is on *mutating* the database at open — never on inspecting it. The
+        // fingerprint assertion below is what enforces the first, and the
+        // epoch-marker check further down is required by the second: without
+        // it this branch performs no schema comparison at all, and an archive
+        // built by a binary older than the re-baseline would be served rather
+        // than refused. Do not delete that check as a "DDL in the owner path"
+        // violation — it runs no DDL and moves nothing.
+        //
+        // The two pragmas at the head of `SCHEMA_SQL` still have to be
+        // accounted for, because skipping the batch skips them too.
         //
         // `journal_mode` is persisted in the database header, so it is
         // asserted rather than set — an owner database that is not in WAL mode
@@ -7179,6 +7211,28 @@ fn open_db(
         // Neither pragma may perturb the database. Asserting it here is what
         // makes the `migration_dirty` tripwire in the owner vacuously true
         // instead of merely relaxed.
+        if database_mutation_fingerprint(&conn)? != before {
+            return Err(wal_owner_open_error());
+        }
+        // The birth-witness latch. Marker-only: one row, no descriptor build.
+        //
+        // This is the owner-path half of the closure. `validate_wal_logical_schema`
+        // guards only the `WalLogicalOnly` branch above, which a genesis-born
+        // WAL-authoritative archive never takes, so before this check the owner
+        // path compared no schema of any kind. An archive with no marker (an
+        // older binary built it, or a rolled-back image did) and an archive
+        // whose recorded chain is not this binary's baseline are both refused
+        // here rather than served.
+        //
+        // Deliberately NOT `assert_canonical_at`: the chain conjunct already
+        // binds the archive to this binary's `BASELINE_DIGEST`, and building a
+        // canonical database on every owner open would be a per-open cost for
+        // a strictly weaker reason.
+        let marker =
+            crate::schema_ladder::read_archive_epoch(&conn).map_err(|_| wal_owner_open_error())?;
+        crate::schema_ladder::validate_servable_epoch(marker)
+            .map_err(|_| wal_owner_open_error())?;
+        // Reading the marker must not perturb the database either.
         if database_mutation_fingerprint(&conn)? != before {
             return Err(wal_owner_open_error());
         }
@@ -7216,15 +7270,20 @@ pub(crate) struct GenesisStoreFacts {
 /// that gets measured, so the length and hash published here would disagree
 /// with the bytes the owner authenticates on open, and the archive would be
 /// unopenable from birth.
-#[allow(
-    dead_code,
-    reason = "reserved for the reviewed genesis composition; no production caller exists yet"
-)]
 pub(crate) fn initialize_genesis_store(path: &Path) -> Result<GenesisStoreFacts> {
     init_vec_extension();
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
+    // The ladder steps and the birth witness are one atomic unit: an archive
+    // whose DDL and whose recorded epoch disagree is exactly the state the
+    // marker exists to make impossible. Both must land before the checkpoint
+    // and the `fs::read` below, or the published `GenesisStoreFacts` describe a
+    // file the owner will never authenticate.
+    let tx = conn.unchecked_transaction()?;
+    crate::schema_ladder::apply_steps(&tx, 0, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    crate::schema_ladder::seed_epoch_marker(&tx, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    tx.commit()?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
     let user_version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     // Fold every committed page back into the main file before it is measured.
@@ -7252,6 +7311,10 @@ pub(crate) fn initialize_wal_owner_store_for_test(path: &Path) -> Result<u32> {
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    crate::schema_ladder::apply_steps(&tx, 0, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    crate::schema_ladder::seed_epoch_marker(&tx, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    tx.commit()?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(Into::into)
@@ -7325,9 +7388,9 @@ fn sqlite_immutable_uri(path: &Path) -> Result<String> {
     Ok(uri)
 }
 
-type SchemaDescriptorRow = (String, String, String, String);
+pub(crate) type SchemaDescriptorRow = (String, String, String, String);
 
-fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescriptorRow>> {
+pub(crate) fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescriptorRow>> {
     let mut statement = conn.prepare(
         "SELECT type,name,tbl_name,coalesce(sql,'')
          FROM sqlite_schema
@@ -7376,6 +7439,14 @@ fn create_empty_db(dek: &Dek) -> Result<Vec<u8>> {
     let conn = Connection::open(&path)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
+    // Seeded here too, even though this is the legacy-snapshot new-user path.
+    // If it were skipped, an absent marker would be ambiguous between "an old
+    // binary built this" and "the legacy path built this" — and the whole value
+    // of the birth witness is that absence has exactly one meaning.
+    let tx = conn.unchecked_transaction()?;
+    crate::schema_ladder::apply_steps(&tx, 0, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    crate::schema_ladder::seed_epoch_marker(&tx, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     drop(conn); // close before reading
     let bytes = std::fs::read(&path)?;
@@ -11886,6 +11957,313 @@ pub(crate) mod tests {
         conn.execute_batch("PRAGMA journal_mode = DELETE;").unwrap();
         drop(conn);
         assert!(open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_err());
+    }
+
+    /// Every table whose `id` is a row *allocator* — implicitly assigned by
+    /// SQLite on insert — **and** which some path deletes from. A plain
+    /// `INTEGER PRIMARY KEY` reuses ids after a delete; every one of these has
+    /// at least one satellite keyed by that id which is cleaned by an explicit
+    /// statement rather than by a cascade, so a reused id aliases a deleted
+    /// row's satellites onto a new row.
+    ///
+    /// Derived by sweeping all four frozen DDL sources; see the PR body. The
+    /// remaining plain `INTEGER PRIMARY KEY` declarations in the baseline are
+    /// borrowed keys (`screenshot_id`, `episode_id`) or projection mirrors,
+    /// never allocators, and adding `AUTOINCREMENT` to them would be wrong.
+    #[cfg(test)]
+    const ALLOCATOR_TABLES: &[&str] = &["audio_segments", "utterances", "screenshots"];
+
+    #[test]
+    fn baseline_declares_autoincrement_for_every_deleting_allocator_table() {
+        // Registration is a sqlite3_auto_extension hook, so it must precede
+        // the open or SCHEMA_SQL's vec0 virtual tables fail with "no such
+        // module". Inverted, these passed only when an alphabetically earlier
+        // test happened to fire the Once first.
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        run_migrations(&conn).unwrap();
+        for table in ALLOCATOR_TABLES {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.contains("AUTOINCREMENT"),
+                "{table} allocates ids and is deleted from, so its id must \
+                 never be reissued:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_allocator_ids_are_never_reissued() {
+        // The single most important assertion in the re-baseline. On the
+        // pre-edit baseline every one of these reissues id 1, which is the
+        // killed MAX(id)+1 allocator with its guardrail removed.
+        // Registration is a sqlite3_auto_extension hook, so it must precede
+        // the open or SCHEMA_SQL's vec0 virtual tables fail with "no such
+        // module". Inverted, these passed only when an alphabetically earlier
+        // test happened to fire the Once first.
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                 VALUES ('a','b',1.0,'mic');
+             INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds,
+                                     text, speaker_label)
+                 VALUES (1, 0.0, 1.0, 'hello', 'S1');
+             INSERT INTO screenshots (captured_at) VALUES ('a');",
+        )
+        .unwrap();
+        for table in ALLOCATOR_TABLES {
+            let first: i64 = conn
+                .query_row(&format!("SELECT max(id) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(first, 1, "{table}: first insert must allocate 1");
+        }
+
+        // `utterances` cascades from `audio_segments`, so delete it first and
+        // let the cascade take the rest.
+        conn.execute_batch("DELETE FROM audio_segments; DELETE FROM screenshots;")
+            .unwrap();
+        for table in ALLOCATOR_TABLES {
+            let remaining: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} should be empty (cascade included)");
+            // The high-water survives the delete. This is the durable fact
+            // that makes reuse impossible; `read_audio_sequence_pins` reads it.
+            let seq: i64 = conn
+                .query_row(
+                    "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name=?1),0)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(seq, 1, "{table}: DELETE must not rewind the high-water");
+        }
+
+        conn.execute_batch(
+            "INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                 VALUES ('a','b',1.0,'mic');
+             INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds,
+                                     text, speaker_label)
+                 VALUES (2, 0.0, 1.0, 'hello', 'S1');
+             INSERT INTO screenshots (captured_at) VALUES ('a');",
+        )
+        .unwrap();
+        for table in ALLOCATOR_TABLES {
+            let reissued: i64 = conn
+                .query_row(&format!("SELECT max(id) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                reissued, 2,
+                "{table} reissued a deleted id; a stale satellite row \
+                 (vec_*, episode_members, mcp_safe_*) would now alias onto it"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_sqlite_reproduces_the_measured_autoincrement_semantics() {
+        // T-14. The design was measured on the sqlite CLI; these are the same
+        // behaviours re-asserted against the bundled rusqlite build, because
+        // the baseline is being changed on the strength of them.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE auto (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+             CREATE TABLE plain (id INTEGER PRIMARY KEY, v TEXT);",
+        )
+        .unwrap();
+        let seq = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name=?1),0)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // A virgin AUTOINCREMENT table has NO sqlite_sequence row, so the
+        // COALESCE pin genuinely reads 0. Never "fall back to MAX(id)" here —
+        // that is the killed allocator.
+        assert_eq!(seq("auto"), 0);
+        conn.execute("INSERT INTO auto (v) VALUES ('a')", [])
+            .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 1);
+        assert_eq!(seq("auto"), 1);
+        conn.execute("INSERT INTO auto (v) VALUES ('b')", [])
+            .unwrap();
+        assert_eq!(seq("auto"), 2);
+        conn.execute("DELETE FROM auto", []).unwrap();
+        assert_eq!(seq("auto"), 2, "delete-all leaves the high-water");
+        conn.execute("INSERT INTO auto (v) VALUES ('c')", [])
+            .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 3, "no reuse");
+
+        // The contrast that gives the change its meaning.
+        conn.execute("INSERT INTO plain (v) VALUES ('a')", [])
+            .unwrap();
+        conn.execute("INSERT INTO plain (v) VALUES ('b')", [])
+            .unwrap();
+        assert_eq!(seq("plain"), 0, "a plain PK never gets a sequence row");
+        conn.execute("DELETE FROM plain WHERE id = 2", []).unwrap();
+        conn.execute("INSERT INTO plain (v) VALUES ('c')", [])
+            .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 2, "a plain PK REUSES id 2");
+
+        // DDL is transactional, which crash point 9 depends on.
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("CREATE TABLE rolled_back (x INTEGER);")
+            .unwrap();
+        drop(tx);
+        assert!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='rolled_back'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()
+                == 0
+        );
+    }
+
+    #[test]
+    fn genesis_store_is_born_with_the_epoch_marker_and_publishes_matching_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genesis.db");
+        let facts = initialize_genesis_store(&path).unwrap();
+
+        // Re-measuring the file must reproduce the published facts exactly:
+        // the marker and the ladder steps land BEFORE the checkpoint and the
+        // read, or the owner would authenticate bytes genesis never described.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(facts.logical_file_length, bytes.len() as u64);
+        assert_eq!(
+            facts.plaintext_sha256,
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let marker = crate::schema_ladder::read_archive_epoch(&conn).unwrap();
+        assert_eq!(marker.epoch, crate::schema_ladder::SCHEMA_EPOCH_TARGET);
+        assert_eq!(
+            marker.chain,
+            crate::schema_ladder::chain_digest(crate::schema_ladder::SCHEMA_EPOCH_TARGET)
+        );
+        crate::schema_ladder::validate_servable_epoch(marker).unwrap();
+        for table in ALLOCATOR_TABLES {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("AUTOINCREMENT"), "{table} born without it");
+        }
+    }
+
+    #[test]
+    fn every_archive_materializing_path_seeds_the_birth_witness() {
+        // Absence must have exactly ONE meaning. If any path that can produce
+        // a servable archive skipped the seed, "no row" would be ambiguous
+        // between "an old binary built this" and "that other path built this",
+        // and the owner-open refusal would have to be softened to admit it.
+        let directory = tempfile::tempdir().unwrap();
+
+        let empty = directory.path().join("empty.db");
+        std::fs::write(&empty, create_empty_db(&Dek([3_u8; 32])).unwrap()).unwrap();
+        let conn = Connection::open(&empty).unwrap();
+        assert_eq!(
+            crate::schema_ladder::read_archive_epoch(&conn)
+                .unwrap()
+                .epoch,
+            crate::schema_ladder::SCHEMA_EPOCH_TARGET
+        );
+        drop(conn);
+
+        let owner = directory.path().join("owner.db");
+        initialize_wal_owner_store_for_test(&owner).unwrap();
+        let conn = Connection::open(&owner).unwrap();
+        assert_eq!(
+            crate::schema_ladder::read_archive_epoch(&conn)
+                .unwrap()
+                .epoch,
+            crate::schema_ladder::SCHEMA_EPOCH_TARGET
+        );
+    }
+
+    #[test]
+    fn wal_owner_open_refuses_an_archive_with_no_epoch_marker() {
+        // T-12b. This is the archive a rolled-back or mid-deploy binary older
+        // than the re-baseline produces: plain-primary-key ids, no marker.
+        // Before the latch was wired, the `WalOwnerAuthoritative` branch
+        // performed NO schema comparison of any kind and served it.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-marker.db");
+        initialize_wal_owner_store_for_test(&path).unwrap();
+        assert!(open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_ok());
+
+        // (a) The row is gone.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM schema_epoch", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+        assert!(
+            open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_err(),
+            "an archive with no birth witness must be refused at owner open"
+        );
+
+        // (b) The whole TABLE is gone — the literal shape a binary older than
+        // this baseline produces, since it never declared `schema_epoch` at
+        // all. The refusal must not depend on the table happening to exist.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE schema_epoch; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+        assert!(
+            open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_err(),
+            "an archive with no schema_epoch table must be refused at owner open"
+        );
+    }
+
+    #[test]
+    fn wal_owner_open_refuses_a_marker_whose_chain_is_not_this_binarys_baseline() {
+        // T-17b. `chain_digest(0) = SHA256(DOMAIN || BASELINE_DIGEST)`, so the
+        // marker carries the re-baselined digest at birth and an archive born
+        // under any other baseline is refused. The archive cannot certify its
+        // own epoch: the comparand is recomputed from this binary.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("foreign-chain.db");
+        initialize_wal_owner_store_for_test(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_epoch SET chain_digest = ?1 WHERE singleton = 1",
+            [&[0xab_u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            open_db(&path, None, StorePersistencePolicy::WalOwnerAuthoritative).is_err(),
+            "a marker whose chain is not this binary's baseline must be refused"
+        );
     }
 
     #[test]
