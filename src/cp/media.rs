@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
+use crate::error::{wal_domain, CaptureReferenceFailureReason, EnclaveError, Result};
 
 use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
@@ -1311,6 +1311,15 @@ async fn upload_capture_event(
             );
         }
     }
+    // ADR-0022 D4: capture ingest is a B domain and is NOT migrated -- the
+    // preflight and the durable write below both go through the legacy
+    // per-user store. Refuse before the limiter burns a token or the multipart
+    // body is read, with the distinguishable 503 rather than a generic 500.
+    // The sibling reference-batch and session-finish routes ARE migrated and
+    // are deliberately not gated.
+    if let Some(error) = state.wal_domain_refusal(&user_id, wal_domain::MEDIA_CAPTURE_EVENTS) {
+        return capture_error_response(started_at, None, error);
+    }
     if !state.sync_limiter.consume(&user_id).await {
         return capture_failure_response(
             started_at,
@@ -1714,6 +1723,9 @@ async fn stream_ack(
     if let Err(error) = validate_id("stream_id", &stream_id) {
         return error.into_response();
     }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_STREAM_ACK) {
+        return error.into_response();
+    }
     match state
         .store
         .with_user(&user.0, |conn| committed_through_sequence(conn, &stream_id))
@@ -1734,6 +1746,9 @@ async fn capture_status(
     Path(event_id): Path<String>,
 ) -> Response {
     if let Err(error) = validate_id("event_id", &event_id) {
+        return error.into_response();
+    }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_EVENT_STATUS) {
         return error.into_response();
     }
     match state
@@ -1767,6 +1782,10 @@ async fn capture_session_status(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSION_STATUS)
+    {
+        return error.into_response();
+    }
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
         .store
@@ -1789,6 +1808,9 @@ async fn list_capture_sessions(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<CaptureSessionListQuery>,
 ) -> Response {
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSIONS) {
+        return error.into_response();
+    }
     let window_hours = query.window_hours.unwrap_or(8).clamp(1, 24);
     let max_sessions = query.max_sessions.unwrap_or(5).clamp(1, 10);
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
@@ -2143,6 +2165,9 @@ async fn list_people(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<PeopleListQuery>,
 ) -> Response {
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
+        return error.into_response();
+    }
     let after_id = query.after_id.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let search = query
@@ -2199,6 +2224,9 @@ async fn person_profile(
     if person_id <= 0 {
         return bad_request("person_id must be positive");
     }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
+        return error.into_response();
+    }
     match state
         .store
         .with_user(&user.0, |conn| load_person_profile(conn, person_id))
@@ -2217,6 +2245,9 @@ async fn person_evidence(
 ) -> Response {
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
+    }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
+        return error.into_response();
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     match state
@@ -2245,6 +2276,9 @@ async fn person_statements(
 ) -> Response {
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
+    }
+    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
+        return error.into_response();
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     match state
@@ -2482,6 +2516,9 @@ enum CaptureIngestFailureReason {
     ReferenceTargetMismatch,
     CanonicalContextUnavailable,
     ReferenceContextTransition,
+    /// ADR-0022 D4: this route's domain has not migrated to the WAL lane and
+    /// the account's archive is WAL-authoritative. A deferral, not a fault.
+    WalDomainUnmigrated,
     Internal,
 }
 
@@ -2499,6 +2536,7 @@ impl CaptureIngestFailureReason {
             Self::MediaTooLarge => "media_too_large",
             Self::MediaInvalid => "media_invalid",
             Self::RequestInvalid => "request_invalid",
+            Self::WalDomainUnmigrated => crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::LifecycleUnavailable => "lifecycle_unavailable",
             Self::RecordingLeaseInactive => "recording_lease_inactive",
@@ -2611,6 +2649,7 @@ fn capture_error_response_for_route(
         },
         EnclaveError::InvalidRequest(_) => CaptureIngestFailureReason::RequestInvalid,
         EnclaveError::Conflict(_) => CaptureIngestFailureReason::IdempotencyConflict,
+        EnclaveError::WalDomainUnmigrated(_) => CaptureIngestFailureReason::WalDomainUnmigrated,
         _ => CaptureIngestFailureReason::Internal,
     };
     let response = error.into_response();
@@ -6187,5 +6226,34 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_slice(&body).unwrap();
         assert!(status["ended_at"].is_string());
+    }
+
+    /// ADR-0022 D4: a deferred capture-read route names its domain in a 503.
+    /// The sibling session-finish and reference-batch routes ARE migrated and
+    /// keep their own paths; see `finish_capture_session`'s tests.
+    #[tokio::test]
+    async fn a_deferred_capture_status_answers_a_named_503() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let state = finish_test_state();
+        let user_id = "media-status-deferred";
+        select_wal_authoritative(&state.store, user_id);
+
+        let response = capture_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("evt-1".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
+        assert_eq!(body["domain"], wal_domain::MEDIA_CAPTURE_EVENT_STATUS);
     }
 }

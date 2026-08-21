@@ -742,7 +742,10 @@ fn map_domain_error(error: EnclaveError) -> WalIdempotencyError {
         | EnclaveError::SignupLimited
         | EnclaveError::DeletionPending(_)
         | EnclaveError::CaptureReference(_)
-        | EnclaveError::CaptureReferenceBatch { .. } => WalIdempotencyError::Unavailable,
+        | EnclaveError::CaptureReferenceBatch { .. }
+        // ADR-0022 D4: a deferred domain is unavailable, never corrupt and
+        // never a definitive precondition failure -- it stays retryable.
+        | EnclaveError::WalDomainUnmigrated(_) => WalIdempotencyError::Unavailable,
     }
 }
 

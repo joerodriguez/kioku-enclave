@@ -461,6 +461,250 @@ pub struct CpState {
     pub voice: Option<Arc<voice_memory::VoiceEngine>>,
 }
 
+impl CpState {
+    /// ADR-0022 D4 — the unmigrated-domain gate for a background worker's
+    /// per-user pass.
+    ///
+    /// `true` means `domain` still reaches its rows through the legacy
+    /// per-user store and this user's archive is WAL-authoritative, so the
+    /// caller must skip that domain. The skip is counted and logged here —
+    /// exactly once per call — so a deferral is inert but never silent: on a
+    /// `true` the caller makes no provider call, leases nothing, and writes
+    /// nothing. Call it once per pass, never once per inner iteration, or the
+    /// "exactly one counted skip per pass" contract breaks.
+    ///
+    /// Gate the deferred domain, not the worker: several of these workers
+    /// already route migrated domains through `wal_authoritative_read` /
+    /// `wal_authoritative_submit`, and gating one of those off would silently
+    /// disable live work.
+    pub(crate) fn wal_domain_skipped(&self, user_id: &str, domain: &'static str) -> bool {
+        if !self.store.is_wal_authoritative(user_id) {
+            return false;
+        }
+        tracing::warn!(
+            user_id,
+            metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+            domain,
+            "not migrated to WAL; skipping"
+        );
+        true
+    }
+
+    /// ADR-0022 D4 — the same gate on a request path.
+    ///
+    /// `Some(error)` refuses with the distinguishable 503 that names the
+    /// domain; `None` means the legacy path is safe for this user. The
+    /// refusal is counted where it becomes a response, so this returns the
+    /// error rather than logging it here.
+    pub(crate) fn wal_domain_refusal(
+        &self,
+        user_id: &str,
+        domain: &'static str,
+    ) -> Option<crate::error::EnclaveError> {
+        self.store
+            .is_wal_authoritative(user_id)
+            .then(|| crate::error::EnclaveError::wal_domain_unmigrated(domain))
+    }
+}
+
+/// Shared harness for the ADR-0022 D4 gate's tests.
+///
+/// Every gated worker lives in its own module, so its gate test must live
+/// there too; this keeps the *state* they all observe in one place, along with
+/// the tracing capture that proves "exactly one counted skip per pass".
+#[cfg(test)]
+pub(crate) mod wal_gate_test_support {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::{BillingEnforcementMode, CpConfig, CpState};
+    use crate::store::Store;
+
+    /// A `CpState` over fake KMS/GCS with no transports wired.
+    pub(crate) fn state() -> Arc<CpState> {
+        let kms = Arc::new(crate::store::tests::FakeKms);
+        let gcs = Arc::new(crate::store::tests::FakeGcs::new());
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        Arc::new(CpState {
+            store,
+            control: Arc::new(super::control_store::ControlStore::new(kms, gcs)),
+            billing: Arc::new(super::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(super::billing::RecordingLeaseGates::default()),
+            config: Arc::new(CpConfig {
+                base_url: "http://localhost:8080".into(),
+                jwt_secrets: vec!["test-secret".into()],
+                google_desktop_client_id: "desktop".into(),
+                google_ios_client_id: "ios".into(),
+                google_web_client_id: "web".into(),
+                google_web_client_secret: "secret".into(),
+                apple_sign_in: None,
+                admin_user_ids: Vec::new(),
+                signup_limit_per_day: super::control_store::TEST_SIGNUP_LIMIT,
+                scheduler_sa_email: None,
+                vertex_project: "project".into(),
+                vertex_location: "location".into(),
+                vertex_model: "model".into(),
+                quota_utterances_per_day: 1,
+                quota_screenshots_per_day: 1,
+                quota_mcp_calls_per_day: 1,
+                quota_vertex_output_tokens_per_day: 524_288,
+                web_origin: "http://localhost:3000".into(),
+                reviewer_auth: None,
+                billing_enforcement_mode: BillingEnforcementMode::Enforce,
+            }),
+            user_verifier: Arc::new(super::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
+            apple_provider: None,
+            sync_limiter: super::limits::RateLimiter::new(10.0, 1.0),
+            reference_batch_limiter: super::limits::RateLimiter::new(10.0, 1.0),
+            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
+            mcp_limiter: super::limits::RateLimiter::new(10.0, 1.0),
+            oauth_limiter: super::limits::RateLimiter::new(10.0, 1.0),
+            test_email_limiter: super::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
+            push_transport: None,
+            embedding: None,
+            voice: None,
+        })
+    }
+
+    /// Give `user_id` the durable-terminal WAL-authority selection the gate
+    /// keys on. No serving authority is registered, which is deliberate: it
+    /// makes EVERY store touch fail, legacy or routed. A gated worker that
+    /// still returns `Ok` therefore provably touched no store at all — so it
+    /// left nothing leased and nothing half-written.
+    pub(crate) fn select_wal_authoritative(store: &Store, user_id: &str) {
+        store
+            .install_wal_authority_persistence(
+                super::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    user_id,
+                    crate::archive_v3::ArchiveId::from_bytes([0x4d; 16]),
+                ),
+            )
+            .expect("the test selection installs once");
+        assert!(
+            store.is_wal_authoritative(user_id),
+            "the harness must actually select the user"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedEvents(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedEvents {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedEvents {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedEvents {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("events are utf-8")
+        }
+
+        /// How many counted D4 skips name `domain`. The contract is exactly
+        /// one per worker pass per user.
+        pub(crate) fn skips(&self, domain: &str) -> usize {
+            let metric = format!(
+                r#""metric":"{}""#,
+                crate::error::WAL_DOMAIN_UNMIGRATED_REASON
+            );
+            let domain = format!(r#""domain":"{domain}""#);
+            self.text()
+                .lines()
+                .filter(|line| line.contains(&metric) && line.contains(&domain))
+                .count()
+        }
+
+        /// Every counted D4 skip, whatever its domain.
+        pub(crate) fn total_skips(&self) -> usize {
+            let metric = format!(
+                r#""metric":"{}""#,
+                crate::error::WAL_DOMAIN_UNMIGRATED_REASON
+            );
+            self.text()
+                .lines()
+                .filter(|line| line.contains(&metric))
+                .count()
+        }
+    }
+
+    /// Capture tracing events for as long as the returned guard lives. The
+    /// default subscriber is thread-local and `#[tokio::test]` polls on the
+    /// calling thread, so an awaited worker pass is captured.
+    pub(crate) fn capture_events() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(captured.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+    use crate::error::{wal_domain, EnclaveError};
+
+    #[test]
+    fn the_worker_gate_is_inert_until_the_user_is_selected_then_counts_one_skip() {
+        let state = state();
+        let (captured, guard) = capture_events();
+        assert!(
+            !state.wal_domain_skipped("unselected-user", wal_domain::PUSH_OUTBOX),
+            "an unselected user keeps the legacy path"
+        );
+        assert_eq!(captured.total_skips(), 0, "{}", captured.text());
+
+        select_wal_authoritative(&state.store, "selected-user");
+        assert!(state.wal_domain_skipped("selected-user", wal_domain::PUSH_OUTBOX));
+        drop(guard);
+
+        assert_eq!(
+            captured.skips(wal_domain::PUSH_OUTBOX),
+            1,
+            "{}",
+            captured.text()
+        );
+        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
+        assert!(
+            captured.text().contains(r#""user_id":"selected-user""#),
+            "the skip must name the user it deferred: {}",
+            captured.text()
+        );
+    }
+
+    #[test]
+    fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
+        let state = state();
+        assert!(state
+            .wal_domain_refusal("unselected-user", wal_domain::QUERY_FEED)
+            .is_none());
+
+        select_wal_authoritative(&state.store, "selected-user");
+        let refusal = state
+            .wal_domain_refusal("selected-user", wal_domain::QUERY_FEED)
+            .expect("a selected user is refused");
+        assert!(matches!(
+            refusal,
+            EnclaveError::WalDomainUnmigrated(domain) if domain == wal_domain::QUERY_FEED
+        ));
+    }
+}
+
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.
 /// Retries with exponential backoff on failure to handle startup network flakes.
 pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result<String, String> {

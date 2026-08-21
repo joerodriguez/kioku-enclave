@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
-    error::{EnclaveError, Result as EnclaveResult},
+    error::{wal_domain, EnclaveError, Result as EnclaveResult},
     store::Store,
 };
 
@@ -66,6 +66,12 @@ async fn sync_status(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
+    // ADR-0022 D4: the counts below read the per-user content DB through the
+    // legacy path. `err503()` already answers 503 for a generic failure, but a
+    // deferral must be distinguishable from a fault, so it names the domain.
+    if let Some(error) = s.wal_domain_refusal(&user_id, wal_domain::SYNC_STATUS) {
+        return error.into_response();
+    }
     let email = s.control.user_email(&user_id).await.ok().flatten();
 
     let stats = s
@@ -102,6 +108,12 @@ async fn sync_status(
 // ── Export ──────────────────────────────────────────────────────────────────────
 
 async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUser>) -> Response {
+    // ADR-0022 D4: `read_user` delegates to the legacy per-user load, which a
+    // WAL-authoritative user's archive refuses. Without this the route answers
+    // 500 `export_failed`, which reads as data loss rather than a deferral.
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::SYNC_EXPORT) {
+        return error.into_response();
+    }
     match dump_user_export(&s.store, &user.0).await {
         Ok(data) => export_success_response(data),
         Err(e) => {
@@ -1892,5 +1904,52 @@ mod tests {
         assert_eq!(after_restart.status, "failed_retryable");
         assert_eq!(after_restart.reason, LEGACY_GENERATION_UNAVAILABLE);
         assert!(gcs.get_object(historical_media).await.is_ok());
+    }
+
+    /// ADR-0022 D4 end to end through a real handler. `/api/export` answered
+    /// 500 `export_failed` for a WAL-authoritative user, which reads as data
+    /// loss; `/api/sync/status` answered a generic 503 indistinguishable from
+    /// a fault. Both must name the deferred domain instead.
+    #[tokio::test]
+    async fn deferred_sync_routes_answer_a_named_503_not_a_generic_failure() {
+        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state as gate_state};
+        use crate::error::WAL_DOMAIN_UNMIGRATED_REASON;
+        use axum::extract::State;
+
+        let state = gate_state();
+        let user_id = "sync-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        for (response, domain) in [
+            (
+                export(
+                    State(Arc::clone(&state)),
+                    Extension(AuthUser(user_id.to_string())),
+                )
+                .await,
+                wal_domain::SYNC_EXPORT,
+            ),
+            (
+                sync_status(
+                    State(Arc::clone(&state)),
+                    Extension(AuthUser(user_id.to_string())),
+                )
+                .await,
+                wal_domain::SYNC_STATUS,
+            ),
+        ] {
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{domain} must defer, not fault"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON, "{domain}");
+            assert_eq!(body["domain"], domain);
+            assert_ne!(body["error"], "export_failed", "{domain}");
+        }
     }
 }

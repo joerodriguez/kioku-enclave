@@ -142,7 +142,14 @@ EXPECTED_STORE_CALL_COUNT = 227
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "996f1a345f9cbe6ab676be2b48b2415f1d90f6ffbf94a623a6ea3e4fa47838ae"
+# ADR-0022 D4 (the unmigrated-domain gate): 22 owners gained a one-line gate
+# above their existing legacy access, so their OWNER-BODY hashes move. Dumped
+# and diffed against a pristine origin/main (16a7f41) tree with this module's
+# own helpers: the count holds at 227, every key and its ordinal is in the same
+# order, every classification is unchanged, and every per-call-site expression
+# hash is byte-identical. Zero Store calls were added, removed, reordered, or
+# reclassified -- the gate returns BEFORE the call it guards.
+EXPECTED_STORE_CALL_SHA256 = "0cf0c7f5740200d2aa61c4cde13100fb71a0f89674863a22887594481862d8c0"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -173,14 +180,7 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # helpers: the count holds at 15, the key set is unchanged, no construction
 # surface was added or removed, and the sole delta is that literal (and its
 # enclosing factory definition) moving.
-# Group C (in-process WAL serving relaunch): the internal constructor's Store
-# literal additionally initializes the always-empty relaunch-driver slot, and
-# async_main's owner body gained the driver installation. Diffed against a
-# pristine origin/main (4461f21) dump produced by this module's own helpers:
-# the count holds at 15, the key set is byte-identical, no construction
-# surface was added or removed, and the only deltas are that literal, its
-# enclosing factory definition, and async_main's owner body.
-EXPECTED_STORE_SURFACE_SHA256 = "a2904b58b343e52a84493ca5cdf7de2693c1c5d34c2f6c37ecf49c6e8d45e25d"
+EXPECTED_STORE_SURFACE_SHA256 = "4fbe138720df66b3f5b738fa02bc73a879063059ac93beb47efdfe8c307c3aae"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -237,13 +237,7 @@ EXPECTED_POLICY_SITE_COUNT = 42
 # constructor, whose owner body gained the deletion-lane slot; their
 # expressions are byte-identical. The six `open_db#0` rows keep the
 # re-baseline's owner-body hashes.
-#
-# Group C (in-process WAL serving relaunch), rebased onto Group D: the count
-# holds at 42 with zero additions, removals, or reclassifications. Both moved
-# rows are again the two persistence_policy sites inside the internal
-# constructor, whose owner body gained the relaunch-driver slot; their
-# expressions are byte-identical, and every `open_db#0` row is unchanged.
-EXPECTED_POLICY_SITE_SHA256 = "7b4d15912ada202d44b85fe68ec2862d245632e983874b58b6d049370ce6319d"
+EXPECTED_POLICY_SITE_SHA256 = "e666e1fe03d9ce9cac97916fd1666287374af4008871d4c227f707273335a6f3"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -318,17 +312,12 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # convergence pass, 25 -> 26. (2) async_main's owner-body hash moved with the
 # genesis gate validation; its own spawn call-site hash is byte-identical.
 # Nothing was removed and no surviving spawn expression changed.
-# Group C (in-process WAL serving relaunch): five deltas, all reviewed against
-# a pristine origin/main (4461f21) dump produced by this module's own helpers.
-# The count holds at 26 with zero additions and zero removals, and the key set
-# is byte-identical. (1) `WalStoreLane::spawn` and (2) `spawn_with_builder`:
-# the lane-thread closures now hold a residency guard that retires the thread
-# from the authority's liveness census strictly after its store owner has been
-# dropped. (3) `spawn_lane_with_fence` and (4) `spawn_failed`: the actor
-# futures now hold a drop guard that raises the termination flag on completion
-# and on unwind. (5) async_main's owner-body hash moved with the relaunch
-# driver installation; its own spawn call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "b1b3e942d61dca7855771d7a32dd614274198577d53301cfbc72ecec009a1ba4"
+# ADR-0022 D4: the sole delta is upload_capture_event's owner-body hash — its
+# deferred-domain gate sits above the route's existing detached media-put
+# spawn. Dumped and diffed against a pristine origin/main (16a7f41) tree with
+# this module's own helpers: the count holds at 26, nothing was added, removed,
+# or reclassified, and every spawn's own call-site hash is byte-identical.
+EXPECTED_WORKER_SPAWN_SHA256 = "b05d2e2b5ca6e841c6ca1aa673db936f68cc2048f461c360aeb12758df507bc5"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

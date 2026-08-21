@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::cp::auth::AuthUser;
 use crate::cp::control_store::PushInstallation;
 use crate::cp::CpState;
-use crate::error::{EnclaveError, Result};
+use crate::error::{wal_domain, EnclaveError, Result};
 
 const IOS_TOPIC: &str = "com.kioku.ios";
 const MACOS_TOPIC: &str = "com.kiokuu.app";
@@ -399,6 +399,14 @@ pub async fn deliver_user_pushes(
     transport: &dyn PushTransport,
     user_id: &str,
 ) -> Result<()> {
+    // ADR-0022 D4: the outbox scan is not migrated (`next_push_delivery` goes
+    // through the legacy per-user store), so no delivery can be selected and
+    // nothing in the sweep is reachable — including the migrated settlement
+    // in `update_delivery`, which only ever runs on a selected delivery.
+    // Returning here leaves exactly one counted skip and no APNs call.
+    if state.wal_domain_skipped(user_id, wal_domain::PUSH_OUTBOX) {
+        return Ok(());
+    }
     for _ in 0..MAX_DELIVERIES_PER_SWEEP {
         let Some(delivery) = state.store.next_push_delivery(user_id).await? else {
             break;
@@ -733,5 +741,43 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// ADR-0022 D4. The outbox scan is deferred, so the pass must be inert:
+    /// Ok, exactly one counted skip, and zero APNs calls — the transport here
+    /// panics if it is ever reached.
+    #[tokio::test]
+    async fn a_deferred_push_outbox_never_reaches_the_provider() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+        use crate::error::wal_domain;
+
+        struct NeverSend;
+        #[async_trait]
+        impl PushTransport for NeverSend {
+            async fn send(
+                &self,
+                _request: PushRequest,
+            ) -> std::result::Result<u16, PushTransportError> {
+                panic!("a gated pass must make zero provider calls");
+            }
+        }
+
+        let state = state();
+        let user_id = "push-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        deliver_user_pushes(&state, &NeverSend, user_id)
+            .await
+            .expect("a deferred domain defers; it must not fail the sweep");
+        drop(guard);
+
+        assert_eq!(
+            captured.skips(wal_domain::PUSH_OUTBOX),
+            1,
+            "exactly one counted skip per pass: {}",
+            captured.text()
+        );
+        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
     }
 }

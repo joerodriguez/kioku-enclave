@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::cp::control_store::WebhookSubscription;
 use crate::cp::delivery;
 use crate::cp::{isotime, CpState};
-use crate::error::{EnclaveError, Result};
+use crate::error::{wal_domain, EnclaveError, Result};
 
 const MAX_DELIVERIES_PER_SWEEP: usize = 10;
 const MAX_ATTEMPTS: i32 = 10;
@@ -541,6 +541,15 @@ async fn next_delivery(state: &CpState, user_id: &str) -> Result<Option<OutboxRo
 
 /// Deliver a bounded number of due events for one user.
 pub async fn deliver_user_webhooks(state: &CpState, user_id: &str) -> Result<()> {
+    // ADR-0022 D4: the outbox scan (`next_delivery`) and the event-body load
+    // (`delivery::load_finalized_episode`) are not migrated, so no delivery
+    // can be selected and nothing in the sweep is reachable — including the
+    // migrated F14 settlement in `set_delivery_state`, which only ever runs on
+    // a selected delivery. Returning here leaves exactly one counted skip, no
+    // outbound POST, and no delivery row moved out of `pending`/`retry`.
+    if state.wal_domain_skipped(user_id, wal_domain::WEBHOOK_WORKER_OUTBOX) {
+        return Ok(());
+    }
     for _ in 0..MAX_DELIVERIES_PER_SWEEP {
         let Some(outbox) = next_delivery(state, user_id).await? else {
             break;
@@ -727,5 +736,44 @@ mod tests {
         assert_eq!(event["time"], "2026-07-30T12:00:00Z");
         assert_eq!(event["datacontenttype"], "application/json");
         assert_eq!(event["data"]["episode_id"], 42);
+    }
+
+    /// ADR-0022 D4. The outbox scan is a deferred domain, so the sweep must be
+    /// INERT, not merely quiet: it returns Ok, emits exactly one counted skip,
+    /// and sends nothing.
+    ///
+    /// The `Ok` is itself the proof that nothing was leased or half-written.
+    /// The harness selects the user WITHOUT registering a serving authority,
+    /// so every store touch — legacy or routed — fails for this user; a sweep
+    /// that reached any of them would have returned `Err`.
+    #[tokio::test]
+    async fn a_deferred_webhook_outbox_makes_the_sweep_inert_and_counts_one_skip() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+        use crate::error::wal_domain;
+
+        let state = state();
+        let user_id = "webhook-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        deliver_user_webhooks(&state, user_id)
+            .await
+            .expect("a deferred domain defers; it must not fail the sweep");
+        drop(guard);
+
+        assert_eq!(
+            captured.skips(wal_domain::WEBHOOK_WORKER_OUTBOX),
+            1,
+            "exactly one counted skip per pass: {}",
+            captured.text()
+        );
+        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
+        assert!(
+            !captured
+                .text()
+                .contains("delivering finalized-episode webhook"),
+            "a gated pass must make no outbound delivery: {}",
+            captured.text()
+        );
     }
 }
