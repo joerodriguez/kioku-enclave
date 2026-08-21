@@ -14700,7 +14700,17 @@ pub(crate) mod tests {
             .expect_err("load task was not cancelled")
             .is_cancelled());
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // LIVENESS bound, not a latency assertion: a leaked STORE_MAX_OPEN slot
+        // blocks this call forever, so any bound well above real scheduling
+        // noise catches the regression identically. It was 2s, which a machine
+        // running concurrent cargo builds legitimately exceeds -- the test then
+        // failed a full suite while passing in ~0.7s in isolation.
+        //
+        // Do NOT bulk-raise the other 2s timeouts in this file. Several of them
+        // are ISOLATION assertions where the bound IS the claim (e.g. "unrelated
+        // user was blocked by slow user's GCS PUT"): widening those would weaken
+        // a real predicate rather than de-flake a proxy.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             store.with_user("post-cancel-user", |_| Ok(())).await
         })
         .await
@@ -14753,7 +14763,8 @@ pub(crate) mod tests {
             .expect_err("eviction task was not cancelled")
             .is_cancelled());
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // LIVENESS bound -- see the note on the cancelled-Loading timeout above.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             store.with_user("post-eviction-cancel", |_| Ok(())).await
         })
         .await
@@ -15282,7 +15293,8 @@ pub(crate) mod tests {
         let restarted =
             make_store_with_limit(Arc::new(FakeKms), database_gcs, failing_media.clone(), 1);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // LIVENESS bound -- see the note on the cancelled-Loading timeout above.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             restarted.delete_user("delete-user").await
         })
         .await
