@@ -253,7 +253,20 @@ EXPECTED_STORE_CALL_COUNT = 229
 # As in #328, the digest does not return to any earlier value even though
 # every D4 gate is retained: the gates sit ABOVE the call sites and the call
 # sites themselves stay routed.
-EXPECTED_STORE_CALL_SHA256 = "1a4dec33bc4476ce4767eeee7c7fef8341afffb31a64f180fa468eed45c1545b"
+# Summarizer window + settled gate routed: count HOLDS at 229 with zero
+# additions and zero removals. Ten rows changed: four key swaps
+# (span_holds_recoverable_media, fetch_range, fetch_open_episodes,
+# session_tail_is_settled -- with_user#0 -> wal_authoritative_read#0, all
+# A->A), plus three summarize_user_window#0 and three
+# wal_authoritative_upsert#0 rows whose owner bodies moved. Zero
+# reclassifications. Re-derived against pristine origin/main (8a6f948,
+# the read-lane merge) with this module's own helpers after rebasing;
+# the pristine dump reproduced 229/1a4dec33 exactly first.
+# NOTE this baseline is 8a6f948, NOT be3b0cb: main moved three times
+# while this branch was in review, and each move re-pinned this same
+# constant. A digest conflict here is never resolvable by picking a
+# side -- the merged tree is a third state.
+EXPECTED_STORE_CALL_SHA256 = "8eb21ded7d08173c971a3bb75c6ff972bfbf36be612eebc979d10b0eca5b7f86"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
