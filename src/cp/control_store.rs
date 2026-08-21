@@ -7743,6 +7743,13 @@ fn tear_down_wal_bookkeeping_conn(
     // Artifacts before attempts before parents: every FK child is removed in
     // the same transaction as its parent, so no row is ever orphaned and no
     // object name outlives the completion that proved it absent.
+    //
+    // This ordering is a DISCIPLINE, not something the database enforces:
+    // the control connection never sets `PRAGMA foreign_keys=ON`, so a
+    // reversed order would NOT raise — it would silently orphan artifact
+    // rows naming objects this teardown is asserting are gone. Do not read
+    // the declared FK as a backstop. Reorder these only with a test that
+    // proves the new order still leaves nothing behind.
     for statement in [
         "DELETE FROM archive_v3_wal_publication_artifacts WHERE archive_id = ?1",
         "DELETE FROM archive_v3_wal_publication_attempts WHERE archive_id = ?1",
