@@ -79,7 +79,30 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # (with_user#0, with_user#1, save_user#0) are byte-identical, so the legacy
 # audio tail -- candidate_name_vocabulary via with_user, persist via
 # with_user, save_user -- is intact for unselected users.
-EXPECTED_STORE_CALL_COUNT = 232
+# Plan-family slice 10i (the media claim boundary): the media worker's claim
+# and failure tails route. Six additions under two new B owners
+# (claim_media_work_unit: the ONE pre-claim routed read that also carries the
+# T24 audio gate, plus the claim submit; settle_media_work_failure: the
+# predecessor read plus the settle submit), the read-only class scan's routed
+# arm inside process_user (A, matching its legacy with_user#0 override), and
+# settle_audio_window_transcript's pre-submit transcript-target occupancy
+# probe (B, existing owner). 232 -> 238, dumped and diffed against a pristine
+# origin/main (5fa1c0b) tree with the gate's own store_call_sites /
+# classify_store_call / inventory_row / digest helpers: exactly six additions,
+# ZERO removals, ZERO reclassifications, and ZERO moved call-expression
+# hashes anywhere.
+#
+# R7 (the positional-key trap) was checked explicitly and did NOT fire. Every
+# routed branch is an `if is_wal_authoritative { ... } else { <legacy call> }`,
+# so all five process_user#0::with_user ordinals and all three save_user
+# ordinals keep their original positions AND their byte-identical call
+# expressions -- verified mechanically, key by key, against the pristine dump.
+# The two out-of-scope voice calls (#3 reconcile_profiles, #4
+# process_lineage_actions) therefore keep their own classifications. The only
+# other row deltas are two OWNER-BODY hashes: process_user#0 (the three
+# routing branches were added inside it) and settle_audio_window_transcript#0
+# (the pre-check).
+EXPECTED_STORE_CALL_COUNT = 238
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -90,7 +113,7 @@ EXPECTED_STORE_CALL_COUNT = 232
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "82b83dab43df61a64d1d9102d3db8e46635a8931908ace703fc75f778adb0b6b"
+EXPECTED_STORE_CALL_SHA256 = "67960a4f5d14570629e4cced19c75f84ae910465064e7875d14e0cac66e82eb0"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -825,8 +848,10 @@ B_OWNERS = frozenset(
         "src/cp/finalizer.rs::record_finalization_failure#0",
         "src/cp/finalizer.rs::defer_finalization_for_budget#0",
         "src/cp/media.rs::load_or_create_media_dek#0",
+        "src/cp/media_worker.rs::claim_media_work_unit#0",
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
+        "src/cp/media_worker.rs::settle_media_work_failure#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
         "src/cp/media_worker.rs::settle_audio_window_attempt#0",
         "src/cp/media_worker.rs::settle_audio_window_transcript#0",
@@ -886,6 +911,11 @@ CALL_OVERRIDES = {
     "src/cp/media_worker.rs::process_work_unit#0::with_user#1": "A",
     "src/cp/media_worker.rs::process_work_unit#0::save_user#0": "A",
     # Scan is read-only A; every lease/retry/reconciliation mutation is B.
+    # Slice 10i: the scan's routed arm is the same read-only class scan as
+    # with_user#0 below, at the same eligibility horizon the claim carries.
+    # The claim and failure mutations live in their own B owners, so no
+    # with_user/save_user ordinal below moved.
+    "src/cp/media_worker.rs::process_user#0::wal_authoritative_read#0": "A",
     "src/cp/media_worker.rs::process_user#0::with_user#0": "A",
     "src/cp/media_worker.rs::process_user#0::with_user#1": "B",
     "src/cp/media_worker.rs::process_user#0::with_user#2": "B",

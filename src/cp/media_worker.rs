@@ -50,6 +50,24 @@ const RESURRECTION_MAX_PER_SWEEP: i64 = 16;
 /// records can still form a memory instead of being stranded behind the
 /// cursor. Later rounds only enrich search.
 pub(crate) const RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS: i64 = MAX_ATTEMPTS + 2;
+/// ADR-0022 slice 10i. The routed claim carries every bound the legacy path
+/// reads from a code constant, so a replay on a later binary re-derives the
+/// identical eligible set. `CLAIM_SCAN_LIMIT` is the legacy `LIMIT 128`;
+/// `CLAIM_LEASE_SECONDS` is the legacy 300s deadline — NOT a mutual-exclusion
+/// token, a deterministic derived recovery deadline the sealed settles read
+/// (`lease_until - attempted_at >= 120_000 ms`, `lease_until >= committed_at`).
+const CLAIM_SCAN_LIMIT: i64 = 128;
+const CLAIM_LEASE_SECONDS: i64 = 300;
+/// `defer_for_budget`'s 6-hour parking offset and `RESURRECTION_WINDOW_SECONDS`
+/// as integral seconds, carried in `MediaWorkFailurePlan` rather than read from
+/// a code constant inside `apply()`.
+const BUDGET_RETRY_SECONDS: i64 = 6 * 60 * 60;
+const RESURRECTION_WINDOW_SECONDS_INTEGRAL: i64 = 7 * 24 * 3_600;
+/// A model-supplied `turn_id` colliding with an existing
+/// `speaker_observations(event_id,turn_id)` row can never succeed on a retry,
+/// so it is detected in the owner before the sealed transcript plan is built
+/// and excluded from every resurrection ladder.
+pub(crate) const TRANSCRIPT_TARGET_CONFLICT: &str = "transcript_target_conflict";
 
 #[derive(Debug, Clone)]
 struct MediaJob {
@@ -118,6 +136,42 @@ impl MediaJob {
                 self.route_epoch.unwrap_or(0)
             ),
         })
+    }
+
+    /// The routed claim's enumerated row already carries every column the
+    /// legacy lease query selected, so the owner's local work unit comes from
+    /// the SAME read the plan was built from — no second read can disagree
+    /// with it. `usage_json` is the only mutable field the claim rewrites, and
+    /// nothing downstream reads `work.jobs[..].usage_json` (both
+    /// `reserve_media_output` and `persist_actual_media_usage` re-read it from
+    /// the database through their own routed reads); every other field is
+    /// immutable capture metadata.
+    fn from_claimable(row: &wal::claim::ClaimableRow) -> Self {
+        Self {
+            id: row.job_id,
+            event_id: row.event_id.clone(),
+            job_kind: row.job_kind.clone(),
+            object_key: row.object_key.clone(),
+            mime_type: row.mime_type.clone(),
+            codec: row.codec.clone(),
+            byte_length: row.byte_length,
+            sample_rate: row.sample_rate,
+            channels: row.channels,
+            width: row.width,
+            height: row.height,
+            sha256: row.media_sha256.clone(),
+            started_at: row.started_at.clone(),
+            ended_at: row.ended_at.clone(),
+            stream_kind: row.stream_kind.clone(),
+            capture_session_id: row.capture_session_id.clone(),
+            stream_id: row.stream_id.clone(),
+            sequence: row.sequence,
+            context_json: row.context_json.clone(),
+            usage_json: row.usage_json.clone(),
+            audio_role: row.audio_role.clone(),
+            audio_route: row.audio_route.clone(),
+            route_epoch: row.route_epoch,
+        }
     }
 
     fn acoustic_domain(&self) -> String {
@@ -483,15 +537,15 @@ fn lease_work_unit(
         .into_iter()
         .filter(|job| member_ids.contains(&job.id))
         .collect::<Vec<_>>();
-    let mut digest = Sha256::new();
-    digest.update(format!("media-work-v1:{class:?}:"));
-    for job in &selected {
-        digest.update(job.event_id.as_bytes());
-        digest.update([0]);
-        digest.update(job.sha256.as_bytes());
-        digest.update([0]);
-    }
-    let id = format!("{:x}", digest.finalize());
+    // The one permitted edit to this legacy body: the digest moved verbatim
+    // into a helper both lanes call, so the routed claim mints byte-identical
+    // work-unit ids. Pinned by `work_unit_id_matches_the_legacy_digest`.
+    let id = wal::claim::work_unit_id(
+        class,
+        selected
+            .iter()
+            .map(|job| (job.event_id.as_str(), job.sha256.as_str())),
+    );
     let reservation_retained = selected.iter().all(|job| {
         job.usage_json
             .as_deref()
@@ -1952,6 +2006,12 @@ fn mark_failed(conn: &Connection, job_id: i64, error_code: &str, now: &str) -> R
 /// failures within the resurrection ladder's memory-hold rounds and recency
 /// window. The summarizer consults this before advancing its forward-only
 /// cursor over an empty span (see `RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS`).
+///
+/// `transcript_target_conflict` is excluded alongside `media_integrity`: a
+/// model-supplied `turn_id` that already occupies its
+/// `speaker_observations(event_id,turn_id)` slot can never recover, so holding
+/// the forward-only cursor for it would strand every later memory. Inert for
+/// the legacy lane, which cannot produce the code.
 pub(crate) fn span_has_recoverable_media(
     conn: &Connection,
     from: &str,
@@ -1966,6 +2026,7 @@ pub(crate) fn span_has_recoverable_media(
            AND (m.processing_state IN ('queued','processing','retry_wait') \
                 OR (m.processing_state='failed' \
                     AND j.error_code IS NOT 'media_integrity' \
+                    AND j.error_code IS NOT 'transcript_target_conflict' \
                     AND j.attempt_count < ?3 \
                     AND e.started_at >= ?4))",
         params![
@@ -2656,9 +2717,47 @@ async fn settle_audio_window_transcript(
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|_| EnclaveError::InvalidRequest("audio transcript turn is invalid".into()))?;
-    wal::audio_result::project_audio_window_for_owner(&authenticated, &facts).map_err(|_| {
-        EnclaveError::InvalidRequest("audio transcript projection is invalid".into())
-    })?;
+    let targets = wal::audio_result::project_audio_window_targets_for_owner(&authenticated, &facts)
+        .map_err(|_| {
+            EnclaveError::InvalidRequest("audio transcript projection is invalid".into())
+        })?;
+    // `speaker_observations` carries UNIQUE(event_id,turn_id) over a
+    // MODEL-supplied turn_id. A collision inside the sealed apply surfaces as
+    // an opaque Unavailable that cannot be told apart from a transient
+    // failure, so the window would burn its whole attempt ladder and then fail
+    // closed permanently. Detect it HERE, before the plan exists, and let the
+    // failure tail terminalize it honestly with a code no resurrection ladder
+    // will pick back up.
+    let conflict = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            for (event_id, turn_id) in targets {
+                let taken = conn
+                    .query_row(
+                        "SELECT 1 FROM speaker_observations \
+                         WHERE event_id=?1 AND turn_id=?2 LIMIT 1",
+                        params![&event_id, &turn_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Ok(Some((event_id, turn_id)));
+                }
+            }
+            Ok(None)
+        })
+        .await?;
+    if let Some((event_id, turn_id)) = conflict {
+        warn!(
+            user_id,
+            work_unit_id = %work.id,
+            event_id = %event_id,
+            turn_id = %turn_id,
+            metric = "media_transcript_target_conflict",
+            "transcript target conflict; work unit will terminalize without resurrection"
+        );
+        return Err(EnclaveError::Conflict(TRANSCRIPT_TARGET_CONFLICT.into()));
+    }
     let plan = wal::AudioWindowTranscriptPlan::new(
         user_id.to_owned(),
         receipt.event_id().to_owned(),
@@ -3013,12 +3112,171 @@ async fn resurrect_user_failed_jobs(state: &CpState, user_id: &str) {
     }
 }
 
+/// The routed claim outcome. Every non-`Claimed` variant leaves durable state
+/// untouched, so the next 30-second sweep re-derives from scratch. Nothing
+/// here terminalizes a job: a construction or submit refusal is a bug signal,
+/// not a work outcome, and burning the attempt budget on one would convert a
+/// code defect into permanent data loss.
+enum ClaimOutcome {
+    Claimed(Box<MediaWorkUnit>),
+    /// T24 (R1): the audio lane is gated off; move on to the next class.
+    AudioLaneBlocked,
+    /// Nothing claimable, or a refusal that must not wedge the loop.
+    Idle,
+}
+
+/// ADR-0022 slice 10i: the claim boundary for a WAL-authoritative user — the
+/// change that lets the media worker run at all on this lane.
+///
+/// ONE routed read produces the whole observation (the bounded eligibility
+/// scan at the carried horizon, the deterministic `plan_first` member
+/// resolution, the minted work-unit id and the observed `media_work_units`
+/// predecessor), the sealed plan is constructed exactly ONCE from it, and the
+/// submit settles it. The local `MediaWorkUnit` handed back is built from that
+/// same read, so `Output = ()` costs nothing.
+///
+/// The T24 audio gate is enforced inside `wal::claim::scan_for_claim`, ahead
+/// of every enumeration, so this path cannot make a PAID audio call that the
+/// sealed transcript settle could never accept.
+async fn claim_media_work_unit(
+    state: &CpState,
+    user_id: &str,
+    class: WorkClass,
+    claimed_at: &str,
+) -> ClaimOutcome {
+    let probe_at = claimed_at.to_owned();
+    let scan = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            wal::claim::scan_for_claim(conn, class, PROCESSOR_VERSION, &probe_at, CLAIM_SCAN_LIMIT)
+                .map_err(|_| EnclaveError::Store("media work claim scan failed".into()))
+        })
+        .await;
+    let observation = match scan {
+        Ok(wal::claim::ClaimScan::Observed(observation)) => observation,
+        Ok(wal::claim::ClaimScan::AudioLaneBlocked) => {
+            warn!(
+                user_id,
+                metric = "media_audio_lane_blocked_t24",
+                "audio lane blocked by the epoch-0 sequence gate; skipping"
+            );
+            return ClaimOutcome::AudioLaneBlocked;
+        }
+        Ok(wal::claim::ClaimScan::Idle) => return ClaimOutcome::Idle,
+        Err(error) => {
+            warn!(user_id, error = %error, "media work claim scan failed");
+            return ClaimOutcome::Idle;
+        }
+    };
+    let work = MediaWorkUnit {
+        id: observation.work_unit_id.clone(),
+        class: observation.class,
+        jobs: observation
+            .member_rows()
+            .into_iter()
+            .map(MediaJob::from_claimable)
+            .collect(),
+    };
+    let reserved_output_tokens = match class {
+        WorkClass::Audio => i64::from(vertex::MAX_MEDIA_OUTPUT_TOKENS),
+        WorkClass::Screen => i64::from(vertex::MAX_SCREEN_OUTPUT_TOKENS),
+    };
+    let prepared = wal::MediaWorkClaimPlan::new(
+        user_id.to_owned(),
+        *observation,
+        PROCESSOR_VERSION,
+        CLAIM_SCAN_LIMIT,
+        CLAIM_LEASE_SECONDS,
+        reserved_output_tokens,
+        claimed_at.to_owned(),
+        now_iso(),
+    )
+    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            warn!(
+                user_id,
+                error = ?error,
+                "media work claim plan construction failed"
+            );
+            return ClaimOutcome::Idle;
+        }
+    };
+    match state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+    {
+        Ok(()) => ClaimOutcome::Claimed(Box::new(work)),
+        Err(error) => {
+            warn!(user_id, error = %error, "media work claim failed");
+            ClaimOutcome::Idle
+        }
+    }
+}
+
+/// ADR-0022 slice 10i: the failure tail for a WAL-authoritative user — per-job
+/// `mark_failed`/`defer_for_budget` plus the work-unit state update, as ONE
+/// sealed plan over ONE routed read of the observed predecessors. Every policy
+/// constant is carried, and the non-terminal branches deliberately write the
+/// FUTURE retry time into `updated_at` (see `wal::failure`'s module doc).
+async fn settle_media_work_failure(
+    state: &CpState,
+    user_id: &str,
+    work: &MediaWorkUnit,
+    error_code: &str,
+    failed_at: &str,
+) -> Result<()> {
+    let probe_work_id = work.id.clone();
+    let probe_ids = work.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+    let observation = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            wal::failure::observe_failure(conn, &probe_work_id, &probe_ids).map_err(|_| {
+                EnclaveError::Store("media work failure predecessor read failed".into())
+            })
+        })
+        .await?
+        .ok_or_else(|| EnclaveError::Store("media work failure predecessor is absent".into()))?;
+    let prepared = wal::MediaWorkFailurePlan::new(
+        user_id.to_owned(),
+        work.id.clone(),
+        wal::claim::class_name(work.class).to_owned(),
+        error_code.to_owned(),
+        PROCESSOR_VERSION,
+        MAX_ATTEMPTS,
+        RESURRECTION_WINDOW_SECONDS_INTEGRAL,
+        BUDGET_RETRY_SECONDS,
+        failed_at.to_owned(),
+        observation,
+    )
+    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+    .map_err(|_| EnclaveError::Store("media work failure plan construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
 async fn process_user(state: &CpState, user_id: &str) {
     let now = now_iso();
-    let pending = state
-        .store
-        .with_user(user_id, |conn| pending_work_classes(conn, &now))
-        .await;
+    // The class scan is read-only, so the routed branch reads it through the
+    // serving authority and the legacy branch keeps its exact call. Both see
+    // the SAME eligibility horizon the subsequent claim carries, so a job can
+    // never be "pending" for the scan and stale for the claim.
+    let pending = if state.store.is_wal_authoritative(user_id) {
+        let probe_now = now.clone();
+        state
+            .store
+            .wal_authoritative_read(user_id, move |conn| pending_work_classes(conn, &probe_now))
+            .await
+    } else {
+        state
+            .store
+            .with_user(user_id, |conn| pending_work_classes(conn, &now))
+            .await
+    };
     let (audio_pending, screen_pending) = match pending {
         Ok(pending) => pending,
         Err(error) => {
@@ -3031,17 +3289,27 @@ async fn process_user(state: &CpState, user_id: &str) {
         media_planner::schedule_classes(audio_pending, screen_pending, MAX_JOBS_PER_USER_PER_SWEEP)
     {
         let leased_at = now_iso();
-        let lease = state
-            .store
-            .with_user(user_id, |conn| lease_work_unit(conn, &leased_at, class))
-            .await;
-        let Some(work) = (match lease {
-            Ok(work) => work,
-            Err(error) => {
-                warn!(user_id, error = %error, "media job lease failed");
-                return;
+        let claimed = if state.store.is_wal_authoritative(user_id) {
+            match claim_media_work_unit(state, user_id, class, &leased_at).await {
+                ClaimOutcome::Claimed(work) => Some(*work),
+                // T24: skip the gated class, keep the sweep alive for screen.
+                ClaimOutcome::AudioLaneBlocked => continue,
+                ClaimOutcome::Idle => None,
             }
-        }) else {
+        } else {
+            let lease = state
+                .store
+                .with_user(user_id, |conn| lease_work_unit(conn, &leased_at, class))
+                .await;
+            match lease {
+                Ok(work) => work,
+                Err(error) => {
+                    warn!(user_id, error = %error, "media job lease failed");
+                    return;
+                }
+            }
+        };
+        let Some(work) = claimed else {
             return;
         };
         if let Err(error) = process_work_unit(state, user_id, &work).await {
@@ -3052,6 +3320,9 @@ async fn process_user(state: &CpState, user_id: &str) {
                 }
                 EnclaveError::Json(_) | EnclaveError::InvalidRequest(_) => "invalid_model_output",
                 EnclaveError::Crypto(_) => "media_integrity",
+                EnclaveError::Conflict(ref message) if message == TRANSCRIPT_TARGET_CONFLICT => {
+                    TRANSCRIPT_TARGET_CONFLICT
+                }
                 _ => "processing_error",
             };
             warn!(
@@ -3061,6 +3332,23 @@ async fn process_user(state: &CpState, user_id: &str) {
                 "media work unit failed"
             );
             let failed_at = now_iso();
+            if state.store.is_wal_authoritative(user_id) {
+                // One sealed plan for the whole tail. On any refusal: warn and
+                // return, leaving the members in `processing` for the lease
+                // deadline to reclaim — never a partial write, never a
+                // terminalize-on-refusal.
+                if let Err(fail_error) =
+                    settle_media_work_failure(state, user_id, &work, error_code, &failed_at).await
+                {
+                    warn!(user_id, work_unit_id = work.id, error = %fail_error, "media work failure persistence failed");
+                    return;
+                }
+                if matches!(error_code, "vertex_quota" | "vertex_daily_budget") {
+                    return;
+                }
+                completed_work = true;
+                continue;
+            }
             let update = state.store.with_user(user_id, |conn| {
                 let tx = conn.unchecked_transaction()?;
                 for job in &work.jobs {
@@ -5459,6 +5747,11 @@ mod tests {
         // Conflict resubmission of the identical prepared object. The
         // audio-specific counts are pinned separately in
         // audio_window_route_is_exactly_dual_path.
+        // ADR-0022 slice 10i re-pin: the transcript settle gained ONE routed
+        // read -- the pre-submit `speaker_observations(event_id,turn_id)`
+        // occupancy probe that turns an opaque sealed-apply constraint
+        // violation into the deterministic `transcript_target_conflict`
+        // code. 4 -> 5; nothing else in this region moved.
         assert_eq!(
             route.matches(concat!("is_wal_", "authoritative(")).count(),
             2
@@ -5467,7 +5760,7 @@ mod tests {
             route
                 .matches(concat!("wal_authoritative_", "read("))
                 .count(),
-            4
+            5
         );
         assert_eq!(
             route
@@ -5553,11 +5846,13 @@ mod tests {
                 .count(),
             1
         );
+        // ADR-0022 slice 10i: the transcript helper's second routed read is
+        // the pre-submit transcript-target occupancy probe.
         assert_eq!(
             helpers
                 .matches(concat!("wal_authoritative_", "read("))
                 .count(),
-            2
+            3
         );
         // One submit per helper plus the single Conflict resubmission of
         // the identical prepared transcript object.
@@ -5751,5 +6046,545 @@ mod tests {
             )
             .unwrap();
         assert_eq!(competing, 0, "no competing active bindings for one profile");
+    }
+
+    // ---- ADR-0022 slice 10i: the media claim boundary ----
+
+    /// The seeded rows take `media_processing_jobs.updated_at` from the live
+    /// `strftime` DEFAULT, and a plan whose commit stamp precedes an observed
+    /// fact is refused at construction — so the lane stamp is derived from the
+    /// same clock, one second on.
+    fn slice10i_leased_at() -> String {
+        isotime::add_seconds(&now_iso(), 1.0)
+    }
+
+    fn slice10i_screen_fixture(count: i64) -> Connection {
+        let conn = job_fixture_db();
+        for index in 0..count {
+            let manifest = numbered_screen_manifest(index);
+            record_source_event(
+                &conn,
+                "account-1",
+                &manifest,
+                &format!("{:064x}", index + 200),
+                &format!("raw/screen-{index}"),
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn slice10i_claim(
+        connection: &mut Connection,
+        claimed_at: &str,
+        committed_at: &str,
+    ) -> MediaWorkUnit {
+        let observation = match wal::claim::scan_for_claim(
+            connection,
+            WorkClass::Screen,
+            PROCESSOR_VERSION,
+            claimed_at,
+            CLAIM_SCAN_LIMIT,
+        )
+        .unwrap()
+        {
+            wal::claim::ClaimScan::Observed(observation) => *observation,
+            other => panic!(
+                "expected claimable screen work, got {}",
+                match other {
+                    wal::claim::ClaimScan::Idle => "idle",
+                    _ => "audio-lane-blocked",
+                }
+            ),
+        };
+        let work = MediaWorkUnit {
+            id: observation.work_unit_id.clone(),
+            class: observation.class,
+            jobs: observation
+                .member_rows()
+                .into_iter()
+                .map(MediaJob::from_claimable)
+                .collect(),
+        };
+        let plan = wal::MediaWorkClaimPlan::new(
+            "11111111-1111-4111-8111-111111111111".into(),
+            observation,
+            PROCESSOR_VERSION,
+            CLAIM_SCAN_LIMIT,
+            CLAIM_LEASE_SECONDS,
+            i64::from(vertex::MAX_SCREEN_OUTPUT_TOKENS),
+            claimed_at.to_owned(),
+            committed_at.to_owned(),
+        )
+        .unwrap();
+        let prepared =
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan).unwrap();
+        crate::archive_v3_wal_idempotency::execute_prepared_for_owner(connection, prepared)
+            .unwrap();
+        work
+    }
+
+    fn slice10i_rows(connection: &Connection, sql: &str) -> Vec<String> {
+        let mut statement = connection.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                let mut cells = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    cells.push(format!(
+                        "{:?}",
+                        row.get::<_, rusqlite::types::Value>(index)?
+                    ));
+                }
+                Ok(cells.join("|"))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_routed_claim_reproduces_the_legacy_lease_row_for_row() {
+        // The whole point of slice 10i: the WAL lane must claim work the same
+        // way the legacy lane does. With `claimed_at == committed_at` the two
+        // lanes should agree byte for byte on every job, media object, work
+        // member and work-unit column -- EXCEPT the two `media_work_units`
+        // clock DEFAULTs the legacy INSERT omits, which is exactly the defect
+        // the routed apply had to fix to stay replayable.
+        let legacy = slice10i_screen_fixture(3);
+        let mut routed = slice10i_screen_fixture(3);
+        let leased_at = slice10i_leased_at();
+        let leased = lease_work_unit(&legacy, &leased_at, WorkClass::Screen)
+            .unwrap()
+            .unwrap();
+        let claimed = slice10i_claim(&mut routed, &leased_at, &leased_at);
+
+        assert_eq!(leased.id, claimed.id, "the work-unit digest is shared");
+        assert_eq!(
+            leased.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            claimed.jobs.iter().map(|job| job.id).collect::<Vec<_>>()
+        );
+        for sql in [
+            "SELECT id,event_id,job_kind,input_revision,processor_version,state,attempt_count,\
+                    lease_until,error_code,usage_json,updated_at \
+             FROM media_processing_jobs ORDER BY id",
+            "SELECT event_id,processing_state FROM media_objects ORDER BY event_id",
+            "SELECT work_unit_id,event_id,job_id,ordinal,window_start_ms,window_end_ms \
+             FROM media_work_members ORDER BY work_unit_id,ordinal",
+            "SELECT id,work_class,processor_version,state,started_at,ended_at,\
+                    reserved_output_tokens,reservation_retained,attempt_count,error_code,\
+                    usage_json FROM media_work_units ORDER BY id",
+        ] {
+            assert_eq!(
+                slice10i_rows(&legacy, sql),
+                slice10i_rows(&routed, sql),
+                "lane divergence for: {sql}"
+            );
+        }
+        let legacy_created: String = legacy
+            .query_row("SELECT created_at FROM media_work_units", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let routed_created: String = routed
+            .query_row("SELECT created_at FROM media_work_units", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_ne!(
+            legacy_created, leased_at,
+            "the legacy INSERT still lets the strftime DEFAULT fire"
+        );
+        assert_eq!(
+            routed_created, leased_at,
+            "the routed apply binds it, so replay is byte-exact and \
+             audio_result::validate_attempt_time can never wedge"
+        );
+    }
+
+    #[test]
+    fn the_claim_leaves_the_reservation_lane_its_row() {
+        // Before slice 10i this read was an unconditional QueryReturnedNoRows
+        // on a selected user: nothing on the WAL lane ever inserted
+        // `media_work_units`, so the media worker was dead one call below the
+        // claim.
+        let mut routed = slice10i_screen_fixture(2);
+        let leased_at = slice10i_leased_at();
+        let work = slice10i_claim(&mut routed, &leased_at, &leased_at);
+        let (attempt_count, retained, usage): (i64, i64, Option<String>) = routed
+            .query_row(
+                "SELECT attempt_count,reservation_retained,usage_json \
+                 FROM media_work_units WHERE id=?1",
+                [&work.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 1);
+        assert_eq!(retained, 0);
+        assert!(usage.unwrap().contains("\"reservation_state\":\"planned\""));
+    }
+
+    #[test]
+    fn the_claimed_job_is_not_reclaimable_until_the_lease_deadline_passes() {
+        let mut routed = slice10i_screen_fixture(2);
+        let leased_at = slice10i_leased_at();
+        slice10i_claim(&mut routed, &leased_at, &leased_at);
+        assert!(matches!(
+            wal::claim::scan_for_claim(
+                &routed,
+                WorkClass::Screen,
+                PROCESSOR_VERSION,
+                &leased_at,
+                CLAIM_SCAN_LIMIT,
+            )
+            .unwrap(),
+            wal::claim::ClaimScan::Idle
+        ));
+        // The ONLY path back for a unit whose owner died mid-flight.
+        let expired = isotime::add_seconds(&leased_at, 301.0);
+        assert!(matches!(
+            wal::claim::scan_for_claim(
+                &routed,
+                WorkClass::Screen,
+                PROCESSOR_VERSION,
+                &expired,
+                CLAIM_SCAN_LIMIT,
+            )
+            .unwrap(),
+            wal::claim::ClaimScan::Observed(_)
+        ));
+    }
+
+    #[test]
+    fn the_audio_class_is_gated_off_on_the_production_baseline() {
+        // R1/T24: `audio_segments` and `utterances` are plain INTEGER PRIMARY
+        // KEY in the frozen epoch-0 baseline, so the sealed transcript
+        // family's sqlite_sequence pins read 0 forever. Claiming audio here
+        // would make a PAID Vertex call that can never settle, three times per
+        // window, forever.
+        let conn = job_fixture_db();
+        for index in 0..2 {
+            let manifest = numbered_audio_manifest(index);
+            record_source_event(
+                &conn,
+                "account-1",
+                &manifest,
+                &format!("{:064x}", index + 1),
+                &format!("raw/audio-{index}"),
+            )
+            .unwrap();
+        }
+        // The legacy lane still leases audio -- this slice changes nothing for
+        // an unselected user.
+        let leased_at = slice10i_leased_at();
+        assert!(lease_work_unit(&conn, &leased_at, WorkClass::Audio)
+            .unwrap()
+            .is_some());
+        // The routed lane refuses it, and writes nothing.
+        let fresh = job_fixture_db();
+        for index in 0..2 {
+            let manifest = numbered_audio_manifest(index);
+            record_source_event(
+                &fresh,
+                "account-1",
+                &manifest,
+                &format!("{:064x}", index + 1),
+                &format!("raw/audio-{index}"),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            wal::claim::scan_for_claim(
+                &fresh,
+                WorkClass::Audio,
+                PROCESSOR_VERSION,
+                &leased_at,
+                CLAIM_SCAN_LIMIT,
+            )
+            .unwrap(),
+            wal::claim::ClaimScan::AudioLaneBlocked
+        ));
+        let units: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM media_work_units", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(units, 0, "no claim, no reservation, no paid call");
+        let claimed: i64 = fresh
+            .query_row(
+                "SELECT COUNT(*) FROM media_processing_jobs WHERE state<>'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed, 0);
+        // The screen lane is untouched by the gate: 10i unblocks it end to end.
+        let screen = slice10i_screen_fixture(1);
+        assert!(matches!(
+            wal::claim::scan_for_claim(
+                &screen,
+                WorkClass::Screen,
+                PROCESSOR_VERSION,
+                &leased_at,
+                CLAIM_SCAN_LIMIT,
+            )
+            .unwrap(),
+            wal::claim::ClaimScan::Observed(_)
+        ));
+    }
+
+    #[test]
+    fn the_transcript_conflict_code_is_excluded_from_every_recovery_gate() {
+        let conn = job_fixture_db();
+        let manifest = numbered_audio_manifest(0);
+        record_source_event(
+            &conn,
+            "account-1",
+            &manifest,
+            &format!("{:064x}", 1),
+            "raw/conflict-0",
+        )
+        .unwrap();
+        let from = "2026-07-31T17:00:00.000Z";
+        let to = "2026-07-31T19:00:00.000Z";
+        let window_start = "2026-07-30T00:00:00.000Z";
+        conn.execute(
+            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE media_processing_jobs SET state='failed_terminal',attempt_count=1,\
+             error_code='processing_error',updated_at='2026-07-31T18:30:00.000Z' \
+             WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        assert!(
+            span_has_recoverable_media(&conn, from, to, window_start).unwrap(),
+            "an ordinary terminal failure still holds the summarizer cursor"
+        );
+        conn.execute(
+            "UPDATE media_processing_jobs SET error_code=?1 WHERE event_id=?2",
+            params![TRANSCRIPT_TARGET_CONFLICT, &manifest.event_id],
+        )
+        .unwrap();
+        assert!(
+            !span_has_recoverable_media(&conn, from, to, window_start).unwrap(),
+            "a target conflict can never recover, so it must release the cursor"
+        );
+        // The legacy resurrection sweep is deliberately NOT taught the code:
+        // the legacy lane cannot produce it and must stay byte-intact.
+        assert_eq!(
+            resurrect_failed_jobs(&conn, "2026-07-31T20:00:00.000Z").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_slice10i_carried_bounds_match_the_legacy_constants() {
+        assert_eq!(CLAIM_SCAN_LIMIT, 128, "the legacy lease scan LIMIT");
+        assert_eq!(CLAIM_LEASE_SECONDS, 300, "the legacy lease deadline");
+        assert_eq!(BUDGET_RETRY_SECONDS, 6 * 60 * 60);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "604800 is exactly representable"
+        )]
+        {
+            assert_eq!(
+                RESURRECTION_WINDOW_SECONDS_INTEGRAL as f64,
+                RESURRECTION_WINDOW_SECONDS
+            );
+        }
+        assert_eq!(TRANSCRIPT_TARGET_CONFLICT, "transcript_target_conflict");
+        let source = include_str!("media_worker.rs");
+        let start = source.find(concat!("fn lease_work_", "unit(")).unwrap();
+        let end = source.find(concat!("fn normalized_", "name(")).unwrap();
+        let legacy = &source[start..end];
+        assert!(
+            legacy.contains("LIMIT 128"),
+            "the carried scan limit still mirrors the legacy literal"
+        );
+        assert!(legacy.contains("isotime::add_seconds(now, 300.0)"));
+    }
+
+    #[test]
+    fn the_media_claim_route_is_exactly_dual_path() {
+        let whole = include_str!("media_worker.rs");
+        // The test module names both constructors in its own fixture helper;
+        // R5 is a claim about production code only.
+        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
+        // R5: each sealed plan is constructed exactly once.
+        assert_eq!(
+            source
+                .matches(concat!("MediaWorkClaimPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches(concat!("MediaWorkFailurePlan::", "new("))
+                .count(),
+            1
+        );
+
+        let claim_start = source
+            .find(concat!("async fn claim_media_work_", "unit("))
+            .unwrap();
+        let failure_start = source
+            .find(concat!("async fn settle_media_work_", "failure("))
+            .unwrap();
+        let process_start = source.find(concat!("async fn process_", "user(")).unwrap();
+        let process_end = source
+            .find(concat!("async fn prune_user_", "media("))
+            .unwrap();
+
+        let claim = &source[claim_start..failure_start];
+        assert_eq!(
+            claim
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1,
+            "ONE routed read produces the whole observation"
+        );
+        assert_eq!(
+            claim
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        assert_eq!(claim.matches(concat!(".with_", "user(")).count(), 0);
+        assert!(claim.contains("scan_for_claim"));
+
+        let failure = &source[failure_start..process_start];
+        assert_eq!(
+            failure
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            failure
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        assert_eq!(failure.matches(concat!(".with_", "user(")).count(), 0);
+
+        let process = &source[process_start..process_end];
+        // The class scan, the claim and the failure tail each branch once.
+        assert_eq!(
+            process
+                .matches(concat!("is_wal_", "authoritative("))
+                .count(),
+            3
+        );
+        // ...and every legacy call survives at its original ordinal: the
+        // class scan, the lease, the failure tail, and the two out-of-scope
+        // voice calls, plus the three legacy saves.
+        assert_eq!(process.matches(concat!(".with_", "user(")).count(), 5);
+        assert_eq!(process.matches(concat!(".save_", "user(")).count(), 3);
+        assert_eq!(
+            process
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1,
+            "only the read-only class scan is routed inline"
+        );
+        assert_eq!(
+            process
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            0
+        );
+        // The legacy bodies never learn about the WAL lane. The ONLY
+        // permitted edit anywhere in them is `lease_work_unit`'s single call
+        // into the shared work-unit-id digest, so both lanes mint identical
+        // ids; its behaviour is pinned row-for-row by
+        // `the_routed_claim_reproduces_the_legacy_lease_row_for_row`.
+        for (from, to, shared_helpers) in [
+            (
+                concat!("fn lease_work_", "unit("),
+                concat!("fn normalized_", "name("),
+                1,
+            ),
+            (
+                concat!("fn mark_", "failed("),
+                "/// True when [from, to) still contains capture media",
+                0,
+            ),
+            (
+                concat!("fn defer_for_", "budget("),
+                concat!("async fn reserve_media_", "output("),
+                0,
+            ),
+        ] {
+            let start = source.find(from).unwrap();
+            let end = source.find(to).unwrap();
+            let body = &source[start..end];
+            assert!(
+                !body.contains(concat!("is_wal_", "authoritative")),
+                "legacy body {from} must stay byte-intact"
+            );
+            assert_eq!(
+                body.matches("wal::").count(),
+                shared_helpers,
+                "legacy body {from} reaches the sealed lane only where allowed"
+            );
+            assert_eq!(body.matches(concat!("Plan::", "new(")).count(), 0);
+        }
+    }
+
+    #[test]
+    fn the_local_work_unit_is_safe_to_reuse_after_the_claim() {
+        // `Output = ()` is only sufficient because nothing downstream reads
+        // the local copy's `usage_json` -- the one mutable field the claim
+        // rewrites. Both consumers re-read it through their own routed reads.
+        let source = include_str!("media_worker.rs");
+        let start = source
+            .find(concat!("async fn process_work_", "unit("))
+            .unwrap();
+        let end = source
+            .find("/// Moves eligible terminally failed jobs back")
+            .unwrap();
+        let body = &source[start..end];
+        assert!(
+            !body.contains("usage_json"),
+            "process_work_unit must never read the stale local usage_json"
+        );
+    }
+
+    #[test]
+    fn the_transcript_conflict_is_classified_before_the_wildcard() {
+        let source = include_str!("media_worker.rs");
+        let start = source.find("let error_code = match error {").unwrap();
+        let classifier = &source[start..];
+        let arm = classifier
+            .find("=> {\n                    TRANSCRIPT_TARGET_CONFLICT")
+            .unwrap();
+        let wildcard = classifier
+            .find(concat!("_ => \"processing_", "error\","))
+            .unwrap();
+        assert!(
+            arm < wildcard,
+            "a Conflict must not fall through to processing_error"
+        );
+        // The two stable metric fields are the only queryable signals in a
+        // repository with no metrics crate.
+        assert!(source.contains(concat!("metric = \"media_transcript_target_", "conflict\"")));
+        assert!(source.contains(concat!("metric = \"media_audio_lane_blocked_", "t24\"")));
+        // The producer and the sealed exclusion ship together.
+        assert!(include_str!("media_worker/wal/resurrection.rs")
+            .contains("AND j.error_code IS NOT 'transcript_target_conflict'"));
+        let legacy_start = source
+            .find(concat!("fn resurrect_failed_", "jobs("))
+            .unwrap();
+        let legacy_end = source
+            .find(concat!("async fn resurrect_user_failed_", "jobs("))
+            .unwrap();
+        assert!(
+            !source[legacy_start..legacy_end].contains("transcript_target_conflict"),
+            "the legacy sweep cannot produce the code and stays byte-intact"
+        );
     }
 }

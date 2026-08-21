@@ -1549,6 +1549,29 @@ pub(in crate::cp::media_worker) fn project_audio_window_for_owner(
     project_audio_window(&work.members, turns).map(|_| ())
 }
 
+/// Owner-facing, read-only projection TARGETS: the exact
+/// `(speaker_observations.event_id, turn_id)` pairs `apply` would insert.
+///
+/// Strictly additive — it runs the same pure projection as the check above and
+/// touches no identity, codec, canonical request, ledger or mutation. It
+/// exists so the owner's `transcript_target_conflict` pre-check cannot
+/// disagree with the rows this sealed `apply` would write: a
+/// `UNIQUE(event_id,turn_id)` violation inside `apply` surfaces as an opaque
+/// `Unavailable` that is indistinguishable from a transient failure, and the
+/// window would then fail closed permanently.
+pub(in crate::cp::media_worker) fn project_audio_window_targets_for_owner(
+    work: &AuthenticatedAudioWork,
+    turns: &[AudioTurnFact],
+) -> Result<Vec<(String, String)>> {
+    let projection = project_audio_window(&work.members, turns)?;
+    Ok(projection
+        .turns
+        .iter()
+        .zip(turns)
+        .map(|(projected, turn)| (projected.anchor_event_id.clone(), turn.turn_id.clone()))
+        .collect())
+}
+
 /// The migration-added target columns must already exist; on a stale
 /// archive this plan is Unavailable and NEVER creates schema.
 fn ensure_target_columns(transaction: &Transaction<'_>) -> Result<()> {

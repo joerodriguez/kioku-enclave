@@ -524,6 +524,10 @@ impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkReservationPl
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkReservationLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaJobResurrectionPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaJobResurrectionLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkClaimPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkClaimLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkFailurePlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkFailureLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaUsageSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaUsageSettlementLedger {}
 impl sealed::DomainPlan for crate::cp::summarizer::wal::EpisodeWindowUpsertPlan {}

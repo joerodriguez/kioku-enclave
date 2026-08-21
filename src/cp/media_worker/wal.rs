@@ -21,6 +21,8 @@
 pub(super) mod attempt;
 pub(super) mod audio_attempt;
 pub(super) mod audio_result;
+pub(super) mod claim;
+pub(super) mod failure;
 pub(super) mod reservation;
 pub(super) mod result;
 pub(super) mod resurrection;
@@ -28,6 +30,8 @@ pub(super) mod usage;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
 pub(crate) use audio_attempt::{AudioWindowAttemptLedger, AudioWindowAttemptPlan};
 pub(crate) use audio_result::{AudioWindowTranscriptLedger, AudioWindowTranscriptPlan};
+pub(crate) use claim::{MediaWorkClaimLedger, MediaWorkClaimPlan};
+pub(crate) use failure::{MediaWorkFailureLedger, MediaWorkFailurePlan};
 pub(crate) use reservation::{MediaWorkReservationLedger, MediaWorkReservationPlan};
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};
