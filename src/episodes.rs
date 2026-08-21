@@ -5,46 +5,19 @@
 //! (per-user SQLite blob); the summariser sends an upsert so re-runs simply
 //! overwrite the previous result without creating duplicates.
 //!
-//! # Routes
-//! - `POST /v1/episodes/upsert`       — write/replace episodes
-//! - `POST /v1/episodes/list`         — newest-first listing with optional time range
-//! - `POST /v1/episodes/delete_range` — delete episodes in `[from, to)` (summariser rewind)
+//! # Surface
+//!
+//! This module serves NO routes. The `/v1/episodes/*` endpoints it once backed
+//! are tombstoned to 410 (`main.rs`, `legacy_data_plane_retired`) and their
+//! handlers are gone. What remains is a library called in-process: the
+//! summariser uses `upsert_episodes` and `write_episode_embedding`, and the
+//! query surface uses `purge_episode`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::error::Result;
 
 // ── Shared row type ───────────────────────────────────────────────────────────
-
-/// A fully-hydrated episode row returned by list / upsert.
-#[derive(Debug, Serialize)]
-#[allow(dead_code)] // hydrated only by the retired `/v1/episodes/list` handler
-pub struct EpisodeRow {
-    pub id: i64,
-    pub started_at: String,
-    pub ended_at: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub episode_type: Option<String>,
-    pub title: Option<String>,
-    pub summary: Option<String>,
-    /// Parsed back from JSON text stored in the DB.
-    pub participants: Value,
-    pub languages: Value,
-    pub action_items: Value,
-    /// Minute-timeline gists (ADR-0004): JSON array of {start, gist}, time
-    /// ascending. Empty array for episodes summarized before the feature.
-    pub minute_summaries: Value,
-    /// ADR-0009 visibility tier: none (hidden), low, or normal.
-    pub substance: String,
-    pub model: Option<String>,
-    pub created_at: String,
-    /// Member counts (v2) — number of utterances / screenshots bound to this
-    /// episode via episode_members. Lets the debugger and list_episodes show
-    /// "N utterances, M screenshots" without a second round-trip.
-    pub utterance_count: i64,
-    pub screenshot_count: i64,
-}
 
 /// One minute-timeline bucket (ADR-0004): a one-line gist of what happened in
 /// the minutes starting at `start`. Stored on the episode row as a JSON array
@@ -627,38 +600,6 @@ pub(crate) fn purge_episode(
     tx.commit()?;
 
     Ok(Some(purge))
-}
-
-// ── Shared helpers ─────────────────────────────────────────────────────────────
-
-/// Parse a JSON-text column into a [`serde_json::Value`] array.
-/// Returns `Value::Array([])` on NULL or parse failure so the response is
-/// always a JSON array rather than null.
-#[allow(dead_code)]
-fn parse_json_array(raw: Option<String>) -> Value {
-    raw.and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Array(vec![]))
-}
-
-#[allow(dead_code)]
-fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
-    Ok(EpisodeRow {
-        id: row.get(0)?,
-        started_at: row.get(1)?,
-        ended_at: row.get(2)?,
-        episode_type: row.get(3)?,
-        title: row.get(4)?,
-        summary: row.get(5)?,
-        participants: parse_json_array(row.get(6)?),
-        languages: parse_json_array(row.get(7)?),
-        action_items: parse_json_array(row.get(8)?),
-        model: row.get(9)?,
-        created_at: row.get(10)?,
-        utterance_count: row.get(11)?,
-        screenshot_count: row.get(12)?,
-        minute_summaries: parse_json_array(row.get(13)?),
-        substance: row.get(14)?,
-    })
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -1346,7 +1287,8 @@ mod tests {
             .await
             .unwrap();
 
-        let p: Value = serde_json::from_str(&raw).expect("participants must be valid JSON");
+        let p: serde_json::Value =
+            serde_json::from_str(&raw).expect("participants must be valid JSON");
         assert!(p.is_array());
         let arr = p.as_array().unwrap();
         assert_eq!(arr.len(), 2);
