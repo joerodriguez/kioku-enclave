@@ -5,50 +5,19 @@
 //! (per-user SQLite blob); the summariser sends an upsert so re-runs simply
 //! overwrite the previous result without creating duplicates.
 //!
-//! # Routes
-//! - `POST /v1/episodes/upsert`       — write/replace episodes
-//! - `POST /v1/episodes/list`         — newest-first listing with optional time range
-//! - `POST /v1/episodes/delete_range` — delete episodes in `[from, to)` (summariser rewind)
+//! # Surface
+//!
+//! This module serves NO routes. The `/v1/episodes/*` endpoints it once backed
+//! are tombstoned to 410 (`main.rs`, `legacy_data_plane_retired`) and their
+//! handlers are gone. What remains is a library called in-process: the
+//! summariser uses `upsert_episodes` and `write_episode_embedding`, and the
+//! query surface uses `purge_episode`.
 
-use std::sync::Arc;
-
-use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tracing::info;
 
-use crate::{error::Result, AppState};
+use crate::error::Result;
 
 // ── Shared row type ───────────────────────────────────────────────────────────
-
-/// A fully-hydrated episode row returned by list / upsert.
-#[derive(Debug, Serialize)]
-#[allow(dead_code)] // hydrated only by the retired `/v1/episodes/list` handler
-pub struct EpisodeRow {
-    pub id: i64,
-    pub started_at: String,
-    pub ended_at: String,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub episode_type: Option<String>,
-    pub title: Option<String>,
-    pub summary: Option<String>,
-    /// Parsed back from JSON text stored in the DB.
-    pub participants: Value,
-    pub languages: Value,
-    pub action_items: Value,
-    /// Minute-timeline gists (ADR-0004): JSON array of {start, gist}, time
-    /// ascending. Empty array for episodes summarized before the feature.
-    pub minute_summaries: Value,
-    /// ADR-0009 visibility tier: none (hidden), low, or normal.
-    pub substance: String,
-    pub model: Option<String>,
-    pub created_at: String,
-    /// Member counts (v2) — number of utterances / screenshots bound to this
-    /// episode via episode_members. Lets the debugger and list_episodes show
-    /// "N utterances, M screenshots" without a second round-trip.
-    pub utterance_count: i64,
-    pub screenshot_count: i64,
-}
 
 /// One minute-timeline bucket (ADR-0004): a one-line gist of what happened in
 /// the minutes starting at `start`. Stored on the episode row as a JSON array
@@ -228,43 +197,6 @@ pub(crate) fn merge_visual_evidence(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EpisodesUpsertRequest {
-    pub user_id: String,
-    pub episodes: Vec<EpisodeInput>,
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct EpisodesUpsertResponse {
-    pub upserted: usize,
-    /// Resulting episode ids, in the same order as the request's `episodes`.
-    /// New episodes carry their freshly-assigned id; updated ones echo theirs.
-    pub ids: Vec<i64>,
-}
-
-#[allow(dead_code)] // authenticated legacy route is now an explicit 410 tombstone
-pub async fn handle_episodes_upsert(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EpisodesUpsertRequest>,
-) -> Result<Json<EpisodesUpsertResponse>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, count = req.episodes.len(), "episodes upsert request");
-
-    let ids = state
-        .store
-        .with_user(&user_id, |conn| upsert_episodes(conn, &req.episodes))
-        .await?;
-
-    state.store.save_user(&user_id).await?;
-    Ok(Json(EpisodesUpsertResponse {
-        upserted: ids.len(),
-        ids,
-    }))
-}
-
 /// Upsert episodes by id and (additively) bind their members.
 ///
 /// Per episode:
@@ -412,129 +344,6 @@ pub(crate) fn upsert_episodes(
         ids.push(episode_id);
     }
     Ok(ids)
-}
-
-// ── List ───────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EpisodesListRequest {
-    pub user_id: String,
-    pub time_start: Option<String>,
-    pub time_end: Option<String>,
-    #[serde(default = "default_list_limit")]
-    pub limit: usize,
-    #[serde(default)]
-    pub offset: usize,
-}
-
-#[allow(dead_code)]
-fn default_list_limit() -> usize {
-    100
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct EpisodesListResponse {
-    pub episodes: Vec<EpisodeRow>,
-}
-
-#[allow(dead_code)]
-pub async fn handle_episodes_list(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EpisodesListRequest>,
-) -> Result<Json<EpisodesListResponse>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, "episodes list request");
-
-    let episodes = state
-        .store
-        .with_user(&user_id, |conn| list_episodes(conn, &req))
-        .await?;
-
-    Ok(Json(EpisodesListResponse { episodes }))
-}
-
-#[allow(dead_code)]
-fn list_episodes(
-    conn: &rusqlite::Connection,
-    req: &EpisodesListRequest,
-) -> Result<Vec<EpisodeRow>> {
-    let mut stmt = conn.prepare(
-        r#"SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary,
-                  e.participants, e.languages, e.action_items, e.model, e.created_at,
-                  (SELECT COUNT(*) FROM episode_members m
-                     WHERE m.episode_id = e.id AND m.record_type = 'utterance')  AS utterance_count,
-                  (SELECT COUNT(*) FROM episode_members m
-                     WHERE m.episode_id = e.id AND m.record_type = 'screenshot') AS screenshot_count,
-                  e.minute_summaries, e.substance
-           FROM episodes e
-           WHERE (?1 IS NULL OR e.started_at >= ?1)
-             AND (?2 IS NULL OR e.started_at < ?2)
-           ORDER BY e.started_at DESC
-           LIMIT ?3 OFFSET ?4"#,
-    )?;
-
-    let rows = stmt.query_map(
-        rusqlite::params![
-            req.time_start,
-            req.time_end,
-            req.limit as i64,
-            req.offset as i64,
-        ],
-        parse_episode_row,
-    )?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-// ── Delete range ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EpisodesDeleteRangeRequest {
-    pub user_id: String,
-    pub from: String,
-    pub to: String,
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct EpisodesDeleteRangeResponse {
-    pub deleted: usize,
-}
-
-#[allow(dead_code)]
-pub async fn handle_episodes_delete_range(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EpisodesDeleteRangeRequest>,
-) -> Result<Json<EpisodesDeleteRangeResponse>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, from = %req.from, to = %req.to, "episodes delete_range request");
-
-    let deleted = state
-        .store
-        .with_user(&user_id, |conn| {
-            conn.execute(
-                "DELETE FROM episodes WHERE started_at >= ?1 AND started_at < ?2",
-                rusqlite::params![req.from, req.to],
-            )?;
-            let deleted = conn.changes() as usize;
-            // vec0 has no FK/trigger support — sweep vectors orphaned by the
-            // delete (stale entries would only waste KNN slots, but keep tidy).
-            conn.execute(
-                "DELETE FROM vec_episodes WHERE episode_id NOT IN (SELECT id FROM episodes)",
-                [],
-            )?;
-            Ok(deleted)
-        })
-        .await?;
-
-    state.store.save_user(&user_id).await?;
-    Ok(Json(EpisodesDeleteRangeResponse { deleted }))
 }
 
 // ── Purge (episode + member raw data) ────────────────────────────────────────
@@ -791,115 +600,6 @@ pub(crate) fn purge_episode(
     tx.commit()?;
 
     Ok(Some(purge))
-}
-
-// ── Members (drill-in) ───────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EpisodesMembersRequest {
-    pub user_id: String,
-    pub episode_id: i64,
-}
-
-/// Return the records bound to one episode (debugger drill-in). Utterances are
-/// joined to audio_segments for their absolute timestamp; both lists come back
-/// time-ascending.
-#[allow(dead_code)]
-pub async fn handle_episodes_members(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EpisodesMembersRequest>,
-) -> Result<Json<Value>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, episode_id = req.episode_id, "episodes members request");
-
-    let result = state
-        .store
-        .with_user(&user_id, |conn| fetch_members(conn, req.episode_id))
-        .await?;
-
-    Ok(Json(result))
-}
-
-#[allow(dead_code)]
-fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> {
-    let mut ustmt = conn.prepare(
-        r#"SELECT u.id, u.text, u.language, u.speaker_label, s.started_at, u.source_key
-           FROM episode_members m
-           JOIN utterances u     ON u.id = m.record_id
-           JOIN audio_segments s ON s.id = u.audio_segment_id
-           WHERE m.episode_id = ?1 AND m.record_type = 'utterance'
-           ORDER BY s.started_at ASC, u.start_offset_seconds ASC"#,
-    )?;
-    let utterances: Vec<Value> = ustmt
-        .query_map([episode_id], |row| {
-            Ok(json!({
-                "id":            row.get::<_, i64>(0)?,
-                "text":          row.get::<_, String>(1)?,
-                "language":      row.get::<_, Option<String>>(2)?,
-                "speaker_label": row.get::<_, String>(3)?,
-                "started_at":    row.get::<_, String>(4)?,
-                "source_key":    row.get::<_, Option<String>>(5)?,
-            }))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut sstmt = conn.prepare(
-        r#"SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title, sc.url, sc.ocr_text,
-                  sc.source_key
-           FROM episode_members m
-           JOIN screenshots sc ON sc.id = m.record_id
-           WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'
-           ORDER BY sc.captured_at ASC"#,
-    )?;
-    let screenshots: Vec<Value> = sstmt
-        .query_map([episode_id], |row| {
-            Ok(json!({
-                "id":           row.get::<_, i64>(0)?,
-                "captured_at":  row.get::<_, String>(1)?,
-                "active_app":   row.get::<_, Option<String>>(2)?,
-                "window_title": row.get::<_, Option<String>>(3)?,
-                "url":          row.get::<_, Option<String>>(4)?,
-                "ocr_text":     row.get::<_, Option<String>>(5)?,
-                "source_key":   row.get::<_, Option<String>>(6)?,
-            }))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    Ok(json!({ "utterances": utterances, "screenshots": screenshots }))
-}
-
-// ── Shared helpers ─────────────────────────────────────────────────────────────
-
-/// Parse a JSON-text column into a [`serde_json::Value`] array.
-/// Returns `Value::Array([])` on NULL or parse failure so the response is
-/// always a JSON array rather than null.
-#[allow(dead_code)]
-fn parse_json_array(raw: Option<String>) -> Value {
-    raw.and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Array(vec![]))
-}
-
-#[allow(dead_code)]
-fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
-    Ok(EpisodeRow {
-        id: row.get(0)?,
-        started_at: row.get(1)?,
-        ended_at: row.get(2)?,
-        episode_type: row.get(3)?,
-        title: row.get(4)?,
-        summary: row.get(5)?,
-        participants: parse_json_array(row.get(6)?),
-        languages: parse_json_array(row.get(7)?),
-        action_items: parse_json_array(row.get(8)?),
-        model: row.get(9)?,
-        created_at: row.get(10)?,
-        utterance_count: row.get(11)?,
-        screenshot_count: row.get(12)?,
-        minute_summaries: parse_json_array(row.get(13)?),
-        substance: row.get(14)?,
-    })
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -1239,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn members_bound_and_counted_and_listed() {
+    async fn members_bound_and_counted() {
         let store = make_store();
         // Seed an audio segment + utterance and a screenshot so the FK targets exist.
         let (utt_id, scr_id) = store
@@ -1277,30 +977,43 @@ mod tests {
             .unwrap();
         let ep_id = ids[0];
 
-        // List returns the member counts.
-        let req = EpisodesListRequest {
-            user_id: "mem_user".to_string(),
-            time_start: None,
-            time_end: None,
-            limit: 10,
-            offset: 0,
-        };
-        let rows = store
-            .with_user("mem_user", |conn| list_episodes(conn, &req))
+        // One member of each kind is bound to the episode.
+        let (utt_members, scr_members) = store
+            .with_user("mem_user", |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT count(*) FROM episode_members
+                         WHERE episode_id = ?1 AND record_type = 'utterance'",
+                        [ep_id],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT count(*) FROM episode_members
+                         WHERE episode_id = ?1 AND record_type = 'screenshot'",
+                        [ep_id],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].utterance_count, 1);
-        assert_eq!(rows[0].screenshot_count, 1);
+        assert_eq!(utt_members, 1);
+        assert_eq!(scr_members, 1);
 
-        // Members drill-in returns the records.
-        let members = store
-            .with_user("mem_user", |conn| fetch_members(conn, ep_id))
+        // The bound member rows point at the seeded records.
+        let bound_text: String = store
+            .with_user("mem_user", |conn| {
+                Ok(conn.query_row(
+                    "SELECT u.text FROM episode_members m
+                     JOIN utterances u ON u.id = m.record_id
+                     WHERE m.episode_id = ?1 AND m.record_type = 'utterance'",
+                    [ep_id],
+                    |r| r.get(0),
+                )?)
+            })
             .await
             .unwrap();
-        assert_eq!(members["utterances"].as_array().unwrap().len(), 1);
-        assert_eq!(members["screenshots"].as_array().unwrap().len(), 1);
-        assert_eq!(members["utterances"][0]["text"], "hello world");
+        assert_eq!(bound_text, "hello world");
 
         // Re-binding the same members is idempotent (INSERT OR IGNORE).
         let ep_again = EpisodeInput {
@@ -1523,36 +1236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_ordering_and_limit() {
-        let store = make_store();
-        let eps = vec![
-            sample_episode("2026-01-01T08:00:00Z", "2026-01-01T08:30:00Z"),
-            sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z"),
-            sample_episode("2026-01-01T10:00:00Z", "2026-01-01T10:30:00Z"),
-        ];
-        store
-            .with_user("list_user", |conn| upsert_episodes(conn, &eps))
-            .await
-            .unwrap();
-
-        let req = EpisodesListRequest {
-            user_id: "list_user".to_string(),
-            time_start: None,
-            time_end: None,
-            limit: 2,
-            offset: 0,
-        };
-        let rows = store
-            .with_user("list_user", |conn| list_episodes(conn, &req))
-            .await
-            .unwrap();
-
-        assert_eq!(rows.len(), 2);
-        // Newest first
-        assert!(rows[0].started_at > rows[1].started_at);
-    }
-
-    #[tokio::test]
     async fn delete_range_only_deletes_in_range() {
         let store = make_store();
         let eps = vec![
@@ -1597,20 +1280,15 @@ mod tests {
             .await
             .unwrap();
 
-        let req = EpisodesListRequest {
-            user_id: "json_user".to_string(),
-            time_start: None,
-            time_end: None,
-            limit: 10,
-            offset: 0,
-        };
-        let rows = store
-            .with_user("json_user", |conn| list_episodes(conn, &req))
+        let raw: String = store
+            .with_user("json_user", |conn| {
+                Ok(conn.query_row("SELECT participants FROM episodes", [], |r| r.get(0))?)
+            })
             .await
             .unwrap();
 
-        assert_eq!(rows.len(), 1);
-        let p = &rows[0].participants;
+        let p: serde_json::Value =
+            serde_json::from_str(&raw).expect("participants must be valid JSON");
         assert!(p.is_array());
         let arr = p.as_array().unwrap();
         assert_eq!(arr.len(), 2);

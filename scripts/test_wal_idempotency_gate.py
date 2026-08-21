@@ -118,7 +118,20 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # settle_for_account_deletion#0::with_user#0, whose expression moved because
 # the legacy sweep is now indented inside `if !wal_lane`; the sweep itself is
 # unchanged and still runs for every unselected account.
-EXPECTED_STORE_CALL_COUNT = 239
+# D1 (retired /v1 data plane): exactly TWELVE removals and zero additions.
+# Deleting the handlers behind the `any(legacy_data_plane_retired)` 410 routes
+# removed every Store call they owned: ingest_batch's with_user+save_user (the
+# whole of src/ingest.rs is gone), handle_search#0::with_user, handle_context /
+# handle_range / handle_stats' with_user, handle_episodes_upsert's
+# with_user+save_user, handle_episodes_delete_range's with_user+save_user, and
+# handle_episodes_list / handle_episodes_members' with_user. 239 -> 227, dumped
+# and diffed against a pristine origin/main (4461f21) tree with this module's
+# own helpers -- which reproduce the previous 239/6599ee98 pin exactly. Zero
+# additions, zero reclassifications, and zero OWNER-BODY hash movement on any
+# surviving row: the retained library functions (search_all/search_episodes,
+# fetch_context, upsert_episodes/write_episode_embedding/purge_episode) take a
+# `&Connection` and own no Store call sites of their own.
+EXPECTED_STORE_CALL_COUNT = 227
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -129,7 +142,7 @@ EXPECTED_STORE_CALL_COUNT = 239
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "6599ee9889c4b5efc31f1bc0213c55b548df773eed5a5d581d73f0206db68adf"
+EXPECTED_STORE_CALL_SHA256 = "996f1a345f9cbe6ab676be2b48b2415f1d90f6ffbf94a623a6ea3e4fa47838ae"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -866,16 +879,10 @@ A_OWNERS = frozenset(
         "src/cp/summarizer.rs::session_tail_is_settled#0",
         "src/cp/sync.rs::sync_status#0",
         "src/cp/webhook_worker.rs::next_delivery#0",
-        "src/episodes.rs::handle_episodes_list#0",
-        "src/episodes.rs::handle_episodes_members#0",
-        "src/search.rs::handle_search#0",
         "src/store.rs::enqueue_email_delivery#0",
         "src/store.rs::next_email_delivery#0",
         "src/store.rs::next_push_delivery#0",
         "src/store.rs::resolve_push_handoff#0",
-        "src/timeline.rs::handle_context#0",
-        "src/timeline.rs::handle_range#0",
-        "src/timeline.rs::handle_stats#0",
     }
 )
 B_OWNERS = frozenset(
@@ -929,9 +936,6 @@ C_OWNERS = frozenset(
     {
         "src/cp/model_usage.rs::settle_for_account_deletion#0",
         "src/cp/query.rs::rest_episode_delete#0",
-        "src/episodes.rs::handle_episodes_upsert#0",
-        "src/episodes.rs::handle_episodes_delete_range#0",
-        "src/ingest.rs::ingest_batch#0",
         "src/store.rs::with_user_read#0",
         "src/store.rs::with_user_if_changed#0",
         "src/store.rs::freeze_wal_authoritative_media_keys#0",

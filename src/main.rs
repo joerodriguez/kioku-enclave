@@ -228,17 +228,14 @@ mod error;
 // Inactive migration-only reader for the historic GCM envelope. It has no
 // Store, GCS provider, route, flag, or authority wiring.
 mod legacy_gcm;
-// The retired local-sync route no longer calls this legacy ingestion surface,
-// but its core remains as migration/regression-test coverage for old indexes.
-#[allow(dead_code)]
-mod ingest;
 mod ocr;
 mod schema_ladder;
 mod search;
 mod storage_observability;
 mod store;
-// Retained for historical index regression tests after the `/v1` query routes
-// were tombstoned.
+// `fetch_context` outlived the `/v1/context` handler that called it; the MCP
+// `get_context` tool is served by `cp::mcp_query::fetch_safe_context` instead.
+// Retained with its own regression coverage as the reference query shape.
 #[allow(dead_code)]
 mod timeline;
 mod tls;
@@ -1664,5 +1661,31 @@ mod retired_route_tests {
             .await
             .unwrap();
         assert_eq!(surviving, 1);
+    }
+
+    /// The 410 tombstone is a published contract: clients (including shipped
+    /// iOS builds) branch on this exact body. Deleting the handlers behind the
+    /// `/v1` routes must not perturb a single byte of it, so pin the status,
+    /// the content type, and the serialized body verbatim.
+    #[tokio::test]
+    async fn legacy_data_plane_410_response_is_byte_identical() {
+        let response = legacy_data_plane_retired().await;
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .expect("410 tombstone must declare a content type"),
+            "application/json"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("410 tombstone body must be readable");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":"legacy_data_plane_retired","message":"Use Kioku Cloud Capture v2."}"#
+        );
     }
 }

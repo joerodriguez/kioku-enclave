@@ -42,13 +42,9 @@
 //! FTS-only, same SQL, same response shape.  The `score` field on each hit is
 //! optional and clients that don't use it can ignore it.
 
-use std::sync::Arc;
-
-use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
-use crate::{error::Result, AppState};
+use crate::error::Result;
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -136,38 +132,6 @@ pub enum SearchHit {
         #[serde(skip_serializing_if = "Option::is_none")]
         score: Option<f64>,
     },
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)] // response wrapper for the retired `/v1/search` handler
-pub struct SearchResponse {
-    pub hits: Vec<SearchHit>,
-    pub total: usize,
-}
-
-// ── Handler ───────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)] // authenticated route is an explicit 410 tombstone
-pub async fn handle_search(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(
-        user_id = %user_id,
-        has_embedding = req.query_embedding.is_some(),
-        query_len = req.query.len(),
-        "search request"
-    );
-
-    let hits = state
-        .store
-        .with_user(&user_id, |conn| search_all(conn, &req))
-        .await?;
-
-    let total = hits.len();
-    Ok(Json(SearchResponse { hits, total }))
 }
 
 // ── Core search logic ─────────────────────────────────────────────────────────
@@ -893,10 +857,8 @@ fn search_episodes_hybrid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::{ingest_utterances, UtteranceInput};
     use crate::store::tests::{FakeGcs, FakeKms};
     use crate::store::Store;
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use std::sync::Arc;
 
     fn make_store() -> Store {
@@ -916,27 +878,49 @@ mod tests {
         vec![unit; n]
     }
 
-    fn make_embedding_b64(val: f32) -> String {
-        let floats = make_embedding(val);
-        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
-        B64.encode(&bytes)
+    /// Raw little-endian float32 bytes, the on-disk vec0 blob layout.
+    fn embedding_bytes(val: f32) -> Vec<u8> {
+        make_embedding(val)
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
     }
 
-    fn utt_with_emb(key: &str, text: &str, emb_val: Option<f32>) -> UtteranceInput {
-        UtteranceInput {
-            segment_started_at: "2026-01-01T09:00:00Z".to_string(),
-            segment_ended_at: "2026-01-01T09:01:00Z".to_string(),
-            duration_seconds: Some(60.0),
-            source_type: "mic".to_string(),
-            start_offset_seconds: 0.0,
-            end_offset_seconds: 5.0,
-            text: text.to_string(),
-            speaker_label: "speaker_0".to_string(),
-            language: None,
-            confidence: None,
-            source_key: Some(key.to_string()),
-            embedding_b64: emb_val.map(make_embedding_b64),
+    /// Seed one utterance (and its shared audio segment) directly, optionally
+    /// with a vec0 embedding. This writes the same rows the retired `/v1/ingest`
+    /// handler used to write, so the search paths under test see identical data.
+    fn seed_utt(
+        conn: &rusqlite::Connection,
+        key: &str,
+        text: &str,
+        emb_val: Option<f32>,
+    ) -> Result<()> {
+        conn.execute(
+            r#"INSERT OR IGNORE INTO audio_segments
+               (started_at, ended_at, duration_seconds, source_type)
+               VALUES ('2026-01-01T09:00:00Z','2026-01-01T09:01:00Z',60.0,'mic')"#,
+            [],
+        )?;
+        let seg_id: i64 = conn.query_row(
+            "SELECT id FROM audio_segments WHERE started_at='2026-01-01T09:00:00Z'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            r#"INSERT INTO utterances
+               (audio_segment_id, start_offset_seconds, end_offset_seconds,
+                text, speaker_label, source_key)
+               VALUES (?1, 0.0, 5.0, ?2, 'speaker_0', ?3)"#,
+            rusqlite::params![seg_id, text, key],
+        )?;
+        if let Some(val) = emb_val {
+            let row_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO vec_utterances(utterance_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![row_id, embedding_bytes(val)],
+            )?;
         }
+        Ok(())
     }
 
     fn req_fts(user: &str, query: &str, kinds: Vec<String>) -> SearchRequest {
@@ -1109,14 +1093,10 @@ mod tests {
 
         store
             .with_user("vsearch_u", |conn| {
-                ingest_utterances(
-                    conn,
-                    &[utt_with_emb("k:1:1", "semantic memory test", Some(1.0))],
-                    true,
-                )
+                seed_utt(conn, "k:1:1", "semantic memory test", Some(1.0))
             })
             .await
-            .expect("ingest");
+            .expect("seed");
 
         // Query with the same direction (cosine distance ≈ 0) → should be returned.
         let hits = store
@@ -1146,21 +1126,13 @@ mod tests {
         store
             .with_user("hybrid_u", |conn| {
                 // Utterance A: matches FTS ("unique_fts_term"), no embedding
-                ingest_utterances(
-                    conn,
-                    &[utt_with_emb("k:1:1", "unique_fts_term alpha", None)],
-                    true,
-                )?;
+                seed_utt(conn, "k:1:1", "unique_fts_term alpha", None)?;
                 // Utterance B: matches vector (similar direction to query), text not matching FTS
-                ingest_utterances(
-                    conn,
-                    &[utt_with_emb("k:1:2", "vector match candidate", Some(1.0))],
-                    true,
-                )?;
+                seed_utt(conn, "k:1:2", "vector match candidate", Some(1.0))?;
                 Ok(())
             })
             .await
-            .expect("ingest");
+            .expect("seed");
 
         // Hybrid query: FTS for "unique_fts_term", vector in direction of emb(1.0)
         let req = SearchRequest {
@@ -1195,14 +1167,10 @@ mod tests {
 
         store
             .with_user("fts_only_u", |conn| {
-                ingest_utterances(
-                    conn,
-                    &[utt_with_emb("k:1:1", "kioku recall test", Some(0.5))],
-                    true,
-                )
+                seed_utt(conn, "k:1:1", "kioku recall test", Some(0.5))
             })
             .await
-            .expect("ingest");
+            .expect("seed");
 
         let hits = store
             .with_user("fts_only_u", |conn| {
@@ -1431,45 +1399,25 @@ mod tests {
     /// FTS-only mode leaves score None.
     #[tokio::test]
     async fn screenshot_hybrid_finds_vector_match() {
-        use crate::ingest::{ingest_screenshots, ScreenshotInput};
         let store = make_store();
 
         store
             .with_user("scr_hybrid_u", |conn| {
-                ingest_screenshots(
-                    conn,
-                    &[ScreenshotInput {
-                        captured_at: "2026-01-01T09:05:00Z".to_string(),
-                        active_app: Some("zoom.us".to_string()),
-                        window_title: None,
-                        ocr_text: Some("participant panel names list".to_string()),
-                        salient_ocr_text: None,
-                        url: None,
-                        image_hash: None,
-                        is_duplicate: None,
-                        display_id: None,
-                        capture_context_version: None,
-                        capture_status: None,
-                        primary_bundle_id: None,
-                        primary_window_id: None,
-                        capture_group_id: None,
-                        visible_windows: None,
-                        visible_windows_truncated: None,
-                        visual_signals: None,
-                        semantic_context_hash: None,
-                        browser_snapshot_source_key: None,
-                        browser_snapshot: None,
-                        duplicate_of_source_key: None,
-                        visible_until: None,
-                        dedupe_version: None,
-                        source_key: Some("dev:9".to_string()),
-                        embedding_b64: Some(make_embedding_b64(1.0)),
-                    }],
-                    true,
-                )
+                conn.execute(
+                    r#"INSERT INTO screenshots (captured_at, active_app, ocr_text, source_key)
+                       VALUES ('2026-01-01T09:05:00Z', 'zoom.us',
+                               'participant panel names list', 'dev:9')"#,
+                    [],
+                )?;
+                let row_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO vec_screenshots(screenshot_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![row_id, embedding_bytes(1.0)],
+                )?;
+                Ok(())
             })
             .await
-            .expect("ingest screenshot");
+            .expect("seed screenshot");
 
         // Hybrid query whose text matches nothing in FTS but whose vector is
         // aligned with the stored embedding.
