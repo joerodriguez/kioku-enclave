@@ -1660,14 +1660,19 @@ fn write_segment(
 ) -> Result<()> {
     let changed = transaction
         .execute(
+            // created_at is explicit for the same reason write_clusters does it:
+            // the baseline declares a strftime DEFAULT (store.rs:5975), and a
+            // clock inside apply would break byte-exact replay.
             "INSERT INTO audio_segments
-             (started_at,ended_at,duration_seconds,source_type,audio_format,transcription_status)
-             VALUES (?1,?2,?3,?4,'audio/wav','done')",
+             (started_at,ended_at,duration_seconds,source_type,audio_format,
+              transcription_status,created_at)
+             VALUES (?1,?2,?3,?4,'audio/wav','done',?5)",
             params![
                 projection.window_started_at,
                 projection.window_ended_at,
                 projection.duration_ms as f64 / 1000.0,
                 projection.source_type,
+                plan.committed_at,
             ],
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -1781,8 +1786,8 @@ fn write_turns(
             .execute(
                 "INSERT INTO utterances
                  (audio_segment_id,start_offset_seconds,end_offset_seconds,text,language,
-                  confidence,speaker_label,source_key,speaker_observation_id)
-                 VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8)",
+                  confidence,speaker_label,source_key,speaker_observation_id,created_at)
+                 VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8,?9)",
                 params![
                     plan.seq_pins.audio_segments + 1,
                     turn.start_ms as f64 / 1000.0,
@@ -1792,6 +1797,7 @@ fn write_turns(
                     projected.label,
                     projected.source_key,
                     observation_id,
+                    plan.committed_at,
                 ],
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -2582,6 +2588,7 @@ pub(super) mod tests {
                     duration_seconds REAL NOT NULL,
                     source_type TEXT NOT NULL,
                     audio_format TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     transcription_status TEXT
                  );
                  CREATE TABLE speaker_clusters (
@@ -2631,7 +2638,8 @@ pub(super) mod tests {
                     confidence REAL,
                     speaker_label TEXT,
                     source_key TEXT,
-                    speaker_observation_id INTEGER
+                    speaker_observation_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                  );",
             )
             .unwrap();
@@ -3399,14 +3407,14 @@ pub(super) mod tests {
             let mut rows = Vec::new();
             for sql in [
                 "SELECT id,started_at,ended_at,duration_seconds,source_type,audio_format,
-                        transcription_status FROM audio_segments ORDER BY id",
+                        transcription_status,created_at FROM audio_segments ORDER BY id",
                 "SELECT id,work_unit_id,speaker_local_id,attribution_state,created_at,updated_at
                  FROM speaker_clusters ORDER BY id",
                 "SELECT id,person_id,event_id,turn_id,speaker_local_id,started_at,ended_at,
                         transcript_text,language,overlap,cluster_id
                  FROM speaker_observations ORDER BY id",
                 "SELECT id,audio_segment_id,start_offset_seconds,end_offset_seconds,text,language,
-                        confidence,speaker_label,source_key,speaker_observation_id
+                        confidence,speaker_label,source_key,speaker_observation_id,created_at
                  FROM utterances ORDER BY id",
                 "SELECT id,state,model_id,prompt_version,schema_version,updated_at
                  FROM media_processing_jobs ORDER BY id",
