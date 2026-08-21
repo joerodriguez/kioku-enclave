@@ -1666,9 +1666,19 @@ async fn current_account_drivers(
 ) -> Option<AccountDrivers> {
     let user_id = user_id.to_string();
     let period = period.to_string();
+    // Routed, not legacy: for a WAL-authoritative account the archive IS the
+    // authoritative database, so its page count and media bytes are the
+    // correct drivers. `wal_authoritative_read` falls through to exactly the
+    // `with_user_read` this used to call for every unselected account, so the
+    // legacy answer is unchanged.
+    //
+    // This was the last ungated legacy read outside the D4 sweep. It mattered
+    // quietly: the refusal for a selected account was swallowed by this
+    // function's `Option` return, so the margin dashboard showed an account
+    // with no drivers rather than an error.
     let mut drivers = state
         .store
-        .read_user(&user_id, {
+        .wal_authoritative_read(&user_id, {
             let period = period.clone();
             move |conn| {
                 let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;

@@ -131,7 +131,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # surviving row: the retained library functions (search_all/search_episodes,
 # fetch_context, upsert_episodes/write_episode_embedding/purge_episode) take a
 # `&Connection` and own no Store call sites of their own.
-EXPECTED_STORE_CALL_COUNT = 227
+EXPECTED_STORE_CALL_COUNT = 228
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -149,7 +149,20 @@ EXPECTED_STORE_CALL_COUNT = 227
 # order, every classification is unchanged, and every per-call-site expression
 # hash is byte-identical. Zero Store calls were added, removed, reordered, or
 # reclassified -- the gate returns BEFORE the call it guards.
-EXPECTED_STORE_CALL_SHA256 = "0cf0c7f5740200d2aa61c4cde13100fb71a0f89674863a22887594481862d8c0"
+# Billing margin read routed: one ADDED row,
+# src/cp/billing.rs::current_account_drivers#0::wal_authoritative_read#0,
+# classified A (read-only). Dumped and diffed against a pristine
+# origin/main (9696081) tree using this module's own helpers; the
+# pristine dump reproduced the prior 227/0cf0c7f5 pin exactly before
+# anything was written. Zero removals, zero reclassifications, every
+# surviving expression hash byte-identical.
+#
+# Note the count ROSE without a matching removal: the replaced call was
+# `Store::read_user`, which this scanner does not track (it is a thin
+# wrapper over with_user_read). Legacy reads reached through read_user
+# are therefore invisible here — worth a sweep of Store's public
+# surface for with_user delegation.
+EXPECTED_STORE_CALL_SHA256 = "bb8acbdf4031368853a73fed7d10adbbf28c7f07a671bfc1570677c3e2cec414"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -873,6 +886,11 @@ def policy_sites() -> list[CallSite]:
 # inventory digest below. Mixed owners use explicit call-site overrides.
 A_OWNERS = frozenset(
     {
+        # Routed margin-dashboard read (billing): page/media/email counters
+        # only, no mutation. Added when the last ungated legacy read outside
+        # the D4 sweep was routed; its `Option` return had been swallowing the
+        # refusal into a driver-less dashboard row.
+        "src/cp/billing.rs::current_account_drivers#0",
         "src/cp/delivery.rs::load_finalized_episode#0",
         "src/cp/finalizer.rs::finalize_user_episodes_scoped#0",
         "src/cp/media.rs::read_media_dek_wrapped#0",
