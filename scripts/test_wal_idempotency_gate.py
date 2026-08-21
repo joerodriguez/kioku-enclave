@@ -172,7 +172,8 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 #     routing branch. Verified line by line against the pristine dump: the two
 #     expressions are identical after stripping leading whitespace, so the
 #     legacy preflight and the legacy write+save pair are byte-intact.
-#   * NINE rows changed in their OWNER-BODY hash only, with byte-identical
+#   * NINE rows changed in their OWNER-BODY hash only (TEN after the
+#     REVIEW FIX addendum below), with byte-identical
 #     call-EXPRESSION hashes and unchanged classifications:
 #     `upload_capture_event#0`'s two save_user rows (the duplicate-branch save
 #     is now skipped on the WAL branch, which has no in-memory half-state to
@@ -185,6 +186,41 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 #
 # Zero removals other than the one rename, zero reclassifications, and the
 # relative order of every surviving key is unchanged.
+#
+# REVIEW FIX (adversarial review of #331, three confirmed defects). The COUNT
+# is unchanged at 232 -- no Store call site was added, removed, renamed or
+# reclassified -- but the digest moves, because three of the fixes edit owner
+# bodies that already carry rows:
+#
+#   * the ingest plan families now take a plan-carried ENCLAVE commit stamp
+#     instead of binding the seven live-clock column DEFAULTs to the DEVICE's
+#     `manifest.source_wall_at`, so `upload_capture_event#0` and
+#     `upload_screen_reference_batch#0` each gained an `enclave_commit_stamp()`
+#     argument inside their WAL branch;
+#   * the four gate-lifted reads (`stream_ack#0`, `capture_status#0`,
+#     `capture_session_status#0`, `list_capture_sessions#0`) now hand their
+#     `Err` arm to `cp::routed_read_unavailable` (503) instead of to
+#     `EnclaveError::into_response` (500 for `EnclaveError::Store`);
+#     `stream_ack#0` additionally keeps `Err(NotFound)` at 404, which is the
+#     absence its lifted gate made truthful;
+#   * `list_people#0`'s retained-gate comment was corrected to name the real
+#     blocker. The owner body hash is taken over RAW source, so a comment-only
+#     edit moves it; nothing executable in that owner changed.
+#
+# That makes it TEN owner-body-only rows rather than nine (the nine above plus
+# `list_people#0::wal_authoritative_read#0`). Re-dumped and re-diffed against a
+# freshly extracted pristine `git archive origin/main | tar -x` tree at 9d78c46
+# -- extracted outside every shared and scratch directory -- with THAT tree's
+# own store_call_sites() / classify_store_call() / inventory_row() / digest()
+# helpers, which reproduced 9d78c46's own 229/8eb21ded pin byte-for-byte before
+# anything was written. The branch script's scanner is byte-identical to that
+# tree's (AST-diffed: only the three CALL_OVERRIDES additions above and these
+# pin constants differ), so the two dumps are directly comparable. The delta
+# against pristine is unchanged in shape: four additions, one removal (the
+# `stream_ack#0::with_user#0` rename), zero reclassifications, the same two
+# indentation-only call-expression moves re-verified line by line, and the
+# relative order of every surviving key still unchanged. The store-surface
+# (15/a2904b58) and policy-site (42/7b4d1591) digests did not move.
 EXPECTED_STORE_CALL_COUNT = 232
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
@@ -320,7 +356,7 @@ EXPECTED_STORE_CALL_COUNT = 232
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "30434e8f143427214e006274d33c095a13ae202532abd6d739957ab7b2407b76"
+EXPECTED_STORE_CALL_SHA256 = "3f71214e9a734420607ae5c625ff92c9430f9b090f250d523c36b429033594f6"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -540,7 +576,16 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # own 26/e6dac368 pin exactly: the count holds at 26, the key set is
 # byte-identical, no spawn was added, removed, reordered or reclassified, and
 # every other spawn's own call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "7ae682ff66d7b4803ebc7ab6d041ed1c30e3088df4e1c9d565e3c3a918ccf605"
+# REVIEW FIX (adversarial review of #331): that same spawn's OWNER-BODY hash
+# moves again, for the same reason and no other -- `upload_capture_event#0`
+# gained the `enclave_commit_stamp()` argument on both of its plan
+# constructions. The GCS media PUT itself is still untouched: its own
+# call-site hash is byte-identical to the pristine dump, the count holds at 26,
+# the key set is unchanged, and no spawn was added, removed, reordered or
+# reclassified. Re-derived against the same freshly extracted pristine 9d78c46
+# tree with that tree's own helpers, which reproduced its own 26/e6dac368 pin
+# exactly first.
+EXPECTED_WORKER_SPAWN_SHA256 = "1741534dbdc25e629e0ab7c76da13c4a91aa297ea8d4c594483eadd42f75d959"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

@@ -272,12 +272,40 @@ pub mod wal_domain {
     //
     /// The four people reads (`list_people`, `person_profile`,
     /// `person_evidence`, `person_statements`). Ingest migrating does NOT lift
-    /// this one: every `people` and `person_facts` row is derived by
-    /// `media_worker`'s voice lanes, and the `voice_profiles` the listing joins
-    /// are written only by the still-deferred `MEDIA_WORKER_VOICE_EMBEDDING`
-    /// and `MEDIA_WORKER_VOICE_PROFILES`. No live writer reaches these tables,
-    /// so a routed read still answers `200 {"people": []}` — the exact shape
-    /// the rule forbids. This lifts with those two lanes.
+    /// this one, and neither does the voice work — the blocker is elsewhere.
+    ///
+    /// **The writers.** Every production `people` row comes from
+    /// `media_worker::create_person` and every `person_facts` row from
+    /// `media_worker::persist_person_fact`. Both are reached ONLY from the
+    /// audio and screen RESULT lanes — `persist_audio_window_result` (directly,
+    /// and via `corroborated_active_screen_person`) and
+    /// `persist_storyboard_results` -> `persist_screen_result_body` ->
+    /// `promote_screen_name_if_corroborated`. Neither voice domain writes
+    /// either table: the only `INSERT INTO people` in `voice_lineage.rs` is
+    /// inside `mod tests`. `init_schema`'s one seeded row (`kind='owner'`) does
+    /// not count — it defaults to `status='unknown'` and every one of these
+    /// reads requires `status='identified'`.
+    ///
+    /// **Why retention is still correct even though those lanes are declared
+    /// migrated.** The sealed result families deliberately commit NO identity,
+    /// and the exclusion is structural rather than conditional:
+    /// `media_worker::wal::audio_result::AudioTurnFact` has no constructor slot
+    /// for `speaker_name*` or `person_facts` at all, and the screen family's
+    /// subtype is literally `screen-storyboard-no-people-v1`. For a selected
+    /// user `process_work_unit` returns early into
+    /// `settle_audio_window_transcript` / `settle_screen_storyboard_result`, so
+    /// the two legacy persisters that DO write these tables are unreachable.
+    /// A routed read would therefore answer `200 {"people": []}` — a refusal
+    /// wearing the face of "you know nobody", the exact shape the rule forbids.
+    ///
+    /// **What actually lifts it.** A sealed WAL family that commits `people`
+    /// and `person_facts` for a selected user, wired into those two settles.
+    /// Migrating `MEDIA_WORKER_VOICE_EMBEDDING` and
+    /// `MEDIA_WORKER_VOICE_PROFILES` is NOT sufficient and never was: the
+    /// listing LEFT JOINs `voice_profiles`, so those lanes can only change a
+    /// count on a row that already exists. Lifting on them would leave
+    /// `GET /api/v2/people` permanently answering an authoritative-looking
+    /// empty roster.
     pub const MEDIA_PEOPLE: &str = "media.people";
     /// `GET /api/sync/status` — counts and freshness over `utterances`,
     /// `screenshots` and `episodes`. Ungated it answers `200 {"counts":

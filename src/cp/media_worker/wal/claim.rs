@@ -553,6 +553,73 @@ pub(in crate::cp::media_worker) fn scan_for_claim(
     }
 }
 
+/// What one sweep of the claim lane did, for a caller that only needs to know
+/// whether the lane still moves. Test-only; see
+/// [`probe_claim_lane_for_ingest_regression`].
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum ClaimLaneProbe {
+    /// `scan_for_claim` observed work AND `MediaWorkClaimPlan::new` accepted
+    /// it. This is the only outcome that means the lane is not wedged.
+    Constructed,
+    /// Nothing claimable at this horizon.
+    Idle,
+    /// T24's `sqlite_sequence` gate held the audio class shut.
+    AudioLaneBlocked,
+    /// Work was observed and the plan REFUSED to construct — the wedge shape.
+    /// `claim_media_work_unit` warns and returns `Idle` here, and the next
+    /// sweep re-derives the identical refusal, forever.
+    Refused(WalIdempotencyError),
+}
+
+/// Test-only bridge for the ingest -> claim regression tests, which have to
+/// live beside the ingest writer in `cp::media::wal::capture_event` (that is
+/// the only module that can construct its plan) while the guard they regress
+/// lives here.
+///
+/// It composes the EXACT two production calls `media_worker::claim_media_work_unit`
+/// makes, in order and with the same arguments — `scan_for_claim` followed by
+/// `MediaWorkClaimPlan::new` — rather than reimplementing either. Anything it
+/// accepts, the production sweep accepts; anything it refuses, the production
+/// sweep refuses and then returns `ClaimOutcome::Idle` on every subsequent
+/// sweep with no attempt cap and no terminalization path.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_claim_lane_for_ingest_regression(
+    connection: &Connection,
+    account_id: &str,
+    class: WorkClass,
+    processor_version: i64,
+    scan_limit: i64,
+    lease_seconds: i64,
+    reserved_output_tokens: i64,
+    claimed_at: &str,
+    committed_at: &str,
+) -> ClaimLaneProbe {
+    let scan = match scan_for_claim(connection, class, processor_version, claimed_at, scan_limit) {
+        Ok(scan) => scan,
+        Err(_) => return ClaimLaneProbe::Refused(WalIdempotencyError::Unavailable),
+    };
+    let observation = match scan {
+        ClaimScan::Observed(observation) => *observation,
+        ClaimScan::Idle => return ClaimLaneProbe::Idle,
+        ClaimScan::AudioLaneBlocked => return ClaimLaneProbe::AudioLaneBlocked,
+    };
+    match MediaWorkClaimPlan::new(
+        account_id.to_owned(),
+        observation,
+        processor_version,
+        scan_limit,
+        lease_seconds,
+        reserved_output_tokens,
+        claimed_at.to_owned(),
+        committed_at.to_owned(),
+    ) {
+        Ok(_) => ClaimLaneProbe::Constructed,
+        Err(error) => ClaimLaneProbe::Refused(error),
+    }
+}
+
 pub(in crate::cp::media_worker) fn observe_claim(
     connection: &Connection,
     class: WorkClass,

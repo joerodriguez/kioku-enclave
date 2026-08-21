@@ -92,6 +92,59 @@ impl RebaseRefusalSink {
     }
 }
 
+/// The byte length beyond which a carried commit stamp is refused. It matches
+/// `media_worker::wal::claim`'s and `media_worker::wal::failure`'s own
+/// `MAX_TIMESTAMP_BYTES`, because those are the bounds a stamp written by this
+/// module is later measured against.
+///
+/// The round-trip check below already implies it — the canonical rendering is
+/// always exactly 24 bytes — so this is a redundant explicit bound, kept
+/// because it names the downstream constant this module has to agree with and
+/// would survive a change to `format_epoch_millis` that the round trip alone
+/// would silently follow.
+pub(super) const MAX_COMMIT_STAMP_BYTES: usize = 64;
+
+/// ADR-0022: the exact shape a carried commit stamp must have before any
+/// family here may bind it in place of a live-clock column DEFAULT.
+///
+/// The stamp must be the canonical UTC rendering `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// that `isotime::format_epoch_millis` — and therefore `media_worker::now_iso`
+/// — produces. It is checked by ROUND TRIP rather than by pattern, so the
+/// predicate cannot drift away from the renderer it is supposed to agree with.
+///
+/// This is not cosmetic, and it is not a re-validation of something the
+/// manifest already checked. `media_worker::wal::claim::MediaWorkClaimPlan::new`
+/// refuses to construct whenever a member's `latest_observed_timestamp()` —
+/// which is `media_processing_jobs.updated_at` while `lease_until` is NULL,
+/// and it is NULL for every `pending` job — string-compares GREATER than the
+/// enclave-generated `committed_at` it carries. `enumerate_claimable` bounds
+/// `updated_at` only in its `retry_wait` arm; `state='pending'` is
+/// unconditional. So a single job row carrying a stamp that sorts above
+/// `now_iso()` is re-enumerated by every sweep, deterministically re-selected
+/// by `media_planner::plan_first`, and refused again at construction — with no
+/// attempt cap, no terminalization path for a `pending` job and no
+/// user-visible error. `media_objects.processing_state` stays `'queued'`
+/// forever, so `summarizer::session_tail_is_settled` never holds and the
+/// summarizer's forward-only cursor never advances: no episodes, ever.
+///
+/// Because the comparison is a RAW STRING compare, two shapes wedge the lane
+/// with no clock skew whatsoever:
+///
+///   * an offset-bearing `2026-08-21T21:00:00+09:00`, which `parse_epoch_millis`
+///     accepts as a PAST instant and which sorts above every `now_iso()` for
+///     the next nine hours;
+///   * more than three fractional digits — `parse_epoch_millis` ignores the
+///     rest, and once the string passes 64 bytes it also fails
+///     `ClaimMember::resolve`'s `MAX_TIMESTAMP_BYTES` bound.
+///
+/// Round-tripping through the canonical renderer rejects both, and every other
+/// shape that is not byte-comparable against `now_iso()`.
+pub(super) fn is_canonical_commit_stamp(value: &str) -> bool {
+    value.len() <= MAX_COMMIT_STAMP_BYTES
+        && super::super::isotime::parse_epoch_millis(value)
+            .is_some_and(|millis| super::super::isotime::format_epoch_millis(millis) == value)
+}
+
 const CAPTURE_SESSION_FINISH_REQUEST_V1: u16 = 1;
 const CAPTURE_SESSION_FINISH_RESULT_V1: u16 = 1;
 const RESULT_FINISHED: u8 = 1;

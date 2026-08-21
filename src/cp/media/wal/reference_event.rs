@@ -113,6 +113,7 @@ pub(crate) struct MediaReferenceEventPlan {
     manifest: CaptureEventManifest,
     manifest_digest: String,
     asset_id: String,
+    committed_at: String,
     refusal: RebaseRefusalSink,
 }
 
@@ -120,14 +121,16 @@ impl MediaReferenceEventPlan {
     pub(in crate::cp::media) fn new(
         account_id: String,
         manifest: CaptureEventManifest,
+        committed_at: String,
     ) -> Result<Self> {
-        Self::build(None, account_id, manifest)
+        Self::build(None, account_id, manifest, committed_at)
     }
 
     fn build(
         operation_id: Option<WalLogicalOperationId>,
         account_id: String,
         manifest: CaptureEventManifest,
+        committed_at: String,
     ) -> Result<Self> {
         super::super::validate_id("account_id", &account_id)
             .map_err(|_| WalIdempotencyError::Malformed)?;
@@ -135,6 +138,9 @@ impl MediaReferenceEventPlan {
             .validate()
             .map_err(|_| WalIdempotencyError::Malformed)?;
         if manifest.media_disposition != MediaDisposition::Reference || manifest.media.is_some() {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        if !super::is_canonical_commit_stamp(&committed_at) {
             return Err(WalIdempotencyError::Malformed);
         }
         // `validate` already proved these are present for a Reference
@@ -171,6 +177,7 @@ impl MediaReferenceEventPlan {
             manifest,
             manifest_digest,
             asset_id,
+            committed_at,
             refusal: RebaseRefusalSink::default(),
         })
     }
@@ -180,8 +187,9 @@ impl MediaReferenceEventPlan {
         operation_id: WalLogicalOperationId,
         account_id: String,
         manifest: CaptureEventManifest,
+        committed_at: String,
     ) -> Result<Self> {
-        Self::build(Some(operation_id), account_id, manifest)
+        Self::build(Some(operation_id), account_id, manifest, committed_at)
     }
 
     /// Handle on the rebase-required reason `apply()` refused with, taken by
@@ -200,27 +208,25 @@ impl MediaReferenceEventPlan {
     /// `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`, and no legacy INSERT
     /// binds any of them.
     ///
-    /// It is the manifest's own `source_wall_at`, a pure function of bytes the
-    /// request fingerprint already commits to, and deliberately NOT a
-    /// caller-supplied `now()`:
+    /// All five are ENCLAVE-side facts — `received_at` means enclave receipt,
+    /// the `created_at` columns mean row creation. The device's own wall time
+    /// keeps its own column (`capture_events.source_wall_at`) and its own
+    /// observation time keeps `browser_observations_v2.observed_at`; neither
+    /// is what these five mean.
     ///
-    ///   * A live clock inside `apply()` makes the committed pages a function
-    ///     of wall time rather than of the plan, which is the byte-exact
-    ///     replay break `media_worker::wal::claim` had to fix on
-    ///     `media_work_units`.
-    ///   * A caller-supplied `now()` fixes that and breaks something worse for
-    ///     a REQUEST-path family. The Mac client's outbox re-posts the same
-    ///     event until it is acknowledged; each retry would mint a different
-    ///     stamp; and a stamp that varies between two posts of one event turns
-    ///     an ordinary idempotent replay into a `FingerprintConflict` -- the
-    ///     client would then never get its 200 and never drain its outbox.
-    ///
-    /// Deriving it from the manifest makes it constant across every retry of
-    /// one event, which is also why it needs no separate framing in
-    /// `canonical_request`: two requests with the same fingerprint necessarily
-    /// carry the same manifest digest and therefore the same stamp.
+    /// So this is the ENCLAVE-generated `committed_at` the route read once
+    /// (`cp::media::enclave_commit_stamp`), never `manifest.source_wall_at`.
+    /// It is fixed in the plan at construction, so `apply()` holds no live
+    /// clock; and it is deliberately kept out of BOTH the operation identity
+    /// and `canonical_request`, so the Mac outbox's re-post of one event —
+    /// which necessarily mints a different stamp — still matches the stored
+    /// fingerprint and settles as `Replayed` writing nothing, instead of
+    /// becoming a `FingerprintConflict` the client can never clear. See
+    /// `super::capture_event::CanonicalCaptureEventPlan::commit_stamp` for the
+    /// full argument and the claim-lane wedge that makes a device-supplied
+    /// stamp unsafe here.
     fn commit_stamp(&self) -> &str {
-        &self.manifest.source_wall_at
+        &self.committed_at
     }
 }
 
@@ -259,6 +265,10 @@ impl WalLogicalDomainPlan for MediaReferenceEventPlan {
         encode_string(&mut request, &self.account_id)?;
         encode_string(&mut request, &self.manifest.event_id)?;
         encode_string(&mut request, &self.manifest_digest)?;
+        // `committed_at` is deliberately NOT here, and not in the identity
+        // either: it is a clock, and the Mac outbox re-posts one event many
+        // times. See `commit_stamp` and the F2 precedent in
+        // `model_usage::wal::coverage`.
         Ok(request)
     }
 
@@ -549,8 +559,10 @@ fn validate_committed_rows(connection: &Connection, plan: &MediaReferenceEventPl
         || stored.13 != Some(i64::from(reference.dedupe_version))
         // The bound commit stamp. A row still carrying `strftime('now')` means
         // the bind was dropped between the plan and the SQL and `apply()`
-        // silently became a function of wall time again.
-        || stored.14 != plan.manifest.source_wall_at
+        // silently became a function of wall time again; a row carrying
+        // `source_wall_at` means the DEVICE's clock reached an enclave-side
+        // column and the claim lane is one poisoned stamp from wedging.
+        || stored.14 != plan.committed_at
     {
         return Err(WalIdempotencyError::Corrupt);
     }
@@ -823,6 +835,12 @@ mod tests {
 
     const ACCOUNT: &str = "account-1";
     const SOURCE_WALL_AT: &str = "2026-07-31T18:00:01.000Z";
+    /// The ENCLAVE stamps the route mints -- one per submit. Both are
+    /// deliberately DIFFERENT from every fixture's `source_wall_at`, so a test
+    /// that confuses a device clock for an enclave one fails instead of
+    /// coincidentally passing.
+    const CANONICAL_COMMITTED_AT: &str = "2026-07-31T18:04:11.750Z";
+    const REFERENCE_COMMITTED_AT: &str = "2026-07-31T18:04:12.125Z";
 
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
@@ -916,7 +934,12 @@ mod tests {
     }
 
     fn plan(manifest: CaptureEventManifest) -> MediaReferenceEventPlan {
-        MediaReferenceEventPlan::new(ACCOUNT.to_owned(), manifest).unwrap()
+        MediaReferenceEventPlan::new(
+            ACCOUNT.to_owned(),
+            manifest,
+            REFERENCE_COMMITTED_AT.to_owned(),
+        )
+        .unwrap()
     }
 
     fn settle(
@@ -975,8 +998,12 @@ mod tests {
         let other_event = plan(reference_to(&canonical, 2, "screen-event-2"));
         assert_ne!(mine.operation_id(), other_event.operation_id());
 
-        let other_account =
-            MediaReferenceEventPlan::new("account-2".to_owned(), event.clone()).unwrap();
+        let other_account = MediaReferenceEventPlan::new(
+            "account-2".to_owned(),
+            event.clone(),
+            REFERENCE_COMMITTED_AT.to_owned(),
+        )
+        .unwrap();
         assert_ne!(mine.operation_id(), other_account.operation_id());
 
         let batch_id =
@@ -985,6 +1012,7 @@ mod tests {
             ACCOUNT.to_owned(),
             batch_id.clone(),
             vec![event.clone()],
+            REFERENCE_COMMITTED_AT.to_owned(),
         )
         .unwrap();
         assert_ne!(
@@ -1237,22 +1265,33 @@ mod tests {
     }
 
     /// TIMESTAMPS. Every clock DEFAULT on this row set is bound to the owning
-    /// plan's commit stamp instead of firing `strftime('now')` inside
+    /// plan's ENCLAVE commit stamp instead of firing `strftime('now')` inside
     /// `apply()`, which would make the committed pages a function of wall time
     /// rather than of the plan.
+    ///
+    /// The second half of the property is the one that matters more: the stamp
+    /// must be the ENCLAVE's, never the manifest's `source_wall_at`. Every
+    /// column below is an enclave-side fact, and
+    /// `media_processing_jobs.updated_at` in particular is compared as a raw
+    /// string against an enclave `committed_at` by `MediaWorkClaimPlan::new` --
+    /// a device stamp there wedges the account's whole media lane. The two
+    /// enclave stamps and the two `source_wall_at` values are all four
+    /// distinct, so every assertion below discriminates.
     ///
     /// Both families are exercised, because in practice a reference event
     /// always follows its canonical on the same stream: the session and stream
     /// rows are created by the CANONICAL arm and carry ITS stamp, while the
     /// reference event's own rows carry the reference's. Testing the reference
-    /// arm alone would have left the canonical arm's five bindings unpinned.
+    /// arm alone would have left the canonical arm's seven bindings unpinned.
     ///
     /// Falsifiability, checked by sabotage: dropping the `Some(commit_stamp)`
     /// argument in either family (or passing `None`) leaves the columns at the
     /// live clock -- and each family's `validate_committed_rows` refuses the
-    /// apply outright, so the sabotage cannot even settle.
+    /// apply outright, so the sabotage cannot even settle. Re-binding either
+    /// family's `commit_stamp` to `manifest.source_wall_at` fails the
+    /// `assert_ne!` pair and then the per-column assertions.
     #[test]
-    fn both_families_bind_their_commit_stamp_instead_of_the_live_clock_defaults() {
+    fn both_families_bind_their_enclave_commit_stamp_never_the_device_wall_clock() {
         let mut connection = connection();
         let canonical = canonical_manifest();
         let asset_id = canonical.media.as_ref().unwrap().asset_id.clone();
@@ -1262,6 +1301,7 @@ mod tests {
             canonical.clone(),
             object_key,
             17,
+            CANONICAL_COMMITTED_AT.to_owned(),
         )
         .unwrap();
         let prepared = PreparedLogicalMutation::prepare(canonical_plan).unwrap();
@@ -1270,11 +1310,15 @@ mod tests {
         let event = reference_to(&canonical, 1, "screen-event-1");
         settle(&mut connection, plan(event)).unwrap();
 
-        let canonical_stamp = canonical.source_wall_at.as_str();
-        assert_ne!(
-            canonical_stamp, SOURCE_WALL_AT,
-            "the two stamps must differ"
-        );
+        // All four stamps in play are distinct, so no assertion below can pass
+        // by coincidence: the two ENCLAVE stamps discriminate the two families
+        // from each other, and neither may equal either DEVICE stamp.
+        assert_ne!(CANONICAL_COMMITTED_AT, REFERENCE_COMMITTED_AT);
+        assert_ne!(canonical.source_wall_at.as_str(), SOURCE_WALL_AT);
+        for enclave in [CANONICAL_COMMITTED_AT, REFERENCE_COMMITTED_AT] {
+            assert_ne!(enclave, canonical.source_wall_at.as_str());
+            assert_ne!(enclave, SOURCE_WALL_AT);
+        }
 
         let stamps: (String, String, String, String, String, String, String) = connection
             .query_row(
@@ -1302,18 +1346,47 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(stamps.0, canonical_stamp, "capture_sessions.created_at");
-        assert_eq!(stamps.1, canonical_stamp, "capture_streams.created_at");
-        assert_eq!(stamps.2, canonical_stamp, "canonical received_at");
-        assert_eq!(stamps.3, canonical_stamp, "media_objects.created_at");
         assert_eq!(
-            stamps.4, canonical_stamp,
+            stamps.0, CANONICAL_COMMITTED_AT,
+            "capture_sessions.created_at"
+        );
+        assert_eq!(
+            stamps.1, CANONICAL_COMMITTED_AT,
+            "capture_streams.created_at"
+        );
+        assert_eq!(stamps.2, CANONICAL_COMMITTED_AT, "canonical received_at");
+        assert_eq!(stamps.3, CANONICAL_COMMITTED_AT, "media_objects.created_at");
+        assert_eq!(
+            stamps.4, CANONICAL_COMMITTED_AT,
             "media_processing_jobs.updated_at"
         );
-        assert_eq!(stamps.5, SOURCE_WALL_AT, "reference received_at");
+        assert_eq!(stamps.5, REFERENCE_COMMITTED_AT, "reference received_at");
         assert_eq!(
-            stamps.6, SOURCE_WALL_AT,
+            stamps.6, REFERENCE_COMMITTED_AT,
             "browser_observations_v2.created_at"
+        );
+
+        // The device's own clocks are still recorded -- in the columns that
+        // MEAN a device clock, and nowhere else.
+        let device: (String, String, String) = connection
+            .query_row(
+                "SELECT
+                    (SELECT source_wall_at FROM capture_events WHERE event_id='screen-event-0'),
+                    (SELECT source_wall_at FROM capture_events WHERE event_id='screen-event-1'),
+                    (SELECT observed_at FROM browser_observations_v2
+                     WHERE event_id='screen-event-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            device.0, canonical.source_wall_at,
+            "canonical source_wall_at"
+        );
+        assert_eq!(device.1, SOURCE_WALL_AT, "reference source_wall_at");
+        assert_eq!(
+            device.2, SOURCE_WALL_AT,
+            "browser_observations_v2.observed_at"
         );
     }
 
@@ -1359,9 +1432,13 @@ mod tests {
     /// have separate families and neither may adopt the other's rows.
     #[test]
     fn a_canonical_manifest_is_refused_before_admission() {
-        let error = MediaReferenceEventPlan::new(ACCOUNT.to_owned(), canonical_manifest())
-            .err()
-            .expect("a canonical manifest must be refused");
+        let error = MediaReferenceEventPlan::new(
+            ACCOUNT.to_owned(),
+            canonical_manifest(),
+            REFERENCE_COMMITTED_AT.to_owned(),
+        )
+        .err()
+        .expect("a canonical manifest must be refused");
         assert_eq!(error, WalIdempotencyError::Malformed);
     }
 
@@ -1398,6 +1475,7 @@ mod tests {
             forced,
             ACCOUNT.to_owned(),
             reference_to(&canonical, 1, "screen-event-1"),
+            REFERENCE_COMMITTED_AT.to_owned(),
         )
         .unwrap();
         settle(&mut connection, first).unwrap();
@@ -1406,6 +1484,7 @@ mod tests {
             forced,
             ACCOUNT.to_owned(),
             reference_to(&canonical, 2, "screen-event-2"),
+            REFERENCE_COMMITTED_AT.to_owned(),
         )
         .unwrap();
         assert_eq!(

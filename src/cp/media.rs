@@ -249,6 +249,25 @@ impl CaptureEventManifest {
                 "sequence must be non-negative".into(),
             ));
         }
+        // Parseable, not canonical. `parse_epoch_millis` deliberately accepts
+        // a `±HH:MM` offset and ignores fractional digits past the third, and
+        // this check is deliberately NOT tightened to reject either.
+        //
+        // It is tempting to normalize here as defence in depth, because a
+        // non-canonical device stamp compared as a raw string is what wedged
+        // the media claim lane. But the wedge was a BINDING defect, not an
+        // input-shape one: `source_wall_at` belongs in
+        // `capture_events.source_wall_at` and `browser_observations_v2.
+        // observed_at`, and nowhere else, which is what
+        // `wal::is_canonical_commit_stamp` now enforces at plan construction.
+        // Rejecting offset-bearing stamps here would instead be a client
+        // contract break with no upside: shipped Mac and iOS builds may
+        // already send them (`parse_epoch_millis` supports the form on
+        // purpose), a 400 on ingest is not something the durable outbox can
+        // rebase away, and the tightening would land in a routing change where
+        // nobody would look for it. If a future change does normalize device
+        // stamps, it belongs in its own migration with the client, and it must
+        // never be done by loosening `parse_epoch_millis`.
         if parse_epoch_millis(&self.source_wall_at).is_none() {
             return Err(EnclaveError::InvalidRequest(
                 "source_wall_at must be ISO-8601".into(),
@@ -1166,6 +1185,7 @@ async fn upload_screen_reference_batch(
             user_id.clone(),
             request.batch_id.clone(),
             request.events.clone(),
+            enclave_commit_stamp(),
         ) {
             Ok(plan) => plan,
             Err(_) => {
@@ -1745,6 +1765,7 @@ async fn upload_capture_event(
                     manifest.clone(),
                     object_key.to_string(),
                     generation,
+                    enclave_commit_stamp(),
                 ) {
                     Ok(plan) => plan,
                     Err(_) => {
@@ -1783,19 +1804,22 @@ async fn upload_capture_event(
                 }
             }
             MediaDisposition::Reference => {
-                let plan =
-                    match wal::MediaReferenceEventPlan::new(user_id.clone(), manifest.clone()) {
-                        Ok(plan) => plan,
-                        Err(_) => {
-                            return capture_error_response(
-                                started_at,
-                                Some(&manifest),
-                                EnclaveError::Store(
-                                    "reference capture plan construction failed".into(),
-                                ),
-                            )
-                        }
-                    };
+                let plan = match wal::MediaReferenceEventPlan::new(
+                    user_id.clone(),
+                    manifest.clone(),
+                    enclave_commit_stamp(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        return capture_error_response(
+                            started_at,
+                            Some(&manifest),
+                            EnclaveError::Store(
+                                "reference capture plan construction failed".into(),
+                            ),
+                        )
+                    }
+                };
                 // Taken BEFORE `prepare` consumes the plan: the submit narrows
                 // every owner refusal to a content-free conflict, and a
                 // rebase-required refusal that arrives content-free is a wedge
@@ -1933,7 +1957,19 @@ async fn stream_ack(
             committed_through_sequence: committed,
         })
         .into_response(),
-        Err(error) => error.into_response(),
+        // `committed_through_sequence` folds "no such stream" into
+        // `Err(NotFound)` rather than `Ok(None)`, so this arm carries two
+        // different things and they must not share a status. The absence is a
+        // truthful 404 now that ingest writes every stream this can name --
+        // that is the whole reason the gate above could be lifted. Everything
+        // else is the routed read itself failing (an unregistered, quarantined
+        // or mid-relaunch serving authority arrives as `EnclaveError::Store`),
+        // which is retryable and answers the lane's 503 under
+        // `super::routed_read_unavailable`'s rule. It is deliberately NOT the
+        // 500 the generic arm would render: that makes a retryable read
+        // failure indistinguishable from a genuinely non-retryable one.
+        Err(EnclaveError::NotFound) => EnclaveError::NotFound.into_response(),
+        Err(error) => super::routed_read_unavailable("api.media.stream_ack", &error),
     }
 }
 
@@ -1963,7 +1999,13 @@ async fn capture_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        Err(error) => error.into_response(),
+        // A failed routed read is NOT an absence and NOT a fault: the archive
+        // is present and merely unreadable. 503 under
+        // `super::routed_read_unavailable`'s rule, never the 500 the generic
+        // arm renders for `EnclaveError::Store` -- the D4 gate used to fire
+        // first, so this arm was unreachable for exactly the population it now
+        // serves.
+        Err(error) => super::routed_read_unavailable("api.media.capture_status", &error),
     }
 }
 
@@ -2002,7 +2044,9 @@ async fn capture_session_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        Err(error) => error.into_response(),
+        // See `capture_status`: an unreadable archive is retryable, so it
+        // answers 503 rather than the generic 500.
+        Err(error) => super::routed_read_unavailable("api.media.capture_session_status", &error),
     }
 }
 
@@ -2040,7 +2084,11 @@ async fn list_capture_sessions(
         .await
     {
         Ok(list) => Json(list).into_response(),
-        Err(error) => error.into_response(),
+        // A COLLECTION endpoint, so this arm matters most: 503 with the named
+        // reason under `super::routed_read_unavailable`'s rule. Never the
+        // generic 500, and never a 200 carrying an empty `sessions` array --
+        // a refusal must not wear the face of a truthful empty archive.
+        Err(error) => super::routed_read_unavailable("api.media.capture_sessions", &error),
     }
 }
 
@@ -2380,12 +2428,16 @@ async fn list_people(
     // statement in the handler: a refusal spends nothing, not even the
     // `to_lowercase` allocation below.
     //
-    // The other collection endpoint, and the same hazard: `people` rows are
-    // derived by `media_worker`'s result lanes from evidence capture ingest
-    // supplies, and the `voice_profiles` this listing joins come only from the
-    // deferred voice lanes. No live writer reaches these tables, so a routed
-    // read for a selected user can only answer `200 {"people": []}` — an
-    // authoritative-looking "you know nobody". Lifts with the writers.
+    // The other collection endpoint, and the same hazard. `people` and
+    // `person_facts` rows come only from `media_worker::create_person` /
+    // `persist_person_fact`, reached only from the audio and screen RESULT
+    // lanes — and although those lanes are migrated, their sealed families
+    // commit NO identity by construction, so for a selected user
+    // `process_work_unit` returns early and the two legacy persisters that
+    // write these tables are unreachable. A routed read can therefore only
+    // answer `200 {"people": []}` — an authoritative-looking "you know
+    // nobody". It lifts when a sealed family actually commits these rows, NOT
+    // when the voice lanes migrate; see `wal_domain::MEDIA_PEOPLE`.
     if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
         return error.into_response();
     }
@@ -4462,10 +4514,39 @@ struct CanonicalReferenceTarget {
 ///
 /// `Some(stamp)` is the WAL-authoritative path, where a live clock inside a
 /// sealed plan's `apply()` would make the committed pages a function of wall
-/// time rather than of the plan — breaking byte-exact replay. See
-/// `wal::reference_event` for why the stamp is derived from the request rather
-/// than supplied by the caller as `now()`.
+/// time rather than of the plan — breaking byte-exact replay.
+///
+/// **The stamp must be an ENCLAVE stamp**, minted by [`enclave_commit_stamp`]
+/// on the route and carried in the plan — never a device-supplied field such
+/// as `manifest.source_wall_at`. All seven columns above are enclave-side
+/// facts (receipt time, row-creation time, scheduling state), the device's own
+/// wall clock already has `capture_events.source_wall_at` and
+/// `browser_observations_v2.observed_at`, and
+/// `media_processing_jobs.updated_at` is compared as a RAW STRING against an
+/// enclave `committed_at` by `media_worker::wal::claim` — one device stamp
+/// that sorts above `now_iso()` wedges that account's media lane permanently.
+/// `wal::is_canonical_commit_stamp` refuses any non-canonical stamp at plan
+/// construction; see `wal::capture_event::CanonicalCaptureEventPlan::commit_stamp`
+/// for the whole argument.
 type CommitStamp<'a> = Option<&'a str>;
+
+/// The enclave's own receipt clock for the ingest plan families, read ONCE per
+/// request on the route and then carried in the plan.
+///
+/// Hoisted out of every `apply()` deliberately (ADR-0022 R7): a sealed plan's
+/// committed pages must be a function of the plan, not of wall time. The
+/// rendering is `isotime::format_epoch_millis`, which is byte-identical to
+/// `media_worker::now_iso` and to `model_usage::settled_now_iso` — that
+/// matters, because `media_worker::wal::claim` compares this stamp against
+/// `now_iso()` as a raw string.
+fn enclave_commit_stamp() -> String {
+    super::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    )
+}
 
 fn record_reference_event(
     conn: &Connection,
@@ -6652,10 +6733,21 @@ mod tests {
     /// selected user with no registered serving authority has no settled lane
     /// to answer from.
     ///
+    /// The refusal's STATUS is pinned exactly, not merely as "some server
+    /// error". `wal_authoritative_read` reports an unregistered, quarantined
+    /// or mid-relaunch authority as `EnclaveError::Store`, whose generic arm
+    /// renders `500 {"error":"internal error"}`; the read lane's rule
+    /// (`cp::routed_read_unavailable`) names 500 as one of the three statuses
+    /// it is deliberately NOT, because a 500 makes a retryable read failure
+    /// indistinguishable from a genuinely non-retryable one. A status-class
+    /// assertion would admit that 500.
+    ///
     /// Falsifiability, checked by sabotage: reverting the handler to
     /// `with_user` (or to `with_user_read`) turns the refusal into a `200`
     /// carrying `committed_through_sequence: 7`, and both assertions below
-    /// fail.
+    /// fail; handing the `Err` arm to `EnclaveError::into_response` instead of
+    /// `routed_read_unavailable` turns the 503 into a 500 and the status and
+    /// reason assertions fail.
     #[tokio::test]
     async fn a_selected_stream_ack_is_never_served_the_legacy_snapshot() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
@@ -6707,15 +6799,17 @@ mod tests {
             Path("stream-1".to_string()),
         )
         .await;
-        assert!(
-            refused.status().is_server_error(),
-            "a selected user must not be served the legacy snapshot, got {}",
-            refused.status()
-        );
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        // A routed-read failure is retryable. 500 would make it
+        // indistinguishable from the genuinely non-retryable failures that
+        // keep 500 on purpose; see `cp::routed_read_unavailable`.
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
         assert!(
             body.get("committed_through_sequence").is_none(),
             "the stale acknowledgement leaked: {body}"
@@ -6738,11 +6832,17 @@ mod tests {
     /// told apart from "you never uploaded that event". Ingest is migrated, so
     /// the 404 is truthful again.
     ///
+    /// The refusal is pinned at the lane's named 503 rather than at a status
+    /// class: the unreachable-archive failure must be told apart both from the
+    /// truthful 404 above it and from the 500 the generic `EnclaveError::Store`
+    /// arm would render. See `cp::routed_read_unavailable`.
+    ///
     /// Falsifiability, checked by sabotage: swapping the handler back to
     /// `with_user_read` turns the selected user's refusal into
     /// `200 {"event_id":"evt-1"}` and both selected-side assertions fail;
     /// dropping the `capture_events` insert turns the unselected user's 200
-    /// into a 404.
+    /// into a 404; handing the `Err` arm to `EnclaveError::into_response`
+    /// turns the 503 into a 500 and the status and reason assertions fail.
     #[tokio::test]
     async fn a_selected_capture_status_is_never_served_the_legacy_row() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
@@ -6801,15 +6901,15 @@ mod tests {
             Path("evt-1".to_string()),
         )
         .await;
-        assert!(
-            refused.status().is_server_error(),
-            "a selected user must not be served the legacy row, got {}",
-            refused.status()
-        );
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
         assert!(
             body.get("event_id").is_none(),
             "the stale row leaked: {body}"
@@ -6902,11 +7002,18 @@ mod tests {
     /// every row this can list, so an empty list is now the truth rather than
     /// a deferral in disguise.
     ///
+    /// The status is pinned at the lane's named 503, not at a status class:
+    /// the generic `EnclaveError::Store` arm renders a 500, which
+    /// `cp::routed_read_unavailable` names as one of the three statuses this
+    /// lane deliberately does not use.
+    ///
     /// Falsifiability, checked by sabotage: swapping the handler back to
     /// `with_user_read` turns the selected user's refusal into a `200` whose
     /// `sessions` array has one element and both selected-side assertions
     /// fail; backdating `started_at` outside the 8-hour window empties the
-    /// unselected user's list.
+    /// unselected user's list; handing the `Err` arm to
+    /// `EnclaveError::into_response` turns the 503 into a 500 and the status
+    /// and reason assertions fail.
     #[tokio::test]
     async fn a_selected_session_list_refuses_instead_of_listing_the_legacy_snapshot() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
@@ -6962,19 +7069,100 @@ mod tests {
             query(),
         )
         .await;
-        assert!(
-            refused.status().is_server_error(),
-            "a selected user must not be listed out of the legacy snapshot, got {}",
-            refused.status()
-        );
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
         assert!(
             body.get("sessions").is_none(),
             "a refusal must never carry a collection: {body}"
+        );
+    }
+    /// The fourth read whose D4 gate lifted with ingest, and the only one that
+    /// had no routing test at all. Same two-sided proof as its siblings: an
+    /// UNSELECTED user reads the row out of the legacy store, and a
+    /// WAL-AUTHORITATIVE user reading the SAME archive is refused rather than
+    /// served it.
+    ///
+    /// The refusal is the lane's named 503, never the 500 the generic
+    /// `EnclaveError::Store` arm renders and never the truthful 404 that
+    /// `Ok(None)` above it answers -- those three outcomes mean three
+    /// different things to a client and this endpoint must not conflate them.
+    /// See `cp::routed_read_unavailable`.
+    ///
+    /// Falsifiability, checked by sabotage: swapping the handler back to
+    /// `with_user_read` turns the selected user's refusal into a `200` naming
+    /// `session-1`; handing the `Err` arm to `EnclaveError::into_response`
+    /// turns the 503 into a 500.
+    #[tokio::test]
+    async fn a_selected_capture_session_status_refuses_at_the_named_503() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let state = finish_test_state();
+        let user_id = "media-session-status-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                     last_event_at,schema_version) \
+                     VALUES('session-1','device-1','install-1',\
+                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let served = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-1".to_string()),
+        )
+        .await;
+        assert_eq!(served.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(served.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["capture_session_id"], "session-1");
+
+        // A session that was never written stays a truthful 404 for the same
+        // unselected user, so the 503 below is provably not just "absent".
+        let absent = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-absent".to_string()),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        select_wal_authoritative(&state.store, user_id);
+        let refused = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-1".to_string()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+        assert!(
+            body.get("capture_session_id").is_none(),
+            "the stale session leaked: {body}"
         );
     }
 }
