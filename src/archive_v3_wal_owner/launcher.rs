@@ -51,6 +51,37 @@ impl SingleArchiveWalLauncherOwner {
     {
         self.owner.read(read).await
     }
+
+    /// Forwarded relaunch trigger: the actor task's own termination.
+    pub(super) fn is_terminal(&self) -> bool {
+        self.owner.is_terminal()
+    }
+
+    /// Forwarded proof of death. An `Err` means "not provably dead" and must
+    /// be quarantined by the caller, never treated as death.
+    pub(super) async fn join_terminated(&self, deadline: std::time::Duration) -> Result<()> {
+        self.owner.join_terminated(deadline).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn terminal_for_relaunch_test() -> Self {
+        Self {
+            owner: WalOwnerHandle::terminated_for_relaunch_test().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_for_relaunch_test() -> Self {
+        Self {
+            owner: WalOwnerHandle::live_for_relaunch_test(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn stuck_for_relaunch_test() -> (Self, super::StuckLaneRelease) {
+        let (owner, release) = WalOwnerHandle::stuck_lane_for_relaunch_test();
+        (Self { owner }, release)
+    }
 }
 
 impl std::fmt::Debug for SingleArchiveWalLauncherOwner {
@@ -69,6 +100,12 @@ mod tests {
             "WalServingHandoff",
             "SingleArchiveWalPublisher::start(handoff)",
             "pub(super) async fn submit<P: WalLogicalDomainPlan>",
+            // The relaunch trigger and its proof of death are forwarded, not
+            // reimplemented: this child must never grow its own launch path.
+            "pub(super) fn is_terminal(&self) -> bool",
+            "pub(super) async fn join_terminated(&self, deadline: std::time::Duration)",
+            "self.owner.is_terminal()",
+            "self.owner.join_terminated(deadline)",
         ] {
             assert!(source.contains(required), "missing {required}");
         }

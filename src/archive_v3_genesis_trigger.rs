@@ -644,12 +644,16 @@ async fn install_and_launch(
         .active_archive_binding(user_id)
         .await
         .map_err(map_control)?;
+    // The archive the slot is pinned to. A later in-process relaunch that
+    // rebuilds a different archive for this user is refused rather than
+    // swapped in.
+    let archive_id = *binding.archive_id().as_bytes();
     let handoff = source.serving_handoff(Arc::clone(control), binding).await?;
     let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
         .await
         .map_err(|_| GenesisTriggerError::Unavailable)?;
     store
-        .install_wal_serving_authority(user_id, Arc::new(authority))
+        .install_wal_serving_authority(user_id, archive_id, Arc::new(authority))
         .map_err(map_control)
 }
 

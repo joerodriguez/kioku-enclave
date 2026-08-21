@@ -105,6 +105,35 @@ async fn relaunch_one(
     store: &Arc<Store>,
     selection: &crate::cp::control_store::WalAuthoritativePersistenceSelection,
 ) -> Result<()> {
+    let (archive_id, authority) =
+        build_wal_serving_authority(kms, control, selection.user_id()).await?;
+    store.install_wal_serving_authority(selection.user_id(), archive_id, Arc::new(authority))?;
+    Ok(())
+}
+
+/// Build one user's serving authority from durable state.
+///
+/// This is the whole launch ladder, extracted verbatim from the startup loop
+/// body so startup and the in-process relaunch driver share it byte for byte:
+/// `from_baked_env` -> `PendingSingleArchiveWalRuntime::new` ->
+/// `active_archive_binding` -> `bind_once` -> `reconstruct_wal_serving_handoff`
+/// -> `SingleArchiveWalServingAuthority::launch`. Startup calls this and then
+/// installs the slot; the driver calls this and then replaces the authority
+/// inside an already-installed slot. ONE ladder, ONE set of predicates, ONE
+/// code path — the driver adds no branch, no witness read, no lease call, and
+/// no Control write of its own, so any provider or Control interleaving it can
+/// produce is one the startup relaunch can already produce.
+///
+/// Returns the archive id the authority actually bound, so the slot can refuse
+/// a successor built for a different archive.
+pub(crate) async fn build_wal_serving_authority(
+    kms: &Arc<GcpKmsClient>,
+    control: &Arc<ControlStore>,
+    user_id: &str,
+) -> Result<(
+    [u8; 16],
+    crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority,
+)> {
     // One bound runtime per archive: the pending runtime is bind-once, so
     // re-read the baked deployment for each selection.
     let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
@@ -116,7 +145,8 @@ async fn relaunch_one(
         })?;
     let pending = PendingSingleArchiveWalRuntime::new(deployment, Arc::clone(kms))
         .map_err(|_| EnclaveError::Store("archive-v3 runtime construction failed".into()))?;
-    let binding = control.active_archive_binding(selection.user_id()).await?;
+    let binding = control.active_archive_binding(user_id).await?;
+    let archive_id = *binding.archive_id().as_bytes();
     let sealed = pending
         .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
         .map_err(|_| {
@@ -135,8 +165,35 @@ async fn relaunch_one(
     let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
         .await
         .map_err(|_| EnclaveError::Store("the WAL serving authority failed to launch".into()))?;
-    store.install_wal_serving_authority(selection.user_id(), Arc::new(authority))?;
-    Ok(())
+    Ok((archive_id, authority))
+}
+
+/// The in-process relaunch driver. It holds the same two dependencies the
+/// startup relaunch holds and does exactly one thing: call the shared ladder.
+pub(crate) struct StartupWalServingRelaunch {
+    kms: Arc<GcpKmsClient>,
+    control: Arc<ControlStore>,
+}
+
+impl StartupWalServingRelaunch {
+    pub(crate) const fn new(kms: Arc<GcpKmsClient>, control: Arc<ControlStore>) -> Self {
+        Self { kms, control }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::store::WalServingRelaunch for StartupWalServingRelaunch {
+    async fn rebuild(
+        &self,
+        user_id: &str,
+    ) -> Result<(
+        [u8; 16],
+        Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
+    )> {
+        let (archive_id, authority) =
+            build_wal_serving_authority(&self.kms, &self.control, user_id).await?;
+        Ok((archive_id, Arc::new(authority)))
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +295,7 @@ mod tests {
             concat!("bind_", "once("),
             "reconstruct_wal_serving_handoff",
             "install_wal_serving_authority",
+            "build_wal_serving_authority",
             concat!("archive-v3 runtime mode is ", "off"),
         ] {
             assert!(source.contains(required), "missing {required}");
@@ -254,6 +312,54 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "found forbidden {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_driver_adds_no_launch_branch() {
+        // The relaunch driver's entire value rests on it having no ladder of
+        // its own: it must reach durable state only through the same
+        // `build_wal_serving_authority` the startup relaunch uses, so the
+        // durable stage picks the predicate and no lease, witness, or evidence
+        // can be fabricated for a successor. Structural, because the property
+        // is structural.
+        let source = include_str!("archive_v3_serving_relaunch.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let ladder = &production[production
+            .find("pub(crate) async fn build_wal_serving_authority(")
+            .expect("the shared ladder moved")..];
+        let ladder = &ladder[..ladder
+            .find("pub(crate) struct StartupWalServingRelaunch")
+            .expect("the driver moved")];
+        for required in [
+            concat!("from_baked_", "env()"),
+            concat!("bind_", "once("),
+            "reconstruct_wal_serving_handoff",
+            "SingleArchiveWalServingAuthority::launch",
+        ] {
+            assert!(ladder.contains(required), "the ladder lost {required}");
+        }
+        let driver = &production[production
+            .find("pub(crate) struct StartupWalServingRelaunch")
+            .unwrap()..];
+        assert!(
+            driver.contains("build_wal_serving_authority(&self.kms, &self.control, user_id)"),
+            "the driver must construct only through the shared ladder"
+        );
+        for forbidden in [
+            concat!("acquire_owner_", "lease"),
+            concat!("reacquire_owner_", "lease"),
+            concat!("maintain_owner_", "lease"),
+            concat!("read_current_", "exact"),
+            concat!("persist_owner_", "renewal"),
+            concat!("rebind_owner_after_", "expiry"),
+            concat!("bind_", "owner("),
+            concat!("mark_owner_send_", "started"),
+        ] {
+            assert!(
+                !driver.contains(forbidden),
+                "the driver grew its own {forbidden} call"
             );
         }
     }

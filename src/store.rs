@@ -256,14 +256,18 @@ pub struct Store {
     /// `wal_authoritative` maintenance-import terminal, and there is no
     /// removal: a selected user can never fall back to snapshot persistence.
     wal_authority_persistence: StdRwLock<HashMap<UserId, [u8; 16]>>,
-    /// Inactive per-user WAL serving authorities. Registered only by the
+    /// Inactive per-user WAL serving slots. Registered only by the
     /// config-gated startup relaunch after reconstruction; empty in every
     /// production constructor today. A selected user with no registered
-    /// authority refuses reads rather than ever serving the stale legacy
-    /// snapshot.
-    wal_serving_authorities: StdRwLock<
-        HashMap<UserId, Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>>,
-    >,
+    /// slot refuses reads rather than ever serving the stale legacy
+    /// snapshot. Registration is install-once and there is no removal; the
+    /// authority *inside* a slot is replaceable under the slot's own guard.
+    wal_serving_authorities: StdRwLock<HashMap<UserId, Arc<WalServingLane>>>,
+    /// The in-process relaunch driver, installed once at startup. Absent in
+    /// every production constructor and in every test that does not install
+    /// one, in which case a terminal slot simply stays terminal — exactly
+    /// today's behaviour.
+    wal_serving_relaunch: StdRwLock<Option<Arc<dyn WalServingRelaunch>>>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     /// Current media write/read bucket. New capture objects are written here.
@@ -292,6 +296,223 @@ pub struct Store {
     /// constructible for an archive that no longer appears in any startup
     /// scan.
     wal_deletion_lane: StdRwLock<Option<Arc<crate::archive_v3_deletion_lane::WalDeletionLane>>>,
+}
+
+// ── WAL serving slot: replaceable, never removable ───────────────────────────
+
+/// How long the driver will wait for proof that the previous owner is dead.
+pub(crate) const WAL_RELAUNCH_JOIN_DEADLINE: Duration = Duration::from_secs(30);
+const WAL_RELAUNCH_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const WAL_RELAUNCH_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Wall-clock budget for healing one lane, measured from its first relaunch
+/// attempt.
+///
+/// It MUST outlast the WAL owner lease with margin. A lane with no pending
+/// durable owner work is fenced out of its own successor by three predicates
+/// in `archive_v3_witness` — `exact_wal_owner_renewal_from` requires a strictly
+/// advanced record, `exact_wal_owner_reacquire_from` requires
+/// `last_server_tick >= previous.lease_expires_at_tick`, and the provider
+/// fallback refuses with `Fenced` while `now < previous.lease_expires_at_tick`
+/// — until its own lease lapses, at most `OWNER_LEASE_TICKS` (300) after the
+/// last renewal. That wait is the cross-process fence and is not introduced
+/// here: a process restart hits the identical three clauses. The budget is
+/// deadline-based, and generous relative to the lease, precisely so such a lane
+/// heals when the lease lapses instead of exhausting a short budget into a new
+/// permanent terminal.
+const WAL_RELAUNCH_WALL_DEADLINE: Duration = Duration::from_secs(900);
+/// The `OWNER_LEASE_TICKS` value the wall deadline is sized against.
+/// `wal_relaunch_wall_deadline_outlasts_the_owner_lease` pins that the
+/// publisher still declares exactly this.
+const WAL_OWNER_LEASE_TICKS_MIRROR: u64 = 300;
+const _: () = assert!(
+    WAL_RELAUNCH_WALL_DEADLINE.as_secs() >= WAL_OWNER_LEASE_TICKS_MIRROR * 3,
+    "the relaunch budget must outlast the WAL owner lease with margin"
+);
+
+/// Why a serving lane stopped trying to heal itself. Every variant is terminal
+/// for this process: the lane keeps refusing exactly as it does today, and only
+/// a restart (or an operator) moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalQuarantineReason {
+    /// The previous owner could not be proven dead inside the join deadline.
+    /// Never construct a successor over this: refusing is always safe.
+    Stuck,
+    /// The per-lane generation budget is spent.
+    GenerationsExhausted,
+    /// The wall-clock heal budget elapsed.
+    DeadlineExceeded,
+    /// The rebuilt authority bound an archive other than the one this slot was
+    /// installed for.
+    ArchiveMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalLaneState {
+    Serving,
+    Quarantined(WalQuarantineReason),
+}
+
+/// Outcome of one `recover_wal_serving_authority` call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalRecoveryOutcome {
+    /// The slot's authority is not terminal — either it never was, or another
+    /// caller already replaced it. No launch was issued.
+    AlreadyLive,
+    /// A successor was built and atomically swapped into the slot.
+    Replaced,
+    /// A launch is not due yet, or the last one failed and is backing off.
+    Backoff,
+    Quarantined(WalQuarantineReason),
+}
+
+/// Per-lane relaunch budget and backoff ledger. Guarded by the lane's async
+/// mutex; the guard is the single-flight token for the whole 12-step sequence.
+struct WalRelaunchLedger {
+    /// Successful swaps. Capped by `MAX_WAL_SERVING_GENERATIONS`, which is
+    /// itself strictly below the durable per-operation attempt cap.
+    installed_generations: u32,
+    /// Failed builds. These deliberately do NOT consume the generation budget:
+    /// a build that never produced a lane never minted a new owner instance id
+    /// and so never burned a durable attempt. Charging them here would let a
+    /// provider outage exhaust the generation budget before the wall deadline
+    /// — and before the owner lease it is sized against — could ever be
+    /// reached.
+    launch_failures: u32,
+    // `tokio::time::Instant` rather than `std::time::Instant`: identical in
+    // production, and it lets the wall-deadline and backoff paths be driven
+    // deterministically under a paused test clock instead of by real sleeping.
+    first_attempt_at: Option<tokio::time::Instant>,
+    next_attempt_at: Option<tokio::time::Instant>,
+    backoff: Duration,
+    state: WalLaneState,
+}
+
+impl WalRelaunchLedger {
+    const fn fresh() -> Self {
+        Self {
+            installed_generations: 0,
+            launch_failures: 0,
+            first_attempt_at: None,
+            next_attempt_at: None,
+            backoff: WAL_RELAUNCH_BACKOFF_MIN,
+            state: WalLaneState::Serving,
+        }
+    }
+
+    fn defer(&mut self, now: tokio::time::Instant) {
+        self.next_attempt_at = Some(now + self.backoff);
+        self.backoff = (self.backoff * 2).min(WAL_RELAUNCH_BACKOFF_MAX);
+    }
+}
+
+/// One user's WAL serving slot.
+///
+/// The slot is atomically REPLACEABLE and never removable. That is strictly
+/// stronger than a remove-then-install pair: the slot holds exactly one
+/// authority for its entire life, so there is never an instant with no
+/// authority for a registered user, and no code path can leave a selected user
+/// silently unregistered and then be raced by a fresh install. It is also why
+/// `install_wal_serving_authority` keeps its install-once contract and why
+/// there is deliberately no removal API.
+pub(crate) struct WalServingLane {
+    /// The only mutator is `Store::recover_wal_serving_authority`, and only
+    /// while holding `relaunch`.
+    current: StdRwLock<Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>>,
+    relaunch: Mutex<WalRelaunchLedger>,
+    /// Pinned at install from the durable-terminal selection. A rebuilt
+    /// authority that binds a different archive is refused, not swapped in.
+    archive_id: [u8; 16],
+    generation: std::sync::atomic::AtomicU64,
+    /// EVENT counters, not state counters: a genuine-corruption -> heal loop
+    /// that stays under budget must not be able to heal silently.
+    relaunches_total: std::sync::atomic::AtomicU64,
+    launch_failures_total: std::sync::atomic::AtomicU64,
+    quarantines_total: std::sync::atomic::AtomicU64,
+}
+
+impl WalServingLane {
+    fn install(
+        archive_id: [u8; 16],
+        authority: Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
+    ) -> Self {
+        Self {
+            current: StdRwLock::new(authority),
+            relaunch: Mutex::new(WalRelaunchLedger::fresh()),
+            archive_id,
+            generation: std::sync::atomic::AtomicU64::new(0),
+            relaunches_total: std::sync::atomic::AtomicU64::new(0),
+            launch_failures_total: std::sync::atomic::AtomicU64::new(0),
+            quarantines_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The authority currently holding this archive. A poisoned slot lock
+    /// cannot be recovered into a safe answer, so callers treat the error as
+    /// unavailable rather than launching over an unknown owner.
+    fn current(
+        &self,
+    ) -> Result<Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>> {
+        self.current
+            .read()
+            .map(|current| Arc::clone(&current))
+            .map_err(|_| EnclaveError::Store("wal serving slot poisoned".into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation_for_test(&self) -> u64 {
+        self.generation.load(AtomicOrdering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_terminal_for_test(&self) -> bool {
+        self.current().is_ok_and(|current| current.is_terminal())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authority_for_test(
+        &self,
+    ) -> Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority> {
+        self.current().expect("test slot is readable")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ledger_for_test(&self) -> (u32, u32, WalLaneState) {
+        let guard = self.relaunch.lock().await;
+        (
+            guard.installed_generations,
+            guard.launch_failures,
+            guard.state,
+        )
+    }
+}
+
+/// Content-free aggregate serving health. Counts only — never a user id, an
+/// archive id, or any other content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalServingHealth {
+    pub serving: usize,
+    pub terminal: usize,
+    pub quarantined: usize,
+    pub relaunches_total: u64,
+    pub launch_failures_total: u64,
+    pub quarantines_total: u64,
+}
+
+/// Rebuilds one user's serving authority through the byte-identical startup
+/// ladder. There is exactly one ladder and one set of predicates: the driver
+/// adds no launch branch, no witness call, no lease call, and no Control write
+/// of its own.
+#[async_trait::async_trait]
+pub(crate) trait WalServingRelaunch: Send + Sync {
+    /// Returns the archive id the rebuilt authority actually bound, so the
+    /// slot can refuse a successor for a different archive.
+    async fn rebuild(
+        &self,
+        user_id: &str,
+    ) -> Result<(
+        [u8; 16],
+        Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
+    )>;
 }
 
 /// One explicitly named, non-default VFS installation and its bounded path
@@ -359,6 +580,42 @@ impl StoreShadowCapture {
 
     fn vfs_name(&self) -> &CStr {
         &self.vfs_name
+    }
+
+    /// Process-wide singleton capture VFS for every WAL-owner lane, mirroring
+    /// the shared test capture below.
+    ///
+    /// MANDATORY, not an optimization. `MAX_CAPTURE_VFS_INSTALLATIONS` is a
+    /// process-lifetime global enforced by a `fetch_update` in
+    /// `archive_v3_sqlite_vfs`, and every install deliberately `Box::leak`s its
+    /// bounded SQLite callback allocation. Installing per launch was harmless
+    /// while the only launch was startup; once a serving slot can be
+    /// relaunched in-process, a per-generation install hard-fails with
+    /// `CaptureVfsError::TooManyInstallations` after the ceiling and makes
+    /// `sqlite3_vfs_find` name resolution order-dependent before then.
+    ///
+    /// Sound because the VFS is a stateless wrapper over per-path
+    /// registrations: each lane registers its own 128-bit-random recovery path,
+    /// the registry is separately capped, and `CaptureRegistration::drop`
+    /// retires and scrubs a dead lane's slot — which the relaunch driver's
+    /// proof of death guarantees has already run before a successor registers.
+    pub(crate) fn shared_for_wal_owner() -> Result<Arc<Self>> {
+        // A `Mutex` rather than a `OnceLock`: installation is fallible, and a
+        // lost `get_or_init` race would burn one of the eight process-lifetime
+        // installations on an allocation nobody keeps.
+        static CAPTURE: std::sync::Mutex<Option<Arc<StoreShadowCapture>>> =
+            std::sync::Mutex::new(None);
+        let mut capture = CAPTURE
+            .lock()
+            .map_err(|_| EnclaveError::Store("shadow capture singleton poisoned".into()))?;
+        if let Some(capture) = capture.as_ref() {
+            return Ok(Arc::clone(capture));
+        }
+        let installed = Arc::new(StoreShadowCapture::install(
+            "kioku-archive-v3-wal-owner-v1",
+        )?);
+        *capture = Some(Arc::clone(&installed));
+        Ok(installed)
     }
 
     #[cfg(test)]
@@ -2494,6 +2751,7 @@ impl Store {
             persistence_policy,
             wal_authority_persistence: StdRwLock::new(HashMap::new()),
             wal_serving_authorities: StdRwLock::new(HashMap::new()),
+            wal_serving_relaunch: StdRwLock::new(None),
             kms,
             gcs,
             media_gcs,
@@ -2588,25 +2846,40 @@ impl Store {
     /// Register the launched WAL serving authority for one selected user.
     /// Requires the durable-terminal selection to already be installed (the
     /// authority's basis), and is install-once: a second registration for the
-    /// same user is a Conflict. No removal exists; a poisoned authority
-    /// refuses every call and the process restarts to relaunch. Nothing in
-    /// startup, config, routes, or providers calls this yet; the sole
-    /// intended caller is the config-gated startup relaunch.
+    /// same user is a Conflict. No removal exists.
+    ///
+    /// What the slot registers is supervised, not abandoned. The authority
+    /// inside it is atomically replaceable by
+    /// `recover_wal_serving_authority`, which is the ONLY mutator of the slot
+    /// and runs only after the previous owner has been proven dead. A slot
+    /// whose authority is terminal and whose relaunch is refused — no driver
+    /// installed, budget spent, backoff pending, or quarantined — keeps
+    /// refusing every call exactly as it does today, and the process restart
+    /// remains the outer recovery. Nothing in startup, config, routes, or
+    /// providers calls this yet; the sole intended caller is the config-gated
+    /// startup relaunch.
     pub(crate) fn install_wal_serving_authority(
         &self,
         user_id: &str,
+        archive_id: [u8; 16],
         authority: Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
     ) -> Result<()> {
         validate_user_id(user_id)?;
         let selections = self.wal_authority_persistence.read().map_err(|_| {
             EnclaveError::Store("wal-authority persistence selections poisoned".into())
         })?;
-        if !selections.contains_key(user_id) {
+        let selected = selections.get(user_id).copied();
+        drop(selections);
+        let Some(selected) = selected else {
             return Err(EnclaveError::Conflict(
                 "wal serving authority requires the durable-terminal selection".into(),
             ));
+        };
+        if selected != archive_id {
+            return Err(EnclaveError::Conflict(
+                "wal serving authority bound a different archive than the selection".into(),
+            ));
         }
-        drop(selections);
         let mut authorities = self
             .wal_serving_authorities
             .write()
@@ -2616,7 +2889,29 @@ impl Store {
                 "wal serving authority already registered".into(),
             ));
         }
-        authorities.insert(user_id.to_owned(), authority);
+        authorities.insert(
+            user_id.to_owned(),
+            Arc::new(WalServingLane::install(archive_id, authority)),
+        );
+        Ok(())
+    }
+
+    /// Install the in-process relaunch driver. Install-once, and the driver is
+    /// the only construction path a slot replacement may use.
+    pub(crate) fn install_wal_serving_relaunch(
+        &self,
+        driver: Arc<dyn WalServingRelaunch>,
+    ) -> Result<()> {
+        let mut installed = self
+            .wal_serving_relaunch
+            .write()
+            .map_err(|_| EnclaveError::Store("wal serving relaunch driver poisoned".into()))?;
+        if installed.is_some() {
+            return Err(EnclaveError::Conflict(
+                "wal serving relaunch driver already installed".into(),
+            ));
+        }
+        *installed = Some(driver);
         Ok(())
     }
 
@@ -2644,14 +2939,190 @@ impl Store {
         }
     }
 
-    fn wal_serving_authority(
-        &self,
-        user_id: &str,
-    ) -> Option<Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>> {
+    /// Resolve the user's serving slot. The map's `std` guard is released
+    /// before the caller can await anything: holding it across an await is
+    /// both a deadlock risk and a `Send`-bound compile error.
+    pub(crate) fn wal_serving_lane(&self, user_id: &str) -> Option<Arc<WalServingLane>> {
         self.wal_serving_authorities
             .read()
             .ok()
             .and_then(|authorities| authorities.get(user_id).cloned())
+    }
+
+    /// Replace a terminal serving authority in place, after proving the
+    /// previous one is dead.
+    ///
+    /// This is the ONLY mutator of a slot's authority, and it is a replace,
+    /// never a remove: the slot holds exactly one authority for its whole
+    /// life. It never re-submits a client operation and never decides the fate
+    /// of a retained commit — the durable stage decides, and the existing
+    /// ladder resolves it on the client's own idempotent retry.
+    ///
+    /// Fencing rests on five facts, in order of the steps below:
+    ///
+    /// 1. Single-flight. `relaunch` serializes callers; the loser re-reads the
+    ///    slot, finds it non-terminal, and issues no launch.
+    /// 2. Terminal precondition AND proof of death. The trigger is the actor
+    ///    task's own termination — never the lane's poison flag, which the
+    ///    ordinary checkpoint path raises mid-root-advance. Then
+    ///    `join_terminated` must SUCCEED: a timeout quarantines and never
+    ///    constructs.
+    /// 3. Monotonicity. `is_terminal()` reads an `AtomicBool` set by a drop
+    ///    guard inside the actor future, so it is set when the future
+    ///    completes or unwinds, never goes true -> false, and cannot be
+    ///    invalidated between the check and the swap.
+    /// 4. No third mutator. Registration is install-once and there is no
+    ///    removal, so the guarded replace below is the only writer.
+    /// 5. No witness relaxation. The successor re-enters the byte-identical
+    ///    startup ladder; the durable stage picks the predicate, not the
+    ///    driver, and no lease, witness, or evidence is fabricated.
+    pub(crate) async fn recover_wal_serving_authority(
+        &self,
+        user_id: &str,
+    ) -> Result<WalRecoveryOutcome> {
+        let Some(lane) = self.wal_serving_lane(user_id) else {
+            return Err(EnclaveError::Store(
+                "wal-authoritative user has no serving authority".into(),
+            ));
+        };
+        // Cheap pre-check under no lock at all.
+        if !lane.current()?.is_terminal() {
+            return Ok(WalRecoveryOutcome::AlreadyLive);
+        }
+        let driver = self
+            .wal_serving_relaunch
+            .read()
+            .map_err(|_| EnclaveError::Store("wal serving relaunch driver poisoned".into()))?
+            .as_ref()
+            .map(Arc::clone);
+        let Some(driver) = driver else {
+            // No driver installed: a terminal slot stays terminal and the
+            // process restart remains the recovery, exactly as today.
+            return Ok(WalRecoveryOutcome::Backoff);
+        };
+        let mut guard = lane.relaunch.lock().await;
+        // Re-read under the guard: another caller may have already replaced
+        // the authority while this one waited.
+        let current = lane.current()?;
+        if !current.is_terminal() {
+            return Ok(WalRecoveryOutcome::AlreadyLive);
+        }
+        if let WalLaneState::Quarantined(reason) = guard.state {
+            return Ok(WalRecoveryOutcome::Quarantined(reason));
+        }
+        let now = tokio::time::Instant::now();
+        if guard.next_attempt_at.is_some_and(|due| now < due) {
+            return Ok(WalRecoveryOutcome::Backoff);
+        }
+        let first = *guard.first_attempt_at.get_or_insert(now);
+        if now.duration_since(first) > WAL_RELAUNCH_WALL_DEADLINE {
+            return Ok(Self::quarantine(
+                &lane,
+                &mut guard,
+                WalQuarantineReason::DeadlineExceeded,
+            ));
+        }
+        if guard.installed_generations >= crate::archive_v3_wal_owner::MAX_WAL_SERVING_GENERATIONS {
+            return Ok(Self::quarantine(
+                &lane,
+                &mut guard,
+                WalQuarantineReason::GenerationsExhausted,
+            ));
+        }
+        // PROOF OF DEATH. Nothing is constructed before this resolves, and a
+        // deadline expiry is never treated as death.
+        if current
+            .join_terminated(WAL_RELAUNCH_JOIN_DEADLINE)
+            .await
+            .is_err()
+        {
+            return Ok(Self::quarantine(
+                &lane,
+                &mut guard,
+                WalQuarantineReason::Stuck,
+            ));
+        }
+        let rebuilt = driver.rebuild(user_id).await;
+        let (archive_id, replacement) = match rebuilt {
+            Ok(rebuilt) => rebuilt,
+            Err(_) => {
+                // A failed build minted no lane and therefore no new owner
+                // instance id, so it burned no durable attempt. It must not
+                // consume the generation budget.
+                guard.launch_failures = guard.launch_failures.saturating_add(1);
+                lane.launch_failures_total
+                    .fetch_add(1, AtomicOrdering::AcqRel);
+                guard.defer(tokio::time::Instant::now());
+                return Ok(WalRecoveryOutcome::Backoff);
+            }
+        };
+        if archive_id != lane.archive_id {
+            // Drop the orphan rather than serve a different archive under this
+            // user's slot. It renewed a lease it will never use; the next
+            // launch renews again through the same predicate.
+            drop(replacement);
+            return Ok(Self::quarantine(
+                &lane,
+                &mut guard,
+                WalQuarantineReason::ArchiveMismatch,
+            ));
+        }
+        {
+            let mut slot = lane
+                .current
+                .write()
+                .map_err(|_| EnclaveError::Store("wal serving slot poisoned".into()))?;
+            *slot = replacement;
+        }
+        guard.installed_generations = guard.installed_generations.saturating_add(1);
+        guard.backoff = WAL_RELAUNCH_BACKOFF_MIN;
+        guard.next_attempt_at = None;
+        lane.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        lane.relaunches_total.fetch_add(1, AtomicOrdering::AcqRel);
+        Ok(WalRecoveryOutcome::Replaced)
+    }
+
+    fn quarantine(
+        lane: &WalServingLane,
+        guard: &mut WalRelaunchLedger,
+        reason: WalQuarantineReason,
+    ) -> WalRecoveryOutcome {
+        if guard.state == WalLaneState::Serving {
+            lane.quarantines_total.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+        guard.state = WalLaneState::Quarantined(reason);
+        WalRecoveryOutcome::Quarantined(reason)
+    }
+
+    /// Content-free aggregate serving health for the liveness probe. The event
+    /// counters are the point: a genuine-corruption -> heal loop that stays
+    /// under budget increments `relaunches_total` on every generation, so it
+    /// cannot heal silently. State counts alone would show a steady
+    /// `serving: 1` and hide it.
+    pub(crate) fn wal_serving_health(&self) -> WalServingHealth {
+        let mut health = WalServingHealth::default();
+        let Ok(lanes) = self.wal_serving_authorities.read() else {
+            return health;
+        };
+        for lane in lanes.values() {
+            let quarantined = lane
+                .relaunch
+                .try_lock()
+                .is_ok_and(|guard| matches!(guard.state, WalLaneState::Quarantined(_)));
+            let terminal = lane.current().is_ok_and(|current| current.is_terminal());
+            if quarantined {
+                health.quarantined += 1;
+            } else if terminal {
+                health.terminal += 1;
+            } else {
+                health.serving += 1;
+            }
+            health.relaunches_total += lane.relaunches_total.load(AtomicOrdering::Acquire);
+            health.launch_failures_total +=
+                lane.launch_failures_total.load(AtomicOrdering::Acquire);
+            health.quarantines_total += lane.quarantines_total.load(AtomicOrdering::Acquire);
+        }
+        health
     }
 
     /// Dual-path read: the single API domain code migrates onto. An
@@ -2672,9 +3143,17 @@ impl Store {
         if !self.wal_selected(user_id) {
             return self.with_user_read(user_id, f).await;
         }
-        let authority = self.wal_serving_authority(user_id).ok_or_else(|| {
+        let lane = self.wal_serving_lane(user_id).ok_or_else(|| {
             EnclaveError::Store("wal-authoritative user has no serving authority".into())
         })?;
+        // Heal before the call, never retry after a failure: the closure is
+        // not moved into a call that is going to fail, and a refused or
+        // backing-off relaunch simply leaves the request to refuse as it does
+        // today.
+        if lane.current()?.is_terminal() {
+            let _ = self.recover_wal_serving_authority(user_id).await;
+        }
+        let authority = lane.current()?;
         match authority.read(f).await {
             Ok(inner) => inner,
             Err(_) => Err(EnclaveError::Store(
@@ -2711,9 +3190,17 @@ impl Store {
                 "wal-authoritative submit requires a selected user".into(),
             ));
         }
-        let authority = self.wal_serving_authority(user_id).ok_or_else(|| {
+        let lane = self.wal_serving_lane(user_id).ok_or_else(|| {
             EnclaveError::Store("wal-authoritative user has no serving authority".into())
         })?;
+        // Heal before the call. This is deliberately NOT a retry-after-failure
+        // hook: a submit that died after `mark_send_started` has an unknown
+        // outcome, and its retry must remain the client's own idempotent
+        // outbox retry. The driver never re-submits an operation.
+        if lane.current()?.is_terminal() {
+            let _ = self.recover_wal_serving_authority(user_id).await;
+        }
+        let authority = lane.current()?;
         authority
             .submit(prepared)
             .await
@@ -12806,6 +13293,576 @@ pub(crate) mod tests {
             ],
             "the deletion query must name everything that was ever recorded"
         );
+    }
+
+    // ── Group C: in-process WAL serving relaunch ────────────────────────────
+
+    const RELAUNCH_ARCHIVE: [u8; 16] = [0x7c; 16];
+    const RELAUNCH_USER: &str = "relaunch-subject";
+
+    /// What the driver answers with. The driver is the ONLY construction path
+    /// a slot replacement may use, so a test double here is a test double for
+    /// the entire launch ladder.
+    #[derive(Clone, Copy)]
+    enum FakeRebuild {
+        Terminal,
+        Live,
+        Fail,
+        OtherArchive,
+    }
+
+    struct CountingRelaunch {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        answer: FakeRebuild,
+    }
+
+    impl CountingRelaunch {
+        fn new(answer: FakeRebuild) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                answer,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalServingRelaunch for CountingRelaunch {
+        async fn rebuild(
+            &self,
+            _user_id: &str,
+        ) -> Result<(
+            [u8; 16],
+            Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
+        )> {
+            self.calls.fetch_add(1, AtomicOrdering::AcqRel);
+            match self.answer {
+                FakeRebuild::Fail => Err(EnclaveError::Store("rebuild refused".into())),
+                FakeRebuild::Live => Ok((
+                    RELAUNCH_ARCHIVE,
+                    Arc::new(
+                        crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::live_for_relaunch_test(),
+                    ),
+                )),
+                FakeRebuild::Terminal => Ok((
+                    RELAUNCH_ARCHIVE,
+                    Arc::new(
+                        crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::terminal_for_relaunch_test()
+                            .await,
+                    ),
+                )),
+                FakeRebuild::OtherArchive => Ok((
+                    [0x0d; 16],
+                    Arc::new(
+                        crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::live_for_relaunch_test(),
+                    ),
+                )),
+            }
+        }
+    }
+
+    fn relaunch_store() -> Arc<Store> {
+        let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    RELAUNCH_USER,
+                    crate::archive_v3::ArchiveId::from_bytes(RELAUNCH_ARCHIVE),
+                ),
+            )
+            .unwrap();
+        store
+    }
+
+    /// Wait for the slot's authority to publish its termination flag. The
+    /// actor future is spawned, so "terminal" is observable only after it has
+    /// been polled to completion at least once.
+    async fn await_terminal_slot(lane: &WalServingLane) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !lane.is_terminal_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the slot's authority never became terminal");
+    }
+
+    async fn install_terminal_slot(store: &Store) {
+        store
+            .install_wal_serving_authority(
+                RELAUNCH_USER,
+                RELAUNCH_ARCHIVE,
+                Arc::new(
+                    crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::terminal_for_relaunch_test()
+                        .await,
+                ),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn construction_never_begins_before_proof_of_death() {
+        // A wedged blocking lane still holds the writable SQLite connection
+        // and the capture registration. `is_terminal()` alone would let a
+        // successor be constructed over it — two live owners believing they
+        // hold the same archive. The driver must refuse instead.
+        let store = relaunch_store();
+        let (stuck, release) =
+            crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::stuck_for_relaunch_test(
+            );
+        store
+            .install_wal_serving_authority(RELAUNCH_USER, RELAUNCH_ARCHIVE, Arc::new(stuck))
+            .unwrap();
+        let driver = CountingRelaunch::new(FakeRebuild::Live);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+        await_terminal_slot(&lane).await;
+        assert!(lane.is_terminal_for_test(), "the actor future is over");
+
+        let outcome = store
+            .recover_wal_serving_authority(RELAUNCH_USER)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            WalRecoveryOutcome::Quarantined(WalQuarantineReason::Stuck)
+        );
+        assert_eq!(
+            driver.calls(),
+            0,
+            "nothing may be constructed without proof of death"
+        );
+        assert_eq!(lane.generation_for_test(), 0);
+        // Quarantine is terminal for this process: it does not retry itself
+        // back into a race once the lane finally leaves.
+        release.release();
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Quarantined(WalQuarantineReason::Stuck)
+        );
+        assert_eq!(driver.calls(), 0);
+        let health = store.wal_serving_health();
+        assert_eq!(health.quarantined, 1);
+        assert_eq!(health.quarantines_total, 1, "quarantine is an event");
+        assert_eq!(health.relaunches_total, 0);
+    }
+
+    #[tokio::test]
+    async fn a_proven_dead_authority_is_replaced_in_place_and_never_removed() {
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::Live);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+        let stale = lane.authority_for_test();
+
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Replaced
+        );
+        assert_eq!(driver.calls(), 1);
+        assert_eq!(lane.generation_for_test(), 1);
+        assert!(!lane.is_terminal_for_test());
+
+        // The slot is the same slot: replaced, never removed. There is no
+        // instant at which a registered user has no authority.
+        assert!(store.has_wal_serving_authority(RELAUNCH_USER));
+        assert!(Arc::ptr_eq(
+            &lane,
+            &store.wal_serving_lane(RELAUNCH_USER).unwrap()
+        ));
+
+        // A stale clone of the previous authority can never write again: its
+        // actor future is over, so the only thing a surviving clone can do is
+        // enqueue onto a channel whose receiver died with the future.
+        assert!(!Arc::ptr_eq(&stale, &lane.authority_for_test()));
+        assert!(stale.read(|_| Ok(())).await.is_err());
+
+        // A second call finds the slot live and issues no launch.
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::AlreadyLive
+        );
+        assert_eq!(driver.calls(), 1);
+
+        let health = store.wal_serving_health();
+        assert_eq!(health.serving, 1);
+        assert_eq!(health.terminal, 0);
+        assert_eq!(health.relaunches_total, 1, "a heal is an event");
+    }
+
+    #[tokio::test]
+    async fn a_successor_for_a_different_archive_is_refused_not_swapped_in() {
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::OtherArchive);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Quarantined(WalQuarantineReason::ArchiveMismatch)
+        );
+        assert_eq!(lane.generation_for_test(), 0);
+        assert!(lane.is_terminal_for_test(), "the slot kept its own archive");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thirty_two_concurrent_callers_launch_exactly_once() {
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::Live);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let mut callers = Vec::new();
+        for _ in 0..32 {
+            let store = Arc::clone(&store);
+            callers.push(tokio::spawn(async move {
+                store.recover_wal_serving_authority(RELAUNCH_USER).await
+            }));
+        }
+        let mut replaced = 0;
+        let mut already_live = 0;
+        for caller in callers {
+            match caller.await.unwrap().unwrap() {
+                WalRecoveryOutcome::Replaced => replaced += 1,
+                WalRecoveryOutcome::AlreadyLive => already_live += 1,
+                other => panic!("unexpected concurrent outcome {other:?}"),
+            }
+        }
+        assert_eq!(replaced, 1, "single-flight: exactly one launch");
+        assert_eq!(already_live, 31);
+        assert_eq!(driver.calls(), 1, "no thundering herd");
+        assert_eq!(
+            store
+                .wal_serving_lane(RELAUNCH_USER)
+                .unwrap()
+                .generation_for_test(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_driver_backs_off_without_consuming_the_generation_budget() {
+        // A failed build minted no lane and therefore no new owner instance
+        // id, so it burned no durable attempt. Charging it to the generation
+        // budget would let a provider outage exhaust the budget long before
+        // the wall deadline — which is sized to outlast the owner lease — can
+        // be reached, converting a transient outage into a new permanent
+        // terminal.
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::Fail);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Backoff
+        );
+        assert_eq!(driver.calls(), 1);
+        // Immediately again: the backoff refuses without touching the driver.
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Backoff
+        );
+        assert_eq!(driver.calls(), 1, "backoff must not re-enter the driver");
+
+        // Keep failing across the wall deadline. Generations stay at zero and
+        // the lane finally quarantines on the deadline, not on the budget.
+        let mut attempts = 1;
+        for _ in 0..64 {
+            tokio::time::advance(Duration::from_secs(120)).await;
+            match store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap()
+            {
+                WalRecoveryOutcome::Backoff => attempts += 1,
+                WalRecoveryOutcome::Quarantined(reason) => {
+                    assert_eq!(reason, WalQuarantineReason::DeadlineExceeded);
+                    break;
+                }
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        let (generations, failures, state) = lane.ledger_for_test().await;
+        assert_eq!(generations, 0, "failed launches never consume generations");
+        assert!(failures >= 2, "launch failures accumulate: {failures}");
+        assert_eq!(
+            state,
+            WalLaneState::Quarantined(WalQuarantineReason::DeadlineExceeded)
+        );
+        assert!(attempts > 1);
+        let health = store.wal_serving_health();
+        assert_eq!(health.quarantined, 1);
+        assert_eq!(health.relaunches_total, 0);
+        assert_eq!(health.launch_failures_total, u64::from(failures));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_generation_budget_bounds_a_corruption_heal_loop_and_stays_visible() {
+        // A genuinely corrupt archive that dies every generation must NOT heal
+        // forever in silence. It is bounded by the generation budget, and
+        // every generation is an observable event.
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::Terminal);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        let lane = store.wal_serving_lane(RELAUNCH_USER).unwrap();
+        let budget = crate::archive_v3_wal_owner::MAX_WAL_SERVING_GENERATIONS;
+        for generation in 1..=budget {
+            assert_eq!(
+                store
+                    .recover_wal_serving_authority(RELAUNCH_USER)
+                    .await
+                    .unwrap(),
+                WalRecoveryOutcome::Replaced,
+                "generation {generation}"
+            );
+            assert_eq!(lane.generation_for_test(), u64::from(generation));
+        }
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Quarantined(WalQuarantineReason::GenerationsExhausted)
+        );
+        assert_eq!(driver.calls() as u32, budget);
+        let health = store.wal_serving_health();
+        assert_eq!(
+            health.relaunches_total,
+            u64::from(budget),
+            "a heal loop under budget must be visible as events, not as a \
+             steady `serving` count"
+        );
+        assert_eq!(health.quarantines_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_slot_without_a_driver_keeps_refusing_exactly_as_today() {
+        // Poison must remain a real, reachable, fail-closed state. Without a
+        // driver installed — every test and every image that does not install
+        // one — a terminal slot stays terminal and the routed read refuses.
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        assert_eq!(
+            store
+                .recover_wal_serving_authority(RELAUNCH_USER)
+                .await
+                .unwrap(),
+            WalRecoveryOutcome::Backoff
+        );
+        let refused = store
+            .wal_authoritative_read(RELAUNCH_USER, |_| Ok(()))
+            .await;
+        assert!(
+            matches!(refused, Err(EnclaveError::Store(_))),
+            "a terminal slot must fail closed: {refused:?}"
+        );
+        assert!(store
+            .wal_serving_lane(RELAUNCH_USER)
+            .unwrap()
+            .is_terminal_for_test());
+    }
+
+    #[tokio::test]
+    async fn a_routed_read_heals_before_the_call_and_a_submit_is_never_auto_retried() {
+        let store = relaunch_store();
+        install_terminal_slot(&store).await;
+        let driver = CountingRelaunch::new(FakeRebuild::Live);
+        store
+            .install_wal_serving_relaunch(Arc::clone(&driver) as Arc<dyn WalServingRelaunch>)
+            .unwrap();
+        // The routed read heals the slot before issuing its closure. The fake
+        // successor refuses every call, so the read still errors — the point
+        // is that the slot was replaced, in-process, without a restart.
+        let _ = store
+            .wal_authoritative_read(RELAUNCH_USER, |_| Ok(()))
+            .await;
+        assert_eq!(driver.calls(), 1, "heal-before-call ran");
+        assert_eq!(
+            store
+                .wal_serving_lane(RELAUNCH_USER)
+                .unwrap()
+                .generation_for_test(),
+            1
+        );
+        // A second read finds the slot live and does not relaunch again.
+        let _ = store
+            .wal_authoritative_read(RELAUNCH_USER, |_| Ok(()))
+            .await;
+        assert_eq!(driver.calls(), 1);
+    }
+
+    #[test]
+    fn the_wal_owner_capture_vfs_installs_once_per_process() {
+        // `MAX_CAPTURE_VFS_INSTALLATIONS` is a process-lifetime global and
+        // every install deliberately leaks its bounded callback allocation.
+        // Installing per launch was harmless while startup was the only
+        // launcher; with an in-process relaunch it hard-fails after the
+        // ceiling and makes VFS name resolution order-dependent before then.
+        let publisher = include_str!("archive_v3_wal_owner/publisher.rs");
+        let production = &publisher[..publisher
+            .find(concat!("mod ", "tests"))
+            .unwrap_or(publisher.len())];
+        assert!(
+            production.contains("StoreShadowCapture::shared_for_wal_owner()"),
+            "the WAL owner must use the shared capture singleton"
+        );
+        assert!(
+            !production.contains(concat!("StoreShadowCapture::install", "(")),
+            "the WAL owner must not install a VFS per launch"
+        );
+        // Non-vacuous: with a per-call install this loop hard-fails on the
+        // ninth iteration with TooManyInstallations.
+        let first = StoreShadowCapture::shared_for_wal_owner().unwrap();
+        for _ in 0..32 {
+            let again = StoreShadowCapture::shared_for_wal_owner().unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "every WAL-owner launch must share one installation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_serving_slot_is_replaceable_and_never_removable() {
+        // Every clause below is a predicate, gate, or failure handler this
+        // change is forbidden to relax. Pinned by source string so softening
+        // one is a test failure, not a review miss.
+        let source = include_str!("store.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        for required in [
+            // The SERVING read poisons on unsettled state. The fix stops that
+            // state from being reached; it never makes this guard quieter.
+            "        if registration.completed_len() != 0 {\n\
+             \x20           self.poison();\n\
+             \x20           return Err(WalOwnerError::Corrupt);\n\
+             \x20       }",
+            // The pre-admission LOOKUP degrades instead. The asymmetry is
+            // deliberate: a lookup that declines to consult unsettled state is
+            // conservative; a serving read that skipped a retained commit
+            // would be serving a lie.
+            "        if registration.completed_len() != 0 {\n\
+             \x20           return Ok(WalStoreReplay::Absent(prepared));\n\
+             \x20       }",
+            // `refresh_lease_binding` and `take_checkpoint_source` poison on
+            // unsettled state, and `take_checkpoint_source` only succeeds when
+            // the capture is empty — which is why a checkpoint-arm relaunch is
+            // provably lossless.
+            "                .completed_len()\n\
+             \x20               != 0\n\
+             \x20       {\n\
+             \x20           self.poison();\n\
+             \x20           return Err(WalOwnerError::Conflict);",
+            // `advance_binding`'s exact-successor conjunction.
+            "            || next.root().sequence()\n\
+             \x20               != self\n\
+             \x20                   .binding\n\
+             \x20                   .root()\n\
+             \x20                   .sequence()\n\
+             \x20                   .checked_add(1)",
+            // Install-once, no removal.
+            "\"wal serving authority already registered\"",
+            "\"wal serving authority requires the durable-terminal selection\"",
+            // Proof of death precedes construction, and a timeout quarantines.
+            "join_terminated(WAL_RELAUNCH_JOIN_DEADLINE)",
+            "WalQuarantineReason::Stuck",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            concat!("fn remove_wal_serving_", "authority"),
+            concat!("fn take_wal_serving_", "authority"),
+            // The live-lease same-owner heartbeat must never be pulled into a
+            // launch ladder; using it there would delete the cross-process
+            // fence entirely.
+            concat!("maintain_owner_", "lease"),
+            concat!("maintain_exact_wal_owner_", "lease"),
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "found forbidden {forbidden}"
+            );
+        }
+        // No removal may ever be reached through the serving registry.
+        for (offset, _) in production.match_indices(".remove(") {
+            let back = production[..offset]
+                .char_indices()
+                .rev()
+                .nth(200)
+                .map_or(0, |(index, _)| index);
+            assert!(
+                !production[back..offset].contains("wal_serving_authorities"),
+                "the serving registry gained a removal: {}",
+                &production[back..offset + 32]
+            );
+        }
+        // Exactly one writer of the slot, and it is inside the driver.
+        let writes: Vec<usize> = production
+            .match_indices(".current\n                .write()")
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(writes.len(), 1, "the slot has more than one writer");
+        let driver = production
+            .find("pub(crate) async fn recover_wal_serving_authority(")
+            .expect("the driver moved");
+        let driver_end = production[driver..]
+            .find("\n    fn quarantine(")
+            .expect("the driver's end moved")
+            + driver;
+        assert!(
+            (driver..driver_end).contains(&writes[0]),
+            "the only slot write must live inside recover_wal_serving_authority"
+        );
+    }
+
+    #[test]
+    fn wal_relaunch_wall_deadline_outlasts_the_owner_lease() {
+        // The Class-1 relaunch is refused by the witness lease predicates
+        // until the lane's own lease lapses. The heal budget is sized against
+        // that constant, so a change to it must be a deliberate, visible one.
+        let publisher = include_str!("archive_v3_wal_owner/publisher.rs");
+        assert!(
+            publisher.contains(&format!(
+                "const OWNER_LEASE_TICKS: u64 = {WAL_OWNER_LEASE_TICKS_MIRROR};"
+            )),
+            "the owner lease the relaunch budget is sized against changed"
+        );
+        assert!(WAL_RELAUNCH_WALL_DEADLINE.as_secs() >= WAL_OWNER_LEASE_TICKS_MIRROR * 3);
     }
 
     #[tokio::test]
