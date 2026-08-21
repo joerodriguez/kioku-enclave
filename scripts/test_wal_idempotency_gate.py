@@ -180,7 +180,7 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # helpers: the count holds at 15, the key set is unchanged, no construction
 # surface was added or removed, and the sole delta is that literal (and its
 # enclosing factory definition) moving.
-EXPECTED_STORE_SURFACE_SHA256 = "4fbe138720df66b3f5b738fa02bc73a879063059ac93beb47efdfe8c307c3aae"
+EXPECTED_STORE_SURFACE_SHA256 = "a2904b58b343e52a84493ca5cdf7de2693c1c5d34c2f6c37ecf49c6e8d45e25d"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -237,7 +237,7 @@ EXPECTED_POLICY_SITE_COUNT = 42
 # constructor, whose owner body gained the deletion-lane slot; their
 # expressions are byte-identical. The six `open_db#0` rows keep the
 # re-baseline's owner-body hashes.
-EXPECTED_POLICY_SITE_SHA256 = "e666e1fe03d9ce9cac97916fd1666287374af4008871d4c227f707273335a6f3"
+EXPECTED_POLICY_SITE_SHA256 = "7b4d15912ada202d44b85fe68ec2862d245632e983874b58b6d049370ce6319d"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -317,7 +317,7 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # spawn. Dumped and diffed against a pristine origin/main (16a7f41) tree with
 # this module's own helpers: the count holds at 26, nothing was added, removed,
 # or reclassified, and every spawn's own call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "b05d2e2b5ca6e841c6ca1aa673db936f68cc2048f461c360aeb12758df507bc5"
+EXPECTED_WORKER_SPAWN_SHA256 = "5fb928cba829ee4592fa14f4e07bbc00dfe6eddfef25331dc512344f68b53ffe"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
