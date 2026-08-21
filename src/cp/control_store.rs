@@ -14880,9 +14880,14 @@ fn inspect_wal_owner_operation_conn(
         // rewrite captured back to prepared).
         // Only a genuinely DIFFERENT operation may pass. A matching
         // operation_id with a different request_fingerprint is idempotency-key
-        // reuse under a changed body: that must stay a definitive refusal, and
-        // it could never be abandoned anyway — the displacing insert would
-        // collide with this very operation's own attempt row.
+        // reuse under a changed body, and must stay a definitive refusal.
+        //
+        // This conjunct is the SOLE barrier — do not simplify it away. No
+        // database constraint backstops it: the abandon supersedes the stored
+        // attempt and the insert below takes the next free ordinal, so a
+        // displacing insert for the same operation_id would now succeed
+        // silently at attempt 2 rather than collide. Pinned by
+        // a_reused_operation_id_with_a_different_fingerprint_is_still_refused.
         if stage == "prepared"
             && (operation.as_slice() != identity.operation_id().as_bytes()
                 || kind != identity.kind() as i64)
@@ -32067,9 +32072,13 @@ mod tests {
 
     /// Reusing an operation id with a DIFFERENT request fingerprint is
     /// idempotency-key reuse under a changed body. It must remain a
-    /// definitive refusal and must never enter the abandon arm — the
-    /// displacing insert would collide with this very operation's own attempt
-    /// row and surface as an unclassified constraint error instead.
+    /// definitive refusal and must never enter the abandon arm.
+    ///
+    /// Nothing else catches this. Because the abandon supersedes the stored
+    /// attempt and the fresh insert takes the next free ordinal, widening the
+    /// arm does not raise a constraint error — it silently displaces the
+    /// original operation at attempt 2. That is what this test exists to
+    /// prevent, and why the operation_id/kind conjunct is load-bearing.
     #[test]
     fn a_reused_operation_id_with_a_different_fingerprint_is_still_refused() {
         let directory = tempfile::tempdir().unwrap();
