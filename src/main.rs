@@ -111,6 +111,10 @@ mod archive_v3_genesis;
 // control-store lifecycle ledger with injected providers behind an unmintable
 // release token; nothing in startup constructs it.
 mod archive_v3_genesis_backend;
+// Config-gated ADR-0022 genesis trigger at sign-in (genesis spine G9). The
+// gate defaults to off and additionally requires the image-baked archive-v3
+// runtime coordinates, so a production image today never fires it.
+mod archive_v3_genesis_trigger;
 // Inactive ADR-0022 deletion-driver seam. It accepts only witness-fenced
 // archive contexts and authenticated canonical metadata; no route, Store,
 // runtime/provider construction, or production authority is connected.
@@ -985,6 +989,17 @@ async fn async_main() {
             unavailable = unavailable_wal_serving_authorities,
             "WAL serving authorities failed to relaunch; those users are unavailable"
         );
+    }
+
+    // ADR-0022 genesis spine (G9): validate the new-user genesis gate against
+    // the image before any request is admitted. An armed gate on an image with
+    // no baked archive-v3 runtime coordinates has nothing to mint an archive
+    // with, so it fails startup closed instead of silently never firing.
+    // Content-free: one boolean.
+    let genesis_native_signin = archive_v3_genesis_trigger::genesis_startup_agreement()
+        .unwrap_or_else(|error| panic!("Failed to validate the genesis sign-in gate: {error}"));
+    if genesis_native_signin {
+        info!("new-user archive-v3 genesis is armed for sign-in");
     }
 
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {

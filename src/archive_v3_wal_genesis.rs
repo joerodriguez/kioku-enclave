@@ -14,15 +14,24 @@
 //! root, seal it, durably prepare both byte payloads, and resolve genesis.
 //! Before `prepare_archive_bootstrap`, a crash orphans one checkpoint's objects and the retry mints a fresh DEK. After it, replay is byte-exact.
 //!
-//! Orphan accounting, honestly: staged-object rows are offered to the
-//! injected `ShadowObjectInventory` seam reserve-first, but NO durable
-//! production recorder accepts a genesis binding today — the ControlStore
-//! inventory is maintenance-operation-bound, and the reachability sweep
-//! starts only from witness-selected roots. A durable genesis staging
-//! inventory recorder is therefore a HARD PREREQUISITE for the G9
-//! production wiring; until it exists, pre-prepare crash orphans are
-//! unenumerable (they are also undecryptable — the crashed attempt's DEK
-//! dies with the process — so the exposure is storage residue, not data).
+//! That boundary is decided by the durable anchor, not by the caller:
+//! [`start_genesis_bootstrap`] recovers first, and a pass that finds a
+//! prepared anchor resumes from the stored payloads and produces nothing at
+//! all — no second DEK, no second checkpoint, no second staging binding. This
+//! is not merely an efficiency: the control ledger ignores the bytes a
+//! post-boundary prepare is handed and replays the stored ones, so a
+//! re-producing pass would stage its objects under a binding built from a
+//! wrapped-registry hash the ladder can never rebuild.
+//!
+//! Orphan accounting: staged-object rows are offered to the injected
+//! `ShadowObjectInventory` seam reserve-first, and G9's
+//! `GenesisStagingInventory` is the durable production recorder that accepts a
+//! genesis binding (the ControlStore's maintenance inventory is
+//! maintenance-operation-bound and cannot, and the reachability sweep starts
+//! only from witness-selected roots). Pre-prepare crash orphans are therefore
+//! durably named by exact canonical key rather than unenumerable; they are
+//! also undecryptable — the crashed attempt's DEK dies with the process — so
+//! the residual exposure is storage residue, not data.
 //!
 //! G6 then runs the witness ladder (Variant B) on the freshly read witness:
 //! acquire the exact lease, advance Legacy → ShadowWal with a zero-WAL
@@ -329,9 +338,14 @@ pub(crate) async fn run_wal_genesis(
     scratch_dir: &Path,
     archive_id: ArchiveId,
 ) -> Result<WalGenesisOutcome, WalGenesisError> {
-    let reservation = reserve_genesis_bootstrap(authority, archive_id).await?;
-    let produced = produce_genesis_bytes(authority, scratch_dir, reservation).await?;
-    let prepared = prepare_genesis_bootstrap(authority, produced).await?;
+    let prepared = match start_genesis_bootstrap(authority, archive_id).await? {
+        GenesisBootstrapStart::Resume(prepared) => prepared,
+        GenesisBootstrapStart::Produce(reservation) => {
+            let produced = produce_genesis_bytes(authority, scratch_dir, reservation).await?;
+            // ◄── CRASH BOUNDARY.
+            prepare_genesis_bootstrap(authority, produced).await?
+        }
+    };
     let plan = prepared.reservation().plan();
     let wrapped_registry_hash = prepared.wrapped_registry_hash();
     let (resolution, _record) = resolve_genesis(authority, prepared).await?;
@@ -382,6 +396,72 @@ pub(crate) async fn reserve_genesis_bootstrap(
         return Err(WalGenesisError::Corrupt);
     }
     Ok(reservation)
+}
+
+/// Where one convergence pass must start, decided by the durable bootstrap
+/// anchor rather than by a caller's memory of how far a previous pass got.
+///
+/// The distinction is load-bearing precisely at the prepare crash boundary.
+/// Once `prepare_archive_bootstrap` has committed, the stored payloads are the
+/// only correct bytes for this archive: the control ledger replays them and
+/// *ignores* whatever a later pass hands it, while the witness ladder rebuilds
+/// its staging binding from the STORED wrapped-registry hash. A resumed pass
+/// that re-produced anyway would mint a second DEK, hash a second wrapped
+/// registry, and stage its checkpoint under a binding derived from that
+/// discarded hash — leaving the ladder unable to stage anything under the
+/// binding it is required to use, on every subsequent pass. Recovering first
+/// deletes that branch instead of trying to reconcile it.
+pub(crate) enum GenesisBootstrapStart {
+    /// Nothing is durably prepared yet, so this pass produces the bytes under
+    /// the freshly minted or exactly re-adopted reservation.
+    Produce(DurableBootstrapReservation),
+    /// The anchor is already past the crash boundary: resume from the durable
+    /// payloads and produce nothing at all.
+    Resume(PreparedBootstrap),
+}
+
+impl fmt::Debug for GenesisBootstrapStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GenesisBootstrapStart(<opaque>)")
+    }
+}
+
+/// Recover the durable bootstrap anchor first and report where this pass
+/// starts. A prepared anchor resumes; anything else takes the unchanged
+/// reserve path.
+pub(crate) async fn start_genesis_bootstrap(
+    authority: &WalGenesisAuthority<'_>,
+    archive_id: ArchiveId,
+) -> Result<GenesisBootstrapStart, WalGenesisError> {
+    if let Some(recovered) = authority
+        .recovery
+        .recover_reserved_bootstrap(archive_id)
+        .await
+        .map_err(map_lifecycle)?
+    {
+        // Same two invariants the reserve path asserts on its own receipt:
+        // the anchor is this archive's, and it sits at the pinned reservation
+        // revision the staging binding fences on.
+        if recovered.reservation().plan().archive_id() != archive_id
+            || recovered.reservation().revision() != GENESIS_RESERVATION_REVISION
+        {
+            return Err(WalGenesisError::Corrupt);
+        }
+        if recovered.prepared().is_some() {
+            return match recovered {
+                RecoveredBootstrap::Prepared(prepared) => {
+                    Ok(GenesisBootstrapStart::Resume(prepared))
+                }
+                // Unreachable given the check above; refuse rather than assume.
+                RecoveredBootstrap::Reserved(_) => Err(WalGenesisError::Corrupt),
+            };
+        }
+    }
+    // Not prepared: today's reserve path, unchanged. It recovers again so the
+    // exact reserved-plan re-adoption lives in exactly one place.
+    Ok(GenesisBootstrapStart::Produce(
+        reserve_genesis_bootstrap(authority, archive_id).await?,
+    ))
 }
 
 /// Produce the exact genesis bytes for one attempt, in the reviewed order:
@@ -1148,6 +1228,7 @@ mod tests {
         archive_v3_genesis_backend::{ControlPlaneGenesisBackend, GenesisRegistryStore},
         archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
         archive_v3_witness::{ExactRootProvider, RootAdvance, WitnessLease},
+        cp::control_store::GenesisStagingInventory,
         store::tests::{FakeGcs, FakeKms},
     };
     use std::{
@@ -1437,6 +1518,27 @@ mod tests {
             }
         }
 
+        /// The same authority over a caller-supplied inventory, so a test can
+        /// substitute the production binding-ENFORCING
+        /// [`GenesisStagingInventory`] for the binding-discarding
+        /// `RecordingInventory`.
+        fn authority_over<'a>(
+            &'a self,
+            inventory: &'a dyn ShadowObjectInventory,
+        ) -> WalGenesisAuthority<'a> {
+            WalGenesisAuthority {
+                inventory,
+                ..self.authority()
+            }
+        }
+
+        /// A fresh production staging-inventory instance for one attempt. Fresh
+        /// matters: the binding latch is process-local, so a new instance is
+        /// exactly what a restarted driver builds.
+        fn staging_inventory(&self, attempt_id: BootstrapAttemptId) -> GenesisStagingInventory {
+            GenesisStagingInventory::new(Arc::clone(&self.control), self.archive_id, attempt_id)
+        }
+
         fn scratch_dir(&self) -> &Path {
             self.scratch.path()
         }
@@ -1672,10 +1774,11 @@ mod tests {
         assert!(harness.inventory.reserved_count() > inventory_before);
     }
 
-    /// (3) Crash after prepare: the retry mints a fresh DEK, but the durable
-    /// prepare replays the stored bytes, so the resolved archive is
-    /// byte-exact the crashed attempt's — same wrapped registry, same root
-    /// envelope — and the retry's fresh upload is orphaned.
+    /// (3) Crash after prepare: the retry recovers a `Prepared` anchor and
+    /// resumes from the stored bytes without producing any of its own, so the
+    /// resolved archive is byte-exact the crashed attempt's — same wrapped
+    /// registry, same root envelope — with no second DEK and no second
+    /// checkpoint upload to orphan.
     #[tokio::test]
     async fn crash_after_prepare_replays_byte_exact_to_the_same_archive() {
         let harness = Harness::new().await;
@@ -1691,6 +1794,7 @@ mod tests {
             .unwrap();
         let stored_registry_hash = prepared.wrapped_registry_hash();
         let stored_root_hash = prepared.root_envelope_hash();
+        let chunks_before = harness.objects.chunk_creates.load(Ordering::Relaxed);
         drop(prepared); // crash: after the durable prepare, before resolve
 
         let outcome = run_wal_genesis(&authority, harness.scratch_dir(), harness.archive_id)
@@ -1714,6 +1818,114 @@ mod tests {
         let replayed = recovered.prepared().expect("prepared state persists");
         assert_eq!(replayed.wrapped_registry_hash(), stored_registry_hash);
         assert_eq!(replayed.root_envelope_hash(), stored_root_hash);
+        assert_eq!(
+            harness.objects.chunk_creates.load(Ordering::Relaxed),
+            chunks_before,
+            "a post-boundary retry must not upload a second checkpoint"
+        );
+    }
+
+    /// G9-1 regression. The witness ladder derives its staging binding from
+    /// the DURABLY PREPARED wrapped-registry hash, while byte production
+    /// derives its own from the hash of the registry it just wrapped under a
+    /// freshly minted DEK. A post-boundary pass that produced anyway would
+    /// therefore latch its staging inventory to a binding the ladder can never
+    /// present, and the ladder would refuse — permanently, on every later
+    /// pass, at exactly the crash points (C3-C6) the trigger's module doc
+    /// claims converge.
+    ///
+    /// The pre-existing convergence tests above cannot observe this: their
+    /// `RecordingInventory` takes `_binding` and throws it away. This one
+    /// drives the production [`GenesisStagingInventory`], which enforces the
+    /// binding, and gives the resumed pass a FRESH instance because the latch
+    /// is process-local — which is precisely what a restarted driver builds.
+    #[tokio::test]
+    async fn a_post_boundary_resume_converges_under_a_binding_enforcing_inventory() {
+        let harness = Harness::new().await;
+        // Attempt 1, staged end-to-end through the binding-enforcing
+        // production inventory and killed right after the durable prepare.
+        let reservation = {
+            let authority = harness.authority();
+            reserve_genesis_bootstrap(&authority, harness.archive_id)
+                .await
+                .unwrap()
+        };
+        let attempt_id = reservation.plan().attempt_id();
+        let (stored_registry_hash, stored_root_hash) = {
+            let crashed = harness.staging_inventory(attempt_id);
+            let authority = harness.authority_over(&crashed);
+            let produced = produce_genesis_bytes(&authority, harness.scratch_dir(), reservation)
+                .await
+                .unwrap();
+            let prepared = prepare_genesis_bootstrap(&authority, produced)
+                .await
+                .unwrap();
+            (
+                prepared.wrapped_registry_hash(),
+                prepared.root_envelope_hash(),
+            )
+        };
+        // ...crash. The producer's latch dies with the process; the durable
+        // staging rows and the prepared anchor do not.
+        let chunks_after_crash = harness.objects.chunk_creates.load(Ordering::Relaxed);
+        assert!(chunks_after_crash > 0, "attempt 1 uploaded a checkpoint");
+
+        // The decision under test: a durably prepared anchor resumes.
+        let start = {
+            let authority = harness.authority();
+            start_genesis_bootstrap(&authority, harness.archive_id)
+                .await
+                .unwrap()
+        };
+        let GenesisBootstrapStart::Resume(recovered) = start else {
+            panic!("a durably prepared anchor must resume, never re-produce");
+        };
+        assert_eq!(recovered.wrapped_registry_hash(), stored_registry_hash);
+        assert_eq!(recovered.root_envelope_hash(), stored_root_hash);
+        assert_eq!(recovered.reservation().plan().attempt_id(), attempt_id);
+        drop(recovered);
+
+        // The resumed pass, under a fresh binding-enforcing instance. Before
+        // the fix this failed with `ShadowObjectInventoryError::Conflict` from
+        // the ladder's first staged root object, and did so on every rerun.
+        let resumed = harness.staging_inventory(attempt_id);
+        let authority = harness.authority_over(&resumed);
+        let outcome = run_wal_genesis(&authority, harness.scratch_dir(), harness.archive_id)
+            .await
+            .expect(
+                "a post-boundary resume must converge; a failure here is the G9-1 wedge \
+                 (the staging latch refuses the ladder's binding, and \
+                 build_zero_wal_candidate reports it as Unavailable)",
+            );
+        assert_eq!(outcome.resolution, GenesisResolution::Created);
+        assert_eq!(
+            outcome.terminal_witness.registry().ciphertext_hash(),
+            stored_registry_hash,
+            "the resumed archive must carry the crashed attempt's exact registry"
+        );
+        // G9-2: the resumed pass minted no DEK and uploaded no checkpoint.
+        assert_eq!(
+            harness.objects.chunk_creates.load(Ordering::Relaxed),
+            chunks_after_crash,
+            "a post-boundary resume must not upload a second checkpoint"
+        );
+        // And a further pass over the terminal archive is likewise free.
+        let roots_after_ladder = harness.objects.root_creates.load(Ordering::Relaxed);
+        let again = run_wal_genesis(&authority, harness.scratch_dir(), harness.archive_id)
+            .await
+            .unwrap();
+        assert_eq!(again.terminal_witness, outcome.terminal_witness);
+        assert_eq!(
+            harness.objects.chunk_creates.load(Ordering::Relaxed),
+            chunks_after_crash
+        );
+        assert_eq!(
+            harness.objects.root_creates.load(Ordering::Relaxed),
+            roots_after_ladder
+        );
+        assert!(harness.scratch_is_empty());
+        // Acquires a WAL-owner lease it never releases, so it goes last.
+        assert_terminal_contract(&harness, &outcome.terminal_witness).await;
     }
 
     /// (4) Restart between the two advances: after Legacy → ShadowWal, a

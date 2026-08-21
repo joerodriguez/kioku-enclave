@@ -40,8 +40,8 @@ use crate::{
         BootstrapPlan, DeletionInventorySeal, DurableBootstrapReservation, DurableInventoryPage,
         DurablePhysicalCompletion, ErasedInventoryPages, FrozenInventorySnapshot,
         FrozenPreWitnessInventorySnapshot, InventoryPage, InventoryPageReference,
-        LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
-        PreWitnessDeletionInventorySeal, PreparedBootstrap, RecoveredBootstrap,
+        LifecycleCreateOutcome, LifecycleError, LifecycleInventoryObject, PhysicalDeletionReceipt,
+        PlannedArtifact, PreWitnessDeletionInventorySeal, PreparedBootstrap, RecoveredBootstrap,
         RecoveredDeletionLifecycle, WitnessCreateDispatchLedger, WitnessSendStarted,
         LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
         PRE_WITNESS_INVENTORY_FORMAT_V1, WITNESS_CREATE_PROTOCOL_V1,
@@ -998,6 +998,37 @@ CREATE TABLE IF NOT EXISTS archive_v3_wal_genesis (
         (stage='genesis_created' AND revision=1)
         OR (stage='wal_authoritative' AND revision=2)
     )
+);
+-- Durable genesis staging inventory. Every immutable object the genesis
+-- producer and its witness ladder create is reserved here BEFORE the provider
+-- request and marked materialized only after the byte-exact readback, so an
+-- attempt killed before `prepare_archive_bootstrap` leaves its orphaned
+-- checkpoint objects durably named instead of unenumerable. Rows are
+-- append-only under one archive's reserved bootstrap attempt: a retry mints a
+-- fresh DEK and fresh object identities, so it appends new ordinals and never
+-- rewrites a prior attempt's row. The columns are exactly the content-free
+-- immutable-object facts the existing lifecycle/deletion inventory family
+-- consumes (canonical key, object ID, role, ciphertext hash) plus the
+-- reconciliation context; they never contain SQL, captured frames, plaintext,
+-- or provider credentials.
+CREATE TABLE IF NOT EXISTS archive_v3_wal_genesis_staged_objects (
+    archive_id BLOB NOT NULL REFERENCES archive_bindings(archive_id)
+        CHECK (length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    bootstrap_attempt_id BLOB NOT NULL
+        CHECK (length(bootstrap_attempt_id)=16 AND bootstrap_attempt_id!=zeroblob(16)),
+    staging_ordinal INTEGER NOT NULL CHECK (staging_ordinal>=0 AND staging_ordinal<131072),
+    canonical_key TEXT NOT NULL CHECK (length(canonical_key)>0 AND length(canonical_key)<=1024),
+    object_id BLOB NOT NULL CHECK (length(object_id)=16 AND object_id!=zeroblob(16)),
+    object_role INTEGER NOT NULL CHECK (object_role IN (1,5,8)),
+    root_seq INTEGER CHECK (root_seq IS NULL OR root_seq>=0),
+    context_aad BLOB NOT NULL CHECK (length(context_aad)>0),
+    ciphertext_hash BLOB NOT NULL
+        CHECK (length(ciphertext_hash)=32 AND ciphertext_hash!=zeroblob(32)),
+    state TEXT NOT NULL CHECK (state IN ('reserved','materialized')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (archive_id, staging_ordinal),
+    UNIQUE (archive_id, object_id),
+    UNIQUE (archive_id, canonical_key)
 );
 -- Inactive single-owner WAL publication protocol. These rows contain only
 -- content-free authenticated bindings and immutable-object facts. They never
@@ -10901,6 +10932,438 @@ fn record_wal_genesis_stage_conn(
     ))
 }
 
+/// Hard ceiling on one archive's durable genesis staging log. A genesis
+/// attempt stages a handful of checkpoint objects plus two ladder roots, so
+/// this bounds thousands of retries; exceeding it fails closed rather than
+/// letting a runaway retry loop grow encrypted control state without bound.
+const MAX_GENESIS_STAGED_OBJECTS: i64 = 131_072;
+
+/// Bind one genesis staging record to the archive's durably reserved bootstrap
+/// attempt. The anchor is written by `reserve_bootstrap`, which always
+/// precedes the first staged object, so a staged row can never name an
+/// attempt this archive did not reserve.
+fn genesis_staging_attempt_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+) -> Result<()> {
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?.ok_or_else(|| {
+        EnclaveError::Conflict("WAL genesis staging has no reserved bootstrap".into())
+    })?;
+    if anchor.plan.attempt_id() != attempt_id {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis staging attempt does not match the reserved bootstrap".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reserve (or mark materialized) one exact immutable object the genesis
+/// producer is about to create, or exactly replay an already-recorded row.
+///
+/// Reserve-first is the whole point: the row is durable before the provider
+/// request, so a crash between the reservation and the create still leaves the
+/// object's canonical name enumerable. `materialized` is a one-way transition
+/// that may only follow this attempt's own reservation of byte-identical
+/// facts; anything else is a content-free Conflict, never an overwrite.
+fn record_wal_genesis_staged_object_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+    facts: &ShadowObjectFacts,
+    materialized: bool,
+) -> Result<(RecordOutcome, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    genesis_staging_attempt_conn(&tx, archive_id, attempt_id)?;
+    let view = facts
+        .maintenance_persistence_view(MaintenancePersistenceContext(()))
+        .map_err(|_| EnclaveError::Store("WAL genesis staged object is invalid".into()))?;
+    if !matches!(
+        view.object_role,
+        ObjectRole::CheckpointChunkV3 | ObjectRole::CheckpointManifestV3 | ObjectRole::RootV3
+    ) {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis stages only checkpoint and root objects".into(),
+        ));
+    }
+    // Reconstructing through the deletion family's own validating constructor
+    // proves the canonical key, embedded object ID, role, and hash all bind to
+    // this archive before anything durable is written.
+    LifecycleInventoryObject::for_archive(
+        archive_id,
+        crate::archive_v3::ObjectKey::from_validated_canonical(
+            view.object_key.to_owned(),
+            view.object_id,
+        ),
+        view.object_role,
+        view.ciphertext_hash,
+    )
+    .map_err(lifecycle_store_error)?;
+    let root_seq = view
+        .root_seq
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("WAL genesis staged root sequence overflow".into()))?;
+    type StagedIdentityRow = (i64, Vec<u8>, i64, Option<i64>, Vec<u8>, Vec<u8>, String);
+    let existing: Option<StagedIdentityRow> = tx
+        .query_row(
+            "SELECT staging_ordinal,bootstrap_attempt_id,object_role,root_seq,
+                    context_aad,ciphertext_hash,state
+             FROM archive_v3_wal_genesis_staged_objects
+             WHERE archive_id=?1 AND object_id=?2",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                view.object_id.as_bytes().as_slice(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((ordinal, stored_attempt, role, stored_root_seq, aad, hash, state)) = existing {
+        let exact = fixed_16(stored_attempt)? == *attempt_id.as_bytes()
+            && role == i64::from(view.object_role as u8)
+            && stored_root_seq == root_seq
+            && aad == view.context_aad
+            && fixed_32(hash)? == view.ciphertext_hash;
+        if !exact {
+            return Err(EnclaveError::Conflict(
+                "WAL genesis staged object conflicts with durable state".into(),
+            ));
+        }
+        if materialized && state == "reserved" {
+            if tx.execute(
+                "UPDATE archive_v3_wal_genesis_staged_objects
+                 SET state='materialized',
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE archive_id=?1 AND staging_ordinal=?2 AND state='reserved'",
+                rusqlite::params![archive_id.as_bytes().as_slice(), ordinal],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "WAL genesis staged materialization raced".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok((RecordOutcome::Recorded, true));
+        }
+        tx.commit()?;
+        return Ok((RecordOutcome::AlreadyRecorded, false));
+    }
+    if materialized {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis staged materialization requires its own reservation".into(),
+        ));
+    }
+    let next_ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(staging_ordinal)+1, 0)
+         FROM archive_v3_wal_genesis_staged_objects WHERE archive_id=?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if next_ordinal >= MAX_GENESIS_STAGED_OBJECTS {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis staging inventory reached its cap".into(),
+        ));
+    }
+    if tx.execute(
+        "INSERT INTO archive_v3_wal_genesis_staged_objects
+         (archive_id,bootstrap_attempt_id,staging_ordinal,canonical_key,object_id,
+          object_role,root_seq,context_aad,ciphertext_hash,state)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved')",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            attempt_id.as_bytes().as_slice(),
+            next_ordinal,
+            view.object_key,
+            view.object_id.as_bytes().as_slice(),
+            i64::from(view.object_role as u8),
+            root_seq,
+            view.context_aad,
+            view.ciphertext_hash.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL genesis staged reservation raced".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((RecordOutcome::Recorded, true))
+}
+
+/// One bounded page of this archive's durable genesis staging log, in the
+/// exact shape the restart-only reserved-object reconciliation reads.
+fn load_wal_genesis_staged_page_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+    after_ordinal: Option<u32>,
+) -> Result<ShadowObjectInventoryPage> {
+    genesis_staging_attempt_conn(conn, archive_id, attempt_id)?;
+    let after = after_ordinal.map_or(-1_i64, i64::from);
+    let mut statement = conn.prepare(
+        "SELECT staging_ordinal,canonical_key,object_id,object_role,root_seq,
+                context_aad,ciphertext_hash,state
+         FROM archive_v3_wal_genesis_staged_objects
+         WHERE archive_id=?1 AND bootstrap_attempt_id=?2 AND staging_ordinal>?3
+         ORDER BY staging_ordinal
+         LIMIT 256",
+    )?;
+    type StagedRow = (
+        i64,
+        String,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+    );
+    let rows: Vec<StagedRow> = statement
+        .query_map(
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                after,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<_, _>>()?;
+    let token = MaintenancePersistenceContext(());
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut last_ordinal = None;
+    for (ordinal, key, object_id, role, root_seq, aad, hash, state) in rows {
+        let ordinal = u32::try_from(ordinal)
+            .map_err(|_| EnclaveError::Store("WAL genesis staged ordinal is invalid".into()))?;
+        let root_seq = root_seq
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| EnclaveError::Store("WAL genesis staged root sequence invalid".into()))?;
+        let facts = ShadowObjectFacts::from_maintenance_persistence(
+            token,
+            ordinal,
+            ObjectId::from_bytes(fixed_16(object_id)?),
+            role,
+            root_seq,
+            aad,
+            key,
+            fixed_32(hash)?,
+        )
+        .map_err(|_| EnclaveError::Store("WAL genesis staged object is corrupt".into()))?;
+        let state = match state.as_str() {
+            "reserved" => ShadowObjectState::Reserved,
+            "materialized" => ShadowObjectState::Materialized,
+            _ => {
+                return Err(EnclaveError::Store(
+                    "WAL genesis staged object state is invalid".into(),
+                ))
+            }
+        };
+        entries.push(ShadowObjectInventoryEntry::from_maintenance_persistence(
+            token, facts, state,
+        ));
+        last_ordinal = Some(ordinal);
+    }
+    let next_ordinal = (entries.len() == 256).then_some(last_ordinal).flatten();
+    Ok(ShadowObjectInventoryPage::from_maintenance_persistence(
+        token,
+        entries,
+        next_ordinal,
+    ))
+}
+
+/// Every immutable object this archive's genesis attempts durably staged, in
+/// the exact content-free [`LifecycleInventoryObject`] shape the existing
+/// deletion-inventory family consumes. Reserved and materialized rows are both
+/// returned: a reserved row is an object whose create may have landed, and the
+/// deletion driver reconciles that ambiguity with its own exact absence read.
+#[allow(
+    dead_code,
+    reason = "genesis-orphan reader for the existing deletion inventory; the coordinator's union over it is a separate reviewed slice"
+)]
+fn load_wal_genesis_staged_inventory_objects_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Vec<LifecycleInventoryObject>> {
+    let mut statement = conn.prepare(
+        "SELECT canonical_key,object_id,object_role,ciphertext_hash
+         FROM archive_v3_wal_genesis_staged_objects
+         WHERE archive_id=?1
+         ORDER BY staging_ordinal",
+    )?;
+    let rows = statement.query_map([archive_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (key, object_id, role, hash) = row?;
+        LifecycleInventoryObject::for_archive(
+            archive_id,
+            crate::archive_v3::ObjectKey::from_validated_canonical(
+                key,
+                ObjectId::from_bytes(fixed_16(object_id)?),
+            ),
+            lifecycle_role(role)?,
+            fixed_32(hash)?,
+        )
+        .map_err(lifecycle_store_error)
+    })
+    .collect()
+}
+
+/// Durable genesis staging inventory bound to exactly one archive's reserved
+/// bootstrap attempt and one exact session binding.
+///
+/// This is the production [`ShadowObjectInventory`] the genesis producer needs
+/// and the maintenance-operation-bound `impl ShadowObjectInventory for
+/// ControlStore` cannot provide: a genesis archive has no maintenance
+/// operation, no legacy source, and no archive-local database to record into
+/// yet. Rows land in encrypted control state before every provider create, so
+/// an attempt killed before `prepare_archive_bootstrap` leaves durably named
+/// orphans instead of unenumerable residue.
+pub(crate) struct GenesisStagingInventory {
+    control: Arc<ControlStore>,
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+    /// The exact staging binding this run latched on its first staged object.
+    /// The driver derives it from the reserved bootstrap plus that attempt's
+    /// wrapped-registry hash, so the trigger cannot know it in advance; the
+    /// latch still pins every later object in the run to that one binding.
+    latched: std::sync::Mutex<Option<ShadowSessionBinding>>,
+}
+
+impl GenesisStagingInventory {
+    pub(crate) const fn new(
+        control: Arc<ControlStore>,
+        archive_id: ArchiveId,
+        attempt_id: BootstrapAttemptId,
+    ) -> Self {
+        Self {
+            control,
+            archive_id,
+            attempt_id,
+            latched: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Refuse any staging binding that is not this archive's reserved
+    /// bootstrap attempt, and — after the first staged object — anything but
+    /// the exact binding this run already latched.
+    fn require_exact_binding(
+        &self,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowObjectInventoryError> {
+        if binding.archive_id() != *self.archive_id.as_bytes()
+            || binding.operation_id() != *self.attempt_id.as_bytes()
+        {
+            return Err(ShadowObjectInventoryError::Conflict);
+        }
+        let mut latched = self
+            .latched
+            .lock()
+            .map_err(|_| ShadowObjectInventoryError::Unavailable)?;
+        match *latched {
+            Some(existing) if existing != binding => Err(ShadowObjectInventoryError::Conflict),
+            Some(_) => Ok(()),
+            None => {
+                *latched = Some(binding);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for GenesisStagingInventory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GenesisStagingInventory(<opaque>)")
+    }
+}
+
+fn map_genesis_staging_error(error: EnclaveError) -> ShadowObjectInventoryError {
+    match error {
+        EnclaveError::Conflict(_) | EnclaveError::Store(_) => ShadowObjectInventoryError::Conflict,
+        _ => ShadowObjectInventoryError::Unavailable,
+    }
+}
+
+#[async_trait::async_trait]
+impl ShadowObjectInventory for GenesisStagingInventory {
+    async fn reserve_exact(
+        &self,
+        _session_id: ShadowSessionId,
+        _attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        self.require_exact_binding(binding)?;
+        let (archive_id, attempt_id) = (self.archive_id, self.attempt_id);
+        self.control
+            .write_owned_if_changed(move |conn| {
+                record_wal_genesis_staged_object_conn(conn, archive_id, attempt_id, &facts, false)
+            })
+            .await
+            .map_err(map_genesis_staging_error)
+    }
+
+    async fn mark_materialized_exact(
+        &self,
+        _session_id: ShadowSessionId,
+        _attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        self.require_exact_binding(binding)?;
+        let (archive_id, attempt_id) = (self.archive_id, self.attempt_id);
+        self.control
+            .write_owned_if_changed(move |conn| {
+                record_wal_genesis_staged_object_conn(conn, archive_id, attempt_id, &facts, true)
+            })
+            .await
+            .map_err(map_genesis_staging_error)
+    }
+
+    async fn load_exact_attempt_page(
+        &self,
+        _session_id: ShadowSessionId,
+        _attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        after_ordinal: Option<u32>,
+    ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
+        self.require_exact_binding(binding)?;
+        let (archive_id, attempt_id) = (self.archive_id, self.attempt_id);
+        self.control
+            .read(move |conn| {
+                load_wal_genesis_staged_page_conn(conn, archive_id, attempt_id, after_ordinal)
+            })
+            .await
+            .map_err(map_genesis_staging_error)
+    }
+}
+
 fn load_phase2_authority_acquisition_conn(
     conn: &Connection,
     archive_id: ArchiveId,
@@ -17494,6 +17957,36 @@ impl ControlStore {
             record_wal_genesis_stage_conn(conn, &user_id, archive_id, stage, &terminal_witness)
         })
         .await
+    }
+
+    /// The genesis control ledger's durable stage for one archive, or `None`
+    /// when genesis has not begun. Every hash/commitment/revision fact on the
+    /// row is recomputed and compared before the stage is reported, so a
+    /// caller can never resume from a tampered or truncated row.
+    pub(crate) async fn wal_genesis_ledger_stage(
+        &self,
+        archive_id: crate::archive_v3::ArchiveId,
+    ) -> Result<Option<WalGenesisStage>> {
+        self.read(move |conn| {
+            Ok(load_wal_genesis_ledger_conn(conn, archive_id)?.map(|record| record.stage))
+        })
+        .await
+    }
+
+    /// Every immutable object this archive's genesis attempts durably staged,
+    /// in the exact content-free shape the existing deletion-inventory family
+    /// consumes. This is the enumeration that makes a pre-boundary crash's
+    /// orphans sweepable instead of unnameable residue.
+    #[allow(
+        dead_code,
+        reason = "genesis-orphan reader for the existing deletion inventory; the coordinator's union over it is a separate reviewed slice"
+    )]
+    pub(crate) async fn load_wal_genesis_staged_inventory_objects(
+        &self,
+        archive_id: crate::archive_v3::ArchiveId,
+    ) -> Result<Vec<LifecycleInventoryObject>> {
+        self.read(move |conn| load_wal_genesis_staged_inventory_objects_conn(conn, archive_id))
+            .await
     }
 
     /// The genesis control ledger's durable `wal_authoritative` terminal for
@@ -30127,6 +30620,167 @@ mod tests {
             reserve_wal_owner_from_genesis_conn(&conn, &terminal),
             Err(EnclaveError::Conflict(_))
         ));
+    }
+
+    /// Build one sealed checkpoint-chunk fact set for the genesis staging
+    /// tests. The expected values below are literals derived from the context
+    /// and envelope the test itself constructs, never read back from the code
+    /// under test.
+    fn genesis_staged_chunk(
+        archive_id: ArchiveId,
+        plan: BootstrapPlan,
+        chunk_index: u32,
+        object_seed: u8,
+        fill: u8,
+    ) -> ShadowObjectFacts {
+        use crate::archive_v3::{ArchiveCipher, ArchiveDek, SQLITE_PAGE_SIZE};
+        // One SQLite page: the exact chunk geometry a checkpoint upload seals.
+        let plaintext = vec![fill; SQLITE_PAGE_SIZE as usize];
+        let plaintext = plaintext.as_slice();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([object_seed; 32]));
+        let context = ObjectContext::new(
+            archive_id,
+            plan.database_epoch(),
+            plan.key_epoch(),
+            ObjectRole::CheckpointChunkV3,
+            LogicalLocation::CheckpointChunk {
+                checkpoint_id: ObjectId::from_bytes([0xC1; 16]),
+                chunk_index,
+                logical_offset: u64::from(chunk_index) * u64::from(CHECKPOINT_CHUNK_BYTES),
+                byte_len: u32::try_from(plaintext.len()).unwrap(),
+            },
+            ObjectId::from_bytes([object_seed; 16]),
+            None,
+        )
+        .unwrap();
+        let envelope = cipher.seal(&context, plaintext).unwrap();
+        ShadowObjectFacts::from_sealed(&context, &envelope, chunk_index).unwrap()
+    }
+
+    /// The genesis staging inventory is the durable record that makes a
+    /// pre-boundary crash's orphans nameable. It must be reserve-first,
+    /// exactly replayable, append-only across attempts, and it must never let
+    /// an object be marked materialized without its own reservation.
+    #[test]
+    fn genesis_staged_objects_are_reserve_first_replayable_and_append_only() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let archive_id = plan.archive_id();
+        let attempt = plan.attempt_id();
+
+        // Nothing may be staged before the bootstrap is durably reserved:
+        // without an anchor there is no attempt to bind the row to.
+        let first = genesis_staged_chunk(archive_id, plan, 0, 0xA1, 0x01);
+        assert!(matches!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, false),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+
+        // Materialization without this attempt's own reservation is refused:
+        // the durable record must precede the provider create, not follow it.
+        assert!(matches!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, true),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Reserve, then exactly replay the reservation, then materialize, then
+        // exactly replay the materialization.
+        assert_eq!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, false)
+                .unwrap(),
+            (RecordOutcome::Recorded, true)
+        );
+        assert_eq!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, false)
+                .unwrap(),
+            (RecordOutcome::AlreadyRecorded, false)
+        );
+        assert_eq!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, true)
+                .unwrap(),
+            (RecordOutcome::Recorded, true)
+        );
+        assert_eq!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &first, true)
+                .unwrap(),
+            (RecordOutcome::AlreadyRecorded, false)
+        );
+
+        // A different attempt cannot append to this archive's staging log.
+        let foreign = BootstrapAttemptId::from_bytes([0xEE; 16]).unwrap();
+        let second = genesis_staged_chunk(archive_id, plan, 1, 0xA2, 0x02);
+        assert!(matches!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, foreign, &second, false),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // A retry after a crash mints a fresh DEK, so it stages a DIFFERENT
+        // object identity. It appends at the next ordinal and the dead
+        // attempt's row survives untouched — that survival is exactly what
+        // keeps the orphan enumerable.
+        assert_eq!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &second, false)
+                .unwrap(),
+            (RecordOutcome::Recorded, true)
+        );
+        let (ordinals, states): (Vec<i64>, Vec<String>) = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT staging_ordinal,state FROM archive_v3_wal_genesis_staged_objects
+                     WHERE archive_id=?1 ORDER BY staging_ordinal",
+                )
+                .unwrap();
+            let rows: Vec<(i64, String)> = statement
+                .query_map([archive_id.as_bytes().as_slice()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            rows.into_iter().unzip()
+        };
+        assert_eq!(ordinals, vec![0, 1]);
+        assert_eq!(states, vec!["materialized".to_string(), "reserved".into()]);
+
+        // Divergent facts for an object identity already staged are a hard
+        // conflict, never an overwrite.
+        let tampered = genesis_staged_chunk(archive_id, plan, 0, 0xA1, 0x03);
+        assert!(matches!(
+            record_wal_genesis_staged_object_conn(&conn, archive_id, attempt, &tampered, false),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Both rows — the materialized one and the still-reserved orphan —
+        // surface in the exact content-free shape the existing deletion
+        // inventory family consumes, in staging order.
+        let expected = |facts: &ShadowObjectFacts| {
+            let view = facts
+                .maintenance_persistence_view(MaintenancePersistenceContext::for_test())
+                .unwrap();
+            LifecycleInventoryObject::for_archive(
+                archive_id,
+                crate::archive_v3::ObjectKey::from_validated_canonical(
+                    view.object_key.to_owned(),
+                    view.object_id,
+                ),
+                view.object_role,
+                view.ciphertext_hash,
+            )
+            .unwrap()
+        };
+        let objects = load_wal_genesis_staged_inventory_objects_conn(&conn, archive_id).unwrap();
+        assert_eq!(objects, vec![expected(&first), expected(&second)]);
+
+        // The restart-only reconciliation page reads the same rows back with
+        // their exact states.
+        let page = load_wal_genesis_staged_page_conn(&conn, archive_id, attempt, None).unwrap();
+        assert_eq!(page.entries().len(), 2);
+        assert_eq!(page.entries()[0].state(), ShadowObjectState::Materialized);
+        assert_eq!(page.entries()[1].state(), ShadowObjectState::Reserved);
+        assert_eq!(page.next_ordinal(), None);
+        assert!(load_wal_genesis_staged_page_conn(&conn, archive_id, foreign, None).is_err());
     }
 
     #[test]

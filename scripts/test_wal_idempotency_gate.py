@@ -110,7 +110,12 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # removing it drops one construction site (16 -> 15). The surviving site is
 # the serving construction -- its call-site hash is byte-identical to the
 # second site before this change. async_main's owner body moves with it.
-EXPECTED_STORE_SURFACE_SHA256 = "6c9303d9b9b1eb7e7412a900bdc8ee4b19f474ce2c3ba034f0d76c815a852340"
+# Genesis spine G9: async_main's owner body gained the pre-admission genesis
+# sign-in gate validation. Diffed against a pristine origin/main checkout of
+# this inventory: the sole delta is that owner-body hash. The count holds at
+# 15, both Store-construction call-site hashes are byte-identical, and the key
+# set is unchanged.
+EXPECTED_STORE_SURFACE_SHA256 = "9642f7988e47bc8c306be3a8ff2f8ccffcc6d1239ca977422857f3dff10a5b56"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -187,7 +192,11 @@ EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
 # (abort x2, abort_reconcile, controller canary, telemetry, the advisory
 # importer's owned run, and the store's compare/retire pair). All 25
 # surviving spawns are byte-identical to main -- diffed, not assumed.
-EXPECTED_WORKER_SPAWN_COUNT = 25
+# Genesis spine G9 adds exactly one spawn: the detached genesis convergence
+# pass in src/archive_v3_genesis_trigger.rs. It is deliberately a worker and
+# not an awaited call — sign-in must never block on, or fail because of,
+# genesis — and it classifies "C" with the rest of the archive-v3 family.
+EXPECTED_WORKER_SPAWN_COUNT = 26
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
@@ -213,7 +222,12 @@ EXPECTED_WORKER_SPAWN_COUNT = 25
 # branch above its legacy GCS-put spawn). The spawn count holds at 25 and
 # every spawn's own call-site hash is byte-identical (diffed against
 # pristine origin/main: zero additions, zero removals).
-EXPECTED_WORKER_SPAWN_SHA256 = "6e33e545562ff5cbb9a7e2fff34d7aa7e643849f6dabeaa02bddc736746c5050"
+# Genesis spine G9: two deltas, both reviewed against a pristine origin/main
+# dump of this inventory. (1) One added spawn — the detached genesis
+# convergence pass, 25 -> 26. (2) async_main's owner-body hash moved with the
+# genesis gate validation; its own spawn call-site hash is byte-identical.
+# Nothing was removed and no surviving spawn expression changed.
+EXPECTED_WORKER_SPAWN_SHA256 = "b313c238eba864456a9347c8beedbc0ac1409f6c5e53f9c6b5a0705ff461212e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

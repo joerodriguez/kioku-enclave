@@ -1602,6 +1602,18 @@ pub(super) async fn begin_authorization_consent(
     // native client ID is public and accepts a caller-chosen loopback port, so
     // another local app can reuse it with its own PKCE verifier. Keep the
     // archive-access disclosure for that path rather than calling it official.
+    // ADR-0022 genesis spine (G9). Both Google and Apple sign-ins funnel
+    // through here, immediately after the control-store transaction that
+    // created (or revalidated) this user's `active_legacy` archive binding has
+    // durably committed. The pass is detached and its outcome is swallowed, so
+    // sign-in never blocks on genesis and a wedged, unavailable, or refused
+    // genesis costs the user nothing they already had. It is also the
+    // resumption point: a half-genesis user converges on their next sign-in.
+    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+        Arc::clone(&s.control),
+        Arc::clone(&s.store),
+        user_id,
+    );
     let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
     let registered = s
         .control
@@ -2043,6 +2055,16 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
             Ok(t) => t,
             Err(_) => return server_error(),
         };
+    // The second genesis resumption point. A native client refreshes long
+    // before it signs in again, so an archive whose genesis was interrupted
+    // (or whose process-local serving authority was lost to a restart)
+    // converges here on the user's next request rather than waiting for a new
+    // interactive sign-in. Detached and swallowed for the same reason.
+    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+        Arc::clone(&s.control),
+        Arc::clone(&s.store),
+        &user_id,
+    );
     token_response(&access, &raw_refresh)
 }
 
