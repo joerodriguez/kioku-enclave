@@ -490,6 +490,18 @@ fn settled_now_iso() -> String {
     )
 }
 
+/// The ordinary outbox's stale-intent cutoff: a durable `started` intent is
+/// only crash residue once the longest generation timeout has elapsed.
+const STALE_INTENT_CUTOFF_MILLIS: i64 = 180_000;
+
+/// Account deletion's stale-intent cutoff. The deletion caller holds the
+/// user's lifecycle fence, so no Vertex call can be in flight and *every*
+/// remaining `started` row is already crash residue — waiting out the
+/// generation timeout would only strand the ledger. This is the enumeration
+/// side of the same reviewed reconcile plan: it changes which rows are named
+/// as stale, never how they are settled.
+const DELETION_STALE_INTENT_CUTOFF_MILLIS: i64 = 0;
+
 /// The WAL-authoritative half of `pending_events` (ADR-0022 F3): the scan and
 /// the safety partition run through the routed read with a hoisted cutoff;
 /// the plan is submitted only when the resolved sets are non-empty, exactly
@@ -498,6 +510,7 @@ async fn pending_events_settled(
     state: &CpState,
     user_id: &str,
     account_id: &str,
+    stale_cutoff_millis: i64,
 ) -> Result<(Vec<VertexUsageEvent>, bool)> {
     let committed_at = settled_now_iso();
     let cutoff = super::isotime::format_epoch_millis(
@@ -505,7 +518,7 @@ async fn pending_events_settled(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64
-            - 180_000,
+            - stale_cutoff_millis,
     );
     let period = committed_at[..7].to_string();
     let account = account_id.to_string();
@@ -631,10 +644,15 @@ async fn pending_events(
     state: &CpState,
     user_id: &str,
     account_id: &str,
+    stale_cutoff_millis: i64,
 ) -> Result<(Vec<VertexUsageEvent>, bool)> {
     if state.store.is_wal_authoritative(user_id) {
-        return pending_events_settled(state, user_id, account_id).await;
+        return pending_events_settled(state, user_id, account_id, stale_cutoff_millis).await;
     }
+    // The legacy branch deliberately ignores `stale_cutoff_millis`: its
+    // deletion caller (`settle_for_account_deletion`) still performs the bare
+    // `with_user` sweep that marks *every* `started` row ambiguous before this
+    // scan runs, so the legacy contract is byte-unchanged.
     let user = user_id.to_string();
     let account = account_id.to_string();
     state
@@ -1255,27 +1273,45 @@ pub async fn settle_for_account_deletion(
     account_id: &str,
 ) -> Result<()> {
     let user = user_id.to_string();
-    let changed = state
-        .store
-        .with_user(&user, |conn| {
-            let changed = conn.execute(
-                "UPDATE vertex_usage_events SET outcome='ambiguous',
-                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE outcome='started'",
-                [],
-            )?;
-            if changed != 0 {
-                refresh_coverage_conn(conn)?;
-            }
-            Ok(changed != 0)
-        })
-        .await?;
-    if changed {
-        state.store.save_user(&user).await?;
+    // ADR-0022 F5: a WAL-authoritative user has no legacy blob to open, and
+    // `with_user` refuses outright for a selected user — running this sweep
+    // would 503 the deletion route forever, before deletion could even begin.
+    // The sweep is not rebuilt: everything after it is already routed
+    // (`pending_events` → `pending_events_settled`, `complete_delivery` →
+    // `settle_delivery`, the coverage family, `note_delivery_failure`), and
+    // `save_user` is a provider-silent no-op for a selected user. The one
+    // effect the sweep contributed — settling `started` rows that the ordinary
+    // 180s cutoff would still consider live — is reproduced exactly by the
+    // deletion cutoff below, through the same reviewed reconcile plan.
+    let wal_lane = state.store.is_wal_authoritative(&user);
+    let stale_cutoff = if wal_lane {
+        DELETION_STALE_INTENT_CUTOFF_MILLIS
+    } else {
+        STALE_INTENT_CUTOFF_MILLIS
+    };
+    if !wal_lane {
+        let changed = state
+            .store
+            .with_user(&user, |conn| {
+                let changed = conn.execute(
+                    "UPDATE vertex_usage_events SET outcome='ambiguous',
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE outcome='started'",
+                    [],
+                )?;
+                if changed != 0 {
+                    refresh_coverage_conn(conn)?;
+                }
+                Ok(changed != 0)
+            })
+            .await?;
+        if changed {
+            state.store.save_user(&user).await?;
+        }
     }
 
     loop {
-        let (events, ledger_dirty) = pending_events(state, &user, account_id).await?;
+        let (events, ledger_dirty) = pending_events(state, &user, account_id, stale_cutoff).await?;
         if ledger_dirty || !events.is_empty() {
             state.store.save_user(&user).await?;
         }
@@ -1420,13 +1456,14 @@ pub async fn drain_outbox(state: &CpState) {
                 continue;
             }
         };
-        let (events, ledger_dirty) = match pending_events(state, &user_id, &account_id).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                warn!(error = %error, "Vertex usage outbox read deferred");
-                continue;
-            }
-        };
+        let (events, ledger_dirty) =
+            match pending_events(state, &user_id, &account_id, STALE_INTENT_CUTOFF_MILLIS).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    warn!(error = %error, "Vertex usage outbox read deferred");
+                    continue;
+                }
+            };
         if ledger_dirty || !events.is_empty() {
             // `pending_events` may have converted an expired started intent to
             // ambiguous or quarantined a malformed billing row. Persist that
@@ -1813,6 +1850,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// ADR-0022 F5: a WAL-authoritative account's deletion must be able to
+    /// BEGIN. The pre-deletion settlement used to open with a bare `with_user`
+    /// sweep, which a selected user's legacy-load choke point refuses
+    /// outright, so the deletion route 503'd forever and no archive was ever
+    /// erased.
+    ///
+    /// The sweep is skipped, not rebuilt. What proves it here is the *shape*
+    /// of the failure: settlement now fails at the routed lane (no serving
+    /// authority is registered in this test) rather than at the legacy load.
+    #[tokio::test]
+    async fn deletion_settlement_never_takes_the_legacy_load_for_a_selected_user() {
+        let state = settlement_state(Arc::new(Mutex::new(Vec::new())));
+        let user = state
+            .control
+            .upsert_user(
+                "wal-settlement-subject",
+                "wal-settlement@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    &user.id,
+                    crate::archive_v3::ArchiveId::from_bytes([0x71; 16]),
+                ),
+            )
+            .unwrap();
+
+        let error =
+            settle_for_account_deletion(&state, &user.id, &format!("acct_{}", "a".repeat(64)))
+                .await
+                .expect_err("no serving authority is registered in this test");
+        let message = error.to_string();
+        assert!(
+            message.contains("no serving authority"),
+            "settlement must reach the routed lane, got: {message}"
+        );
+        assert!(
+            !message.contains("reads are routed"),
+            "the bare legacy sweep must not run for a selected user, got: {message}"
+        );
+    }
+
+    /// The legacy contract is byte-unchanged: an unselected account still gets
+    /// the bare sweep that marks every `started` row ambiguous regardless of
+    /// age, and the ordinary outbox still waits out the 180s generation
+    /// timeout before calling one stale.
+    #[tokio::test]
+    async fn the_legacy_settlement_sweep_and_the_outbox_cutoff_are_unchanged() {
+        assert_eq!(STALE_INTENT_CUTOFF_MILLIS, 180_000);
+        assert_eq!(DELETION_STALE_INTENT_CUTOFF_MILLIS, 0);
+
+        let state = settlement_state(Arc::new(Mutex::new(Vec::new())));
+        let user = state
+            .control
+            .upsert_user(
+                "legacy-settlement-subject",
+                "legacy-settlement@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .with_user(&user.id, |conn| {
+                // A `started` row observed *now* — far younger than the 180s
+                // cutoff the outbox would apply.
+                conn.execute(
+                    "INSERT INTO vertex_usage_events
+                     (event_id,operation,requested_model,location,outcome,observed_at)
+                     VALUES ('fresh-started','episode_summarization','gemini-3.5-flash',
+                             'global','started',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    [],
+                )?;
+                refresh_coverage_conn(conn)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        state.store.save_user(&user.id).await.unwrap();
+
+        settle_for_account_deletion(&state, &user.id, &format!("acct_{}", "b".repeat(64)))
+            .await
+            .unwrap();
+
+        let outcome: String = state
+            .store
+            .read_user(&user.id, |conn| {
+                Ok(conn.query_row(
+                    "SELECT outcome FROM vertex_usage_events WHERE event_id='fresh-started'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome, "ambiguous",
+            "the legacy deletion sweep still settles every started row"
+        );
     }
 
     #[test]

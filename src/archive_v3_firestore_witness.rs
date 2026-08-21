@@ -2724,6 +2724,11 @@ pub(crate) struct FirestoreWitness {
     provider_audience: FirestoreWitnessAudience,
     tokens: Arc<dyn FirestoreWitnessBearerTokenProvider>,
     transport: Arc<dyn FirestoreWitnessTransport>,
+    /// Deletion authority for every local replay of a provider record. It is
+    /// deny-by-default: `new` installs `DenyDeletionWorkers`, so an ordinary
+    /// witness cannot execute a destructive transition at all. Only
+    /// `with_deletion_authority` installs the real control principal.
+    deletion_authenticator: Arc<dyn crate::archive_v3_witness::DeletionWorkerAuthenticator>,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
@@ -2789,8 +2794,20 @@ impl FirestoreWitness {
             provider_audience: config.provider_audience,
             tokens,
             transport,
+            deletion_authenticator: crate::archive_v3_witness::deny_deletion_workers(),
             runtime: Mutex::new(Some(runtime)),
         })
+    }
+
+    /// Install the production deletion authority. Consuming `self` keeps the
+    /// authority install-once: an already-constructed witness handle can never
+    /// have its deny-by-default authenticator swapped out underneath it.
+    pub(crate) fn with_deletion_authority(
+        mut self,
+        authenticator: Arc<dyn crate::archive_v3_witness::DeletionWorkerAuthenticator>,
+    ) -> Self {
+        self.deletion_authenticator = authenticator;
+        self
     }
 
     async fn token(&self) -> std::result::Result<FirestoreWitnessBearerToken, WitnessError> {
@@ -2844,9 +2861,12 @@ impl FirestoreWitness {
             let current = decode_read(&read, archive_id)
                 .map_err(FirestoreUpdateError::Failed)?
                 .ok_or(FirestoreUpdateError::Failed(WitnessError::MissingArchive))?;
-            let local =
-                InMemoryWitness::from_provider_record_at_tick(Some(current), read.trusted_tick)
-                    .map_err(FirestoreUpdateError::Failed)?;
+            let local = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+                Some(current),
+                read.trusted_tick,
+                Arc::clone(&self.deletion_authenticator),
+            )
+            .map_err(FirestoreUpdateError::Failed)?;
             let output = apply(&local).map_err(FirestoreUpdateError::Rejected)?;
             let next = local
                 .read_current(archive_id)
@@ -3118,7 +3138,11 @@ impl FirestoreWitness {
             if decode_read(&read, archive_id)?.is_some() {
                 return Err(WitnessError::AlreadyExists);
             }
-            let local = InMemoryWitness::from_provider_record_at_tick(None, read.trusted_tick)?;
+            let local = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+                None,
+                read.trusted_tick,
+                Arc::clone(&self.deletion_authenticator),
+            )?;
             let record = local.bootstrap_at_tick(bootstrap.clone(), read.trusted_tick)?;
             let encoded = record.encode();
             match self
@@ -3171,8 +3195,11 @@ impl FirestoreWitness {
         if encoded != expected.encode() {
             return Err(WitnessError::Fenced);
         }
-        let local =
-            InMemoryWitness::from_provider_record_at_tick(Some(encoded), read.trusted_tick)?;
+        let local = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+            Some(encoded),
+            read.trusted_tick,
+            Arc::clone(&self.deletion_authenticator),
+        )?;
         let refreshed = local
             .read_current(expected.archive_id())?
             .ok_or(WitnessError::MissingArchive)?;
@@ -3183,7 +3210,11 @@ impl FirestoreWitness {
         archive_id: ArchiveId,
     ) -> std::result::Result<RecoveryRoot, WitnessError> {
         let (read, record) = self.fresh_record(archive_id).await?;
-        let local = InMemoryWitness::from_provider_record_at_tick(record, read.trusted_tick)?;
+        let local = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+            record,
+            read.trusted_tick,
+            Arc::clone(&self.deletion_authenticator),
+        )?;
         local.recovery_root(archive_id)
     }
     pub(crate) async fn acquire_lease_async(
@@ -3640,9 +3671,12 @@ impl FirestoreWitness {
                     WitnessError::CompareFailed,
                 ));
             }
-            let local =
-                InMemoryWitness::from_provider_record_at_tick(Some(current), read.trusted_tick)
-                    .map_err(FirestoreWitnessCommitError::Failed)?;
+            let local = InMemoryWitness::from_provider_record_at_tick_with_authenticator(
+                Some(current),
+                read.trusted_tick,
+                Arc::clone(&self.deletion_authenticator),
+            )
+            .map_err(FirestoreWitnessCommitError::Failed)?;
             let receipt = local
                 .advance_migration(advance.clone(), next)
                 .map_err(FirestoreWitnessCommitError::Rejected)?;

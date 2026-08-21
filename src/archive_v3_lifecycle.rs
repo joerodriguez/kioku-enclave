@@ -435,6 +435,18 @@ pub(crate) struct FrozenInventorySnapshot {
     deletion_fence: ObjectId,
     revision: u64,
     create_ahead: Vec<PlannedArtifact>,
+    /// Frozen create-ahead facts that are NOT genesis bootstrap artifacts:
+    /// every unconsumed WAL publication/checkpoint artifact row and every
+    /// durably staged genesis object. These are recorded before the provider
+    /// create that names them, so a crashed attempt's uploaded object is
+    /// enumerable here even though nothing reaches it from any root.
+    ///
+    /// They arrive as [`LifecycleInventoryObject`] rather than
+    /// [`PlannedArtifact`] deliberately: the create-ahead ledger's
+    /// `artifact_ordinal IN (0,1)` CHECK admits only the genesis registry and
+    /// root, and `PlannedArtifact::new` demands a nonzero `encoded_len` these
+    /// rows do not carry. Neither constraint is relaxed to make them fit.
+    widened: Vec<LifecycleInventoryObject>,
 }
 
 impl FrozenInventorySnapshot {
@@ -444,8 +456,9 @@ impl FrozenInventorySnapshot {
         deletion_fence: ObjectId,
         revision: u64,
         create_ahead: Vec<PlannedArtifact>,
+        widened: Vec<LifecycleInventoryObject>,
     ) -> Result<Self, LifecycleError> {
-        Self::validated(archive_id, deletion_fence, revision, create_ahead)
+        Self::validated(archive_id, deletion_fence, revision, create_ahead, widened)
     }
 
     #[cfg(test)]
@@ -455,7 +468,24 @@ impl FrozenInventorySnapshot {
         revision: u64,
         create_ahead: Vec<PlannedArtifact>,
     ) -> Result<Self, LifecycleError> {
-        Self::validated(archive_id, deletion_fence, revision, create_ahead)
+        Self::validated(
+            archive_id,
+            deletion_fence,
+            revision,
+            create_ahead,
+            Vec::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_widened_test(
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        revision: u64,
+        create_ahead: Vec<PlannedArtifact>,
+        widened: Vec<LifecycleInventoryObject>,
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(archive_id, deletion_fence, revision, create_ahead, widened)
     }
 
     fn validated(
@@ -463,17 +493,32 @@ impl FrozenInventorySnapshot {
         deletion_fence: ObjectId,
         revision: u64,
         create_ahead: Vec<PlannedArtifact>,
+        widened: Vec<LifecycleInventoryObject>,
     ) -> Result<Self, LifecycleError> {
         if !nonzero(archive_id.as_bytes())
             || !nonzero(deletion_fence.as_bytes())
             || revision == 0
             || create_ahead.len() > MAX_LIFECYCLE_ARTIFACTS
+            || widened.len() > MAX_LIFECYCLE_ARTIFACTS
+            || create_ahead
+                .len()
+                .checked_add(widened.len())
+                .is_none_or(|total| total > MAX_LIFECYCLE_ARTIFACTS)
             || create_ahead.iter().any(|artifact| {
                 artifact.create_state == ArtifactCreateState::OutcomeUnknown
                     || !artifact
                         .key
                         .as_str()
                         .starts_with(ArchivePrefix::for_archive(archive_id).as_str())
+            })
+            // The per-entry blast-radius bound the driver enforces at delete
+            // time is enforced here too: a widened row can never name an
+            // object outside this archive's own prefix.
+            || widened.iter().any(|object| {
+                !object
+                    .key()
+                    .as_str()
+                    .starts_with(ArchivePrefix::for_archive(archive_id).as_str())
             })
         {
             return Err(LifecycleError::Malformed);
@@ -486,12 +531,28 @@ impl FrozenInventorySnapshot {
             }
             previous = Some(current);
         }
+        // Strictly increasing by canonical key: the persisted order is the
+        // committed order, so a duplicate or a reordered row is a corrupted
+        // snapshot rather than something to silently normalize.
+        let mut previous_key: Option<&str> = None;
+        for object in &widened {
+            let current = object.key().as_str();
+            if previous_key.is_some_and(|value| value >= current) {
+                return Err(LifecycleError::Malformed);
+            }
+            previous_key = Some(current);
+        }
         Ok(Self {
             archive_id,
             deletion_fence,
             revision,
             create_ahead,
+            widened,
         })
+    }
+
+    pub(crate) fn widened(&self) -> &[LifecycleInventoryObject] {
+        &self.widened
     }
 
     pub(crate) const fn archive_id(&self) -> ArchiveId {

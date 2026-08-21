@@ -102,7 +102,23 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # other row deltas are two OWNER-BODY hashes: process_user#0 (the three
 # routing branches were added inside it) and settle_audio_window_transcript#0
 # (the pre-check).
-EXPECTED_STORE_CALL_COUNT = 238
+# Group D (archive-v3 deletion driver): exactly ONE addition --
+# Store::freeze_wal_authoritative_media_keys' routed read, which freezes a
+# WAL-authoritative account's exact media inventory before its binding is
+# tombstoned. It is a Store-internal delegating wrapper, so it classifies "C"
+# with with_user_read/with_user_if_changed. Rebased onto origin/main b096af0,
+# which carries slice 10i's 238: 238 -> 239, dumped and diffed against a
+# pristine origin/main (b096af0) tree with this module's own
+# helpers: zero removals, zero reclassifications. The other row deltas are all
+# OWNER-BODY hashes in model_usage.rs from the one-parameter Vertex cutoff
+# (pending_events / pending_events_settled gained `stale_cutoff_millis`;
+# settle_for_account_deletion gained the wal-lane branch; drain_outbox passes
+# the 180s constant explicitly) -- every one of those call EXPRESSIONS is
+# byte-identical. The single exception is
+# settle_for_account_deletion#0::with_user#0, whose expression moved because
+# the legacy sweep is now indented inside `if !wal_lane`; the sweep itself is
+# unchanged and still runs for every unselected account.
+EXPECTED_STORE_CALL_COUNT = 239
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -113,7 +129,7 @@ EXPECTED_STORE_CALL_COUNT = 238
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "67960a4f5d14570629e4cced19c75f84ae910465064e7875d14e0cac66e82eb0"
+EXPECTED_STORE_CALL_SHA256 = "6599ee9889c4b5efc31f1bc0213c55b548df773eed5a5d581d73f0206db68adf"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -138,7 +154,13 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # this inventory: the sole delta is that owner-body hash. The count holds at
 # 15, both Store-construction call-site hashes are byte-identical, and the key
 # set is unchanged.
-EXPECTED_STORE_SURFACE_SHA256 = "9642f7988e47bc8c306be3a8ff2f8ccffcc6d1239ca977422857f3dff10a5b56"
+# Group D (archive-v3 deletion driver): the internal constructor's Store
+# literal additionally initializes the always-empty archive-v3 deletion-lane
+# slot. Diffed against pristine origin/main (5fa1c0b) with this module's own
+# helpers: the count holds at 15, the key set is unchanged, no construction
+# surface was added or removed, and the sole delta is that literal (and its
+# enclosing factory definition) moving.
+EXPECTED_STORE_SURFACE_SHA256 = "4fbe138720df66b3f5b738fa02bc73a879063059ac93beb47efdfe8c307c3aae"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -188,7 +210,14 @@ EXPECTED_POLICY_SITE_COUNT = 42
 # unchanged. (An earlier revision of this comment said "exactly one row";
 # that was wrong, and these comments are the whole audit trail a reviewer
 # has for a pinned security value.)
-EXPECTED_POLICY_SITE_SHA256 = "11194ee709351375f51bc224823f0dbb1130e4c8380290c0c3d43e8dfcb29bf8"
+#
+# Group D (archive-v3 deletion driver), rebased onto the sealed re-baseline:
+# the count holds at 42 with zero additions, removals, or reclassifications.
+# Both moved rows are the two persistence_policy sites inside the internal
+# constructor, whose owner body gained the deletion-lane slot; their
+# expressions are byte-identical. The six `open_db#0` rows keep the
+# re-baseline's owner-body hashes.
+EXPECTED_POLICY_SITE_SHA256 = "e666e1fe03d9ce9cac97916fd1666287374af4008871d4c227f707273335a6f3"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -905,6 +934,7 @@ C_OWNERS = frozenset(
         "src/ingest.rs::ingest_batch#0",
         "src/store.rs::with_user_read#0",
         "src/store.rs::with_user_if_changed#0",
+        "src/store.rs::freeze_wal_authoritative_media_keys#0",
     }
 )
 

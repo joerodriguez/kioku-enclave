@@ -563,6 +563,14 @@ fn canonical_union(
     for planned in snapshot.create_ahead() {
         insert_object(&mut by_id, planned.inventory_object()?)?;
     }
+    // Every frozen create-ahead row that is not a genesis bootstrap artifact:
+    // unconsumed WAL publication/checkpoint artifacts, and the durably staged
+    // genesis objects a pre-boundary crash leaves behind. Without this union a
+    // crashed attempt's uploaded object is unreachable from every root, never
+    // enters the sealed inventory, and survives erasure with no disclosure.
+    for object in snapshot.widened() {
+        insert_object(&mut by_id, object.clone())?;
+    }
     let mut objects = by_id.into_values().collect::<Vec<_>>();
     objects.sort();
     let key_bytes = objects.iter().try_fold(0usize, |total, object| {

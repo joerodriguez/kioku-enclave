@@ -640,6 +640,27 @@ async fn delete_account(
             )
                 .into_response();
         }
+        // Freeze the WAL-authoritative account's exact media inventory while
+        // it can still be read. `begin_user_deletion` tombstones the archive
+        // binding, the startup selection scan filters tombstoned bindings, and
+        // no serving authority is ever re-registered — so after that point the
+        // archive's logical database is unreadable and media enumeration would
+        // be wedged forever on the first crash. Doing it here, under the same
+        // lifecycle guard as settlement and before any tombstone, makes the
+        // rung idempotently re-runnable instead.
+        if let Some(lane) = s.store.wal_deletion_lane() {
+            if let Err(e) = lane
+                .freeze_media_inventory(s.control.as_ref(), s.store.as_ref(), &user_id)
+                .await
+            {
+                warn!(error = %e, "failed to freeze media inventory before deletion");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "deletion_media_inventory_unavailable"})),
+                )
+                    .into_response();
+            }
+        }
     } else if !matches!(account_status.as_str(), "deleting" | "deleted") {
         return (
             StatusCode::CONFLICT,
@@ -710,8 +731,7 @@ async fn delete_account(
 
     // 2. Delete content. Any incomplete outcome remains a durable 202
     // operation; every non-deletion account route stays denied.
-    if let Err(error) = delete_account_content(s.control.as_ref(), s.store.as_ref(), &user_id).await
-    {
+    if let Err(error) = delete_account_content(&s.control, s.store.as_ref(), &user_id).await {
         let (reason, retry_after_seconds, hard_delete_time) = match &error {
             EnclaveError::DeletionPending(pending) => (
                 pending.reason.as_str(),
@@ -843,7 +863,7 @@ fn deletion_operation_requires_remediation(operation: &AccountDeletionOperation)
 /// repeats DELETE. Work is serial and bounded so one sweep cannot fan out GCS,
 /// KMS, or control-DB writes.
 async fn reconcile_pending_account_deletions(
-    control: &ControlStore,
+    control: &Arc<ControlStore>,
     store: &Store,
     apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
 ) -> EnclaveResult<DeletionReconcileSummary> {
@@ -950,7 +970,7 @@ async fn reconcile_pending_account_deletions(
 /// Store-owned admission/lifecycle fence and reconciled durably before final
 /// identity cleanup is allowed.
 async fn delete_account_content(
-    control: &ControlStore,
+    control: &Arc<ControlStore>,
     store: &Store,
     user_id: &str,
 ) -> EnclaveResult<()> {
@@ -971,13 +991,35 @@ async fn delete_account_content(
     // falsely stamps the account complete with the whole archive intact.
     // The durable ledger-backed lane predicate closes that window.
     if store.is_wal_authoritative(user_id) || control.wal_deletion_lane(user_id).await? {
-        return Err(EnclaveError::DeletionPending(
-            crate::error::DeletionPending {
-                reason: crate::error::DeletionPendingReason::ArchiveV3DeletionUnwired,
-                retry_after_seconds: Some(30),
-                hard_delete_time: None,
-            },
-        ));
+        // The archive-v3 lane is the only correct erasure for this account.
+        // With a lane installed, drive it; without one — every image today —
+        // keep failing closed, because the alternative is the legacy sweep
+        // succeeding vacuously and finalization stamping the account complete
+        // with the whole archive intact. The refusal is never removed, only
+        // superseded by real deletion.
+        let Some(lane) = store.wal_deletion_lane() else {
+            return Err(EnclaveError::DeletionPending(
+                crate::error::DeletionPending {
+                    reason: crate::error::DeletionPendingReason::ArchiveV3DeletionUnwired,
+                    retry_after_seconds: Some(30),
+                    hard_delete_time: None,
+                },
+            ));
+        };
+        return match lane.drive(control, store, user_id).await? {
+            crate::archive_v3_deletion_lane::WalDeletionOutcome::Complete(residue) => {
+                // Disclosure is part of completion, not a footnote to it: the
+                // classes that survive are recorded on the operation's own
+                // terminal metadata before the caller can observe success.
+                control
+                    .record_deletion_residue_disclosure(user_id, &residue.flags())
+                    .await?;
+                Ok(())
+            }
+            crate::archive_v3_deletion_lane::WalDeletionOutcome::Pending(stage) => {
+                Err(stage.into_pending())
+            }
+        };
     }
     let operation = control.identity_rebind_operation_for_user(user_id).await?;
     let Some(operation) = operation else {
@@ -1228,11 +1270,9 @@ mod tests {
             .unwrap();
 
         // Before cutover the legacy sweep owns deletion, unchanged.
-        assert!(
-            delete_account_content(control.as_ref(), store.as_ref(), &user.id)
-                .await
-                .is_ok()
-        );
+        assert!(delete_account_content(&control, store.as_ref(), &user.id)
+            .await
+            .is_ok());
 
         // After cutover the authoritative data lives in the archive-v3
         // keyspace the legacy sweep cannot see. Deletion must stay PENDING —
@@ -1247,7 +1287,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let error = delete_account_content(control.as_ref(), store.as_ref(), &user.id)
+        let error = delete_account_content(&control, store.as_ref(), &user.id)
             .await
             .expect_err("a wal-authoritative archive must not report deletion complete");
         match error {
@@ -1287,12 +1327,106 @@ mod tests {
         // Deliberately NO install_wal_authority_persistence: this is the
         // post-restart shape where the in-memory map proves nothing.
         assert!(!store.is_wal_authoritative(&user.id));
-        let error = delete_account_content(control.as_ref(), store.as_ref(), &user.id)
+        let error = delete_account_content(&control, store.as_ref(), &user.id)
             .await
             .expect_err("a durably WAL-authoritative archive must never take the legacy sweep");
         match error {
             EnclaveError::DeletionPending(pending) => {
                 assert_eq!(pending.reason.as_str(), "archive_v3_deletion_unwired");
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
+    }
+
+    /// The honest refusal is replaced by real deletion, never removed.
+    ///
+    /// With a lane installed the WAL-authoritative branch drives the archive-v3
+    /// ladder and reports the rung it reached; with no lane — every image
+    /// today — it still fails closed as `archive_v3_deletion_unwired`. Neither
+    /// arm can return `Ok`, which is what would let finalization stamp the
+    /// account complete with the archive intact.
+    #[tokio::test]
+    async fn an_installed_lane_drives_the_archive_v3_ladder_instead_of_refusing() {
+        struct NeverBuildsRuntime;
+
+        #[async_trait::async_trait]
+        impl crate::archive_v3_deletion_lane::ArchiveDeletionRuntimeFactory for NeverBuildsRuntime {
+            async fn runtime_for(
+                &self,
+                _archive_id: crate::archive_v3::ArchiveId,
+            ) -> EnclaveResult<Arc<dyn crate::archive_v3_deletion_lane::ArchiveDeletionRuntime>>
+            {
+                panic!("this rung must not construct an archive-v3 deletion runtime")
+            }
+        }
+
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_user(
+                "wal-lane-dispatch",
+                "wal-lane@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        control
+            .seed_wal_genesis_terminal_for_test(&user.id)
+            .await
+            .unwrap();
+
+        // No lane installed: the honest refusal still stands.
+        match delete_account_content(&control, store.as_ref(), &user.id)
+            .await
+            .expect_err("no lane means no erasure and no completion")
+        {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(pending.reason.as_str(), "archive_v3_deletion_unwired");
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
+
+        store
+            .install_wal_deletion_lane(Arc::new(
+                crate::archive_v3_deletion_lane::WalDeletionLane::new(
+                    Arc::new(
+                        crate::archive_v3_witness::DeletionPrincipalKey::derive_from_control_root(
+                            &[0x41; 32],
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(NeverBuildsRuntime),
+                ),
+            ))
+            .unwrap();
+
+        // With a lane, the account is on the real ladder: the reason names the
+        // rung it reached, and it is still never `Ok`.
+        match delete_account_content(&control, store.as_ref(), &user.id)
+            .await
+            .expect_err("the ladder has not completed")
+        {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(pending.reason.as_str(), "archive_v3_tombstone_pending");
+                assert_eq!(pending.retry_after_seconds, Some(30));
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
+
+        // Once the ledger is tombstoned the ladder advances to the media rung,
+        // which is the one that must be satisfied before anything destructive.
+        control.begin_user_deletion(&user.id).await.unwrap();
+        match delete_account_content(&control, store.as_ref(), &user.id)
+            .await
+            .expect_err("the media inventory has not been frozen")
+        {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(
+                    pending.reason.as_str(),
+                    "archive_v3_media_inventory_pending"
+                );
             }
             other => panic!("expected a pending deletion, got {other:?}"),
         }
@@ -1349,7 +1483,7 @@ mod tests {
         drop(store);
         drop(control);
         gcs.expire_soft_deleted("");
-        let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
+        let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
 
         let summary =
@@ -1422,7 +1556,7 @@ mod tests {
         // no request task remains to update status or finalize the identity.
         drop(store);
         drop(control);
-        let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
+        let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
 
         let summary =
@@ -1485,7 +1619,7 @@ mod tests {
         // let the restart worker delete content or finalize the account.
         drop(store);
         drop(control);
-        let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
+        let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
         let summary =
             reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
@@ -1596,7 +1730,7 @@ mod tests {
         gcs.expire_soft_deleted("");
         gcs.purge_versions(&index);
         gcs.purge_versions(&format!("legacy-recovery/{}/", user.id));
-        let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
+        let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs.clone());
 
         let summary =

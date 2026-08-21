@@ -1259,6 +1259,40 @@ CREATE TABLE IF NOT EXISTS archive_deletion_ledgers (
          AND tombstoned_at IS NOT NULL)
     )
 );
+-- Residue classes an archive-v3 physical completion discloses rather than
+-- claims to have erased. Retained with the account tombstone: an operator
+-- answering a deletion request must be able to say exactly what survived and
+-- in what form. Flags only — never a name, key, or count of user objects.
+CREATE TABLE IF NOT EXISTS account_deletion_residue_disclosures (
+    user_id    TEXT PRIMARY KEY,
+    flags      TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+-- The exact media inventory of a WAL-authoritative account, frozen while the
+-- archive's logical database can still be read (before its binding is
+-- tombstoned) and consumed after the archive receipt. Media keys live outside
+-- the opaque archive prefix, so they can neither be reached by the archive
+-- reachability walk nor be admitted into the driver's inventory without
+-- relaxing its per-entry archive-prefix bound. These are exact names only:
+-- there is no prefix, pattern, or listing column here.
+CREATE TABLE IF NOT EXISTS archive_media_deletion_stages (
+    archive_id     BLOB PRIMARY KEY REFERENCES archive_deletion_ledgers(archive_id)
+        CHECK (length(archive_id) = 16 AND archive_id != zeroblob(16)),
+    deletion_fence BLOB CHECK (deletion_fence IS NULL OR (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16))),
+    frozen         INTEGER NOT NULL DEFAULT 0 CHECK (frozen IN (0, 1)),
+    drained        INTEGER NOT NULL DEFAULT 0 CHECK (drained IN (0, 1)),
+    key_count      INTEGER NOT NULL CHECK (key_count >= 0),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    -- Nothing can be drained that was never frozen.
+    CHECK (drained = 0 OR frozen = 1)
+);
+CREATE TABLE IF NOT EXISTS archive_media_deletion_inventories (
+    archive_id BLOB NOT NULL REFERENCES archive_media_deletion_stages(archive_id),
+    seq        INTEGER NOT NULL CHECK (seq >= 0),
+    object_key TEXT NOT NULL CHECK (length(object_key) > 0 AND length(object_key) <= 1024),
+    PRIMARY KEY (archive_id, seq),
+    UNIQUE (archive_id, object_key)
+);
 -- Inactive archive-v3 create-ahead authority. This extends the existing
 -- archive binding/deletion ledger rather than inventing a second identity or
 -- tombstone source. Exact bootstrap payloads remain control-DEK encrypted and
@@ -4597,7 +4631,97 @@ fn lifecycle_create_ahead_conn(
     .collect()
 }
 
-const INVENTORY_SNAPSHOT_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/inventory-snapshot/v1\0";
+/// Bumped from `/v1` when the frozen snapshot began binding the widened
+/// create-ahead union (unconsumed WAL publication/checkpoint artifacts and
+/// durably staged genesis objects) in addition to the genesis bootstrap
+/// artifacts. The domain change is the runtime refusal of a v1 snapshot: a
+/// snapshot frozen under the old rules recomputes to a different commitment
+/// and every load fails closed rather than sealing an inventory that is
+/// missing the crashed-attempt objects.
+const INVENTORY_SNAPSHOT_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/inventory-snapshot/v2\0";
+
+/// Every frozen create-ahead fact that is not a genesis bootstrap artifact.
+///
+/// Three sources, all recorded in encrypted control state *before* the
+/// provider create that names the object, so a crashed publication or
+/// checkpoint attempt's uploaded object stays enumerable even though the
+/// reachability walk can never reach it:
+///
+///   * `archive_v3_wal_publication_artifacts` (roles 2/5/9),
+///   * `archive_v3_wal_checkpoint_artifacts` (roles 1/5/8),
+///   * `archive_v3_wal_genesis_staged_objects` (roles 1/5/8) — the G9
+///     pre-boundary genesis orphans.
+///
+/// `reserved` rows are included: deletion is absence-tolerant, and a reserved
+/// row is exactly the case where the create may have landed. Rows are returned
+/// sorted by canonical key; two rows that name the same object with different
+/// facts are a corrupted ledger and refuse, which is the same cross-source
+/// authentication the coordinator's `DuplicateConflict` performs.
+fn widened_create_ahead_objects_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Vec<LifecycleInventoryObject>> {
+    let mut objects = Vec::new();
+    for statement in [
+        "SELECT object_key,object_id,object_role,ciphertext_hash
+         FROM archive_v3_wal_publication_artifacts WHERE archive_id=?1
+         ORDER BY operation_kind,operation_id,attempt,ordinal",
+        "SELECT object_key,object_id,object_role,ciphertext_hash
+         FROM archive_v3_wal_checkpoint_artifacts WHERE archive_id=?1
+         ORDER BY operation_id,attempt,ordinal",
+        "SELECT canonical_key,object_id,object_role,ciphertext_hash
+         FROM archive_v3_wal_genesis_staged_objects WHERE archive_id=?1
+         ORDER BY staging_ordinal",
+    ] {
+        let mut prepared = conn.prepare(statement)?;
+        let rows = prepared.query_map([archive_id.as_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, object_id, role, hash) = row?;
+            objects.push(
+                LifecycleInventoryObject::for_archive(
+                    archive_id,
+                    crate::archive_v3::ObjectKey::from_validated_canonical(
+                        key,
+                        ObjectId::from_bytes(fixed_16(object_id)?),
+                    ),
+                    lifecycle_role(role)?,
+                    fixed_32(hash)?,
+                )
+                .map_err(lifecycle_store_error)?,
+            );
+        }
+    }
+    objects.sort_by(|left, right| left.key().as_str().cmp(right.key().as_str()));
+    let mut deduplicated: Vec<LifecycleInventoryObject> = Vec::with_capacity(objects.len());
+    for object in objects {
+        match deduplicated.last() {
+            Some(previous) if previous.key().as_str() == object.key().as_str() => {
+                if previous.role() != object.role()
+                    || previous.ciphertext_hash() != object.ciphertext_hash()
+                    || previous.key().object_id() != object.key().object_id()
+                {
+                    return Err(EnclaveError::Conflict(
+                        "archive lifecycle create-ahead union names one object twice".into(),
+                    ));
+                }
+            }
+            _ => deduplicated.push(object),
+        }
+    }
+    if deduplicated.len() > crate::archive_v3_lifecycle::MAX_LIFECYCLE_ARTIFACTS {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle create-ahead union exceeded its bound".into(),
+        ));
+    }
+    Ok(deduplicated)
+}
 
 fn lifecycle_inventory_snapshot_commitment_conn(
     conn: &Connection,
@@ -4668,6 +4792,27 @@ fn lifecycle_inventory_snapshot_commitment_conn(
                 "archive lifecycle witness snapshot is inconsistent".into(),
             ))
         }
+    }
+    // The widened union is frozen into the same commitment as the bootstrap
+    // artifacts, so a row that appears or changes after the freeze breaks
+    // every later load rather than silently entering (or escaping) the seal.
+    let widened = widened_create_ahead_objects_conn(conn, plan.archive_id())?;
+    hasher.update(
+        u32::try_from(widened.len())
+            .map_err(|_| EnclaveError::Store("archive lifecycle snapshot is too large".into()))?
+            .to_be_bytes(),
+    );
+    for object in &widened {
+        let key = object.key().as_str().as_bytes();
+        hasher.update(
+            u32::try_from(key.len())
+                .map_err(|_| EnclaveError::Store("archive lifecycle key is too large".into()))?
+                .to_be_bytes(),
+        );
+        hasher.update(key);
+        hasher.update(object.key().object_id().as_bytes());
+        hasher.update([object.role() as u8]);
+        hasher.update(object.ciphertext_hash());
     }
     Ok(hasher.finalize().into())
 }
@@ -4781,7 +4926,7 @@ fn load_archive_inventory_snapshot_conn(
     conn: &Connection,
     archive_id: ArchiveId,
     deletion_fence: ObjectId,
-) -> Result<(u64, Vec<PlannedArtifact>)> {
+) -> Result<(u64, Vec<PlannedArtifact>, Vec<LifecycleInventoryObject>)> {
     let tx = conn.unchecked_transaction()?;
     let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(&tx, archive_id)?;
     if normal_branch != 1 || pre_witness_branch != 0 {
@@ -4817,8 +4962,9 @@ fn load_archive_inventory_snapshot_conn(
         ));
     }
     let artifacts = lifecycle_create_ahead_conn(&tx, anchor.plan)?;
+    let widened = widened_create_ahead_objects_conn(&tx, archive_id)?;
     tx.commit()?;
-    Ok((revision, artifacts))
+    Ok((revision, artifacts, widened))
 }
 
 fn exact_inventory_branch_counts_conn(
@@ -7361,6 +7507,246 @@ fn wal_deletion_lane_conn(conn: &Connection, user_id: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(lane == 1)
+}
+
+/// The archive an account's WAL deletion lane must erase, or `None` when the
+/// account is not on that lane.
+///
+/// This deliberately answers from the *binding*, not from the in-memory
+/// selection map: deletion tombstones the binding before any content work and
+/// the startup selection scan filters tombstoned bindings, so a mid-deletion
+/// restart has an empty map. A tombstoned deletion ledger is therefore itself
+/// proof that this archive belongs to the WAL lane.
+fn wal_deletion_archive_conn(conn: &Connection, user_id: &str) -> Result<Option<ArchiveId>> {
+    validate_user_id(user_id)?;
+    let row: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT b.archive_id FROM archive_bindings b
+             WHERE b.user_id = ?1
+               AND (b.state = 'tombstoned'
+                    OR EXISTS(
+                        SELECT 1 FROM archive_deletion_ledgers l
+                        WHERE l.archive_id = b.archive_id AND l.state = 'tombstoned')
+                    OR EXISTS(
+                        SELECT 1 FROM archive_v3_wal_genesis g
+                        WHERE g.archive_id = b.archive_id AND g.format_version = 1
+                          AND g.stage = 'wal_authoritative')
+                    OR EXISTS(
+                        SELECT 1 FROM archive_v3_maintenance_imports m
+                        WHERE m.archive_id = b.archive_id AND m.format_version = 1
+                          AND m.stage = 'wal_authoritative'))",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    row.map(|blob| Ok(ArchiveId::from_bytes(fixed_16(blob)?)))
+        .transpose()
+}
+
+/// The deletion fence minted by the control transaction that tombstoned this
+/// archive's ledger. It is the deletion's only operation identity — never
+/// caller-chosen — and the worker identity derives from it, so it must be read
+/// back rather than regenerated.
+fn archive_deletion_fence_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<ObjectId>> {
+    let row: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT deletion_fence_id FROM archive_deletion_ledgers
+             WHERE archive_id = ?1 AND state = 'tombstoned'",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    row.map(|blob| Ok(ObjectId::from_bytes(fixed_16(blob)?)))
+        .transpose()
+}
+
+fn archive_lifecycle_revision_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<u64>> {
+    conn.query_row(
+        "SELECT revision FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()?
+    .map(|revision| {
+        u64::try_from(revision)
+            .map_err(|_| EnclaveError::Store("archive lifecycle revision is invalid".into()))
+    })
+    .transpose()
+}
+
+/// Mint-once freeze of an account's exact media inventory.
+///
+/// Idempotent on an identical key set, and a conflicting re-freeze refuses
+/// rather than overwriting: after the tombstone the archive database can never
+/// be read again, so the first durable inventory is the only one there will
+/// ever be and silently replacing it could only ever lose names.
+fn freeze_media_deletion_inventory_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    keys: &[String],
+) -> Result<bool> {
+    if keys.len() > crate::archive_v3_lifecycle::MAX_LIFECYCLE_ARTIFACTS {
+        return Err(EnclaveError::Conflict(
+            "media deletion inventory exceeded its bound".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let fence: Vec<u8> = tx
+        .query_row(
+            "SELECT deletion_fence_id FROM archive_deletion_ledgers
+             WHERE archive_id = ?1 AND state = 'tombstoned'",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT frozen FROM archive_media_deletion_stages WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        let durable = load_media_deletion_inventory_conn(&tx, archive_id)?.unwrap_or_default();
+        if durable != keys {
+            return Err(EnclaveError::Conflict(
+                "media deletion inventory changed after it was frozen".into(),
+            ));
+        }
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO archive_media_deletion_stages (archive_id, deletion_fence, frozen, key_count)
+         VALUES (?1, ?2, 1, ?3)",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            (!fence.is_empty()).then_some(fence),
+            i64::try_from(keys.len())
+                .map_err(|_| EnclaveError::Store("media inventory count overflow".into()))?,
+        ],
+    )?;
+    for (ordinal, key) in keys.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO archive_media_deletion_inventories (archive_id, seq, object_key)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                i64::try_from(ordinal)
+                    .map_err(|_| EnclaveError::Store("media inventory ordinal overflow".into()))?,
+                key,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn load_media_deletion_inventory_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<Vec<String>>> {
+    let frozen: Option<i64> = conn
+        .query_row(
+            "SELECT frozen FROM archive_media_deletion_stages WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if frozen != Some(1) {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare(
+        "SELECT object_key FROM archive_media_deletion_inventories
+         WHERE archive_id = ?1 ORDER BY seq",
+    )?;
+    let keys = statement
+        .query_map([archive_id.as_bytes().as_slice()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(keys))
+}
+
+/// Tear down the WAL bookkeeping whose `object_key` columns are names, once
+/// the physical receipt and the media drain both exist.
+///
+/// The publication/checkpoint *attempt* rows are retired to `superseded`
+/// rather than deleted where they survive at all: their artifact rows carry a
+/// foreign key on `(archive_id, operation_kind, operation_id, attempt)`, so
+/// deleting an attempt out from under a live artifact row either fails or
+/// strands an uploaded object outside the reachability walk. Here the artifact
+/// rows go first, in the same transaction, which is what makes the attempt
+/// deletes legal — the ordering is the whole argument.
+/// True once this archive's deletion has fully landed: the witness receipt was
+/// recorded, the sealed pages and retry payloads were erased, and the media
+/// stage drained.
+///
+/// This is the fast path a retry must take. Control cleanup erases the sealed
+/// inventory pages, so a later pass through the driver would find no inventory
+/// to load and could never reach completion again — a crash between cleanup
+/// and the caller observing success would otherwise wedge the account
+/// permanently short of `physical_complete`.
+fn wal_deletion_already_complete_conn(conn: &Connection, archive_id: ArchiveId) -> Result<bool> {
+    let complete: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_anchors a
+             JOIN archive_media_deletion_stages m ON m.archive_id = a.archive_id
+             WHERE a.archive_id = ?1 AND a.state = 'physical_complete'
+               AND a.payload_erased = 1 AND m.drained = 1)",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(complete == 1)
+}
+
+fn tear_down_wal_bookkeeping_conn(conn: &Connection, archive_id: ArchiveId) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let complete: i64 = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_anchors
+             WHERE archive_id = ?1 AND state = 'physical_complete')",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if complete != 1 {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "WAL bookkeeping teardown requires a physically complete archive".into(),
+        ));
+    }
+    let archive = archive_id.as_bytes().as_slice();
+    // Artifacts before attempts before parents: every FK child is removed in
+    // the same transaction as its parent, so no row is ever orphaned and no
+    // object name outlives the completion that proved it absent.
+    for statement in [
+        "DELETE FROM archive_v3_wal_publication_artifacts WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_publication_attempts WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_publications WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_checkpoint_artifacts WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_checkpoint_attempts WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_checkpoints WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_genesis_staged_objects WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_owner_leases WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_owners WHERE archive_id = ?1",
+        "DELETE FROM archive_v3_wal_genesis WHERE archive_id = ?1",
+        "DELETE FROM archive_media_deletion_inventories WHERE archive_id = ?1",
+    ] {
+        tx.execute(statement, [archive])?;
+    }
+    tx.execute(
+        "UPDATE archive_media_deletion_stages SET drained = 1 WHERE archive_id = ?1",
+        [archive],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn archive_binding_conn(conn: &Connection, user_id: &str) -> Result<Option<ArchiveBinding>> {
@@ -17630,7 +18016,15 @@ fn begin_user_deletion_conn(
 
 fn deletion_operation_status_for_reason(reason: &str) -> &'static str {
     match reason {
-        "legacy_generation_unavailable" | "legacy_snapshot_too_large" => "failed_retryable",
+        // `archive_v3_manual_required` joins the two legacy classes an
+        // automatic retry can never clear: an exceeded inventory bound, an
+        // archive that cannot be enumerated before key erasure, or a frozen
+        // billing ledger with an unsettleable intent. The operator sees it as
+        // `failed_retryable`, which is the surface the reconciler already
+        // reports and never confuses with completion.
+        "legacy_generation_unavailable"
+        | "legacy_snapshot_too_large"
+        | "archive_v3_manual_required" => "failed_retryable",
         _ => "pending",
     }
 }
@@ -20999,7 +21393,7 @@ impl ControlStore {
         &self,
         archive_id: ArchiveId,
         deletion_fence: ObjectId,
-    ) -> Result<(u64, Vec<PlannedArtifact>)> {
+    ) -> Result<(u64, Vec<PlannedArtifact>, Vec<LifecycleInventoryObject>)> {
         self.read(move |conn| {
             load_archive_inventory_snapshot_conn(conn, archive_id, deletion_fence)
         })
@@ -21033,6 +21427,171 @@ impl ControlStore {
         dead_code,
         reason = "reserved for reviewed archive-v3 authority wiring"
     )]
+    /// The archive an account's WAL deletion lane must erase. Answered from
+    /// durable control state, so a mid-deletion restart still routes correctly
+    /// with an empty in-memory selection map.
+    pub(crate) async fn wal_deletion_archive(&self, user_id: &str) -> Result<Option<ArchiveId>> {
+        let user_id = user_id.to_owned();
+        self.read(move |conn| wal_deletion_archive_conn(conn, &user_id))
+            .await
+    }
+
+    /// The deletion fence pinned when the archive's ledger was tombstoned.
+    pub(crate) async fn archive_deletion_fence(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<ObjectId>> {
+        self.read(move |conn| archive_deletion_fence_conn(conn, archive_id))
+            .await
+    }
+
+    pub(crate) async fn archive_lifecycle_revision(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<u64>> {
+        self.read(move |conn| archive_lifecycle_revision_conn(conn, archive_id))
+            .await
+    }
+
+    /// Freeze the account's exact media inventory. Mint-once; a re-freeze with
+    /// a different key set refuses rather than replacing the durable one.
+    pub(crate) async fn freeze_media_deletion_inventory(
+        &self,
+        archive_id: ArchiveId,
+        keys: &[String],
+    ) -> Result<()> {
+        let keys = keys.to_vec();
+        self.write_if_changed(move |conn| {
+            freeze_media_deletion_inventory_conn(conn, archive_id, &keys)
+                .map(|changed| ((), changed))
+        })
+        .await
+    }
+
+    pub(crate) async fn frozen_media_deletion_inventory(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<Vec<String>>> {
+        self.read(move |conn| load_media_deletion_inventory_conn(conn, archive_id))
+            .await
+    }
+
+    /// Record the residue classes this account's physical completion
+    /// discloses. Written before completion is observable, so an operation can
+    /// never report `physical_complete` without its disclosure alongside it.
+    pub(crate) async fn record_deletion_residue_disclosure(
+        &self,
+        user_id: &str,
+        flags: &[&'static str],
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        let user_id = user_id.to_owned();
+        let flags = flags.join(",");
+        self.write_if_changed(move |conn| {
+            conn.execute(
+                "INSERT INTO account_deletion_residue_disclosures (user_id, flags)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                     flags = excluded.flags,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![user_id, flags],
+            )?;
+            Ok(((), true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "read surface for the operator-facing deletion disclosure"
+    )]
+    pub(crate) async fn deletion_residue_disclosure(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<Vec<String>>> {
+        validate_user_id(user_id)?;
+        let user_id = user_id.to_owned();
+        self.read(move |conn| {
+            let flags: Option<String> = conn
+                .query_row(
+                    "SELECT flags FROM account_deletion_residue_disclosures WHERE user_id = ?1",
+                    [&user_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(flags.map(|value| {
+                value
+                    .split(',')
+                    .filter(|flag| !flag.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }))
+        })
+        .await
+    }
+
+    /// Simulate a fully landed archive-v3 deletion so the completion fast
+    /// path can be exercised without a live archive-v3 runtime.
+    #[cfg(test)]
+    pub(crate) async fn mark_wal_deletion_complete_for_test(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<()> {
+        self.write_if_changed(move |conn| {
+            let archive = archive_id.as_bytes().as_slice();
+            conn.execute(
+                "INSERT INTO archive_lifecycle_anchors
+                 (archive_id, format_version, revision, state, bootstrap_attempt_id,
+                  database_epoch, key_epoch, registry_object_id, root_object_id,
+                  payload_erased)
+                 VALUES (?1, 1, 1, 'physical_complete', ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT(archive_id) DO UPDATE SET
+                     state = 'physical_complete', payload_erased = 1,
+                     wrapped_registry_bytes = NULL, root_envelope_bytes = NULL,
+                     witness_record_bytes = NULL, witness_create_state = NULL",
+                rusqlite::params![
+                    archive,
+                    [0x21u8; 16].as_slice(),
+                    [0x22u8; 16].as_slice(),
+                    [0x23u8; 16].as_slice(),
+                    [0x24u8; 16].as_slice(),
+                    [0x25u8; 16].as_slice(),
+                ],
+            )?;
+            let drained = conn.execute(
+                "UPDATE archive_media_deletion_stages SET drained = 1 WHERE archive_id = ?1",
+                [archive],
+            )?;
+            if drained != 1 {
+                return Err(EnclaveError::Conflict(
+                    "the media deletion stage must be frozen before it can drain".into(),
+                ));
+            }
+            Ok(((), true))
+        })
+        .await
+    }
+
+    /// True once the archive's deletion has fully landed. A retry must take
+    /// this fast path rather than re-entering the driver, whose sealed
+    /// inventory pages the control cleanup has already erased.
+    pub(crate) async fn wal_deletion_already_complete(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<bool> {
+        self.read(move |conn| wal_deletion_already_complete_conn(conn, archive_id))
+            .await
+    }
+
+    /// Remove the WAL bookkeeping whose `object_key` columns are names, once
+    /// the archive is physically complete.
+    pub(crate) async fn tear_down_wal_bookkeeping(&self, archive_id: ArchiveId) -> Result<()> {
+        self.write_if_changed(move |conn| {
+            tear_down_wal_bookkeeping_conn(conn, archive_id).map(|()| ((), true))
+        })
+        .await
+    }
+
     pub(crate) async fn mark_archive_physical_complete(
         &self,
         completion: PhysicalDeletionReceipt,
@@ -21980,8 +22539,13 @@ impl ArchiveLifecycleLedger for ControlStore {
         archive_id: ArchiveId,
         deletion_fence: ObjectId,
     ) -> std::result::Result<(u64, Vec<PlannedArtifact>), LifecycleError> {
+        // The genesis create-ahead recovery seam only needs the bootstrap
+        // artifacts it planned; the widened union is a deletion-time fact and
+        // reaches the deletion coordinator through `freeze_snapshot` /
+        // `load_snapshot` instead.
         self.load_archive_inventory_snapshot(archive_id, deletion_fence)
             .await
+            .map(|(revision, create_ahead, _widened)| (revision, create_ahead))
             .map_err(|_| LifecycleError::Unavailable)
     }
 
@@ -22810,7 +23374,7 @@ impl DeletionInventoryControl for ControlStore {
             .freeze_archive_inventory_snapshot(archive_id, expected_revision, deletion_fence)
             .await
             .map_err(|_| LifecycleError::Unavailable)?;
-        let (loaded_revision, create_ahead) = self
+        let (loaded_revision, create_ahead, widened) = self
             .load_archive_inventory_snapshot(archive_id, deletion_fence)
             .await
             .map_err(|_| LifecycleError::Unavailable)?;
@@ -22823,6 +23387,7 @@ impl DeletionInventoryControl for ControlStore {
             deletion_fence,
             revision,
             create_ahead,
+            widened,
         )
     }
 
@@ -22831,7 +23396,7 @@ impl DeletionInventoryControl for ControlStore {
         archive_id: ArchiveId,
         deletion_fence: ObjectId,
     ) -> std::result::Result<FrozenInventorySnapshot, LifecycleError> {
-        let (revision, create_ahead) = self
+        let (revision, create_ahead, widened) = self
             .load_archive_inventory_snapshot(archive_id, deletion_fence)
             .await
             .map_err(|_| LifecycleError::Unavailable)?;
@@ -22841,6 +23406,7 @@ impl DeletionInventoryControl for ControlStore {
             deletion_fence,
             revision,
             create_ahead,
+            widened,
         )
     }
 
@@ -23464,15 +24030,21 @@ mod tests {
         fence: ObjectId,
         pages: &[DurableInventoryPage],
     ) -> Result<DeletionInventorySeal> {
-        let (revision, create_ahead) =
+        let (revision, create_ahead, widened) =
             load_archive_inventory_snapshot_conn(conn, archive_id, fence)?;
         if revision != expected_revision {
             return Err(EnclaveError::Conflict(
                 "test coordinator snapshot changed".into(),
             ));
         }
-        let snapshot = FrozenInventorySnapshot::for_test(archive_id, fence, revision, create_ahead)
-            .map_err(lifecycle_store_error)?;
+        let snapshot = FrozenInventorySnapshot::for_widened_test(
+            archive_id,
+            fence,
+            revision,
+            create_ahead,
+            widened,
+        )
+        .map_err(lifecycle_store_error)?;
         let planned = pages
             .iter()
             .map(|page| page.page().clone())
@@ -25423,6 +25995,227 @@ mod tests {
             fence,
         )
         .is_err());
+    }
+
+    /// A crashed publication or checkpoint attempt uploads objects that no
+    /// root will ever reach. Their create-ahead rows are the only enumeration
+    /// they have, so the frozen snapshot must bind them — otherwise they
+    /// survive erasure with no disclosure at all.
+    ///
+    /// The same applies to a genesis attempt killed before its bootstrap
+    /// boundary: G9 records those objects durably, and this is the union that
+    /// makes them sweepable instead of unnameable residue.
+    #[test]
+    fn the_frozen_snapshot_unions_crashed_attempt_and_genesis_staging_objects() {
+        use crate::archive_v3::{LogicalLocation, ObjectContext, ObjectRole};
+
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let archive_id = plan.archive_id();
+        let canonical = |role, location, id: u8| {
+            ObjectContext::new(
+                archive_id,
+                plan.database_epoch(),
+                plan.key_epoch(),
+                role,
+                location,
+                ObjectId::from_bytes([id; 16]),
+                None,
+            )
+            .unwrap()
+            .object_key()
+        };
+        let segment = canonical(
+            ObjectRole::WalSegmentV3,
+            LogicalLocation::Wal {
+                root_seq: 4,
+                wal_generation: 2,
+                segment_index: 0,
+            },
+            0xa1,
+        );
+        let manifest = canonical(
+            ObjectRole::CheckpointManifestV3,
+            LogicalLocation::CheckpointManifest {
+                checkpoint_id: ObjectId::from_bytes([0xa3; 16]),
+                level: 0,
+                range_start: 0,
+                range_end: 1,
+            },
+            0xa2,
+        );
+
+        // A publication attempt that crashed after reserving its segment.
+        conn.execute(
+            "INSERT INTO archive_v3_wal_owners
+             (archive_id, format_version, owner_id, database_epoch, key_epoch, root_seq,
+              root_object_id, root_ciphertext_hash, witness_record, witness_hash,
+              binding_commitment, revision)
+             VALUES (?1, 1, ?2, ?3, ?4, 4, ?5, ?6, ?7, ?8, ?9, 1)",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                [0xb1u8; 16].as_slice(),
+                plan.database_epoch().as_bytes().as_slice(),
+                plan.key_epoch().as_bytes().as_slice(),
+                [0xb2u8; 16].as_slice(),
+                [0xb3u8; 32].as_slice(),
+                vec![0u8; 724],
+                [0xb4u8; 32].as_slice(),
+                [0xb5u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_v3_wal_publication_attempts
+             (archive_id, operation_kind, operation_id, attempt, attempt_id, owner_instance_id, state)
+             VALUES (?1, 1, ?2, 1, ?3, ?4, 'active')",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                [0xc1u8; 16].as_slice(),
+                [0xc2u8; 16].as_slice(),
+                [0xb1u8; 16].as_slice(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO archive_v3_wal_publication_artifacts
+             (archive_id, operation_kind, operation_id, attempt, ordinal, context_aad,
+              object_id, object_role, object_key, ciphertext_hash, state)
+             VALUES (?1, 1, ?2, 1, 0, ?3, ?4, 2, ?5, ?6, 'reserved')",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                [0xc1u8; 16].as_slice(),
+                b"aad".as_slice(),
+                [0xa1u8; 16].as_slice(),
+                segment.as_str(),
+                [0xd1u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+        // A genesis attempt killed before its bootstrap boundary.
+        conn.execute(
+            "INSERT INTO archive_v3_wal_genesis_staged_objects
+             (archive_id, bootstrap_attempt_id, staging_ordinal, canonical_key, object_id,
+              object_role, context_aad, ciphertext_hash, state)
+             VALUES (?1, ?2, 0, ?3, ?4, 8, ?5, ?6, 'reserved')",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                [0xe1u8; 16].as_slice(),
+                manifest.as_str(),
+                [0xa2u8; 16].as_slice(),
+                b"aad".as_slice(),
+                [0xd2u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            archive_id,
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &registry, LifecycleCreateOutcome::Created)
+                .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, archive_id, revision, LIFECYCLE_ROOT_ORDINAL).unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let revision = freeze_archive_lifecycle_conn(&conn, archive_id, revision, fence).unwrap();
+        let revision =
+            freeze_archive_inventory_snapshot_conn(&conn, archive_id, revision, fence).unwrap();
+
+        let (loaded_revision, create_ahead, widened) =
+            load_archive_inventory_snapshot_conn(&conn, archive_id, fence).unwrap();
+        assert_eq!(loaded_revision, revision);
+        // The bootstrap ordinals are unchanged; the widened set is additive.
+        assert_eq!(create_ahead.len(), 2);
+        let widened_keys = widened
+            .iter()
+            .map(|object| object.key().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            widened_keys.contains(&segment.as_str().to_owned()),
+            "a crashed publication attempt's reserved segment must be enumerable"
+        );
+        assert!(
+            widened_keys.contains(&manifest.as_str().to_owned()),
+            "a pre-boundary genesis orphan must be enumerable"
+        );
+        // The snapshot binds the union: a row appearing after the freeze
+        // breaks every later load rather than slipping in or out unnoticed.
+        conn.execute(
+            "UPDATE archive_v3_wal_publication_artifacts SET state='materialized'
+             WHERE archive_id=?1",
+            [archive_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(load_archive_inventory_snapshot_conn(&conn, archive_id, fence).is_ok());
+        conn.execute(
+            "DELETE FROM archive_v3_wal_genesis_staged_objects WHERE archive_id=?1",
+            [archive_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(
+            load_archive_inventory_snapshot_conn(&conn, archive_id, fence).is_err(),
+            "losing a widened row after the freeze must fail the commitment, not shrink the seal"
+        );
+    }
+
+    /// A snapshot frozen under the pre-widening commitment domain can never be
+    /// loaded: its commitment recomputes differently, so the load fails closed
+    /// rather than sealing an inventory that omits the crashed-attempt objects.
+    #[test]
+    fn a_snapshot_frozen_under_the_v1_domain_is_refused_at_load() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let archive_id = plan.archive_id();
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            archive_id,
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &registry, LifecycleCreateOutcome::Created)
+                .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, archive_id, revision, LIFECYCLE_ROOT_ORDINAL).unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let revision = freeze_archive_lifecycle_conn(&conn, archive_id, revision, fence).unwrap();
+        freeze_archive_inventory_snapshot_conn(&conn, archive_id, revision, fence).unwrap();
+        assert!(load_archive_inventory_snapshot_conn(&conn, archive_id, fence).is_ok());
+
+        // Rewrite the stored commitment as a v1-domain snapshot would have.
+        let stale = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"kioku/archive-v3/inventory-snapshot/v1\0");
+            hasher.update(archive_id.as_bytes());
+            hasher.finalize().to_vec()
+        };
+        conn.execute(
+            "UPDATE archive_lifecycle_inventory_snapshots SET snapshot_commitment = ?2
+             WHERE archive_id = ?1",
+            rusqlite::params![archive_id.as_bytes().as_slice(), stale],
+        )
+        .unwrap();
+        assert!(load_archive_inventory_snapshot_conn(&conn, archive_id, fence).is_err());
     }
 
     #[test]
