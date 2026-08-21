@@ -14878,7 +14878,15 @@ fn inspect_wal_owner_operation_conn(
         // re-randomizes on lane replacement) and never by the false lemma
         // "prepared means record_captured never ran" (two production paths
         // rewrite captured back to prepared).
-        if stage == "prepared" {
+        // Only a genuinely DIFFERENT operation may pass. A matching
+        // operation_id with a different request_fingerprint is idempotency-key
+        // reuse under a changed body: that must stay a definitive refusal, and
+        // it could never be abandoned anyway — the displacing insert would
+        // collide with this very operation's own attempt row.
+        if stage == "prepared"
+            && (operation.as_slice() != identity.operation_id().as_bytes()
+                || kind != identity.kind() as i64)
+        {
             return Ok(WalOwnerAdmission::SettledHead);
         }
         return Err(EnclaveError::Conflict(
@@ -15009,7 +15017,10 @@ fn prepare_wal_owner_operation_conn(
             tx.commit()?;
             return Ok((attempt, changed));
         }
-        if stage == "prepared" {
+        if stage == "prepared"
+            && (operation.as_slice() != identity.operation_id().as_bytes()
+                || kind != identity.kind() as i64)
+        {
             // Abandon the stranded non-authoritative row (candidate-absence;
             // see inspect_wal_owner_operation_conn). Stage-pinned so a
             // concurrent capture of the same row refuses instead of being
@@ -15067,13 +15078,34 @@ fn prepare_wal_owner_operation_conn(
             "WAL attempt identity unavailable".into(),
         ));
     }
+    // Attempt rows are never deleted, so they ARE this operation's durable
+    // high-water mark. An operation whose row was abandoned at 'prepared'
+    // still owns its earlier superseded attempts; reusing attempt 1 would
+    // violate the attempts PRIMARY KEY and surface as an unclassified
+    // constraint error instead of a refusal. Take the next free ordinal, the
+    // same way the supersession arm above does.
+    let prior_attempt: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(attempt),0) FROM archive_v3_wal_publication_attempts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    let attempt_ordinal = u32::try_from(prior_attempt)
+        .ok()
+        .and_then(|attempt| attempt.checked_add(1))
+        .filter(|attempt| *attempt <= MAX_WAL_OWNER_ATTEMPTS)
+        .ok_or_else(|| EnclaveError::Conflict("WAL attempt cap reached".into()))?;
     if tx.execute(
         "INSERT INTO archive_v3_wal_publications
          (archive_id,format_version,owner_id,owner_instance_id,operation_id,
           request_fingerprint,operation_kind,expected_witness,
           expected_binding_commitment,session_id,attempt,attempt_id,
           expected_wal_generation,revision,stage)
-         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,NULL,1,'prepared')",
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?11,?10,NULL,1,'prepared')",
         rusqlite::params![
             binding.archive_id().as_bytes().as_slice(),
             owner.as_bytes().as_slice(),
@@ -15085,18 +15117,20 @@ fn prepare_wal_owner_operation_conn(
             binding.commitment().as_slice(),
             session.as_bytes().as_slice(),
             attempt_id.as_bytes().as_slice(),
+            i64::from(attempt_ordinal),
         ],
     )? != 1
         || tx.execute(
             "INSERT INTO archive_v3_wal_publication_attempts
              (archive_id,operation_kind,operation_id,attempt,attempt_id,owner_instance_id,state)
-             VALUES (?1,?2,?3,1,?4,?5,'active')",
+             VALUES (?1,?2,?3,?6,?4,?5,'active')",
             rusqlite::params![
                 binding.archive_id().as_bytes().as_slice(),
                 identity.kind() as i64,
                 identity.operation_id().as_bytes().as_slice(),
                 attempt_id.as_bytes().as_slice(),
                 owner_instance_id.as_bytes().as_slice(),
+                i64::from(attempt_ordinal),
             ],
         )? != 1
     {
@@ -31998,6 +32032,97 @@ mod tests {
                 .unwrap();
         assert!(!replay.1);
         assert_eq!(replay.0.attempt_id(), next.0.attempt_id());
+
+        // An ABANDONED operation must still be able to complete later. Its
+        // superseded attempt row survives (artifacts foreign-key it), so the
+        // re-prepare has to take the next free ordinal rather than colliding
+        // on attempt 1. Without this the wedge fix would merely relocate the
+        // wedge from the archive onto the one operation it displaced.
+        let revived = prepare_wal_owner_operation_conn(
+            &conn,
+            &binding,
+            wal_owner_instance(0x47),
+            stranded_identity,
+        )
+        .expect("an abandoned operation must be preparable again");
+        assert!(revived.1);
+        assert_eq!(
+            revived.0.attempt(),
+            2,
+            "the re-prepare must honour the surviving attempt high-water mark"
+        );
+        let (states, active): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM archive_v3_wal_publication_attempts
+                          WHERE operation_id=?1),
+                        (SELECT count(*) FROM archive_v3_wal_publication_attempts
+                          WHERE state='active')",
+                [stranded_identity.operation_id().as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(states, 2, "attempt 1 superseded, attempt 2 active");
+        assert_eq!(active, 1);
+    }
+
+    /// Reusing an operation id with a DIFFERENT request fingerprint is
+    /// idempotency-key reuse under a changed body. It must remain a
+    /// definitive refusal and must never enter the abandon arm — the
+    /// displacing insert would collide with this very operation's own attempt
+    /// row and surface as an unclassified constraint error instead.
+    #[test]
+    fn a_reused_operation_id_with_a_different_fingerprint_is_still_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reused-operation-id.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (_terminal, _acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
+
+        let original = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0x61,
+            0x62,
+        );
+        assert!(
+            prepare_wal_owner_operation_conn(&conn, &binding, wal_owner_instance(0x63), original)
+                .unwrap()
+                .1
+        );
+
+        // Same operation id and kind, different request fingerprint.
+        let tampered = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0x61,
+            0x99,
+        );
+        assert_eq!(tampered.operation_id(), original.operation_id());
+        assert_ne!(
+            tampered.request_fingerprint(),
+            original.request_fingerprint()
+        );
+
+        assert!(matches!(
+            inspect_wal_owner_operation_conn(&conn, &binding, tampered),
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert!(matches!(
+            prepare_wal_owner_operation_conn(&conn, &binding, wal_owner_instance(0x64), tampered),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The original operation is untouched and still replayable.
+        let (rows, stage, attempts): (i64, String, i64) = conn
+            .query_row(
+                "SELECT count(*), (SELECT stage FROM archive_v3_wal_publications),
+                        (SELECT count(*) FROM archive_v3_wal_publication_attempts
+                          WHERE state='active')
+                 FROM archive_v3_wal_publications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(stage, "prepared");
+        assert_eq!(attempts, 1);
     }
 
     /// The companion negative: a `'captured'` row has reserved artifacts and a
