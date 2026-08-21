@@ -566,6 +566,8 @@ impl sealed::DomainPlan for crate::cp::summarizer::wal::SubstanceBackfillBatchPl
 impl sealed::DomainLedger for crate::cp::summarizer::wal::SubstanceBackfillBatchLedger {}
 impl sealed::DomainPlan for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchPlan {}
 impl sealed::DomainLedger for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchLedger {}
+impl sealed::DomainPlan for crate::cp::schema_epoch::wal::SchemaEpochAdvancePlan {}
+impl sealed::DomainLedger for crate::cp::schema_epoch::wal::SchemaEpochAdvanceLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.

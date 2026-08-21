@@ -221,7 +221,64 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # indentation-only call-expression moves re-verified line by line, and the
 # relative order of every surviving key still unchanged. The store-surface
 # (15/a2904b58) and policy-site (42/7b4d1591) digests did not move.
-EXPECTED_STORE_CALL_COUNT = 232
+#
+# ---- ADR-0022 Part B REBASED ON TOP of the ingest delta above (2026-08-21) ----
+# Both branches independently moved 229 -> 232 by adding DIFFERENT call sites,
+# so the merged tree is a THIRD state and NEITHER predecessor digest is correct
+# here: ingest's 232/3f71214e and this branch's 232/ec8373dd are both wrong on
+# the merged tree. Re-derived rather than resolved by picking a side.
+#
+# MERGED BASELINE: a pristine `git archive origin/main | tar -x` tree at
+# 0d51bc8 ("Route capture-event ingest ... (#331)"), extracted under ~/.cache
+# outside every worktree, and dumped with THAT tree's own store_call_sites() /
+# classify_store_call() / inventory_row() / digest() helpers. It reproduced all
+# FOUR of 0d51bc8's own declared pins byte-for-byte first -- store 232/3f71214e,
+# surface 15/a2904b58, spawn 26/1741534d, policy 42/7b4d1591 -- so the delta
+# below is against a verified baseline, not an assumed one.
+#
+# MERGED DELTA, exactly: 232 -> 235. THREE additions, all the advance_one_epoch
+# sites enumerated below. ZERO removals, ZERO reclassifications, ZERO moved
+# call-EXPRESSION hashes and ZERO moved owner-body hashes in this inventory --
+# diffed key by key against the pristine dump. Ingest's own rows are already in
+# the baseline and are untouched by this branch.
+#
+# The other three inventories on the merged tree: store-surface 15 with ONE
+# owner-body move (async_main, from destructuring RelaunchCounts) -> 6f80aa29;
+# worker-spawn 26 with the SAME single async_main owner-body move -> c821c699,
+# which is NOT this branch's pre-rebase 34a018b2, because that value was derived
+# against 85b83e0 before ingest landed and ingest had itself moved a spawn owner
+# body; policy 42 completely unmoved at 7b4d1591.
+#
+# ADR-0022 Part B (the owner-side schema-ladder driver): exactly THREE
+# additions and nothing else. 229 -> 232.
+#
+# BASELINE: a pristine `git archive origin/main | tar -x` tree at commit
+# 9d78c46 ("Route the summarizer window's evidence reads (unblocks the merged
+# upsert plan) (#330)"), dumped with THIS module's own store_call_sites() /
+# classify_store_call() / inventory_row() / digest() helpers before anything
+# was written. That pristine dump reproduced 9d78c46's own 229/8eb21ded pin
+# byte-for-byte, so the delta below is against a verified baseline.
+#
+# DELTA, exactly:
+#   * THREE additions, all under the ONE new B owner
+#     `src/cp/schema_epoch/wal/advance.rs::advance_one_epoch#0`:
+#     `wal_authoritative_read#0` (the single marker read -- `read_archive_epoch`
+#     and nothing else; a second read would open a window in which the epoch
+#     the plan is built for is not the epoch it is submitted against),
+#     `wal_authoritative_submit#0` (the sealed step), and
+#     `wal_authoritative_submit#1` (the ONE Conflict resubmission of the
+#     identical prepared object). Three sites for two logical operations is the
+#     same shape slice 11's settle_audio_window_transcript already carries.
+#   * ZERO removals, ZERO reclassifications, ZERO moved call-EXPRESSION hashes,
+#     and ZERO moved OWNER-BODY hashes anywhere -- diffed key by key against
+#     the pristine dump. The relative order of every surviving key is
+#     identical.
+#
+# Note what did NOT move and why: `archive_v3_serving_relaunch.rs::relaunch_one`
+# gained the `advance_to_target_epoch` call, but neither that function nor
+# `install_wal_serving_authority` is a tracked Store target, so relaunch_one
+# owns no row here and its body hash is invisible to this inventory.
+EXPECTED_STORE_CALL_COUNT = 235
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -356,7 +413,7 @@ EXPECTED_STORE_CALL_COUNT = 232
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "3f71214e9a734420607ae5c625ff92c9430f9b090f250d523c36b429033594f6"
+EXPECTED_STORE_CALL_SHA256 = "7ce82572243f92af5ffe08830f7f05eef77830d589a7994d2d27364c1094e34f"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -394,7 +451,24 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # the count holds at 15, the key set is byte-identical, no construction
 # surface was added or removed, and the only deltas are that literal, its
 # enclosing factory definition, and async_main's owner body.
-EXPECTED_STORE_SURFACE_SHA256 = "a2904b58b343e52a84493ca5cdf7de2693c1c5d34c2f6c37ecf49c6e8d45e25d"
+# ADR-0022 Part B (schema-ladder driver, review fix [5]): the startup relaunch
+# now returns a `RelaunchCounts` struct instead of `(relaunched, unavailable)`,
+# because a user whose epoch advance failed IS being served -- the authority is
+# installed before the advance runs and there is no removal API -- so counting
+# them `unavailable` inverted the health signal. async_main destructures the
+# new counts and reports the added `behind_target` / `unservable_epoch`
+# subsets. Count HOLDS at 15 with zero additions, zero removals, zero
+# reclassifications, and ZERO Store-construction call-EXPRESSION hash moves;
+# the key set is byte-identical. The sole delta is async_main's owner body
+# (05f35ac2 -> d3d8b028).
+# Diffed with this module's own store_surface_sites()/inventory_row()/digest()
+# helpers against TWO pristine `git archive | tar -x` trees extracted outside
+# any shared directory: origin/main (85b83e0) and this branch's base (9d78c46).
+# Both reproduced their own 15/a2904b58 pin byte-for-byte before anything was
+# written, and their inventories are byte-identical to each other -- #333's
+# main.rs edit is a module-level const array outside async_main's span, so the
+# merged tree is not a third state here.
+EXPECTED_STORE_SURFACE_SHA256 = "6f80aa294dc424877cac64f89fbb5f199ccb42a4cbf7de1e7c0a9d6978264164"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -585,7 +659,24 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # reclassified. Re-derived against the same freshly extracted pristine 9d78c46
 # tree with that tree's own helpers, which reproduced its own 26/e6dac368 pin
 # exactly first.
-EXPECTED_WORKER_SPAWN_SHA256 = "1741534dbdc25e629e0ab7c76da13c4a91aa297ea8d4c594483eadd42f75d959"
+#
+# ---- Part B rebased on top of the ingest delta above ----
+# Both branches moved this pin for DIFFERENT reasons, so the merged tree is a
+# third state and neither predecessor digest is correct. Re-derived below.
+#
+# ADR-0022 Part B (schema-ladder driver, review fix [5]): count HOLDS at 26
+# with zero additions, zero removals, zero reclassifications and zero spawn
+# call-EXPRESSION hash moves. The sole delta is async_main's owner body
+# (05f35ac2 -> d3d8b028), the SAME owner-body move the store-surface pin above
+# records and for the same reason: the startup relaunch now returns
+# `RelaunchCounts` and async_main reports its `behind_target` /
+# `unservable_epoch` subsets. No spawn was added, removed or moved. Same two
+# pristine `git archive | tar -x` trees (origin/main 85b83e0 and this branch's
+# base 9d78c46, both extracted outside any shared directory) and the same
+# worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the pins
+# above; both reproduced their own 26/e6dac368 pin byte-for-byte, and their
+# inventories are byte-identical to each other, before anything was written.
+EXPECTED_WORKER_SPAWN_SHA256 = "c821c6993a7d244bfc53e143795aad5017ca48b167913dfb09570365576c2e1e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1192,6 +1283,11 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::settle_audio_window_transcript#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_attempt#0",
         "src/cp/media_worker.rs::settle_screen_storyboard_result#0",
+        # ADR-0022 Part B: the owner-side schema-ladder driver. Reads the
+        # archive's own epoch marker, then submits ONE sealed step. It is the
+        # only writer of `schema_epoch` after birth, so it classifies with the
+        # other settle owners rather than as a read.
+        "src/cp/schema_epoch/wal/advance.rs::advance_one_epoch#0",
         "src/cp/model_usage.rs::begin_invocation#0",
         "src/cp/model_usage.rs::settle_response_required#0",
         "src/cp/model_usage.rs::begin_invocation_settled#0",

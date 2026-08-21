@@ -57,7 +57,9 @@ const SQLITE_WAL_FRAME_BYTES: usize = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAG
 // The largest encoded predecessor-bearing `WalSegment` fixed prefix is 138
 // bytes. Keep this independent of the encoder's allocation strategy.
 const MAX_WAL_SEGMENT_FIXED_BYTES: usize = 138;
-const MAX_WAL_FRAMES_PER_SEGMENT: usize =
+// `pub(crate)` for the schema-ladder advance's pre-commit page budget, which
+// must stay under `MAX_WAL_SEGMENTS_PER_COMMIT * MAX_WAL_FRAMES_PER_SEGMENT`.
+pub(crate) const MAX_WAL_FRAMES_PER_SEGMENT: usize =
     (MAX_WAL_SEGMENT_BYTES - MAX_WAL_SEGMENT_FIXED_BYTES) / SQLITE_WAL_FRAME_BYTES;
 
 /// A VFS capture has its own 8-MiB ceiling. This independent publication cap

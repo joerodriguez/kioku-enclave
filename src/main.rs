@@ -985,7 +985,7 @@ async fn async_main() {
     // durable state through the image-baked runtime coordinates, so the
     // routed read serves the settled lane from the first admitted request.
     // Off-config images with selected users fail startup closed here.
-    let (relaunched_wal_serving_authorities, unavailable_wal_serving_authorities) =
+    let wal_serving_relaunch_counts =
         archive_v3_serving_relaunch::relaunch_wal_serving_authorities(
             || Ok(Arc::clone(&concrete_kms)),
             Arc::clone(&control_store),
@@ -993,20 +993,32 @@ async fn async_main() {
         )
         .await
         .unwrap_or_else(|error| panic!("Failed to relaunch WAL serving authorities: {error}"));
-    if relaunched_wal_serving_authorities > 0 {
+    if wal_serving_relaunch_counts.relaunched > 0 {
         info!(
-            relaunched = relaunched_wal_serving_authorities,
+            relaunched = wal_serving_relaunch_counts.relaunched,
             "relaunched WAL serving authorities before request admission"
         );
     }
-    if unavailable_wal_serving_authorities > 0 {
+    if wal_serving_relaunch_counts.unavailable > 0 {
         // Contained, not ignored: these users are refused rather than served a
         // stale snapshot, and the rest of the fleet is admitted. Startup no
         // longer dies for everyone because one archive could not be
         // reconstructed.
         error!(
-            unavailable = unavailable_wal_serving_authorities,
+            unavailable = wal_serving_relaunch_counts.unavailable,
             "WAL serving authorities failed to relaunch; those users are unavailable"
+        );
+    }
+    if wal_serving_relaunch_counts.behind_target > 0 {
+        // A SUBSET of `relaunched`: these users are serving normally, at the
+        // schema epoch their archive recorded, which is a complete servable
+        // state. What it blocks is raising SCHEMA_EPOCH_MIN_SERVABLE — see the
+        // runbook in `schema_ladder`. A ladder step no archive can take is a
+        // step to split or withdraw, never one to force.
+        error!(
+            behind_target = wal_serving_relaunch_counts.behind_target,
+            unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
+            "WAL serving authorities are serving below this binary's schema epoch target"
         );
     }
 

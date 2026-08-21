@@ -40,6 +40,61 @@ FORBIDDEN_STEP_SQL = (
     "alter table" " " "drop",
 )
 
+# ── G5/G6: the shipped steps themselves ───────────────────────────────────────
+#
+# Everything above constrains the ladder's SHAPE -- contiguous epochs, unique
+# ids, additive-only SQL -- and nothing constrained its CONTENT. Editing a
+# shipped step's SQL passed all of it.
+#
+# That is not a cosmetic hole. A step's digest is chained into `chain_digest`,
+# which every archive records in its `schema_epoch` marker and which
+# `validate_servable_epoch` recomputes at owner open. Ship an edited step and
+# two archives sit at nominal epoch 1 carrying different DDL and different
+# chains, each permanently unopenable by the other's binary. Nothing at RUNTIME
+# can catch it either: plan and running binary share one `&'static` ladder by
+# construction, so the advance plan's own "is the step still what I recorded"
+# precondition is an identity, and at `from_epoch = 0` the recorded chain is
+# the bare baseline anchor and contains no step to disagree with.
+#
+# So the guard has to be here, and it has to be a pin: the digests are literals
+# in THIS file, so editing a shipped step fails CI unless the gate is edited in
+# the same diff, which is what makes the act unmissable in review.
+#
+# Recompute, never transcribe: `python3 scripts/test_schema_ladder_gate.py
+# --print-ladder-pins`.
+
+# Every shipped step, `(epoch, id, step_digest_hex)`, in declaration order.
+# Empty because SCHEMA_LADDER is empty; G4 already refuses a step over an
+# unsealed baseline. Appending a step means appending here too -- runbook
+# step 3.
+SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = ()
+
+# `chain_digest(SCHEMA_EPOCH_HEAD)` over the declared ladder, anchored on
+# BASELINE_DIGEST.
+#
+# This is the exact value an archive records in its `schema_epoch` marker and
+# that `validate_servable_epoch` recomputes at owner open, pinned end to end.
+# What it adds over the per-step tuple above is the ANCHOR: the tuple says
+# nothing about BASELINE_DIGEST, and the chain is built from it, so a baseline
+# re-pin moves this even when no step moved. Not vacuous with an empty ladder
+# either -- it is then exactly `SHA256(LADDER_DOMAIN || BASELINE_DIGEST)`.
+SEALED_LADDER_CHAIN_HEAD = "44c94f297c002b76892e96f1449398610eaf981dc1f6c123cfa69630d8c72c98"
+
+# One fixture triple digested by BOTH implementations of `step_digest`: this
+# file's and `schema_ladder::step_digest`'s. The identical constant is asserted
+# in `cp::schema_epoch::wal::advance`'s test module, so a drift in either
+# language's framing, domain separation or integer width fails on one side.
+# Keep the two in sync; that is the whole point of them.
+CROSS_CHECKED_STEP = (
+    1,
+    "0001_capture_events_stream_sequence",
+    "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence);",
+)
+CROSS_CHECKED_STEP_DIGEST = (
+    "00721b2e0796349ebb9200f0f2595b2537d9250212f0b0bf0dd77e5d21622887"
+)
+
+
 # ── The seal ──────────────────────────────────────────────────────────────────
 #
 # The epoch-0 baseline may be re-pinned only while no archive exists. Once the
@@ -161,6 +216,15 @@ def declared_baseline_digest(ladder: str) -> bytes:
     return bytes(values)
 
 
+def schema_ladder_literal(ladder: str) -> str:
+    """Only the SCHEMA_LADDER array, never the test fixtures below it."""
+    return ladder[
+        ladder.index("pub(crate) const SCHEMA_LADDER") : ladder.index(
+            "pub(crate) const SCHEMA_EPOCH_HEAD"
+        )
+    ]
+
+
 def step_sql_literals(literal: str) -> list[str]:
     """Every `sql:` value in a ladder literal, plain AND raw strings.
 
@@ -172,6 +236,117 @@ def step_sql_literals(literal: str) -> list[str]:
     found = re.findall(r'sql:\s*"((?:[^"\\]|\\.)*)"', literal)
     found += [body for _, body in re.findall(r'sql:\s*r(#*)"(.*?)"\1', literal, re.S)]
     return found
+
+
+_SIMPLE_RUST_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
+
+
+def rust_string_literal_value(literal: str) -> str:
+    """Decode one plain (non-raw) Rust string literal body to its real bytes.
+
+    Digesting the SOURCE text instead of the value would be wrong the moment a
+    step used `\\"` or a line continuation, and wrong silently -- the pin would
+    still be stable, it would just be a pin on a different string than the one
+    the compiler builds. So this decodes, and it raises on anything it does not
+    understand rather than guessing: a step whose SQL this cannot read must
+    fail the build, never be digested approximately.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(literal):
+        char = literal[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        if index >= len(literal):
+            raise ValueError("string literal ends in a backslash")
+        escape = literal[index]
+        if escape in _SIMPLE_RUST_ESCAPES:
+            out.append(_SIMPLE_RUST_ESCAPES[escape])
+            index += 1
+        elif escape == "x":
+            out.append(chr(int(literal[index + 1 : index + 3], 16)))
+            index += 3
+        elif escape == "u":
+            close = literal.index("}", index)
+            out.append(chr(int(literal[index + 2 : close].replace("_", ""), 16)))
+            index = close + 1
+        elif escape == "\n":
+            # Rust's line continuation: the newline AND the following leading
+            # whitespace vanish. This is the shape the ladder's own doc comment
+            # recommends for multi-line SQL, so getting it wrong is not exotic.
+            index += 1
+            while index < len(literal) and literal[index] in " \t\r\n":
+                index += 1
+        else:
+            raise ValueError(f"unsupported Rust string escape: \\{escape!r}")
+    return "".join(out)
+
+
+def ladder_steps(literal: str) -> list[tuple[int, str, str]]:
+    """Every declared `SchemaStep` as `(epoch, id, sql)`, in source order.
+
+    Fails closed: a struct missing any of the three fields, or carrying a
+    literal shape this cannot decode, raises rather than being skipped.
+    """
+    steps: list[tuple[int, str, str]] = []
+    # `SchemaStep\s*{`, not bare `SchemaStep`: the declaration's own type
+    # annotation `&[SchemaStep]` is not a struct literal, and splitting on the
+    # bare name made the empty ladder parse as one unreadable step.
+    #
+    # Each chunk runs from one struct's `{` to the next struct's name, NOT to
+    # a closing brace -- a `}` can legally appear inside the SQL, and cutting
+    # there would truncate the field it was hiding in. Requiring exactly one of
+    # each field per chunk is what keeps the fields associated with their own
+    # struct: a struct missing one would otherwise borrow the next struct's.
+    for chunk in re.split(r"SchemaStep\s*\{", literal)[1:]:
+        epochs = re.findall(r"epoch:\s*(\d+)\s*,", chunk)
+        identifiers = re.findall(r'id:\s*"((?:[^"\\]|\\.)*)"', chunk)
+        sql_values = step_sql_literals(chunk)
+        if len(epochs) != 1 or len(identifiers) != 1 or len(sql_values) != 1:
+            raise ValueError(f"ladder step is not parseable: {chunk[:160]!r}")
+        # `step_sql_literals` returns raw-string bodies verbatim, which is
+        # already the value; only a plain literal needs unescaping.
+        raw = re.search(r'sql:\s*r(#*)"', chunk)
+        sql = sql_values[0] if raw else rust_string_literal_value(sql_values[0])
+        steps.append(
+            (int(epochs[0]), rust_string_literal_value(identifiers[0]), sql)
+        )
+    return steps
+
+
+def step_digest(epoch: int, identifier: str, sql: str) -> bytes:
+    """`schema_ladder::step_digest`, byte for byte."""
+    hasher = hashlib.sha256()
+    hasher.update(LADDER_DOMAIN)
+    hasher.update(epoch.to_bytes(4, "big"))
+    hasher.update(framed(identifier.encode()))
+    hasher.update(framed(sql.encode()))
+    return hasher.digest()
+
+
+def ladder_chain_head(steps: list[tuple[int, str, str]], baseline: bytes) -> bytes:
+    """`LadderView::chain_digest(head)`, byte for byte."""
+    hasher = hashlib.sha256()
+    hasher.update(LADDER_DOMAIN)
+    hasher.update(baseline)
+    digest = hasher.digest()
+    for step in steps:
+        hasher = hashlib.sha256()
+        hasher.update(digest)
+        hasher.update(step_digest(*step))
+        digest = hasher.digest()
+    return digest
 
 
 def history_chain(entries: list[dict]) -> list[str]:
@@ -219,6 +394,23 @@ def print_digest() -> int:
     return 0
 
 
+def print_ladder_pins() -> int:
+    """Emit `SEALED_STEP_DIGESTS` and `SEALED_LADDER_CHAIN_HEAD` to paste.
+
+    Uses the same `ladder_steps` / `step_digest` / `ladder_chain_head` the
+    tests assert against, so a hand-transcription error cannot survive.
+    """
+    ladder = LADDER.read_text(encoding="utf-8")
+    steps = ladder_steps(schema_ladder_literal(ladder))
+    print("SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = (")
+    for epoch, identifier, sql in steps:
+        print(f'    ({epoch}, "{identifier}", "{step_digest(epoch, identifier, sql).hex()}"),')
+    print(")")
+    head = ladder_chain_head(steps, declared_baseline_digest(ladder)).hex()
+    print(f'SEALED_LADDER_CHAIN_HEAD = "{head}"')
+    return 0
+
+
 def print_seal_chain() -> int:
     """Emit the history chain for the seal file and `SEALED_HISTORY_HEAD`."""
     seal = json.loads(SEAL.read_text(encoding="utf-8"))
@@ -235,6 +427,7 @@ class SchemaLadderGateTest(unittest.TestCase):
         self.media = MEDIA.read_text(encoding="utf-8")
         self.projection = PROJECTION.read_text(encoding="utf-8")
         self.seal = json.loads(SEAL.read_text(encoding="utf-8"))
+        self.ladder_literal = schema_ladder_literal(self.ladder)
 
     def test_epoch_zero_baseline_is_frozen(self) -> None:
         """The recorded baseline digest must still describe the live baseline.
@@ -254,11 +447,7 @@ class SchemaLadderGateTest(unittest.TestCase):
     def test_ladder_is_append_only_and_contiguous(self) -> None:
         epochs = [int(value) for value in re.findall(r"epoch:\s*(\d+)\s*,", self.ladder)]
         # Only the SCHEMA_LADDER literal region, not the test fixtures below it.
-        literal = self.ladder[
-            self.ladder.index("pub(crate) const SCHEMA_LADDER") : self.ladder.index(
-                "pub(crate) const SCHEMA_EPOCH_HEAD"
-            )
-        ]
+        literal = self.ladder_literal
         declared = [int(value) for value in re.findall(r"epoch:\s*(\d+)\s*,", literal)]
         self.assertEqual(declared, list(range(1, len(declared) + 1)))
         ids = re.findall(r'id:\s*"([^"]+)"', literal)
@@ -267,11 +456,7 @@ class SchemaLadderGateTest(unittest.TestCase):
         del epochs
 
     def test_steps_are_additive_only(self) -> None:
-        literal = self.ladder[
-            self.ladder.index("pub(crate) const SCHEMA_LADDER") : self.ladder.index(
-                "pub(crate) const SCHEMA_EPOCH_HEAD"
-            )
-        ]
+        literal = self.ladder_literal
         for sql in step_sql_literals(literal):
             lowered = sql.lower()
             for forbidden in FORBIDDEN_STEP_SQL:
@@ -466,6 +651,96 @@ class SchemaLadderGateTest(unittest.TestCase):
         """G-SEAL-5. The seal bit is a literal here, so unsealing fails CI."""
         self.assertIs(self.seal["sealed"], SEALED_EXPECTED)
 
+    # ── G5/G6 ─────────────────────────────────────────────────────────────
+
+    def test_every_shipped_step_digest_is_pinned(self) -> None:
+        """G5. Editing, renumbering or re-identifying a shipped step fails CI.
+
+        The pin is `(epoch, id, digest)` rather than the digest alone so the
+        failure message names WHICH step moved, and so a step that swapped
+        places with another is caught by position as well as by content.
+        """
+        steps = ladder_steps(self.ladder_literal)
+        recorded = tuple(
+            (epoch, identifier, step_digest(epoch, identifier, sql).hex())
+            for epoch, identifier, sql in steps
+        )
+        self.assertEqual(
+            recorded,
+            SEALED_STEP_DIGESTS,
+            "a shipped ladder step's epoch, id or SQL changed: a step's digest "
+            "is chained into every archive's recorded schema_epoch marker, so "
+            "editing one strands every archive that already took it. Append a "
+            "NEW step instead; if this really is a new step, add its pin to "
+            "SEALED_STEP_DIGESTS in this gate script",
+        )
+
+    def test_ladder_chain_head_is_pinned(self) -> None:
+        """G6. The chain the archives record, pinned end to end.
+
+        Catches what the per-step tuple alone cannot: a move of
+        BASELINE_DIGEST, which the tuple does not mention and on which the
+        chain is anchored.
+        """
+        steps = ladder_steps(self.ladder_literal)
+        self.assertEqual(
+            ladder_chain_head(steps, declared_baseline_digest(self.ladder)).hex(),
+            SEALED_LADDER_CHAIN_HEAD,
+            "the ladder chain moved: appending a step must also move "
+            "SEALED_LADDER_CHAIN_HEAD in this gate script",
+        )
+
+    def test_step_digest_agrees_with_the_rust_implementation(self) -> None:
+        """G5's cross-check. Two languages, one digest, one pinned value.
+
+        This gate computes step digests independently of `schema_ladder.rs`, so
+        the pin is only worth anything if the two agree. The same triple and
+        the same expected hex are asserted in
+        `cp::schema_epoch::wal::advance`'s tests against the real
+        `schema_ladder::step_digest`; a drift in domain separation, integer
+        width or length framing on either side fails on that side.
+        """
+        epoch, identifier, sql = CROSS_CHECKED_STEP
+        self.assertEqual(
+            step_digest(epoch, identifier, sql).hex(), CROSS_CHECKED_STEP_DIGEST
+        )
+
+    def test_step_sql_is_digested_by_value_and_never_by_source_text(self) -> None:
+        """A literal's escapes must be decoded before it is digested.
+
+        Digesting the source text would produce a pin that is stable and
+        WRONG -- on a different string than the compiler builds -- for any step
+        using `\\"`, `\\\\` or the line continuation the ladder's own docs
+        recommend for multi-line SQL.
+        """
+        self.assertEqual(rust_string_literal_value(r"a\"b"), 'a"b')
+        self.assertEqual(rust_string_literal_value(r"a\\b"), "a\\b")
+        self.assertEqual(rust_string_literal_value(r"a\nb"), "a\nb")
+        self.assertEqual(rust_string_literal_value("CREATE \\\n      INDEX"), "CREATE INDEX")
+        # Fail closed on anything unrecognised rather than digesting a guess.
+        with self.assertRaises(ValueError):
+            rust_string_literal_value(r"a\qb")
+        with self.assertRaises(ValueError):
+            rust_string_literal_value("trailing\\")
+
+    def test_ladder_steps_parse_both_literal_shapes_and_fail_closed(self) -> None:
+        plain = (
+            'SchemaStep { epoch: 1, id: "0001_x", class: StepClass::Index, '
+            'sql: "CREATE INDEX a ON t (\\"c\\");" }'
+        )
+        self.assertEqual(
+            ladder_steps(plain), [(1, "0001_x", 'CREATE INDEX a ON t ("c");')]
+        )
+        raw = (
+            'SchemaStep { epoch: 2, id: "0002_y", class: StepClass::Table, '
+            'sql: r#"CREATE TABLE y (a TEXT)"# }'
+        )
+        self.assertEqual(ladder_steps(raw), [(2, "0002_y", "CREATE TABLE y (a TEXT)")])
+        # A struct the parser cannot read must stop the build, never be
+        # silently skipped out of the pinned set.
+        with self.assertRaises(ValueError):
+            ladder_steps('SchemaStep { epoch: 3, class: StepClass::Index }')
+
     def test_ladder_step_requires_a_sealed_baseline(self) -> None:
         """G4. No step may ship over a baseline that can still move.
 
@@ -473,11 +748,7 @@ class SchemaLadderGateTest(unittest.TestCase):
         anchor is movable produces a chain that changes retroactively, so
         every archive that recorded the old chain is refused.
         """
-        literal = self.ladder[
-            self.ladder.index("pub(crate) const SCHEMA_LADDER") : self.ladder.index(
-                "pub(crate) const SCHEMA_EPOCH_HEAD"
-            )
-        ]
+        literal = self.ladder_literal
         if re.search(r"epoch:\s*\d+\s*,", literal):
             self.assertTrue(
                 self.seal["sealed"],
@@ -490,4 +761,6 @@ if __name__ == "__main__":
         raise SystemExit(print_digest())
     if "--print-seal-chain" in sys.argv:
         raise SystemExit(print_seal_chain())
+    if "--print-ladder-pins" in sys.argv:
+        raise SystemExit(print_ladder_pins())
     unittest.main(verbosity=2)

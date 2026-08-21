@@ -8033,11 +8033,32 @@ fn sqlite_immutable_uri(path: &Path) -> Result<String> {
 
 pub(crate) type SchemaDescriptorRow = (String, String, String, String);
 
+/// Every `sqlite_schema` row except the names SQLite reserves for itself.
+///
+/// # Why the `ESCAPE`
+///
+/// The exclusion was written `name NOT LIKE 'sqlite_%'`, in which `_` is
+/// LIKE's **single-character wildcard**. SQLite reserves only the literal
+/// seven-character prefix `sqlite_` (`sqlite3CheckObjectName`, case
+/// insensitive), so `sqlitew`, `sqlitex` and `SQLITEQ_x` are legal user DDL —
+/// verified directly: `CREATE TRIGGER sqlitew AFTER INSERT ON episodes …` is
+/// accepted, and the unescaped predicate discarded it before any caller saw
+/// it. All three callers of this function compare a live database against a
+/// canonical build, so a discarded row is a discarded *difference*: an
+/// undeclared trigger on a product table produced a byte-identical descriptor
+/// to a clean archive.
+///
+/// `LIKE 'sqlite\_%' ESCAPE '\'` matches exactly the reserved prefix and keeps
+/// LIKE's default ASCII case-insensitivity, so it is identical to the intended
+/// semantics on every name SQLite can actually create (`sqlite_sequence`,
+/// `sqlite_autoindex_*`, `sqlite_stat1`) and strictly stronger on everything
+/// else. `GLOB 'sqlite_*'` was rejected as the fix: GLOB is case-sensitive,
+/// which would have been a second, unrelated behaviour change.
 pub(crate) fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescriptorRow>> {
     let mut statement = conn.prepare(
-        "SELECT type,name,tbl_name,coalesce(sql,'')
+        r"SELECT type,name,tbl_name,coalesce(sql,'')
          FROM sqlite_schema
-         WHERE name NOT LIKE 'sqlite_%'
+         WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\'
          ORDER BY type,name,tbl_name,coalesce(sql,'')",
     )?;
     let rows = statement
@@ -8052,10 +8073,35 @@ pub(crate) fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescripto
 /// database would receive, without mutating the target. Older or extra schema
 /// fails closed until a separately authorized migration runs under legacy
 /// persistence.
+///
+/// # Epoch awareness
+///
+/// The comparand is `build_canonical(marker.epoch)`, not a bare baseline. This
+/// is a change of pinned VALUE (*which* canonical) under an unchanged RULE
+/// (verbatim descriptor equality, refuse on mismatch), and it strictly *adds*
+/// two refusals ahead of the comparison it already performed:
+///
+/// * an archive with no epoch marker is refused rather than compared — before
+///   this, a database built by a binary older than the sealed re-baseline was
+///   only caught if its descriptor happened to differ;
+/// * an archive whose recorded epoch this binary cannot serve, or whose
+///   recorded chain is not this binary's `BASELINE_DIGEST` + `SCHEMA_LADDER`,
+///   is refused. The chain conjunct is what stops the marker being
+///   self-certifying: the archive supplies the epoch, but the comparand is
+///   recomputed here.
+///
+/// While the ladder is empty every archive is at epoch 0 and
+/// `build_canonical(0)` is exactly the bare baseline, so nothing else moves.
+/// The `user_version` / `application_id` comparison below is deliberately left
+/// alone and stays absolute: `build_canonical` never sets `user_version`, so
+/// making it epoch-relative is what would turn it into the tautology where the
+/// archive supplies the value that selects its own comparand.
 fn validate_wal_logical_schema(conn: &Connection) -> Result<()> {
-    let canonical = Connection::open_in_memory()?;
-    canonical.execute_batch(SCHEMA_SQL)?;
-    run_migrations(&canonical)?;
+    let marker =
+        crate::schema_ladder::read_archive_epoch(conn).map_err(|_| wal_logical_only_error())?;
+    crate::schema_ladder::validate_servable_epoch(marker).map_err(|_| wal_logical_only_error())?;
+    let canonical = crate::schema_ladder::build_canonical(marker.epoch)
+        .map_err(|_| wal_logical_only_error())?;
     let current_versions = (
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
         conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?,
