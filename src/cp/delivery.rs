@@ -7,7 +7,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::cp::CpState;
-use crate::error::Result;
+use crate::error::{wal_domain, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecisionDetail {
@@ -54,6 +54,14 @@ pub async fn load_finalized_episode(
     user_id: &str,
     episode_id: i64,
 ) -> Result<Option<FinalizedEpisode>> {
+    // ADR-0022 D4: the brief join is not migrated. Every outbound channel
+    // gates its own sweep before reaching here, so this is the backstop —
+    // and it must REFUSE, never answer `Ok(None)`: the webhook worker reads
+    // `None` as `event_data_missing` and terminalises the delivery, so a
+    // silent empty here would destroy the outbox instead of deferring it.
+    if let Some(error) = state.wal_domain_refusal(user_id, wal_domain::DELIVERY_FINALIZED_EPISODE) {
+        return Err(error);
+    }
     let user = user_id.to_string();
     state
         .store
@@ -108,5 +116,27 @@ mod tests {
             parse_string_list(Some("invalid".to_string())),
             Vec::<String>::new()
         );
+    }
+
+    /// ADR-0022 D4. The finalized-brief loader is deferred, and it must REFUSE
+    /// rather than answer `Ok(None)`: the webhook worker reads `None` as
+    /// `event_data_missing` and terminalises the delivery, so a silent empty
+    /// would destroy the outbox instead of deferring it.
+    #[tokio::test]
+    async fn a_deferred_brief_load_refuses_instead_of_reporting_no_brief() {
+        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state};
+        use crate::error::{wal_domain, EnclaveError};
+
+        let state = state();
+        let user_id = "delivery-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        match load_finalized_episode(&state, user_id, 1).await {
+            Err(EnclaveError::WalDomainUnmigrated(domain)) => {
+                assert_eq!(domain, wal_domain::DELIVERY_FINALIZED_EPISODE);
+            }
+            Ok(None) => panic!("a deferred brief must never be reported as absent"),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 }

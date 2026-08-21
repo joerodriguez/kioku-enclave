@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::cp::delivery;
 use crate::cp::email_renderer;
 use crate::cp::{isotime, CpState};
-use crate::error::Result;
+use crate::error::{wal_domain, Result};
 
 const MAX_DELIVERIES_PER_SWEEP: usize = 10;
 const MAX_ATTEMPTS: i32 = 10;
@@ -243,6 +243,15 @@ pub async fn deliver_user_emails(
             break;
         }
 
+        // ADR-0022 D4: the outbox scan is not migrated (`next_email_delivery`
+        // goes through the legacy per-user store), so no delivery can be
+        // selected and nothing below this line is reachable. The gate sits
+        // HERE, after the preference check above, because the cancellation
+        // ladder it can reach IS migrated and must keep running. `break`
+        // leaves exactly one counted skip per pass and no leased row.
+        if state.wal_domain_skipped(user_id, wal_domain::EMAIL_WORKER_OUTBOX) {
+            break;
+        }
         let Some(outbox) = state.store.next_email_delivery(user_id).await? else {
             break;
         };
@@ -849,5 +858,80 @@ mod tests {
 
         let due = store.next_email_delivery(&user.id).await.unwrap();
         assert!(due.is_none());
+    }
+
+    /// ADR-0022 D4. A real, due delivery exists and the transport would send
+    /// it; once the user's archive is WAL-authoritative the outbox scan is a
+    /// deferred domain, so the pass must be INERT — Ok, exactly one counted
+    /// skip, and zero provider calls. The gate sits after the preference check
+    /// because the cancellation ladder it can reach IS migrated.
+    #[tokio::test]
+    async fn a_deferred_email_outbox_sends_nothing_and_counts_one_skip() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+        use crate::error::wal_domain;
+
+        let state = state();
+        let user = state
+            .control
+            .upsert_user(
+                "google-sub-d4-email",
+                "deferred@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        state
+            .control
+            .set_email_preference(&user.id, true, false)
+            .await
+            .unwrap();
+        state.store.with_user(&user.id, |conn| {
+            conn.execute_batch(
+                "INSERT INTO episodes (id, started_at, ended_at, finalized_at, title, summary, substance)
+                 VALUES (1, '2026-07-30T10:00:00Z', '2026-07-30T10:30:00Z', '2026-07-30T10:30:00Z', 'Title', 'Summary', 'normal');
+                 INSERT INTO episode_final_briefs (episode_id, overview, decisions, action_items, important_links, open_questions)
+                 VALUES (1, 'Overview', '[]', '[]', '[]', '[]');"
+            )?;
+            Ok(())
+        }).await.unwrap();
+        state
+            .store
+            .enqueue_email_delivery(&user.id, 1, 1, false)
+            .await
+            .unwrap();
+        // The delivery really is due before the gate exists for this user.
+        assert!(state
+            .store
+            .next_email_delivery(&user.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        select_wal_authoritative(&state.store, &user.id);
+        let transport = FakeEmailTransport::new();
+        let (captured, guard) = capture_events();
+        deliver_user_emails(&state, &transport, &user.id)
+            .await
+            .expect("a deferred domain defers; it must not fail the sweep");
+        drop(guard);
+
+        assert!(
+            transport.get_sent_requests().await.is_empty(),
+            "a gated pass must make zero provider calls"
+        );
+        assert_eq!(
+            captured.skips(wal_domain::EMAIL_WORKER_OUTBOX),
+            1,
+            "exactly one counted skip per pass: {}",
+            captured.text()
+        );
+        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
+        assert!(
+            !captured
+                .text()
+                .contains("delivering transactional episode email"),
+            "{}",
+            captured.text()
+        );
     }
 }

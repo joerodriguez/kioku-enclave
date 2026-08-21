@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::error::{EnclaveError, Result};
+use crate::error::{wal_domain, EnclaveError, Result};
 use crate::store::Store;
 
 use super::media::{parse_audio_result, AudioTurn};
@@ -3398,6 +3398,13 @@ async fn process_user(state: &CpState, user_id: &str) {
         // settled gate re-checks open sessions and remaining media work.
         super::summarizer::kick_session_settled(user_id);
     }
+    // ADR-0022 D4: the voice-profile reconciliation and lineage tail is not
+    // migrated. The gate sits HERE, after the migrated claim/result/failure
+    // lanes above have run — gating this worker at the top would disable the
+    // slice-10i screen lane, which is live for WAL-authoritative users.
+    if state.wal_domain_skipped(user_id, wal_domain::MEDIA_WORKER_VOICE_PROFILES) {
+        return;
+    }
     match state
         .store
         .with_user(user_id, |conn| {
@@ -3588,6 +3595,13 @@ async fn prune_user_media_store(store: &Store, user_id: &str) {
 }
 
 async fn process_user_voice_embedding_jobs(state: &CpState, user_id: &str) {
+    // ADR-0022 D4: the voice-embedding lane is not migrated — every lease,
+    // reconstruction, and enrolment below goes through the legacy per-user
+    // store. The migrated media lanes (claim, work-unit result, retention)
+    // ran earlier in this same sweep and are deliberately untouched.
+    if state.wal_domain_skipped(user_id, wal_domain::MEDIA_WORKER_VOICE_EMBEDDING) {
+        return;
+    }
     let now = now_iso();
     let worker_id = "media_worker";
     let lease_token = format!(
@@ -6585,6 +6599,134 @@ mod tests {
         assert!(
             !source[legacy_start..legacy_end].contains("transcript_target_conflict"),
             "the legacy sweep cannot produce the code and stays byte-intact"
+        );
+    }
+
+    /// ADR-0022 D4 is a PER-DOMAIN gate, never a per-worker one. Slice 10i
+    /// opened the media claim boundary for WAL-authoritative users and the
+    /// screen lane is live; a gate at the top of this worker would silently
+    /// disable it. This pins the placement in production source.
+    #[test]
+    fn the_wal_gate_covers_only_the_unmigrated_voice_domains() {
+        let whole = include_str!("media_worker.rs");
+        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
+
+        // Exactly two gates, and both name a voice domain.
+        assert_eq!(
+            source.matches(concat!("wal_domain_", "skipped(")).count(),
+            2,
+            "the media lanes must not acquire a gate"
+        );
+        assert_eq!(source.matches("MEDIA_WORKER_VOICE_EMBEDDING").count(), 1);
+        assert_eq!(source.matches("MEDIA_WORKER_VOICE_PROFILES").count(), 1);
+
+        let process_start = source.find(concat!("async fn process_", "user(")).unwrap();
+        let process_end = source
+            .find(concat!("async fn prune_user_", "media("))
+            .unwrap();
+        let process = &source[process_start..process_end];
+
+        // The migrated claim and failure lanes run BEFORE the gate.
+        let gate = process
+            .find(concat!("wal_domain_", "skipped("))
+            .expect("process_user gates its voice tail");
+        for migrated in [
+            concat!("claim_media_work_", "unit(state"),
+            concat!("settle_media_work_", "failure(state"),
+        ] {
+            let at = process
+                .find(migrated)
+                .unwrap_or_else(|| panic!("{migrated} must still run for a selected user"));
+            assert!(
+                at < gate,
+                "{migrated} must run before the voice gate, not behind it"
+            );
+        }
+
+        // The migrated per-user lanes carry no gate at all.
+        for (start, end) in [
+            (
+                concat!("async fn resurrect_user_failed_", "jobs("),
+                concat!("async fn claim_media_work_", "unit("),
+            ),
+            (
+                concat!("async fn claim_media_work_", "unit("),
+                concat!("async fn settle_media_work_", "failure("),
+            ),
+            (
+                concat!("async fn settle_media_work_", "failure("),
+                concat!("async fn process_", "user("),
+            ),
+            (
+                concat!("async fn prune_user_media_", "store("),
+                concat!("async fn process_user_voice_embedding_", "jobs("),
+            ),
+        ] {
+            let from = source.find(start).unwrap();
+            let to = source.find(end).unwrap();
+            assert!(
+                !source[from..to].contains(concat!("wal_domain_", "skipped(")),
+                "{start} is migrated and must not be gated"
+            );
+        }
+    }
+
+    /// The voice-embedding lane defers inertly: one counted skip, and none of
+    /// the legacy lease refusal it used to log every sweep.
+    #[tokio::test]
+    async fn the_deferred_voice_embedding_lane_skips_once_without_leasing() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+
+        let state = state();
+        let user_id = "media-voice-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        process_user_voice_embedding_jobs(&state, user_id).await;
+        drop(guard);
+
+        assert_eq!(
+            captured.skips(wal_domain::MEDIA_WORKER_VOICE_EMBEDDING),
+            1,
+            "{}",
+            captured.text()
+        );
+        assert!(
+            !captured
+                .text()
+                .contains("failed to lease voice embedding jobs"),
+            "the gate must stop before the lease, not after it: {}",
+            captured.text()
+        );
+    }
+
+    /// The other half of the same contract, observed at runtime: a selected
+    /// user's pass still ENTERS the migrated claim lane. The harness registers
+    /// no serving authority, so the routed class scan fails and says so —
+    /// which is only reachable if the worker was not gated at its top. The
+    /// voice tail behind it is never reached on that path.
+    #[tokio::test]
+    async fn a_selected_user_still_enters_the_migrated_media_claim_lane() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+
+        let state = state();
+        let user_id = "media-claim-lane-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        process_user(&state, user_id).await;
+        drop(guard);
+
+        assert!(
+            captured.text().contains("media class scan failed"),
+            "the routed media lane must still be attempted: {}",
+            captured.text()
+        );
+        assert_eq!(
+            captured.skips(wal_domain::MEDIA_WORKER_VOICE_PROFILES),
+            0,
+            "the voice gate sits behind the media lanes, not in front of them: {}",
+            captured.text()
         );
     }
 }

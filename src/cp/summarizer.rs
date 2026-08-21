@@ -37,7 +37,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
-use crate::error::{EnclaveError, Result};
+use crate::error::{wal_domain, EnclaveError, Result};
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
 use super::CpState;
@@ -929,6 +929,20 @@ async fn summarize_user_window(
     user_id: &str,
     mode: SummarizeMode,
 ) -> Result<Value> {
+    // ADR-0022 D4: the window's evidence reads (`fetch_range`,
+    // `fetch_open_episodes`) are still legacy, so the window cannot complete
+    // for a WAL-authoritative user however far it gets — the F8 upsert at its
+    // tail IS migrated, but it is unreachable until the reads are. Skipping
+    // before the serializing lock keeps the deferral off other users' path,
+    // and the `skipped` shape lands on `summarize_all`'s `Ok(_) => break`, so
+    // one sweep produces exactly one counted skip and no Vertex call.
+    if state.wal_domain_skipped(user_id, wal_domain::SUMMARIZER_WINDOW) {
+        return Ok(serde_json::json!({
+            "skipped": true,
+            "reason": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+            "domain": wal_domain::SUMMARIZER_WINDOW,
+        }));
+    }
     // Serialize runs: the scheduler's catch-up loop and the session-settled
     // kick (ADR-0034) can fire concurrently for the same user, and two
     // racing runs would summarize the same window and double-create episodes
@@ -1975,6 +1989,14 @@ pub fn kick_session_settled(user_id: &str) {
 /// kick (or the sweep) will retry; running early would summarize a window
 /// whose transcript is still forming and could consume it.
 async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
+    // ADR-0022 D4: the settled predicate reads capture_sessions/media_objects
+    // through the legacy per-user store. Report "not settled" so the kick
+    // path stops here with exactly one counted skip instead of falling
+    // through to the window (which would skip again) — the deferral is inert
+    // either way, but only one of them is counted.
+    if state.wal_domain_skipped(user_id, wal_domain::SUMMARIZER_SESSION_SETTLED) {
+        return false;
+    }
     let result = state
         .store
         .with_user(user_id, |conn| {
@@ -2446,5 +2468,78 @@ mod tests {
         assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT
             .contains("do not classify an episode as useful merely because screenshots exist"));
         assert_ne!(VISUAL_EVIDENCE_BACKFILL_KEY, SUBSTANCE_BACKFILL_KEY);
+    }
+
+    /// ADR-0022 D4. The window's evidence reads are deferred, so a sweep pass
+    /// must be inert: the `skipped` shape (which lands on `summarize_all`'s
+    /// `Ok(_) => break`, so the sweep stops after one), exactly one counted
+    /// skip, and no Vertex call — the gate returns before the range fetch that
+    /// assembles the prompt, so no request can be built at all.
+    #[tokio::test]
+    async fn a_deferred_summarizer_window_skips_once_and_never_calls_vertex() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+        use crate::error::wal_domain;
+
+        let state = state();
+        let user_id = "summarizer-deferred-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        let outcome = summarize_user(&state, user_id)
+            .await
+            .expect("a deferred domain defers; it must not fail the sweep");
+        drop(guard);
+
+        assert_eq!(outcome["skipped"], true);
+        assert_eq!(
+            outcome["reason"],
+            crate::error::WAL_DOMAIN_UNMIGRATED_REASON
+        );
+        assert_eq!(outcome["domain"], wal_domain::SUMMARIZER_WINDOW);
+        // `summarize_all` continues only on an advanced cursor; this shape is
+        // neither `to` nor `no_new_records`, so the pass ends after one skip.
+        assert!(outcome.get("to").is_none());
+        assert_ne!(outcome["reason"], "no_new_records");
+        assert_eq!(
+            captured.skips(wal_domain::SUMMARIZER_WINDOW),
+            1,
+            "exactly one counted skip per pass: {}",
+            captured.text()
+        );
+        assert!(
+            !captured.text().contains("summarized"),
+            "a gated pass must not report work: {}",
+            captured.text()
+        );
+    }
+
+    /// The ADR-0034 kick's settled gate is deferred too, and reports
+    /// "not settled" so the kick stops there with its own counted skip.
+    #[tokio::test]
+    async fn the_deferred_settled_gate_holds_the_kick_with_one_counted_skip() {
+        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+        use crate::error::wal_domain;
+
+        let state = state();
+        let user_id = "summarizer-settled-user";
+        select_wal_authoritative(&state.store, user_id);
+
+        let (captured, guard) = capture_events();
+        assert!(!session_tail_is_settled(&state, user_id).await);
+        drop(guard);
+
+        assert_eq!(
+            captured.skips(wal_domain::SUMMARIZER_SESSION_SETTLED),
+            1,
+            "{}",
+            captured.text()
+        );
+        assert!(
+            !captured
+                .text()
+                .contains("session-settled gate check failed"),
+            "the gate replaces the legacy refusal, it does not add to it: {}",
+            captured.text()
+        );
     }
 }

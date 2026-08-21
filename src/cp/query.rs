@@ -28,6 +28,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::error::wal_domain;
 use crate::search::{search_all, SearchRequest};
 
 use super::auth::AuthUser;
@@ -590,6 +591,22 @@ fn object_array_schema(properties: Value) -> Value {
     })
 }
 
+/// Every tool name `dispatch_tool` answers, in `tool_definitions()` order.
+///
+/// The ADR-0022 D4 gate consults this list so an *unknown* name still falls
+/// through to the JSON-RPC "unknown tool" error instead of being refused as a
+/// deferred domain. `mcp_tool_names_match_the_published_definitions` pins it
+/// against `tool_definitions()`, so a seventh tool cannot silently escape the
+/// gate.
+const MCP_TOOL_NAMES: &[&str] = &[
+    "search_transcripts",
+    "search_screenshots",
+    "get_context",
+    "summarize_time_range",
+    "list_episodes",
+    "get_capture_status",
+];
+
 fn tool_definitions() -> Value {
     json!([
         {
@@ -804,6 +821,26 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
     if let Some(refusal) = super::mcp_safety::refusal_for_args(name, args) {
         return Some(refusal);
     }
+    // ADR-0022 D4: none of the six tools below is migrated -- every one reads
+    // through the legacy per-user store. The gate sits at the single dispatch
+    // point and answers with an `error` key, which sets `isError` on the tool
+    // result. It must never be an empty payload: `list_episodes` and
+    // `get_capture_status` both flatten a failed read into a result with no
+    // `error` key, which the assistant would report as "you have no data"
+    // while the archive is fully present and merely unmigrated.
+    if MCP_TOOL_NAMES.contains(&name) && s.store.is_wal_authoritative(user_id) {
+        tracing::warn!(
+            user_id,
+            metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+            domain = wal_domain::MCP_TOOLS,
+            tool = name,
+            "not migrated to WAL; refusing tool"
+        );
+        return Some(json!({
+            "error": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+            "domain": wal_domain::MCP_TOOLS,
+        }));
+    }
     let result = match name {
         "search_transcripts" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -970,6 +1007,9 @@ async fn rest_search(
         )
             .into_response();
     };
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_SEARCH) {
+        return error.into_response();
+    }
     let args =
         json!({ "query": q, "from": p.from, "to": p.to, "limit": p.limit.unwrap_or(10).min(50) });
     Json(tool_search_transcripts(&s, &user.0, &args).await).into_response()
@@ -989,6 +1029,11 @@ async fn rest_episodes(
     Query(p): Query<EpisodesParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
+    // ADR-0022 D4: `list_episodes_value` flattens any read failure into an
+    // empty list, so an unmigrated archive would be reported as "no episodes".
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODES) {
+        return error.into_response();
+    }
     Json(
         list_episodes_value(
             &s,
@@ -1019,6 +1064,9 @@ async fn rest_episode(
     Query(p): Query<EpisodeParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODES) {
+        return error.into_response();
+    }
     match query_episodes_value(&s, &user.0, None, None, 1, include_low, Some(id)).await {
         Ok(data) => match data
             .get("episodes")
@@ -1053,6 +1101,9 @@ async fn rest_episode_delete(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODE_DELETE) {
+        return error.into_response();
+    }
     // Remove encrypted media before dropping its durable DB references. If a
     // GCS deletion fails, the operation remains retryable and no orphan is
     // silently left behind.
@@ -1160,6 +1211,9 @@ async fn rest_episode_members(
     // expanded episode view renders this as the raw evidence behind the
     // summary. The caller is the authenticated owner of the data; these same
     // rows are already reachable via /api/search and /v1/context.
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODE_MEMBERS) {
+        return error.into_response();
+    }
     let result = s
         .store
         .with_user(&user.0, move |conn| {
@@ -1363,6 +1417,9 @@ async fn rest_browser_snapshot(
     Extension(user): Extension<AuthUser>,
     Path(source_key): Path<String>,
 ) -> Response {
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_BROWSER_SNAPSHOT) {
+        return error.into_response();
+    }
     let result = s
         .store
         .with_user(&user.0, move |conn| {
@@ -1883,6 +1940,9 @@ async fn rest_feed(
     Extension(user): Extension<AuthUser>,
     Query(p): Query<FeedParams>,
 ) -> Response {
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_FEED) {
+        return error.into_response();
+    }
     let result = s
         .store
         .with_user(&user.0, move |conn| query_feed(conn, &p))
@@ -2368,6 +2428,9 @@ async fn rest_screenshot_upload_plan(
             .into_response();
     }
 
+    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN) {
+        return error.into_response();
+    }
     let result = s
         .store
         .with_user(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
@@ -3215,6 +3278,11 @@ async fn rest_screenshot_image_content(
             .into_response();
     }
 
+    if let Some(error) = s.wal_domain_refusal(&user_id, wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT)
+    {
+        return error.into_response();
+    }
+
     // 1. Resolve either a legacy selected-evidence ID or a namespaced Cloud
     // Capture v2 asset ID inside this authenticated user's database.
     let user_id_cloned = user_id.clone();
@@ -3760,22 +3828,49 @@ mod tests {
             )
             .unwrap();
 
-        for tool in [
-            "search_transcripts",
-            "get_context",
-            "summarize_time_range",
-            "search_screenshots",
-        ] {
+        // ADR-0022 D4 extends this to EVERY tool. `list_episodes` and
+        // `get_capture_status` were the two that still flattened a failed read
+        // into a payload with no `error` key -- an authoritative-looking empty
+        // result, which is the exact defect this test exists to prevent.
+        for tool in MCP_TOOL_NAMES {
             let args = json!({"query": "invoice total", "at": "2026-08-20T00:00:00Z",
                               "from": "2026-08-19T00:00:00Z", "to": "2026-08-20T00:00:00Z"});
             let result = dispatch_tool(&state, user_id, tool, &args)
                 .await
                 .unwrap_or_else(|| panic!("{tool} should dispatch"));
-            assert!(
-                result.get("error").is_some(),
-                "{tool} answered an unreadable archive without an error key: {result}"
+            assert_eq!(
+                result["error"],
+                crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
+                "{tool} answered an unmigrated archive without the stable reason: {result}"
             );
+            assert_eq!(result["domain"], wal_domain::MCP_TOOLS, "{tool}");
+            for empty_shape in ["episodes", "results", "utterances", "screenshots"] {
+                assert!(
+                    result.get(empty_shape).is_none(),
+                    "{tool} must not also answer an empty {empty_shape} payload: {result}"
+                );
+            }
         }
+
+        // An unknown name still falls through to the JSON-RPC error rather
+        // than being reported as a deferred domain.
+        assert!(dispatch_tool(&state, user_id, "not_a_tool", &json!({}))
+            .await
+            .is_none());
+    }
+
+    /// The D4 gate consults `MCP_TOOL_NAMES`, so a seventh tool that is not
+    /// listed there would escape the gate and answer from the legacy store.
+    #[test]
+    fn mcp_tool_names_match_the_published_definitions() {
+        let tools = tool_definitions();
+        let published: Vec<&str> = tools
+            .as_array()
+            .expect("tool definitions must be an array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("every tool is named"))
+            .collect();
+        assert_eq!(published, MCP_TOOL_NAMES);
     }
 
     fn query_test_state() -> Arc<CpState> {
@@ -5277,6 +5372,45 @@ mod tests {
         assert_eq!(
             legacy_route.matches(concat!("put_user_", "media(")).count(),
             1
+        );
+    }
+
+    /// The REST twin of the empty-result defect: `list_episodes_value`
+    /// flattens a failed read into `{"episodes": []}`, so before the D4 gate
+    /// `/api/episodes` answered a WAL-authoritative user 200 with an empty
+    /// list — indistinguishable from an account with no memories.
+    #[tokio::test]
+    async fn a_deferred_episode_list_answers_503_instead_of_an_empty_200() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Query, State};
+        use axum::Extension;
+
+        let state = query_test_state();
+        let user_id = "rest-episodes-deferred";
+        select_wal_authoritative(&state.store, user_id);
+
+        let response = rest_episodes(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Query(EpisodesParams {
+                from: None,
+                to: None,
+                max_episodes: None,
+                include_low: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
+        assert_eq!(body["domain"], wal_domain::QUERY_EPISODES);
+        assert!(
+            body.get("episodes").is_none(),
+            "a deferral must never carry an authoritative-looking empty list: {body}"
         );
     }
 }
