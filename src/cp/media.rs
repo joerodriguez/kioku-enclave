@@ -6792,6 +6792,23 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["committed_through_sequence"], 7);
 
+        // The ABSENCE, at the handler. `committed_through_sequence` folds "no
+        // such stream" into `Err(NotFound)` rather than `Ok(None)`, so the
+        // handler's `Err` arm carries two different things: this truthful 404
+        // -- which is exactly what lifting the D4 gate made truthful -- and the
+        // unreachable-archive 503 below. Funnelling the whole arm into 503
+        // would tell a caller their stream might come back later when it never
+        // existed. Only `committed_through_sequence` itself was tested before,
+        // so this arm had no coverage at the route at all.
+        let absent = stream_ack(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("stream-absent".to_string()),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_ne!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
+
         select_wal_authoritative(&state.store, user_id);
         let refused = stream_ack(
             State(Arc::clone(&state)),

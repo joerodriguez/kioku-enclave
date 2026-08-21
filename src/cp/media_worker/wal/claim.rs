@@ -596,9 +596,13 @@ pub(crate) fn probe_claim_lane_for_ingest_regression(
     claimed_at: &str,
     committed_at: &str,
 ) -> ClaimLaneProbe {
+    // The scan's own refusal is propagated verbatim, never collapsed: a
+    // member row the enumeration itself cannot resolve (an over-long
+    // `updated_at`, say) wedges the lane exactly as a guard refusal does, and
+    // a caller has to be able to tell the two apart.
     let scan = match scan_for_claim(connection, class, processor_version, claimed_at, scan_limit) {
         Ok(scan) => scan,
-        Err(_) => return ClaimLaneProbe::Refused(WalIdempotencyError::Unavailable),
+        Err(error) => return ClaimLaneProbe::Refused(error),
     };
     let observation = match scan {
         ClaimScan::Observed(observation) => *observation,

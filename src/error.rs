@@ -298,6 +298,13 @@ pub mod wal_domain {
     /// A routed read would therefore answer `200 {"people": []}` — a refusal
     /// wearing the face of "you know nobody", the exact shape the rule forbids.
     ///
+    /// That exclusion is enforced, not merely intended:
+    /// `audio_result::tests::e2_identity_exclusion_red_line_holds_after_apply`
+    /// asserts zero rows in `people`, `person_facts` and every voice table
+    /// after a transcript apply, and `test_wal_idempotency_gate.py` refuses an
+    /// `INSERT INTO people` anywhere in the screen family's production half.
+    /// A change that lifts this gate has to move one of those two first.
+    ///
     /// **What actually lifts it.** A sealed WAL family that commits `people`
     /// and `person_facts` for a selected user, wired into those two settles.
     /// Migrating `MEDIA_WORKER_VOICE_EMBEDDING` and

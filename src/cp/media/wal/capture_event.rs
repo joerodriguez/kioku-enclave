@@ -1638,38 +1638,75 @@ mod tests {
     ///
     /// Falsifiability, checked by sabotage: re-binding `commit_stamp()` to
     /// `self.manifest.source_wall_at` makes every case reach
-    /// `ClaimLaneProbe::Refused(Malformed)` (the over-long case fails earlier,
-    /// in `ClaimMember::resolve`'s `MAX_TIMESTAMP_BYTES` bound) and the
-    /// `Constructed` assertion fails.
+    /// `ClaimLaneProbe::Refused` and the `Constructed` assertion fails --
+    /// `Malformed` from the guard for (a) and (b), `Malformed` from
+    /// `ClaimMember::resolve`'s length bound for (c), which never reaches the
+    /// guard at all.
+    ///
+    /// The per-case `Breach` assertions below are load-bearing, not
+    /// decoration. A first draft of this test used `...T14:00:00.000+09:00`
+    /// for (b), which sorts BELOW a 14:05 sweep stamp, so that case passed
+    /// even under full sabotage: the fixture had silently stopped being a
+    /// trigger. Asserting each case's breach against the sweep stamp is what
+    /// makes such a fixture fail loudly instead.
     #[test]
     fn a_poisoned_device_wall_clock_cannot_wedge_the_claim_lane() {
+        use crate::cp::isotime::parse_epoch_millis;
         use crate::cp::media_planner::WorkClass;
         use crate::cp::media_worker::wal::{
             probe_claim_lane_for_ingest_regression, ClaimLaneProbe,
         };
 
+        /// Which of the claim family's two string-shaped bounds a trigger
+        /// breaches when the DEVICE stamp reaches `updated_at`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Breach {
+            /// Sorts above the sweep's enclave `committed_at`, so
+            /// `MediaWorkClaimPlan::new`'s `latest_observed_timestamp` guard
+            /// refuses the plan.
+            SortsAboveCommittedAt,
+            /// Longer than `ClaimMember::resolve`'s `MAX_TIMESTAMP_BYTES`, so
+            /// the enumeration refuses before the guard is even reached.
+            ExceedsTimestampBound,
+        }
+
         // The enclave's own horizon for the sweep that follows ingest. Both
         // stamps are AFTER `COMMITTED_AT`, exactly as a real sweep's would be.
         const CLAIMED_AT: &str = "2026-08-15T14:05:00.000Z";
         const SWEEP_COMMITTED_AT: &str = "2026-08-15T14:05:00.500Z";
+        const CLAIM_MAX_TIMESTAMP_BYTES: usize = 64;
 
-        for (case, poisoned) in [
+        for (case, poisoned, future_instant, breach) in [
             // (a) A FUTURE stamp: clock skew, a dead CMOS battery, or a
             //     malicious client. Two days ahead of the sweep.
-            ("future", "2026-08-17T14:00:00.000Z"),
-            // (b) An OFFSET-BEARING stamp. This is a PAST instant --
-            //     2026-08-15T05:00:00Z, nine hours BEFORE the sweep -- yet it
-            //     string-sorts above every `now_iso()` for the next nine
-            //     hours, because '+' (0x2B) does not sort like a digit and
-            //     the year field is already equal.
-            ("offset-bearing", "2026-08-15T14:00:00.000+09:00"),
+            (
+                "future",
+                "2026-08-17T14:00:00.000Z",
+                true,
+                Breach::SortsAboveCommittedAt,
+            ),
+            // (b) An OFFSET-BEARING stamp, and the striking one: a device in
+            //     JST reporting local wall time. It denotes
+            //     2026-08-15T14:00:00Z -- the event's own instant, five
+            //     minutes BEFORE the sweep -- yet its TEXT begins `...T23:`
+            //     and therefore sorts above every `now_iso()` until 23:00Z.
+            //     No clock is wrong anywhere.
+            (
+                "offset-bearing",
+                "2026-08-15T23:00:00.000+09:00",
+                false,
+                Breach::SortsAboveCommittedAt,
+            ),
             // (c) More than three fractional digits. `parse_epoch_millis`
             //     ignores everything past the third, so validation accepts it;
-            //     the string is 71 bytes, over `ClaimMember::resolve`'s
-            //     64-byte `MAX_TIMESTAMP_BYTES` bound.
+            //     the string is 65 bytes, over `ClaimMember::resolve`'s
+            //     64-byte `MAX_TIMESTAMP_BYTES` bound. It denotes the event's
+            //     own instant, so again no clock is wrong.
             (
                 "over-long fractional",
                 "2026-08-15T14:00:00.000000000000000000000000000000000000000000000Z",
+                false,
+                Breach::ExceedsTimestampBound,
             ),
         ] {
             let mut poisoned_manifest = manifest(0, "screen-event-0", "screen-asset-0");
@@ -1679,6 +1716,33 @@ mod tests {
             poisoned_manifest
                 .validate()
                 .unwrap_or_else(|error| panic!("{case}: ingest must admit this stamp: {error}"));
+
+            // ... and every trigger must still BE a trigger. Without these, a
+            // fixture that quietly stopped breaching either bound would pass
+            // this test while covering nothing.
+            let sweep_millis = parse_epoch_millis(SWEEP_COMMITTED_AT).unwrap();
+            let poisoned_millis = parse_epoch_millis(poisoned)
+                .unwrap_or_else(|| panic!("{case}: the trigger must parse"));
+            assert_eq!(
+                poisoned_millis > sweep_millis,
+                future_instant,
+                "{case}: the trigger's INSTANT is what the comment claims"
+            );
+            match breach {
+                Breach::SortsAboveCommittedAt => {
+                    assert!(
+                        poisoned > SWEEP_COMMITTED_AT,
+                        "{case}: must string-sort above the sweep stamp to reach the guard"
+                    );
+                    assert!(poisoned.len() <= CLAIM_MAX_TIMESTAMP_BYTES);
+                }
+                Breach::ExceedsTimestampBound => {
+                    assert!(
+                        poisoned.len() > CLAIM_MAX_TIMESTAMP_BYTES,
+                        "{case}: must exceed ClaimMember::resolve's timestamp bound"
+                    );
+                }
+            }
 
             let mut connection = connection();
             execute_prepared_for_owner(
