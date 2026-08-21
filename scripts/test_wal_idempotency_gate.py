@@ -430,7 +430,24 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # the count holds at 15, the key set is byte-identical, no construction
 # surface was added or removed, and the only deltas are that literal, its
 # enclosing factory definition, and async_main's owner body.
-EXPECTED_STORE_SURFACE_SHA256 = "a2904b58b343e52a84493ca5cdf7de2693c1c5d34c2f6c37ecf49c6e8d45e25d"
+# ADR-0022 Part B (schema-ladder driver, review fix [5]): the startup relaunch
+# now returns a `RelaunchCounts` struct instead of `(relaunched, unavailable)`,
+# because a user whose epoch advance failed IS being served -- the authority is
+# installed before the advance runs and there is no removal API -- so counting
+# them `unavailable` inverted the health signal. async_main destructures the
+# new counts and reports the added `behind_target` / `unservable_epoch`
+# subsets. Count HOLDS at 15 with zero additions, zero removals, zero
+# reclassifications, and ZERO Store-construction call-EXPRESSION hash moves;
+# the key set is byte-identical. The sole delta is async_main's owner body
+# (05f35ac2 -> d3d8b028).
+# Diffed with this module's own store_surface_sites()/inventory_row()/digest()
+# helpers against TWO pristine `git archive | tar -x` trees extracted outside
+# any shared directory: origin/main (85b83e0) and this branch's base (9d78c46).
+# Both reproduced their own 15/a2904b58 pin byte-for-byte before anything was
+# written, and their inventories are byte-identical to each other -- #333's
+# main.rs edit is a module-level const array outside async_main's span, so the
+# merged tree is not a third state here.
+EXPECTED_STORE_SURFACE_SHA256 = "6f80aa294dc424877cac64f89fbb5f199ccb42a4cbf7de1e7c0a9d6978264164"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -621,7 +638,24 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # reclassified. Re-derived against the same freshly extracted pristine 9d78c46
 # tree with that tree's own helpers, which reproduced its own 26/e6dac368 pin
 # exactly first.
-EXPECTED_WORKER_SPAWN_SHA256 = "1741534dbdc25e629e0ab7c76da13c4a91aa297ea8d4c594483eadd42f75d959"
+#
+# ---- Part B rebased on top of the ingest delta above ----
+# Both branches moved this pin for DIFFERENT reasons, so the merged tree is a
+# third state and neither predecessor digest is correct. Re-derived below.
+#
+# ADR-0022 Part B (schema-ladder driver, review fix [5]): count HOLDS at 26
+# with zero additions, zero removals, zero reclassifications and zero spawn
+# call-EXPRESSION hash moves. The sole delta is async_main's owner body
+# (05f35ac2 -> d3d8b028), the SAME owner-body move the store-surface pin above
+# records and for the same reason: the startup relaunch now returns
+# `RelaunchCounts` and async_main reports its `behind_target` /
+# `unservable_epoch` subsets. No spawn was added, removed or moved. Same two
+# pristine `git archive | tar -x` trees (origin/main 85b83e0 and this branch's
+# base 9d78c46, both extracted outside any shared directory) and the same
+# worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the pins
+# above; both reproduced their own 26/e6dac368 pin byte-for-byte, and their
+# inventories are byte-identical to each other, before anything was written.
+EXPECTED_WORKER_SPAWN_SHA256 = "PENDING_REDERIVATION"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

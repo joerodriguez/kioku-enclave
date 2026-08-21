@@ -8033,11 +8033,32 @@ fn sqlite_immutable_uri(path: &Path) -> Result<String> {
 
 pub(crate) type SchemaDescriptorRow = (String, String, String, String);
 
+/// Every `sqlite_schema` row except the names SQLite reserves for itself.
+///
+/// # Why the `ESCAPE`
+///
+/// The exclusion was written `name NOT LIKE 'sqlite_%'`, in which `_` is
+/// LIKE's **single-character wildcard**. SQLite reserves only the literal
+/// seven-character prefix `sqlite_` (`sqlite3CheckObjectName`, case
+/// insensitive), so `sqlitew`, `sqlitex` and `SQLITEQ_x` are legal user DDL —
+/// verified directly: `CREATE TRIGGER sqlitew AFTER INSERT ON episodes …` is
+/// accepted, and the unescaped predicate discarded it before any caller saw
+/// it. All three callers of this function compare a live database against a
+/// canonical build, so a discarded row is a discarded *difference*: an
+/// undeclared trigger on a product table produced a byte-identical descriptor
+/// to a clean archive.
+///
+/// `LIKE 'sqlite\_%' ESCAPE '\'` matches exactly the reserved prefix and keeps
+/// LIKE's default ASCII case-insensitivity, so it is identical to the intended
+/// semantics on every name SQLite can actually create (`sqlite_sequence`,
+/// `sqlite_autoindex_*`, `sqlite_stat1`) and strictly stronger on everything
+/// else. `GLOB 'sqlite_*'` was rejected as the fix: GLOB is case-sensitive,
+/// which would have been a second, unrelated behaviour change.
 pub(crate) fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescriptorRow>> {
     let mut statement = conn.prepare(
-        "SELECT type,name,tbl_name,coalesce(sql,'')
+        r"SELECT type,name,tbl_name,coalesce(sql,'')
          FROM sqlite_schema
-         WHERE name NOT LIKE 'sqlite_%'
+         WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\'
          ORDER BY type,name,tbl_name,coalesce(sql,'')",
     )?;
     let rows = statement

@@ -127,43 +127,80 @@
 //!      step would let a second application pass unnoticed, which is exactly
 //!      what the `from_epoch` precondition exists to catch.
 //!
-//! 3. **Append one [`SchemaStep`]** to [`SCHEMA_LADDER`] with
+//! 3. **Bound the step's write cost, in pages, before writing it.** A step's
+//!    DDL text is small and its WAL is not: `CREATE INDEX` over a live table
+//!    produces frames in proportion to the *table*. One advance commit may
+//!    allocate at most `MAX_STEP_ALLOCATED_PAGES` (in
+//!    [`crate::cp::schema_epoch::wal::advance`]) —
+//!    1018 pages ≈ 4 MiB with today's constants, derived from the shadow
+//!    capture's 8 MiB ceiling and the publication ceiling, not chosen. Above
+//!    it the advance refuses, cleanly and repeatably, and **the archive never
+//!    advances at all**; there is no forcing it, because a commit past the
+//!    capture ceiling poisons the owner instead of failing. So estimate first:
+//!    for an index, the new b-tree is roughly (rows × indexed bytes) / 4096
+//!    pages, and the largest archive in the fleet is the one that decides.
+//!    A step that does not fit is a step to **split or narrow** — a partial
+//!    index, a narrower key — never one to ship and hope. Note this is a real
+//!    ceiling on what the ladder can express, and it is deliberately the
+//!    conservative side of a wedge.
+//!
+//! 4. **Append one [`SchemaStep`]** to [`SCHEMA_LADDER`] with
 //!    `epoch: SCHEMA_EPOCH_HEAD + 1`, a fresh never-reused `id` of the form
 //!    `"NNNN_snake_name"`, its class, and the SQL as a plain double-quoted Rust
 //!    literal. **Never edit, reorder or renumber a shipped step** — its digest
 //!    is recorded in the chain every archive carries.
 //!
-//! 4. **Bump [`SCHEMA_EPOCH_HEAD`]** to the new epoch. Leave
+//!    Then **pin it in the gate**: run
+//!    `python3 scripts/test_schema_ladder_gate.py --print-ladder-pins` and
+//!    paste both `SEALED_STEP_DIGESTS` and `SEALED_LADDER_CHAIN_HEAD` into
+//!    `scripts/test_schema_ladder_gate.py`. Gate rules **G5**/**G6** are what
+//!    make "never edit a shipped step" enforceable rather than advisory: no
+//!    runtime check can catch an edited step, because the plan and the running
+//!    binary share one `&'static` ladder by construction, and at `from_epoch`
+//!    0 the recorded chain is the bare baseline anchor and carries no step to
+//!    disagree with. Recompute the pins, never transcribe them.
+//!
+//! 5. **Bump [`SCHEMA_EPOCH_HEAD`]** to the new epoch. Leave
 //!    [`SCHEMA_EPOCH_TARGET`] and [`SCHEMA_EPOCH_MIN_SERVABLE`] alone. Ship.
 //!    This deploys a binary that *knows* the step and applies nothing. The
 //!    rollout gap is deliberate: the step is observed in service before
 //!    anything acts on it.
 //!
-//! 5. **Add the three required tests:** `build_canonical(N)` succeeds; an
+//! 6. **Add the four required tests:** `build_canonical(N)` succeeds; an
 //!    archive advanced `N-1 → N` by the driver has a product descriptor
-//!    byte-identical to `build_canonical(N)`; and the descriptor delta versus
+//!    byte-identical to `build_canonical(N)`; the descriptor delta versus
 //!    `N-1` is exactly the intended object and nothing else, asserted as a
-//!    diff. The end-to-end tests in this module and in
-//!    `crate::cp::schema_epoch::wal::advance` are written to be copied.
+//!    diff; and **the step stays inside the page budget on an archive at the
+//!    fleet's largest realistic row count**, asserted from the pager's own
+//!    counters rather than from the estimate in step 3. The end-to-end tests
+//!    in this module and in `crate::cp::schema_epoch::wal::advance` are
+//!    written to be copied — including
+//!    `a_step_that_exceeds_the_page_budget_is_refused_before_it_writes`.
 //!
-//! 6. **Verify the fleet is on the new binary** — every serving replica
+//! 7. **Verify the fleet is on the new binary** — every serving replica
 //!    reports `SCHEMA_EPOCH_HEAD == N`. Only then, in a **second** PR, bump
 //!    [`SCHEMA_EPOCH_TARGET`] to `N`. Ship.
 //!
-//! 7. **The driver advances each archive by one epoch** under its own lease at
-//!    next admission. Progress is observable as the `schema_epoch` row. No
-//!    manual action, and no batch job: every intermediate epoch is a complete,
-//!    servable state, which is the structural property a drop-and-recreate
-//!    rebuild does not have.
+//! 8. **The driver advances each archive by one epoch** at startup, under its
+//!    own lease, before request admission. Progress is observable as the
+//!    `schema_epoch` row. No manual action, and no batch job: every
+//!    intermediate epoch is a complete, servable state, which is the
+//!    structural property a drop-and-recreate rebuild does not have.
 //!
-//! 8. **When every archive reports `epoch >= N`** and no binary older than the
+//!    An archive that does not reach the target keeps serving at the epoch it
+//!    recorded and is counted `behind_target` at startup — **not**
+//!    `unavailable`, because it is not. That count is the operator signal, and
+//!    it is what blocks step 9.
+//!
+//! 9. **When every archive reports `epoch >= N`** and no binary older than the
 //!    step is in service, bump [`SCHEMA_EPOCH_MIN_SERVABLE`] to `N` in a
 //!    **third** PR. Only after this may reading code assume the new object
-//!    exists.
+//!    exists. A non-zero `behind_target` means this step has not landed
+//!    everywhere; raising the floor over it would refuse those archives.
 //!
-//! 9. **Until step 8 completes, product code must tolerate `epoch < N`.**
-//!    Absence of the new column or table is a legal servable state. Degrade,
-//!    never error.
+//! 10. **Until step 9 completes, product code must tolerate `epoch < N`.**
+//!     Absence of the new column or table is a legal servable state. Degrade,
+//!     never error.
 //!
 //! **Never, at any point after the seal:** edit `SCHEMA_SQL`, the
 //! `run_migrations` body, `cp::media::init_schema`, or

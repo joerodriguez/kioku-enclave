@@ -76,6 +76,83 @@ const BOUNDS: DomainLedgerBounds = DomainLedgerBounds::new(MAX_ROWS, MAX_RESULT_
 /// excluded set contains nothing else.
 const WAL_DOMAIN_PREFIX: &str = "archive_v3_wal_";
 
+// ── The pre-commit write budget ───────────────────────────────────────────
+//
+// A step's DDL is arbitrary, and `CREATE INDEX` over a live table produces WAL
+// in proportion to the table, not to the step's text. Two independent ceilings
+// bound one commit, and BOTH of them are enforced only AFTER the local commit:
+//
+//   * the shadow capture's [`MAX_SHADOW_WAL_BYTES`]. `observe_write` drops the
+//     whole capture generation the moment a WAL write passes it, and never
+//     fails the SQLite write. The step, the marker and the ledger row commit
+//     locally; only then does `take_exact_captured` ask for exactly one
+//     captured commit, find zero, and POISON the owner
+//     (`WalOwnerError::Capture`, which maps to `EnclaveError::Store` and not
+//     to `Conflict`, so the driver's retry arm is not even taken).
+//   * the publication ceiling
+//     `MAX_WAL_SEGMENTS_PER_COMMIT * MAX_WAL_FRAMES_PER_SEGMENT`.
+//
+// A dropped generation is not self-healing: `drop_generation` only clears in
+// `reset_generation`, which needs a WAL truncate, and the owner runs with
+// `wal_autocheckpoint=0`. So an oversized step leaves the archive pinned at
+// its old epoch with a poisoned owner, and the next process start replays the
+// identical too-large step. The largest archives in the fleet would be exactly
+// the ones that could never advance.
+//
+// Everything below therefore has to happen BEFORE the commit, and — because a
+// mid-statement page-cache spill already writes WAL frames — before the step
+// even runs.
+
+/// Frames the shadow capture can hold in one WAL generation.
+///
+/// `observe_write` compares the write's END OFFSET against the byte ceiling,
+/// so this is `(ceiling - header) / frame`, floored.
+const CAPTURE_FRAME_CEILING: u32 = ((crate::archive_v3_shadow::MAX_SHADOW_WAL_BYTES
+    - crate::archive_v3_shadow::SQLITE_WAL_HEADER_BYTES)
+    / crate::archive_v3_shadow::SQLITE_WAL_FRAME_BYTES) as u32;
+
+/// Frames one commit may publish as immutable WAL objects.
+const PUBLICATION_FRAME_CEILING: u32 = crate::archive_v3_shadow_wal::MAX_WAL_SEGMENTS_PER_COMMIT
+    * crate::archive_v3_shadow_wal::MAX_WAL_FRAMES_PER_SEGMENT as u32;
+
+/// The binding ceiling: whichever of the two is reached first.
+const COMMIT_FRAME_CEILING: u32 = if CAPTURE_FRAME_CEILING < PUBLICATION_FRAME_CEILING {
+    CAPTURE_FRAME_CEILING
+} else {
+    PUBLICATION_FRAME_CEILING
+};
+
+/// Reserved for everything in the advance commit that is NOT the step: the
+/// three ledger tables `ensure_schema` creates, the ledger row, the marker
+/// upsert, `sqlite_schema` churn and freelist trunk pages. Generous on
+/// purpose — it is the slack that makes the budget below conservative rather
+/// than exact.
+const ADVANCE_OVERHEAD_PAGES: u32 = 64;
+
+/// Pages one ladder step may allocate.
+///
+/// Half the ceiling, not all of it. The WAL is not truncated between commits
+/// (`wal_autocheckpoint=0`; only `take_checkpoint_source` truncates), so the
+/// step's frames start at whatever offset the generation has already reached.
+/// The driver runs at startup, before request admission, on a freshly opened
+/// archive whose `-wal` is empty — but that is a property of the *caller*, and
+/// a budget that depended on it would break the first time a step was applied
+/// from anywhere else. Halving buys a whole second commit's worth of
+/// generation headroom regardless.
+///
+/// With today's constants: `(8 MiB - 32) / 4120 = 2036` capture frames versus
+/// `16 * 254 = 4064` publication frames, so the ceiling is 2036 and the budget
+/// is 1018 pages — the "conservative 1,024-page budget" the design nominated,
+/// derived rather than transcribed, and guaranteed to move with the constants
+/// instead of disagreeing with them.
+const MAX_STEP_ALLOCATED_PAGES: u32 = COMMIT_FRAME_CEILING / 2;
+
+// The budget plus its reserve must fit under the ceiling it is taken from, or
+// the whole check is decoration. Enforced at compile time so raising either
+// constant without re-deriving the other cannot ship.
+const _: () = assert!(MAX_STEP_ALLOCATED_PAGES + ADVANCE_OVERHEAD_PAGES <= COMMIT_FRAME_CEILING);
+const _: () = assert!(MAX_STEP_ALLOCATED_PAGES > 0);
+
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
 
 /// One sealed advance of one archive by exactly one epoch.
@@ -91,8 +168,15 @@ pub(crate) struct SchemaEpochAdvancePlan {
     /// The ladder this plan was built against. Deliberately **not** part of
     /// the canonical request: the ladder's *content* is already bound exactly
     /// by `step_digest`, `from_chain` and `to_chain`, which are. This field is
-    /// only how `apply` looks the step up, and precondition (3) is what
-    /// refuses a binary whose ladder was edited after the step shipped.
+    /// only how `apply` looks the step up.
+    ///
+    /// It is **not** a defence against a binary whose ladder was edited after
+    /// a step shipped, and no check inside `apply` can be. `LadderView` is
+    /// `Copy` over a `&'static [SchemaStep]`; the constructor stores the view
+    /// verbatim, nothing ever reassigns it, and `apply` reads the step out of
+    /// *this* field — so plan and running binary are one ladder by
+    /// construction and any comparison between them is an identity. What
+    /// actually refuses an edited shipped step is named on check (3) below.
     ladder: LadderView,
 }
 
@@ -211,12 +295,27 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
         Ok(request)
     }
 
-    /// The ten checks of §7.3, in this exact order, every failure closed.
+    /// The checks of §7.3, in this exact order, every failure closed.
     ///
     /// The whole body runs inside the owner's single `BEGIN IMMEDIATE`, which
     /// the shared gate supplies by signature. SQLite DDL is transactional, so
     /// the step, the marker upsert and the ledger row commit or roll back as
-    /// one — there is no half-applied schema and no wedge.
+    /// one: **there is no half-applied schema.**
+    ///
+    /// # There IS a wedge, and check (6) is what forecloses it
+    ///
+    /// This docstring used to claim "no half-applied schema and no wedge". The
+    /// first half is true and the second was false. Rolling the SQLite
+    /// transaction back does not roll back the shadow capture: a commit whose
+    /// WAL passes [`CAPTURE_FRAME_CEILING`] is dropped by the capture, commits
+    /// LOCALLY anyway, and then poisons the owner when publication finds no
+    /// captured commit to drain. Nothing about that is recoverable in-process,
+    /// and the next start replays the identical step.
+    ///
+    /// Check (6) is the only thing standing between an oversized step and that
+    /// outcome, and it has to run *before* the step executes, because a
+    /// mid-statement page-cache spill writes WAL frames of its own — measured:
+    /// a `CREATE INDEX` that was rolled back still left 1.1 MB in the `-wal`.
     fn apply(&self, transaction: &Transaction<'_>) -> Result<WalReplayResult> {
         // (1) Exact CAS on the marker. NEVER `>=`: a second application of a
         // shipped step must be refused, not adopted.
@@ -231,6 +330,17 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Precondition);
         }
 
+        // (2) and (3) are STRUCTURAL RE-ASSERTIONS, not guards. Both are
+        // stated in terms of `self.ladder`, which is the same `LadderView` the
+        // constructor derived `to_epoch`, `step_digest`, `from_chain` and
+        // `to_chain` from, so neither can fire today. They are kept because
+        // they are the invariant the fields are supposed to satisfy, and a
+        // future refactor that lets the fields and the ladder drift apart —
+        // deserializing a plan, caching a step, threading a second view — must
+        // land on a refusal here rather than on an applied step. They are
+        // deliberately NOT documented as a defence against anything external;
+        // see the `ladder` field doc and the note under (3).
+
         // (2) Exactly one epoch, and never past what this binary will drive to
         // or could build.
         if self.to_epoch != self.from_epoch.saturating_add(1)
@@ -240,10 +350,27 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Precondition);
         }
 
-        // (3) The running binary's ladder must be the ladder this plan was
-        // built against. A step edited after shipping, a renumbered step, or a
-        // different baseline all land here rather than being applied on top of
-        // a divergent history.
+        // (3) The step this plan committed to is still the step at this epoch.
+        //
+        // What refuses a binary whose ladder was EDITED after a step shipped
+        // is not this check and cannot be — plan and binary share one
+        // `&'static` ladder. It is, in order of when they bite:
+        //
+        //   * CI. `scripts/test_schema_ladder_gate.py` pins every shipped
+        //     step's digest and the ladder's chain head as literals in the
+        //     gate, so editing a step's SQL fails the build unless the gate is
+        //     edited in the same diff. That is the real guard, and it did not
+        //     exist until it was added for this defect: before it, epoch
+        //     contiguity, step-id uniqueness and forbidden SQL were the only
+        //     rules, and an edited step shipped green.
+        //   * check (1), for every archive whose recorded epoch already
+        //     includes the edited step: its chain no longer matches
+        //     `from_chain`, so the CAS refuses. Note the gap this leaves and
+        //     why CI has to be the primary: at `from_epoch = 0` the chain is
+        //     the bare baseline anchor and contains no step at all, so an
+        //     archive at epoch 0 would accept an edited step 1.
+        //   * `FingerprintConflict` in the ledger, for a re-presentation of
+        //     the same operation id with different bytes.
         let step = self
             .ladder
             .step_at(self.to_epoch)
@@ -276,7 +403,26 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Precondition);
         }
 
-        // (6) One `execute_batch`, aborting on the first error.
+        // (6) The pre-commit write budget. See the constants above for why an
+        // oversized commit poisons the owner rather than failing, and why this
+        // has to run before the step rather than after it.
+        //
+        // A step can dirty a page only by taking one off the freelist or by
+        // growing the file, so the budget is enforced in exactly those two
+        // places:
+        //
+        //   * growth is capped by `PRAGMA max_page_count`, which SQLite
+        //     enforces itself — a `CREATE INDEX` that would pass it fails with
+        //     `SQLITE_FULL` and leaves the transaction open and rollable back
+        //     (measured). This is what makes the bound an enforcement rather
+        //     than an estimate.
+        //   * freelist reuse is NOT capped by `max_page_count` — measured: a
+        //     `CREATE INDEX` allocated 711 pages with the growth allowance set
+        //     to zero — so an archive whose freelist alone could exceed the
+        //     budget is refused up front instead.
+        let budget = StepWriteBudget::open(transaction)?;
+
+        // (7) One `execute_batch`, aborting on the first error, under the cap.
         //
         // Note precisely what this does and does not buy. It does NOT provide
         // the all-or-nothing guarantee — the enclosing transaction does, and a
@@ -289,11 +435,13 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
         // The thing that would actually break convergence is committing
         // mid-apply. Never do that here: `apply` must leave the transaction
         // exactly as it found it or fail.
-        transaction
-            .execute_batch(step.sql)
-            .map_err(|_| WalIdempotencyError::Unavailable)?;
+        let executed = transaction.execute_batch(step.sql);
 
-        // (7) Post-state pin. This single check subsumes every worry about
+        // (8) Release the cap before anything else can fail, then charge the
+        // step against the budget from the counters rather than from trust.
+        budget.close(transaction, executed)?;
+
+        // (9) Post-state pin. This single check subsumes every worry about
         // quoting, whitespace, column position and index reproduction: the
         // archive's text must equal the canonical's text, byte for byte.
         let canonical_to = self
@@ -304,7 +452,7 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Corrupt);
         }
 
-        // (8) The step must not have orphaned a reference.
+        // (10) The step must not have orphaned a reference.
         let violations: i64 = transaction
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
@@ -314,7 +462,7 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Corrupt);
         }
 
-        // (9) Settle the marker in the SAME transaction, from the plan's own
+        // (11) Settle the marker in the SAME transaction, from the plan's own
         // recorded `to_chain` rather than a recomputation.
         crate::schema_ladder::write_epoch_marker(transaction, self.to_epoch, self.to_chain)
             .map_err(|_| WalIdempotencyError::Corrupt)?;
@@ -329,7 +477,7 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
             return Err(WalIdempotencyError::Corrupt);
         }
 
-        // (10)
+        // (12)
         Ok(WalReplayResult::unit())
     }
 
@@ -343,6 +491,127 @@ impl WalLogicalDomainPlan for SchemaEpochAdvancePlan {
     fn decode_output(&self, result: &WalReplayResult) -> Result<Self::Output> {
         self.validate_replay(result)
     }
+}
+
+/// One step's page budget, held open across the step's execution.
+///
+/// Opened before the step runs and closed immediately after it, so the
+/// `max_page_count` cap exists for exactly the window in which the step is
+/// executing and for no other statement in the advance transaction. The cap is
+/// **connection** state, not transaction state: rolling back does not release
+/// it, so leaking it would leave the owner unable to grow the database for the
+/// rest of the process. `close` therefore releases first and reports second,
+/// and a release that does not read back is `Corrupt` even when the step
+/// itself succeeded.
+struct StepWriteBudget {
+    pages_before: u32,
+    freelist_before: u32,
+    restore_to: u32,
+}
+
+impl StepWriteBudget {
+    fn open(transaction: &Transaction<'_>) -> Result<Self> {
+        let pages_before = pager_counter(transaction, "page_count")?;
+        let freelist_before = pager_counter(transaction, "freelist_count")?;
+        let restore_to = pager_counter(transaction, "max_page_count")?;
+
+        // `max_page_count` bounds the FILE, so it bounds only the growth half
+        // of the step's allocation. Pages taken off the freelist are already
+        // inside the file and pass it untouched, which makes an archive whose
+        // freelist alone could exceed the budget unbounded — refuse it here
+        // rather than let the cap create a false sense of enforcement.
+        if freelist_before > MAX_STEP_ALLOCATED_PAGES {
+            return Err(WalIdempotencyError::Limit);
+        }
+        // `checked_sub` rather than `-`: the conjunct above is what makes the
+        // subtraction safe, and a future edit that weakened it must land on a
+        // refusal here rather than on a debug-build panic in the owner.
+        let growth = MAX_STEP_ALLOCATED_PAGES
+            .checked_sub(freelist_before)
+            .ok_or(WalIdempotencyError::Limit)?;
+        let ceiling = pages_before
+            .checked_add(growth)
+            .ok_or(WalIdempotencyError::Limit)?;
+
+        // Never RAISE an existing cap. If something has already capped this
+        // connection tighter than the budget plus its reserve, that cap is the
+        // authority and this advance refuses instead of widening it.
+        if restore_to < ceiling.saturating_add(ADVANCE_OVERHEAD_PAGES) {
+            return Err(WalIdempotencyError::Precondition);
+        }
+        let applied = set_max_page_count(transaction, ceiling)?;
+        if applied != ceiling {
+            // SQLite clamps a cap below the current size. Unreachable, since
+            // `ceiling >= pages_before` — but if it ever were reached, the cap
+            // in force would not be the one this budget reasons about.
+            let _ = set_max_page_count(transaction, restore_to);
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self {
+            pages_before,
+            freelist_before,
+            restore_to,
+        })
+    }
+
+    /// Release the cap, then charge the step against the budget.
+    fn close(
+        self,
+        transaction: &Transaction<'_>,
+        executed: std::result::Result<(), rusqlite::Error>,
+    ) -> Result<()> {
+        // Release FIRST and unconditionally, before any early return can skip
+        // it, and treat a release that does not read back as the most serious
+        // thing that happened here — a leaked cap outlives the transaction.
+        let released = set_max_page_count(transaction, self.restore_to);
+        if released != Ok(self.restore_to) {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        if let Err(error) = executed {
+            return Err(
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+                    // The cap fired: the step wanted more of the file than one
+                    // publishable commit can carry.
+                    WalIdempotencyError::Limit
+                } else {
+                    WalIdempotencyError::Unavailable
+                },
+            );
+        }
+
+        // Belt: the cap plus the freelist precondition already bound this, so
+        // a violation here means one of them did not hold. Measured from the
+        // pager's own counters rather than assumed.
+        let pages_after = pager_counter(transaction, "page_count")?;
+        let freelist_after = pager_counter(transaction, "freelist_count")?;
+        let allocated = pages_after
+            .saturating_sub(self.pages_before)
+            .saturating_add(self.freelist_before.saturating_sub(freelist_after));
+        if allocated > MAX_STEP_ALLOCATED_PAGES {
+            return Err(WalIdempotencyError::Limit);
+        }
+        Ok(())
+    }
+}
+
+fn pager_counter(connection: &Connection, pragma: &'static str) -> Result<u32> {
+    // `pragma` is one of three `&'static` literals from this module; SQLite
+    // does not accept a bound parameter in a PRAGMA name.
+    let value: i64 = connection
+        .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    u32::try_from(value).map_err(|_| WalIdempotencyError::Corrupt)
+}
+
+fn set_max_page_count(connection: &Connection, value: u32) -> Result<u32> {
+    // `value` is a `u32`, so the formatted statement is a bare integer
+    // literal. PRAGMA values cannot be bound.
+    let applied: i64 = connection
+        .query_row(&format!("PRAGMA max_page_count = {value}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    u32::try_from(applied).map_err(|_| WalIdempotencyError::Corrupt)
 }
 
 /// The product half of [`crate::store::schema_descriptor`].
@@ -365,14 +634,23 @@ fn product_descriptor(conn: &Connection) -> Result<Vec<crate::store::SchemaDescr
         crate::store::schema_descriptor(conn).map_err(|_| WalIdempotencyError::Unavailable)?;
     let mut product = Vec::with_capacity(rows.len());
     for row in rows {
-        let (_, name, table, _) = &row;
-        let wal_named = is_wal_domain_name(name);
-        if wal_named != is_wal_domain_name(table) {
+        let (kind, name, table, _) = &row;
+        // The `type` is part of the exclusion, not decoration. Keying on the
+        // name alone dropped a WAL-named TRIGGER from BOTH descriptors, so
+        // `CREATE TRIGGER archive_v3_wal_evil AFTER INSERT ON
+        // archive_v3_wal_schema_epoch_operations BEGIN DELETE FROM episodes;
+        // END;` compared equal on both sides and then fired on this family's
+        // own ledger INSERT, inside the committed advance transaction.
+        let wal_excluded = is_wal_domain_object(kind, name);
+        if wal_excluded != is_wal_domain_name(table) {
             // A product object attached to a WAL-domain table, or the reverse.
-            // Neither side of the comparison can describe that.
+            // Neither side of the comparison can describe that. This is also
+            // where the WAL-named trigger and the WAL-named view land: their
+            // `tbl_name` is WAL-domain while their `type` keeps them out of
+            // the excluded set, so they are refused rather than dropped.
             return Err(WalIdempotencyError::Corrupt);
         }
-        if wal_named {
+        if wal_excluded {
             continue;
         }
         product.push(row);
@@ -380,9 +658,27 @@ fn product_descriptor(conn: &Connection) -> Result<Vec<crate::store::SchemaDescr
     Ok(product)
 }
 
-/// A WAL bookkeeping object name: the prefix plus a strictly lowercase
-/// `snake_case` tail. Closed-world on purpose — a name that merely *starts*
-/// with the prefix but is otherwise arbitrary is refused rather than excluded.
+/// The `sqlite_schema.type` values legitimate WAL bookkeeping can take.
+///
+/// Verified against the tree: every `archive_v3_wal_*` object created inside
+/// an archive is a table, plus exactly one index
+/// (`archive_v3_wal_selected_screenshot_terminations_episode`). The other two
+/// `archive_v3_wal_*` indexes — `archive_v3_wal_checkpoint_one_active` and
+/// `archive_v3_wal_one_active_attempt` — live in the Control database, which
+/// this descriptor never sees. No WAL family creates a trigger or a view in
+/// the archive.
+const WAL_DOMAIN_TYPES: [&str; 2] = ["table", "index"];
+
+/// A WAL bookkeeping object: an admitted `type`, and the prefix plus a
+/// strictly lowercase `snake_case` tail. Closed-world on purpose — an object
+/// whose name merely *starts* with the prefix, or whose type is not
+/// bookkeeping at all, is refused rather than excluded.
+fn is_wal_domain_object(kind: &str, name: &str) -> bool {
+    WAL_DOMAIN_TYPES.contains(&kind) && is_wal_domain_name(name)
+}
+
+/// The name half of [`is_wal_domain_object`]. Applied on its own to
+/// `tbl_name`, which carries no type of its own.
 fn is_wal_domain_name(name: &str) -> bool {
     name.strip_prefix(WAL_DOMAIN_PREFIX).is_some_and(|tail| {
         !tail.is_empty()
@@ -686,6 +982,18 @@ fn decide_from_marker(marker: ArchiveEpoch, ladder: LadderView) -> Option<Advanc
 /// `from_epoch` comes from the marker and from nothing else: never from a
 /// `MAX`, a `COUNT`, a file measurement, or a config value. The marker is the
 /// only thing that knows where this archive actually is.
+///
+/// # An `Err` here is not an unavailable user
+///
+/// Every refusal this can return — the write-budget `Limit` of check (6), a
+/// transient submit failure, a precondition — leaves the archive **exactly**
+/// at `from_epoch`, which is a complete, servable state by construction. The
+/// owner is not poisoned by any of them: `apply` returning `Err` maps to
+/// `WalOwnerError::Conflict` without touching the poison flag, and check (6)
+/// is what keeps the one refusal that WOULD poison from ever reaching the
+/// commit. So the caller must treat a failure as "this archive did not move",
+/// never as "this user cannot be served" — see
+/// `archive_v3_serving_relaunch::advance_to_target_epoch`.
 pub(crate) async fn advance_one_epoch(
     store: &crate::store::Store,
     user_id: &str,
@@ -738,7 +1046,7 @@ mod tests {
     };
     use crate::schema_ladder::{
         chain_digest, read_archive_epoch, seed_epoch_marker, SchemaStep, StepClass,
-        SCHEMA_EPOCH_TARGET,
+        SCHEMA_EPOCH_HEAD, SCHEMA_EPOCH_TARGET,
     };
 
     const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
@@ -778,6 +1086,24 @@ mod tests {
         id: "0001_capture_events_stream_sequence",
         class: StepClass::Index,
         sql: "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence) ;",
+    }];
+
+    /// A step whose index is far larger than one publishable commit can carry.
+    const LADDER_OVERSIZED: &[SchemaStep] = &[SchemaStep {
+        epoch: 1,
+        id: "0001_probe_budget",
+        class: StepClass::Index,
+        sql: "CREATE INDEX idx_probe_budget ON audio_segments (processing_error);",
+    }];
+
+    /// The same shape over a column three bytes wide. Comfortably inside the
+    /// budget on the identical archive, which is what makes the refusal above
+    /// a statement about the STEP rather than about the fixture.
+    const LADDER_NARROW: &[SchemaStep] = &[SchemaStep {
+        epoch: 1,
+        id: "0001_probe_narrow",
+        class: StepClass::Index,
+        sql: "CREATE INDEX idx_probe_narrow ON audio_segments (source_type);",
     }];
 
     /// A step whose batch fails on its second statement (duplicate index
@@ -820,6 +1146,34 @@ mod tests {
         )
         .unwrap()
             == 1
+    }
+
+    fn pragma(conn: &Connection, name: &'static str) -> u32 {
+        pager_counter(conn, name).unwrap()
+    }
+
+    /// Rows wide enough that indexing `processing_error` costs about one page
+    /// each: a 4000-byte payload is far past an index leaf's maximum local
+    /// payload (~1002 bytes at a 4096-byte page), so every entry pushes an
+    /// overflow page of its own. `audio_segments` is chosen because it carries
+    /// no `REFERENCES`, so no parent rows have to be fabricated and check (8)'s
+    /// `pragma_foreign_key_check` stays clean.
+    fn seed_wide_rows(conn: &Connection, rows: usize) {
+        let value = "p".repeat(4000);
+        conn.execute_batch("BEGIN").unwrap();
+        {
+            let mut statement = conn
+                .prepare(
+                    "INSERT INTO audio_segments
+                        (started_at, ended_at, duration_seconds, source_type, processing_error)
+                     VALUES ('1970-01-01','1970-01-01',1.0,'mic',?1)",
+                )
+                .unwrap();
+            for _ in 0..rows {
+                statement.execute([&value]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
     }
 
     // ── The whole loop: 0 → 1, canonical match, no-op at 1 ────────────────
@@ -1186,6 +1540,24 @@ mod tests {
         assert!(!is_wal_domain_name("archive_v3_wal_Mixed"));
         assert!(!is_wal_domain_name("capture_events"));
 
+        // Only a table or an index can BE bookkeeping. Verified against the
+        // tree: every `archive_v3_wal_*` object inside an archive is a table
+        // plus exactly one index; the other two such indexes live in the
+        // Control database, which this descriptor never sees.
+        assert!(is_wal_domain_object(
+            "table",
+            "archive_v3_wal_schema_epoch_state"
+        ));
+        assert!(is_wal_domain_object(
+            "index",
+            "archive_v3_wal_selected_screenshot_terminations_episode"
+        ));
+        assert!(!is_wal_domain_object(
+            "trigger",
+            "archive_v3_wal_schema_epoch_state"
+        ));
+        assert!(!is_wal_domain_object("view", "archive_v3_wal_anything"));
+
         // An object whose own name is product but whose table is WAL-domain
         // (or the reverse) is refused, not silently dropped by one side.
         archive
@@ -1196,6 +1568,390 @@ mod tests {
         assert_eq!(
             product_descriptor(&archive).unwrap_err(),
             WalIdempotencyError::Corrupt
+        );
+    }
+
+    #[test]
+    fn a_wal_named_trigger_is_refused_rather_than_dropped_from_both_descriptors() {
+        // The exclusion used to key on the NAME alone, so an object whose own
+        // name AND whose `tbl_name` were both well-formed WAL-domain names
+        // vanished from both sides of the comparison and compared equal. This
+        // one then fires on this family's own ledger INSERT, inside the
+        // committed advance transaction, and empties a product table with no
+        // refusal and no visible descriptor difference afterwards.
+        let view = ladder(LADDER_ONE);
+        let mut archive = archive_at_epoch_zero();
+        settle(
+            &mut archive,
+            SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, view).unwrap(),
+        )
+        .unwrap();
+        archive
+            .execute_batch(
+                "CREATE TRIGGER archive_v3_wal_evil
+                 AFTER INSERT ON archive_v3_wal_schema_epoch_operations
+                 BEGIN DELETE FROM episodes; END;",
+            )
+            .unwrap();
+        assert_eq!(
+            product_descriptor(&archive).unwrap_err(),
+            WalIdempotencyError::Corrupt,
+            "a WAL-named trigger on a WAL-domain table must be refused, never excluded"
+        );
+
+        // A WAL-named VIEW carries its own name as `tbl_name`, so the type is
+        // the only thing separating it from bookkeeping.
+        let clean = archive_at_epoch_zero();
+        clean
+            .execute_batch("CREATE VIEW archive_v3_wal_peek AS SELECT 1;")
+            .unwrap();
+        assert_eq!(
+            product_descriptor(&clean).unwrap_err(),
+            WalIdempotencyError::Corrupt
+        );
+
+        // And a WAL-named trigger on a PRODUCT table is not excluded either —
+        // it lands in the product descriptor, where the canonical comparison
+        // has no such object and refuses.
+        let smuggled = archive_at_epoch_zero();
+        let baseline = product_descriptor(&smuggled).unwrap();
+        smuggled
+            .execute_batch(
+                "CREATE TRIGGER archive_v3_wal_on_product
+                 AFTER INSERT ON episodes BEGIN DELETE FROM episodes; END;",
+            )
+            .unwrap();
+        let seen = product_descriptor(&smuggled).unwrap();
+        assert_ne!(seen, baseline);
+        assert!(seen.iter().any(|row| row.1 == "archive_v3_wal_on_product"));
+    }
+
+    #[test]
+    fn a_name_that_only_matches_the_like_wildcard_is_not_hidden_from_the_comparison() {
+        // `WHERE name NOT LIKE 'sqlite_%'` used `_` as LIKE's SINGLE-CHARACTER
+        // WILDCARD, while SQLite reserves only the literal seven-byte prefix.
+        // `CREATE TRIGGER sqlitew AFTER INSERT ON episodes …` is accepted —
+        // verified directly against SQLite — and the unescaped predicate
+        // discarded it before either descriptor saw it, so an archive carrying
+        // an undeclared trigger on a product table produced a byte-identical
+        // descriptor to a clean one and passed both the pre- and the post-state
+        // pin.
+        let archive = archive_at_epoch_zero();
+        let clean = product_descriptor(&archive).unwrap();
+        for name in ["sqlitew", "sqlitex", "SQLITEQ_x"] {
+            archive
+                .execute_batch(&format!(
+                    "CREATE TRIGGER {name} AFTER INSERT ON episodes
+                     BEGIN DELETE FROM episodes; END;"
+                ))
+                .unwrap();
+        }
+        let smuggled = product_descriptor(&archive).unwrap();
+        assert_ne!(
+            smuggled, clean,
+            "an object SQLite does not reserve must be visible to the comparison"
+        );
+        for name in ["sqlitew", "sqlitex", "SQLITEQ_x"] {
+            assert!(smuggled.iter().any(|row| row.1 == name));
+        }
+
+        // And the genuinely reserved prefix stays excluded, or every archive
+        // with an AUTOINCREMENT table would fail its own canonical comparison.
+        seed_wide_rows(&archive, 1);
+        let sequence_exists: i64 = archive
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name='sqlite_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sequence_exists, 1,
+            "the fixture must exercise a real reserved name"
+        );
+        assert!(product_descriptor(&archive)
+            .unwrap()
+            .iter()
+            .all(|row| !row.1.starts_with("sqlite_")));
+    }
+
+    // ── The pre-commit write budget ──────────────────────────────────────
+
+    #[test]
+    fn the_page_budget_is_derived_from_the_capture_and_publication_ceilings() {
+        // Derived, never transcribed. The design nominated "a conservative
+        // 1,024-page budget"; 1024 was a number that could silently disagree
+        // with the constants it is supposed to respect, so this asserts the
+        // derivation instead and lets the value follow.
+        assert_eq!(
+            CAPTURE_FRAME_CEILING,
+            ((8 * 1024 * 1024 - 32) / (24 + 4096)) as u32,
+            "the shadow capture's byte ceiling, in whole frames"
+        );
+        assert_eq!(CAPTURE_FRAME_CEILING, 2036);
+        assert_eq!(PUBLICATION_FRAME_CEILING, 16 * 254);
+        assert_eq!(PUBLICATION_FRAME_CEILING, 4064);
+        // The capture is the tighter of the two, which is the whole reason the
+        // publication ceiling alone would have been the wrong bound.
+        assert_eq!(COMMIT_FRAME_CEILING, CAPTURE_FRAME_CEILING);
+        assert_eq!(MAX_STEP_ALLOCATED_PAGES, 1018);
+        // `const` blocks: these are compile-time facts, and clippy is right
+        // that a runtime `assert!` over constants proves nothing at run time.
+        // The budget plus its reserve must fit under BOTH ceilings, or the
+        // check in `apply` is decoration.
+        const { assert!(MAX_STEP_ALLOCATED_PAGES + ADVANCE_OVERHEAD_PAGES <= COMMIT_FRAME_CEILING) };
+        const { assert!(MAX_STEP_ALLOCATED_PAGES + ADVANCE_OVERHEAD_PAGES <= PUBLICATION_FRAME_CEILING) };
+    }
+
+    #[test]
+    fn a_step_that_exceeds_the_page_budget_is_refused_before_it_writes() {
+        // The defect this exists for: `execute_batch(step.sql)` had no bound
+        // at all. A step whose WAL passes MAX_SHADOW_WAL_BYTES is dropped by
+        // the capture, COMMITS LOCALLY anyway, and then poisons the owner when
+        // publication finds nothing to drain — as `WalOwnerError::Capture`,
+        // which maps to `Store` and not `Conflict`, so the driver's retry arm
+        // is not even taken. The archive is then pinned at its old epoch for
+        // good and the next process start replays the identical step.
+        let mut archive = archive_at_epoch_zero();
+        seed_wide_rows(&archive, 1400);
+        let before = product_descriptor(&archive).unwrap();
+        let cap_before = pragma(&archive, "max_page_count");
+        let pages_before = pragma(&archive, "page_count");
+        assert_eq!(pragma(&archive, "freelist_count"), 0);
+
+        let plan = SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, ladder(LADDER_OVERSIZED))
+            .unwrap();
+        assert_eq!(
+            settle(&mut archive, plan).unwrap_err(),
+            WalIdempotencyError::Limit,
+            "an unbounded step must refuse, never commit and poison the owner"
+        );
+
+        // Exactly where it was, with no residue: this is a REFUSAL, not a
+        // half-applied step and not a wedge.
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 0);
+        assert_eq!(product_descriptor(&archive).unwrap(), before);
+        assert!(!index_exists(&archive, "idx_probe_budget"));
+        assert_eq!(schema_state(&archive).unwrap(), LedgerSchemaState::Absent);
+        assert_eq!(pragma(&archive, "page_count"), pages_before);
+        // The cap is CONNECTION state and survives the rollback. Leaking it
+        // would leave the owner unable to grow the database for the rest of
+        // the process — a different wedge, introduced by the fix itself.
+        assert_eq!(pragma(&archive, "max_page_count"), cap_before);
+
+        // Repeatable: presenting it again refuses identically rather than
+        // drifting into some other failure.
+        let again =
+            SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, ladder(LADDER_OVERSIZED))
+                .unwrap();
+        assert_eq!(
+            settle(&mut archive, again).unwrap_err(),
+            WalIdempotencyError::Limit
+        );
+
+        // And the budget refuses the STEP, not the archive: a step that fits
+        // still advances this very database.
+        settle(
+            &mut archive,
+            SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, ladder(LADDER_NARROW)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 1);
+        assert!(index_exists(&archive, "idx_probe_narrow"));
+        assert_eq!(pragma(&archive, "max_page_count"), cap_before);
+    }
+
+    #[test]
+    fn an_archive_whose_freelist_alone_could_exceed_the_budget_is_refused() {
+        // `PRAGMA max_page_count` bounds the FILE, so it cannot bound pages
+        // taken off the freelist — measured directly: a `CREATE INDEX`
+        // allocated 711 pages with the growth allowance set to zero. Without
+        // this conjunct the cap would look like enforcement and not be any.
+        let narrow = ladder(LADDER_NARROW);
+
+        // Control: the identical step over the identical rows, empty freelist.
+        // Without it the refusal below would prove nothing about the freelist.
+        let mut clean = archive_at_epoch_zero();
+        seed_wide_rows(&clean, 1400);
+        assert_eq!(pragma(&clean, "freelist_count"), 0);
+        settle(
+            &mut clean,
+            SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, narrow).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_archive_epoch(&clean).unwrap().epoch, 1);
+
+        let mut archive = archive_at_epoch_zero();
+        seed_wide_rows(&archive, 1400);
+        archive
+            .execute_batch("DELETE FROM audio_segments;")
+            .unwrap();
+        assert!(
+            pragma(&archive, "freelist_count") > MAX_STEP_ALLOCATED_PAGES,
+            "the fixture must actually build a freelist larger than the budget"
+        );
+        let before = product_descriptor(&archive).unwrap();
+        let cap_before = pragma(&archive, "max_page_count");
+        assert_eq!(
+            settle(
+                &mut archive,
+                SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, narrow).unwrap(),
+            )
+            .unwrap_err(),
+            WalIdempotencyError::Limit
+        );
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 0);
+        assert_eq!(product_descriptor(&archive).unwrap(), before);
+        assert!(!index_exists(&archive, "idx_probe_narrow"));
+        assert_eq!(pragma(&archive, "max_page_count"), cap_before);
+    }
+
+    #[test]
+    fn the_refusal_lands_before_the_shadow_capture_would_have_been_dropped() {
+        // The ONE test that sees what the defect actually turns on. Every
+        // fixture above uses a bare `Connection` with no capture registration,
+        // so they can prove the refusal but not that it comes early enough:
+        // `WalCaptureState::observe_write` drops the whole generation the
+        // moment a WAL write passes MAX_SHADOW_WAL_BYTES, never fails the
+        // SQLite write, and never recovers without a WAL truncate that the
+        // owner (`wal_autocheckpoint=0`) does not perform.
+        //
+        // So register the REAL capture VFS on a real file-backed archive, run
+        // the oversized step through it, and assert the capture is untouched.
+        let capture = crate::store::StoreShadowCapture::shared_for_test();
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("ladder-budget.db");
+        let wal = directory.path().join("ladder-budget.db-wal");
+
+        // Build and seed on an ORDINARY connection, exactly as the owner is
+        // handed an already-materialized archive: the capture must see the
+        // step's own writes and nothing else.
+        crate::store::init_vec_extension();
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.execute_batch(crate::store::SCHEMA_SQL).unwrap();
+            crate::store::run_migrations(&seed).unwrap();
+            seed_epoch_marker(&seed, 0).unwrap();
+            // Deliberately more rows than the in-memory fixtures above: the
+            // uncapped step must exceed MAX_SHADOW_WAL_BYTES outright, so that
+            // removing the cap and leaving only the post-commit charge makes
+            // THIS test fail. A fixture that merely exceeds the page budget
+            // would let a late refusal look identical to an early one.
+            seed_wide_rows(&seed, 2600);
+            seed.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        assert!(
+            !wal.exists(),
+            "the seeded archive must hand over an empty WAL"
+        );
+
+        let registration = capture.register_path_for_test(&path).unwrap();
+        let mut archive = Connection::open_with_flags_and_vfs(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            capture.vfs_name_for_test(),
+        )
+        .unwrap();
+        archive
+            .execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA foreign_keys = ON;")
+            .unwrap();
+        let metrics_before = registration.metrics();
+
+        assert_eq!(
+            settle(
+                &mut archive,
+                SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, ladder(LADDER_OVERSIZED))
+                    .unwrap(),
+            )
+            .unwrap_err(),
+            WalIdempotencyError::Limit
+        );
+
+        // The capture is intact. Before the budget existed this is precisely
+        // where `oversized_writes` and `generations_dropped` would have moved,
+        // the commit would have landed locally anyway, and the owner would
+        // have been poisoned by the drain that followed.
+        let after_refusal = registration.metrics();
+        assert_eq!(
+            after_refusal.oversized_writes,
+            metrics_before.oversized_writes
+        );
+        assert_eq!(
+            after_refusal.generations_dropped,
+            metrics_before.generations_dropped
+        );
+        assert_eq!(registration.completed_len(), 0, "nothing was committed");
+        let wal_bytes = wal.metadata().map(|meta| meta.len()).unwrap_or(0);
+        assert!(
+            wal_bytes < crate::archive_v3_shadow::MAX_SHADOW_WAL_BYTES as u64,
+            "the refused step still wrote {wal_bytes} WAL bytes"
+        );
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 0);
+
+        // A step that fits produces EXACTLY ONE captured commit — the literal
+        // predicate `begin_exact_one_drain` demands and the one an oversized
+        // step fails by producing zero.
+        settle(
+            &mut archive,
+            SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 0, ladder(LADDER_NARROW)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 1);
+        assert_eq!(registration.completed_len(), 1);
+        let after_advance = registration.metrics();
+        assert_eq!(
+            after_advance.oversized_writes,
+            metrics_before.oversized_writes
+        );
+        assert_eq!(
+            after_advance.generations_dropped,
+            metrics_before.generations_dropped
+        );
+        assert!(
+            wal.metadata().unwrap().len() < crate::archive_v3_shadow::MAX_SHADOW_WAL_BYTES as u64
+        );
+    }
+
+    // ── The digest the CI gate pins ──────────────────────────────────────
+
+    #[test]
+    fn the_step_digest_agrees_with_the_gate_scripts_implementation() {
+        // `scripts/test_schema_ladder_gate.py` recomputes step digests in
+        // Python so it can pin every shipped step as a literal — the ONLY
+        // thing that can refuse a step edited after shipping, since plan and
+        // running binary share one `&'static` ladder and no runtime check
+        // between them can be anything but an identity.
+        //
+        // A pin is worth nothing if the two implementations disagree, so the
+        // same triple and the same expected hex are asserted on both sides.
+        // Keep this constant and `CROSS_CHECKED_STEP_DIGEST` in the gate in
+        // sync; a drift in domain separation, integer width or length framing
+        // fails on whichever side moved.
+        let step = SchemaStep {
+            epoch: 1,
+            id: "0001_capture_events_stream_sequence",
+            class: StepClass::Index,
+            sql: STEP_ONE_SQL,
+        };
+        let rendered: String = step_digest(&step)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            rendered, "00721b2e0796349ebb9200f0f2595b2537d9250212f0b0bf0dd77e5d21622887",
+            "step_digest moved: re-pin scripts/test_schema_ladder_gate.py with \
+             --print-ladder-pins and re-derive every SEALED_STEP_DIGESTS entry"
+        );
+        // The chain head the gate pins, over the shipped (empty) ladder.
+        let head: String = LadderView::PRODUCTION
+            .chain_digest(SCHEMA_EPOCH_HEAD)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            head, "44c94f297c002b76892e96f1449398610eaf981dc1f6c123cfa69630d8c72c98",
+            "SEALED_LADDER_CHAIN_HEAD in the gate script must move with this"
         );
     }
 

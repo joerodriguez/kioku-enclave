@@ -40,8 +40,39 @@ fn require_config_agreement(selected_users: usize, deployment_active: bool) -> R
     Ok(())
 }
 
+/// What one selection's relaunch actually achieved.
+///
+/// The two variants differ in the archive's epoch, never in whether the user
+/// is being served: both mean an authority is installed and every routed read
+/// and submit will reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelaunchOutcome {
+    /// Installed, serving, and at this binary's target epoch.
+    Serving,
+    /// Installed and serving, at the epoch the archive recorded. Every
+    /// intermediate epoch is a complete servable state, so this is a degraded
+    /// but correct outcome — not an outage.
+    ServingBehindTarget,
+    /// Installed and serving, at an epoch this binary cannot describe.
+    /// Structurally unreachable — see [`advance_to_target_epoch`].
+    ServingUnservableEpoch,
+}
+
+/// Content-free startup counts. Counts only — never a user id or an epoch.
+///
+/// `relaunched + unavailable` is every selection. `behind_target` and
+/// `unservable_epoch` are SUBSETS of `relaunched`: those users are serving,
+/// which is exactly why they must not be counted as unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RelaunchCounts {
+    pub(crate) relaunched: usize,
+    pub(crate) unavailable: usize,
+    pub(crate) behind_target: usize,
+    pub(crate) unservable_epoch: usize,
+}
+
 /// Relaunch every selected user's WAL serving authority before request
-/// admission. Returns `(relaunched, unavailable)`.
+/// admission.
 ///
 /// A refusal that is scoped to one selection contains itself: that user comes
 /// up unavailable and the rest of the fleet is admitted. This is safe rather
@@ -60,7 +91,7 @@ pub(crate) async fn relaunch_wal_serving_authorities(
     kms: impl FnOnce() -> Result<Arc<GcpKmsClient>>,
     control: Arc<ControlStore>,
     store: Arc<Store>,
-) -> Result<(usize, usize)> {
+) -> Result<RelaunchCounts> {
     let selections = control
         .load_wal_authoritative_persistence_selections()
         .await?;
@@ -71,76 +102,128 @@ pub(crate) async fn relaunch_wal_serving_authorities(
     if selections.is_empty() {
         // No WAL-authoritative user exists; active or off, the image serves
         // the legacy path for everyone and nothing relaunches.
-        return Ok((0, 0));
+        return Ok(RelaunchCounts::default());
     }
     // KMS is consumed lazily: the no-op and refusal paths above never
     // construct it, which the unit tests pin.
     let kms = kms()?;
-    let mut relaunched = 0usize;
-    let mut unavailable = 0usize;
+    let mut counts = RelaunchCounts::default();
     for selection in selections {
         let outcome = relaunch_one(&kms, &control, &store, &selection).await;
-        count_outcome(outcome, &mut relaunched, &mut unavailable);
+        count_outcome(outcome, &mut counts);
     }
-    Ok((relaunched, unavailable))
+    Ok(counts)
 }
 
 /// Fold one selection's outcome into the counts.
 ///
 /// Extracted so the containment decision is testable on its own: a
-/// per-selection failure becomes a count, never an early return. The user is
-/// left without a serving authority, which the routed read refuses; every
-/// other selection still launches.
-fn count_outcome(outcome: Result<()>, relaunched: &mut usize, unavailable: &mut usize) {
+/// per-selection failure becomes a count, never an early return; every other
+/// selection still launches.
+///
+/// `Err` here means the authority was never installed, and only that. The user
+/// is then left without a serving authority, which the routed read refuses.
+/// **A failure that happens after the install is not an `Err` and must never
+/// become one** — see [`relaunch_one`].
+fn count_outcome(outcome: Result<RelaunchOutcome>, counts: &mut RelaunchCounts) {
     match outcome {
-        Ok(()) => *relaunched += 1,
-        Err(_) => *unavailable += 1,
+        Ok(reached) => {
+            counts.relaunched += 1;
+            match reached {
+                RelaunchOutcome::Serving => {}
+                RelaunchOutcome::ServingBehindTarget => counts.behind_target += 1,
+                RelaunchOutcome::ServingUnservableEpoch => {
+                    counts.behind_target += 1;
+                    counts.unservable_epoch += 1;
+                }
+            }
+        }
+        Err(_) => counts.unavailable += 1,
     }
 }
 
 /// Relaunch exactly one selection. Every failure here is scoped to this user.
+///
+/// # Why nothing after the install may return `Err`
+///
+/// `install_wal_serving_authority` is install-once and there is deliberately
+/// **no removal API** — `WalServingLane` holds exactly one authority for its
+/// whole life, so no code path can leave a registered user unregistered. The
+/// consequence is unavoidable and load-bearing: once line-by-line control
+/// passes the install, this user IS being served. `wal_serving_lane` will
+/// resolve for them, and every routed read and submit reaches the authority.
+///
+/// So an `Err` returned after the install would be counted `unavailable` and
+/// logged as offline while the lane served every request for the whole process
+/// lifetime — a health signal that says the exact opposite of the truth, and
+/// nothing retries, because relaunch runs once at startup and a second install
+/// refuses with `Conflict`. That is why [`advance_to_target_epoch`] is
+/// infallible: the epoch advance decides how far the archive got, never
+/// whether the user exists.
 async fn relaunch_one(
     kms: &Arc<GcpKmsClient>,
     control: &Arc<ControlStore>,
     store: &Arc<Store>,
     selection: &crate::cp::control_store::WalAuthoritativePersistenceSelection,
-) -> Result<()> {
+) -> Result<RelaunchOutcome> {
     let (archive_id, authority) =
         build_wal_serving_authority(kms, control, selection.user_id()).await?;
     store.install_wal_serving_authority(selection.user_id(), archive_id, Arc::new(authority))?;
-    advance_to_target_epoch(store, selection.user_id()).await?;
-    Ok(())
+    // Past this line the user is registered and serving. Nothing below may
+    // propagate: it reports how far the ladder got, and that is all.
+    Ok(advance_to_target_epoch(store, selection.user_id()).await)
 }
 
 /// Carry this archive to the epoch this binary drives to, one step per
 /// transaction, before any product request is admitted.
 ///
 /// Placed here and not on the request path on purpose: the authority is
-/// installed immediately above, so the routed submit has somewhere to go, and
-/// a failure is still scoped to this one selection — `count_outcome` folds it
-/// into `unavailable` and every other user still launches. A user left at a
-/// stale epoch comes up without a serving authority, which the routed read
-/// refuses; they can never be served the stale legacy snapshot.
+/// installed immediately above, so the routed submit has somewhere to go.
+///
+/// # Infallible by construction
+///
+/// Not a swallowed error — a refusal to make this a failure at all. Every way
+/// the loop can stop short leaves the archive **exactly** at the epoch its
+/// marker records, which is a complete servable state: a step is one
+/// all-or-nothing transaction, the owner is not poisoned by a refused apply,
+/// and `SCHEMA_EPOCH_MIN_SERVABLE` is only raised (runbook step 8) once every
+/// archive reports the new epoch, so an archive that stalls at `N-1` never
+/// becomes unservable. Reporting that as an outage would be false, and — since
+/// the lane cannot be uninstalled — would also be unactionable.
+///
+/// The stall is instead an operator signal: `behind_target` is what blocks
+/// runbook step 8, and a step that no archive can take is a step to be split
+/// or withdrawn, never one to be forced. There is no path that applies a step
+/// larger than one publishable commit without poisoning the owner, which is
+/// what the write budget in `cp::schema_epoch::wal::advance` refuses ahead of.
 ///
 /// The loop is bounded by the ladder, not by a retry budget: each iteration
 /// advances exactly one epoch, and `AlreadyAtTarget` is reached in at most
-/// `SCHEMA_EPOCH_TARGET` steps. `RefusedNotServable` stops immediately — an
-/// archive this binary cannot describe must never be driven.
-async fn advance_to_target_epoch(store: &Arc<Store>, user_id: &str) -> Result<()> {
+/// `SCHEMA_EPOCH_TARGET` steps. An `Err` from the driver stops it — the
+/// archive did not move, and re-attempting the identical plan in the same
+/// process would fail identically.
+///
+/// `RefusedNotServable` is reported distinctly and is structurally unreachable
+/// here: the owner's own open runs `validate_servable_epoch` on the same
+/// marker (`store::open_wal_owner_connection`), so an archive this binary
+/// cannot describe fails `build_wal_serving_authority` and is counted
+/// `unavailable` before the install. It is retained as a second line and given
+/// its own counter so that, if it ever did fire, it would be visible rather
+/// than folded into the ordinary stall.
+async fn advance_to_target_epoch(store: &Arc<Store>, user_id: &str) -> RelaunchOutcome {
     use crate::cp::schema_epoch::wal::{advance_one_epoch, AdvanceOutcome};
 
     // Every intermediate epoch is a complete, servable state, so an
     // interruption anywhere in this loop leaves a servable archive at a
     // well-defined epoch and the next relaunch resumes from its marker.
     loop {
-        match advance_one_epoch(store, user_id).await? {
-            AdvanceOutcome::Advanced { .. } => continue,
-            AdvanceOutcome::AlreadyAtTarget(_) => return Ok(()),
-            AdvanceOutcome::RefusedNotServable(_) => {
-                return Err(EnclaveError::Conflict(
-                    "archive records a schema epoch this binary cannot serve".into(),
-                ))
+        match advance_one_epoch(store, user_id).await {
+            Ok(AdvanceOutcome::Advanced { .. }) => continue,
+            Ok(AdvanceOutcome::AlreadyAtTarget(_)) => return RelaunchOutcome::Serving,
+            Ok(AdvanceOutcome::RefusedNotServable(_)) => {
+                return RelaunchOutcome::ServingUnservableEpoch
             }
+            Err(_) => return RelaunchOutcome::ServingBehindTarget,
         }
     }
 }
@@ -256,34 +339,99 @@ mod tests {
         // The test environment has no baked coordinates (mode off) and no
         // selected users: the relaunch is an exact no-op. KMS is consumed
         // lazily and this closure proves the no-op path never constructs it.
-        let (relaunched, unavailable) = relaunch_wal_serving_authorities(
+        let counts = relaunch_wal_serving_authorities(
             || panic!("the no-op relaunch path must not construct KMS"),
             control,
             store,
         )
         .await
         .unwrap();
-        assert_eq!((relaunched, unavailable), (0, 0));
+        assert_eq!(counts, RelaunchCounts::default());
     }
 
     #[test]
     fn a_failed_selection_is_counted_unavailable_and_never_propagates() {
-        let (mut relaunched, mut unavailable) = (0usize, 0usize);
-        count_outcome(Ok(()), &mut relaunched, &mut unavailable);
+        let mut counts = RelaunchCounts::default();
+        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
         count_outcome(
             Err(EnclaveError::Conflict("reconstruction failed".into())),
-            &mut relaunched,
-            &mut unavailable,
+            &mut counts,
         );
         count_outcome(
             Err(EnclaveError::Store("the authority failed to launch".into())),
-            &mut relaunched,
-            &mut unavailable,
+            &mut counts,
         );
-        count_outcome(Ok(()), &mut relaunched, &mut unavailable);
+        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
         // Two users are unavailable and two are serving. Before containment
         // the first failure ended startup for the entire fleet.
-        assert_eq!((relaunched, unavailable), (2, 2));
+        assert_eq!((counts.relaunched, counts.unavailable), (2, 2));
+        assert_eq!((counts.behind_target, counts.unservable_epoch), (0, 0));
+    }
+
+    #[test]
+    fn an_archive_that_did_not_reach_the_target_is_counted_serving_not_unavailable() {
+        // The health signal has to match what the lane actually does. The
+        // authority is installed before the epoch advance runs and there is no
+        // removal API, so a user whose advance failed IS served by every routed
+        // read and submit for the whole process lifetime. Counting them
+        // `unavailable` said the exact opposite, and nothing retried.
+        let mut counts = RelaunchCounts::default();
+        count_outcome(Ok(RelaunchOutcome::ServingBehindTarget), &mut counts);
+        count_outcome(Ok(RelaunchOutcome::ServingUnservableEpoch), &mut counts);
+        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
+        assert_eq!(
+            counts,
+            RelaunchCounts {
+                relaunched: 3,
+                unavailable: 0,
+                behind_target: 2,
+                unservable_epoch: 1,
+            },
+            "a stalled ladder is a degraded epoch, never an outage"
+        );
+        // `behind_target` and `unservable_epoch` are strict subsets of the
+        // users who ARE serving, and every selection lands in exactly one of
+        // `relaunched` / `unavailable`.
+        assert!(counts.behind_target <= counts.relaunched);
+        assert!(counts.unservable_epoch <= counts.behind_target);
+    }
+
+    #[test]
+    fn the_epoch_advance_can_never_make_a_registered_user_unavailable() {
+        // Structural, because the property is structural: the install happens
+        // first and cannot be undone, so `relaunch_one` must not carry a `?`
+        // past it. A `?` on the advance is exactly the defect this test
+        // exists to keep out.
+        let source = include_str!("archive_v3_serving_relaunch.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let body = &production[production
+            .find("async fn relaunch_one(")
+            .expect("relaunch_one moved")..];
+        let body = &body[..body
+            .find("/// Carry this archive to the epoch")
+            .expect("advance_to_target_epoch moved")];
+        let after_install = &body[body
+            .find("install_wal_serving_authority(")
+            .expect("the install moved")..];
+        assert!(
+            after_install.contains("advance_to_target_epoch(store, selection.user_id()).await)"),
+            "the advance must be returned as an outcome, not propagated"
+        );
+        assert!(
+            !after_install.contains("advance_to_target_epoch(store, selection.user_id()).await?"),
+            "a `?` on the epoch advance counts a serving user as unavailable"
+        );
+        // And the advance itself must not be able to produce an `Err` at all.
+        let advance = &production[production
+            .find("async fn advance_to_target_epoch(")
+            .expect("advance_to_target_epoch moved")..];
+        assert!(
+            advance.starts_with(
+                "async fn advance_to_target_epoch(store: &Arc<Store>, user_id: &str) \
+                 -> RelaunchOutcome {"
+            ),
+            "advance_to_target_epoch must be infallible by signature"
+        );
     }
 
     #[test]
@@ -299,11 +447,11 @@ mod tests {
             .find("for selection in selections {")
             .expect("the per-selection loop moved")..];
         let loop_body = &loop_body[..loop_body
-            .find("\n    Ok((relaunched, unavailable))")
-            .unwrap()];
+            .find("\n    Ok(counts)")
+            .expect("the relaunch loop's return moved")];
         assert!(loop_body.contains("relaunch_one("));
         assert!(
-            loop_body.contains("count_outcome(outcome, &mut relaunched, &mut unavailable)"),
+            loop_body.contains("count_outcome(outcome, &mut counts)"),
             "a per-selection failure must be counted, not propagated"
         );
         assert!(

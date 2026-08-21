@@ -22,9 +22,14 @@ use zeroize::Zeroize;
 use crate::archive_v3::{ArchiveV3Error, ImmutableReference, ObjectId, Result, SQLITE_PAGE_SIZE};
 use crate::archive_v3_journal::{WalSegment, MAX_WAL_SEGMENT_BYTES};
 
-const SQLITE_WAL_HEADER_BYTES: usize = 32;
+// `pub(crate)` because the schema-ladder advance derives its pre-commit page
+// budget from these and from `MAX_SHADOW_WAL_BYTES` below. Deriving it there
+// from a second copy of the WAL geometry would let the budget and the ceiling
+// it is supposed to stay under drift apart silently.
+pub(crate) const SQLITE_WAL_HEADER_BYTES: usize = 32;
 const SQLITE_WAL_FRAME_HEADER_BYTES: usize = 24;
-const SQLITE_WAL_FRAME_BYTES: usize = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
+pub(crate) const SQLITE_WAL_FRAME_BYTES: usize =
+    SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
 const SQLITE_WAL_MAGIC_LE_CHECKSUM: u32 = 0x377f_0682;
 const SQLITE_WAL_MAGIC_BE_CHECKSUM: u32 = 0x377f_0683;
 const SQLITE_WAL_FORMAT_VERSION: u32 = 3_007_000;
