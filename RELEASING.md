@@ -54,6 +54,16 @@ GitHub secret values and never prints them:
 The command uses a private, temporary registry login, validates the reconstructed values,
 creates the parent directory privately, refuses overwrite, and writes exact mode 0600.
 
+**That migration is complete, and this command is not a recovery path today.** It reads
+the deployed image's `.Image.Config.Env`, but the reviewed configuration has since moved
+out of image ENV into the baked `/kioku-config` file, so no image built by the current
+`Dockerfile` carries `KIOKU_BUILD_PROFILE` there. The tool refuses any such image with
+"the selected deployed image is not a production build", and no future deploy restores
+it. **The local operator file is therefore the only copy of its values** — including
+`PRODUCTION_REVIEWER_AUTH_API_KEY` and, as of the baked genesis gate,
+`PRODUCTION_GENESIS_WAL_NATIVE`. Keep a backup outside this repository; losing the file
+means reconstructing every secret it holds by hand.
+
 ## Verify, build, scan, and sign an image
 
 First merge the reviewed version bump and required ADR-0016 classification. From clean,

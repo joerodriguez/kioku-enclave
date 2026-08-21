@@ -162,8 +162,26 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   digest — not a restart, not an environment change, not a Cloud Run variable
   edit.** Step 5 must be planned as a release: change the operator profile
   value to `on`, rebuild against the WAL release tag, push, re-verify the
-  digest against the attestation, and roll. The old digest remains the
-  rollback, and rolling back the gate is likewise a redeploy of that digest.
+  digest against the attestation, and roll.
+
+  **Rolling the gate BACK needs an image that does not exist yet — build it
+  before step 5.** The obvious rollback, redeploying the digest that was
+  running before step 5, is exactly the act step 4 exists to prevent: that
+  digest is pre-re-baseline, step 4 deletes or deny-tags it and pins the
+  re-baselined digest as the deploy floor, and restoring it silently
+  re-enables plain-primary-key genesis. Either the floor blocks the redeploy
+  and the operator is stranded mid-cutover with signup closed, or the operator
+  lifts the floor to make the rollback work and thereby causes the corruption
+  the floor was protecting against. Nothing in the sequence otherwise produces
+  a gate-off build of the re-baselined image, so **no digest exists that both
+  clears the step-4 floor and has `GENESIS_WAL_NATIVE=off`**.
+
+  Therefore build **two** images from the same `vX.Y.Z-archive-v3-wal.N` tag
+  before step 5 — one `off`, one `on` — and register the `off` digest as the
+  designated rollback target alongside the deploy floor. It is re-baselined,
+  so it clears the floor, and un-arming the gate is then a redeploy of that
+  digest with no pre-re-baseline binary ever returning to service.
+
   This bullet records that the *mechanism* is in place. It does **not**
   discharge anything else in this document.
 - The transcripts lane must merge before the cutover: running this family is
