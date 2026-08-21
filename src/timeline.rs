@@ -1,19 +1,19 @@
-//! Timeline handlers — context window, raw range, and stats.
+//! Timeline context-window query.
 //!
-//! These three endpoints feed the LLM summariser and the MCP `get_context` tool:
+//! The `/v1/context`, `/v1/range`, and `/v1/stats` handlers this module once
+//! served were retired with the rest of the `/v1` data plane; the routes remain
+//! bound to the `legacy_data_plane_retired` 410 tombstone in `main`.
 //!
-//! - `POST /v1/context` — rows *nearest* a center timestamp (capped per kind)
-//! - `POST /v1/range`   — all rows in `[from, to)`, time-ascending, with per-kind limit
-//! - `POST /v1/stats`   — row counts and latest-seen timestamps (sync monitoring)
+//! What survives is [`fetch_context`]: rows *nearest* a center timestamp,
+//! capped per kind. It has no production caller today — the MCP `get_context`
+//! tool is served by [`crate::cp::mcp_query::fetch_safe_context`], a separate
+//! redaction-aware implementation. It is retained as the reference shape for
+//! that query, with its own regression coverage below.
 
-use std::sync::Arc;
-
-use axum::{extract::State, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::info;
 
-use crate::{error::Result, AppState};
+use crate::error::Result;
 
 // ── Context ────────────────────────────────────────────────────────────────────
 
@@ -44,22 +44,6 @@ fn default_max_utterances() -> usize {
 }
 fn default_max_screenshots() -> usize {
     100
-}
-
-pub async fn handle_context(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ContextRequest>,
-) -> Result<Json<Value>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, center = %req.center, "context request");
-
-    let result = state
-        .store
-        .with_user(&user_id, |conn| fetch_context(conn, &req))
-        .await?;
-
-    Ok(Json(result))
 }
 
 pub(crate) fn fetch_context(conn: &rusqlite::Connection, req: &ContextRequest) -> Result<Value> {
@@ -152,145 +136,6 @@ fn fetch_context_screenshots(
     )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
-}
-
-// ── Range ──────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct RangeRequest {
-    pub user_id: String,
-    pub from: String,
-    pub to: String,
-    /// Which kinds to return.  Absent = both.  Values: `"utterances"`, `"screenshots"`.
-    #[serde(default)]
-    pub include: Vec<String>,
-    /// Per-kind row limit (default 5000).
-    #[serde(default = "default_range_limit")]
-    pub limit: usize,
-}
-
-fn default_range_limit() -> usize {
-    5000
-}
-
-pub async fn handle_range(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RangeRequest>,
-) -> Result<Json<Value>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, from = %req.from, to = %req.to, "range request");
-
-    let result = state
-        .store
-        .with_user(&user_id, |conn| fetch_range(conn, &req))
-        .await?;
-
-    Ok(Json(result))
-}
-
-fn fetch_range(conn: &rusqlite::Connection, req: &RangeRequest) -> Result<Value> {
-    let want_all = req.include.is_empty();
-    let want_utterances = want_all || req.include.iter().any(|x| x == "utterances");
-    let want_screenshots = want_all || req.include.iter().any(|x| x == "screenshots");
-
-    let mut obj = serde_json::Map::new();
-
-    if want_utterances {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT u.id, u.audio_segment_id, u.start_offset_seconds, u.end_offset_seconds,
-                   u.text, u.language, u.confidence, u.speaker_label, u.source_key, u.created_at,
-                   s.started_at, s.ended_at, s.duration_seconds, s.source_type
-            FROM utterances u
-            JOIN audio_segments s ON s.id = u.audio_segment_id
-            WHERE s.started_at >= ?1 AND s.started_at < ?2
-            ORDER BY s.started_at ASC, u.start_offset_seconds ASC
-            LIMIT ?3
-        "#,
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![req.from, req.to, req.limit as i64],
-            utterance_to_json,
-        )?;
-        let utts: Vec<Value> = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(crate::error::EnclaveError::from)?;
-        obj.insert("utterances".into(), Value::Array(utts));
-    }
-
-    if want_screenshots {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT s.id, s.captured_at, s.active_app, s.window_title, s.ocr_text, s.url,
-                   s.ocr_status, s.image_hash, s.is_duplicate, s.source_key, s.created_at,
-                   o.status, o.literal_description, o.screen_state, o.content_type
-            FROM screenshots s LEFT JOIN screen_observations o ON o.screenshot_id=s.id
-            WHERE s.captured_at >= ?1 AND s.captured_at < ?2 AND s.is_duplicate = 0
-            ORDER BY s.captured_at ASC
-            LIMIT ?3
-        "#,
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![req.from, req.to, req.limit as i64],
-            screenshot_to_json,
-        )?;
-        let scrns: Vec<Value> = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(crate::error::EnclaveError::from)?;
-        obj.insert("screenshots".into(), Value::Array(scrns));
-    }
-
-    Ok(Value::Object(obj))
-}
-
-// ── Stats ──────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct StatsRequest {
-    pub user_id: String,
-}
-
-pub async fn handle_stats(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<StatsRequest>,
-) -> Result<Json<Value>> {
-    let user_id = req.user_id.clone();
-    crate::store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, "stats request");
-
-    let result = state.store.with_user(&user_id, fetch_stats).await?;
-
-    Ok(Json(result))
-}
-
-fn fetch_stats(conn: &rusqlite::Connection) -> Result<Value> {
-    let utterance_count: i64 =
-        conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
-
-    let screenshot_count: i64 =
-        conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?;
-
-    let episode_count: i64 = conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?;
-
-    // last_utterance_at: max started_at of the audio segment of any utterance
-    let last_utterance_at: Option<String> = conn.query_row(
-        r#"SELECT MAX(s.started_at) FROM utterances u
-           JOIN audio_segments s ON s.id = u.audio_segment_id"#,
-        [],
-        |r| r.get(0),
-    )?;
-
-    let last_screenshot_at: Option<String> =
-        conn.query_row("SELECT MAX(captured_at) FROM screenshots", [], |r| r.get(0))?;
-
-    Ok(json!({
-        "utterance_count":   utterance_count,
-        "screenshot_count":  screenshot_count,
-        "episode_count":     episode_count,
-        "last_utterance_at": last_utterance_at,
-        "last_screenshot_at": last_screenshot_at,
-    }))
 }
 
 // ── Row serialisers ────────────────────────────────────────────────────────────
@@ -450,109 +295,5 @@ mod tests {
         let utts = result["utterances"].as_array().unwrap();
         assert_eq!(utts.len(), 1);
         assert_eq!(utts[0]["text"].as_str().unwrap(), "in window");
-    }
-
-    // ── range ──────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn range_half_open_interval() {
-        let store = make_store();
-        seed_utterance(&store, "rng_u", "2026-01-01T09:00:00Z", "at from").await;
-        seed_utterance(&store, "rng_u", "2026-01-01T09:30:00Z", "inside").await;
-        seed_utterance(&store, "rng_u", "2026-01-01T10:00:00Z", "at to — excluded").await;
-
-        let req = RangeRequest {
-            user_id: "rng_u".to_string(),
-            from: "2026-01-01T09:00:00Z".to_string(),
-            to: "2026-01-01T10:00:00Z".to_string(),
-            include: vec![],
-            limit: 5000,
-        };
-
-        let result = store
-            .with_user("rng_u", |conn| fetch_range(conn, &req))
-            .await
-            .unwrap();
-
-        let utts = result["utterances"].as_array().unwrap();
-        assert_eq!(utts.len(), 2, "[from, to) should exclude 'at to'");
-        // time-ascending
-        assert!(utts[0]["started_at"].as_str().unwrap() <= utts[1]["started_at"].as_str().unwrap());
-    }
-
-    #[tokio::test]
-    async fn range_include_filter_screenshots_only() {
-        let store = make_store();
-        seed_utterance(&store, "rng_f", "2026-01-01T09:00:00Z", "utt").await;
-        seed_screenshot(&store, "rng_f", "2026-01-01T09:05:00Z").await;
-
-        let req = RangeRequest {
-            user_id: "rng_f".to_string(),
-            from: "2026-01-01T09:00:00Z".to_string(),
-            to: "2026-01-01T10:00:00Z".to_string(),
-            include: vec!["screenshots".to_string()],
-            limit: 5000,
-        };
-
-        let result = store
-            .with_user("rng_f", |conn| fetch_range(conn, &req))
-            .await
-            .unwrap();
-
-        assert!(
-            result.get("utterances").is_none(),
-            "utterances key should be absent when not in include"
-        );
-        let scrns = result["screenshots"].as_array().unwrap();
-        assert_eq!(scrns.len(), 1);
-    }
-
-    // ── stats ──────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn stats_counts_correct() {
-        let store = make_store();
-        seed_utterance(&store, "stat_u", "2026-01-01T09:00:00Z", "u1").await;
-        seed_utterance(&store, "stat_u", "2026-01-01T09:05:00Z", "u2").await;
-        seed_screenshot(&store, "stat_u", "2026-01-01T09:10:00Z").await;
-
-        // Insert an episode directly
-        store
-            .with_user("stat_u", |conn| {
-                conn.execute(
-                    r#"INSERT INTO episodes (started_at, ended_at, title)
-                       VALUES ('2026-01-01T09:00:00Z', '2026-01-01T09:30:00Z', 'ep')"#,
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let stats = store.with_user("stat_u", fetch_stats).await.unwrap();
-
-        assert_eq!(stats["utterance_count"], 2);
-        assert_eq!(stats["screenshot_count"], 1);
-        assert_eq!(stats["episode_count"], 1);
-        assert_eq!(
-            stats["last_utterance_at"].as_str().unwrap(),
-            "2026-01-01T09:05:00Z"
-        );
-        assert_eq!(
-            stats["last_screenshot_at"].as_str().unwrap(),
-            "2026-01-01T09:10:00Z"
-        );
-    }
-
-    #[tokio::test]
-    async fn stats_empty_user() {
-        let store = make_store();
-        let stats = store.with_user("empty_stat", fetch_stats).await.unwrap();
-
-        assert_eq!(stats["utterance_count"], 0);
-        assert_eq!(stats["screenshot_count"], 0);
-        assert_eq!(stats["episode_count"], 0);
-        assert!(stats["last_utterance_at"].is_null());
-        assert!(stats["last_screenshot_at"].is_null());
     }
 }

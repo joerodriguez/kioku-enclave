@@ -2,8 +2,10 @@
 
 The control plane runs inside the enclave. All
 of this runs in the one attested binary; handlers call the data-plane query/storage code
-([`../search.rs`](../map.md), `../timeline.rs`, `../episodes.rs`, `../ingest.rs`) in-process
-— no HTTP hop. Routes are wired in [`../main.rs`](../map.md).
+([`../search.rs`](../map.md), `../episodes.rs`) in-process — no HTTP hop:
+`search::search_all` / `search::search_episodes` from `query.rs`, and
+`episodes::upsert_episodes` / `write_episode_embedding` / `purge_episode` from
+`summarizer.rs` and `query.rs`. Routes are wired in [`../main.rs`](../map.md).
 
 | File | Role |
 |---|---|
