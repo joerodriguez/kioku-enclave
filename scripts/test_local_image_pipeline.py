@@ -516,6 +516,83 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(assembler_keys, rust_keys)
         self.assertEqual(len(assembler_keys), len(set(assembler_keys)))
         self.assertIn("for required in $allowed_keys; do", assembler_source)
+        # The ADR-0022 cutover gate is one of the baked keys, so it is covered
+        # by the attested digest and the assembler requires it like any other.
+        self.assertIn("GENESIS_WAL_NATIVE", rust_keys)
+        self.assertIn("GENESIS_WAL_NATIVE", assembler_keys)
+
+    def test_genesis_gate_is_baked_from_the_profile_and_never_from_the_environment(
+        self,
+    ) -> None:
+        pipeline = load_pipeline()
+        values = environment()
+        values.pop("PATH", None)
+        # An operator (or an attacker with the build shell) exporting the bare
+        # name must not reach the image: the selector only ever reads the
+        # profile-prefixed operator value, and the baked bytes are built from
+        # the selector result alone.
+        values["GENESIS_WAL_NATIVE"] = "on"
+        configuration = pipeline.selected_configuration(
+            "production",
+            values,
+            source_ref="main",
+            probe_config_path=ROOT / "config/archive-witness-probe.json",
+            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
+        )
+        self.assertEqual(configuration["GENESIS_WAL_NATIVE"], "off")
+        runtime = pipeline.runtime_config(configuration, "production")
+        self.assertIn("GENESIS_WAL_NATIVE", runtime)
+        self.assertEqual(runtime["GENESIS_WAL_NATIVE"], "off")
+        encoded = pipeline.runtime_config_bytes(configuration, "production")
+        self.assertIn(b"GENESIS_WAL_NATIVE=off\n", encoded)
+        self.assertNotIn(b"GENESIS_WAL_NATIVE=on\n", encoded)
+
+        def assemble(payload: bytes, name: str) -> subprocess.CompletedProcess[str]:
+            source = directory / f"{name}.env"
+            source.write_bytes(payload)
+            source.chmod(0o600)
+            return subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(source),
+                    str(directory / f"{name}.out"),
+                    hashlib.sha256(payload).hexdigest(),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            accepted = assemble(encoded, "baked")
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn(
+                b"GENESIS_WAL_NATIVE=off\n", (directory / "baked.out").read_bytes()
+            )
+
+            # Dropping the key entirely is refused at the image boundary, so a
+            # binary can never fall back to the process environment for it.
+            dropped = b"".join(
+                line
+                for line in encoded.splitlines(keepends=True)
+                if not line.startswith(b"GENESIS_WAL_NATIVE=")
+            )
+            self.assertNotEqual(assemble(dropped, "dropped").returncode, 0)
+            self.assertFalse((directory / "dropped.out").exists())
+
+            # A hand-authored secret cannot arm the gate on an image whose
+            # archive-v3 runtime is off, and cannot smuggle an empty or
+            # unknown value past the boundary either.
+            for label, replacement in (
+                ("armed", b"GENESIS_WAL_NATIVE=on\n"),
+                ("empty", b"GENESIS_WAL_NATIVE=\n"),
+                ("truthy", b"GENESIS_WAL_NATIVE=1\n"),
+            ):
+                with self.subTest(value=label):
+                    mutated = encoded.replace(b"GENESIS_WAL_NATIVE=off\n", replacement)
+                    self.assertNotEqual(assemble(mutated, label).returncode, 0)
+                    self.assertFalse((directory / f"{label}.out").exists())
 
     def test_baked_configuration_load_precedes_tokio_and_no_runtime_env_mutation(self) -> None:
         source = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")

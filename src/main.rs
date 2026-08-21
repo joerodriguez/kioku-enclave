@@ -298,6 +298,7 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
     "ARCHIVE_V3_WITNESS_DATABASE_ID",
     "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
+    "GENESIS_WAL_NATIVE",
 ];
 
 /// Load the allowlisted image configuration assembled by the final Docker
