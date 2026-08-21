@@ -128,12 +128,12 @@ pub mod wal_domain {
     /// The bounded voice-profile reconciliation and lineage tail at the end of
     /// `media_worker::process_user`, after the migrated work-unit lanes.
     pub const MEDIA_WORKER_VOICE_PROFILES: &str = "media_worker.voice_profiles";
-    /// The summarizer window: its evidence reads (`fetch_range`,
-    /// `fetch_open_episodes`) are legacy, so the whole window cannot complete
-    /// even though the F8 episode upsert at its tail is migrated.
-    pub const SUMMARIZER_WINDOW: &str = "summarizer.window";
-    /// The ADR-0034 settled-tail gate the session-settled kick consults.
-    pub const SUMMARIZER_SESSION_SETTLED: &str = "summarizer.session_settled_gate";
+    // The summarizer window (`summarizer.window`) and its ADR-0034
+    // settled-tail gate (`summarizer.session_settled_gate`) were registered
+    // here until their evidence reads migrated. Both are routed now — the
+    // window reads, the F8 episode upsert at its tail, and the F9 embedding
+    // batch all reach the WAL lane — so the constants are deleted rather than
+    // left standing over a live domain.
     /// The email outbox scan (`Store::next_email_delivery`). The email
     /// settlement and cancellation ladders behind it ARE migrated.
     pub const EMAIL_WORKER_OUTBOX: &str = "email_worker.outbox";
@@ -498,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_domain_never_falls_into_the_generic_internal_error() {
         for domain in [
-            wal_domain::SUMMARIZER_WINDOW,
+            wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::PUSH_OUTBOX,
             wal_domain::MEDIA_CAPTURE_EVENTS,
             wal_domain::SYNC_EXPORT,
@@ -527,8 +527,6 @@ mod tests {
         let domains = [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
-            wal_domain::SUMMARIZER_WINDOW,
-            wal_domain::SUMMARIZER_SESSION_SETTLED,
             wal_domain::EMAIL_WORKER_OUTBOX,
             wal_domain::PUSH_OUTBOX,
             wal_domain::WEBHOOK_WORKER_OUTBOX,
