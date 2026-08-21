@@ -47,7 +47,14 @@ use crate::archive_v3_wal_idempotency::{
 
 const REQUEST_V1: u16 = 1;
 const SUBTYPE: &[u8] = b"adr-0022-episode-window-upsert-v1";
-const MAX_BATCH_ITEMS: usize = 64;
+/// The sealed per-plan item bound. Visible to the owner because the owner
+/// must SPLIT a larger window across successive plans: a window that merely
+/// holds more episodes than one plan may carry is not a malformed window, and
+/// refusing it here used to surface as the construction-refusal shape, which
+/// the sweep's failure ladder eventually walks the forward-only cursor past —
+/// discarding those episodes permanently. The bound itself is unchanged and
+/// still enforced below; only the owner's response to hitting it changed.
+pub(in crate::cp) const MAX_BATCH_ITEMS: usize = 64;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_MEMBERS_PER_ITEM: usize = 65_536;
 const ENCODED_UNIT_RESULT_BYTES: usize = 9;
@@ -1383,6 +1390,100 @@ mod tests {
             settle(&mut connection, build(0, 0, COMMITTED_AT, episodes)).unwrap(),
             LogicalMutationDisposition::Applied
         ));
+    }
+
+    /// DATA LOSS. A window may hold more episodes than one plan carries. The
+    /// bound stays where it is — it is a sealed, merged decision, and nothing
+    /// here relaxes it — but hitting it must SPLIT the window, never discard
+    /// it: an oversize batch handed to `new` refuses `Malformed`, the owner
+    /// reports the construction-refusal shape, and after three sweeps
+    /// `summarize_all` walks the forward-only cursor past the whole window.
+    /// Those episodes are then gone for good, and only for a WAL-selected
+    /// user — the legacy path caps nothing.
+    ///
+    /// This settles the split the owner performs, against a real connection:
+    /// the successive plans are admitted, ids stay a pure function of the
+    /// re-read pin, every item lands exactly once, and — the part that makes
+    /// a mid-window failure survivable — the archive cutoff stays at the
+    /// window's own `from` until the LAST chunk is the one settling, so it
+    /// never floors the next run past episodes that were never written.
+    #[test]
+    fn an_oversize_window_settles_as_successive_plans() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        install_schema(&connection);
+        let oversize: Vec<WindowEpisode> = (0..MAX_BATCH_ITEMS + 1)
+            .map(|index| WindowEpisode::insert(target(&format!("episode {index}"))).unwrap())
+            .collect();
+
+        assert!(
+            EpisodeWindowUpsertPlan::new(
+                ACCOUNT.into(),
+                0,
+                FROM.into(),
+                TO.into(),
+                CUTOFF.into(),
+                0,
+                COMMITTED_AT.into(),
+                oversize.clone(),
+            )
+            .is_err(),
+            "the per-plan bound still stands; the owner must split, not relax it"
+        );
+
+        let chunks: Vec<&[WindowEpisode]> = oversize.chunks(MAX_BATCH_ITEMS).collect();
+        assert_eq!(chunks.len(), 2, "65 items are two plans, not one");
+        let mut settled_ids = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let final_chunk = index + 1 == chunks.len();
+            // Re-read exactly as the owner does between chunks: the previous
+            // chunk CAS-advanced the sequence and allocated ids, so a carried
+            // pair would refuse the next plan with `Precondition`.
+            let (window_seq, cutoff) = read_window_progress(&connection).unwrap();
+            let sequence_pin = read_sequence_pin(&connection).unwrap();
+            assert_eq!(window_seq as usize, index);
+            assert_eq!(sequence_pin as usize, index * MAX_BATCH_ITEMS);
+            if index == 1 {
+                assert_eq!(
+                    cutoff.as_deref(),
+                    Some(FROM),
+                    "a non-final chunk publishes the window's own start, so \
+                     the next run re-derives this window instead of skipping \
+                     the tail of it"
+                );
+            }
+            let plan = EpisodeWindowUpsertPlan::new(
+                ACCOUNT.into(),
+                window_seq,
+                FROM.into(),
+                TO.into(),
+                if final_chunk { CUTOFF } else { FROM }.into(),
+                sequence_pin,
+                COMMITTED_AT.into(),
+                chunk.to_vec(),
+            )
+            .expect("every chunk is within the bound the owner split by");
+            assert!(matches!(
+                settle(&mut connection, plan).unwrap(),
+                LogicalMutationDisposition::Applied
+            ));
+            settled_ids.extend(read_window_assignments(&connection, window_seq).unwrap());
+        }
+
+        assert_eq!(
+            settled_ids,
+            (1..=MAX_BATCH_ITEMS as i64 + 1).collect::<Vec<_>>(),
+            "every item settles exactly once, in order, with ids a pure \
+             function of the re-read pin"
+        );
+        let stored: i64 = connection
+            .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored as usize, MAX_BATCH_ITEMS + 1, "nothing was dropped");
+        assert_eq!(
+            read_window_progress(&connection).unwrap(),
+            (2, Some(CUTOFF.to_string())),
+            "the real cutoff is published only once the whole window is down"
+        );
     }
 
     #[test]

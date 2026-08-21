@@ -63,6 +63,14 @@ const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
 const MAX_WINDOWS_PER_SWEEP: u32 = 1;
 const CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 2_048;
+/// First delay after a window is derived, paid for, and then refused at
+/// submit time. Deliberately longer than one [`SCHEDULER_INTERVAL_SECS`]
+/// sweep: at or below it the backoff would not actually skip a sweep.
+const SETTLE_BACKOFF_BASE_SECS: i64 = 900;
+/// Ceiling on that delay. A lane that never recovers therefore costs at most
+/// a handful of summary calls a day instead of one per sweep, while still
+/// retrying often enough that a healed lane resumes without an operator.
+const SETTLE_BACKOFF_MAX_SECS: i64 = 6 * 60 * 60;
 const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
 const SUBSTANCE_BACKFILL_BATCH: usize = 50;
 const VISUAL_EVIDENCE_BACKFILL_KEY: &str = "adr_0010_visual_evidence_backfill_v1";
@@ -919,6 +927,89 @@ fn derive_membership(
     out
 }
 
+/// One user's outstanding settle refusal: a window that was derived, paid for
+/// with a summary call, and then refused by the WAL lane at submit time.
+///
+/// Holding the cursor is the right answer for evidence integrity — those
+/// episodes were never written, and a forward-only cursor that steps over
+/// them loses them for good. But holding it alone means the very next sweep
+/// re-derives the identical window and re-issues the identical PAID call, ten
+/// minutes later, and again ten minutes after that, until the daily Vertex
+/// budget refuses. This memo bounds that: it records which held cursor is
+/// refusing and how long to wait before spending on it again.
+///
+/// In-process and advisory, like `summarize_all`'s failure ladder. Losing it
+/// across a restart costs at most one extra call, and it can never make a
+/// window fail that would otherwise have settled — the only thing it
+/// suppresses is the spend.
+struct SettleRefusal {
+    /// The Control cursor the refused window started from. A different value
+    /// means the cursor has moved, so this is a different window and the memo
+    /// no longer applies.
+    cursor: Option<String>,
+    consecutive: u32,
+    retry_at_ms: i64,
+}
+
+fn settle_refusals() -> &'static Mutex<HashMap<String, SettleRefusal>> {
+    static SETTLE_REFUSALS: OnceLock<Mutex<HashMap<String, SettleRefusal>>> = OnceLock::new();
+    SETTLE_REFUSALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Seconds still to wait before this user's window may be derived — and paid
+/// for — again, or `None` when nothing is holding it back. A memo recorded
+/// against a different cursor is dropped on sight: the cursor moved, so the
+/// refusal it recorded is not this window's.
+async fn settle_backoff_holds(user_id: &str, cursor: Option<&str>) -> Option<i64> {
+    let mut refusals = settle_refusals().lock().await;
+    let (stale, retry_at_ms) = {
+        let refusal = refusals.get(user_id)?;
+        (refusal.cursor.as_deref() != cursor, refusal.retry_at_ms)
+    };
+    if stale {
+        refusals.remove(user_id);
+        return None;
+    }
+    let remaining_ms = retry_at_ms - now_ms();
+    if remaining_ms <= 0 {
+        return None;
+    }
+    Some(remaining_ms.div_euclid(1000).max(1))
+}
+
+/// Record that this user's window was refused at settle time, and return the
+/// backoff now in force, in seconds. Doubling from
+/// [`SETTLE_BACKOFF_BASE_SECS`], capped at [`SETTLE_BACKOFF_MAX_SECS`]: a
+/// lane that heals is retried shortly after it does, and a lane that never
+/// heals stops re-buying the same summary once per sweep forever.
+async fn note_settle_refusal(user_id: &str, cursor: Option<&str>) -> i64 {
+    let mut refusals = settle_refusals().lock().await;
+    let entry = refusals
+        .entry(user_id.to_owned())
+        .or_insert_with(|| SettleRefusal {
+            cursor: cursor.map(str::to_owned),
+            consecutive: 0,
+            retry_at_ms: 0,
+        });
+    if entry.cursor.as_deref() != cursor {
+        entry.cursor = cursor.map(str::to_owned);
+        entry.consecutive = 0;
+    }
+    entry.consecutive = entry.consecutive.saturating_add(1);
+    let doublings = 1i64.checked_shl(entry.consecutive - 1).unwrap_or(i64::MAX);
+    let delay_secs = SETTLE_BACKOFF_BASE_SECS
+        .saturating_mul(doublings)
+        .min(SETTLE_BACKOFF_MAX_SECS);
+    entry.retry_at_ms = now_ms() + delay_secs * 1000;
+    delay_secs
+}
+
+/// The lane settled a window for this user: whatever it was refusing before,
+/// it is not refusing now.
+async fn clear_settle_refusal(user_id: &str) {
+    settle_refusals().lock().await.remove(user_id);
+}
+
 /// Summarize one user's recent capture into episodes. Returns a short status.
 pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     summarize_user_window(state, user_id, SummarizeMode::Scheduled).await
@@ -952,6 +1043,28 @@ async fn summarize_user_window(
     // future bounded operator/user queue without competing with live capture.
 
     let summarized_until = state.control.summarized_until(user_id).await?;
+    // A window this lane already refused to settle held the cursor rather
+    // than stepping over evidence it never wrote (see
+    // `wal_authoritative_upsert`) — but the window ahead of a held cursor is
+    // re-derived from scratch every sweep, and re-deriving it means re-paying
+    // for the summary. Wait the backoff out before spending again. This
+    // advances nothing and claims no progress: it is the same non-advancing
+    // `skipped` shape the short-tail case uses, so it lands on
+    // `summarize_all`'s `Ok(_) => break`, never on the cursor-advanced arm.
+    // Unselected users can have no memo — nothing arms one off the WAL
+    // path — and the check is gated anyway, so the legacy path is untouched.
+    let settle_backoff = if state.store.is_wal_authoritative(user_id) {
+        settle_backoff_holds(user_id, summarized_until.as_deref()).await
+    } else {
+        None
+    };
+    if let Some(retry_in_secs) = settle_backoff {
+        return Ok(serde_json::json!({
+            "skipped": true,
+            "reason": "settle_backoff",
+            "retry_in_secs": retry_in_secs,
+        }));
+    }
     // ADR-0022 F8: the archive progress row closes the Control/archive
     // durability split. If a settled window's Control cursor write was lost,
     // start from the archive-recorded cutoff instead of re-summarizing the
@@ -1276,10 +1389,14 @@ async fn summarize_user_window(
     if !to_upsert.is_empty() {
         let user = user_id.to_string();
         let ids = if state.store.is_wal_authoritative(&user) {
-            // ADR-0022 F8: the window settles as one sealed plan; the ids
-            // come back from the assignment table it wrote. A deterministic
-            // refusal takes the error/window_to shape so the sweep's skip
-            // ladder can move past the window instead of freezing on it.
+            // ADR-0022 F8: the window settles as sealed plans (one per
+            // MAX_BATCH_ITEMS chunk); the ids come back from the assignment
+            // tables they wrote. A CONSTRUCTION-time refusal — the window's
+            // own content, not the lane — takes the error/window_to shape so
+            // the sweep's skip ladder can move past the window instead of
+            // freezing on it. A settle-time refusal cannot be told apart
+            // from a lane that is merely down, so it holds the cursor and
+            // arms the backoff instead; see `wal_authoritative_upsert`.
             match wal_authoritative_upsert(
                 state,
                 &user,
@@ -1288,12 +1405,33 @@ async fn summarize_user_window(
                 &new_to_iso,
                 &format_epoch_millis(effective_cutoff),
             )
-            .await?
+            .await
             {
-                Ok(ids) => ids,
-                Err(reason) => {
+                Ok(Ok(ids)) => {
+                    clear_settle_refusal(&user).await;
+                    ids
+                }
+                Ok(Err(reason)) => {
                     warn!(user_id, reason, "episode window plan refused");
                     return Ok(serde_json::json!({ "error": reason, "window_to": new_to_iso }));
+                }
+                Err(error) => {
+                    // Paid for and not settled. HOLD the cursor — these
+                    // episodes were never written — and stop re-buying the
+                    // same summary once per sweep while the lane stays this
+                    // way. `Err` reaches `summarize_all`'s warn-and-break
+                    // arm, which records no window_to, so the skip ladder
+                    // stays out of it and nothing advances.
+                    let retry_in_secs =
+                        note_settle_refusal(&user, summarized_until.as_deref()).await;
+                    warn!(
+                        user_id,
+                        error = %error,
+                        retry_in_secs,
+                        "episode window did not settle; holding the cursor and \
+                         backing off the summary call"
+                    );
+                    return Err(error);
                 }
             }
         } else {
@@ -1330,15 +1468,30 @@ async fn summarize_user_window(
     Ok(serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }))
 }
 
-/// ADR-0022 F8: settle one summarizer window as a sealed plan (constructed
-/// once, R5) and return the resulting episode ids in item order from the
-/// assignment table the plan wrote.
+/// ADR-0022 F8: settle one summarizer window as a sealed plan per
+/// `MAX_BATCH_ITEMS` chunk (each constructed once, R5) and return the
+/// resulting episode ids in item order from the assignment tables the plans
+/// wrote.
 ///
-/// `Ok(Err(reason))` is a **deterministic refusal** (construction/prepare
-/// rejected the window itself): the caller reports it in the
+/// `Ok(Err(reason))` is a **construction-time refusal** — `WindowEpisode`,
+/// `EpisodeWindowUpsertPlan::new`, or `prepare` rejected the window's own
+/// content before anything was submitted. The caller reports it in the
 /// `{"error","window_to"}` shape so the sweep's MAX_WINDOW_FAILURES ladder
 /// skips the window instead of freezing the cursor and re-burning the
-/// Vertex call forever. Transient store/witness failures stay `Err`.
+/// Vertex call forever.
+///
+/// Everything else stays `Err`, and that deliberately includes SUBMIT-time
+/// refusals. It is tempting to call those deterministic too, but they cannot
+/// be classified here: `Store::wal_authoritative_submit` surfaces owner-side
+/// refusals content-free — a conflict as `Conflict`, and precondition,
+/// corrupt, limit, malformed, and plain unavailability all alike as
+/// "wal serving authority is unavailable". Routing them into the
+/// error/window_to shape would let a lane that is merely down for half an
+/// hour march the cursor past three windows of real evidence. So they hold
+/// the cursor. The provider spend that would otherwise follow from holding
+/// it — the same window re-derived and the same summary call re-issued every
+/// sweep — is bounded separately, by the settle-refusal backoff the caller
+/// arms on `Err`; see [`note_settle_refusal`].
 async fn wal_authoritative_upsert(
     state: &CpState,
     user_id: &str,
@@ -1397,120 +1550,156 @@ async fn wal_authoritative_upsert(
         coalesced[index] = merged;
     }
 
-    // One routed read snapshots the window sequence, the id-allocation pin,
-    // and every predecessor tuple; the plan is then constructed once.
-    let probe_ids: Vec<Option<i64>> = coalesced.iter().map(|item| item.id).collect();
-    let (window_seq, sequence_pin, predecessors) = state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            let (window_seq, _) = wal::window::read_window_progress(conn)?;
-            let sequence_pin = wal::window::read_sequence_pin(conn)?;
-            let mut predecessors = Vec::with_capacity(probe_ids.len());
-            for id in probe_ids {
-                predecessors.push(match id {
-                    Some(id) => wal::window::read_episode_predecessor(conn, id)?
-                        .map(|predecessor| (id, predecessor)),
-                    None => None,
-                });
-            }
-            Ok((window_seq, sequence_pin, predecessors))
-        })
-        .await?;
-
+    // A window that holds more episodes than one sealed plan may carry is
+    // SPLIT across successive plans, never refused: `EpisodeWindowUpsertPlan`
+    // caps a batch at `MAX_BATCH_ITEMS`, and handing it a larger batch used to
+    // surface as the construction-refusal shape — which the sweep's
+    // MAX_WINDOW_FAILURES ladder walks the forward-only cursor PAST after
+    // three passes, discarding every episode in the window permanently and
+    // unrecoverably. The legacy path has no such cap, so that cliff also made
+    // a selected user silently lose windows an unselected one keeps. The
+    // bound is unchanged; only the response to hitting it is.
+    //
+    // One routed read per chunk snapshots the window sequence, the
+    // id-allocation pin, and that chunk's predecessor tuples, because every
+    // settled chunk CAS-advances the sequence and allocates ids: carrying the
+    // first chunk's pair into the second would refuse it with `Precondition`.
     let committed_at = format_epoch_millis(now_ms());
-    let mut episodes = Vec::with_capacity(coalesced.len());
-    for (item, predecessor) in coalesced.iter().zip(predecessors) {
-        let to_json = |values: Option<&[String]>| {
-            values.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))
+    let chunk_count = coalesced.len().div_ceil(wal::window::MAX_BATCH_ITEMS);
+    let mut assigned: Vec<i64> = Vec::with_capacity(coalesced.len());
+    for (chunk_index, chunk) in coalesced.chunks(wal::window::MAX_BATCH_ITEMS).enumerate() {
+        let probe_ids: Vec<Option<i64>> = chunk.iter().map(|item| item.id).collect();
+        let (window_seq, sequence_pin, predecessors) = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                let (window_seq, _) = wal::window::read_window_progress(conn)?;
+                let sequence_pin = wal::window::read_sequence_pin(conn)?;
+                let mut predecessors = Vec::with_capacity(probe_ids.len());
+                for id in probe_ids {
+                    predecessors.push(match id {
+                        Some(id) => wal::window::read_episode_predecessor(conn, id)?
+                            .map(|predecessor| (id, predecessor)),
+                        None => None,
+                    });
+                }
+                Ok((window_seq, sequence_pin, predecessors))
+            })
+            .await?;
+
+        let mut episodes = Vec::with_capacity(chunk.len());
+        for (item, predecessor) in chunk.iter().zip(predecessors) {
+            let to_json = |values: Option<&[String]>| {
+                values.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))
+            };
+            let (existing_minutes, existing_substance, existing_visual) = match &predecessor {
+                Some((_, p)) => (
+                    p.minute_summaries().map(str::to_owned),
+                    Some(p.substance().to_owned()),
+                    Some(p.visual_evidence().to_owned()),
+                ),
+                None => (None, None, None),
+            };
+            let merged = crate::episodes::merge_minute_summaries(
+                existing_minutes.as_deref(),
+                item.minute_summaries.as_deref().unwrap_or(&[]),
+            );
+            let (minutes_json, minutes_text) = match merged {
+                Some((json, text)) => (Some(json), Some(text)),
+                None => (None, None),
+            };
+            let substance = if predecessor.is_some() {
+                crate::episodes::merge_substance(
+                    existing_substance.as_deref(),
+                    item.substance.as_deref(),
+                )
+            } else {
+                crate::episodes::normalized_substance(item.substance.as_deref())
+            }
+            .to_string();
+            let visual_evidence = if predecessor.is_some() {
+                crate::episodes::merge_visual_evidence(
+                    existing_visual.as_deref(),
+                    item.visual_evidence.as_deref(),
+                )
+            } else {
+                crate::episodes::normalized_visual_evidence(item.visual_evidence.as_deref())
+            }
+            .to_string();
+            let target = wal::window::WindowEpisodeTarget {
+                started_at: item.started_at.clone(),
+                ended_at: item.ended_at.clone(),
+                episode_type: item.episode_type.clone(),
+                title: item.title.clone(),
+                summary: item.summary.clone(),
+                participants_json: to_json(item.participants.as_deref()),
+                languages_json: to_json(item.languages.as_deref()),
+                action_items_json: to_json(item.action_items.as_deref()),
+                model: item.model.clone(),
+                minutes_json,
+                minutes_text,
+                substance,
+                visual_evidence,
+                member_utterance_ids: item.member_utterance_ids.clone(),
+                member_screenshot_ids: item.member_screenshot_ids.clone(),
+            };
+            let episode = match predecessor {
+                Some((id, p)) => wal::window::WindowEpisode::update(id, p, target),
+                None => wal::window::WindowEpisode::insert(target),
+            };
+            let Ok(episode) = episode else {
+                return Ok(Err("episode window item refused"));
+            };
+            episodes.push(episode);
+        }
+        // Only the FINAL chunk publishes the window's real archive cutoff. A
+        // chunk that settles while a later one still might not is not evidence
+        // that the window was consumed, and the progress row's cutoff is a floor
+        // on the next run's `new_from` (see `summarize_user_window`) — publishing
+        // the real cutoff early would step the archive side of the cursor over
+        // episodes that were never written. `from_iso` IS this run's `new_from`,
+        // so a partial window's floor is exactly the floor it already had: the
+        // next run re-derives the same window rather than skipping the tail of
+        // it. The cost of a mid-window failure is therefore a possible duplicate
+        // of an already-settled chunk (the same accepted case as a lost Control
+        // write — see the module docs on why member-exclusivity is deliberately
+        // not a precondition), never a lost one.
+        let chunk_cutoff = if chunk_index + 1 == chunk_count {
+            effective_cutoff
+        } else {
+            from_iso
         };
-        let (existing_minutes, existing_substance, existing_visual) = match &predecessor {
-            Some((_, p)) => (
-                p.minute_summaries().map(str::to_owned),
-                Some(p.substance().to_owned()),
-                Some(p.visual_evidence().to_owned()),
-            ),
-            None => (None, None, None),
+        let Ok(plan) = wal::window::EpisodeWindowUpsertPlan::new(
+            user_id.to_owned(),
+            window_seq,
+            from_iso.to_owned(),
+            to_iso.to_owned(),
+            chunk_cutoff.to_owned(),
+            sequence_pin,
+            committed_at.clone(),
+            episodes,
+        ) else {
+            return Ok(Err("episode window plan refused"));
         };
-        let merged = crate::episodes::merge_minute_summaries(
-            existing_minutes.as_deref(),
-            item.minute_summaries.as_deref().unwrap_or(&[]),
+        let Ok(prepared) =
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        else {
+            return Ok(Err("episode window request refused"));
+        };
+        state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await?;
+        let settled_seq = window_seq;
+        assigned.extend(
+            state
+                .store
+                .wal_authoritative_read(user_id, move |conn| {
+                    Ok(wal::window::read_window_assignments(conn, settled_seq)?)
+                })
+                .await?,
         );
-        let (minutes_json, minutes_text) = match merged {
-            Some((json, text)) => (Some(json), Some(text)),
-            None => (None, None),
-        };
-        let substance = if predecessor.is_some() {
-            crate::episodes::merge_substance(
-                existing_substance.as_deref(),
-                item.substance.as_deref(),
-            )
-        } else {
-            crate::episodes::normalized_substance(item.substance.as_deref())
-        }
-        .to_string();
-        let visual_evidence = if predecessor.is_some() {
-            crate::episodes::merge_visual_evidence(
-                existing_visual.as_deref(),
-                item.visual_evidence.as_deref(),
-            )
-        } else {
-            crate::episodes::normalized_visual_evidence(item.visual_evidence.as_deref())
-        }
-        .to_string();
-        let target = wal::window::WindowEpisodeTarget {
-            started_at: item.started_at.clone(),
-            ended_at: item.ended_at.clone(),
-            episode_type: item.episode_type.clone(),
-            title: item.title.clone(),
-            summary: item.summary.clone(),
-            participants_json: to_json(item.participants.as_deref()),
-            languages_json: to_json(item.languages.as_deref()),
-            action_items_json: to_json(item.action_items.as_deref()),
-            model: item.model.clone(),
-            minutes_json,
-            minutes_text,
-            substance,
-            visual_evidence,
-            member_utterance_ids: item.member_utterance_ids.clone(),
-            member_screenshot_ids: item.member_screenshot_ids.clone(),
-        };
-        let episode = match predecessor {
-            Some((id, p)) => wal::window::WindowEpisode::update(id, p, target),
-            None => wal::window::WindowEpisode::insert(target),
-        };
-        let Ok(episode) = episode else {
-            return Ok(Err("episode window item refused"));
-        };
-        episodes.push(episode);
     }
-    let Ok(plan) = wal::window::EpisodeWindowUpsertPlan::new(
-        user_id.to_owned(),
-        window_seq,
-        from_iso.to_owned(),
-        to_iso.to_owned(),
-        effective_cutoff.to_owned(),
-        sequence_pin,
-        committed_at,
-        episodes,
-    ) else {
-        return Ok(Err("episode window plan refused"));
-    };
-    let Ok(prepared) = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-    else {
-        return Ok(Err("episode window request refused"));
-    };
-    state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
-        .await?;
-    let settled_seq = window_seq;
-    state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            Ok(wal::window::read_window_assignments(conn, settled_seq)?)
-        })
-        .await
-        .map(Ok)
+    Ok(Ok(assigned))
 }
 
 /// In-enclave episode embeddings (ADR-0004 §G.2). Episodes are born in the
@@ -2487,8 +2676,30 @@ mod tests {
     /// cursor through a seven-day backlog reporting `no_new_records` over
     /// evidence nobody ever read. That is unrecoverable — the cursor only
     /// moves forward.
+    ///
+    /// The two legs share one fixture, and the LEGACY leg is what makes the
+    /// selected leg mean anything: on exactly these bounds an unselected user
+    /// reaches the empty-span branch and really does advance the cursor. So
+    /// the fixture is live, the window is real, and "the cursor did not move"
+    /// on the selected leg is a fact about the refusal rather than about a
+    /// window that was never offered.
+    ///
+    /// **What this does NOT prove.** On the selected leg the run stops at the
+    /// F8 archive-cutoff read, which is the FIRST routed read in
+    /// `summarize_user_window` and predates this migration — so
+    /// `summarize_user` never reaches `fetch_range` here, and the end-to-end
+    /// assertion cannot distinguish "the window reads propagate their
+    /// refusal" from "something earlier refused". The per-helper assertions
+    /// below cover the helpers themselves, and
+    /// `the_window_reads_are_never_flattened_at_their_call_sites` covers the
+    /// call sites; a refusal flattened at a call site
+    /// (`fetch_range(..).await.unwrap_or_default()`) would still not be
+    /// caught end-to-end by this test. Closing that would need a serving
+    /// authority that answers reads, which this harness deliberately has no
+    /// way to register — `select_wal_authoritative` exists precisely to make
+    /// every store touch fail.
     #[tokio::test]
-    async fn a_routed_evidence_refusal_reaches_the_caller_and_never_advances_the_cursor() {
+    async fn an_unavailable_lane_refuses_every_window_read_where_the_legacy_path_advances() {
         use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
 
         let state = state();
@@ -2519,9 +2730,46 @@ mod tests {
             "the fixture must offer a window, or this proves nothing"
         );
 
-        // Selected with no serving authority registered: the routed lane is
-        // unavailable, exactly as it is while one is quarantined or
-        // relaunching. Nothing legacy may answer in its place.
+        // CONTROL LEG. Same bounds, same empty per-user index, no WAL
+        // selection: the empty span is consumed and the cursor MOVES. This is
+        // the behaviour a flattened refusal would counterfeit, and running it
+        // here proves the fixture can actually reach it.
+        let legacy = state
+            .control
+            .upsert_user(
+                "google-sub-legacy-summarizer",
+                "legacy@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .expect("the harness creates the account");
+        state
+            .control
+            .set_summarized_until(&legacy.id, &cursor)
+            .await
+            .expect("the baseline cursor is written");
+        let advanced = summarize_user(&state, &legacy.id)
+            .await
+            .expect("an unselected user's empty span is ordinary work");
+        assert_eq!(
+            advanced["reason"], "no_new_records",
+            "the control leg must reach the empty-span branch: {advanced}"
+        );
+        assert_ne!(
+            state
+                .control
+                .summarized_until(&legacy.id)
+                .await
+                .expect("the cursor is readable")
+                .as_deref(),
+            Some(cursor.as_str()),
+            "the control leg must actually advance the cursor, or the \
+             selected leg's 'did not advance' proves nothing"
+        );
+
+        // SELECTED LEG. Selected with no serving authority registered: the
+        // routed lane is unavailable, exactly as it is while one is
+        // quarantined or relaunching. Nothing legacy may answer in its place.
         select_wal_authoritative(&state.store, &user.id);
         let from = format_epoch_millis(now_ms() - 2 * 60 * 60 * 1000);
         let to = format_epoch_millis(now_ms() - 60 * 60 * 1000);
@@ -2567,6 +2815,57 @@ mod tests {
             "the domain is migrated; nothing may still report a D4 deferral: {}",
             captured.text()
         );
+    }
+
+    /// Call-site pin, in production source. The helpers propagate their
+    /// refusals (proved above), but a regression that flattened one at its
+    /// CALL SITE — `fetch_range(..).await.unwrap_or_default()`, or an `.ok()`
+    /// on the cursor-hold probe — would turn a refusal back into an empty
+    /// span and march the cursor through a backlog, and no end-to-end test in
+    /// this harness can reach that (see the note on the test above). Pin it
+    /// structurally instead: every window-read call site in production source
+    /// must hand its refusal straight on with `?`.
+    #[test]
+    fn the_window_reads_are_never_flattened_at_their_call_sites() {
+        let whole = include_str!("summarizer.rs");
+        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
+
+        // `session_tail_is_settled` is deliberately absent: it owns a failure
+        // handler that answers "not settled", which HOLDS the kick and is the
+        // conservative direction. The three below return the refusal itself,
+        // and their callers must not absorb it.
+        for (helper, expected_call_sites) in [
+            (concat!("fetch_", "range("), 1),
+            (concat!("fetch_open_", "episodes("), 1),
+            // Both empty-span branches probe the cursor hold before advancing.
+            (concat!("span_holds_recoverable_", "media("), 2),
+        ] {
+            let mut call_sites = 0;
+            let mut cursor = 0;
+            while let Some(offset) = source[cursor..].find(helper) {
+                let start = cursor + offset;
+                cursor = start + helper.len();
+                // Skip the definitions themselves; only calls are pinned.
+                if source[..start].ends_with("async fn ") {
+                    continue;
+                }
+                call_sites += 1;
+                let tail = &source[start..(start + 200).min(source.len())];
+                let consumed = tail
+                    .find(".await")
+                    .map(|at| &tail[at + ".await".len()..])
+                    .unwrap_or_else(|| panic!("{helper} must be awaited: {tail}"));
+                assert!(
+                    consumed.starts_with('?'),
+                    "{helper} is consumed without propagating its refusal: {}",
+                    &tail[..tail.len().min(160)]
+                );
+            }
+            assert_eq!(
+                call_sites, expected_call_sites,
+                "{helper}: this pin must see every production call site"
+            );
+        }
     }
 
     /// The legacy path is untouched: `wal_authoritative_read` falls through to
@@ -2737,6 +3036,145 @@ mod tests {
                 .unwrap()..]
                 .contains(concat!(".with_", "user(")),
             "the embed tail keeps its legacy write branch for unselected users"
+        );
+    }
+
+    /// Data-loss pin, in production source. A window holding more episodes
+    /// than one sealed plan may carry must be SPLIT, never handed to the plan
+    /// whole: `EpisodeWindowUpsertPlan::new` refuses an oversize batch with
+    /// `Malformed`, that refusal surfaces as the construction-refusal shape,
+    /// and `summarize_all`'s MAX_WINDOW_FAILURES ladder then walks the
+    /// forward-only cursor PAST the window after three sweeps — discarding
+    /// every episode in it, permanently and unrecoverably, while an
+    /// unselected user with the identical window keeps all of them.
+    ///
+    /// The split itself is proved end-to-end against a real connection in
+    /// `wal::window`'s `an_oversize_window_settles_as_successive_plans`. It
+    /// cannot be reached from here: `wal_authoritative_upsert` opens with a
+    /// routed read, and this harness registers no serving authority, so the
+    /// run refuses long before a plan is built. What is pinned here is the
+    /// remaining link — that the production caller feeds the plan CHUNKS
+    /// bounded by the plan's own limit, and publishes the archive cutoff only
+    /// once the last chunk is the one settling.
+    #[test]
+    fn an_oversize_window_is_split_rather_than_handed_to_one_plan() {
+        let whole = include_str!("summarizer.rs");
+        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
+        let from = source
+            .find(concat!("async fn wal_authoritative_", "upsert("))
+            .expect("the routed upsert must exist");
+        let to = source
+            .find(concat!("pub(crate) async fn embed_", "episodes("))
+            .expect("the embed tail follows it");
+        let body = &source[from..to];
+
+        assert!(
+            body.contains(concat!(".chunks(wal::window::MAX_BATCH_", "ITEMS)")),
+            "the window must be split by the plan's own bound, not refused"
+        );
+        assert!(
+            body.contains(concat!("for (item, predecessor) in chunk", ".iter()")),
+            "each plan must be built from ONE chunk, never the whole batch"
+        );
+        assert!(
+            body.contains("chunk_index + 1 == chunk_count"),
+            "only the final chunk may publish the window's archive cutoff; \
+             an earlier one would step the archive cursor over episodes that \
+             were never written"
+        );
+        assert!(
+            !body.contains(concat!("effective_cutoff.to_", "owned()")),
+            "the plan must take the per-chunk cutoff, not the window's"
+        );
+    }
+
+    /// MONEY. A window that is derived, PAID for with a summary call, and
+    /// then refused by the lane at submit time holds the cursor — correct,
+    /// because those episodes were never written and a forward-only cursor
+    /// that steps over them loses them. But holding alone means the next
+    /// sweep re-derives the identical window and re-issues the identical
+    /// paid call, every ten minutes, until the daily budget refuses. The
+    /// refusal must therefore also BOUND the spend.
+    #[tokio::test]
+    async fn a_settle_refusal_backs_the_paid_call_off_instead_of_re_buying_it_every_sweep() {
+        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state};
+
+        let state = state();
+        let user = state
+            .control
+            .upsert_user(
+                "google-sub-wal-settle-backoff",
+                "backoff@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .expect("the harness creates the account");
+        let cursor = format_epoch_millis(now_ms() - 3 * 60 * 60 * 1000);
+        state
+            .control
+            .set_summarized_until(&user.id, &cursor)
+            .await
+            .expect("the baseline cursor is written");
+        select_wal_authoritative(&state.store, &user.id);
+
+        // Without the memo this same call is what the sweep makes every ten
+        // minutes: a full re-derivation, and a fresh summary call with it.
+        let first = note_settle_refusal(&user.id, Some(&cursor)).await;
+        assert_eq!(
+            first, SETTLE_BACKOFF_BASE_SECS,
+            "the first wait must outlast one sweep, or nothing is skipped"
+        );
+        assert!(
+            SETTLE_BACKOFF_BASE_SECS > SCHEDULER_INTERVAL_SECS as i64,
+            "a backoff inside one sweep interval bounds nothing"
+        );
+
+        let held = summarize_user(&state, &user.id)
+            .await
+            .expect("the backoff is a hold, not a failure");
+        assert_eq!(
+            held["reason"], "settle_backoff",
+            "a held window must stop before the window is re-derived and \
+             re-paid for: {held}"
+        );
+        assert!(
+            held.get("to").is_none() && held["reason"] != "no_new_records",
+            "the hold must not look like progress to summarize_all: {held}"
+        );
+        assert_eq!(
+            state
+                .control
+                .summarized_until(&user.id)
+                .await
+                .expect("the cursor is readable")
+                .as_deref(),
+            Some(cursor.as_str()),
+            "holding must never advance the forward-only cursor"
+        );
+
+        // Consecutive refusals on the SAME held cursor widen the wait.
+        assert_eq!(
+            note_settle_refusal(&user.id, Some(&cursor)).await,
+            SETTLE_BACKOFF_BASE_SECS * 2,
+            "a lane that keeps refusing must be re-tried less often, not \
+             just as often"
+        );
+
+        // A moved cursor is a different window: the memo does not apply.
+        let moved = format_epoch_millis(now_ms() - 60 * 60 * 1000);
+        assert!(
+            settle_backoff_holds(&user.id, Some(&moved)).await.is_none(),
+            "the memo names one held cursor; it may not hold a different one"
+        );
+
+        // And a lane that settles clears it outright.
+        note_settle_refusal(&user.id, Some(&cursor)).await;
+        clear_settle_refusal(&user.id).await;
+        assert!(
+            settle_backoff_holds(&user.id, Some(&cursor))
+                .await
+                .is_none(),
+            "a settled window releases the backoff"
         );
     }
 }
