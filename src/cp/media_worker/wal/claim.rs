@@ -125,17 +125,19 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
     rows.collect()
 }
 
-/// T24: `audio_segments` and `utterances` are plain `INTEGER PRIMARY KEY` in
-/// the frozen epoch-0 baseline, so they never appear in `sqlite_sequence` and
-/// `audio_result::read_audio_sequence_pins` reads a constant 0 for both. Every
-/// derived row id then collides on any non-empty archive and the sealed
-/// transcript settle fails closed forever.
+/// T24 is now a residual defence. The sealed epoch-0 re-baseline declares
+/// `audio_segments` and `utterances` `AUTOINCREMENT`, so this gate opens on a
+/// current production archive. It still refuses a legacy archive materialized
+/// before that re-baseline, where either table is a plain `INTEGER PRIMARY
+/// KEY`: those tables never advance `sqlite_sequence`, so a non-empty archive
+/// can collide at a derived id and even an empty one fails the transcript
+/// settle's post-state pin re-validation.
 ///
-/// Opening the claim boundary without this probe means audio work units are
-/// claimed, **PAID** Vertex audio calls are made, and every settle fails —
-/// burning `MAX_ATTEMPTS` paid calls per window, forever, for every selected
-/// user with audio. The probe runs BEFORE the claim, so a blocked lane makes
-/// no claim, no reservation and no paid call.
+/// On such a legacy shape, opening the claim boundary without this probe means
+/// audio work units are claimed, **PAID** Vertex audio calls are made, and
+/// every settle fails — burning `MAX_ATTEMPTS` paid calls per window, forever,
+/// for every selected user with audio. The probe runs BEFORE the claim, so a
+/// blocked lane makes no claim, no reservation and no paid call.
 ///
 /// The probe asks whether the two tables ARE `AUTOINCREMENT`, by reading their
 /// DDL — never whether they currently HAVE `sqlite_sequence` rows.

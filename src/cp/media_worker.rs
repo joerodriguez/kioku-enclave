@@ -6270,12 +6270,13 @@ mod tests {
     }
 
     #[test]
-    fn the_audio_class_is_gated_off_on_the_production_baseline() {
-        // R1/T24: `audio_segments` and `utterances` are plain INTEGER PRIMARY
-        // KEY in the frozen epoch-0 baseline, so the sealed transcript
-        // family's sqlite_sequence pins read 0 forever. Claiming audio here
-        // would make a PAID Vertex call that can never settle, three times per
-        // window, forever.
+    fn the_audio_class_is_gated_off_on_a_legacy_pre_rebaseline_archive() {
+        // R1/T24 residual defence: `job_fixture_db` deliberately hand-writes
+        // the legacy archive shape, with plain INTEGER PRIMARY KEY declarations
+        // for `audio_segments` and `utterances`. `init_schema` uses CREATE TABLE
+        // IF NOT EXISTS and therefore preserves that pre-re-baseline DDL. On
+        // this shape the sealed transcript family's sqlite_sequence pins cannot
+        // advance, so claiming audio would pay for a call that cannot settle.
         let conn = job_fixture_db();
         for index in 0..2 {
             let manifest = numbered_audio_manifest(index);
@@ -6345,6 +6346,19 @@ mod tests {
             .unwrap(),
             wal::claim::ClaimScan::Observed(_)
         ));
+    }
+
+    #[test]
+    fn the_audio_sequence_gate_is_open_on_the_production_baseline() {
+        crate::store::init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::store::SCHEMA_SQL).unwrap();
+        crate::store::run_migrations(&conn).unwrap();
+
+        assert!(
+            wal::claim::audio_sequence_gate_open(&conn),
+            "the sealed production baseline declares both audio allocator tables AUTOINCREMENT"
+        );
     }
 
     #[test]
