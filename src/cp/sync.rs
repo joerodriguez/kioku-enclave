@@ -173,7 +173,7 @@ fn export_success_response(data: serde_json::Value) -> Response {
 /// and falls through to the ordinary guarded legacy read otherwise. It is the
 /// same pure `canonical_logical_export` value either way, so the versioned
 /// logical-export digest the inactive shadow verification hashes is unchanged.
-/// An unreadable archive still propagates its error to the route's 500 rather
+/// An unreadable archive still propagates its error to the route's 503 rather
 /// than exporting a truncated or empty document.
 async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_json::Value> {
     crate::store::validate_user_id(user_id)?;
