@@ -574,9 +574,22 @@ pub(crate) mod wal_gate_test_support {
         let kms = Arc::new(crate::store::tests::FakeKms);
         let gcs = Arc::new(crate::store::tests::FakeGcs::new());
         let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = Arc::new(super::control_store::ControlStore::new(kms, gcs));
+        state_over(store, control)
+    }
+
+    /// The same `CpState`, over a store and control store the caller already
+    /// owns. `answerable_wal_archive` needs this: its two halves have to be
+    /// the SAME handles the genesis convergence launched the serving
+    /// authority on, or the routed read finds no authority and the archive is
+    /// unreadable again.
+    pub(crate) fn state_over(
+        store: Arc<Store>,
+        control: Arc<super::control_store::ControlStore>,
+    ) -> Arc<CpState> {
         Arc::new(CpState {
             store,
-            control: Arc::new(super::control_store::ControlStore::new(kms, gcs)),
+            control,
             billing: Arc::new(super::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(super::billing::RecordingLeaseGates::default()),
             config: Arc::new(CpConfig {
@@ -635,6 +648,92 @@ pub(crate) mod wal_gate_test_support {
             store.is_wal_authoritative(user_id),
             "the harness must actually select the user"
         );
+    }
+
+    /// A selected user whose archive is REAL, READABLE and NOT EMPTY.
+    ///
+    /// This is the harness a LIFTED gate needs, and it is deliberately not
+    /// `select_wal_authoritative`. That helper installs the selection with no
+    /// serving authority precisely so every store touch fails — it can prove a
+    /// refusal and nothing else. A lifted gate has to be proven on the
+    /// opposite property: the read ANSWERS, with content. A test written on
+    /// `select_wal_authoritative` would pass just as happily on a route that
+    /// answers `200 {"episodes": []}`, which is the exact shape the D4
+    /// registry exists to keep off the wire.
+    ///
+    /// Everything here is durable and real: `converge_genesis_over` runs the
+    /// reviewed genesis driver to the `wal_authoritative` terminal and
+    /// launches the serving authority, and the rows arrive through
+    /// `wal_authoritative_submit` as the sealed `ReviewerFixturePlan` — the
+    /// same settle path `oauth.rs` uses in production. No row is written
+    /// through `with_user`, and none could be: a selected user has no such
+    /// lane.
+    ///
+    /// The fixture is the seed of convenience, not the justification. Each
+    /// lifted gate's justification is that the ordinary capture chain
+    /// (`CanonicalCaptureEventPlan` -> the media work claim -> the sealed
+    /// audio/screen result families -> `EpisodeWindowUpsertPlan`) writes the
+    /// same tables for every selected user; the fixture just gets rows into
+    /// them in one submit instead of five.
+    pub(crate) struct AnswerableArchive {
+        /// Held for the lifetime of the archive: dropping the substrate is the
+        /// harness's stand-in for process death and takes the serving
+        /// authority with it.
+        _substrate: crate::archive_v3_genesis_trigger::tests::GenesisSmokeSubstrate,
+        pub(crate) state: Arc<CpState>,
+        pub(crate) user_id: String,
+    }
+
+    /// Converge genesis for `user_id` (which must be a UUID — the fixture plan
+    /// validates it), then seed the archive through the WAL lane.
+    ///
+    /// Asserts its own preconditions, so a test built on it cannot pass
+    /// vacuously if the selection, the authority launch, or the seed silently
+    /// stops happening.
+    pub(crate) async fn answerable_wal_archive(user_id: &str) -> AnswerableArchive {
+        use crate::archive_v3_genesis_trigger::tests::{converge_for_smoke, GenesisSmokeSubstrate};
+        use crate::archive_v3_genesis_trigger::GenesisConvergence;
+
+        let substrate = GenesisSmokeSubstrate::new();
+        let process = substrate.boot();
+        process
+            .control
+            .create_genesis_test_binding(user_id)
+            .await
+            .expect("the harness mints the archive binding the way sign-in does");
+        let outcome = converge_for_smoke(
+            &substrate.runtime(),
+            &process.control,
+            &process.store,
+            user_id,
+        )
+        .await
+        .expect("genesis convergence must reach the durable terminal");
+        assert_eq!(outcome, GenesisConvergence::Converged);
+        assert!(
+            process.store.is_wal_authoritative(user_id),
+            "the archive must be selected, or the lifted gate is not the thing under test"
+        );
+        assert!(
+            process.store.has_wal_serving_authority(user_id),
+            "the archive must be READABLE, or every assertion below would be \
+             indistinguishable from the unavailable-authority lane"
+        );
+
+        assert!(
+            super::reviewer::ensure_demo_archive(&process.store, user_id)
+                .await
+                .expect("the sealed fixture settles"),
+            "the seed must have written; a no-op seed makes every content \
+             assertion below vacuous"
+        );
+
+        let state = state_over(Arc::clone(&process.store), Arc::clone(&process.control));
+        AnswerableArchive {
+            _substrate: substrate,
+            state,
+            user_id: user_id.to_owned(),
+        }
     }
 
     /// Make `user_id`'s LEGACY archive unreadable, without selecting them.
@@ -881,16 +980,16 @@ mod tests {
     fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
         let state = state();
         assert!(state
-            .wal_domain_refusal("unselected-user", wal_domain::QUERY_FEED)
+            .wal_domain_refusal("unselected-user", wal_domain::QUERY_BROWSER_SNAPSHOT)
             .is_none());
 
         select_wal_authoritative(&state.store, "selected-user");
         let refusal = state
-            .wal_domain_refusal("selected-user", wal_domain::QUERY_FEED)
+            .wal_domain_refusal("selected-user", wal_domain::QUERY_BROWSER_SNAPSHOT)
             .expect("a selected user is refused");
         assert!(matches!(
             refusal,
-            EnclaveError::WalDomainUnmigrated(domain) if domain == wal_domain::QUERY_FEED
+            EnclaveError::WalDomainUnmigrated(domain) if domain == wal_domain::QUERY_BROWSER_SNAPSHOT
         ));
     }
 }

@@ -24,7 +24,7 @@ use tracing::warn;
 use rusqlite::OptionalExtension;
 
 use crate::{
-    error::{wal_domain, EnclaveError, Result as EnclaveResult},
+    error::{EnclaveError, Result as EnclaveResult},
     store::Store,
 };
 
@@ -68,15 +68,12 @@ async fn sync_status(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
-    // ADR-0022 D4 — first, ahead of the control-store round trip below. A
-    // deferred domain must spend nothing: `user_email` is a GCS-backed load,
-    // and a refusal that pays for it is a refusal that can be turned into a
-    // load generator. `routed_read_unavailable()` already answers a generic
-    // 503, but a deferral must be distinguishable from a fault, so it names
-    // the domain instead.
-    if let Some(error) = s.wal_domain_refusal(&user_id, wal_domain::SYNC_STATUS) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `sync.status` gate is GONE. All three counted tables
+    // have live sealed writers for a selected user — `utterances` and
+    // `audio_segments` from `media_worker/wal/audio_result.rs::write_turns`,
+    // `screenshots` from `media_worker/wal/result.rs::write_frame`, `episodes`
+    // from `summarizer/wal/window.rs::apply` — so a zero count is now a
+    // truthful zero rather than a deferral wearing the face of one.
     let email = s.control.user_email(&user_id).await.ok().flatten();
 
     // ADR-0022: the counts route through the settled-only serving lane for a
@@ -124,14 +121,16 @@ async fn sync_status(
 // ── Export ──────────────────────────────────────────────────────────────────────
 
 async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUser>) -> Response {
-    // ADR-0022 D4. Without this the route answers `export_failed`, which reads
-    // as "your export is broken" rather than "this is deferred" — and if the
-    // routed read ever DID succeed for a selected user it would be worse: a
-    // complete-looking export document with every array empty, which is
-    // indistinguishable from an erased archive.
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::SYNC_EXPORT) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `sync.export` gate is GONE. The premise it rested on —
+    // "a complete-looking document with every array empty" — stopped being
+    // true when the evidence chain came alive: `utterances`, `screenshots`,
+    // `episodes`, `capture_events`, `capture_sessions`, `capture_streams`,
+    // `media_objects`, `speaker_observations`, `speaker_clusters`,
+    // `speaker_observation_sources` and `episode_final_briefs` all carry rows
+    // for a selected user who has captured anything. The arrays that stay
+    // empty (`people`, `person_facts`, `voice_profiles`) are empty because
+    // those rows genuinely do not exist on this lane, which is the one thing
+    // an export is supposed to report faithfully.
     match dump_user_export(&s.store, &user.0).await {
         Ok(data) => export_success_response(data),
         Err(e) => {
@@ -2062,6 +2061,121 @@ mod tests {
                 .expect("the export carries a screenshots array")
                 .len(),
             1
+        );
+    }
+
+    /// **ADR-0022 D4, `sync.status` LIFTED: the counts are REAL.**
+    ///
+    /// The gate this replaces existed because `200 {"counts": {"utterances":
+    /// 0, ...}}` reads as "your archive is empty". Deleting it is only correct
+    /// if the counts can be non-zero, so this asserts the exact fixture
+    /// cardinalities and the freshness stamps — a route that answered zeroes,
+    /// or answered counts without the `audio_segments` join behind
+    /// `utterance_at`, fails here.
+    #[tokio::test]
+    async fn the_lifted_sync_status_route_answers_a_selected_user_with_real_counts() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::State;
+
+        let archive = answerable_wal_archive("b0000000-0000-4000-8000-000000000001").await;
+        let response = sync_status(
+            State(Arc::clone(&archive.state)),
+            Extension(AuthUser(archive.user_id.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["counts"]["utterances"].as_i64(), Some(6), "{body}");
+        assert_eq!(body["counts"]["screenshots"].as_i64(), Some(1), "{body}");
+        assert_eq!(body["counts"]["episodes"].as_i64(), Some(4), "{body}");
+        assert_eq!(
+            body["latest"]["utterance_at"].as_str(),
+            Some("2026-07-22T14:00:00Z"),
+            "the freshness stamp comes from the audio_segments join: {body}"
+        );
+        assert_eq!(
+            body["latest"]["screenshot_at"].as_str(),
+            Some("2026-07-22T11:20:00Z"),
+            "{body}"
+        );
+    }
+
+    /// **`sync.export` LIFTED: the document carries rows.**
+    ///
+    /// This is the widest read in the lane, and its old rationale was that an
+    /// ungated export hands back "a complete-looking document with every array
+    /// empty". So the assertion is exactly that claim's negation, per table
+    /// rather than in aggregate: an export that filled `utterances` and left
+    /// `episodes` empty would be the same defect in a smaller place.
+    ///
+    /// The arrays that legitimately stay empty are asserted empty on purpose.
+    /// `people` and `person_facts` have no WAL-lane writer by construction
+    /// (see `wal_domain::MEDIA_PEOPLE`), and an export is the one surface
+    /// whose job is to report that faithfully rather than hide it — but if a
+    /// future change starts filling them, this fails and the reviewer has to
+    /// decide deliberately rather than by drift.
+    #[tokio::test]
+    async fn the_lifted_export_route_answers_a_selected_user_with_a_populated_document() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::State;
+
+        let archive = answerable_wal_archive("b0000000-0000-4000-8000-000000000002").await;
+        let response = export(
+            State(Arc::clone(&archive.state)),
+            Extension(AuthUser(archive.user_id.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for (field, expected) in [
+            ("utterances", 6usize),
+            ("screenshots", 1),
+            ("episodes", 4),
+            ("episode_final_briefs", 4),
+        ] {
+            let rows = body[field]
+                .as_array()
+                .unwrap_or_else(|| panic!("the export carries a {field} array: {body}"));
+            assert_eq!(rows.len(), expected, "{field}: {body}");
+        }
+        assert!(
+            body["utterances"]
+                .as_array()
+                .expect("checked above")
+                .iter()
+                .any(|row| row["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("August 19"))),
+            "the export must carry the transcript CONTENT, not just row count: {body}"
+        );
+        for empty in ["person_facts", "voice_profiles", "media_objects"] {
+            assert_eq!(
+                body[empty].as_array().map(Vec::len),
+                Some(0),
+                "{empty} has no WAL-lane writer reachable from this fixture; a \
+                 non-empty array here needs a deliberate review, not a silent \
+                 pass: {body}"
+            );
+        }
+        // `people` is the one that is not empty and still carries no identity:
+        // `init_schema` seeds a single `kind='owner'` row at `status='unknown'`,
+        // which every people READ filters out (see `wal_domain::MEDIA_PEOPLE`).
+        // Pinning its shape rather than its emptiness is what would catch a
+        // future change that starts committing identity on this lane.
+        let people = body["people"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the export carries a people array: {body}"));
+        assert_eq!(people.len(), 1, "{body}");
+        assert_eq!(people[0]["kind"], "owner", "{body}");
+        assert_eq!(
+            people[0]["status"], "unknown",
+            "no WAL-lane writer commits an identified person: {body}"
         );
     }
 }

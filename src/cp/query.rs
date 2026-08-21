@@ -621,12 +621,11 @@ fn object_array_schema(properties: Value) -> Value {
 
 /// Every tool name `dispatch_tool` answers, in `tool_definitions()` order.
 ///
-/// The ADR-0022 D4 `mcp.tools` gate in `mcp_endpoint` consults this list, so an
-/// *unknown* name still falls through to the JSON-RPC "unknown tool" error
-/// instead of being refused as a deferred domain.
-///
-/// Two real tests pin it, and a seventh tool cannot silently escape the gate
-/// without failing one of them:
+/// It is `#[cfg(test)]` because the ADR-0022 D4 `mcp.tools` gate that used to
+/// consult it in `mcp_endpoint` is gone: dispatch is keyed on the `match` in
+/// `dispatch_tool`, and an unknown name has always fallen through it to the
+/// JSON-RPC "unknown tool" error. What is left is a roster the tests sweep, and
+/// a seventh tool cannot silently escape any of them:
 ///
 /// * `mcp_tool_names_match_the_published_definitions` compares this list to
 ///   `tool_definitions()` in both directions, so a published tool must appear
@@ -637,6 +636,10 @@ fn object_array_schema(properties: Value) -> Value {
 ///   here that has no dispatch arm. That assertion — not a separate
 ///   `every_published_tool_dispatches`, which does not exist — is what pins
 ///   this list against `dispatch_tool`.
+/// * `every_mcp_tool_answers_a_selected_user_with_real_content` counts its own
+///   expectation table against this list, so a seventh tool must be proven to
+///   ANSWER, not merely proven to refuse cleanly.
+#[cfg(test)]
 const MCP_TOOL_NAMES: &[&str] = &[
     "search_transcripts",
     "search_screenshots",
@@ -966,49 +969,18 @@ async fn mcp_endpoint(
     let user_id = user.0;
 
     if rpc.method == "tools/call" {
-        let name = rpc
-            .params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        // ADR-0022 D4: none of the six tools can be answered for a
-        // WAL-authoritative archive — see `wal_domain`'s read-lane note for
-        // the writer-by-writer argument. The gate consults `MCP_TOOL_NAMES` so
-        // an UNKNOWN name still falls through to the JSON-RPC "unknown tool"
-        // error rather than being reported as a deferred domain.
+        // ADR-0022 D4: the `mcp.tools` gate that stood here is GONE. All six
+        // tools read through `wal_authoritative_read` (the mechanical half),
+        // and the evidence chain behind every table they touch is live for a
+        // selected user (the answerability half) — capture ingest through the
+        // sealed audio/screen result families to `utterances`/`screenshots`,
+        // and the sealed episode-window upsert to `episodes`/`episode_members`.
         //
-        // It sits here, ahead of the limiter, and not in `dispatch_tool` where
-        // it used to: a deferral must not consume the caller's rate-limit
-        // budget for a call that was never going to touch the archive. The
-        // cost is that it now preempts `mcp_safety::refusal_for_args`, which
-        // runs inside `dispatch_tool`. Both are refusals and neither returns
-        // any archive content, and "your archive is unreadable" is the more
-        // specific fact — the safety boundary is unweakened for every request
-        // that reaches the store.
-        if MCP_TOOL_NAMES.contains(&name) && s.store.is_wal_authoritative(&user_id) {
-            tracing::warn!(
-                user_id,
-                metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-                domain = wal_domain::MCP_TOOLS,
-                tool = name,
-                "not migrated to WAL; refusing tool"
-            );
-            // An `error` key is what sets `isError` on the tool result. It must
-            // never be an empty payload: the assistant reports that as "you
-            // have no data" while the archive is fully present.
-            let refusal = json!({
-                "error": crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-                "domain": wal_domain::MCP_TOOLS,
-            });
-            let text = serde_json::to_string(&refusal).unwrap_or_else(|_| "{}".into());
-            return rpc_ok(
-                &rpc.id,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": true
-                }),
-            );
-        }
+        // With the gate gone, `mcp_safety::refusal_for_args` inside
+        // `dispatch_tool` is no longer preempted for a selected user, so the
+        // safety boundary now runs on every request again rather than on every
+        // request that got past the deferral.
+        //
         // A volatile rate limit protects the service without making read-only
         // tool calls persist usage or query-log state.
         if !s.mcp_limiter.consume(&user_id).await {
@@ -1100,9 +1072,11 @@ async fn rest_search(
         )
             .into_response();
     };
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_SEARCH) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `query.search` gate is GONE. Both tables this read
+    // decides on have live sealed writers for a selected user — `episodes`
+    // from `summarizer/wal/window.rs`, `utterances` from
+    // `media_worker/wal/audio_result.rs` — and the read below is routed, so
+    // an empty result set is now a truthful one.
     let args =
         json!({ "query": q, "from": p.from, "to": p.to, "limit": p.limit.unwrap_or(10).min(50) });
     // The same treatment `rest_episodes` gets, and for the same reason: this
@@ -1131,9 +1105,11 @@ async fn rest_episodes(
     Query(p): Query<EpisodesParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODES) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `query.episodes` gate is GONE. `episodes` and
+    // `episode_members` are both written inside
+    // `summarizer/wal/window.rs::apply` for a selected user, and
+    // `episode_final_briefs` by `finalizer/wal.rs::write_brief`.
+    //
     // A read that fails answers 503, never 200 with an empty list: "no
     // episodes" and "your episodes are unreadable" are different facts, and
     // the debugger renders the first as an account with no memories. The gate
@@ -1172,9 +1148,10 @@ async fn rest_episode(
     Query(p): Query<EpisodeParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODES) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: gate GONE with `rest_episodes`'. The `NotFound` arm below
+    // stays a 404 and is NOT funnelled into the routed-read 503: an id that is
+    // absent from a readable archive is a different fact from an archive that
+    // could not be read, and only the second is retryable.
     match query_episodes_value(&s, &user.0, None, None, 1, include_low, Some(id)).await {
         Ok(data) => match data
             .get("episodes")
@@ -1322,9 +1299,14 @@ async fn rest_episode_members(
     // expanded episode view renders this as the raw evidence behind the
     // summary. The caller is the authenticated owner of the data; these same
     // rows are already reachable via /api/search and /v1/context.
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODE_MEMBERS) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `query.episode_members` gate is GONE. Every table that
+    // decides this answer has a live sealed writer for a selected user —
+    // `episode_members` from `summarizer/wal/window.rs::apply`, `utterances`
+    // and `audio_segments` from `media_worker/wal/audio_result.rs::write_turns`,
+    // `screenshots` and `screen_observations` from
+    // `media_worker/wal/result.rs::write_frame`. The `LEFT JOIN`ed identity
+    // and image tables do not decide it: they widen a member row, they cannot
+    // create or suppress one.
     let result = s
         .store
         .wal_authoritative_read(&user.0, move |conn| {
@@ -2036,9 +2018,10 @@ async fn rest_feed(
     Extension(user): Extension<AuthUser>,
     Query(p): Query<FeedParams>,
 ) -> Response {
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_FEED) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the `query.feed` gate is GONE. The feed merges
+    // `utterances`+`audio_segments` with `screenshots`+`screen_observations`
+    // and annotates from `episode_members`; all five are written by live
+    // sealed families for a selected user.
     let result = s
         .store
         .wal_authoritative_read(&user.0, move |conn| query_feed(conn, &p))
@@ -5810,80 +5793,341 @@ mod tests {
         assert_eq!(records[0]["active_app"], "Ledger");
     }
 
-    /// The D4 `mcp.tools` gate at the level it actually runs.
+    /// **ADR-0022 D4, `mcp.tools` LIFTED: every tool ANSWERS.**
     ///
-    /// It moved out of `dispatch_tool` and into `mcp_endpoint`, ahead of the
-    /// rate limiter, so a deferral no longer spends the caller's budget. This
-    /// pins the three things that move could have broken: the refusal still
-    /// names the domain, it still sets `isError` (an empty payload is reported
-    /// to the user as "you have no data"), and an UNKNOWN tool name still
-    /// falls through to the JSON-RPC error instead of being reported as a
-    /// deferred domain.
+    /// The gate this replaces asserted that all six tools refuse a selected
+    /// user. Deleting it is only correct if the tools now answer with real
+    /// content, and "no longer 503" is not that: `dispatch_tool` degrades a
+    /// failed read into `{"error": ...}` under HTTP 200, so a broken read
+    /// would sail past any assertion that only checked the status.
+    ///
+    /// So this asserts, per tool: no `error` key, the tool's own payload key
+    /// present, and a FIXTURE STRING inside it. The archive is a real
+    /// converged genesis archive seeded through `wal_authoritative_submit`
+    /// (see `wal_gate_test_support::answerable_wal_archive`), so every row
+    /// read here arrived on the WAL lane — `with_user` cannot write to a
+    /// selected user at all.
     #[tokio::test]
-    async fn the_mcp_gate_refuses_before_the_rate_limiter_and_lets_unknown_tools_through() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+    async fn every_mcp_tool_answers_a_selected_user_with_real_content() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
         use axum::extract::State;
         use axum::Extension;
 
-        let state = query_test_state();
-        let user_id = "mcp-gate-user";
-        select_wal_authoritative(&state.store, user_id);
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000001").await;
+        let state = &archive.state;
 
-        for tool in MCP_TOOL_NAMES {
+        // (tool, arguments, payload key that must be present, substring the
+        // fixture guarantees is inside it).
+        let expectations: [(&str, Value, &str, &str); 6] = [
+            (
+                "search_transcripts",
+                json!({"query": "depuis"}),
+                "results",
+                "depuis",
+            ),
+            (
+                "search_screenshots",
+                json!({"query": "renewal"}),
+                "results",
+                "Vendor renewal checklist",
+            ),
+            (
+                "get_context",
+                json!({"at": "2026-07-22T09:00:00Z", "window_seconds": 600}),
+                "utterances",
+                "August 19",
+            ),
+            (
+                "summarize_time_range",
+                json!({"from": "2026-07-22T00:00:00Z", "to": "2026-07-23T00:00:00Z"}),
+                "episodes",
+                "Launch planning and QA decision",
+            ),
+            (
+                "list_episodes",
+                json!({}),
+                "episodes",
+                "Dashboard cache invalidation fix",
+            ),
+            ("get_capture_status", json!({}), "total_utterances", ""),
+        ];
+        assert_eq!(
+            expectations.len(),
+            MCP_TOOL_NAMES.len(),
+            "a seventh tool must be given an ANSWERS expectation here, not just \
+             an unreadable-archive one"
+        );
+
+        for (tool, arguments, payload_key, must_contain) in expectations {
             let response = mcp_endpoint(
-                State(Arc::clone(&state)),
-                Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+                State(Arc::clone(state)),
+                Extension(crate::cp::auth::AuthUser(archive.user_id.clone())),
                 Json(JsonRpcRequest {
                     id: json!(1),
                     method: "tools/call".into(),
-                    params: json!({"name": tool, "arguments": {"query": "invoice"}}),
+                    params: json!({"name": tool, "arguments": arguments}),
                 }),
             )
             .await;
-            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
                 .await
                 .unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["result"]["isError"], json!(true), "{tool}: {body}");
+            assert_ne!(
+                body["result"]["isError"],
+                json!(true),
+                "{tool} still refuses a selected user: {body}"
+            );
             let text = body["result"]["content"][0]["text"]
                 .as_str()
-                .expect("the refusal carries text");
-            let refusal: Value = serde_json::from_str(text).unwrap();
-            assert_eq!(refusal["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-            assert_eq!(refusal["domain"], wal_domain::MCP_TOOLS);
+                .unwrap_or_else(|| panic!("{tool} answered no content: {body}"));
+            let payload: Value = serde_json::from_str(text)
+                .unwrap_or_else(|_| panic!("{tool} answered non-JSON content: {text}"));
             assert!(
-                body["result"].get("structuredContent").is_none(),
-                "{tool} must not also answer a structured payload: {body}"
+                payload.get("error").is_none(),
+                "{tool} answered a degraded error payload under HTTP 200: {payload}"
             );
+            let carried = payload
+                .get(payload_key)
+                .unwrap_or_else(|| panic!("{tool} answered without {payload_key}: {payload}"));
+            if must_contain.is_empty() {
+                // `get_capture_status` carries counts, not prose.
+                assert_eq!(
+                    carried.as_i64(),
+                    Some(6),
+                    "get_capture_status must count the six fixture utterances: {payload}"
+                );
+                assert_eq!(payload["total_screenshots"].as_i64(), Some(1), "{payload}");
+                assert_eq!(payload["episode_count"].as_i64(), Some(4), "{payload}");
+            } else {
+                let rendered = carried.to_string();
+                assert!(
+                    rendered.contains(must_contain),
+                    "{tool} answered {payload_key} without the fixture's own \
+                     content ({must_contain:?}): {rendered}"
+                );
+            }
         }
+    }
 
-        // The whole point of consulting MCP_TOOL_NAMES rather than gating
-        // every `tools/call`.
-        let unknown = mcp_endpoint(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Json(JsonRpcRequest {
-                id: json!(2),
-                method: "tools/call".into(),
-                params: json!({"name": "not_a_tool", "arguments": {}}),
+    /// **`query.search` LIFTED.** `/api/search` answers a selected user with
+    /// both halves of its payload carrying fixture rows: `episodes` from the
+    /// sealed episode-window family's table and `results` from the sealed
+    /// transcript family's. The FTS shadow tables are trigger-maintained, so a
+    /// hit here also proves the WAL capture carried the trigger writes.
+    #[tokio::test]
+    async fn the_lifted_search_route_answers_a_selected_user_with_rows() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::{Query, State};
+        use axum::Extension;
+
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000002").await;
+        let response = rest_search(
+            State(Arc::clone(&archive.state)),
+            Extension(crate::cp::auth::AuthUser(archive.user_id.clone())),
+            Query(SearchParams {
+                q: Some("depuis".into()),
+                from: None,
+                to: None,
+                limit: None,
             }),
         )
         .await;
-        let bytes = axum::body::to_bytes(unknown.into_body(), 4 * 1024)
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], json!(-32601));
+        let results = body["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the search answers a results array: {body}"));
+        assert!(
+            results
+                .iter()
+                .any(|hit| hit["text"].as_str().is_some_and(|t| t.contains("depuis"))),
+            "the utterance half must carry the fixture transcript: {body}"
+        );
+        let episodes = body["episodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the search answers an episodes array: {body}"));
+        assert!(
+            episodes
+                .iter()
+                .any(|hit| hit["title"].as_str().is_some_and(|t| t.contains("depuis"))),
+            "the episode half must carry the fixture episode: {body}"
+        );
+    }
 
-        // The gate ran ahead of the limiter, so none of the calls above spent
-        // budget. The harness limiter is 10 tokens refilling at 1/s, so a
-        // spent budget would show here.
-        let unselected = "mcp-gate-unselected";
-        for _ in 0..10 {
-            assert!(
-                state.mcp_limiter.consume(unselected).await,
-                "the deferral must not have spent the service's rate-limit budget"
-            );
-        }
+    /// **`query.episodes` LIFTED**, both routes. The list carries all four
+    /// fixture episodes with their member counts and final briefs; the detail
+    /// route resolves one by id. The detail route's `NotFound` -> 404 arm is
+    /// asserted here too, because lifting the gate above it must not have
+    /// funnelled a genuine absence into the routed-read 503.
+    #[tokio::test]
+    async fn the_lifted_episode_routes_answer_a_selected_user_with_rows() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::{Path, Query, State};
+        use axum::Extension;
+
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000003").await;
+        let user = || crate::cp::auth::AuthUser(archive.user_id.clone());
+
+        let listed = rest_episodes(
+            State(Arc::clone(&archive.state)),
+            Extension(user()),
+            Query(EpisodesParams {
+                from: None,
+                to: None,
+                max_episodes: None,
+                include_low: None,
+            }),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(listed.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["episode_count"].as_i64(), Some(4), "{body}");
+        let episodes = body["episodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the list answers an episodes array: {body}"));
+        assert_eq!(episodes.len(), 4, "{body}");
+        let launch = episodes
+            .iter()
+            .find(|e| e["id"].as_i64() == Some(940001))
+            .unwrap_or_else(|| panic!("the fixture's launch episode must be listed: {body}"));
+        assert_eq!(launch["title"], "Launch planning and QA decision");
+        // `episode_members` and `episode_final_briefs` are separate sealed
+        // writes; asserting them here is what keeps this from passing on an
+        // `episodes` table that happens to have rows and nothing else.
+        assert_eq!(launch["utterance_count"].as_i64(), Some(2), "{launch}");
+        assert!(
+            launch["final_brief"]["overview"]
+                .as_str()
+                .is_some_and(|o| o.contains("delayed the Kioku launch")),
+            "the final brief must join: {launch}"
+        );
+
+        let detail = rest_episode(
+            State(Arc::clone(&archive.state)),
+            Extension(user()),
+            Path(940002),
+            Query(EpisodeParams { include_low: None }),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(detail.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["title"], "Dashboard cache invalidation fix");
+
+        // The neighbouring meaning the lift must preserve: absent id is 404,
+        // not the routed read's 503.
+        let missing = rest_episode(
+            State(Arc::clone(&archive.state)),
+            Extension(user()),
+            Path(7),
+            Query(EpisodeParams { include_low: None }),
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::NOT_FOUND,
+            "an absent episode in a READABLE archive is an absence, not a deferral"
+        );
+    }
+
+    /// **`query.episode_members` LIFTED.** The members route joins
+    /// `episode_members` to `utterances` and `audio_segments`, so it answers
+    /// only if all three sealed writes landed and the join holds.
+    #[tokio::test]
+    async fn the_lifted_episode_members_route_answers_a_selected_user_with_rows() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000004").await;
+        let response = rest_episode_members(
+            State(Arc::clone(&archive.state)),
+            Extension(crate::cp::auth::AuthUser(archive.user_id.clone())),
+            Path(940001),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["member_count"].as_i64(), Some(2), "{body}");
+        let members = body["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the route answers a members array: {body}"));
+        assert!(
+            members
+                .iter()
+                .any(|m| m["text"].as_str().is_some_and(|t| t.contains("August 19"))),
+            "a member must carry its utterance TEXT, not just an id: {body}"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|m| m["started_at"].as_str().is_some_and(|t| !t.is_empty())),
+            "every member's timestamp comes from the audio_segments join: {body}"
+        );
+    }
+
+    /// **`query.feed` LIFTED.** The feed is the one lifted read that merges
+    /// the audio and screen families in a single answer, so it asserts one
+    /// record from each.
+    #[tokio::test]
+    async fn the_lifted_feed_route_answers_a_selected_user_with_rows() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::extract::{Query, State};
+        use axum::Extension;
+
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000005").await;
+        let response = rest_feed(
+            State(Arc::clone(&archive.state)),
+            Extension(crate::cp::auth::AuthUser(archive.user_id.clone())),
+            Query(FeedParams {
+                from: None,
+                to: None,
+                limit: None,
+                before: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let records = body["records"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the feed answers a records array: {body}"));
+        assert_eq!(
+            records.len(),
+            7,
+            "six utterances and one screenshot: {body}"
+        );
+        assert!(
+            records.iter().any(|r| r["kind"] == "utterance"
+                && r["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("cache invalidation bug"))),
+            "the audio family's rows must reach the feed: {body}"
+        );
+        let screen = records
+            .iter()
+            .find(|r| r["kind"] == "screenshot")
+            .unwrap_or_else(|| panic!("the screen family's row must reach the feed: {body}"));
+        assert_eq!(screen["active_app"], "Google Chrome", "{screen}");
+        assert_eq!(
+            screen["episode_id"].as_i64(),
+            Some(940003),
+            "the episode_members annotation must resolve: {screen}"
+        );
     }
 }
