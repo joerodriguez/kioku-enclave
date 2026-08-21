@@ -539,7 +539,7 @@ fn lease_work_unit(
         .collect::<Vec<_>>();
     // The one permitted edit to this legacy body: the digest moved verbatim
     // into a helper both lanes call, so the routed claim mints byte-identical
-    // work-unit ids. Pinned by `work_unit_id_matches_the_legacy_digest`.
+    // work-unit ids. Pinned by `the_work_unit_id_digest_is_byte_stable`.
     let id = wal::claim::work_unit_id(
         class,
         selected

@@ -110,12 +110,31 @@ impl FailureMember {
         Ok(())
     }
 
+    /// ENCLAVE-WRITTEN stamps only. `capture_started_at` is DEVICE-supplied and
+    /// must never be folded in here.
+    ///
+    /// This guard exists to bound stamps the enclave itself wrote, so a commit
+    /// stamp cannot precede a fact it recorded. `capture_events.started_at`
+    /// comes verbatim from the client manifest, is never compared to the
+    /// enclave clock on ingest, and is compared here as a raw STRING — so an
+    /// offset-bearing form like `...T20:00:00+09:00` (a PAST instant) or a
+    /// millisecond-less `...:04Z` sorts above every `now_iso()` stamp. Folding
+    /// it in refused the settle for a work unit the claim family had already
+    /// admitted, and the refusal leaves the members in `processing` for the
+    /// lease to reclaim. Because `enumerate_claimable` has no `attempt_count`
+    /// term — the ONLY attempt cap on this lane lives further down THIS tail —
+    /// that became an uncapped loop re-issuing a PAID Vertex call every
+    /// `CLAIM_LEASE_SECONDS`, bounded only by the daily budget it would starve.
+    ///
+    /// Nothing is weakened by excluding it: `capture_started_at` still binds
+    /// the operation id, still binds the canonical request, still drives the
+    /// budget-staleness test, and is still compared for exact equality by
+    /// `apply`'s whole-row precondition. The sibling families agree — the
+    /// claim's own `latest_observed_timestamp` folds only enclave stamps, and
+    /// the success family bounds `capture_started_at` inside the work window,
+    /// never against `committed_at`.
     fn latest_observed_timestamp(&self) -> &str {
-        let mut latest = self.updated_at.as_str();
-        if self.capture_started_at.as_str() > latest {
-            latest = self.capture_started_at.as_str();
-        }
-        latest
+        self.updated_at.as_str()
     }
 
     fn read(connection: &Connection, job_id: i64) -> rusqlite::Result<Option<Self>> {
@@ -1151,6 +1170,51 @@ mod tests {
             LogicalMutationDisposition::Replayed
         ));
         assert_eq!(applied, dump(&connection));
+    }
+
+    /// A device-supplied `capture_started_at` that STRING-sorts above the
+    /// commit stamp must still settle. It is not an enclave-written fact, so
+    /// it must not reach the commit-stamp ordering guard.
+    ///
+    /// If it does, the settle returns `Malformed`, the owner warns and returns
+    /// leaving the members in `processing`, and `enumerate_claimable` re-admits
+    /// them on lease expiry with NO `attempt_count` term — because the only
+    /// attempt cap on this lane is further down this very tail. That is an
+    /// uncapped loop paying for a Vertex call every `CLAIM_LEASE_SECONDS`.
+    ///
+    /// Both spellings below are reachable from a real client: an offset-bearing
+    /// form is a PAST instant that sorts high, and a millisecond-less form
+    /// sorts high because `Z` (0x5A) exceeds `.` (0x2E).
+    #[test]
+    fn a_high_sorting_device_capture_stamp_still_settles() {
+        for stamp in [
+            "2026-08-21T21:00:00+09:00", // == 12:00Z, a PAST instant that sorts high
+            "2026-08-21T12:01:00Z",      // no milliseconds: 'Z' 0x5A > '.' 0x2E
+            "2026-08-21T12:10:00.000Z",  // a genuinely skewed device clock
+        ] {
+            assert!(
+                stamp > COMMITTED_AT,
+                "precondition: {stamp} must sort above the commit stamp"
+            );
+            let attempts = [1_i64];
+            let mut connection = fixture(&attempts, stamp);
+            let plan = build(
+                &connection,
+                "processing_error",
+                ATTEMPT_LIMIT,
+                &job_ids(&attempts),
+            );
+            settle(&mut connection, plan).unwrap_or_else(|error| {
+                panic!(
+                    "a device stamp sorting above the commit stamp must settle, \
+                     not wedge the unit in `processing` for an uncapped paid \
+                     retry loop: {stamp} -> {error:?}"
+                )
+            });
+            let (state, _attempt_count, lease, _updated) = job_row(&connection, 1);
+            assert_eq!(state, "retry_wait", "{stamp} must leave `processing`");
+            assert_eq!(lease, None);
+        }
     }
 
     #[test]
