@@ -249,6 +249,25 @@ impl CaptureEventManifest {
                 "sequence must be non-negative".into(),
             ));
         }
+        // Parseable, not canonical. `parse_epoch_millis` deliberately accepts
+        // a `±HH:MM` offset and ignores fractional digits past the third, and
+        // this check is deliberately NOT tightened to reject either.
+        //
+        // It is tempting to normalize here as defence in depth, because a
+        // non-canonical device stamp compared as a raw string is what wedged
+        // the media claim lane. But the wedge was a BINDING defect, not an
+        // input-shape one: `source_wall_at` belongs in
+        // `capture_events.source_wall_at` and `browser_observations_v2.
+        // observed_at`, and nowhere else, which is what
+        // `wal::is_canonical_commit_stamp` now enforces at plan construction.
+        // Rejecting offset-bearing stamps here would instead be a client
+        // contract break with no upside: shipped Mac and iOS builds may
+        // already send them (`parse_epoch_millis` supports the form on
+        // purpose), a 400 on ingest is not something the durable outbox can
+        // rebase away, and the tightening would land in a routing change where
+        // nobody would look for it. If a future change does normalize device
+        // stamps, it belongs in its own migration with the client, and it must
+        // never be done by loosening `parse_epoch_millis`.
         if parse_epoch_millis(&self.source_wall_at).is_none() {
             return Err(EnclaveError::InvalidRequest(
                 "source_wall_at must be ISO-8601".into(),
@@ -1166,6 +1185,7 @@ async fn upload_screen_reference_batch(
             user_id.clone(),
             request.batch_id.clone(),
             request.events.clone(),
+            enclave_commit_stamp(),
         ) {
             Ok(plan) => plan,
             Err(_) => {
@@ -1179,6 +1199,11 @@ async fn upload_screen_reference_batch(
                 )
             }
         };
+        // Taken BEFORE `prepare` consumes the plan: the submit narrows every
+        // owner refusal to a content-free conflict, so the rebase-required
+        // reason has to travel out of band or the route answers 409 and the
+        // client's durable outbox re-posts an event only a rebase can fix.
+        let refusal = plan.refusal_sink();
         let prepared =
             match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
                 Ok(prepared) => prepared,
@@ -1208,7 +1233,7 @@ async fn upload_screen_reference_batch(
                     "screen_reference_batch",
                     started_at,
                     manifest,
-                    error,
+                    refusal.observed().unwrap_or(error),
                 )
             }
         }
@@ -1311,87 +1336,30 @@ async fn upload_capture_event(
             );
         }
     }
-    // ADR-0022 D4: capture ingest is a B domain and is NOT migrated. Refuse
-    // before the limiter burns a token or the multipart body is read, with the
-    // distinguishable 503 rather than a generic 500. The sibling
-    // reference-batch and session-finish routes ARE migrated and are
-    // deliberately not gated. This module's capture/session/people READ routes
-    // ARE gated, and they are gated on THIS domain: see the answerability rule
-    // in `error::wal_domain`. Every one of them reads a table only this route
-    // fills, so they lift together with it and not before.
+    // ADR-0022 per-domain routing: capture ingest is MIGRATED. Its D4 gate is
+    // gone because both dispositions this one route serves now have a sealed
+    // family:
+    //   * canonical  -- `wal::CanonicalCaptureEventPlan` (subtype
+    //                   `canonical-capture-event-v1`), taking the object key
+    //                   and positive provider generation the upload boundary
+    //                   below produces. Its residual was never the plan: it
+    //                   treats an already-present event as a hard precondition
+    //                   failure while this route answers 200, so the preflight
+    //                   below had to route to the settled lane before the
+    //                   submit could be reached at all.
+    //   * reference  -- `wal::MediaReferenceEventPlan` (subtype
+    //                   `adr-0022-single-reference-capture-event-v1`), a new
+    //                   family with its own operation-source domain and its
+    //                   own ledger. See that module for why a bespoke plan
+    //                   reusing the batch id derivation would have collided on
+    //                   one `archive_v3_wal_publications` slot and one attempt
+    //                   ladder with a fingerprint it could never match.
     //
-    // The gate stays because this ONE route serves BOTH media dispositions and
-    // only one of them has a sealed family:
-    //   * canonical  -- `wal::CanonicalCaptureEventPlan` covers it exactly
-    //                   (subtype `canonical-capture-event-v1` of
-    //                   `WalOperationKind::MediaCaptureEvent`), taking the
-    //                   object key and positive provider generation the B
-    //                   upload boundary below already produces.
-    //   * reference  -- NOT covered. The canonical plan rejects a
-    //                   non-canonical disposition outright.
-    //
-    // The hazard here is NOT that reusing `MediaReferenceBatchPlan` literally
-    // would wedge the lane. It would not, and the reasoning must not pretend
-    // otherwise. A Reference event is always `mac_screen`, so a one-event
-    // batch validates; the operation id derives from `reference_batch_id` over
-    // the ordered (event_id, sequence) pairs, so a single-event POST for event
-    // E does land on the same id as the one-event batch POST for the same E.
-    // But literal reuse carries that plan's `canonical_request` and its
-    // `Output` too, so the request fingerprint matches and `validate_replay`
-    // accepts the stored `MediaReferenceBatchOutcome`. That alias is exactly
-    // correct idempotent dedup -- the two POSTs ARE the same logical mutation
-    // -- and `reference_batch`'s stable-identity test already pins the
-    // id-and-request equality that makes it so.
-    //
-    // The genuine hazard is the bespoke variant. A NEW single-event plan that
-    // reused only the `reference_batch_id` derivation for its operation id
-    // while committing its OWN `Output` type -- `CaptureAccepted`, say, rather
-    // than the batch's counts -- would collide on operation id under the same
-    // `WalOperationKind::MediaCaptureEvent` ordinal with a MISMATCHING
-    // fingerprint (its `canonical_request` frames a different subtype and a
-    // different payload) and a MISMATCHING decoded outcome.
-    //
-    // That pair is exactly what the durable publication stage keys on.
-    // `archive_v3_wal_publications` holds ONE row per archive under
-    // `UNIQUE (archive_id, operation_kind, operation_id)`; it resumes an
-    // in-flight operation only when operation id AND request fingerprint AND
-    // kind all three match, and it derives that row's `session_id` from
-    // `(archive_id, kind, operation_id)` alone -- fingerprint-blind. So two
-    // families sharing that pair share one durable operation slot while never
-    // matching each other's fingerprint: the second arrival takes neither the
-    // resume branch nor the abandon branch (which fires only when the id or
-    // the kind differs) and refuses with "another WAL operation is active"
-    // until the first resolves. They also share one attempt ladder --
-    // `archive_v3_wal_publication_attempts` is keyed
-    // `(archive_id, operation_kind, operation_id, attempt)` with no
-    // fingerprint -- so each family's retries burn the other's budget toward
-    // the same `MAX_WAL_OWNER_ATTEMPTS` cap of 16.
-    //
-    // If such a plan reused the reference-batch LEDGER as well as the id, the
-    // mismatch bites one step earlier and harder:
-    // `MediaReferenceBatchLedger::lookup` answers `FingerprintConflict` on the
-    // pre-existing row, and were the fingerprints ever forced to agree the
-    // stored `result_bytes` still decode as the other family's outcome and
-    // fail as `Corrupt`. (Each sealed family does get its own ledger table
-    // today -- canonical capture events and reference batches share the
-    // ordinal but not the table -- so this is the avoidable branch, not the
-    // load-bearing one.)
-    //
-    // Covering the reference disposition therefore needs its own subtype
-    // constant and a reviewed identity argument -- the discipline
-    // `test_plan_family_subtypes_are_declared_and_pairwise_distinct` enforces
-    // -- not a call site.
-    //
-    // Routing only the canonical arm would leave a WAL-authoritative client's
-    // interleaved reference events refusing mid-stream, and `capture_streams`'
-    // contiguous acknowledgement would wedge at the first hole. Moving the
-    // gate below the disposition branch to do that would also spend a limiter
-    // token and read the whole multipart body before refusing. Both are
-    // strictly worse than deferring the route, so the gate is retained until a
-    // reviewed single-event reference family exists.
-    if let Some(error) = state.wal_domain_refusal(&user_id, wal_domain::MEDIA_CAPTURE_EVENTS) {
-        return capture_error_response(started_at, None, error);
-    }
+    // BOTH had to land together. A mac_screen stream interleaves canonical
+    // screenshots and their reference pointers by sequence, and
+    // `advance_contiguous_ack` walks only while the next sequence exists, so
+    // routing the canonical arm alone would have stalled every such stream
+    // permanently at its first refused reference event.
     if !state.sync_limiter.consume(&user_id).await {
         return capture_failure_response(
             started_at,
@@ -1572,12 +1540,46 @@ async fn upload_capture_event(
             )
         }
     };
-    let preflight = state
-        .store
-        .with_user(&user_id, |conn| {
-            preflight_source_event(conn, &manifest, &digest, object_key.as_deref())
-        })
-        .await;
+    // ADR-0022 per-domain routing. This preflight is the canonical arm's whole
+    // residual and it is load-bearing on BOTH branches:
+    //
+    //   * A WAL-authoritative user reads the SETTLED lane. Without that, a
+    //     selected user's preflight would run through `with_user`, which
+    //     refuses outright for a WAL-authoritative archive, and every capture
+    //     would fail before it reached a plan.
+    //   * `CanonicalCaptureEventPlan` treats an already-present event as a
+    //     hard `Precondition` failure (`ensure_domain_targets_absent`), and
+    //     the legacy route answers 200 for it. Catching the duplicate HERE,
+    //     before the submit, is what keeps a re-posted event answering 200
+    //     instead of 409. The reference arm's plan handles a duplicate as a
+    //     first-class outcome, so this read is a fast path for it, not a
+    //     correctness precondition.
+    //
+    // Same shape as `upload_screen_reference_batch` above.
+    let wal_authoritative = state.store.is_wal_authoritative(&user_id);
+    let preflight = if wal_authoritative {
+        let preflight_manifest = manifest.clone();
+        let preflight_digest = digest.clone();
+        let preflight_object_key = object_key.clone();
+        state
+            .store
+            .wal_authoritative_read(&user_id, move |conn| {
+                preflight_source_event(
+                    conn,
+                    &preflight_manifest,
+                    &preflight_digest,
+                    preflight_object_key.as_deref(),
+                )
+            })
+            .await
+    } else {
+        state
+            .store
+            .with_user(&user_id, |conn| {
+                preflight_source_event(conn, &manifest, &digest, object_key.as_deref())
+            })
+            .await
+    };
     match preflight {
         Ok(PreflightOutcome::Duplicate {
             committed_through_sequence,
@@ -1585,18 +1587,22 @@ async fn upload_capture_event(
             // A prior attempt may have committed only to the in-memory archive
             // before its durable save failed. Flush even duplicate preflight
             // state before acknowledging or clearing delayed-delivery authority.
-            if let Err(error) = state.store.save_user(&user_id).await {
-                tracing::error!(error = %error, "duplicate capture persistence failed");
-                return capture_failure_response(
-                    started_at,
-                    Some(&manifest),
-                    CaptureIngestFailureReason::PersistenceUnavailable,
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "capture persistence failed",
-                    )
-                        .into_response(),
-                );
+            // The WAL lane has no such half-state: it acknowledges only after
+            // witness settlement and never persists through `save_user`.
+            if !wal_authoritative {
+                if let Err(error) = state.store.save_user(&user_id).await {
+                    tracing::error!(error = %error, "duplicate capture persistence failed");
+                    return capture_failure_response(
+                        started_at,
+                        Some(&manifest),
+                        CaptureIngestFailureReason::PersistenceUnavailable,
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "capture persistence failed",
+                        )
+                            .into_response(),
+                    );
+                }
             }
             if encrypted_outbox_delivery {
                 super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id)
@@ -1729,45 +1735,176 @@ async fn upload_capture_event(
         }
     }
 
-    let outcome = state
-        .store
-        .with_user(&user_id, |conn| {
-            match manifest.media_disposition {
-                MediaDisposition::Canonical => record_source_event_with_generation(
-                    conn,
-                    &user_id,
-                    &manifest,
-                    &digest,
-                    object_key
-                        .as_deref()
-                        .expect("validated canonical object key"),
-                    media_generation,
-                )?,
-                MediaDisposition::Reference => {
-                    record_reference_event(conn, &user_id, &manifest, &digest)?
+    // The settle-submit replaces the legacy write+save pair: acknowledgement
+    // comes only after immutable publication and witness settlement, so there
+    // is no `save_user` on this branch and nothing to flush. Billing, limits,
+    // leases, the media upload above and the telemetry below are identical on
+    // both branches.
+    let (committed, duplicate) = if wal_authoritative {
+        match manifest.media_disposition {
+            MediaDisposition::Canonical => {
+                let object_key = object_key
+                    .as_deref()
+                    .expect("validated canonical object key");
+                // The plan requires the immutable upload handoff: an exact
+                // account-bound object key and a POSITIVE provider generation.
+                // A missing or non-positive generation means the upload above
+                // did not actually fix the object, so refuse rather than mint
+                // a receipt for media nothing can be replayed against.
+                let Some(generation) = media_generation.filter(|value| *value > 0) else {
+                    tracing::error!("canonical capture reached the WAL lane without a generation");
+                    return capture_failure_response(
+                        started_at,
+                        Some(&manifest),
+                        CaptureIngestFailureReason::MediaStorageUnavailable,
+                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                    );
+                };
+                let plan = match wal::CanonicalCaptureEventPlan::new(
+                    user_id.clone(),
+                    manifest.clone(),
+                    object_key.to_string(),
+                    generation,
+                    enclave_commit_stamp(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        return capture_error_response(
+                            started_at,
+                            Some(&manifest),
+                            EnclaveError::Store(
+                                "canonical capture plan construction failed".into(),
+                            ),
+                        )
+                    }
+                };
+                let prepared =
+                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+                    {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            return capture_error_response(
+                                started_at,
+                                Some(&manifest),
+                                EnclaveError::Store(
+                                    "canonical capture plan construction failed".into(),
+                                ),
+                            )
+                        }
+                    };
+                match state
+                    .store
+                    .wal_authoritative_submit(&user_id, prepared)
+                    .await
+                {
+                    Ok(outcome) => (outcome.committed_through_sequence(), false),
+                    Err(error) => {
+                        return capture_error_response(started_at, Some(&manifest), error)
+                    }
                 }
-            };
-            committed_through_sequence(conn, &manifest.stream_id)
-        })
-        .await;
-    let committed = match outcome {
-        Ok(value) => value,
-        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
+            }
+            MediaDisposition::Reference => {
+                let plan = match wal::MediaReferenceEventPlan::new(
+                    user_id.clone(),
+                    manifest.clone(),
+                    enclave_commit_stamp(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        return capture_error_response(
+                            started_at,
+                            Some(&manifest),
+                            EnclaveError::Store(
+                                "reference capture plan construction failed".into(),
+                            ),
+                        )
+                    }
+                };
+                // Taken BEFORE `prepare` consumes the plan: the submit narrows
+                // every owner refusal to a content-free conflict, and a
+                // rebase-required refusal that arrives content-free is a wedge
+                // -- the client re-posts an event only a rebase can fix.
+                let refusal = plan.refusal_sink();
+                let prepared =
+                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+                    {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            return capture_error_response(
+                                started_at,
+                                Some(&manifest),
+                                EnclaveError::Store(
+                                    "reference capture plan construction failed".into(),
+                                ),
+                            )
+                        }
+                    };
+                match state
+                    .store
+                    .wal_authoritative_submit(&user_id, prepared)
+                    .await
+                {
+                    Ok(outcome) => (outcome.committed_through_sequence(), outcome.duplicate()),
+                    Err(error) => {
+                        return capture_error_response(
+                            started_at,
+                            Some(&manifest),
+                            refusal.observed().unwrap_or(error),
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        let outcome = state
+            .store
+            .with_user(&user_id, |conn| {
+                match manifest.media_disposition {
+                    MediaDisposition::Canonical => record_source_event_with_generation(
+                        conn,
+                        &user_id,
+                        &manifest,
+                        &digest,
+                        object_key
+                            .as_deref()
+                            .expect("validated canonical object key"),
+                        media_generation,
+                    )?,
+                    MediaDisposition::Reference => {
+                        record_reference_event(conn, &user_id, &manifest, &digest)?
+                    }
+                };
+                committed_through_sequence(conn, &manifest.stream_id)
+            })
+            .await;
+        let committed = match outcome {
+            Ok(value) => value,
+            Err(error) => return capture_error_response(started_at, Some(&manifest), error),
+        };
+        if let Err(error) = state.store.save_user(&user_id).await {
+            tracing::error!(error = %error, "capture database persistence failed");
+            return capture_failure_response(
+                started_at,
+                Some(&manifest),
+                CaptureIngestFailureReason::PersistenceUnavailable,
+                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+            );
+        }
+        (committed, false)
     };
-    if let Err(error) = state.store.save_user(&user_id).await {
-        tracing::error!(error = %error, "capture database persistence failed");
-        return capture_failure_response(
-            started_at,
-            Some(&manifest),
-            CaptureIngestFailureReason::PersistenceUnavailable,
-            (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
-        );
-    }
     if encrypted_outbox_delivery {
         super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id).await;
     }
+    // A reference event that raced another writer between the preflight and
+    // the submit settles as a duplicate rather than refusing, and answers the
+    // same 200 the preflight branch above would have.
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     (
-        StatusCode::CREATED,
+        status,
         Json(CaptureAccepted {
             event_id: manifest.event_id,
             asset_id,
@@ -1795,29 +1932,24 @@ async fn stream_ack(
     if let Err(error) = validate_id("stream_id", &stream_id) {
         return error.into_response();
     }
-    // ADR-0022 D4: RETAINED deliberately, and NOT because this handler writes
-    // -- it is a pure SELECT over `capture_streams`, classified A by the
-    // idempotency gate's own inventory, and it would route as mechanically as
-    // the capture/session/people reads below.
-    //
-    // It stays gated under the ANSWERABILITY RULE in `error::wal_domain`:
-    // a read stays gated while every production writer of the tables it reads
-    // is itself a deferred domain. The migrated reference-batch route does
-    // advance a reference stream's acknowledgement, but every canonical stream
-    // is created by `upload_capture_event`, which is still deferred above. So a
-    // WAL-authoritative client asking about its own audio stream would get
-    // `NotFound` -> 404 "no such stream" when the truth is "ingest for your
-    // account is deferred" -- a deferral wearing the shape of an authoritative
-    // absence, which is precisely the failure D4 exists to prevent. The 503
-    // keeps the client's durable outbox retrying instead of concluding its
-    // stream was lost. This gate lifts with the capture-events gate, not
-    // before it.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_STREAM_ACK) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: the gate here is GONE because its answerability blocker is.
+    // It was retained not because this handler writes -- it is a pure SELECT
+    // over `capture_streams` -- but because every canonical stream it could
+    // name was created by the then-deferred `upload_capture_event`, so a
+    // routed answer for a selected user could only be `NotFound` -> 404 "no
+    // such stream" when the truth was "ingest for your account is deferred".
+    // Ingest is migrated, so the absence this read reports is now a truthful
+    // one, and the read routes: a selected user reads the settled lane, an
+    // unselected user keeps the legacy path, and neither is served the other's
+    // snapshot. (`with_user_read` rather than the bare `with_user` this
+    // replaced, so the legacy fallthrough also runs under SQLite's
+    // `query_only` guard.)
     match state
         .store
-        .with_user(&user.0, |conn| committed_through_sequence(conn, &stream_id))
+        .wal_authoritative_read(&user.0, {
+            let stream_id = stream_id.clone();
+            move |conn| committed_through_sequence(conn, &stream_id)
+        })
         .await
     {
         Ok(committed) => Json(StreamAck {
@@ -1825,7 +1957,19 @@ async fn stream_ack(
             committed_through_sequence: committed,
         })
         .into_response(),
-        Err(error) => error.into_response(),
+        // `committed_through_sequence` folds "no such stream" into
+        // `Err(NotFound)` rather than `Ok(None)`, so this arm carries two
+        // different things and they must not share a status. The absence is a
+        // truthful 404 now that ingest writes every stream this can name --
+        // that is the whole reason the gate above could be lifted. Everything
+        // else is the routed read itself failing (an unregistered, quarantined
+        // or mid-relaunch serving authority arrives as `EnclaveError::Store`),
+        // which is retryable and answers the lane's 503 under
+        // `super::routed_read_unavailable`'s rule. It is deliberately NOT the
+        // 500 the generic arm would render: that makes a retryable read
+        // failure indistinguishable from a genuinely non-retryable one.
+        Err(EnclaveError::NotFound) => EnclaveError::NotFound.into_response(),
+        Err(error) => super::routed_read_unavailable("api.media.stream_ack", &error),
     }
 }
 
@@ -1837,24 +1981,17 @@ async fn capture_status(
     if let Err(error) = validate_id("event_id", &event_id) {
         return error.into_response();
     }
-    // ADR-0022 D4, the ANSWERABILITY RULE stated in `error::wal_domain`: this
-    // read's only production writer is `upload_capture_event`, which is still
-    // deferred above. Routed, it could only answer `Ok(None)` -> 404 "no such
-    // event" for a selected user, and a 404 is indistinguishable from the
-    // truthful "you never uploaded that event". The gate lifts WITH
-    // `MEDIA_CAPTURE_EVENTS`, never before it — and because the read below is
-    // already routed, lifting it is deleting these four lines.
+    // ADR-0022 D4: the gate here is GONE because its answerability blocker is.
+    // This read's only production writer is `upload_capture_event`, which was
+    // deferred; a routed `Ok(None)` -> 404 "no such event" for a selected user
+    // was then indistinguishable from the truthful "you never uploaded that
+    // event". Ingest is migrated, so the 404 is now truthful and the routing
+    // below is answerable.
     //
-    // Nothing is spent above: `validate_id` touches no store and no limiter.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_EVENT_STATUS) {
-        return error.into_response();
-    }
-    // Per-domain routing, live for every unselected user today: the legacy
-    // fallthrough is `with_user_read`, so the read runs under SQLite's
-    // `query_only` guard instead of the bare `with_user` this replaced. When
-    // the gate above lifts, a WAL-authoritative user reads the settled-only
-    // lane and a user with no registered serving authority refuses as
-    // unavailable — never the stale legacy snapshot.
+    // The legacy fallthrough is `with_user_read`, so an unselected user's read
+    // runs under SQLite's `query_only` guard; a WAL-authoritative user reads
+    // the settled-only lane and a user with no registered serving authority
+    // refuses as unavailable — never the stale legacy snapshot.
     match state
         .store
         .wal_authoritative_read(&user.0, move |conn| load_capture_status(conn, &event_id))
@@ -1862,7 +1999,13 @@ async fn capture_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        Err(error) => error.into_response(),
+        // A failed routed read is NOT an absence and NOT a fault: the archive
+        // is present and merely unreadable. 503 under
+        // `super::routed_read_unavailable`'s rule, never the 500 the generic
+        // arm renders for `EnclaveError::Store` -- the D4 gate used to fire
+        // first, so this arm was unreachable for exactly the population it now
+        // serves.
+        Err(error) => super::routed_read_unavailable("api.media.capture_status", &error),
     }
 }
 
@@ -1886,18 +2029,11 @@ async fn capture_session_status(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`. The gate is
-    // ABOVE `summarized_until_ms` deliberately: that is a control-store read,
-    // and a refusal must not spend one. `finish_capture_session` routing this
-    // same read is not a counter-argument — it reads a session the caller just
-    // settled through the migrated lane, so an answer exists; here the session
-    // could only have been created by the deferred ingest, so it could not.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSION_STATUS)
-    {
-        return error.into_response();
-    }
-    // Per-domain routing, live for every unselected user today; see
-    // `capture_status` above for why the routed call stays while the gate does.
+    // ADR-0022 D4: gate GONE with ingest. The session rows this reads could
+    // once only have been created by the deferred ingest, so a routed answer
+    // could only be an absence; ingest is migrated, so an absence here is
+    // truthful. Routed exactly as `finish_capture_session` routes this same
+    // read.
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
         .store
@@ -1908,7 +2044,9 @@ async fn capture_session_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        Err(error) => error.into_response(),
+        // See `capture_status`: an unreadable archive is retryable, so it
+        // answers 503 rather than the generic 500.
+        Err(error) => super::routed_read_unavailable("api.media.capture_session_status", &error),
     }
 }
 
@@ -1920,19 +2058,12 @@ async fn list_capture_sessions(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<CaptureSessionListQuery>,
 ) -> Response {
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`. FIRST
-    // statement in the handler, above the `summarized_until_ms` control-store
-    // read below: a refusal spends nothing.
-    //
-    // This is the endpoint the rule matters most for. It answers a COLLECTION,
-    // so an ungated routed read for a selected user does not even produce the
-    // 404 its single-session sibling would — it produces
-    // `200 {"sessions": []}`, a refusal wearing the face of a truthful empty
-    // archive. Lifts with `MEDIA_CAPTURE_EVENTS`, which writes every row it
-    // could list.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_CAPTURE_SESSIONS) {
-        return error.into_response();
-    }
+    // ADR-0022 D4: gate GONE with ingest, which writes every row this could
+    // list. It was the endpoint the answerability rule mattered most for,
+    // because it answers a COLLECTION: an ungated routed read for a selected
+    // user produced `200 {"sessions": []}`, a deferral wearing the face of a
+    // truthful empty archive. With ingest migrated the empty list is the
+    // truth, and this routes like its single-session sibling.
     let window_hours = query.window_hours.unwrap_or(8).clamp(1, 24);
     let max_sessions = query.max_sessions.unwrap_or(5).clamp(1, 10);
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
@@ -1953,7 +2084,11 @@ async fn list_capture_sessions(
         .await
     {
         Ok(list) => Json(list).into_response(),
-        Err(error) => error.into_response(),
+        // A COLLECTION endpoint, so this arm matters most: 503 with the named
+        // reason under `super::routed_read_unavailable`'s rule. Never the
+        // generic 500, and never a 200 carrying an empty `sessions` array --
+        // a refusal must not wear the face of a truthful empty archive.
+        Err(error) => super::routed_read_unavailable("api.media.capture_sessions", &error),
     }
 }
 
@@ -2293,12 +2428,16 @@ async fn list_people(
     // statement in the handler: a refusal spends nothing, not even the
     // `to_lowercase` allocation below.
     //
-    // The other collection endpoint, and the same hazard: `people` rows are
-    // derived by `media_worker`'s result lanes from evidence capture ingest
-    // supplies, and the `voice_profiles` this listing joins come only from the
-    // deferred voice lanes. No live writer reaches these tables, so a routed
-    // read for a selected user can only answer `200 {"people": []}` — an
-    // authoritative-looking "you know nobody". Lifts with the writers.
+    // The other collection endpoint, and the same hazard. `people` and
+    // `person_facts` rows come only from `media_worker::create_person` /
+    // `persist_person_fact`, reached only from the audio and screen RESULT
+    // lanes — and although those lanes are migrated, their sealed families
+    // commit NO identity by construction, so for a selected user
+    // `process_work_unit` returns early and the two legacy persisters that
+    // write these tables are unreachable. A routed read can therefore only
+    // answer `200 {"people": []}` — an authoritative-looking "you know
+    // nobody". It lifts when a sealed family actually commits these rows, NOT
+    // when the voice lanes migrate; see `wal_domain::MEDIA_PEOPLE`.
     if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
         return error.into_response();
     }
@@ -4133,6 +4272,7 @@ pub fn record_source_event_with_generation(
         manifest_digest,
         object_key,
         object_generation,
+        None,
     )?;
     tx.commit()?;
     Ok(outcome)
@@ -4145,6 +4285,7 @@ fn record_source_event_in_transaction(
     manifest_digest: &str,
     object_key: &str,
     object_generation: Option<i64>,
+    commit_stamp: CommitStamp<'_>,
 ) -> Result<RecordOutcome> {
     manifest.validate()?;
     if manifest.media_disposition != MediaDisposition::Canonical {
@@ -4185,8 +4326,10 @@ fn record_source_event_in_transaction(
 
     conn.execute(
         "INSERT INTO capture_sessions \
-         (id, device_id, install_id, started_at, last_event_at, schema_version, ended_at) \
-         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
+         (id, device_id, install_id, started_at, last_event_at, schema_version, ended_at, \
+          created_at) \
+         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END,\
+                 COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
          ON CONFLICT(id) DO UPDATE SET \
            last_event_at=MAX(last_event_at, excluded.last_event_at), \
            ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at, excluded.ended_at) \
@@ -4197,18 +4340,21 @@ fn record_source_event_in_transaction(
             manifest.install_id,
             manifest.started_at,
             manifest.ended_at,
-            manifest.session_finished.unwrap_or(false)
+            manifest.session_finished.unwrap_or(false),
+            commit_stamp
         ],
     )?;
     conn.execute(
         "INSERT INTO capture_streams \
-         (id, capture_session_id, device_id, stream_kind) VALUES (?1,?2,?3,?4) \
+         (id, capture_session_id, device_id, stream_kind, created_at) \
+         VALUES (?1,?2,?3,?4,COALESCE(?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
          ON CONFLICT(id) DO NOTHING",
         params![
             manifest.stream_id,
             manifest.capture_session_id,
             manifest.device_id,
-            manifest.stream_kind.as_str()
+            manifest.stream_kind.as_str(),
+            commit_stamp
         ],
     )?;
     let context_json = manifest
@@ -4220,8 +4366,10 @@ fn record_source_event_in_transaction(
         "INSERT INTO capture_events \
          (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
           source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
-          clock_uncertainty_ms,asset_id,manifest_digest,context_json,audio_role,audio_route,route_epoch) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+          clock_uncertainty_ms,asset_id,manifest_digest,context_json,audio_role,audio_route,route_epoch,\
+          received_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
+                 COALESCE(?21,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
         params![
             manifest.event_id,
             manifest.device_id,
@@ -4243,6 +4391,7 @@ fn record_source_event_in_transaction(
             manifest.audio_role,
             manifest.audio_route,
             manifest.route_epoch.map(|v| v as i64),
+            commit_stamp,
         ],
     );
     if let Err(error) = event_insert {
@@ -4256,8 +4405,9 @@ fn record_source_event_in_transaction(
     conn.execute(
         "INSERT INTO media_objects \
          (asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,sample_rate,channels, \
-          frame_count,width,height,scale,orientation,retain_until) \
-         VALUES (?1,?2,?3,?4,CASE WHEN ?4 IS NULL THEN NULL ELSE 'current' END,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+          frame_count,width,height,scale,orientation,retain_until,created_at) \
+         VALUES (?1,?2,?3,?4,CASE WHEN ?4 IS NULL THEN NULL ELSE 'current' END,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
+                 COALESCE(?17,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
         params![
             media.asset_id,
             manifest.event_id,
@@ -4274,20 +4424,26 @@ fn record_source_event_in_transaction(
             media.height,
             media.scale,
             media.orientation,
-            super::isotime::add_seconds(&manifest.ended_at, 30.0 * 86_400.0)
+            super::isotime::add_seconds(&manifest.ended_at, 30.0 * 86_400.0),
+            commit_stamp
         ],
     )?;
-    record_browser_observation(conn, manifest)?;
+    record_browser_observation(conn, manifest, commit_stamp)?;
     let job_kind = if manifest.stream_kind.is_audio() {
         "gemini_audio"
     } else {
         "gemini_screen"
     };
+    // `updated_at` is a retry-backoff deadline only for `state='retry_wait'`;
+    // a freshly inserted `pending` job is selected without consulting it and
+    // the lease scans order by `e.started_at,e.sequence,j.id`, never by it. So
+    // binding the commit stamp here changes no scheduling decision — it only
+    // keeps the stamp out of the live clock.
     conn.execute(
         "INSERT INTO media_processing_jobs \
-         (event_id,job_kind,input_revision,processor_version,state) \
-         VALUES (?1,?2,?3,1,'pending')",
-        params![manifest.event_id, job_kind, manifest_digest],
+         (event_id,job_kind,input_revision,processor_version,state,updated_at) \
+         VALUES (?1,?2,?3,1,'pending',COALESCE(?4,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+        params![manifest.event_id, job_kind, manifest_digest, commit_stamp],
     )?;
     advance_contiguous_ack(conn, &manifest.stream_id)?;
     Ok(RecordOutcome::Created)
@@ -4341,6 +4497,57 @@ struct CanonicalReferenceTarget {
     media_sha256: String,
 }
 
+/// ADR-0022: the commit stamp bound in place of this row set's live-clock
+/// column DEFAULTs.
+///
+/// `capture_sessions.created_at`, `capture_streams.created_at`,
+/// `capture_events.received_at`, `browser_states_v2.created_at`,
+/// `browser_observations_v2.created_at`, `media_objects.created_at` and
+/// `media_processing_jobs.updated_at` are every one of them declared
+/// `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))` in `init_schema` — and NOT
+/// in `SCHEMA_SQL`, which never declares these tables — and no legacy INSERT
+/// binds any of them.
+///
+/// `None` is the LEGACY path: the parameter is NULL, the `COALESCE` collapses
+/// to the identical `strftime` expression the column DEFAULT would have run,
+/// and the row is byte-for-byte what it was before this parameter existed.
+///
+/// `Some(stamp)` is the WAL-authoritative path, where a live clock inside a
+/// sealed plan's `apply()` would make the committed pages a function of wall
+/// time rather than of the plan — breaking byte-exact replay.
+///
+/// **The stamp must be an ENCLAVE stamp**, minted by [`enclave_commit_stamp`]
+/// on the route and carried in the plan — never a device-supplied field such
+/// as `manifest.source_wall_at`. All seven columns above are enclave-side
+/// facts (receipt time, row-creation time, scheduling state), the device's own
+/// wall clock already has `capture_events.source_wall_at` and
+/// `browser_observations_v2.observed_at`, and
+/// `media_processing_jobs.updated_at` is compared as a RAW STRING against an
+/// enclave `committed_at` by `media_worker::wal::claim` — one device stamp
+/// that sorts above `now_iso()` wedges that account's media lane permanently.
+/// `wal::is_canonical_commit_stamp` refuses any non-canonical stamp at plan
+/// construction; see `wal::capture_event::CanonicalCaptureEventPlan::commit_stamp`
+/// for the whole argument.
+type CommitStamp<'a> = Option<&'a str>;
+
+/// The enclave's own receipt clock for the ingest plan families, read ONCE per
+/// request on the route and then carried in the plan.
+///
+/// Hoisted out of every `apply()` deliberately (ADR-0022 R7): a sealed plan's
+/// committed pages must be a function of the plan, not of wall time. The
+/// rendering is `isotime::format_epoch_millis`, which is byte-identical to
+/// `media_worker::now_iso` and to `model_usage::settled_now_iso` — that
+/// matters, because `media_worker::wal::claim` compares this stamp against
+/// `now_iso()` as a raw string.
+fn enclave_commit_stamp() -> String {
+    super::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    )
+}
+
 fn record_reference_event(
     conn: &Connection,
     account_id: &str,
@@ -4349,7 +4556,7 @@ fn record_reference_event(
 ) -> Result<RecordOutcome> {
     let tx = conn.unchecked_transaction()?;
     let outcome =
-        record_reference_event_in_transaction(&tx, account_id, manifest, manifest_digest)?;
+        record_reference_event_in_transaction(&tx, account_id, manifest, manifest_digest, None)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -4375,17 +4582,18 @@ fn record_reference_batch(
     let mut new_count = 0usize;
     let mut duplicate_count = 0usize;
     for (index, (event, digest)) in events.iter().zip(manifest_digests).enumerate() {
-        let outcome = match record_reference_event_in_transaction(&tx, account_id, event, digest) {
-            Ok(outcome) => outcome,
-            Err(EnclaveError::CaptureReference(reason)) => {
-                return Err(EnclaveError::CaptureReferenceBatch {
-                    reason,
-                    index,
-                    sequence: event.sequence,
-                })
-            }
-            Err(error) => return Err(error),
-        };
+        let outcome =
+            match record_reference_event_in_transaction(&tx, account_id, event, digest, None) {
+                Ok(outcome) => outcome,
+                Err(EnclaveError::CaptureReference(reason)) => {
+                    return Err(EnclaveError::CaptureReferenceBatch {
+                        reason,
+                        index,
+                        sequence: event.sequence,
+                    })
+                }
+                Err(error) => return Err(error),
+            };
         match outcome {
             RecordOutcome::Created => new_count += 1,
             RecordOutcome::Duplicate => duplicate_count += 1,
@@ -4405,6 +4613,7 @@ fn record_reference_event_in_transaction(
     account_id: &str,
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
+    commit_stamp: CommitStamp<'_>,
 ) -> Result<RecordOutcome> {
     manifest.validate()?;
     if manifest.media_disposition != MediaDisposition::Reference {
@@ -4509,10 +4718,15 @@ fn record_reference_event_in_transaction(
         ));
     }
 
+    // The session upsert's max/coalesce merge semantics are unchanged; only
+    // `created_at` is added, and it is written by the INSERT half alone, never
+    // by the DO UPDATE half, so a second event never rewrites the stamp the
+    // session was created with.
     conn.execute(
         "INSERT INTO capture_sessions \
-         (id,device_id,install_id,started_at,last_event_at,schema_version,ended_at) \
-         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
+         (id,device_id,install_id,started_at,last_event_at,schema_version,ended_at,created_at) \
+         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END,\
+                 COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
          ON CONFLICT(id) DO UPDATE SET \
            last_event_at=MAX(last_event_at,excluded.last_event_at), \
            ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at,excluded.ended_at) \
@@ -4523,18 +4737,21 @@ fn record_reference_event_in_transaction(
             manifest.install_id,
             manifest.started_at,
             manifest.ended_at,
-            manifest.session_finished.unwrap_or(false)
+            manifest.session_finished.unwrap_or(false),
+            commit_stamp
         ],
     )?;
     conn.execute(
         "INSERT INTO capture_streams \
-         (id,capture_session_id,device_id,stream_kind) VALUES (?1,?2,?3,?4) \
+         (id,capture_session_id,device_id,stream_kind,created_at) \
+         VALUES (?1,?2,?3,?4,COALESCE(?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
          ON CONFLICT(id) DO NOTHING",
         params![
             manifest.stream_id,
             manifest.capture_session_id,
             manifest.device_id,
-            manifest.stream_kind.as_str()
+            manifest.stream_kind.as_str(),
+            commit_stamp
         ],
     )?;
     let context_json = serde_json::to_string(current_context)?;
@@ -4546,9 +4763,10 @@ fn record_reference_event_in_transaction(
           clock_uncertainty_ms,asset_id,manifest_digest,context_json,media_disposition,\
           canonical_event_id,canonical_asset_id,canonical_media_sha256,perceptual_hash,\
           hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version,\
-          audio_role,audio_route,route_epoch) \
+          audio_role,audio_route,route_epoch,received_at) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
-                 'reference',?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+                 'reference',?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,\
+                 COALESCE(?29,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
         params![
             manifest.event_id,
             manifest.device_id,
@@ -4578,6 +4796,7 @@ fn record_reference_event_in_transaction(
             manifest.audio_role,
             manifest.audio_route,
             manifest.route_epoch.map(|v| v as i64),
+            commit_stamp,
         ],
     );
     if let Err(error) = event_insert {
@@ -4588,12 +4807,16 @@ fn record_reference_event_in_transaction(
         }
         return Err(error.into());
     }
-    record_browser_observation(conn, manifest)?;
+    record_browser_observation(conn, manifest, commit_stamp)?;
     advance_contiguous_ack(conn, &manifest.stream_id)?;
     Ok(RecordOutcome::Created)
 }
 
-fn record_browser_observation(conn: &Connection, manifest: &CaptureEventManifest) -> Result<()> {
+fn record_browser_observation(
+    conn: &Connection,
+    manifest: &CaptureEventManifest,
+    commit_stamp: CommitStamp<'_>,
+) -> Result<()> {
     let Some(context) = &manifest.context else {
         return Ok(());
     };
@@ -4601,15 +4824,18 @@ fn record_browser_observation(conn: &Connection, manifest: &CaptureEventManifest
         let tabs_json = serde_json::to_string(&snapshot.tabs)?;
         conn.execute(
             "INSERT INTO browser_states_v2 \
-             (state_key,browser_bundle_id,browser_name,permission_status,content_hash,tabs_json) \
-             VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(state_key) DO NOTHING",
+             (state_key,browser_bundle_id,browser_name,permission_status,content_hash,tabs_json,\
+              created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
+             ON CONFLICT(state_key) DO NOTHING",
             params![
                 snapshot.state_key,
                 snapshot.browser_bundle_id,
                 snapshot.browser_name,
                 snapshot.permission_status,
                 snapshot.content_hash.to_ascii_lowercase(),
-                tabs_json
+                tabs_json,
+                commit_stamp
             ],
         )?;
         let existing_hash: String = conn.query_row(
@@ -4635,15 +4861,17 @@ fn record_browser_observation(conn: &Connection, manifest: &CaptureEventManifest
     };
     conn.execute(
         "INSERT INTO browser_observations_v2 \
-         (observation_id,event_id,observed_at,state_key,context_status,active_url,active_title) \
-         VALUES (?1,?1,?2,?3,?4,?5,?6)",
+         (observation_id,event_id,observed_at,state_key,context_status,active_url,active_title,\
+          created_at) \
+         VALUES (?1,?1,?2,?3,?4,?5,?6,COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
         params![
             manifest.event_id,
             manifest.source_wall_at,
             state_key,
             context.capture_status,
             context.active_url,
-            context.active_url_title
+            context.active_url_title,
+            commit_stamp
         ],
     )?;
     Ok(())
@@ -5102,6 +5330,129 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// ADR-0022: the ingest route is dual-path, and structurally so.
+    ///
+    /// The preflight read is the canonical arm's whole residual, and it has to
+    /// route: a selected user's `with_user` preflight would refuse before any
+    /// plan was reached. Both dispositions must submit, because a mac_screen
+    /// stream interleaves canonical screenshots and reference pointers by
+    /// sequence and `advance_contiguous_ack` walks only while the next
+    /// sequence exists — one migrated arm would stall the stream at the first
+    /// refused event of the other.
+    ///
+    /// Falsifiability, checked by sabotage: deleting either
+    /// `wal_authoritative_submit` call drops that count to 1; routing the
+    /// preflight back to `with_user` drops the `wal_authoritative_read` count
+    /// to 0 and raises the `with_user` count to 2.
+    #[test]
+    fn capture_event_route_is_exactly_dual_path_on_both_dispositions() {
+        let source = include_str!("media.rs");
+        let start = source
+            .find(concat!("async fn upload_capture_", "event"))
+            .unwrap();
+        let end = source
+            .find(concat!("fn capture_requires_recording_", "lease"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("is_wal_", "authoritative(")).count(),
+            1
+        );
+        // One routed preflight read for the selected branch.
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1
+        );
+        // BOTH dispositions submit: canonical and reference.
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            2
+        );
+        assert_eq!(
+            route
+                .matches(concat!("CanonicalCaptureEventPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("MediaReferenceEventPlan::", "new("))
+                .count(),
+            1
+        );
+        // The legacy branch keeps its exact preflight + write + save trio and
+        // nothing more.
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 2);
+        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 2);
+        // The D4 gate is gone: ingest is migrated, so nothing here may refuse
+        // a selected user on the grounds that the domain is deferred.
+        assert!(!route.contains(concat!("wal_domain_", "refusal")));
+        // Both submits carry the rebase reason out of band or the client's
+        // durable outbox retries an unrebasable event forever.
+        assert_eq!(route.matches("refusal.observed()").count(), 1);
+    }
+
+    /// The LEGACY path stays byte-intact: `commit_stamp: None` leaves every
+    /// clock DEFAULT to the database exactly as it was before the parameter
+    /// existed. The WAL branch is entered only under selection, so an
+    /// unselected user's rows must still carry the live clock.
+    ///
+    /// Falsifiability, checked by sabotage: passing `Some(...)` from the
+    /// legacy wrappers stamps these columns with the manifest's
+    /// `source_wall_at` and every assertion below fails.
+    #[test]
+    fn the_legacy_writers_still_leave_every_clock_default_to_the_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
+        let reference = reference_to(&canonical, 1, "screen-event-1");
+        record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap();
+
+        let stamps: Vec<String> = conn
+            .query_row(
+                "SELECT
+                    (SELECT created_at FROM capture_sessions WHERE id='session-1'),
+                    (SELECT created_at FROM capture_streams WHERE id='screen-1'),
+                    (SELECT received_at FROM capture_events WHERE event_id='screen-event-0'),
+                    (SELECT created_at FROM media_objects WHERE asset_id='screen-asset-0'),
+                    (SELECT updated_at FROM media_processing_jobs
+                     WHERE event_id='screen-event-0'),
+                    (SELECT received_at FROM capture_events WHERE event_id='screen-event-1'),
+                    (SELECT created_at FROM browser_observations_v2
+                     WHERE event_id='screen-event-1')",
+                [],
+                |row| {
+                    Ok(vec![
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ])
+                },
+            )
+            .unwrap();
+        // 2026-07-31 is the fixture's wall clock; SQLite's `now` is the suite's
+        // real one, so a bound stamp and a live DEFAULT are never equal.
+        for stamp in &stamps {
+            assert_ne!(
+                stamp, "2026-07-31T18:00:00.000Z",
+                "the legacy path must not bind the manifest stamp"
+            );
+            assert!(
+                parse_epoch_millis(stamp).is_some(),
+                "the DEFAULT must still produce an ISO-8601 stamp: {stamp}"
+            );
+        }
     }
 
     #[test]
@@ -6371,71 +6722,155 @@ mod tests {
         assert!(status["ended_at"].is_string());
     }
 
-    /// ADR-0022 D4: the deferred stream-acknowledgement read names its domain
-    /// in a 503.
+    /// ADR-0022 per-domain routing for the stream-acknowledgement read, now
+    /// that its answerability blocker (deferred ingest) is gone.
     ///
-    /// The point of the assertion is the *shape* of the refusal: a deferred
-    /// stream must answer `wal_domain_unmigrated`, never the `NotFound` 404 a
-    /// routed read would produce for a stream that ingest was never allowed to
-    /// create, and never the opaque 500 the unrouted legacy `with_user` would
-    /// produce for a selected user.
+    /// The half worth pinning is the one the gate used to make unobservable: a
+    /// WAL-AUTHORITATIVE user must never be answered out of the legacy
+    /// snapshot. The row below is seeded through `with_user` BEFORE the user is
+    /// selected, so it provably exists in that user's own legacy archive; after
+    /// selection the same read must refuse rather than serve it, because a
+    /// selected user with no registered serving authority has no settled lane
+    /// to answer from.
+    ///
+    /// The refusal's STATUS is pinned exactly, not merely as "some server
+    /// error". `wal_authoritative_read` reports an unregistered, quarantined
+    /// or mid-relaunch authority as `EnclaveError::Store`, whose generic arm
+    /// renders `500 {"error":"internal error"}`; the read lane's rule
+    /// (`cp::routed_read_unavailable`) names 500 as one of the three statuses
+    /// it is deliberately NOT, because a 500 makes a retryable read failure
+    /// indistinguishable from a genuinely non-retryable one. A status-class
+    /// assertion would admit that 500.
+    ///
+    /// Falsifiability, checked by sabotage: reverting the handler to
+    /// `with_user` (or to `with_user_read`) turns the refusal into a `200`
+    /// carrying `committed_through_sequence: 7`, and both assertions below
+    /// fail; handing the `Err` arm to `EnclaveError::into_response` instead of
+    /// `routed_read_unavailable` turns the 503 into a 500 and the status and
+    /// reason assertions fail.
     #[tokio::test]
-    async fn a_deferred_stream_ack_answers_a_named_503() {
+    async fn a_selected_stream_ack_is_never_served_the_legacy_snapshot() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
         use axum::extract::{Path, State};
         use axum::Extension;
 
         let state = finish_test_state();
-        let user_id = "media-stream-ack-deferred";
-        select_wal_authoritative(&state.store, user_id);
+        let user_id = "media-stream-ack-selected";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                     last_event_at,schema_version) \
+                     VALUES('session-1','device-1','install-1',\
+                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_streams(id,capture_session_id,device_id,stream_kind,\
+                     committed_through_sequence) \
+                     VALUES('stream-1','session-1','device-1','mic',7)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        let response = stream_ack(
+        // Unselected: the row is readable, so the refusal below is a routing
+        // decision and not an empty or broken store.
+        let served = stream_ack(
             State(Arc::clone(&state)),
             Extension(crate::cp::auth::AuthUser(user_id.to_string())),
             Path("stream-1".to_string()),
         )
         .await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
+        assert_eq!(served.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(served.into_body(), 4 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_STREAM_ACK);
+        assert_eq!(body["committed_through_sequence"], 7);
+
+        // The ABSENCE, at the handler. `committed_through_sequence` folds "no
+        // such stream" into `Err(NotFound)` rather than `Ok(None)`, so the
+        // handler's `Err` arm carries two different things: this truthful 404
+        // -- which is exactly what lifting the D4 gate made truthful -- and the
+        // unreachable-archive 503 below. Funnelling the whole arm into 503
+        // would tell a caller their stream might come back later when it never
+        // existed. Only `committed_through_sequence` itself was tested before,
+        // so this arm had no coverage at the route at all.
+        let absent = stream_ack(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("stream-absent".to_string()),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_ne!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        select_wal_authoritative(&state.store, user_id);
+        let refused = stream_ack(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("stream-1".to_string()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        // A routed-read failure is retryable. 500 would make it
+        // indistinguishable from the genuinely non-retryable failures that
+        // keep 500 on purpose; see `cp::routed_read_unavailable`.
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+        assert!(
+            body.get("committed_through_sequence").is_none(),
+            "the stale acknowledgement leaked: {body}"
+        );
     }
 
-    /// Both sides of the RETAINED capture-status gate, in one test because
+    /// Both sides of the now-ROUTED capture-status read, in one test because
     /// each is only meaningful against the other:
     ///
-    /// * a WAL-AUTHORITATIVE user gets the machine-readable deferral — 503,
-    ///   `wal_domain_unmigrated`, and the specific domain. Not a 404 (which is
-    ///   what the routed read below would answer for a selected user, since
-    ///   the only writer of `capture_events` is the still-deferred ingest),
-    ///   and not the opaque 500 that both the routed read with no serving
-    ///   authority and the unrouted `with_user` would produce. Those two
-    ///   500-shaped outcomes are why the gate cannot be replaced by routing:
-    ///   they are indistinguishable from a real fault.
-    /// * an UNSELECTED user is unaffected and still reads a real row out of
-    ///   the legacy store — the neighbour's row proves the store is loadable
-    ///   and populated, so the refusal above is a decision, not an outage.
+    /// * an UNSELECTED user reads a real row out of the legacy store, so the
+    ///   store is provably loadable and populated;
+    /// * a WAL-AUTHORITATIVE user reading the SAME archive is refused rather
+    ///   than served that row. This is the property the retained gate used to
+    ///   hide: with no registered serving authority there is no settled lane,
+    ///   and the one thing that must never happen is the stale legacy snapshot
+    ///   being handed back as if it were authoritative.
     ///
-    /// Falsifiability, checked by sabotage: deleting the gate turns the
-    /// selected user's 503 into a 500; naming a different domain in the gate
-    /// breaks the `domain` assertion; dropping the `capture_events` insert
-    /// turns the unselected user's 200 into a 404.
+    /// The gate that used to sit above this is gone: its whole justification
+    /// was that ingest was deferred, so a routed `Ok(None)` -> 404 could not be
+    /// told apart from "you never uploaded that event". Ingest is migrated, so
+    /// the 404 is truthful again.
+    ///
+    /// The refusal is pinned at the lane's named 503 rather than at a status
+    /// class: the unreachable-archive failure must be told apart both from the
+    /// truthful 404 above it and from the 500 the generic `EnclaveError::Store`
+    /// arm would render. See `cp::routed_read_unavailable`.
+    ///
+    /// Falsifiability, checked by sabotage: swapping the handler back to
+    /// `with_user_read` turns the selected user's refusal into
+    /// `200 {"event_id":"evt-1"}` and both selected-side assertions fail;
+    /// dropping the `capture_events` insert turns the unselected user's 200
+    /// into a 404; handing the `Err` arm to `EnclaveError::into_response`
+    /// turns the 503 into a 500 and the status and reason assertions fail.
     #[tokio::test]
-    async fn a_deferred_capture_status_answers_a_named_503_while_legacy_still_reads_its_row() {
+    async fn a_selected_capture_status_is_never_served_the_legacy_row() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
         use axum::extract::{Path, State};
         use axum::Extension;
 
         let state = finish_test_state();
-        let legacy_user = "media-status-legacy";
+        let user_id = "media-status-user";
         state
             .store
-            .with_user(legacy_user, |conn| {
+            .with_user(user_id, |conn| {
                 conn.execute(
                     "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
                      last_event_at,schema_version) \
@@ -6463,27 +6898,9 @@ mod tests {
             .await
             .unwrap();
 
-        let selected_user = "media-status-selected";
-        select_wal_authoritative(&state.store, selected_user);
-        let refused = capture_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
-            Path("evt-1".to_string()),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_CAPTURE_EVENT_STATUS);
-
         let served = capture_status(
             State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
             Path("evt-1".to_string()),
         )
         .await;
@@ -6493,6 +6910,27 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["event_id"], "evt-1");
+
+        select_wal_authoritative(&state.store, user_id);
+        let refused = capture_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("evt-1".to_string()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+        assert!(
+            body.get("event_id").is_none(),
+            "the stale row leaked: {body}"
+        );
     }
 
     /// The same two-sided proof for the people domain, which carries four
@@ -6568,33 +7006,42 @@ mod tests {
         assert_eq!(body["people"][0]["display_name"], "Ada");
     }
 
-    /// The session-list gate, whose placement the review flagged: it now sits
-    /// above `summarized_until_ms`, so a refusal spends no control-store read.
-    /// The behavioural half provable here is the same collection hazard as
-    /// `list_people` — the refusal must be the named 503 carrying no
-    /// `sessions` key, never `200 {"sessions": []}` — and that an unselected
-    /// user still gets their in-window session out of the legacy store.
+    /// The session listing, now routed. It answers a COLLECTION, which is the
+    /// shape the answerability rule warned about hardest: an unanswerable
+    /// routed read here returns `200 {"sessions": []}`, a refusal wearing the
+    /// face of a truthful empty archive. That is exactly why this one must
+    /// refuse rather than fall through to the legacy snapshot for a selected
+    /// user, and why the assertion checks for the ABSENCE of a `sessions` key
+    /// rather than only a status code — an empty success would pass a
+    /// status-only check.
     ///
-    /// The placement itself is structural, not observable from the response:
-    /// `summarized_until_ms` degrades an unreadable cursor to `None` on
-    /// purpose, so a gate below it would return the identical body. This test
-    /// deliberately does NOT claim to prove ordering.
+    /// The gate above it is gone with ingest: `upload_capture_event` writes
+    /// every row this can list, so an empty list is now the truth rather than
+    /// a deferral in disguise.
     ///
-    /// Falsifiability, checked by sabotage: deleting the gate turns the 503
-    /// into a 500; naming a different domain breaks the `domain` assertion;
-    /// backdating the session's `started_at` outside the 8-hour window empties
-    /// the unselected user's list.
+    /// The status is pinned at the lane's named 503, not at a status class:
+    /// the generic `EnclaveError::Store` arm renders a 500, which
+    /// `cp::routed_read_unavailable` names as one of the three statuses this
+    /// lane deliberately does not use.
+    ///
+    /// Falsifiability, checked by sabotage: swapping the handler back to
+    /// `with_user_read` turns the selected user's refusal into a `200` whose
+    /// `sessions` array has one element and both selected-side assertions
+    /// fail; backdating `started_at` outside the 8-hour window empties the
+    /// unselected user's list; handing the `Err` arm to
+    /// `EnclaveError::into_response` turns the 503 into a 500 and the status
+    /// and reason assertions fail.
     #[tokio::test]
-    async fn a_deferred_session_list_answers_a_named_503_while_legacy_still_lists_its_session() {
+    async fn a_selected_session_list_refuses_instead_of_listing_the_legacy_snapshot() {
         use crate::cp::wal_gate_test_support::select_wal_authoritative;
         use axum::extract::{Query, State};
         use axum::Extension;
 
         let state = finish_test_state();
-        let legacy_user = "media-session-list-legacy";
+        let user_id = "media-session-list-user";
         state
             .store
-            .with_user(legacy_user, |conn| {
+            .with_user(user_id, |conn| {
                 // Inside the default 8-hour window, sourced from SQLite's own
                 // clock so the row cannot age out of the window as the suite
                 // ages.
@@ -6611,38 +7058,16 @@ mod tests {
             .await
             .unwrap();
 
-        let selected_user = "media-session-list-selected";
-        select_wal_authoritative(&state.store, selected_user);
-        let refused = list_capture_sessions(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
+        let query = || {
             Query(CaptureSessionListQuery {
                 window_hours: None,
                 max_sessions: None,
-            }),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_CAPTURE_SESSIONS);
-        assert!(
-            body.get("sessions").is_none(),
-            "a refusal must never carry a collection: {body}"
-        );
-
+            })
+        };
         let served = list_capture_sessions(
             State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
-            Query(CaptureSessionListQuery {
-                window_hours: None,
-                max_sessions: None,
-            }),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            query(),
         )
         .await;
         assert_eq!(served.status(), StatusCode::OK);
@@ -6653,5 +7078,108 @@ mod tests {
         let sessions = body["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["capture_session_id"], "session-1");
+
+        select_wal_authoritative(&state.store, user_id);
+        let refused = list_capture_sessions(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            query(),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+        assert!(
+            body.get("sessions").is_none(),
+            "a refusal must never carry a collection: {body}"
+        );
+    }
+    /// The fourth read whose D4 gate lifted with ingest, and the only one that
+    /// had no routing test at all. Same two-sided proof as its siblings: an
+    /// UNSELECTED user reads the row out of the legacy store, and a
+    /// WAL-AUTHORITATIVE user reading the SAME archive is refused rather than
+    /// served it.
+    ///
+    /// The refusal is the lane's named 503, never the 500 the generic
+    /// `EnclaveError::Store` arm renders and never the truthful 404 that
+    /// `Ok(None)` above it answers -- those three outcomes mean three
+    /// different things to a client and this endpoint must not conflate them.
+    /// See `cp::routed_read_unavailable`.
+    ///
+    /// Falsifiability, checked by sabotage: swapping the handler back to
+    /// `with_user_read` turns the selected user's refusal into a `200` naming
+    /// `session-1`; handing the `Err` arm to `EnclaveError::into_response`
+    /// turns the 503 into a 500.
+    #[tokio::test]
+    async fn a_selected_capture_session_status_refuses_at_the_named_503() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let state = finish_test_state();
+        let user_id = "media-session-status-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                     last_event_at,schema_version) \
+                     VALUES('session-1','device-1','install-1',\
+                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let served = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-1".to_string()),
+        )
+        .await;
+        assert_eq!(served.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(served.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["capture_session_id"], "session-1");
+
+        // A session that was never written stays a truthful 404 for the same
+        // unselected user, so the 503 below is provably not just "absent".
+        let absent = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-absent".to_string()),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        select_wal_authoritative(&state.store, user_id);
+        let refused = capture_session_status(
+            State(Arc::clone(&state)),
+            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
+            Path("session-1".to_string()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(refused.status(), StatusCode::OK);
+        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
+        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+        assert!(
+            body.get("capture_session_id").is_none(),
+            "the stale session leaked: {body}"
+        );
     }
 }

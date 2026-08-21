@@ -37,6 +37,13 @@ pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan
 pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};
 pub(crate) use usage::{MediaUsageSettlementLedger, MediaUsageSettlementPlan};
 
+/// Test-only: the ingest -> claim regression tests live beside the ingest
+/// writer in `cp::media::wal::capture_event`, because that is the only module
+/// allowed to construct its plan, while the guard they regress lives in
+/// `claim`. See [`claim::probe_claim_lane_for_ingest_regression`].
+#[cfg(test)]
+pub(crate) use claim::{probe_claim_lane_for_ingest_regression, ClaimLaneProbe};
+
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;
 

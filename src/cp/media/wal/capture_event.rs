@@ -50,19 +50,19 @@ pub(crate) struct CanonicalCaptureEventOutcome {
 }
 
 impl CanonicalCaptureEventOutcome {
-    pub(super) fn event_id(&self) -> &str {
+    pub(in crate::cp::media) fn event_id(&self) -> &str {
         &self.event_id
     }
 
-    pub(super) fn asset_id(&self) -> &str {
+    pub(in crate::cp::media) fn asset_id(&self) -> &str {
         &self.asset_id
     }
 
-    pub(super) fn stream_id(&self) -> &str {
+    pub(in crate::cp::media) fn stream_id(&self) -> &str {
         &self.stream_id
     }
 
-    pub(super) const fn committed_through_sequence(&self) -> i64 {
+    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -77,16 +77,25 @@ pub(crate) struct CanonicalCaptureEventPlan {
     manifest_digest: String,
     object_key: String,
     object_generation: i64,
+    committed_at: String,
 }
 
 impl CanonicalCaptureEventPlan {
-    pub(super) fn new(
+    pub(in crate::cp::media) fn new(
         account_id: String,
         manifest: CaptureEventManifest,
         object_key: String,
         object_generation: i64,
+        committed_at: String,
     ) -> Result<Self> {
-        Self::build(None, account_id, manifest, object_key, object_generation)
+        Self::build(
+            None,
+            account_id,
+            manifest,
+            object_key,
+            object_generation,
+            committed_at,
+        )
     }
 
     fn build(
@@ -95,6 +104,7 @@ impl CanonicalCaptureEventPlan {
         manifest: CaptureEventManifest,
         object_key: String,
         object_generation: i64,
+        committed_at: String,
     ) -> Result<Self> {
         super::super::validate_id("account_id", &account_id)
             .map_err(|_| WalIdempotencyError::Malformed)?;
@@ -102,6 +112,9 @@ impl CanonicalCaptureEventPlan {
             .validate()
             .map_err(|_| WalIdempotencyError::Malformed)?;
         if manifest.media_disposition != MediaDisposition::Canonical || object_generation <= 0 {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        if !super::is_canonical_commit_stamp(&committed_at) {
             return Err(WalIdempotencyError::Malformed);
         }
         let media = manifest
@@ -140,6 +153,7 @@ impl CanonicalCaptureEventPlan {
             manifest_digest,
             object_key,
             object_generation,
+            committed_at,
         })
     }
 
@@ -150,6 +164,7 @@ impl CanonicalCaptureEventPlan {
         manifest: CaptureEventManifest,
         object_key: String,
         object_generation: i64,
+        committed_at: String,
     ) -> Result<Self> {
         Self::build(
             Some(operation_id),
@@ -157,7 +172,60 @@ impl CanonicalCaptureEventPlan {
             manifest,
             object_key,
             object_generation,
+            committed_at,
         )
+    }
+
+    /// The stamp bound in place of this row set's live-clock column DEFAULTs
+    /// (`capture_sessions.created_at`, `capture_streams.created_at`,
+    /// `capture_events.received_at`, `media_objects.created_at`,
+    /// `browser_states_v2.created_at`, `browser_observations_v2.created_at`
+    /// and `media_processing_jobs.updated_at` — every one of them declared
+    /// only in `cp::media::init_schema`, never in `SCHEMA_SQL`, and bound by
+    /// no legacy INSERT).
+    ///
+    /// Every one of those seven is an ENCLAVE-side fact: `received_at` means
+    /// "the enclave received this", the `created_at` columns mean "this row
+    /// was created", and `updated_at` is media scheduling state. The DEVICE's
+    /// own wall time already has its own home in
+    /// `capture_events.source_wall_at`, and the device's own observation time
+    /// has one in `browser_observations_v2.observed_at`; neither is what these
+    /// seven columns mean.
+    ///
+    /// So the stamp is the ENCLAVE-generated `committed_at` the route read
+    /// once (`cp::media::enclave_commit_stamp`, byte-identical in format to
+    /// `media_worker::now_iso`) and handed to the constructor — never
+    /// `manifest.source_wall_at`. Three properties have to hold at once, and
+    /// this is the only arrangement that holds all three:
+    ///
+    ///   * **No live clock inside `apply()`.** The stamp is fixed in the plan
+    ///     at construction, so the committed pages are a function of the plan
+    ///     and not of wall time — the byte-exact replay break
+    ///     `media_worker::wal::claim` had to fix on `media_work_units`.
+    ///   * **The Mac outbox still drains.** Its retries re-post the same event
+    ///     until acknowledged, and each retry mints a *different* stamp. A
+    ///     varying field inside `canonical_request` turns an ordinary
+    ///     idempotent replay into a `FingerprintConflict`, so the client would
+    ///     never get its 200. The stamp is therefore deliberately kept out of
+    ///     BOTH the operation identity and `canonical_request`: the ledger
+    ///     lookup matches on the operation id, the fingerprint matches because
+    ///     the stamp was never in it, and the second post settles as
+    ///     `Replayed` writing nothing at all. `model_usage::wal::coverage` and
+    ///     `model_usage::wal::delivery` carry their `committed_at` exactly this
+    ///     way (the F2 precedent); `summarizer::wal::embedding` and
+    ///     `media::wal::media_dek` carry none.
+    ///   * **The claim lane cannot be wedged.** A device-supplied stamp in
+    ///     `media_processing_jobs.updated_at` is compared as a RAW STRING
+    ///     against an enclave `committed_at` by `MediaWorkClaimPlan::new`, and
+    ///     a `pending` job that loses that comparison is re-enumerated and
+    ///     re-refused forever with no attempt cap and no terminalization path.
+    ///     `media_worker::wal::failure` documents this exact class for
+    ///     `capture_events.started_at`: the guard must fold ENCLAVE-written
+    ///     stamps only. `super::is_canonical_commit_stamp` refuses at
+    ///     construction anything that is not byte-comparable against
+    ///     `now_iso()`.
+    fn commit_stamp(&self) -> &str {
+        &self.committed_at
     }
 
     fn expected_outcome(
@@ -215,6 +283,10 @@ impl WalLogicalDomainPlan for CanonicalCaptureEventPlan {
         request.extend_from_slice(self.manifest_digest.as_bytes());
         encode_string(&mut request, &self.object_key)?;
         request.extend_from_slice(&self.object_generation.to_be_bytes());
+        // `committed_at` is deliberately NOT here, and not in the identity
+        // either: it is a clock, and the Mac outbox re-posts one event many
+        // times. See `commit_stamp` and the F2 precedent in
+        // `model_usage::wal::coverage`.
         Ok(request)
     }
 
@@ -228,6 +300,7 @@ impl WalLogicalDomainPlan for CanonicalCaptureEventPlan {
             &self.manifest_digest,
             &self.object_key,
             Some(self.object_generation),
+            Some(self.commit_stamp()),
         )
         .map_err(map_domain_error)?;
         if outcome != RecordOutcome::Created {
@@ -713,6 +786,61 @@ fn validate_committed_rows(
     {
         return Err(WalIdempotencyError::Corrupt);
     }
+    validate_committed_stamps(connection, plan)
+}
+
+/// Read back every column whose live-clock DEFAULT this family now binds. A
+/// row still carrying `strftime('now')` means the bind was dropped somewhere
+/// between the plan and the SQL, and `apply()` silently became a function of
+/// wall time again — the exact regression this check exists to make loud.
+fn validate_committed_stamps(
+    connection: &Connection,
+    plan: &CanonicalCaptureEventPlan,
+) -> Result<()> {
+    let stamp = plan.commit_stamp();
+    let media = plan
+        .manifest
+        .media
+        .as_ref()
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    let stamps = connection
+        .query_row(
+            "SELECT
+                (SELECT created_at FROM capture_sessions WHERE id=?1),
+                (SELECT created_at FROM capture_streams WHERE id=?2),
+                (SELECT received_at FROM capture_events WHERE event_id=?3),
+                (SELECT created_at FROM media_objects WHERE asset_id=?4),
+                (SELECT updated_at FROM media_processing_jobs WHERE event_id=?3)",
+            params![
+                plan.manifest.capture_session_id,
+                plan.manifest.stream_id,
+                plan.manifest.event_id,
+                media.asset_id,
+            ],
+            |row| {
+                Ok([
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ])
+            },
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    // The session and the stream may pre-date this event, in which case their
+    // stamp belongs to whichever operation created them and this plan neither
+    // wrote nor may rewrite it. The three rows this operation definitely
+    // created must carry the stamp exactly.
+    if stamps[2].as_deref() != Some(stamp)
+        || stamps[3].as_deref() != Some(stamp)
+        || stamps[4].as_deref() != Some(stamp)
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    if stamps[0].is_none() || stamps[1].is_none() {
+        return Err(WalIdempotencyError::Corrupt);
+    }
     Ok(())
 }
 
@@ -960,6 +1088,10 @@ mod tests {
     use serde_json::json;
 
     const ACCOUNT: &str = "account-1";
+    /// The ENCLAVE stamp the route mints. Deliberately DIFFERENT from every
+    /// manifest's `source_wall_at` above, so any test that confuses the two
+    /// fails instead of coincidentally passing.
+    const COMMITTED_AT: &str = "2026-08-15T14:03:07.250Z";
 
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
@@ -1025,7 +1157,14 @@ mod tests {
 
     fn plan(manifest: CaptureEventManifest) -> CanonicalCaptureEventPlan {
         let key = object_key(&manifest);
-        CanonicalCaptureEventPlan::new(ACCOUNT.to_owned(), manifest, key, 41).unwrap()
+        CanonicalCaptureEventPlan::new(
+            ACCOUNT.to_owned(),
+            manifest,
+            key,
+            41,
+            COMMITTED_AT.to_owned(),
+        )
+        .unwrap()
     }
 
     fn forced_plan(value: u8, manifest: CaptureEventManifest) -> CanonicalCaptureEventPlan {
@@ -1036,6 +1175,7 @@ mod tests {
             manifest,
             key,
             41,
+            COMMITTED_AT.to_owned(),
         )
         .unwrap()
     }
@@ -1064,6 +1204,7 @@ mod tests {
             event,
             "raw/account-1/screen-asset-0.enc".to_owned(),
             42,
+            COMMITTED_AT.to_owned(),
         )
         .unwrap();
         assert_eq!(one.operation_id(), changed.operation_id());
@@ -1081,6 +1222,7 @@ mod tests {
             event.clone(),
             "wrong".to_owned(),
             41,
+            COMMITTED_AT.to_owned(),
         )
         .is_err());
         assert!(CanonicalCaptureEventPlan::new(
@@ -1088,6 +1230,7 @@ mod tests {
             event.clone(),
             object_key(&event),
             0,
+            COMMITTED_AT.to_owned(),
         )
         .is_err());
         let mut reference = event;
@@ -1098,6 +1241,7 @@ mod tests {
             reference,
             "raw/account-1/screen-asset-0.enc".to_owned(),
             41,
+            COMMITTED_AT.to_owned(),
         )
         .is_err());
     }
@@ -1162,6 +1306,7 @@ mod tests {
             event,
             "raw/account-1/screen-asset-0.enc".to_owned(),
             42,
+            COMMITTED_AT.to_owned(),
         )
         .unwrap();
         let error = execute_prepared_for_owner(
@@ -1457,5 +1602,313 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error, WalIdempotencyError::Corrupt);
+    }
+    /// **The claim-lane wedge, regressed at its three independent triggers.**
+    ///
+    /// `media_processing_jobs.updated_at` is an ENCLAVE-side scheduling fact.
+    /// While it was bound to the manifest's DEVICE-supplied `source_wall_at`,
+    /// a single ingested event could permanently wedge the whole media lane
+    /// for that account:
+    ///
+    ///   * `MediaWorkClaimPlan::new` refuses construction (`Malformed`) when a
+    ///     member's `latest_observed_timestamp()` -- `updated_at` while
+    ///     `lease_until` is NULL, and it is NULL for every `pending` job --
+    ///     string-compares GREATER than the enclave-generated `committed_at`;
+    ///   * `enumerate_claimable` bounds `updated_at` only in its `retry_wait`
+    ///     arm, so a `pending` job is re-enumerated by every sweep;
+    ///   * `plan_first` is deterministic, so the same poisoned job is
+    ///     re-selected every time; `claim_media_work_unit` warns and returns
+    ///     `ClaimOutcome::Idle`; `process_user` returns. There is no attempt
+    ///     cap on this path and no terminalization path for a `pending` job.
+    ///
+    /// Downstream, `media_objects.processing_state` stays `'queued'`, so
+    /// `summarizer::session_tail_is_settled` never holds and
+    /// `span_has_recoverable_media` pins the summarizer's forward-only cursor:
+    /// no episodes, ever, with no user-visible error anywhere.
+    ///
+    /// The comparison is a RAW STRING compare against canonical
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, so two of the three triggers need NO clock
+    /// skew at all. Each case below is a stamp `CaptureEventManifest::validate`
+    /// accepts today (`parse_epoch_millis` returns `Some` for every one of
+    /// them), which is exactly why validation was never the fix.
+    ///
+    /// This is the same class `media_worker::wal::failure` already documents
+    /// for `capture_events.started_at`: an enclave guard must fold
+    /// ENCLAVE-written stamps only.
+    ///
+    /// Falsifiability, checked by sabotage: re-binding `commit_stamp()` to
+    /// `self.manifest.source_wall_at` makes every case reach
+    /// `ClaimLaneProbe::Refused` and the `Constructed` assertion fails --
+    /// `Malformed` from the guard for (a) and (b), `Malformed` from
+    /// `ClaimMember::resolve`'s length bound for (c), which never reaches the
+    /// guard at all.
+    ///
+    /// The per-case `Breach` assertions below are load-bearing, not
+    /// decoration. A first draft of this test used `...T14:00:00.000+09:00`
+    /// for (b), which sorts BELOW a 14:05 sweep stamp, so that case passed
+    /// even under full sabotage: the fixture had silently stopped being a
+    /// trigger. Asserting each case's breach against the sweep stamp is what
+    /// makes such a fixture fail loudly instead.
+    #[test]
+    fn a_poisoned_device_wall_clock_cannot_wedge_the_claim_lane() {
+        use crate::cp::isotime::parse_epoch_millis;
+        use crate::cp::media_planner::WorkClass;
+        use crate::cp::media_worker::wal::{
+            probe_claim_lane_for_ingest_regression, ClaimLaneProbe,
+        };
+
+        /// Which of the claim family's two string-shaped bounds a trigger
+        /// breaches when the DEVICE stamp reaches `updated_at`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Breach {
+            /// Sorts above the sweep's enclave `committed_at`, so
+            /// `MediaWorkClaimPlan::new`'s `latest_observed_timestamp` guard
+            /// refuses the plan.
+            SortsAboveCommittedAt,
+            /// Longer than `ClaimMember::resolve`'s `MAX_TIMESTAMP_BYTES`, so
+            /// the enumeration refuses before the guard is even reached.
+            ExceedsTimestampBound,
+        }
+
+        // The enclave's own horizon for the sweep that follows ingest. Both
+        // stamps are AFTER `COMMITTED_AT`, exactly as a real sweep's would be.
+        const CLAIMED_AT: &str = "2026-08-15T14:05:00.000Z";
+        const SWEEP_COMMITTED_AT: &str = "2026-08-15T14:05:00.500Z";
+        const CLAIM_MAX_TIMESTAMP_BYTES: usize = 64;
+
+        for (case, poisoned, future_instant, breach) in [
+            // (a) A FUTURE stamp: clock skew, a dead CMOS battery, or a
+            //     malicious client. Two days ahead of the sweep.
+            (
+                "future",
+                "2026-08-17T14:00:00.000Z",
+                true,
+                Breach::SortsAboveCommittedAt,
+            ),
+            // (b) An OFFSET-BEARING stamp, and the striking one: a device in
+            //     JST reporting local wall time. It denotes
+            //     2026-08-15T14:00:00Z -- the event's own instant, five
+            //     minutes BEFORE the sweep -- yet its TEXT begins `...T23:`
+            //     and therefore sorts above every `now_iso()` until 23:00Z.
+            //     No clock is wrong anywhere.
+            (
+                "offset-bearing",
+                "2026-08-15T23:00:00.000+09:00",
+                false,
+                Breach::SortsAboveCommittedAt,
+            ),
+            // (c) More than three fractional digits. `parse_epoch_millis`
+            //     ignores everything past the third, so validation accepts it;
+            //     the string is 65 bytes, over `ClaimMember::resolve`'s
+            //     64-byte `MAX_TIMESTAMP_BYTES` bound. It denotes the event's
+            //     own instant, so again no clock is wrong.
+            (
+                "over-long fractional",
+                "2026-08-15T14:00:00.000000000000000000000000000000000000000000000Z",
+                false,
+                Breach::ExceedsTimestampBound,
+            ),
+        ] {
+            let mut poisoned_manifest = manifest(0, "screen-event-0", "screen-asset-0");
+            poisoned_manifest.source_wall_at = poisoned.to_owned();
+            // Every trigger must still be something ingest ADMITS -- a stamp
+            // the manifest rejected would prove nothing about this guard.
+            poisoned_manifest
+                .validate()
+                .unwrap_or_else(|error| panic!("{case}: ingest must admit this stamp: {error}"));
+
+            // ... and every trigger must still BE a trigger. Without these, a
+            // fixture that quietly stopped breaching either bound would pass
+            // this test while covering nothing.
+            let sweep_millis = parse_epoch_millis(SWEEP_COMMITTED_AT).unwrap();
+            let poisoned_millis = parse_epoch_millis(poisoned)
+                .unwrap_or_else(|| panic!("{case}: the trigger must parse"));
+            assert_eq!(
+                poisoned_millis > sweep_millis,
+                future_instant,
+                "{case}: the trigger's INSTANT is what the comment claims"
+            );
+            match breach {
+                Breach::SortsAboveCommittedAt => {
+                    assert!(
+                        poisoned > SWEEP_COMMITTED_AT,
+                        "{case}: must string-sort above the sweep stamp to reach the guard"
+                    );
+                    assert!(poisoned.len() <= CLAIM_MAX_TIMESTAMP_BYTES);
+                }
+                Breach::ExceedsTimestampBound => {
+                    assert!(
+                        poisoned.len() > CLAIM_MAX_TIMESTAMP_BYTES,
+                        "{case}: must exceed ClaimMember::resolve's timestamp bound"
+                    );
+                }
+            }
+
+            let mut connection = connection();
+            execute_prepared_for_owner(
+                &mut connection,
+                PreparedLogicalMutation::prepare(plan(poisoned_manifest)).unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("{case}: ingest must commit: {error:?}"));
+
+            let (updated_at, source_wall_at): (String, String) = connection
+                .query_row(
+                    "SELECT j.updated_at,e.source_wall_at
+                     FROM media_processing_jobs j
+                     JOIN capture_events e ON e.event_id=j.event_id
+                     WHERE j.event_id='screen-event-0'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                source_wall_at, poisoned,
+                "{case}: the device clock still belongs in source_wall_at"
+            );
+            assert_eq!(
+                updated_at, COMMITTED_AT,
+                "{case}: updated_at must carry the ENCLAVE stamp"
+            );
+            assert!(
+                updated_at.as_str() <= SWEEP_COMMITTED_AT,
+                "{case}: the guard compares raw strings, so this ordering IS the property"
+            );
+
+            let probe = probe_claim_lane_for_ingest_regression(
+                &connection,
+                "11111111-1111-4111-8111-111111111111",
+                WorkClass::Screen,
+                1,
+                128,
+                600,
+                2_048,
+                CLAIMED_AT,
+                SWEEP_COMMITTED_AT,
+            );
+            assert!(
+                matches!(probe, ClaimLaneProbe::Constructed),
+                "{case}: the claim lane must still construct a plan, got {probe:?}"
+            );
+        }
+    }
+
+    /// A non-canonical commit stamp is refused at CONSTRUCTION, before
+    /// anything durable moves. Every rejected shape here PARSES as a valid
+    /// instant under `parse_epoch_millis` -- that is the point: parseability
+    /// was never the property, byte-comparability against `now_iso()` is.
+    ///
+    /// This is the structural half of the fix. The route mints the stamp with
+    /// `cp::media::enclave_commit_stamp`, so in production it is always
+    /// canonical; this makes a future caller that hands over a device field
+    /// (or any other non-canonical string) fail loudly at construction instead
+    /// of silently re-opening the wedge above.
+    ///
+    /// Falsifiability, checked by sabotage: deleting the
+    /// `is_canonical_commit_stamp` guard in `build` admits all four and every
+    /// assertion fails.
+    #[test]
+    fn a_non_canonical_commit_stamp_is_refused_at_construction() {
+        let event = manifest(0, "screen-event-0", "screen-asset-0");
+        for stamp in [
+            // The offset-bearing and over-long forms from the wedge above.
+            "2026-08-15T14:00:00.000+09:00",
+            "2026-08-15T14:00:00.000000000000000000000000000000000000000000000Z",
+            // Millisecond-less, which `media_worker::wal::failure` calls out
+            // by name: `...:04Z` sorts above `...:04.000Z`.
+            "2026-08-15T14:00:00Z",
+            "",
+        ] {
+            assert_eq!(
+                CanonicalCaptureEventPlan::new(
+                    ACCOUNT.to_owned(),
+                    event.clone(),
+                    object_key(&event),
+                    41,
+                    stamp.to_owned(),
+                )
+                .err(),
+                Some(WalIdempotencyError::Malformed),
+                "{stamp:?} must not be admitted as a commit stamp"
+            );
+        }
+        // The canonical rendering the route actually mints is admitted.
+        assert!(CanonicalCaptureEventPlan::new(
+            ACCOUNT.to_owned(),
+            event.clone(),
+            object_key(&event),
+            41,
+            crate::cp::isotime::format_epoch_millis(1_787_000_000_123),
+        )
+        .is_ok());
+    }
+
+    /// The stamp is carried UNFINGERPRINTED, and that is load-bearing: the Mac
+    /// client's outbox re-posts one event until it is acknowledged, and each
+    /// re-post mints a fresh `enclave_commit_stamp()`. If the stamp entered
+    /// the identity the two posts would be different operations; if it entered
+    /// `canonical_request` the second would be a `FingerprintConflict` the
+    /// client can never clear, so it would re-post forever and never drain.
+    ///
+    /// Instead the second post settles as `Replayed`, writing nothing at all
+    /// and leaving the first stamp intact.
+    ///
+    /// Falsifiability, checked by sabotage: framing `self.committed_at` into
+    /// `canonical_request` makes the second submit fail with
+    /// `FingerprintConflict` and the `Replayed` assertion fails; framing it
+    /// into the operation source makes the two ids differ and the first
+    /// assertion fails.
+    #[test]
+    fn a_retry_with_a_fresh_stamp_replays_instead_of_conflicting() {
+        let mut connection = connection();
+        let event = manifest(0, "screen-event-0", "screen-asset-0");
+        let key = object_key(&event);
+        let retry_stamp = "2026-08-15T14:09:59.999Z";
+        assert_ne!(retry_stamp, COMMITTED_AT);
+
+        let first = plan(event.clone());
+        let retry = CanonicalCaptureEventPlan::new(
+            ACCOUNT.to_owned(),
+            event,
+            key,
+            41,
+            retry_stamp.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(first.operation_id(), retry.operation_id());
+        assert_eq!(
+            first.canonical_request().unwrap(),
+            retry.canonical_request().unwrap()
+        );
+
+        let applied = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(first).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied.disposition(), LogicalMutationDisposition::Applied);
+        let changes = connection.total_changes();
+
+        let replayed = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(retry).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayed.disposition(), LogicalMutationDisposition::Replayed);
+        assert_eq!(
+            connection.total_changes(),
+            changes,
+            "a replay writes nothing"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT updated_at FROM media_processing_jobs WHERE event_id='screen-event-0'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            COMMITTED_AT,
+            "the first commit's stamp survives the retry"
+        );
     }
 }

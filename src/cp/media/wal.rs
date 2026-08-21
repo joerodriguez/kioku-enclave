@@ -15,10 +15,14 @@
 mod capture_event;
 mod media_dek;
 mod reference_batch;
+mod reference_event;
 pub(crate) use capture_event::{CanonicalCaptureEventLedger, CanonicalCaptureEventPlan};
 pub(in crate::cp) use media_dek::{authenticate_media_dek_install_receipt, MediaDekInstallReceipt};
 pub(crate) use media_dek::{MediaDekInstallLedger, MediaDekInstallPlan};
 pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
+pub(crate) use reference_event::{MediaReferenceEventLedger, MediaReferenceEventPlan};
+
+use std::sync::{Arc, OnceLock};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;
@@ -28,6 +32,118 @@ use crate::archive_v3_wal_idempotency::{
     WalLogicalDomainLedger, WalLogicalDomainPlan, WalLogicalOperationId, WalOperationKind,
     WalReplayResult, MAX_ENCODED_REPLAY_RESULT_BYTES,
 };
+use crate::error::{CaptureReferenceFailureReason, EnclaveError};
+
+/// ADR-0022: the rebase-required reason a reference write observed *inside*
+/// `apply()`, carried out of band so the route can still answer with it.
+///
+/// Why a side channel and not the error type: `WalIdempotencyError` is a
+/// payload-free `Copy` enum, and `Store::wal_authoritative_submit` deliberately
+/// narrows every owner refusal to a content-free `Conflict` or `Store`. A
+/// reference refusal that reaches the submit boundary therefore arrives with
+/// nothing but "conflict", and the route answers `409`/`500` instead of the
+/// documented `400 {"error":"screen_reference_rebase_required","reason":...}`.
+/// That is a real wedge, not a cosmetic one: the Mac client's outbox is
+/// durable, a 409/500 is retryable to it, and the one thing that can clear the
+/// refusal is a *rebase* it never learns it needs — so it re-posts the same
+/// unrebasable event forever and its stream never advances.
+///
+/// The preflight read the routes run first catches the ordinary case. This
+/// carries the race window between that read and the submit, which is exactly
+/// where the refusal is both possible and invisible.
+///
+/// Recording is strictly additive: `apply()` still returns the same
+/// `WalIdempotencyError::Precondition` it returned before, the transaction
+/// still rolls back, and a route that ignores the sink behaves exactly as it
+/// did. Only the FIRST refusal is retained (`OnceLock`), which matches the
+/// batch loop's own abort-on-first-item semantics.
+#[derive(Clone, Default)]
+pub(in crate::cp::media) struct RebaseRefusalSink(Arc<OnceLock<RebaseRefusal>>);
+
+#[derive(Clone, Copy)]
+struct RebaseRefusal {
+    reason: CaptureReferenceFailureReason,
+    /// `Some((index, sequence))` for a batch item, mirroring the legacy
+    /// `record_reference_batch` framing byte for byte; `None` for the
+    /// single-event route, whose legacy branch reports the bare reason.
+    batch_position: Option<(usize, i64)>,
+}
+
+impl RebaseRefusalSink {
+    fn record(&self, reason: CaptureReferenceFailureReason, batch_position: Option<(usize, i64)>) {
+        let _ = self.0.set(RebaseRefusal {
+            reason,
+            batch_position,
+        });
+    }
+
+    /// The exact error the legacy branch would have returned, if `apply()`
+    /// observed a rebase-required refusal. `None` means the submit failed for
+    /// some other reason and the caller must keep its own error.
+    pub(in crate::cp::media) fn observed(&self) -> Option<EnclaveError> {
+        self.0.get().map(|refusal| match refusal.batch_position {
+            Some((index, sequence)) => EnclaveError::CaptureReferenceBatch {
+                reason: refusal.reason,
+                index,
+                sequence,
+            },
+            None => EnclaveError::CaptureReference(refusal.reason),
+        })
+    }
+}
+
+/// The byte length beyond which a carried commit stamp is refused. It matches
+/// `media_worker::wal::claim`'s and `media_worker::wal::failure`'s own
+/// `MAX_TIMESTAMP_BYTES`, because those are the bounds a stamp written by this
+/// module is later measured against.
+///
+/// The round-trip check below already implies it — the canonical rendering is
+/// always exactly 24 bytes — so this is a redundant explicit bound, kept
+/// because it names the downstream constant this module has to agree with and
+/// would survive a change to `format_epoch_millis` that the round trip alone
+/// would silently follow.
+pub(super) const MAX_COMMIT_STAMP_BYTES: usize = 64;
+
+/// ADR-0022: the exact shape a carried commit stamp must have before any
+/// family here may bind it in place of a live-clock column DEFAULT.
+///
+/// The stamp must be the canonical UTC rendering `YYYY-MM-DDTHH:MM:SS.mmmZ`
+/// that `isotime::format_epoch_millis` — and therefore `media_worker::now_iso`
+/// — produces. It is checked by ROUND TRIP rather than by pattern, so the
+/// predicate cannot drift away from the renderer it is supposed to agree with.
+///
+/// This is not cosmetic, and it is not a re-validation of something the
+/// manifest already checked. `media_worker::wal::claim::MediaWorkClaimPlan::new`
+/// refuses to construct whenever a member's `latest_observed_timestamp()` —
+/// which is `media_processing_jobs.updated_at` while `lease_until` is NULL,
+/// and it is NULL for every `pending` job — string-compares GREATER than the
+/// enclave-generated `committed_at` it carries. `enumerate_claimable` bounds
+/// `updated_at` only in its `retry_wait` arm; `state='pending'` is
+/// unconditional. So a single job row carrying a stamp that sorts above
+/// `now_iso()` is re-enumerated by every sweep, deterministically re-selected
+/// by `media_planner::plan_first`, and refused again at construction — with no
+/// attempt cap, no terminalization path for a `pending` job and no
+/// user-visible error. `media_objects.processing_state` stays `'queued'`
+/// forever, so `summarizer::session_tail_is_settled` never holds and the
+/// summarizer's forward-only cursor never advances: no episodes, ever.
+///
+/// Because the comparison is a RAW STRING compare, two shapes wedge the lane
+/// with no clock skew whatsoever:
+///
+///   * an offset-bearing `2026-08-21T21:00:00+09:00`, which `parse_epoch_millis`
+///     accepts as a PAST instant and which sorts above every `now_iso()` for
+///     the next nine hours;
+///   * more than three fractional digits — `parse_epoch_millis` ignores the
+///     rest, and once the string passes 64 bytes it also fails
+///     `ClaimMember::resolve`'s `MAX_TIMESTAMP_BYTES` bound.
+///
+/// Round-tripping through the canonical renderer rejects both, and every other
+/// shape that is not byte-comparable against `now_iso()`.
+pub(super) fn is_canonical_commit_stamp(value: &str) -> bool {
+    value.len() <= MAX_COMMIT_STAMP_BYTES
+        && super::super::isotime::parse_epoch_millis(value)
+            .is_some_and(|millis| super::super::isotime::format_epoch_millis(millis) == value)
+}
 
 const CAPTURE_SESSION_FINISH_REQUEST_V1: u16 = 1;
 const CAPTURE_SESSION_FINISH_RESULT_V1: u16 = 1;

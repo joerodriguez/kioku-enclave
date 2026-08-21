@@ -18,6 +18,7 @@ use crate::error::EnclaveError;
 use super::super::{
     CaptureEventManifest, RecordOutcome, ScreenReferenceBatchRequest, MAX_REFERENCE_BATCH_BYTES,
 };
+use super::RebaseRefusalSink;
 
 const REQUEST_V1: u16 = 1;
 const REQUEST_REFERENCE_BATCH: u8 = 1;
@@ -83,6 +84,8 @@ pub(crate) struct MediaReferenceBatchPlan {
     stream_id: String,
     first_sequence: i64,
     last_sequence: i64,
+    committed_at: String,
+    refusal: RebaseRefusalSink,
 }
 
 impl MediaReferenceBatchPlan {
@@ -90,8 +93,33 @@ impl MediaReferenceBatchPlan {
         account_id: String,
         batch_id: String,
         events: Vec<CaptureEventManifest>,
+        committed_at: String,
     ) -> Result<Self> {
-        Self::build(None, account_id, batch_id, events)
+        Self::build(None, account_id, batch_id, events, committed_at)
+    }
+
+    /// Handle on the rebase-required reason `apply()` refused with, taken by
+    /// the route before `prepare` consumes the plan. See
+    /// [`RebaseRefusalSink`].
+    pub(in crate::cp::media) fn refusal_sink(&self) -> RebaseRefusalSink {
+        self.refusal.clone()
+    }
+
+    /// The ENCLAVE-generated stamp bound in place of this batch's live-clock
+    /// column DEFAULTs, read once by the route
+    /// (`cp::media::enclave_commit_stamp`).
+    ///
+    /// ONE stamp for the whole batch, not one per event: the enclave received
+    /// the batch at a single instant, which is what `received_at` and the
+    /// `created_at` columns mean. Each event's own device wall time is still
+    /// written verbatim to its `capture_events.source_wall_at` and its
+    /// `browser_observations_v2.observed_at` row, which is where a device
+    /// clock belongs. See
+    /// `super::capture_event::CanonicalCaptureEventPlan::commit_stamp` for why
+    /// a device stamp must never reach an enclave-side column, and why this
+    /// one stays out of the identity and the fingerprint.
+    fn commit_stamp(&self) -> &str {
+        &self.committed_at
     }
 
     fn build(
@@ -99,9 +127,13 @@ impl MediaReferenceBatchPlan {
         account_id: String,
         batch_id: String,
         events: Vec<CaptureEventManifest>,
+        committed_at: String,
     ) -> Result<Self> {
         super::super::validate_id("account_id", &account_id)
             .map_err(|_| WalIdempotencyError::Malformed)?;
+        if !super::is_canonical_commit_stamp(&committed_at) {
+            return Err(WalIdempotencyError::Malformed);
+        }
         let request = ScreenReferenceBatchRequest {
             schema_version: 1,
             batch_id: batch_id.clone(),
@@ -132,6 +164,8 @@ impl MediaReferenceBatchPlan {
             stream_id: validated.stream_id,
             first_sequence: validated.first_sequence,
             last_sequence: validated.last_sequence,
+            committed_at,
+            refusal: RebaseRefusalSink::default(),
         })
     }
 
@@ -141,8 +175,15 @@ impl MediaReferenceBatchPlan {
         account_id: &str,
         batch_id: String,
         events: Vec<CaptureEventManifest>,
+        committed_at: String,
     ) -> Result<Self> {
-        Self::build(Some(operation_id), account_id.to_owned(), batch_id, events)
+        Self::build(
+            Some(operation_id),
+            account_id.to_owned(),
+            batch_id,
+            events,
+            committed_at,
+        )
     }
 }
 
@@ -188,21 +229,44 @@ impl WalLogicalDomainPlan for MediaReferenceBatchPlan {
         if request.len() > MAX_REFERENCE_BATCH_BYTES {
             return Err(WalIdempotencyError::Limit);
         }
+        // `committed_at` is deliberately NOT here, and not in the identity
+        // either: it is a clock, and the Mac outbox re-posts one batch many
+        // times. See `commit_stamp` and the F2 precedent in
+        // `model_usage::wal::coverage`.
         Ok(request)
     }
 
     fn apply(&self, transaction: &Transaction<'_>) -> Result<WalReplayResult> {
         let mut new_count = 0u16;
         let mut duplicate_count = 0u16;
-        for (event, digest) in self.events.iter().zip(&self.manifest_digests) {
-            match super::super::record_reference_event_in_transaction(
+        for (index, (event, digest)) in self.events.iter().zip(&self.manifest_digests).enumerate() {
+            let outcome = match super::super::record_reference_event_in_transaction(
                 transaction,
                 &self.account_id,
                 event,
                 digest,
-            )
-            .map_err(map_domain_error)?
-            {
+                // The whole batch stamps its rows with the ONE enclave stamp
+                // the route read, instead of firing the live-clock DEFAULTs
+                // inside `apply()`. Not the events' own `source_wall_at`:
+                // these are enclave-side columns and a device clock in one of
+                // them wedges the media claim lane. See `commit_stamp`.
+                Some(self.commit_stamp()),
+            ) {
+                Ok(outcome) => outcome,
+                Err(EnclaveError::CaptureReference(reason)) => {
+                    // The refusal still collapses to `Precondition` below --
+                    // no failure handler is weakened and the transaction still
+                    // rolls back. The reason is recorded first so the route can
+                    // answer the documented 400 instead of a content-free
+                    // conflict the client would retry forever. The framing
+                    // mirrors the legacy `record_reference_batch` branch
+                    // exactly: the failing item's index and sequence.
+                    self.refusal.record(reason, Some((index, event.sequence)));
+                    return Err(map_domain_error(EnclaveError::CaptureReference(reason)));
+                }
+                Err(error) => return Err(map_domain_error(error)),
+            };
+            match outcome {
                 RecordOutcome::Created => {
                     new_count = new_count.checked_add(1).ok_or(WalIdempotencyError::Limit)?;
                 }
@@ -709,9 +773,20 @@ mod tests {
         .unwrap();
     }
 
+    /// The ENCLAVE stamp the route mints. Deliberately DIFFERENT from every
+    /// fixture's `source_wall_at`, so a test that confuses the two fails
+    /// instead of coincidentally passing.
+    const COMMITTED_AT: &str = "2026-07-31T18:04:11.750Z";
+
     fn plan(events: Vec<CaptureEventManifest>) -> MediaReferenceBatchPlan {
         let batch_id = super::super::super::reference_batch_id(&events).unwrap();
-        MediaReferenceBatchPlan::new("account-1".to_owned(), batch_id, events).unwrap()
+        MediaReferenceBatchPlan::new(
+            "account-1".to_owned(),
+            batch_id,
+            events,
+            COMMITTED_AT.to_owned(),
+        )
+        .unwrap()
     }
 
     fn forced_plan(value: u8, events: Vec<CaptureEventManifest>) -> MediaReferenceBatchPlan {
@@ -721,6 +796,7 @@ mod tests {
             "account-1",
             batch_id,
             events,
+            COMMITTED_AT.to_owned(),
         )
         .unwrap()
     }
@@ -1156,5 +1232,154 @@ mod tests {
             PreparedLogicalMutation::prepare(forced_plan(17, events)).unwrap(),
         )
         .is_err());
+    }
+
+    /// The pre-existing wedge on the MERGED batch path: a rebase-required
+    /// refusal used to collapse into a content-free `Precondition`, the submit
+    /// narrowed that to a bare conflict, and the route answered 409 instead of
+    /// the documented `400 screen_reference_rebase_required`. The Mac client's
+    /// outbox treats a 409 as retryable, so it re-posted an event only a rebase
+    /// could fix -- forever. The preflight read the route runs first catches
+    /// the ordinary case; this carries the race window between that read and
+    /// the submit, which is exactly where the refusal is both possible and
+    /// invisible.
+    ///
+    /// The batch framing (failing item index and sequence) mirrors the legacy
+    /// `record_reference_batch` branch byte for byte, so the WAL and legacy
+    /// responses for the same refusal are the same response.
+    ///
+    /// Falsifiability, checked by sabotage: deleting the `self.refusal.record`
+    /// call leaves `observed()` as `None` and every assertion after the
+    /// `Precondition` one fails -- which is why the `Precondition` assertion
+    /// alone was never enough to catch this.
+    #[test]
+    fn a_rebase_required_refusal_reaches_the_route_with_its_index_and_sequence() {
+        use crate::error::CaptureReferenceFailureReason;
+
+        let mut connection = connection();
+        let canonical = canonical_manifest();
+        insert_canonical(&connection, &canonical);
+        let good = reference_to(&canonical, 1, "screen-event-1");
+        let mut bad = reference_to(&canonical, 2, "screen-event-2");
+        bad.reference.as_mut().unwrap().canonical_media_sha256 = "b".repeat(64);
+
+        let plan = plan(vec![good, bad]);
+        let refusal = plan.refusal_sink();
+        let prepared = PreparedLogicalMutation::prepare(plan).unwrap();
+        let error = execute_prepared_for_owner(&mut connection, prepared)
+            .err()
+            .unwrap();
+        assert_eq!(error, WalIdempotencyError::Precondition);
+
+        let observed = refusal.observed().expect("the reason must reach the route");
+        match observed {
+            EnclaveError::CaptureReferenceBatch {
+                reason,
+                index,
+                sequence,
+            } => {
+                assert_eq!(reason, CaptureReferenceFailureReason::TargetMismatch);
+                assert_eq!(index, 1, "the failing item's position");
+                assert_eq!(sequence, 2, "the failing item's sequence");
+            }
+            other => panic!("expected a batch rebase refusal, got {other:?}"),
+        }
+        let response = axum::response::IntoResponse::into_response(
+            refusal.observed().expect("still recorded"),
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM capture_events WHERE media_disposition='reference'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "the refused batch must roll back entirely");
+    }
+
+    /// The whole batch stamps its enclave-side columns with the ONE enclave
+    /// stamp the route read, so the committed pages stay a function of the plan
+    /// rather than of wall time -- and, more importantly, so no DEVICE clock
+    /// reaches an enclave-side column. `capture_events.received_at` means
+    /// "the enclave received this"; binding it to each item's own
+    /// `source_wall_at` hands a device the ability to write a stamp that
+    /// string-sorts above `now_iso()`, which is exactly what wedges
+    /// `MediaWorkClaimPlan::new` for the sibling canonical family.
+    ///
+    /// The two items carry deliberately different `source_wall_at` values, and
+    /// both differ from the enclave stamp, so the assertions discriminate.
+    ///
+    /// Falsifiability, checked by sabotage: re-binding `commit_stamp` to
+    /// `event.source_wall_at` makes `received_at` differ per item and the
+    /// first assertion fails; passing `None` leaves the live-clock DEFAULT and
+    /// it fails too.
+    #[test]
+    fn the_batch_binds_one_enclave_stamp_never_each_item_source_wall_at() {
+        let mut connection = connection();
+        let canonical = canonical_manifest();
+        insert_canonical(&connection, &canonical);
+        let mut first = reference_to(&canonical, 1, "screen-event-1");
+        first.source_wall_at = "2026-07-31T18:00:01.000Z".to_owned();
+        let mut second = reference_to(&canonical, 2, "screen-event-2");
+        second.source_wall_at = "2026-07-31T18:00:02.000Z".to_owned();
+        assert_ne!(first.source_wall_at, second.source_wall_at);
+        assert_ne!(first.source_wall_at, COMMITTED_AT);
+        assert_ne!(second.source_wall_at, COMMITTED_AT);
+
+        let prepared = PreparedLogicalMutation::prepare(plan(vec![first, second])).unwrap();
+        execute_prepared_for_owner(&mut connection, prepared).unwrap();
+
+        let rows: Vec<(String, String)> = connection
+            .prepare(
+                "SELECT received_at,source_wall_at FROM capture_events \
+                 WHERE media_disposition='reference' ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<&str>>(),
+            vec![COMMITTED_AT, COMMITTED_AT],
+            "received_at is the enclave's receipt of the batch"
+        );
+        // The device clocks survive, in the column that MEANS a device clock.
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<&str>>(),
+            vec!["2026-07-31T18:00:01.000Z", "2026-07-31T18:00:02.000Z"],
+            "each item keeps its own source_wall_at"
+        );
+    }
+
+    /// A non-canonical commit stamp is refused at CONSTRUCTION, before
+    /// anything durable moves. Every shape here parses as a valid instant
+    /// under `parse_epoch_millis` -- that is the point: parsing is not the
+    /// property, byte-comparability against `now_iso()` is.
+    #[test]
+    fn a_non_canonical_commit_stamp_is_refused_at_construction() {
+        let canonical = canonical_manifest();
+        let events = vec![reference_to(&canonical, 1, "screen-event-1")];
+        let batch_id = super::super::super::reference_batch_id(&events).unwrap();
+        for stamp in [
+            "2026-07-31T18:04:11+09:00",
+            "2026-07-31T18:04:11.7500000000000000000000000000000000000000000000Z",
+            "2026-07-31T18:04:11Z",
+            "",
+        ] {
+            assert_eq!(
+                MediaReferenceBatchPlan::new(
+                    "account-1".to_owned(),
+                    batch_id.clone(),
+                    events.clone(),
+                    stamp.to_owned(),
+                )
+                .err(),
+                Some(WalIdempotencyError::Malformed),
+                "{stamp:?} must not be admitted as a commit stamp"
+            );
+        }
     }
 }
