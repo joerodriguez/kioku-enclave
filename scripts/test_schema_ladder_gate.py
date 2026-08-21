@@ -18,6 +18,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 STORE = ROOT / "src/store.rs"
 LADDER = ROOT / "src/schema_ladder.rs"
+# `run_migrations` delegates part of the epoch-0 baseline to these two
+# functions, which between them create 37 baseline tables. Hashing only
+# store.rs left all of that DDL editable without tripping the freeze.
+MEDIA = ROOT / "src/cp/media.rs"
+PROJECTION = ROOT / "src/cp/mcp_projection.rs"
 LADDER_DOMAIN = b"kioku.schema-ladder.v1"
 
 # DDL a ladder step may never contain: each rewrites or removes existing
@@ -61,11 +66,43 @@ def run_migrations_body(source: str) -> str:
     return source[start : index - 1]
 
 
-def baseline_digest(source: str) -> bytes:
+def function_body(source: str, marker: str) -> str:
+    """The exact body of the function opened by `marker`, brace-balanced."""
+    start = source.index(marker) + len(marker)
+    depth = 1
+    index = start
+    while depth:
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    return source[start : index - 1]
+
+
+def baseline_digest(source: str, media: str, projection: str) -> bytes:
     hasher = hashlib.sha256()
     hasher.update(LADDER_DOMAIN)
     hasher.update(framed(schema_sql_body(source).encode()))
     hasher.update(framed(run_migrations_body(source).encode()))
+    # `run_migrations` calls these; their DDL is as much the frozen baseline
+    # as SCHEMA_SQL is, so the pin has to cover them or the freeze is a
+    # statement about one file rather than about the baseline.
+    hasher.update(
+        framed(
+            function_body(
+                projection, "pub fn init_projection_schema(conn: &Connection) -> SqlResult<()> {"
+            ).encode()
+        )
+    )
+    hasher.update(
+        framed(
+            function_body(
+                media, "pub fn init_schema(conn: &Connection) -> Result<()> {"
+            ).encode()
+        )
+    )
     return hasher.digest()
 
 
@@ -76,10 +113,25 @@ def declared_baseline_digest(ladder: str) -> bytes:
     return bytes(values)
 
 
+def step_sql_literals(literal: str) -> list[str]:
+    """Every `sql:` value in a ladder literal, plain AND raw strings.
+
+    Raw strings were previously invisible to the scan, so a step written
+    `sql: r#"DROP TABLE ..."#` -- the natural shape for the multi-line SQL a
+    real step is most likely to use -- passed the additive-only rule
+    vacuously.
+    """
+    found = re.findall(r'sql:\s*"((?:[^"\\]|\\.)*)"', literal)
+    found += [body for _, body in re.findall(r'sql:\s*r(#*)"(.*?)"\1', literal, re.S)]
+    return found
+
+
 class SchemaLadderGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = STORE.read_text(encoding="utf-8")
         self.ladder = LADDER.read_text(encoding="utf-8")
+        self.media = MEDIA.read_text(encoding="utf-8")
+        self.projection = PROJECTION.read_text(encoding="utf-8")
 
     def test_epoch_zero_baseline_is_frozen(self) -> None:
         """The recorded baseline digest must still describe the live baseline.
@@ -91,7 +143,7 @@ class SchemaLadderGateTest(unittest.TestCase):
         """
         self.assertEqual(
             declared_baseline_digest(self.ladder).hex(),
-            baseline_digest(self.store).hex(),
+            baseline_digest(self.store, self.media, self.projection).hex(),
             "epoch-0 baseline changed: express schema changes as an appended "
             "ladder step, never as a baseline edit",
         )
@@ -117,7 +169,7 @@ class SchemaLadderGateTest(unittest.TestCase):
                 "pub(crate) const SCHEMA_EPOCH_HEAD"
             )
         ]
-        for sql in re.findall(r'sql:\s*"((?:[^"\\]|\\.)*)"', literal):
+        for sql in step_sql_literals(literal):
             lowered = sql.lower()
             for forbidden in FORBIDDEN_STEP_SQL:
                 self.assertNotIn(
@@ -125,6 +177,52 @@ class SchemaLadderGateTest(unittest.TestCase):
                     lowered,
                     f"ladder step performs a non-additive change: {forbidden}",
                 )
+
+    def test_baseline_digest_covers_the_delegated_schema_bodies(self) -> None:
+        """`run_migrations` delegates baseline DDL; the pin must cover it.
+
+        Hashing only store.rs left the 37 tables created by
+        `cp::media::init_schema` and `cp::mcp_projection::init_projection_schema`
+        editable without tripping the freeze. Perturbing either body must move
+        the digest, or the freeze is a statement about one file rather than
+        about the baseline.
+        """
+        real = baseline_digest(self.store, self.media, self.projection)
+        self.assertNotEqual(
+            real,
+            baseline_digest(
+                self.store,
+                self.media.replace("CREATE TABLE", "CREATE  TABLE", 1),
+                self.projection,
+            ),
+            "editing cp::media::init_schema must change the baseline digest",
+        )
+        self.assertNotEqual(
+            real,
+            baseline_digest(
+                self.store,
+                self.media,
+                self.projection.replace("CREATE TABLE", "CREATE  TABLE", 1),
+            ),
+            "editing init_projection_schema must change the baseline digest",
+        )
+
+    def test_raw_string_steps_are_scanned_for_forbidden_sql(self) -> None:
+        """A raw-string step must not bypass the additive-only rule."""
+        plain = 'SchemaStep { epoch: 1, id: "a", sql: "ALTER TABLE t ADD COLUMN c TEXT" }'
+        raw = 'SchemaStep { epoch: 2, id: "b", sql: r#"DROP TABLE t"# }'
+        self.assertEqual(
+            step_sql_literals(plain), ["ALTER TABLE t ADD COLUMN c TEXT"]
+        )
+        self.assertEqual(step_sql_literals(raw), ["DROP TABLE t"])
+        self.assertTrue(
+            any(
+                forbidden in sql.lower()
+                for sql in step_sql_literals(raw)
+                for forbidden in FORBIDDEN_STEP_SQL
+            ),
+            "a raw-string step containing DROP TABLE must be caught",
+        )
 
     def test_epoch_constants_are_ordered(self) -> None:
         def constant(name: str) -> int:
