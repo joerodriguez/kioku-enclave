@@ -131,7 +131,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # surviving row: the retained library functions (search_all/search_episodes,
 # fetch_context, upsert_episodes/write_episode_embedding/purge_episode) take a
 # `&Connection` and own no Store call sites of their own.
-EXPECTED_STORE_CALL_COUNT = 228
+EXPECTED_STORE_CALL_COUNT = 229
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -194,7 +194,66 @@ EXPECTED_STORE_CALL_COUNT = 228
 # gates are back: the gates live above the call sites, and the call sites
 # themselves stay routed. The count returning to the pre-PR 228 and the
 # seven rows keeping classification A is the shape to expect here.
-EXPECTED_STORE_CALL_SHA256 = "b68a7595455720610d9be302f7c1f460206afe6239a991f9aa9524b18e94703a"
+# Read lane routed, D4 gates RETAINED (the six MCP tools, /api/search,
+# /api/episodes and /api/episodes/{id}, /api/episodes/{id}/members,
+# /api/browser-snapshots/{k}, /api/feed, /api/screenshot-images/plan,
+# /api/screenshot-images/{id}/content, /api/sync/status, /api/export).
+# 228 -> 229.
+#
+# BASELINE: a pristine `git archive origin/main | tar -x` tree at commit
+# be3b0cb ("Route the capture, session and people reads; scope the ingest
+# write (media.rs) (#328)"). NOT ea2bf62, that commit's parent -- and the
+# distinction is easy to miss here, because ea2bf62 carries the SAME count of
+# 228 with a DIFFERENT digest (bb8acbdf); #328 held the count and moved the
+# digest to b68a7595. Diffing against the parent would reproduce the right
+# number and the wrong rows. The pristine tree was dumped with THIS module's
+# own store_call_sites()/classify_store_call()/inventory_row()/digest()
+# helpers before anything was written, and reproduced be3b0cb's own
+# 228/b68a7595 pin byte-for-byte, so the delta below is against a verified
+# baseline. The store-surface (15/ec7ce1bc) and policy-site (42/a6ddddfe)
+# digests are byte-identical to that pristine dump afterwards.
+#
+# DELTA, exactly:
+#   * THIRTEEN one-for-one call renames, `with_user#N` ->
+#     `wal_authoritative_read#N`, under the SAME owner at the SAME ordinal,
+#     keeping the SAME A classification: tool_search_screenshots,
+#     query_episodes_value, tool_get_capture_status, dispatch_tool #0/#1/#2,
+#     rest_episode_members, rest_browser_snapshot, rest_feed,
+#     rest_screenshot_upload_plan, rest_screenshot_image_content #0/#1, and
+#     sync_status. Each is a routed read that falls through to the ordinary
+#     guarded legacy read for an unselected user, so no lane was added.
+#   * ONE rename that also renames its OWNER, A -> A:
+#     tool_search_transcripts#0::with_user#0 ->
+#     query_transcripts_value#0::wal_authoritative_read#0. The function was
+#     given a `Result` return so /api/search could stop answering a failed
+#     read with HTTP 200, and renamed with it because the `tool_` prefix was
+#     wrong -- MCP's own search_transcripts is served by
+#     mcp_query::search_safe_transcripts, and this function's only caller was
+#     the REST route.
+#   * ONE net addition, src/cp/sync.rs::dump_user_export#0::
+#     wal_authoritative_read#0, classified A (read-only export). The count
+#     rises WITHOUT a matching removal because the call it replaced was
+#     `Store::read_user`, which this scanner does not track. Do not read the
+#     imbalance as a new lane: /api/export had exactly one legacy read before
+#     and has exactly one routed read now, behind a RETAINED sync.export
+#     gate. `read_user` has no production caller left after this change.
+#   * SEVEN rows changed in their OWNER-BODY hash ONLY, with byte-identical
+#     call-EXPRESSION hashes and unchanged classifications:
+#     rest_episode_delete#0 (with_user#0, with_user#1, save_user#0, all C)
+#     gained the comment recording why it is deliberately NOT migrated, and
+#     rest_episode_finalize#0 (wal_authoritative_read#0,
+#     wal_authoritative_submit#0, with_user#0, save_user#0, all A) had its
+#     failure arm folded into cp::routed_read_unavailable. body_hash is taken
+#     over raw source, so both prose and a replaced failure arm move it.
+#
+# Zero reclassifications, zero call-EXPRESSION hash moves on any surviving
+# key, and the relative order of every surviving key is unchanged -- verified
+# key by key against the pristine dump.
+#
+# As in #328, the digest does not return to any earlier value even though
+# every D4 gate is retained: the gates sit ABOVE the call sites and the call
+# sites themselves stay routed.
+EXPECTED_STORE_CALL_SHA256 = "1a4dec33bc4476ce4767eeee7c7fef8341afffb31a64f180fa468eed45c1545b"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -396,7 +455,17 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the
 # store-call pin above; that pristine dump reproduced ea2bf62's own
 # 26/5fb928cb pin byte-for-byte before anything was written.
-EXPECTED_WORKER_SPAWN_SHA256 = "fe52045d89ce8bd08c6fe28012c080b531e5184df5c6727a6fb853c50c4ed715"
+# Read lane routed, D4 gates RETAINED: count HOLDS at 26 with zero
+# additions, zero removals, zero reclassifications and zero spawn
+# call-EXPRESSION hash moves. The sole delta is rest_episode_finalize#0's
+# owner body (class B, unchanged), whose routed-read failure arm was folded
+# into cp::routed_read_unavailable above the route's detached spawn; the
+# spawn expression itself is byte-identical. Same pristine origin/main
+# (be3b0cb) tree and the same worker_spawn_sites()/classify_worker_spawn()/
+# digest() helpers as the store-call pin above; that pristine dump
+# reproduced be3b0cb's own 26/fe52045d pin byte-for-byte before anything was
+# written.
+EXPECTED_WORKER_SPAWN_SHA256 = "e6dac368f934782905a53d04530287e5c8e16b2177911813a3b0255fc0a68fc1"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -956,7 +1025,7 @@ A_OWNERS = frozenset(
         "src/cp/model_usage.rs::complete_coverage#0",
         "src/cp/model_usage.rs::persist_coverage_snapshot#0",
         "src/cp/model_usage.rs::invalidate_stale_coverage#0",
-        "src/cp/query.rs::tool_search_transcripts#0",
+        "src/cp/query.rs::query_transcripts_value#0",
         "src/cp/query.rs::tool_search_screenshots#0",
         "src/cp/query.rs::query_episodes_value#0",
         "src/cp/query.rs::tool_get_capture_status#0",
@@ -973,6 +1042,7 @@ A_OWNERS = frozenset(
         "src/cp/summarizer.rs::fetch_range#0",
         "src/cp/summarizer.rs::fetch_open_episodes#0",
         "src/cp/summarizer.rs::session_tail_is_settled#0",
+        "src/cp/sync.rs::dump_user_export#0",
         "src/cp/sync.rs::sync_status#0",
         "src/cp/webhook_worker.rs::next_delivery#0",
         "src/store.rs::enqueue_email_delivery#0",

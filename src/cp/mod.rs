@@ -507,6 +507,54 @@ impl CpState {
     }
 }
 
+/// The stable machine-readable reason a failed routed read reports.
+pub(crate) const ROUTED_READ_UNAVAILABLE_REASON: &str = "enclave_unavailable";
+
+/// ADR-0022 — **the failure-status rule for the read lane, stated once.**
+///
+/// > A routed read (`Store::wal_authoritative_read`) that returns `Err` answers
+/// > **503 `enclave_unavailable`**.
+///
+/// A routed read fails for exactly one class of reason: the archive behind it
+/// could not be read. For a WAL-authoritative user that is a serving authority
+/// that is unregistered, quarantined, or mid-relaunch; for an unselected user
+/// it is the guarded legacy load failing. Both are transient and retryable, and
+/// 503 is the only status that says so. The three statuses it is deliberately
+/// NOT, each of which shipped as a defect on this lane:
+///
+/// * **200** with an `error` key in the body. Every client that switches on the
+///   status before the body reads that as data. `/api/search` did this.
+/// * **404**. That is an absence, and the archive is present and merely
+///   unreadable — it tells the caller their screenshot does not exist.
+///   `/api/screenshot-images/{id}/content` did this.
+/// * **500**. That is a fault: it invites a bug report instead of a retry, and
+///   it makes a retryable read failure indistinguishable from the genuinely
+///   non-retryable failures (a KMS unwrap, an AEAD authentication failure) that
+///   keep 500 on purpose.
+///
+/// The one exception, stated here so it cannot be mistaken for drift: a failure
+/// arm that ALSO covers a genuinely non-retryable failure keeps its own status
+/// and says why at the call site. In this lane that is
+/// `query.rs::rest_screenshot_image_content`'s DEK-load and decrypt arms, which
+/// stay 500 because a key that will not unwrap or a blob that will not
+/// authenticate is not fixed by retrying.
+///
+/// `sync.rs::export` is NOT such an exception: it keeps its distinct
+/// `export_failed` reason (a client contract) but answers it at 503, because
+/// the only thing behind it is the same routed read.
+pub(crate) fn routed_read_unavailable(
+    context: &'static str,
+    error: &crate::error::EnclaveError,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    tracing::error!(error = %error, metric = ROUTED_READ_UNAVAILABLE_REASON, context, "routed read failed");
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::response::Json(serde_json::json!({ "error": ROUTED_READ_UNAVAILABLE_REASON })),
+    )
+        .into_response()
+}
+
 /// Shared harness for the ADR-0022 D4 gate's tests.
 ///
 /// Every gated worker lives in its own module, so its gate test must live
@@ -585,6 +633,147 @@ pub(crate) mod wal_gate_test_support {
         assert!(
             store.is_wal_authoritative(user_id),
             "the harness must actually select the user"
+        );
+    }
+
+    /// Make `user_id`'s LEGACY archive unreadable, without selecting them.
+    ///
+    /// This is the second half of the read lane's failure story. `select_wal_
+    /// authoritative` covers a selected user, but a selected user is answered
+    /// by the D4 gate before the routed read is ever called — so on its own it
+    /// cannot see a failure arm hiding behind a gate. Both blockers found in
+    /// the read-lane review lived exactly there: `/api/search` answered 200
+    /// with an error body and `/api/screenshot-images/{id}/content` answered a
+    /// bare 404, and the gate hid both.
+    ///
+    /// An unselected user with a corrupt index blob takes the OTHER branch of
+    /// `wal_authoritative_read` — the guarded legacy load — and fails in it.
+    /// That is the shape of a real transient store fault, and no gate stands
+    /// in front of it.
+    ///
+    /// The helper proves its own sabotage before returning, so a test built on
+    /// it can never pass vacuously if the object naming or the load path
+    /// changes underneath it.
+    pub(crate) async fn make_legacy_archive_unreadable(store: &Store, user_id: &str) {
+        // Mirrors `store::gcs_object_name`, which is private. The assertion
+        // below is what keeps this honest.
+        let index = format!("indexes/{user_id}.db.enc");
+        store
+            .gcs
+            .put_object(
+                &index,
+                b"not an encrypted sqlite archive",
+                "not-base64!!",
+                0,
+            )
+            .await
+            .expect("the fake provider accepts the corrupt blob");
+        assert!(
+            !store.is_wal_authoritative(user_id),
+            "this lane must exercise the LEGACY branch, so the user must not be selected"
+        );
+        let probe = store.with_user(user_id, |_| Ok(())).await;
+        assert!(
+            probe.is_err(),
+            "the sabotage did not bite: {user_id}'s legacy archive still loads, so any test \
+             built on this helper would pass vacuously"
+        );
+    }
+
+    /// Every response key that would make a refusal look like data.
+    ///
+    /// A refusal must never present as a success, an empty collection, or an
+    /// absence — so it must not carry the shape the successful response has,
+    /// at any status.
+    pub(crate) const DATA_SHAPED_KEYS: &[&str] = &[
+        "episodes",
+        "episode_count",
+        "hidden_count",
+        "results",
+        "utterances",
+        "screenshots",
+        "screenshot_images",
+        "members",
+        "member_count",
+        "participant_details",
+        "records",
+        "next_before",
+        "tabs",
+        "counts",
+        "latest",
+        "total_utterances",
+        "total_screenshots",
+        "capture_events",
+        "capture_sessions",
+    ];
+
+    /// The read lane's one property: an archive that cannot be read is
+    /// answered with a non-2xx that carries no data.
+    ///
+    /// It deliberately does NOT pin a particular status or reason. Whether the
+    /// D4 gate answered (503 `wal_domain_unmigrated`, naming the domain) or
+    /// the routed read's own failure arm did (503 `enclave_unavailable`, or
+    /// `export_failed`), both are correct answers and the surface is free to
+    /// pick. What is never correct is a 2xx, or a body a client can mistake
+    /// for an empty archive.
+    pub(crate) async fn assert_refuses_without_data(
+        label: &str,
+        response: axum::response::Response,
+    ) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !status.is_success() && !status.is_redirection(),
+            "{label} answered {status} for an unreadable archive; a refusal must never present \
+             as a success"
+        );
+        // A 404 is an ABSENCE, and the archive is present and merely
+        // unreadable. `/api/screenshot-images/{id}/content` shipped exactly
+        // this: `Err(_) => NOT_FOUND`, byte-identical to its genuine-absence
+        // arm. "Non-2xx" alone does not catch it, which is the whole reason
+        // this assertion names it.
+        assert_ne!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "{label} answered 404 for an unreadable archive; a refusal must never present as an \
+             absence"
+        );
+        assert!(
+            !content_type.starts_with("image/"),
+            "{label} answered {status} but shipped {content_type}: a refusal must never present \
+             as content"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        // A bare status with no body is the other half of the same defect: it
+        // is unlogged, has no machine-readable reason, and a client cannot
+        // tell it from any other failure. Parsing is an assertion, not a
+        // convenience.
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!(
+                "{label} answered {status} with no JSON body; a refusal must carry a \
+                 machine-readable reason: {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        for key in DATA_SHAPED_KEYS {
+            assert!(
+                body.get(*key).is_none(),
+                "{label} answered {status} but carried a data-shaped `{key}`, which reads as an \
+                 empty archive: {body}"
+            );
+        }
+        assert!(
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| !reason.is_empty()),
+            "{label} answered {status} with no `error` reason: {body}"
         );
     }
 
