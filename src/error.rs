@@ -260,34 +260,24 @@ pub mod wal_domain {
     // deferral into a 200 with an empty collection or a 404, which is the one
     // outcome no refusal is allowed to wear.
     //
-    /// Capture ingest itself: the sole production writer of `capture_events`,
-    /// `capture_streams` and every canonical `capture_sessions` row. Every
-    /// other media read gate below is answerability-blocked on THIS one.
-    pub const MEDIA_CAPTURE_EVENTS: &str = "media.capture_events";
-    /// `stream_ack`'s contiguous-acknowledgement read over `capture_streams`.
-    /// A pure SELECT, so it is not gated for writing — it is gated because
-    /// every canonical stream it could name is created by
-    /// `MEDIA_CAPTURE_EVENTS` above, so a routed answer is `NotFound` -> 404
-    /// "no such stream" when the truth is "your ingest is deferred".
-    pub const MEDIA_STREAM_ACK: &str = "media.stream_ack";
-    /// `capture_status`'s single-event read over `capture_events`, whose only
-    /// production writer is `MEDIA_CAPTURE_EVENTS`.
-    pub const MEDIA_CAPTURE_EVENT_STATUS: &str = "media.capture_event_status";
-    /// `list_capture_sessions`' bounded session listing. It answers a
-    /// COLLECTION, so its ungated failure mode is the worst shape the rule
-    /// names: `200 {"sessions": []}`, a refusal wearing a truthful-empty face.
-    pub const MEDIA_CAPTURE_SESSIONS: &str = "media.capture_sessions";
-    /// `capture_session_status`' single-session read. Its rows and its whole
-    /// evidence rollup are written by ingest.
-    pub const MEDIA_CAPTURE_SESSION_STATUS: &str = "media.capture_session_status";
+    // Capture ingest (`media.capture_events`) and the four reads that were
+    // answerability-blocked on it — `media.stream_ack`,
+    // `media.capture_event_status`, `media.capture_sessions` and
+    // `media.capture_session_status` — MIGRATED and their constants are gone.
+    // `upload_capture_event` now routes both of its dispositions through
+    // sealed plan families (`CanonicalCaptureEventPlan` and
+    // `MediaReferenceEventPlan`), so it is a live writer of `capture_events`,
+    // `capture_streams` and every canonical `capture_sessions` row, and the
+    // absences those four reads report are truthful again.
+    //
     /// The four people reads (`list_people`, `person_profile`,
-    /// `person_evidence`, `person_statements`). Every `people` and
-    /// `person_facts` row is derived by `media_worker`'s result lanes from
-    /// evidence that capture ingest supplies, so with `MEDIA_CAPTURE_EVENTS`
-    /// deferred there is no work unit to derive a person from; and the
-    /// `voice_profiles` the listing joins are written only by the deferred
-    /// `MEDIA_WORKER_VOICE_EMBEDDING` and `MEDIA_WORKER_VOICE_PROFILES` lanes.
-    /// No live writer reaches these tables.
+    /// `person_evidence`, `person_statements`). Ingest migrating does NOT lift
+    /// this one: every `people` and `person_facts` row is derived by
+    /// `media_worker`'s voice lanes, and the `voice_profiles` the listing joins
+    /// are written only by the still-deferred `MEDIA_WORKER_VOICE_EMBEDDING`
+    /// and `MEDIA_WORKER_VOICE_PROFILES`. No live writer reaches these tables,
+    /// so a routed read still answers `200 {"people": []}` — the exact shape
+    /// the rule forbids. This lifts with those two lanes.
     pub const MEDIA_PEOPLE: &str = "media.people";
     /// `GET /api/sync/status` — counts and freshness over `utterances`,
     /// `screenshots` and `episodes`. Ungated it answers `200 {"counts":
@@ -500,7 +490,7 @@ mod tests {
         for domain in [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::PUSH_OUTBOX,
-            wal_domain::MEDIA_CAPTURE_EVENTS,
+            wal_domain::MEDIA_PEOPLE,
             wal_domain::SYNC_EXPORT,
         ] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
@@ -540,11 +530,6 @@ mod tests {
             wal_domain::QUERY_FEED,
             wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,
             wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
-            wal_domain::MEDIA_CAPTURE_EVENTS,
-            wal_domain::MEDIA_CAPTURE_EVENT_STATUS,
-            wal_domain::MEDIA_CAPTURE_SESSIONS,
-            wal_domain::MEDIA_CAPTURE_SESSION_STATUS,
-            wal_domain::MEDIA_STREAM_ACK,
             wal_domain::MEDIA_PEOPLE,
             wal_domain::SYNC_STATUS,
             wal_domain::SYNC_EXPORT,

@@ -50,19 +50,19 @@ pub(crate) struct CanonicalCaptureEventOutcome {
 }
 
 impl CanonicalCaptureEventOutcome {
-    pub(super) fn event_id(&self) -> &str {
+    pub(in crate::cp::media) fn event_id(&self) -> &str {
         &self.event_id
     }
 
-    pub(super) fn asset_id(&self) -> &str {
+    pub(in crate::cp::media) fn asset_id(&self) -> &str {
         &self.asset_id
     }
 
-    pub(super) fn stream_id(&self) -> &str {
+    pub(in crate::cp::media) fn stream_id(&self) -> &str {
         &self.stream_id
     }
 
-    pub(super) const fn committed_through_sequence(&self) -> i64 {
+    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -80,7 +80,7 @@ pub(crate) struct CanonicalCaptureEventPlan {
 }
 
 impl CanonicalCaptureEventPlan {
-    pub(super) fn new(
+    pub(in crate::cp::media) fn new(
         account_id: String,
         manifest: CaptureEventManifest,
         object_key: String,
@@ -160,6 +160,35 @@ impl CanonicalCaptureEventPlan {
         )
     }
 
+    /// The stamp bound in place of this row set's live-clock column DEFAULTs
+    /// (`capture_sessions.created_at`, `capture_streams.created_at`,
+    /// `capture_events.received_at`, `media_objects.created_at`,
+    /// `browser_states_v2.created_at`, `browser_observations_v2.created_at`
+    /// and `media_processing_jobs.updated_at` — every one of them declared
+    /// only in `cp::media::init_schema`, never in `SCHEMA_SQL`, and bound by
+    /// no legacy INSERT).
+    ///
+    /// It is the manifest's own `source_wall_at`, a pure function of bytes the
+    /// request fingerprint already commits to, and NOT a caller-supplied
+    /// `now()`. Both halves matter:
+    ///
+    ///   * A live clock inside `apply()` makes the committed pages a function
+    ///     of wall time instead of the plan, which is exactly the byte-exact
+    ///     replay break `media_worker::wal::claim` had to fix on
+    ///     `media_work_units`.
+    ///   * A caller-supplied `now()` would fix that but break something worse
+    ///     for a REQUEST-path family: the Mac client's outbox retries the same
+    ///     event until it is acknowledged, each retry would mint a different
+    ///     stamp, and a stamp inside the canonical request turns an ordinary
+    ///     idempotent replay into a `FingerprintConflict`. Deriving it from
+    ///     the manifest makes it constant across every retry of one event, so
+    ///     it needs no separate framing in `canonical_request` to be bound:
+    ///     two requests with the same fingerprint necessarily carry the same
+    ///     manifest and therefore the same stamp.
+    fn commit_stamp(&self) -> &str {
+        &self.manifest.source_wall_at
+    }
+
     fn expected_outcome(
         &self,
         committed_through_sequence: i64,
@@ -228,6 +257,7 @@ impl WalLogicalDomainPlan for CanonicalCaptureEventPlan {
             &self.manifest_digest,
             &self.object_key,
             Some(self.object_generation),
+            Some(self.commit_stamp()),
         )
         .map_err(map_domain_error)?;
         if outcome != RecordOutcome::Created {
@@ -711,6 +741,61 @@ fn validate_committed_rows(
         || stored_job.11.is_some()
         || stored_job.12.is_some()
     {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    validate_committed_stamps(connection, plan)
+}
+
+/// Read back every column whose live-clock DEFAULT this family now binds. A
+/// row still carrying `strftime('now')` means the bind was dropped somewhere
+/// between the plan and the SQL, and `apply()` silently became a function of
+/// wall time again — the exact regression this check exists to make loud.
+fn validate_committed_stamps(
+    connection: &Connection,
+    plan: &CanonicalCaptureEventPlan,
+) -> Result<()> {
+    let stamp = plan.commit_stamp();
+    let media = plan
+        .manifest
+        .media
+        .as_ref()
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    let stamps = connection
+        .query_row(
+            "SELECT
+                (SELECT created_at FROM capture_sessions WHERE id=?1),
+                (SELECT created_at FROM capture_streams WHERE id=?2),
+                (SELECT received_at FROM capture_events WHERE event_id=?3),
+                (SELECT created_at FROM media_objects WHERE asset_id=?4),
+                (SELECT updated_at FROM media_processing_jobs WHERE event_id=?3)",
+            params![
+                plan.manifest.capture_session_id,
+                plan.manifest.stream_id,
+                plan.manifest.event_id,
+                media.asset_id,
+            ],
+            |row| {
+                Ok([
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ])
+            },
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    // The session and the stream may pre-date this event, in which case their
+    // stamp belongs to whichever operation created them and this plan neither
+    // wrote nor may rewrite it. The three rows this operation definitely
+    // created must carry the stamp exactly.
+    if stamps[2].as_deref() != Some(stamp)
+        || stamps[3].as_deref() != Some(stamp)
+        || stamps[4].as_deref() != Some(stamp)
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    if stamps[0].is_none() || stamps[1].is_none() {
         return Err(WalIdempotencyError::Corrupt);
     }
     Ok(())

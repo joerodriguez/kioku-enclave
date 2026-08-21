@@ -15,10 +15,14 @@
 mod capture_event;
 mod media_dek;
 mod reference_batch;
+mod reference_event;
 pub(crate) use capture_event::{CanonicalCaptureEventLedger, CanonicalCaptureEventPlan};
 pub(in crate::cp) use media_dek::{authenticate_media_dek_install_receipt, MediaDekInstallReceipt};
 pub(crate) use media_dek::{MediaDekInstallLedger, MediaDekInstallPlan};
 pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
+pub(crate) use reference_event::{MediaReferenceEventLedger, MediaReferenceEventPlan};
+
+use std::sync::{Arc, OnceLock};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;
@@ -28,6 +32,65 @@ use crate::archive_v3_wal_idempotency::{
     WalLogicalDomainLedger, WalLogicalDomainPlan, WalLogicalOperationId, WalOperationKind,
     WalReplayResult, MAX_ENCODED_REPLAY_RESULT_BYTES,
 };
+use crate::error::{CaptureReferenceFailureReason, EnclaveError};
+
+/// ADR-0022: the rebase-required reason a reference write observed *inside*
+/// `apply()`, carried out of band so the route can still answer with it.
+///
+/// Why a side channel and not the error type: `WalIdempotencyError` is a
+/// payload-free `Copy` enum, and `Store::wal_authoritative_submit` deliberately
+/// narrows every owner refusal to a content-free `Conflict` or `Store`. A
+/// reference refusal that reaches the submit boundary therefore arrives with
+/// nothing but "conflict", and the route answers `409`/`500` instead of the
+/// documented `400 {"error":"screen_reference_rebase_required","reason":...}`.
+/// That is a real wedge, not a cosmetic one: the Mac client's outbox is
+/// durable, a 409/500 is retryable to it, and the one thing that can clear the
+/// refusal is a *rebase* it never learns it needs — so it re-posts the same
+/// unrebasable event forever and its stream never advances.
+///
+/// The preflight read the routes run first catches the ordinary case. This
+/// carries the race window between that read and the submit, which is exactly
+/// where the refusal is both possible and invisible.
+///
+/// Recording is strictly additive: `apply()` still returns the same
+/// `WalIdempotencyError::Precondition` it returned before, the transaction
+/// still rolls back, and a route that ignores the sink behaves exactly as it
+/// did. Only the FIRST refusal is retained (`OnceLock`), which matches the
+/// batch loop's own abort-on-first-item semantics.
+#[derive(Clone, Default)]
+pub(in crate::cp::media) struct RebaseRefusalSink(Arc<OnceLock<RebaseRefusal>>);
+
+#[derive(Clone, Copy)]
+struct RebaseRefusal {
+    reason: CaptureReferenceFailureReason,
+    /// `Some((index, sequence))` for a batch item, mirroring the legacy
+    /// `record_reference_batch` framing byte for byte; `None` for the
+    /// single-event route, whose legacy branch reports the bare reason.
+    batch_position: Option<(usize, i64)>,
+}
+
+impl RebaseRefusalSink {
+    fn record(&self, reason: CaptureReferenceFailureReason, batch_position: Option<(usize, i64)>) {
+        let _ = self.0.set(RebaseRefusal {
+            reason,
+            batch_position,
+        });
+    }
+
+    /// The exact error the legacy branch would have returned, if `apply()`
+    /// observed a rebase-required refusal. `None` means the submit failed for
+    /// some other reason and the caller must keep its own error.
+    pub(in crate::cp::media) fn observed(&self) -> Option<EnclaveError> {
+        self.0.get().map(|refusal| match refusal.batch_position {
+            Some((index, sequence)) => EnclaveError::CaptureReferenceBatch {
+                reason: refusal.reason,
+                index,
+                sequence,
+            },
+            None => EnclaveError::CaptureReference(refusal.reason),
+        })
+    }
+}
 
 const CAPTURE_SESSION_FINISH_REQUEST_V1: u16 = 1;
 const CAPTURE_SESSION_FINISH_RESULT_V1: u16 = 1;

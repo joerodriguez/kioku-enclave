@@ -131,7 +131,61 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # surviving row: the retained library functions (search_all/search_episodes,
 # fetch_context, upsert_episodes/write_episode_embedding/purge_episode) take a
 # `&Connection` and own no Store call sites of their own.
-EXPECTED_STORE_CALL_COUNT = 229
+# Capture INGEST routed; its D4 gate and the four reads gated on it LIFTED.
+# 229 -> 232.
+#
+# BASELINE: a pristine `git archive origin/main | tar -x` tree at commit
+# 9d78c46 ("Route the summarizer window's evidence reads (unblocks the merged
+# upsert plan) (#330)"), extracted OUTSIDE any shared working directory. Main
+# moved twice while this branch was in progress (be3b0cb -> 8a6f948 -> 9d78c46)
+# and each move re-pinned this same constant, so the delta below was re-derived
+# from scratch after the final rebase -- 8a6f948's 229/1a4dec33 is NOT the
+# baseline here even though this branch was first derived against it. The
+# pristine tree was dumped with THAT tree's own store_call_sites() /
+# classify_store_call() / inventory_row() / digest() helpers and reproduced
+# 9d78c46's own 229/8eb21ded pin byte-for-byte, so the delta below is against a
+# verified baseline. The store-surface (15/a2904b58) and policy-site
+# (42/7b4d1591) digests are byte-identical to that pristine dump afterwards.
+#
+# As #330 records: a digest conflict on this constant is never resolvable by
+# picking a side. The merged tree is a third state and has to be re-derived.
+#
+# DELTA, exactly:
+#   * ONE one-for-one rename, `stream_ack#0::with_user#0` ->
+#     `stream_ack#0::wal_authoritative_read#0`, keeping classification A. Its
+#     D4 gate lifted with ingest (every canonical stream it could name is
+#     written by `upload_capture_event`), and lifting a gate above an
+#     UNROUTED legacy read would have handed a selected user a `with_user`
+#     refusal, so the read had to route in the same change.
+#   * THREE additions under `upload_capture_event#0`, all classified A by the
+#     explicit overrides below: `wal_authoritative_read#0` (the routed
+#     preflight -- the canonical arm's whole residual, because the sealed plan
+#     treats an already-present event as a hard precondition failure while the
+#     route answers 200) and `wal_authoritative_submit#0`/`#1`, one per media
+#     disposition. Both submits are required: a mac_screen stream interleaves
+#     canonical screenshots and reference pointers by sequence and
+#     `advance_contiguous_ack` walks only while the next sequence exists, so a
+#     half-migrated ingest stalls the stream at its first refused event.
+#   * TWO changed rows with a moved CALL-EXPRESSION hash and no
+#     reclassification: `upload_capture_event#0::with_user#0` and `#1`. Both
+#     moved by INDENTATION ONLY -- they are now inside the `else` arm of the
+#     routing branch. Verified line by line against the pristine dump: the two
+#     expressions are identical after stripping leading whitespace, so the
+#     legacy preflight and the legacy write+save pair are byte-intact.
+#   * NINE rows changed in their OWNER-BODY hash only, with byte-identical
+#     call-EXPRESSION hashes and unchanged classifications:
+#     `upload_capture_event#0`'s two save_user rows (the duplicate-branch save
+#     is now skipped on the WAL branch, which has no in-memory half-state to
+#     flush, but the call expression itself is one line and unchanged);
+#     `upload_screen_reference_batch#0`'s four rows (the plan's rebase-refusal
+#     sink is taken before `prepare` consumes it, and the submit's failure arm
+#     now prefers the recorded reason); and `capture_status#0`,
+#     `capture_session_status#0` and `list_capture_sessions#0`, whose D4 gates
+#     were deleted above already-routed reads.
+#
+# Zero removals other than the one rename, zero reclassifications, and the
+# relative order of every surviving key is unchanged.
+EXPECTED_STORE_CALL_COUNT = 232
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -266,7 +320,7 @@ EXPECTED_STORE_CALL_COUNT = 229
 # while this branch was in review, and each move re-pinned this same
 # constant. A digest conflict here is never resolvable by picking a
 # side -- the merged tree is a third state.
-EXPECTED_STORE_CALL_SHA256 = "8eb21ded7d08173c971a3bb75c6ff972bfbf36be612eebc979d10b0eca5b7f86"
+EXPECTED_STORE_CALL_SHA256 = "30434e8f143427214e006274d33c095a13ae202532abd6d739957ab7b2407b76"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -478,7 +532,15 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # digest() helpers as the store-call pin above; that pristine dump
 # reproduced be3b0cb's own 26/fe52045d pin byte-for-byte before anything was
 # written.
-EXPECTED_WORKER_SPAWN_SHA256 = "e6dac368f934782905a53d04530287e5c8e16b2177911813a3b0255fc0a68fc1"
+# Capture ingest routed: the sole delta is
+# `upload_capture_event#0::tokio::spawn#0`'s OWNER-BODY hash. That spawn is the
+# GCS media PUT, which keeps the provider write alive if the HTTP future is
+# cancelled; it was not touched. Dumped and diffed against a pristine
+# origin/main (9d78c46) tree with that tree's own helpers, which reproduced its
+# own 26/e6dac368 pin exactly: the count holds at 26, the key set is
+# byte-identical, no spawn was added, removed, reordered or reclassified, and
+# every other spawn's own call-site hash is byte-identical.
+EXPECTED_WORKER_SPAWN_SHA256 = "7ae682ff66d7b4803ebc7ab6d041ed1c30e3088df4e1c9d565e3c3a918ccf605"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1128,6 +1190,14 @@ CALL_OVERRIDES = {
     "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#0": "B",
     "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#1": "B",
     # Stable capture record, but the complete owner has the B dependency below.
+    # The routed sites join them at the same classification: the preflight is
+    # read-only, and both settle-submits commit the same stable capture record
+    # their legacy counterparts do -- one per media disposition, because this
+    # one route serves both and a half-migrated ingest stalls an interleaved
+    # mac_screen stream at its first refused event.
+    "src/cp/media.rs::upload_capture_event#0::wal_authoritative_read#0": "A",
+    "src/cp/media.rs::upload_capture_event#0::wal_authoritative_submit#0": "A",
+    "src/cp/media.rs::upload_capture_event#0::wal_authoritative_submit#1": "A",
     "src/cp/media.rs::upload_capture_event#0::with_user#0": "A",
     "src/cp/media.rs::upload_capture_event#0::with_user#1": "A",
     "src/cp/media.rs::upload_capture_event#0::save_user#0": "A",
@@ -1568,6 +1638,9 @@ impl X {
         capture_event_domain = (
             ROOT / "src/cp/media/wal/capture_event.rs"
         ).read_text(encoding="utf-8")
+        reference_event_domain = (
+            ROOT / "src/cp/media/wal/reference_event.rs"
+        ).read_text(encoding="utf-8")
         media_dek_domain = (
             ROOT / "src/cp/media/wal/media_dek.rs"
         ).read_text(encoding="utf-8")
@@ -1690,7 +1763,48 @@ impl X {
         self.assertIn("MAX_ROWS: u32 = 1_048_576", capture_event_domain)
         self.assertIn("DomainLedgerBounds::new", capture_event_domain)
         self.assertIn("WalIdempotencyError::Precondition", capture_event_domain)
-        self.assertNotIn("CanonicalCaptureEventPlan::", media)
+        # Capture ingest MIGRATED. The former assertNotIn pinned the
+        # deliberate pre-wiring state; this pins the wired one just as
+        # exactly, the same way MediaDekInstallPlan's did in slice 1 (F1).
+        # The route constructs each plan at exactly ONE site, inside the
+        # `is_wal_authoritative` branch and after the routed preflight.
+        self.assertEqual(media.count("CanonicalCaptureEventPlan::new("), 1)
+        # The single-event reference family: the OTHER media disposition the
+        # one ingest route serves. Both arms had to migrate together -- a
+        # mac_screen stream interleaves canonical screenshots and reference
+        # pointers by sequence and `advance_contiguous_ack` walks only while
+        # the next sequence exists, so migrating one arm alone stalls the
+        # stream permanently at the first refused event of the other.
+        self.assertIn("mod reference_event;", domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media::wal::MediaReferenceEventPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media::wal::MediaReferenceEventLedger",
+            gate,
+        )
+        self.assertIn("struct MediaReferenceEventPlan", reference_event_domain)
+        self.assertIn("struct MediaReferenceEventLedger", reference_event_domain)
+        self.assertIn(
+            "archive_v3_wal_media_reference_event_operations",
+            reference_event_domain,
+        )
+        # Its OWN operation-source subtype, distinct from the batch's
+        # `reference-batch-v1` and the canonical family's
+        # `canonical-capture-event-v1`. A bespoke plan reusing the batch id
+        # derivation while committing its own Output would share one
+        # `archive_v3_wal_publications` slot and one attempt ladder with a
+        # fingerprint it could never match;
+        # test_plan_family_subtypes_are_declared_and_pairwise_distinct is what
+        # keeps the subtype unique in review.
+        self.assertIn(
+            "adr-0022-single-reference-capture-event-v1", reference_event_domain
+        )
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", reference_event_domain)
+        self.assertIn("DomainLedgerBounds::new", reference_event_domain)
+        self.assertIn("WalIdempotencyError::Precondition", reference_event_domain)
+        self.assertEqual(media.count("MediaReferenceEventPlan::new("), 1)
         self.assertIn("mod media_dek;", domain)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media::wal::MediaDekInstallPlan",
