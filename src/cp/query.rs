@@ -3,7 +3,12 @@
 //! (`/api/search`, `/api/episodes`, `/api/episodes/:id`,
 //! `/api/episodes/:id/members`) the debugger
 //! uses. All routes are auth-gated; tool logic calls the data-plane query code
-//! (`search::search_all`, `timeline::fetch_context`) in-process.
+//! (`search::search_all`, `search::search_episodes`, `episodes::purge_episode`)
+//! in-process. Note `timeline::fetch_context` is NOT among them despite a
+//! long-standing claim here: `get_context` is served by this module's own
+//! redaction-aware `mcp_query::fetch_safe_context`. That stale claim was the
+//! stated reason `timeline::fetch_context` survived the /v1 retirement, so it
+//! is corrected rather than carried.
 //! `POST /api/episodes/:id/finalize` queues a scoped retry for an incomplete
 //! or version-stale canonical brief. `/api/webhooks` manages signed,
 //! user-configured finalized-episode event destinations.
