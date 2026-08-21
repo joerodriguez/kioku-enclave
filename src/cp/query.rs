@@ -3828,10 +3828,17 @@ mod tests {
             )
             .unwrap();
 
-        // ADR-0022 D4 extends this to EVERY tool. `list_episodes` and
-        // `get_capture_status` were the two that still flattened a failed read
-        // into a payload with no `error` key -- an authoritative-looking empty
-        // result, which is the exact defect this test exists to prevent.
+        // ADR-0022 D4 extends this to EVERY tool. Exactly ONE of them --
+        // `list_episodes` -- still flattened a failed read into a payload with
+        // no `error` key, via `list_episodes_value`'s
+        // `{"episode_count":0,"hidden_count":0,"episodes":[]}` fallback: an
+        // authoritative-looking empty result, which is the defect this test
+        // exists to prevent. `get_capture_status` was NOT such a case; it
+        // already answered `{"error":"stats failed"}`, so the gate upgrades it
+        // from prose to the stable machine-readable reason rather than fixing
+        // a swallow. Stated precisely because an earlier revision of this
+        // comment claimed two, and a miscount here misleads exactly the
+        // reviewer who is relying on it.
         for tool in MCP_TOOL_NAMES {
             let args = json!({"query": "invoice total", "at": "2026-08-20T00:00:00Z",
                               "from": "2026-08-19T00:00:00Z", "to": "2026-08-20T00:00:00Z"});
