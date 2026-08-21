@@ -73,6 +73,7 @@ const MAX_JSON_BYTES: usize = 8 * 1024;
 /// admitted.
 const MAX_MEMBERS: usize = 128;
 const MAX_SCAN_LIMIT: i64 = 1_024;
+const CLAIMABLE_ROW_COMMITMENT_DOMAIN: &[u8] = b"adr-0022-media-claimable-row-v1\0";
 /// The two `media_processing_jobs.state` values that a claim may leave, and
 /// the three it may consume, are pinned as literals here so a widened
 /// eligibility predicate cannot smuggle in a state the CAS never observed.
@@ -247,6 +248,13 @@ pub(in crate::cp::media_worker) struct ClaimableRow {
 }
 
 impl ClaimableRow {
+    pub(in crate::cp::media_worker) fn attempt_count_refuses(
+        &self,
+        total_attempt_cap: i64,
+    ) -> bool {
+        self.attempt_count < 0 || self.attempt_count >= total_attempt_cap
+    }
+
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             job_id: row.get(0)?,
@@ -291,12 +299,171 @@ impl ClaimableRow {
         }
     }
 
+    /// Why the claim family cannot resolve THIS row, or `None` when it can.
+    ///
+    /// Every bound the family refuses a single enumerated row on lives here
+    /// exactly once. `planning_event` and `ClaimMember::resolve` both call it
+    /// before they do anything else, so a row this accepts is a row both of
+    /// them accept — by construction, not by convention — and a row this names
+    /// is one the owner may quarantine knowing the plan could never have been
+    /// built over it.
+    ///
+    /// It is a PURE function of the row plus the carried total-attempt cap: no
+    /// clock, no eligibility horizon, no sibling rows. That is what makes its
+    /// verdict stable across sweeps, and a stable verdict is the whole
+    /// justification for spending an attempt on it instead of retrying forever.
+    ///
+    /// `started_at`/`ended_at` are bounded HERE, and they are the reason this
+    /// function is not just a refactor. They are DEVICE-supplied and were
+    /// previously only parsed, never measured, on the claim path — while
+    /// `wal::failure`'s `FailureMember` and `wal::result`'s `valid_timestamp`
+    /// both refuse a `capture_started_at` over `MAX_TIMESTAMP_BYTES`. An
+    /// over-long stamp was therefore claimed and PAID FOR, and then refused by
+    /// every settle. `cp::media`'s `MAX_DEVICE_TIMESTAMP_BYTES` closes that at
+    /// ingest for new events; this closes it for rows already at rest, BEFORE
+    /// the claim, which is the only side of the paid call where closing it
+    /// costs nothing.
+    pub(in crate::cp::media_worker) fn refusal_reason(
+        &self,
+        total_attempt_cap: i64,
+    ) -> Option<WalIdempotencyError> {
+        if isotime::parse_epoch_millis(&self.started_at).is_none()
+            || isotime::parse_epoch_millis(&self.ended_at).is_none()
+            || self.job_id <= 0
+            || self.attempt_count_refuses(total_attempt_cap)
+            || self.processor_version <= 0
+            || self.event_id.is_empty()
+            || self.event_id.len() > MAX_ID_BYTES
+            || self.job_kind.is_empty()
+            || self.job_kind.len() > MAX_ID_BYTES
+            || self.input_revision.is_empty()
+            || self.input_revision.len() > MAX_ID_BYTES
+            || self.media_sha256.is_empty()
+            || self.media_sha256.len() > MAX_ID_BYTES
+            || self.updated_at.is_empty()
+            || self.updated_at.len() > MAX_TIMESTAMP_BYTES
+            || self.started_at.is_empty()
+            || self.started_at.len() > MAX_TIMESTAMP_BYTES
+            || self.ended_at.is_empty()
+            || self.ended_at.len() > MAX_TIMESTAMP_BYTES
+            || self.media_processing_state.is_empty()
+            || self.media_processing_state.len() > MAX_ID_BYTES
+            || !CLAIMABLE_STATES.contains(&self.state.as_str())
+            || opt_len_exceeds(self.lease_until.as_deref(), MAX_TIMESTAMP_BYTES)
+            || opt_len_exceeds(self.error_code.as_deref(), MAX_ID_BYTES)
+            || opt_len_exceeds(self.usage_json.as_deref(), MAX_JSON_BYTES)
+        {
+            return Some(WalIdempotencyError::Malformed);
+        }
+        None
+    }
+
+    /// Read the exact joined predecessor by job id. The quarantine family uses
+    /// this inside its mutation transaction to prove that the row which made a
+    /// claim impossible is still byte-for-byte the row the owner observed.
+    pub(in crate::cp::media_worker) fn read_exact(
+        connection: &Connection,
+        job_id: i64,
+    ) -> rusqlite::Result<Option<Self>> {
+        connection
+            .query_row(
+                "SELECT j.id,j.event_id,j.job_kind,j.input_revision,j.processor_version,\
+                        j.state,j.attempt_count,j.lease_until,j.error_code,j.usage_json,j.updated_at,\
+                        m.object_key,m.mime_type,m.codec,m.byte_length,m.sample_rate,m.channels,\
+                        m.width,m.height,m.sha256,m.processing_state,\
+                        e.started_at,e.ended_at,e.stream_kind,e.capture_session_id,e.stream_id,\
+                        e.sequence,e.context_json,e.audio_role,e.audio_route,e.route_epoch \
+                 FROM media_processing_jobs j \
+                 JOIN capture_events e ON e.event_id=j.event_id \
+                 JOIN media_objects m ON m.event_id=j.event_id \
+                 WHERE j.id=?1",
+                [job_id],
+                Self::from_row,
+            )
+            .optional()
+    }
+
+    /// A stable commitment to every column the claim scan observed. The
+    /// quarantine request fingerprints this value rather than embedding up to
+    /// 128 complete joined rows in the one-MiB canonical-request envelope.
+    /// `apply()` separately exact-compares the live row to this retained row.
+    pub(in crate::cp::media_worker) fn commitment(&self) -> Result<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hasher.update(CLAIMABLE_ROW_COMMITMENT_DOMAIN);
+        hash_field(&mut hasher, &self.job_id.to_be_bytes())?;
+        hash_field(&mut hasher, self.event_id.as_bytes())?;
+        hash_field(&mut hasher, self.job_kind.as_bytes())?;
+        hash_field(&mut hasher, self.input_revision.as_bytes())?;
+        hash_field(&mut hasher, &self.processor_version.to_be_bytes())?;
+        hash_field(&mut hasher, self.state.as_bytes())?;
+        hash_field(&mut hasher, &self.attempt_count.to_be_bytes())?;
+        hash_opt(&mut hasher, self.lease_until.as_deref())?;
+        hash_opt(&mut hasher, self.error_code.as_deref())?;
+        hash_opt(&mut hasher, self.usage_json.as_deref())?;
+        hash_field(&mut hasher, self.updated_at.as_bytes())?;
+        hash_field(&mut hasher, self.object_key.as_bytes())?;
+        hash_field(&mut hasher, self.mime_type.as_bytes())?;
+        hash_field(&mut hasher, self.codec.as_bytes())?;
+        hash_field(&mut hasher, &self.byte_length.to_be_bytes())?;
+        hash_opt_i64(&mut hasher, self.sample_rate)?;
+        hash_opt_i64(&mut hasher, self.channels)?;
+        hash_opt_i64(&mut hasher, self.width)?;
+        hash_opt_i64(&mut hasher, self.height)?;
+        hash_field(&mut hasher, self.media_sha256.as_bytes())?;
+        hash_field(&mut hasher, self.media_processing_state.as_bytes())?;
+        hash_field(&mut hasher, self.started_at.as_bytes())?;
+        hash_field(&mut hasher, self.ended_at.as_bytes())?;
+        hash_field(&mut hasher, self.stream_kind.as_bytes())?;
+        hash_field(&mut hasher, self.capture_session_id.as_bytes())?;
+        hash_field(&mut hasher, self.stream_id.as_bytes())?;
+        hash_field(&mut hasher, &self.sequence.to_be_bytes())?;
+        hash_opt(&mut hasher, self.context_json.as_deref())?;
+        hash_opt(&mut hasher, self.audio_role.as_deref())?;
+        hash_opt(&mut hasher, self.audio_route.as_deref())?;
+        hash_opt_i64(&mut hasher, self.route_epoch)?;
+        Ok(hasher.finalize().into())
+    }
+
+    /// Whether this row can never enter even a one-member planner window.
+    pub(in crate::cp::media_worker) fn is_unwindowable(
+        &self,
+        total_attempt_cap: i64,
+    ) -> Result<bool> {
+        let candidate = self.planning_event(total_attempt_cap)?;
+        Ok(media_planner::plan_first(&[candidate])
+            .member_job_ids
+            .is_empty())
+    }
+
+    /// The member-attributable half of the claim constructor's commit-order
+    /// guard, evaluated directly over the observed joined row.
+    pub(in crate::cp::media_worker) fn construction_refuses_at(
+        &self,
+        job_kind: &str,
+        processor_version: i64,
+        committed_at: &str,
+    ) -> bool {
+        let latest = match self.lease_until.as_deref() {
+            Some(lease) if lease > self.updated_at.as_str() => lease,
+            _ => self.updated_at.as_str(),
+        };
+        self.job_kind != job_kind
+            || self.processor_version != processor_version
+            || latest > committed_at
+    }
+
     /// The planner input, derived identically for the owner and for `apply()`.
     /// `plan_first` is a pure function of this vector — it re-sorts by
     /// `(started_ms, sequence, job_id)` and folds with saturating arithmetic
     /// over compile-time constants only — so the re-derivation inside `apply()`
     /// is exact.
-    pub(in crate::cp::media_worker) fn planning_event(&self) -> Result<PlanningEvent> {
+    pub(in crate::cp::media_worker) fn planning_event(
+        &self,
+        total_attempt_cap: i64,
+    ) -> Result<PlanningEvent> {
+        if let Some(error) = self.refusal_reason(total_attempt_cap) {
+            return Err(error);
+        }
         let started_ms =
             isotime::parse_epoch_millis(&self.started_at).ok_or(WalIdempotencyError::Malformed)?;
         let ended_ms =
@@ -352,32 +519,23 @@ pub(in crate::cp::media_worker) struct ClaimMember {
 }
 
 impl ClaimMember {
-    fn resolve(row: &ClaimableRow, ordinal: i64, plan_started_ms: i64) -> Result<Self> {
+    fn resolve(
+        row: &ClaimableRow,
+        ordinal: i64,
+        plan_started_ms: i64,
+        total_attempt_cap: i64,
+    ) -> Result<Self> {
+        // The row's own bounds live in ONE place (`ClaimableRow::refusal_reason`)
+        // so the set the owner can attribute a refusal to is exactly the set
+        // this constructor rejects. `ordinal` is the only non-row fact here.
+        if let Some(error) = row.refusal_reason(total_attempt_cap) {
+            return Err(error);
+        }
         let started_ms =
             isotime::parse_epoch_millis(&row.started_at).ok_or(WalIdempotencyError::Malformed)?;
         let ended_ms =
             isotime::parse_epoch_millis(&row.ended_at).ok_or(WalIdempotencyError::Malformed)?;
-        if row.job_id <= 0
-            || row.attempt_count < 0
-            || row.processor_version <= 0
-            || ordinal < 0
-            || row.event_id.is_empty()
-            || row.event_id.len() > MAX_ID_BYTES
-            || row.job_kind.is_empty()
-            || row.job_kind.len() > MAX_ID_BYTES
-            || row.input_revision.is_empty()
-            || row.input_revision.len() > MAX_ID_BYTES
-            || row.media_sha256.is_empty()
-            || row.media_sha256.len() > MAX_ID_BYTES
-            || row.updated_at.is_empty()
-            || row.updated_at.len() > MAX_TIMESTAMP_BYTES
-            || row.media_processing_state.is_empty()
-            || row.media_processing_state.len() > MAX_ID_BYTES
-            || !CLAIMABLE_STATES.contains(&row.state.as_str())
-            || opt_len_exceeds(row.lease_until.as_deref(), MAX_TIMESTAMP_BYTES)
-            || opt_len_exceeds(row.error_code.as_deref(), MAX_ID_BYTES)
-            || opt_len_exceeds(row.usage_json.as_deref(), MAX_JSON_BYTES)
-        {
+        if ordinal < 0 {
             return Err(WalIdempotencyError::Malformed);
         }
         Ok(Self {
@@ -406,48 +564,163 @@ impl ClaimMember {
             _ => self.updated_at.as_str(),
         }
     }
+
+    /// The per-member half of `MediaWorkClaimPlan::new`'s construction guard:
+    /// every refusal there that can be ATTRIBUTED to one member rather than to
+    /// the plan as a whole.
+    ///
+    /// `new` refuses on the first member this names; the structured refusal
+    /// classifier walks every member with the same function after first
+    /// excluding plan-wide clock/account/code failures. The set the owner may
+    /// charge is therefore exactly the stored member evidence the guard
+    /// refuses on, without blaming a healthy member for a global inversion.
+    ///
+    /// The `latest_observed_timestamp` comparison is #331's own trigger, and
+    /// it is NOT relaxed by being attributable: it still refuses, still
+    /// compares raw strings, still folds `lease_until`. All that changes is
+    /// that the refusal now has a name, so the response to it can be bounded.
+    fn construction_refusal(&self, committed_at: &str) -> Option<WalIdempotencyError> {
+        if self.latest_observed_timestamp() > committed_at {
+            return Some(WalIdempotencyError::Malformed);
+        }
+        None
+    }
+}
+
+/// A durable claim-construction refusal that may be charged to exact stored
+/// evidence. Global account/code invariants and `claimed_at > committed_at`
+/// never produce one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::cp::media_worker) enum AttributableClaimRefusalKind {
+    MemberCommitOrder,
+    DuplicateEventTopology,
+    WorkUnitMalformed,
+    WorkUnitCommitOrder,
+    WorkUnitDerivedMismatch,
+    WorkUnitAttemptCount,
+}
+
+/// The complete stored evidence for one attributable plan refusal.
+pub(in crate::cp::media_worker) struct AttributableClaimRefusal {
+    pub(in crate::cp::media_worker) kind: AttributableClaimRefusalKind,
+    pub(in crate::cp::media_worker) rows: Vec<ClaimableRow>,
+    pub(in crate::cp::media_worker) work_unit_id: Option<String>,
+    pub(in crate::cp::media_worker) unit: Option<ClaimedUnitPredecessor>,
+    pub(in crate::cp::media_worker) unit_expectation: Option<ClaimedUnitExpectation>,
+    pub(in crate::cp::media_worker) claimed_at: String,
+    pub(in crate::cp::media_worker) committed_at: String,
+}
+
+/// The member jobs a claim over `observation` could not be constructed for,
+/// with the observed predecessor tuple each quarantine CAS needs.
+///
+/// An EMPTY result does not mean the plan builds. This helper covers only the
+/// member commit-order guard; the owner's structured classifier separately
+/// names duplicate-event and stored-work-unit evidence, while account/code and
+/// `claimed_at`/`committed_at` failures remain deliberately non-charging.
+///
+/// Cheap enough to run unconditionally (at most `MAX_MEMBERS` members, three
+/// comparisons each) and pure, so the owner can derive it BEFORE handing the
+/// observation to `new` and use it only if `new` refuses.
+pub(in crate::cp::media_worker) fn unplannable_members(
+    observation: &ClaimObservation,
+    processor_version: i64,
+    committed_at: &str,
+) -> Vec<ClaimableRow> {
+    let job_kind = job_kind_for(observation.class);
+    if observation
+        .members
+        .iter()
+        .any(|member| member.job_kind != job_kind || member.processor_version != processor_version)
+    {
+        return Vec::new();
+    }
+    observation
+        .members
+        .iter()
+        .filter(|member| member.construction_refusal(committed_at).is_some())
+        .filter_map(|member| {
+            observation
+                .rows
+                .iter()
+                .find(|row| row.job_id == member.job_id)
+                .cloned()
+        })
+        .collect()
 }
 
 /// The observed `media_work_units` row. A claim after a failure or a lease
 /// expiry finds one; the first claim of a window does not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::cp::media_worker) struct ClaimedUnitPredecessor {
-    state: String,
-    attempt_count: i64,
-    reservation_retained: i64,
-    error_code: Option<String>,
-    usage_json: Option<String>,
-    created_at: String,
-    updated_at: String,
+    pub(in crate::cp::media_worker) work_class: String,
+    pub(in crate::cp::media_worker) processor_version: i64,
+    pub(in crate::cp::media_worker) state: String,
+    pub(in crate::cp::media_worker) started_at: String,
+    pub(in crate::cp::media_worker) ended_at: String,
+    pub(in crate::cp::media_worker) reserved_output_tokens: i64,
+    pub(in crate::cp::media_worker) attempt_count: i64,
+    pub(in crate::cp::media_worker) reservation_retained: i64,
+    pub(in crate::cp::media_worker) error_code: Option<String>,
+    pub(in crate::cp::media_worker) usage_json: Option<String>,
+    pub(in crate::cp::media_worker) created_at: String,
+    pub(in crate::cp::media_worker) updated_at: String,
 }
 
 impl ClaimedUnitPredecessor {
-    fn read(connection: &Connection, work_unit_id: &str) -> rusqlite::Result<Option<Self>> {
+    pub(in crate::cp::media_worker) fn attempt_count_refuses(
+        &self,
+        total_attempt_cap: i64,
+    ) -> bool {
+        self.attempt_count < 0 || self.attempt_count >= total_attempt_cap
+    }
+
+    pub(in crate::cp::media_worker) fn read(
+        connection: &Connection,
+        work_unit_id: &str,
+    ) -> rusqlite::Result<Option<Self>> {
         connection
             .query_row(
-                "SELECT state,attempt_count,reservation_retained,error_code,usage_json,\
-                        created_at,updated_at \
+                "SELECT work_class,processor_version,state,started_at,ended_at,\
+                        reserved_output_tokens,attempt_count,reservation_retained,error_code,\
+                        usage_json,created_at,updated_at \
                  FROM media_work_units WHERE id=?1",
                 [work_unit_id],
                 |row| {
                     Ok(Self {
-                        state: row.get(0)?,
-                        attempt_count: row.get(1)?,
-                        reservation_retained: row.get(2)?,
-                        error_code: row.get(3)?,
-                        usage_json: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        work_class: row.get(0)?,
+                        processor_version: row.get(1)?,
+                        state: row.get(2)?,
+                        started_at: row.get(3)?,
+                        ended_at: row.get(4)?,
+                        reserved_output_tokens: row.get(5)?,
+                        attempt_count: row.get(6)?,
+                        reservation_retained: row.get(7)?,
+                        error_code: row.get(8)?,
+                        usage_json: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 },
             )
             .optional()
     }
 
-    fn validate(&self) -> Result<()> {
-        if self.state.is_empty()
+    pub(in crate::cp::media_worker) fn refusal_reason(
+        &self,
+        total_attempt_cap: i64,
+    ) -> Option<WalIdempotencyError> {
+        if self.work_class.is_empty()
+            || self.work_class.len() > MAX_ID_BYTES
+            || self.processor_version <= 0
+            || self.state.is_empty()
             || self.state.len() > MAX_ID_BYTES
-            || self.attempt_count < 0
+            || isotime::parse_epoch_millis(&self.started_at).is_none()
+            || isotime::parse_epoch_millis(&self.ended_at).is_none()
+            || self.started_at.len() > MAX_TIMESTAMP_BYTES
+            || self.ended_at.len() > MAX_TIMESTAMP_BYTES
+            || self.reserved_output_tokens <= 0
+            || self.attempt_count_refuses(total_attempt_cap)
             || self.reservation_retained < 0
             || self.created_at.is_empty()
             || self.created_at.len() > MAX_TIMESTAMP_BYTES
@@ -456,9 +729,86 @@ impl ClaimedUnitPredecessor {
             || opt_len_exceeds(self.error_code.as_deref(), MAX_ID_BYTES)
             || opt_len_exceeds(self.usage_json.as_deref(), MAX_JSON_BYTES)
         {
-            return Err(WalIdempotencyError::Malformed);
+            return Some(WalIdempotencyError::Malformed);
         }
-        Ok(())
+        None
+    }
+
+    fn validate(&self, total_attempt_cap: i64) -> Result<()> {
+        match self.refusal_reason(total_attempt_cap) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub(in crate::cp::media_worker) fn commitment(&self) -> Result<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, self.work_class.as_bytes())?;
+        hash_field(&mut hasher, &self.processor_version.to_be_bytes())?;
+        hash_field(&mut hasher, self.state.as_bytes())?;
+        hash_field(&mut hasher, self.started_at.as_bytes())?;
+        hash_field(&mut hasher, self.ended_at.as_bytes())?;
+        hash_field(&mut hasher, &self.reserved_output_tokens.to_be_bytes())?;
+        hash_field(&mut hasher, &self.attempt_count.to_be_bytes())?;
+        hash_field(&mut hasher, &self.reservation_retained.to_be_bytes())?;
+        hash_opt(&mut hasher, self.error_code.as_deref())?;
+        hash_opt(&mut hasher, self.usage_json.as_deref())?;
+        hash_field(&mut hasher, self.created_at.as_bytes())?;
+        hash_field(&mut hasher, self.updated_at.as_bytes())?;
+        Ok(hasher.finalize().into())
+    }
+}
+
+/// The immutable work-unit topology the carried claim would insert on a first
+/// attempt. SQLite's conflict arm does not rewrite these columns, so an
+/// existing row must already equal them byte-for-byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::cp::media_worker) struct ClaimedUnitExpectation {
+    pub(in crate::cp::media_worker) work_class: String,
+    pub(in crate::cp::media_worker) processor_version: i64,
+    pub(in crate::cp::media_worker) started_at: String,
+    pub(in crate::cp::media_worker) ended_at: String,
+    pub(in crate::cp::media_worker) reserved_output_tokens: i64,
+}
+
+impl ClaimedUnitExpectation {
+    fn new(
+        class: WorkClass,
+        processor_version: i64,
+        started_ms: i64,
+        ended_ms: i64,
+        reserved_output_tokens: i64,
+    ) -> Self {
+        Self {
+            work_class: class_name(class).to_owned(),
+            processor_version,
+            started_at: isotime::format_epoch_millis(started_ms),
+            ended_at: isotime::format_epoch_millis(ended_ms),
+            reserved_output_tokens,
+        }
+    }
+
+    pub(in crate::cp::media_worker) fn commitment(&self) -> Result<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, self.work_class.as_bytes())?;
+        hash_field(&mut hasher, &self.processor_version.to_be_bytes())?;
+        hash_field(&mut hasher, self.started_at.as_bytes())?;
+        hash_field(&mut hasher, self.ended_at.as_bytes())?;
+        hash_field(&mut hasher, &self.reserved_output_tokens.to_be_bytes())?;
+        Ok(hasher.finalize().into())
+    }
+}
+
+impl ClaimedUnitPredecessor {
+    pub(in crate::cp::media_worker) fn derived_mismatch(
+        &self,
+        expected: &ClaimedUnitExpectation,
+    ) -> bool {
+        self.work_class != expected.work_class
+            || self.processor_version != expected.processor_version
+            || self.started_at != expected.started_at
+            || self.ended_at != expected.ended_at
+            || self.reserved_output_tokens != expected.reserved_output_tokens
     }
 }
 
@@ -471,17 +821,52 @@ struct ResolvedClaim {
     ended_ms: i64,
 }
 
-fn resolve_claim(rows: &[ClaimableRow]) -> Result<Option<ResolvedClaim>> {
+/// What one enumeration resolves to. The third arm is the whole point: before
+/// it existed, an enumeration that produced no plan was indistinguishable from
+/// an empty queue, and "indistinguishable from an empty queue" is how a
+/// deterministic refusal became a silent permanent wedge.
+enum ClaimResolution {
+    /// Nothing claimable at this horizon.
+    Empty,
+    Resolved(Box<ResolvedClaim>),
+    /// Rows that cannot be planned, and will not be plannable on any later
+    /// sweep because nothing about them or about `plan_first` depends on time.
+    /// Named so the owner can bound its response to them.
+    Unplannable(Vec<ClaimableRow>),
+}
+
+fn resolve_claim(rows: &[ClaimableRow], total_attempt_cap: i64) -> Result<ClaimResolution> {
     if rows.is_empty() {
-        return Ok(None);
+        return Ok(ClaimResolution::Empty);
+    }
+    // A row the family cannot resolve is reported rather than collapsed into a
+    // whole-enumeration refusal: the offending rows are named, the rest of the
+    // lane is untouched, and the next sweep plans what is left once these are
+    // quarantined out of the eligible set.
+    let unresolvable = rows
+        .iter()
+        .filter(|row| row.refusal_reason(total_attempt_cap).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unresolvable.is_empty() {
+        return Ok(ClaimResolution::Unplannable(unresolvable));
     }
     let candidates = rows
         .iter()
-        .map(ClaimableRow::planning_event)
+        .map(|row| row.planning_event(total_attempt_cap))
         .collect::<Result<Vec<_>>>()?;
     let plan = media_planner::plan_first(&candidates);
     if plan.member_job_ids.is_empty() {
-        return Ok(None);
+        // The head could not enter a window of its own — an audio event longer
+        // than `MAX_AUDIO_WINDOW_MS`, a frame over the byte or pixel cap. The
+        // planner is pure, so the identical head is re-selected by every
+        // sweep; reporting `Empty` here is what let one such event hold its
+        // whole class `pending` forever.
+        let head = rows
+            .iter()
+            .find(|row| row.job_id == plan.head_job_id)
+            .ok_or(WalIdempotencyError::Corrupt)?;
+        return Ok(ClaimResolution::Unplannable(vec![head.clone()]));
     }
     let mut members = Vec::with_capacity(plan.member_job_ids.len());
     for (ordinal, job_id) in plan.member_job_ids.iter().enumerate() {
@@ -493,13 +878,14 @@ fn resolve_claim(rows: &[ClaimableRow]) -> Result<Option<ResolvedClaim>> {
             row,
             i64::try_from(ordinal).map_err(|_| WalIdempotencyError::Limit)?,
             plan.started_ms,
+            total_attempt_cap,
         )?);
     }
-    Ok(Some(ResolvedClaim {
+    Ok(ClaimResolution::Resolved(Box::new(ResolvedClaim {
         members,
         started_ms: plan.started_ms,
         ended_ms: plan.ended_ms,
-    }))
+    })))
 }
 
 /// Everything the owner reads in ONE routed snapshot, so no carried fact can
@@ -516,6 +902,22 @@ pub(in crate::cp::media_worker) struct ClaimObservation {
     pub(in crate::cp::media_worker) usage_json: String,
 }
 
+/// Carried plan-wide inputs shared by refusal attribution and construction.
+///
+/// Keeping these inputs together makes the two callers feed the same guard
+/// without widening that guard's method signature every time a new immutable
+/// construction fact is added.
+struct ClaimConstructionContext<'a> {
+    account_id: &'a str,
+    processor_version: i64,
+    scan_limit: i64,
+    total_attempt_cap: i64,
+    lease_seconds: i64,
+    reserved_output_tokens: i64,
+    claimed_at: &'a str,
+    committed_at: &'a str,
+}
+
 impl ClaimObservation {
     /// The member rows in ordinal order, for the owner's local work unit.
     pub(in crate::cp::media_worker) fn member_rows(&self) -> Vec<&ClaimableRow> {
@@ -523,6 +925,148 @@ impl ClaimObservation {
             .iter()
             .filter_map(|member| self.rows.iter().find(|row| row.job_id == member.job_id))
             .collect()
+    }
+
+    fn global_construction_refuses(&self, context: &ClaimConstructionContext<'_>) -> bool {
+        let job_kind = job_kind_for(self.class);
+        crate::store::validate_user_id(context.account_id).is_err()
+            || self.members.is_empty()
+            || self.members.len() > MAX_MEMBERS
+            || context.processor_version <= 0
+            || context.total_attempt_cap <= 0
+            || context.reserved_output_tokens <= 0
+            || context.lease_seconds <= 0
+            || !(1..=MAX_SCAN_LIMIT).contains(&context.scan_limit)
+            || usize::try_from(context.scan_limit)
+                .map_or(true, |limit| self.members.len() > limit)
+            || self.work_unit_id.is_empty()
+            || self.work_unit_id.len() > MAX_ID_BYTES
+            || self.usage_json.is_empty()
+            || self.usage_json.len() > MAX_JSON_BYTES
+            || context.claimed_at.is_empty()
+            || context.claimed_at.len() > MAX_TIMESTAMP_BYTES
+            || context.committed_at.is_empty()
+            || context.committed_at.len() > MAX_TIMESTAMP_BYTES
+            // This PLAN-wide clock inversion has priority over every member
+            // timestamp. Otherwise a healthy `updated_at` between the two
+            // clock samples would be blamed on the job for the enclave clock
+            // moving backwards.
+            || context.claimed_at > context.committed_at
+            || self.members.iter().any(|member| {
+                member.job_kind != job_kind
+                    || member.processor_version != context.processor_version
+            })
+            || self.members.iter().enumerate().any(|(index, member)| {
+                member.ordinal != i64::try_from(index).unwrap_or(i64::MIN)
+                    || self
+                        .members
+                        .iter()
+                        .skip(index + 1)
+                        .any(|other| other.job_id == member.job_id)
+            })
+    }
+
+    fn duplicate_event_rows(&self) -> Vec<ClaimableRow> {
+        self.members
+            .iter()
+            .filter(|member| {
+                self.members
+                    .iter()
+                    .filter(|other| other.event_id == member.event_id)
+                    .count()
+                    > 1
+            })
+            .filter_map(|member| {
+                self.rows
+                    .iter()
+                    .find(|row| row.job_id == member.job_id)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Classify only refusals proved by durable stored evidence. The owner
+    /// calls this before consuming the observation. A `None` result is
+    /// deliberately non-charging: either the plan constructs, or the refusal
+    /// belongs to account/code/clock state rather than to a job.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::cp::media_worker) fn attributable_refusal(
+        &self,
+        account_id: &str,
+        processor_version: i64,
+        scan_limit: i64,
+        total_attempt_cap: i64,
+        lease_seconds: i64,
+        reserved_output_tokens: i64,
+        claimed_at: &str,
+        committed_at: &str,
+    ) -> Option<AttributableClaimRefusal> {
+        let context = ClaimConstructionContext {
+            account_id,
+            processor_version,
+            scan_limit,
+            total_attempt_cap,
+            lease_seconds,
+            reserved_output_tokens,
+            claimed_at,
+            committed_at,
+        };
+        if self.global_construction_refuses(&context) {
+            return None;
+        }
+        let member_rows = unplannable_members(self, processor_version, committed_at);
+        if !member_rows.is_empty() {
+            return Some(AttributableClaimRefusal {
+                kind: AttributableClaimRefusalKind::MemberCommitOrder,
+                rows: member_rows,
+                work_unit_id: None,
+                unit: None,
+                unit_expectation: None,
+                claimed_at: claimed_at.to_owned(),
+                committed_at: committed_at.to_owned(),
+            });
+        }
+        let duplicates = self.duplicate_event_rows();
+        if !duplicates.is_empty() {
+            return Some(AttributableClaimRefusal {
+                kind: AttributableClaimRefusalKind::DuplicateEventTopology,
+                rows: duplicates,
+                work_unit_id: None,
+                unit: None,
+                unit_expectation: None,
+                claimed_at: claimed_at.to_owned(),
+                committed_at: committed_at.to_owned(),
+            });
+        }
+        let unit = self.unit.as_ref()?;
+        let expected = ClaimedUnitExpectation::new(
+            self.class,
+            processor_version,
+            self.started_ms,
+            self.ended_ms,
+            reserved_output_tokens,
+        );
+        let kind = if unit.attempt_count_refuses(total_attempt_cap) {
+            AttributableClaimRefusalKind::WorkUnitAttemptCount
+        } else if unit.refusal_reason(total_attempt_cap).is_some() {
+            AttributableClaimRefusalKind::WorkUnitMalformed
+        } else if unit.created_at.as_str() > committed_at || unit.updated_at.as_str() > committed_at
+        {
+            AttributableClaimRefusalKind::WorkUnitCommitOrder
+        } else if unit.derived_mismatch(&expected) {
+            AttributableClaimRefusalKind::WorkUnitDerivedMismatch
+        } else {
+            return None;
+        };
+        Some(AttributableClaimRefusal {
+            kind,
+            rows: self.member_rows().into_iter().cloned().collect(),
+            work_unit_id: Some(self.work_unit_id.clone()),
+            unit: Some(unit.clone()),
+            unit_expectation: Some(expected),
+            claimed_at: claimed_at.to_owned(),
+            committed_at: committed_at.to_owned(),
+        })
     }
 }
 
@@ -533,6 +1077,12 @@ pub(in crate::cp::media_worker) enum ClaimScan {
     AudioLaneBlocked,
     /// Nothing claimable in this class at this horizon.
     Idle,
+    /// Enumerated rows the family cannot plan, and will not be able to plan on
+    /// any later sweep. Carries the observed predecessor of each so the owner
+    /// can quarantine them without a second read — and, decisively, BEFORE any
+    /// reservation or PAID provider call, which is the only side of the call
+    /// where refusing is free.
+    Unplannable(Vec<ClaimableRow>),
     Observed(Box<ClaimObservation>),
 }
 
@@ -545,14 +1095,25 @@ pub(in crate::cp::media_worker) fn scan_for_claim(
     processor_version: i64,
     as_of: &str,
     scan_limit: i64,
+    total_attempt_cap: i64,
 ) -> Result<ClaimScan> {
+    if total_attempt_cap <= 0 {
+        // A carried code/policy invariant is global and cannot be charged to a
+        // stored row. Reject it before enumeration rather than making every
+        // non-negative attempt look like attributable poison.
+        return Err(WalIdempotencyError::Malformed);
+    }
     if matches!(class, WorkClass::Audio) && !audio_sequence_gate_open(connection) {
         return Ok(ClaimScan::AudioLaneBlocked);
     }
-    match observe_claim(connection, class, processor_version, as_of, scan_limit)? {
-        Some(observation) => Ok(ClaimScan::Observed(Box::new(observation))),
-        None => Ok(ClaimScan::Idle),
-    }
+    observe_claim(
+        connection,
+        class,
+        processor_version,
+        as_of,
+        scan_limit,
+        total_attempt_cap,
+    )
 }
 
 /// What one sweep of the claim lane did, for a caller that only needs to know
@@ -568,10 +1129,14 @@ pub(crate) enum ClaimLaneProbe {
     Idle,
     /// T24's `sqlite_sequence` gate held the audio class shut.
     AudioLaneBlocked,
-    /// Work was observed and the plan REFUSED to construct — the wedge shape.
-    /// `claim_media_work_unit` warns and returns `Idle` here, and the next
-    /// sweep re-derives the identical refusal, forever.
-    Refused(WalIdempotencyError),
+    /// Work was observed and the plan REFUSED to construct. Carries the member
+    /// jobs the refusal is attributable to, which is exactly the set
+    /// `claim_media_work_unit` quarantines; an EMPTY set is a refusal no job
+    /// may be charged for.
+    Refused(WalIdempotencyError, Vec<i64>),
+    /// The enumeration itself could not be planned — an unresolvable row, or a
+    /// head that fits no window. Carries the named job ids.
+    Unplannable(Vec<i64>),
 }
 
 /// Test-only bridge for the ingest -> claim regression tests, which have to
@@ -582,9 +1147,9 @@ pub(crate) enum ClaimLaneProbe {
 /// It composes the EXACT two production calls `media_worker::claim_media_work_unit`
 /// makes, in order and with the same arguments — `scan_for_claim` followed by
 /// `MediaWorkClaimPlan::new` — rather than reimplementing either. Anything it
-/// accepts, the production sweep accepts; anything it refuses, the production
-/// sweep refuses and then returns `ClaimOutcome::Idle` on every subsequent
-/// sweep with no attempt cap and no terminalization path.
+/// accepts, the production sweep accepts; anything it attributes, the
+/// production sweep sends to the bounded quarantine instead of collapsing the
+/// refusal into `Idle` and re-deriving it forever.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_claim_lane_for_ingest_regression(
@@ -593,6 +1158,7 @@ pub(crate) fn probe_claim_lane_for_ingest_regression(
     class: WorkClass,
     processor_version: i64,
     scan_limit: i64,
+    total_attempt_cap: i64,
     lease_seconds: i64,
     reserved_output_tokens: i64,
     claimed_at: &str,
@@ -602,27 +1168,55 @@ pub(crate) fn probe_claim_lane_for_ingest_regression(
     // member row the enumeration itself cannot resolve (an over-long
     // `updated_at`, say) wedges the lane exactly as a guard refusal does, and
     // a caller has to be able to tell the two apart.
-    let scan = match scan_for_claim(connection, class, processor_version, claimed_at, scan_limit) {
+    let scan = match scan_for_claim(
+        connection,
+        class,
+        processor_version,
+        claimed_at,
+        scan_limit,
+        total_attempt_cap,
+    ) {
         Ok(scan) => scan,
-        Err(error) => return ClaimLaneProbe::Refused(error),
+        Err(error) => return ClaimLaneProbe::Refused(error, Vec::new()),
     };
     let observation = match scan {
         ClaimScan::Observed(observation) => *observation,
         ClaimScan::Idle => return ClaimLaneProbe::Idle,
         ClaimScan::AudioLaneBlocked => return ClaimLaneProbe::AudioLaneBlocked,
+        ClaimScan::Unplannable(rows) => {
+            return ClaimLaneProbe::Unplannable(rows.iter().map(|row| row.job_id).collect())
+        }
     };
+    // Derived from the observation BEFORE it is consumed, exactly as the owner
+    // does, so the probe cannot report an attribution the production sweep
+    // would not have made.
+    let attributed = observation
+        .attributable_refusal(
+            account_id,
+            processor_version,
+            scan_limit,
+            total_attempt_cap,
+            lease_seconds,
+            reserved_output_tokens,
+            claimed_at,
+            committed_at,
+        )
+        .map_or_else(Vec::new, |refusal| {
+            refusal.rows.iter().map(|row| row.job_id).collect()
+        });
     match MediaWorkClaimPlan::new(
         account_id.to_owned(),
         observation,
         processor_version,
         scan_limit,
+        total_attempt_cap,
         lease_seconds,
         reserved_output_tokens,
         claimed_at.to_owned(),
         committed_at.to_owned(),
     ) {
         Ok(_) => ClaimLaneProbe::Constructed,
-        Err(error) => ClaimLaneProbe::Refused(error),
+        Err(error) => ClaimLaneProbe::Refused(error, attributed),
     }
 }
 
@@ -632,7 +1226,8 @@ pub(in crate::cp::media_worker) fn observe_claim(
     processor_version: i64,
     as_of: &str,
     scan_limit: i64,
-) -> Result<Option<ClaimObservation>> {
+    total_attempt_cap: i64,
+) -> Result<ClaimScan> {
     let rows = enumerate_claimable(
         connection,
         processor_version,
@@ -641,8 +1236,10 @@ pub(in crate::cp::media_worker) fn observe_claim(
         scan_limit,
     )
     .map_err(|_| WalIdempotencyError::Unavailable)?;
-    let Some(resolved) = resolve_claim(&rows)? else {
-        return Ok(None);
+    let resolved = match resolve_claim(&rows, total_attempt_cap)? {
+        ClaimResolution::Resolved(resolved) => *resolved,
+        ClaimResolution::Empty => return Ok(ClaimScan::Idle),
+        ClaimResolution::Unplannable(rows) => return Ok(ClaimScan::Unplannable(rows)),
     };
     let work_unit_id = work_unit_id(
         class,
@@ -661,7 +1258,7 @@ pub(in crate::cp::media_worker) fn observe_claim(
         reservation_retained,
         processor_version,
     );
-    Ok(Some(ClaimObservation {
+    Ok(ClaimScan::Observed(Box::new(ClaimObservation {
         members: resolved.members,
         rows,
         work_unit_id,
@@ -671,7 +1268,7 @@ pub(in crate::cp::media_worker) fn observe_claim(
         unit,
         reservation_retained,
         usage_json,
-    }))
+    })))
 }
 
 /// The exact legacy predicate (`lease_work_unit`): a retained reservation is
@@ -719,6 +1316,7 @@ pub(crate) struct MediaWorkClaimPlan {
     job_kind: String,
     processor_version: i64,
     scan_limit: i64,
+    total_attempt_cap: i64,
     lease_seconds: i64,
     reserved_output_tokens: i64,
     claimed_at: String,
@@ -733,22 +1331,39 @@ pub(crate) struct MediaWorkClaimPlan {
 
 impl MediaWorkClaimPlan {
     /// Construct from ONE routed observation. Every deterministic refusal here
-    /// is `Malformed`/`Limit` and happens before anything durable moves: the
-    /// caller warns and returns, and the next 30-second sweep re-derives from
-    /// scratch. A refusal is a bug signal, never a work outcome — terminalizing
-    /// on one would convert a code defect into permanent data loss.
+    /// is `Malformed`/`Limit` and happens before the claim moves anything. The
+    /// owner attributes only the guard's member-local half and sends those
+    /// exact rows to the bounded quarantine; plan-level defects remain a
+    /// counted no-op, because charging a job for an unattributable refusal
+    /// would convert a code defect into permanent data loss.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::cp::media_worker) fn new(
         account_id: String,
         observation: ClaimObservation,
         processor_version: i64,
         scan_limit: i64,
+        total_attempt_cap: i64,
         lease_seconds: i64,
         reserved_output_tokens: i64,
         claimed_at: String,
         committed_at: String,
     ) -> Result<Self> {
-        crate::store::validate_user_id(&account_id).map_err(|_| WalIdempotencyError::Malformed)?;
+        if observation.members.len() > MAX_MEMBERS {
+            return Err(WalIdempotencyError::Limit);
+        }
+        let context = ClaimConstructionContext {
+            account_id: &account_id,
+            processor_version,
+            scan_limit,
+            total_attempt_cap,
+            lease_seconds,
+            reserved_output_tokens,
+            claimed_at: &claimed_at,
+            committed_at: &committed_at,
+        };
+        if observation.global_construction_refuses(&context) {
+            return Err(WalIdempotencyError::Malformed);
+        }
         let ClaimObservation {
             members,
             rows: _,
@@ -760,34 +1375,24 @@ impl MediaWorkClaimPlan {
             reservation_retained,
             usage_json,
         } = observation;
-        if members.len() > MAX_MEMBERS {
-            // Never truncate an observed predecessor set.
-            return Err(WalIdempotencyError::Limit);
-        }
         let class_name = class_name(class).to_owned();
         let job_kind = job_kind_for(class).to_owned();
-        if members.is_empty()
-            || processor_version <= 0
-            || reserved_output_tokens <= 0
-            || lease_seconds <= 0
-            || !(1..=MAX_SCAN_LIMIT).contains(&scan_limit)
-            || members.len()
-                > usize::try_from(scan_limit).map_err(|_| WalIdempotencyError::Limit)?
-            || work_unit_id.is_empty()
-            || work_unit_id.len() > MAX_ID_BYTES
-            || usage_json.is_empty()
-            || usage_json.len() > MAX_JSON_BYTES
-            || claimed_at.is_empty()
-            || claimed_at.len() > MAX_TIMESTAMP_BYTES
-            || committed_at.is_empty()
-            || committed_at.len() > MAX_TIMESTAMP_BYTES
+        let unit_expectation = ClaimedUnitExpectation::new(
+            class,
+            processor_version,
+            started_ms,
+            ended_ms,
+            reserved_output_tokens,
+        );
+        // The attributable per-member guards, including #331's own
+        // `latest_observed_timestamp` comparison, run through the SAME
+        // `construction_refusal` the owner's structured classifier walks. The
+        // guard is unchanged in strength; only its refusal is now nameable.
+        if let Some(error) = members
+            .iter()
+            .find_map(|member| member.construction_refusal(&committed_at))
         {
-            return Err(WalIdempotencyError::Malformed);
-        }
-        if members.iter().any(|member| {
-            member.job_kind != job_kind || member.processor_version != processor_version
-        }) {
-            return Err(WalIdempotencyError::Malformed);
+            return Err(error);
         }
         // Ordinal order is `plan_first`'s, keyed on (started_ms, sequence,
         // job_id) — NOT ascending job_id. Strict uniqueness is what the CAS
@@ -803,17 +1408,24 @@ impl MediaWorkClaimPlan {
             }
         }
         if let Some(unit) = unit.as_ref() {
-            unit.validate()?;
+            unit.validate(total_attempt_cap)?;
         }
         // A plan whose commit stamp precedes an observed fact is refused at
-        // construction, not at apply.
-        if claimed_at > committed_at
-            || members
-                .iter()
-                .any(|member| member.latest_observed_timestamp() > committed_at.as_str())
-            || unit.as_ref().is_some_and(|unit| {
-                unit.created_at > committed_at || unit.updated_at > committed_at
-            })
+        // construction, not at apply. The MEMBER half of this comparison moved
+        // into `construction_refusal` above so it can be attributed; the two
+        // facts left here belong to the plan as a whole and to the observed
+        // work-unit row. The latter is exact durable evidence and is classified
+        // by `attributable_refusal`; a global inversion was already rejected
+        // before member or unit attribution.
+        if unit
+            .as_ref()
+            .is_some_and(|unit| unit.created_at > committed_at || unit.updated_at > committed_at)
+        {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        if unit
+            .as_ref()
+            .is_some_and(|unit| unit.derived_mismatch(&unit_expectation))
         {
             return Err(WalIdempotencyError::Malformed);
         }
@@ -840,9 +1452,15 @@ impl MediaWorkClaimPlan {
         hash_field(&mut payload, work_unit_id.as_bytes())?;
         hash_field(&mut payload, class_name.as_bytes())?;
         hash_field(&mut payload, &processor_version.to_be_bytes())?;
+        hash_field(&mut payload, &total_attempt_cap.to_be_bytes())?;
         hash_field(&mut payload, &[u8::from(unit.is_some())])?;
         if let Some(unit) = unit.as_ref() {
+            hash_field(&mut payload, unit.work_class.as_bytes())?;
+            hash_field(&mut payload, &unit.processor_version.to_be_bytes())?;
             hash_field(&mut payload, unit.state.as_bytes())?;
+            hash_field(&mut payload, unit.started_at.as_bytes())?;
+            hash_field(&mut payload, unit.ended_at.as_bytes())?;
+            hash_field(&mut payload, &unit.reserved_output_tokens.to_be_bytes())?;
             hash_field(&mut payload, &unit.attempt_count.to_be_bytes())?;
             hash_field(&mut payload, &unit.reservation_retained.to_be_bytes())?;
             hash_opt(&mut payload, unit.error_code.as_deref())?;
@@ -885,6 +1503,7 @@ impl MediaWorkClaimPlan {
             job_kind,
             processor_version,
             scan_limit,
+            total_attempt_cap,
             lease_seconds,
             reserved_output_tokens,
             claimed_at,
@@ -931,13 +1550,19 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
         encode_string(&mut request, &self.job_kind)?;
         request.extend_from_slice(&self.processor_version.to_be_bytes());
         request.extend_from_slice(&self.scan_limit.to_be_bytes());
+        request.extend_from_slice(&self.total_attempt_cap.to_be_bytes());
         request.extend_from_slice(&self.lease_seconds.to_be_bytes());
         encode_string(&mut request, &self.claimed_at)?;
         encode_string(&mut request, &self.committed_at)?;
         encode_string(&mut request, &self.usage_json)?;
         request.push(u8::from(self.unit.is_some()));
         if let Some(unit) = self.unit.as_ref() {
+            encode_string(&mut request, &unit.work_class)?;
+            request.extend_from_slice(&unit.processor_version.to_be_bytes());
             encode_string(&mut request, &unit.state)?;
+            encode_string(&mut request, &unit.started_at)?;
+            encode_string(&mut request, &unit.ended_at)?;
+            request.extend_from_slice(&unit.reserved_output_tokens.to_be_bytes());
             request.extend_from_slice(&unit.attempt_count.to_be_bytes());
             request.extend_from_slice(&unit.reservation_retained.to_be_bytes());
             encode_opt(&mut request, unit.error_code.as_deref())?;
@@ -983,8 +1608,21 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
             self.scan_limit,
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
-        let Some(resolved) = resolve_claim(&observed)? else {
-            return Err(WalIdempotencyError::Precondition);
+        // Inside `apply()` an unplannable enumeration is NOT an owner-level
+        // quarantine signal — nothing here may soften into a skip. The plan
+        // was built over an exactly-resolved set, so anything else is a moved
+        // world (`Precondition`) or a row this transaction cannot resolve, and
+        // the latter keeps the exact refusal `resolve_claim` produced for it
+        // before this arm existed.
+        let resolved = match resolve_claim(&observed, self.total_attempt_cap)? {
+            ClaimResolution::Resolved(resolved) => *resolved,
+            ClaimResolution::Empty => return Err(WalIdempotencyError::Precondition),
+            ClaimResolution::Unplannable(rows) => {
+                return Err(rows
+                    .first()
+                    .and_then(|row| row.refusal_reason(self.total_attempt_cap))
+                    .unwrap_or(WalIdempotencyError::Precondition))
+            }
         };
         if resolved.members != self.members
             || resolved.started_ms != self.started_ms
@@ -1026,6 +1664,31 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
             return Err(WalIdempotencyError::Corrupt);
         }
         let derived_lease_until = self.derived_lease_until();
+        // Compute every increment before the first write. Construction and the
+        // transactional re-resolution already enforce `< total_attempt_cap`;
+        // checked arithmetic is the final defence if either classifier ever
+        // drifts. No Rust overflow and no SQLite INTEGER-to-REAL promotion is
+        // permitted on the claim boundary.
+        let prior_unit_attempt = self.unit.as_ref().map_or(-1, |unit| unit.attempt_count);
+        let next_unit_attempt = match self.unit.as_ref() {
+            None => 1,
+            Some(unit) => unit
+                .attempt_count
+                .checked_add(1)
+                .filter(|next| *next <= self.total_attempt_cap)
+                .ok_or(WalIdempotencyError::Corrupt)?,
+        };
+        let next_member_attempts = self
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .attempt_count
+                    .checked_add(1)
+                    .filter(|next| *next <= self.total_attempt_cap)
+                    .ok_or(WalIdempotencyError::Corrupt)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // FIRST WRITE. `created_at` and `updated_at` are bound EXPLICITLY:
         // both are declared `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
@@ -1039,11 +1702,13 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
                  (id,work_class,processor_version,state,started_at,ended_at,\
                   reserved_output_tokens,reservation_retained,attempt_count,usage_json,\
                   created_at,updated_at) \
-                 VALUES (?1,?2,?3,'processing',?4,?5,?6,?7,1,?8,?9,?9) \
+                 VALUES (?1,?2,?3,'processing',?4,?5,?6,?7,?10,?8,?9,?9) \
                  ON CONFLICT(id) DO UPDATE SET state='processing',error_code=NULL,\
                   reservation_retained=?7,\
-                  attempt_count=media_work_units.attempt_count+1,\
-                  usage_json=?8,updated_at=?9",
+                  attempt_count=?10,usage_json=?8,updated_at=?9 \
+                 WHERE typeof(media_work_units.attempt_count)='integer' \
+                   AND media_work_units.attempt_count=?11 \
+                   AND media_work_units.attempt_count<?12",
                 params![
                     self.work_unit_id,
                     self.class_name,
@@ -1054,13 +1719,16 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
                     i64::from(self.reservation_retained),
                     self.usage_json,
                     self.committed_at,
+                    next_unit_attempt,
+                    prior_unit_attempt,
+                    self.total_attempt_cap,
                 ],
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
         if changed != 1 {
             return Err(WalIdempotencyError::Corrupt);
         }
-        for member in &self.members {
+        for (member, next_attempt) in self.members.iter().zip(&next_member_attempts) {
             transaction
                 .execute(
                     "INSERT OR IGNORE INTO media_work_members \
@@ -1086,9 +1754,10 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
                      WHERE id=?5 AND event_id=?6 AND job_kind=?7 AND input_revision=?8 \
                        AND processor_version=?9 AND state=?10 AND attempt_count=?11 \
                        AND lease_until IS ?12 AND error_code IS ?13 AND usage_json IS ?14 \
-                       AND updated_at=?15",
+                       AND updated_at=?15 AND typeof(attempt_count)='integer' \
+                       AND attempt_count<?16",
                     params![
-                        member.attempt_count + 1,
+                        next_attempt,
                         derived_lease_until,
                         self.usage_json,
                         self.committed_at,
@@ -1103,6 +1772,7 @@ impl WalLogicalDomainPlan for MediaWorkClaimPlan {
                         member.error_code,
                         member.usage_json,
                         member.updated_at,
+                        self.total_attempt_cap,
                     ],
                 )
                 .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -1386,6 +2056,16 @@ fn hash_opt(hasher: &mut Sha256, value: Option<&str>) -> Result<()> {
     }
 }
 
+fn hash_opt_i64(hasher: &mut Sha256, value: Option<i64>) -> Result<()> {
+    match value {
+        None => hash_field(hasher, &[0]),
+        Some(value) => {
+            hash_field(hasher, &[1])?;
+            hash_field(hasher, &value.to_be_bytes())
+        }
+    }
+}
+
 fn encode_len(request: &mut Vec<u8>, value: usize) -> Result<()> {
     let value = u32::try_from(value).map_err(|_| WalIdempotencyError::Limit)?;
     request.extend_from_slice(&value.to_be_bytes());
@@ -1416,16 +2096,21 @@ fn encode_opt(request: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+// Visible to the sibling `quarantine` family's tests: the quarantine is the
+// bounded RESPONSE to a claim refusal, so its regressions must run against
+// the claim boundary's own schema and seed rather than a second copy that
+// could drift away from them.
+pub(in crate::cp::media_worker) mod tests {
     use super::*;
     use crate::archive_v3_wal_idempotency::{
         execute_prepared_for_owner, LogicalMutationDisposition,
     };
 
-    const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
-    const AS_OF: &str = "2026-08-21T12:00:00.000Z";
-    const COMMITTED_AT: &str = "2026-08-21T12:00:01.000Z";
-    const RESERVED_TOKENS: i64 = 2_048;
+    pub(in crate::cp::media_worker) const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
+    pub(in crate::cp::media_worker) const AS_OF: &str = "2026-08-21T12:00:00.000Z";
+    pub(in crate::cp::media_worker) const COMMITTED_AT: &str = "2026-08-21T12:00:01.000Z";
+    pub(in crate::cp::media_worker) const RESERVED_TOKENS: i64 = 2_048;
+    pub(in crate::cp::media_worker) const TOTAL_ATTEMPT_CAP: i64 = 9;
 
     /// The four tables this family writes are declared ONLY in
     /// `cp::media::init_schema` (never in `SCHEMA_SQL`), and the two
@@ -1433,7 +2118,7 @@ mod tests {
     /// `apply_binds_created_at_and_updated_at_instead_of_the_clock_default`.
     /// Copied verbatim; `media_work_units_still_declares_the_clock_defaults`
     /// fails if the source drifts away from this fixture.
-    fn install_schema(connection: &Connection) {
+    pub(in crate::cp::media_worker) fn install_schema(connection: &Connection) {
         connection
             .execute_batch(
                 "CREATE TABLE media_processing_jobs (
@@ -1511,7 +2196,7 @@ mod tests {
             .unwrap();
     }
 
-    fn seed(connection: &Connection, count: i64) {
+    pub(in crate::cp::media_worker) fn seed(connection: &Connection, count: i64) {
         for index in 0..count {
             let event_id = format!("ev-{index}");
             connection
@@ -1551,7 +2236,7 @@ mod tests {
         }
     }
 
-    fn fixture(count: i64) -> Connection {
+    pub(in crate::cp::media_worker) fn fixture(count: i64) -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         seed(&connection, count);
@@ -1559,10 +2244,23 @@ mod tests {
     }
 
     fn observe(connection: &Connection) -> ClaimObservation {
-        match scan_for_claim(connection, WorkClass::Screen, 1, AS_OF, 128).unwrap() {
+        match scan_for_claim(
+            connection,
+            WorkClass::Screen,
+            1,
+            AS_OF,
+            128,
+            TOTAL_ATTEMPT_CAP,
+        )
+        .unwrap()
+        {
             ClaimScan::Observed(observation) => *observation,
             ClaimScan::Idle => panic!("expected claimable work"),
             ClaimScan::AudioLaneBlocked => panic!("screen is never gated"),
+            ClaimScan::Unplannable(rows) => panic!(
+                "expected a plannable enumeration, got {:?} unplannable",
+                rows.iter().map(|row| row.job_id).collect::<Vec<_>>()
+            ),
         }
     }
 
@@ -1572,6 +2270,7 @@ mod tests {
             observation,
             1,
             128,
+            TOTAL_ATTEMPT_CAP,
             300,
             RESERVED_TOKENS,
             AS_OF.into(),
@@ -1787,6 +2486,74 @@ mod tests {
     }
 
     #[test]
+    fn cap_minus_one_claim_assigns_checked_integers_for_job_and_unit() {
+        let mut connection = fixture(1);
+        let initial = observe(&connection);
+        let work_unit_id = initial.work_unit_id.clone();
+        connection
+            .execute(
+                "INSERT INTO media_work_units \
+                 (id,work_class,processor_version,state,started_at,ended_at,\
+                  reserved_output_tokens,reservation_retained,attempt_count,created_at,updated_at) \
+                 VALUES (?1,'screen',1,'processing',?2,?3,?4,0,?5,?6,?6)",
+                params![
+                    work_unit_id,
+                    isotime::format_epoch_millis(initial.started_ms),
+                    isotime::format_epoch_millis(initial.ended_ms),
+                    RESERVED_TOKENS,
+                    TOTAL_ATTEMPT_CAP - 1,
+                    "2026-08-21T11:00:00.000Z",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE media_processing_jobs SET attempt_count=?1 WHERE id=1",
+                [TOTAL_ATTEMPT_CAP - 1],
+            )
+            .unwrap();
+
+        let plan = build(observe(&connection), COMMITTED_AT);
+        settle(&mut connection, plan).unwrap();
+        let (job_attempts, job_type): (i64, String) = connection
+            .query_row(
+                "SELECT attempt_count,typeof(attempt_count) \
+                 FROM media_processing_jobs WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (unit_attempts, unit_type): (i64, String) = connection
+            .query_row(
+                "SELECT attempt_count,typeof(attempt_count) FROM media_work_units WHERE id=?1",
+                [work_unit_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(job_attempts, TOTAL_ATTEMPT_CAP);
+        assert_eq!(unit_attempts, TOTAL_ATTEMPT_CAP);
+        assert_eq!(job_type, "integer");
+        assert_eq!(unit_type, "integer");
+
+        let source = include_str!("claim.rs");
+        let start = source.find("fn apply(&self").unwrap();
+        let end = source[start..]
+            .find("fn validate_replay")
+            .map(|offset| start + offset)
+            .unwrap();
+        let apply = &source[start..end];
+        assert!(!apply.contains("attempt_count+1"));
+        assert_eq!(apply.matches(".checked_add(1)").count(), 2);
+        assert_eq!(apply.matches("typeof(attempt_count)='integer'").count(), 1);
+        assert_eq!(
+            apply
+                .matches("typeof(media_work_units.attempt_count)='integer'")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn a_stale_enumeration_fails_closed_before_any_write() {
         let mut connection = fixture(2);
         let observation = observe(&connection);
@@ -1904,7 +2671,10 @@ mod tests {
             let mut row = template.clone();
             row.job_id = i64::try_from(index).unwrap() + 1;
             row.event_id = format!("ev-{index}");
-            members.push(ClaimMember::resolve(&row, i64::try_from(index).unwrap(), 0).unwrap());
+            members.push(
+                ClaimMember::resolve(&row, i64::try_from(index).unwrap(), 0, TOTAL_ATTEMPT_CAP)
+                    .unwrap(),
+            );
         }
         assert_eq!(members.len(), MAX_MEMBERS + 1);
         let observation = ClaimObservation {
@@ -1925,6 +2695,7 @@ mod tests {
                 observation,
                 1,
                 1_024,
+                TOTAL_ATTEMPT_CAP,
                 300,
                 RESERVED_TOKENS,
                 AS_OF.into(),
@@ -1943,6 +2714,7 @@ mod tests {
                 observe(&connection),
                 1,
                 128,
+                TOTAL_ATTEMPT_CAP,
                 300,
                 RESERVED_TOKENS,
                 AS_OF.into(),
@@ -2040,10 +2812,302 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                scan_for_claim(&connection, WorkClass::Audio, 1, AS_OF, 128).unwrap(),
+                scan_for_claim(
+                    &connection,
+                    WorkClass::Audio,
+                    1,
+                    AS_OF,
+                    128,
+                    TOTAL_ATTEMPT_CAP,
+                )
+                .unwrap(),
                 ClaimScan::AudioLaneBlocked
             ),
             "claimable audio work must still be refused while T24 stands"
+        );
+    }
+
+    fn unplannable_job_ids(scan: &ClaimScan) -> Vec<i64> {
+        match scan {
+            ClaimScan::Unplannable(rows) => rows.iter().map(|row| row.job_id).collect(),
+            ClaimScan::Idle => panic!("the scan reported Idle, which is the wedge shape"),
+            ClaimScan::AudioLaneBlocked => panic!("screen is never gated"),
+            ClaimScan::Observed(_) => panic!("the scan planned work it should have refused"),
+        }
+    }
+
+    /// **The amplifier, at the boundary that produced it.**
+    ///
+    /// A row the family cannot resolve is NAMED, not collapsed into a
+    /// whole-enumeration refusal and not reported as an empty queue. Before
+    /// this, `resolve_claim` propagated one row's `Malformed` out of
+    /// `observe_claim`, the owner logged a `warn!` and returned
+    /// `ClaimOutcome::Idle`, and — because `enumerate_claimable`'s `pending`
+    /// arm carries no `attempt_count` term and `plan_first` is pure — the next
+    /// sweep re-derived the identical refusal, forever, with no attempt cap and
+    /// no terminalization path.
+    ///
+    /// Both triggers below are DEVICE-supplied capture stamps that
+    /// `parse_epoch_millis` accepts and that denote a perfectly ordinary
+    /// instant. The over-long one is the live sibling of #331:
+    /// `capture_events.started_at` had no ingest length bound while
+    /// `wal::failure` and `wal::result` both refuse a `capture_started_at` over
+    /// 64 bytes, so it was claimed, PAID FOR, and then could never settle
+    /// either way.
+    ///
+    /// Falsifiability, checked by sabotage: dropping the `started_at` length
+    /// bound from `ClaimableRow::refusal_reason` makes the first case reach
+    /// `ClaimScan::Observed` and `unplannable_job_ids` panics on it.
+    #[test]
+    fn an_unresolvable_row_is_named_rather_than_wedging_the_enumeration() {
+        for (case, column, poison) in [
+            (
+                "over-long started_at",
+                "started_at",
+                "2026-08-21T11:00:00.000000000000000000000000000000000000000000000Z".to_owned(),
+            ),
+            (
+                "unparseable ended_at",
+                "ended_at",
+                "not-a-timestamp".to_owned(),
+            ),
+        ] {
+            let connection = fixture(3);
+            // Every trigger must still BE a trigger, or the fixture has
+            // silently stopped covering anything.
+            match column {
+                "started_at" => assert!(
+                    poison.len() > MAX_TIMESTAMP_BYTES
+                        && isotime::parse_epoch_millis(&poison).is_some(),
+                    "{case}: must parse AND exceed the settle families' bound"
+                ),
+                _ => assert!(
+                    isotime::parse_epoch_millis(&poison).is_none(),
+                    "{case}: must be the unparseable shape"
+                ),
+            }
+            connection
+                .execute(
+                    &format!("UPDATE capture_events SET {column}=?1 WHERE event_id='ev-1'"),
+                    params![poison],
+                )
+                .unwrap();
+
+            let scan = scan_for_claim(
+                &connection,
+                WorkClass::Screen,
+                1,
+                AS_OF,
+                128,
+                TOTAL_ATTEMPT_CAP,
+            )
+            .unwrap();
+            assert_eq!(
+                unplannable_job_ids(&scan),
+                vec![2],
+                "{case}: only the offending job may be named"
+            );
+            // ...and nothing durable moved: naming is not settling.
+            let pending: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM media_processing_jobs WHERE state='pending'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending, 3, "{case}: the scan itself writes nothing");
+        }
+    }
+
+    /// The third door into the same wedge, and it is live on `main` with no
+    /// poisoning at all: `CaptureEventManifest::validate` admits an audio event
+    /// up to EIGHT HOURS long and `validate_media` bounds only its bytes, so a
+    /// single event longer than `MAX_AUDIO_WINDOW_MS` is ingested normally and
+    /// then fits no window `plan_first` can build.
+    ///
+    /// `plan_first` returned an empty member set, `resolve_claim` turned that
+    /// into `Ok(None)`, the scan reported `Idle`, and `process_user` RETURNED —
+    /// so the event stayed `pending` forever, `pending_work_classes` kept
+    /// reporting audio pending forever, and because audio is scheduled first
+    /// the SCREEN lane never ran either.
+    ///
+    /// Falsifiability, checked by sabotage: restoring `Ok(ClaimResolution::Empty)`
+    /// for an empty plan over non-empty rows makes this reach `ClaimScan::Idle`
+    /// and `unplannable_job_ids` panics with "the wedge shape".
+    #[test]
+    fn a_head_that_fits_no_window_is_named_rather_than_reported_idle() {
+        let connection = fixture(1);
+        connection
+            .execute_batch(
+                "UPDATE media_processing_jobs SET job_kind='gemini_audio';
+                 UPDATE capture_events SET stream_kind='audio';
+                 CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+            )
+            .unwrap();
+        let (started, ended): (String, String) = connection
+            .query_row(
+                "SELECT started_at,ended_at FROM capture_events WHERE event_id='ev-0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let started_ms = isotime::parse_epoch_millis(&started).unwrap();
+        // Six minutes: over `MAX_AUDIO_WINDOW_MS`, well under the eight-hour
+        // duration ingest enforces, and under `MAX_AUDIO_BYTES`.
+        let over_window = isotime::format_epoch_millis(started_ms + 6 * 60 * 1_000);
+        assert!(
+            over_window > ended,
+            "precondition: the fixture event must be widened, not narrowed"
+        );
+        connection
+            .execute(
+                "UPDATE capture_events SET ended_at=?1 WHERE event_id='ev-0'",
+                params![over_window],
+            )
+            .unwrap();
+
+        let scan = scan_for_claim(
+            &connection,
+            WorkClass::Audio,
+            1,
+            AS_OF,
+            128,
+            TOTAL_ATTEMPT_CAP,
+        )
+        .unwrap();
+        assert_eq!(
+            unplannable_job_ids(&scan),
+            vec![1],
+            "the head that fits no window is the job to name"
+        );
+    }
+
+    /// The construction guard and the owner's attribution are the SAME
+    /// predicate, and the distinction that keeps a job from being charged for
+    /// somebody else's defect actually holds.
+    ///
+    /// Case 1 is #331's own trigger — a member whose `latest_observed_timestamp`
+    /// string-sorts above the enclave commit stamp. The guard still refuses;
+    /// what is new is that the refusal has a name, so the owner can bound it.
+    ///
+    /// Case 2 is a refusal belonging to the PLAN — `claimed_at > committed_at`,
+    /// a clock inversion. Attribution must come back EMPTY: quarantining a job
+    /// for that would burn its attempt budget for a defect it did not cause,
+    /// which is precisely the data loss a skip-ladder is supposed to prevent.
+    ///
+    /// Falsifiability, checked by sabotage: moving the `claimed_at >
+    /// committed_at` test into `ClaimMember::construction_refusal` makes case 2
+    /// attribute both jobs and the empty assertion fails; deleting the
+    /// `latest_observed_timestamp` comparison from `construction_refusal` makes
+    /// case 1 construct and both of its assertions fail.
+    #[test]
+    fn attribution_names_exactly_what_the_construction_guard_refuses() {
+        // A healthy observation attributes nothing and constructs.
+        let connection = fixture(2);
+        let healthy = observe(&connection);
+        assert!(unplannable_members(&healthy, 1, COMMITTED_AT).is_empty());
+        assert!(MediaWorkClaimPlan::new(
+            ACCOUNT.into(),
+            healthy,
+            1,
+            128,
+            TOTAL_ATTEMPT_CAP,
+            300,
+            RESERVED_TOKENS,
+            AS_OF.into(),
+            COMMITTED_AT.into(),
+        )
+        .is_ok());
+
+        // Case 1: #331's shape, on ONE of two members.
+        let connection = fixture(2);
+        let poisoned = "2026-08-21T23:00:00.000+09:00";
+        assert!(
+            poisoned > COMMITTED_AT && isotime::parse_epoch_millis(poisoned).is_some(),
+            "the trigger must string-sort above the commit stamp while parsing fine"
+        );
+        connection
+            .execute(
+                "UPDATE media_processing_jobs SET updated_at=?1 WHERE id=2",
+                params![poisoned],
+            )
+            .unwrap();
+        let observation = observe(&connection);
+        assert_eq!(
+            unplannable_members(&observation, 1, COMMITTED_AT)
+                .iter()
+                .map(|row| row.job_id)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "only the member the guard refuses on may be charged"
+        );
+        assert_eq!(
+            MediaWorkClaimPlan::new(
+                ACCOUNT.into(),
+                observation,
+                1,
+                128,
+                TOTAL_ATTEMPT_CAP,
+                300,
+                RESERVED_TOKENS,
+                AS_OF.into(),
+                COMMITTED_AT.into(),
+            )
+            .err(),
+            Some(WalIdempotencyError::Malformed),
+            "the guard itself is unchanged in strength"
+        );
+
+        // Case 2: a plan-level refusal charges nobody, even when a healthy
+        // member timestamp falls BETWEEN the two backwards clock samples.
+        let connection = fixture(2);
+        let inverted_commit = "2026-08-21T11:59:59.000Z";
+        let between = "2026-08-21T11:59:59.500Z";
+        assert!(
+            inverted_commit < between && between < AS_OF,
+            "the member stamp must sit between commit and claim horizons"
+        );
+        connection
+            .execute(
+                "UPDATE media_processing_jobs SET updated_at=?1 WHERE id=1",
+                [between],
+            )
+            .unwrap();
+        let observation = observe(&connection);
+        assert!(
+            !unplannable_members(&observation, 1, inverted_commit).is_empty(),
+            "the member-only predicate demonstrates the old misattribution"
+        );
+        assert!(
+            observation
+                .attributable_refusal(
+                    ACCOUNT,
+                    1,
+                    128,
+                    TOTAL_ATTEMPT_CAP,
+                    300,
+                    RESERVED_TOKENS,
+                    AS_OF,
+                    inverted_commit,
+                )
+                .is_none(),
+            "global clock inversion must take priority and charge nobody"
+        );
+        assert_eq!(
+            MediaWorkClaimPlan::new(
+                ACCOUNT.into(),
+                observation,
+                1,
+                128,
+                TOTAL_ATTEMPT_CAP,
+                300,
+                RESERVED_TOKENS,
+                AS_OF.into(),
+                inverted_commit.into(),
+            )
+            .err(),
+            Some(WalIdempotencyError::Malformed)
         );
     }
 }

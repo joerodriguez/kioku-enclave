@@ -62,6 +62,13 @@ const CLAIM_LEASE_SECONDS: i64 = 300;
 /// as integral seconds, carried in `MediaWorkFailurePlan` rather than read from
 /// a code constant inside `apply()`.
 const BUDGET_RETRY_SECONDS: i64 = 6 * 60 * 60;
+/// `mark_failed`'s own backoff base, carried into `MediaClaimQuarantinePlan`
+/// rather than read from a code constant inside `apply()`. A quarantined job
+/// walks the SAME ladder a failed one does — `30 * 2^min(attempts, 6)` seconds
+/// into `updated_at`, which every eligibility predicate on this lane reads as
+/// next-attempt-at — so a transient cause clears on its own and only a
+/// permanent one reaches `MAX_ATTEMPTS`.
+const QUARANTINE_RETRY_BASE_SECONDS: i64 = 30;
 const RESURRECTION_WINDOW_SECONDS_INTEGRAL: i64 = 7 * 24 * 3_600;
 /// A model-supplied `turn_id` colliding with an existing
 /// `speaker_observations(event_id,turn_id)` row can never succeed on a retry,
@@ -3112,17 +3119,179 @@ async fn resurrect_user_failed_jobs(state: &CpState, user_id: &str) {
     }
 }
 
-/// The routed claim outcome. Every non-`Claimed` variant leaves durable state
-/// untouched, so the next 30-second sweep re-derives from scratch. Nothing
-/// here terminalizes a job: a construction or submit refusal is a bug signal,
-/// not a work outcome, and burning the attempt budget on one would convert a
-/// code defect into permanent data loss.
+/// The routed claim outcome.
+///
+/// A refusal is still never a work OUTCOME — nothing here decides that the
+/// media could not be understood, and no reservation or provider call is made
+/// on any of these paths. What changed is that a refusal is no longer allowed
+/// to be a no-op: an unattributable one is counted, and an attributable one is
+/// quarantined onto the same bounded `retry_wait`/`failed_terminal` ladder
+/// `mark_failed` walks, so it stops being re-derived forever.
+///
+/// Which of those two a `Refused` was is decided inside
+/// `claim_media_work_unit` and is invisible here on purpose: the sweep's
+/// obligation is identical either way — keep going. Attribution decides only
+/// whether a job is CHARGED, and a refusal that cannot be charged to any job
+/// (a code constant, the account id, a `claimed_at`/`committed_at` inversion)
+/// charges nothing, because terminalizing a job for a defect it did not cause
+/// is the permanent data loss this design exists to avoid.
 enum ClaimOutcome {
     Claimed(Box<MediaWorkUnit>),
     /// T24 (R1): the audio lane is gated off; move on to the next class.
     AudioLaneBlocked,
-    /// Nothing claimable, or a refusal that must not wedge the loop.
+    /// A deterministic refusal. Durable state may have moved (a quarantine),
+    /// but no work unit was claimed. The sweep MUST continue to the next class
+    /// rather than return — one poisoned audio job starving the screen lane is
+    /// half of what made this failure catastrophic.
+    Refused,
+    /// Nothing claimable at this horizon.
     Idle,
+}
+
+enum ClaimQuarantineEvidence {
+    Rows {
+        claimed_at: String,
+        rows: Vec<wal::claim::ClaimableRow>,
+    },
+    Attributable(Box<wal::claim::AttributableClaimRefusal>),
+}
+
+/// Settle a deterministic claim refusal onto the bounded ladder.
+///
+/// This is the amplifier fix. `MediaWorkClaimPlan::new`'s guard is untouched
+/// and nothing is admitted; what is bounded is the RESPONSE — one sealed plan
+/// advances `attempt_count` on exactly the named jobs and parks them in
+/// `retry_wait` behind a future next-attempt stamp, or terminalizes them once
+/// the ladder is exhausted. The job leaves the eligible set either way, so the
+/// next sweep plans the REST of the lane instead of re-deriving the identical
+/// refusal.
+///
+/// It writes a durable, user-visible fact rather than only a log line:
+/// `media_processing_jobs.error_code='claim_unplannable'` with an advanced
+/// `attempt_count` is what `GET /api/v2/capture/events/{event_id}` already
+/// returns, and `media_objects.processing_state` moving to
+/// `retry_wait`/`failed` is what the capture-session status counts and turns
+/// into `needs_attention`.
+///
+/// A refusal to settle is itself only a warn — but it is a warn about a
+/// bounded, attributed condition, and the next sweep re-derives the identical
+/// quarantine rather than the identical wedge.
+async fn quarantine_unplannable_jobs(
+    state: &CpState,
+    user_id: &str,
+    class: WorkClass,
+    evidence: ClaimQuarantineEvidence,
+) {
+    let job_kind = wal::claim::job_kind_for(class);
+    let mut job_ids = match &evidence {
+        ClaimQuarantineEvidence::Rows { rows, .. } => {
+            rows.iter().map(|row| row.job_id).collect::<Vec<_>>()
+        }
+        ClaimQuarantineEvidence::Attributable(refusal) => refusal
+            .rows
+            .iter()
+            .map(|row| row.job_id)
+            .collect::<Vec<_>>(),
+    };
+    job_ids.sort_unstable();
+    let plan = match evidence {
+        ClaimQuarantineEvidence::Rows { claimed_at, rows } => {
+            let committed_at = now_iso();
+            let members = rows
+                .iter()
+                .map(|row| {
+                    wal::quarantine::QuarantineMember::from_claimable(
+                        row,
+                        job_kind,
+                        PROCESSOR_VERSION,
+                        RESURRECTION_TOTAL_ATTEMPT_CAP,
+                        &committed_at,
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>();
+            members.and_then(|members| {
+                wal::MediaClaimQuarantinePlan::new(
+                    user_id.to_owned(),
+                    job_kind.to_owned(),
+                    PROCESSOR_VERSION,
+                    wal::quarantine::QUARANTINE_ERROR_CODE.to_owned(),
+                    MAX_ATTEMPTS,
+                    RESURRECTION_TOTAL_ATTEMPT_CAP,
+                    QUARANTINE_RETRY_BASE_SECONDS,
+                    claimed_at,
+                    committed_at,
+                    members,
+                )
+            })
+        }
+        ClaimQuarantineEvidence::Attributable(refusal) => {
+            wal::MediaClaimQuarantinePlan::from_attributable_refusal(
+                user_id.to_owned(),
+                job_kind.to_owned(),
+                PROCESSOR_VERSION,
+                wal::quarantine::QUARANTINE_ERROR_CODE.to_owned(),
+                MAX_ATTEMPTS,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
+                QUARANTINE_RETRY_BASE_SECONDS,
+                *refusal,
+            )
+        }
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(
+                user_id,
+                metric = "media_claim_quarantine_unbuildable",
+                error = ?error,
+                jobs = ?job_ids,
+                "claim quarantine plan construction failed; the lane stays live but these jobs are unbounded"
+            );
+            return;
+        }
+    };
+    let terminalizes = plan.terminalizes();
+    let prepared = match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            warn!(
+                user_id,
+                metric = "media_claim_quarantine_unbuildable",
+                error = ?error,
+                jobs = ?job_ids,
+                "claim quarantine plan preparation failed"
+            );
+            return;
+        }
+    };
+    match state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+    {
+        Ok(()) => {
+            warn!(
+                user_id,
+                metric = if terminalizes {
+                    "media_claim_quarantine_terminalized"
+                } else {
+                    "media_claim_quarantine_deferred"
+                },
+                jobs = ?job_ids,
+                terminalizes,
+                "quarantined media jobs the claim boundary cannot plan"
+            );
+        }
+        Err(error) => {
+            warn!(
+                user_id,
+                metric = "media_claim_quarantine_failed",
+                error = %error,
+                jobs = ?job_ids,
+                "claim quarantine settle failed"
+            );
+        }
+    }
 }
 
 /// ADR-0022 slice 10i: the claim boundary for a WAL-authoritative user — the
@@ -3148,8 +3317,15 @@ async fn claim_media_work_unit(
     let scan = state
         .store
         .wal_authoritative_read(user_id, move |conn| {
-            wal::claim::scan_for_claim(conn, class, PROCESSOR_VERSION, &probe_at, CLAIM_SCAN_LIMIT)
-                .map_err(|_| EnclaveError::Store("media work claim scan failed".into()))
+            wal::claim::scan_for_claim(
+                conn,
+                class,
+                PROCESSOR_VERSION,
+                &probe_at,
+                CLAIM_SCAN_LIMIT,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
+            )
+            .map_err(|_| EnclaveError::Store("media work claim scan failed".into()))
         })
         .await;
     let observation = match scan {
@@ -3162,10 +3338,36 @@ async fn claim_media_work_unit(
             );
             return ClaimOutcome::AudioLaneBlocked;
         }
+        Ok(wal::claim::ClaimScan::Unplannable(rows)) => {
+            // The enumeration itself could not be planned: a row the family
+            // cannot resolve, or a head that fits no window (an audio event
+            // longer than `MAX_AUDIO_WINDOW_MS` is admitted by ingest and is
+            // exactly this shape). Nothing about it depends on the clock, so
+            // the identical refusal returns on every sweep until the named
+            // jobs leave the eligible set.
+            quarantine_unplannable_jobs(
+                state,
+                user_id,
+                class,
+                ClaimQuarantineEvidence::Rows {
+                    claimed_at: claimed_at.to_owned(),
+                    rows,
+                },
+            )
+            .await;
+            return ClaimOutcome::Refused;
+        }
         Ok(wal::claim::ClaimScan::Idle) => return ClaimOutcome::Idle,
         Err(error) => {
-            warn!(user_id, error = %error, "media work claim scan failed");
-            return ClaimOutcome::Idle;
+            warn!(
+                user_id,
+                metric = "media_claim_scan_failed",
+                error = %error,
+                "media work claim scan failed"
+            );
+            // A scan ERROR is an I/O or store condition, not a property of any
+            // job: it is not attributable and must not charge one.
+            return ClaimOutcome::Refused;
         }
     };
     let work = MediaWorkUnit {
@@ -3181,26 +3383,70 @@ async fn claim_media_work_unit(
         WorkClass::Audio => i64::from(vertex::MAX_MEDIA_OUTPUT_TOKENS),
         WorkClass::Screen => i64::from(vertex::MAX_SCREEN_OUTPUT_TOKENS),
     };
+    let committed_at = now_iso();
+    // Derived from the observation BEFORE it is consumed, through the same
+    // structured refusal classifier the guard below mirrors. Cheap and pure,
+    // so it runs unconditionally and is read only if construction actually
+    // refuses. Global account/code/clock failures deliberately classify as
+    // `None` and therefore cannot spend a job's attempt budget.
+    let refusal = observation.attributable_refusal(
+        user_id,
+        PROCESSOR_VERSION,
+        CLAIM_SCAN_LIMIT,
+        RESURRECTION_TOTAL_ATTEMPT_CAP,
+        CLAIM_LEASE_SECONDS,
+        reserved_output_tokens,
+        claimed_at,
+        &committed_at,
+    );
     let prepared = wal::MediaWorkClaimPlan::new(
         user_id.to_owned(),
         *observation,
         PROCESSOR_VERSION,
         CLAIM_SCAN_LIMIT,
+        RESURRECTION_TOTAL_ATTEMPT_CAP,
         CLAIM_LEASE_SECONDS,
         reserved_output_tokens,
         claimed_at.to_owned(),
-        now_iso(),
+        committed_at,
     )
     .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            warn!(
-                user_id,
-                error = ?error,
-                "media work claim plan construction failed"
-            );
-            return ClaimOutcome::Idle;
+            if let Some(refusal) = refusal {
+                let jobs = refusal
+                    .rows
+                    .iter()
+                    .map(|row| row.job_id)
+                    .collect::<Vec<_>>();
+                warn!(
+                    user_id,
+                    metric = "media_claim_refused",
+                    error = ?error,
+                    jobs = ?jobs,
+                    "media work claim plan construction failed; quarantining the named jobs"
+                );
+                quarantine_unplannable_jobs(
+                    state,
+                    user_id,
+                    class,
+                    ClaimQuarantineEvidence::Attributable(Box::new(refusal)),
+                )
+                .await;
+            } else {
+                // Unattributable: the account id, a carried code constant, the
+                // derived-plan invariants, or a clock inversion. No
+                // job may be charged for it, so this stays a counted refusal —
+                // bounded only in the sense that the lane keeps moving.
+                warn!(
+                    user_id,
+                    metric = "media_claim_refused_unattributed",
+                    error = ?error,
+                    "media work claim plan construction failed with no attributable job"
+                );
+            }
+            return ClaimOutcome::Refused;
         }
     };
     match state
@@ -3210,8 +3456,15 @@ async fn claim_media_work_unit(
     {
         Ok(()) => ClaimOutcome::Claimed(Box::new(work)),
         Err(error) => {
-            warn!(user_id, error = %error, "media work claim failed");
-            ClaimOutcome::Idle
+            // A SUBMIT failure is not a property of the observed jobs — the
+            // plan was constructible — so it is counted, never charged.
+            warn!(
+                user_id,
+                metric = "media_claim_submit_failed",
+                error = %error,
+                "media work claim failed"
+            );
+            ClaimOutcome::Refused
         }
     }
 }
@@ -3294,6 +3547,11 @@ async fn process_user(state: &CpState, user_id: &str) {
                 ClaimOutcome::Claimed(work) => Some(*work),
                 // T24: skip the gated class, keep the sweep alive for screen.
                 ClaimOutcome::AudioLaneBlocked => continue,
+                // A deterministic refusal must NOT end the sweep. `audio` is
+                // scheduled first, so returning here is what let one poisoned
+                // audio job starve the screen lane as well as its own — the
+                // difference between an annoying stall and a total outage.
+                ClaimOutcome::Refused => continue,
                 ClaimOutcome::Idle => None,
             }
         } else {
@@ -6099,6 +6357,7 @@ mod tests {
             PROCESSOR_VERSION,
             claimed_at,
             CLAIM_SCAN_LIMIT,
+            RESURRECTION_TOTAL_ATTEMPT_CAP,
         )
         .unwrap()
         {
@@ -6125,6 +6384,7 @@ mod tests {
             observation,
             PROCESSOR_VERSION,
             CLAIM_SCAN_LIMIT,
+            RESURRECTION_TOTAL_ATTEMPT_CAP,
             CLAIM_LEASE_SECONDS,
             i64::from(vertex::MAX_SCREEN_OUTPUT_TOKENS),
             claimed_at.to_owned(),
@@ -6250,6 +6510,7 @@ mod tests {
                 PROCESSOR_VERSION,
                 &leased_at,
                 CLAIM_SCAN_LIMIT,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
             )
             .unwrap(),
             wal::claim::ClaimScan::Idle
@@ -6263,6 +6524,7 @@ mod tests {
                 PROCESSOR_VERSION,
                 &expired,
                 CLAIM_SCAN_LIMIT,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
             )
             .unwrap(),
             wal::claim::ClaimScan::Observed(_)
@@ -6315,6 +6577,7 @@ mod tests {
                 PROCESSOR_VERSION,
                 &leased_at,
                 CLAIM_SCAN_LIMIT,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
             )
             .unwrap(),
             wal::claim::ClaimScan::AudioLaneBlocked
@@ -6342,6 +6605,7 @@ mod tests {
                 PROCESSOR_VERSION,
                 &leased_at,
                 CLAIM_SCAN_LIMIT,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
             )
             .unwrap(),
             wal::claim::ClaimScan::Observed(_)
@@ -6455,10 +6719,45 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            source
+                .matches(concat!("MediaClaimQuarantinePlan::", "new("))
+                .count(),
+            1
+        );
 
+        // The quarantine route is the amplifier fix and gets the same
+        // structural shape as its two siblings: ONE sealed submit, and NO read
+        // at all — it settles the predecessors the claim scan already
+        // observed, so a second read could only widen what it writes past what
+        // the refusal named. It sits BEFORE the claim so the slices below stay
+        // one-function-each.
+        let quarantine_start = source
+            .find(concat!("async fn quarantine_unplannable_", "jobs("))
+            .unwrap();
         let claim_start = source
             .find(concat!("async fn claim_media_work_", "unit("))
             .unwrap();
+        assert!(quarantine_start < claim_start);
+        let quarantine = &source[quarantine_start..claim_start];
+        assert_eq!(
+            quarantine
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            quarantine
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            0
+        );
+        assert_eq!(quarantine.matches(concat!(".with_", "user(")).count(), 0);
+        assert_eq!(quarantine.matches(concat!(".save_", "user(")).count(), 0);
+        // No provider call, no reservation: a quarantine is the opposite of a
+        // claim and must never be able to spend.
+        assert_eq!(quarantine.matches("reserve_media_output").count(), 0);
+        assert_eq!(quarantine.matches("vertex").count(), 0);
         let failure_start = source
             .find(concat!("async fn settle_media_work_", "failure("))
             .unwrap();
@@ -6524,6 +6823,15 @@ mod tests {
                 .matches(concat!("wal_authoritative_", "submit("))
                 .count(),
             0
+        );
+        assert_eq!(
+            process.matches("ClaimOutcome::Refused => continue").count(),
+            1,
+            "a routed refusal must advance to the next scheduled class"
+        );
+        assert!(
+            !process.contains("ClaimOutcome::Refused => return"),
+            "a poisoned audio claim must never starve the screen class"
         );
         // The legacy bodies never learn about the WAL lane. The ONLY
         // permitted edit anywhere in them is `lease_work_unit`'s single call

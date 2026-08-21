@@ -278,7 +278,10 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # gained the `advance_to_target_epoch` call, but neither that function nor
 # `install_wal_serving_authority` is a tracked Store target, so relaunch_one
 # owns no row here and its body hash is invisible to this inventory.
-EXPECTED_STORE_CALL_COUNT = 235
+# Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
+# 235 -> 236. The final third-state derivation against the merged gate-lift
+# baseline is recorded immediately above the digest below.
+EXPECTED_STORE_CALL_COUNT = 236
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -456,7 +459,56 @@ EXPECTED_STORE_CALL_COUNT = 235
 # moves; only the same three owner-body hashes moved, and the merged digest
 # remained 24fcfb44. This appends the final third-state provenance rather than
 # replacing the earlier derivations that explain how the pin arrived here.
-EXPECTED_STORE_CALL_SHA256 = "24fcfb447716d7a1628647c350782e7f57c437e4c4ee868059e240c8699d282c"
+#
+# Claim-lane wedge hardening, rebased onto the merged gate-lift tip 12c9077:
+# 235 -> 236. A pristine `git archive HEAD` tree was extracted under
+# `/private/tmp` outside every worktree and its own gate passed all 14 tests,
+# reproducing 12c9077's declared 235/24fcfb44 pin before this value was
+# derived. The branch inventory was then diffed key by key with each tree's
+# own scanner/classifier:
+#   * ONE addition, `quarantine_unplannable_jobs#0::
+#     wal_authoritative_submit#0`, classified B. It is the sealed mutation that
+#     advances the named refused jobs onto their bounded retry/terminal ladder.
+#   * ZERO removals and ZERO reclassifications.
+#   * ELEVEN surviving rows move only in OWNER-BODY hash, with byte-identical
+#     call-expression hashes: the two `claim_media_work_unit` routed rows (the
+#     deterministic-refusal response now invokes quarantine) and all nine
+#     `process_user` rows (the loop continues after a refusal instead of
+#     returning and starving the next class).
+#   * ZERO other moved rows; surviving-key order is unchanged.
+#
+# Post-independent-review repair was derived again from a fresh pristine
+# `git archive HEAD` of the same 12c9077 base. Its own 14-test gate again
+# reproduced 235/24fcfb44 exactly before comparison. The stable branch remains
+# the same structural delta: one B quarantine submit, zero removals, zero
+# reclassifications, zero call-expression moves, and the same eleven
+# owner-body-only moves (two claim-owner rows plus nine process-user rows).
+# The owner hashes change because claim now uses explicit durable
+# member/duplicate/unit refusal classes, prioritizes global clock inversion,
+# and carries exact immutable work-unit topology; those repairs add no Store
+# surface. The key-by-key merged digest is therefore the third-state value
+# below, not the pre-review a6fd6940 value above.
+#
+# Final attempt-cap/INTEGER-safety repair was re-derived once more against the
+# same untouched 12c9077 archive. Its 14-test gate still reproduced
+# 235/24fcfb44 exactly. The branch remains 236 rows: the same one B quarantine
+# submit, zero removals and zero reclassifications. The surviving owner-body
+# inventory also remains exactly eleven rows (two claim-owner rows and all
+# nine process-user rows). Ten keep byte-identical call expressions; only
+# `claim_media_work_unit#0::wal_authoritative_read#0` moves both hashes because
+# the scan now receives the carried total-attempt cap. No owner moved and no
+# Store surface changed beyond that explicitly accounted expression update.
+#
+# The post-full Clippy structural repair was then derived against that same
+# untouched archive after its 14-test gate again reproduced 235/24fcfb44.
+# Boxing the large attributable-refusal enum member changes source only inside
+# the claim and quarantine owner bodies: relative to the reviewed 44c0feb1
+# branch pin, exactly the two claim rows and the one added quarantine row move
+# owner-body hash, while every call-expression hash, structural key and class
+# remains byte-identical. The construction-context refactor lives outside a
+# tracked Store owner. The resulting inventory is still 236 rows with the same
+# one B addition, zero removals and zero reclassifications.
+EXPECTED_STORE_CALL_SHA256 = "3fbe72eafbf2236494f9b960d40366c8431f5fee9b7c331ed679eea47c90b89b"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1318,6 +1370,7 @@ B_OWNERS = frozenset(
         "src/cp/finalizer.rs::defer_finalization_for_budget#0",
         "src/cp/media.rs::load_or_create_media_dek#0",
         "src/cp/media_worker.rs::claim_media_work_unit#0",
+        "src/cp/media_worker.rs::quarantine_unplannable_jobs#0",
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::settle_media_work_failure#0",

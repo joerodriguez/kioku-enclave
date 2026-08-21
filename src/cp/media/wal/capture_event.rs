@@ -1780,6 +1780,7 @@ mod tests {
                 WorkClass::Screen,
                 1,
                 128,
+                9,
                 600,
                 2_048,
                 CLAIMED_AT,
