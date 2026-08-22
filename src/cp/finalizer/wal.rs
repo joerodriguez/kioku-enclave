@@ -390,10 +390,12 @@ impl FinalizationPushDelivery {
         handoff_handle: String,
         collapse_id: String,
     ) -> Result<Self> {
-        // Installation ids come from the Control push registry, which admits
-        // uppercase UUIDs; refusing them failed every finalization for an
-        // affected user while legacy inserted the same row verbatim.
-        validate_uuid_any_case(&installation_id)?;
+        // The existing TEXT column now carries a versioned, exact Control
+        // token-generation binding. This is the Genesis-safe activation
+        // boundary: a legacy bare UUID can never be mistaken for an eligible
+        // post-activation destination.
+        super::super::push::PushInstallationBinding::parse(&installation_id)
+            .ok_or(WalIdempotencyError::Malformed)?;
         validate_uuid(&delivery_id)?;
         validate_uuid(&collapse_id)?;
         if handoff_handle.len() != 43
@@ -2256,7 +2258,7 @@ mod tests {
 
     const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
     const SUBSCRIPTION: &str = "22222222-2222-4222-8222-222222222222";
-    const INSTALLATION: &str = "33333333-3333-4333-8333-333333333333";
+    const INSTALLATION: &str = "p1:33333333-3333-4333-8333-333333333333:7";
     const PUSH_DELIVERY: &str = "44444444-4444-4444-8444-444444444444";
     const COLLAPSE: &str = "55555555-5555-4555-8555-555555555555";
     const EVENT_ONE: &str = "vtx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2658,8 +2660,8 @@ mod tests {
     fn review_fixes_hold_for_uuid_case_elision_scale_and_probe_classes() {
         // RC5: Control-registry installation ids may be uppercase.
         assert!(FinalizationPushDelivery::new(
-            "11111111-1111-4111-8111-11111111111A".into(),
-            INSTALLATION.into(),
+            "p1:11111111-1111-4111-8111-11111111111A:7".into(),
+            PUSH_DELIVERY.into(),
             HANDOFF.into(),
             COLLAPSE.into(),
         )

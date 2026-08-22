@@ -13,7 +13,7 @@ EVIDENCE_DIR=""
 CONFIG_FILE=""
 REPOSITORY=""
 DEPLOYMENT_REPO_PATH="${DEPLOYMENT_REPO_PATH:-}"
-LOCAL_ROLL_SCRIPT="${LOCAL_ROLL_SCRIPT:-scripts/local-operations.sh}"
+LOCAL_ROLL_SCRIPT="scripts/local-operations.sh"
 RELEASE_SIGNER_FINGERPRINT="${RELEASE_SIGNER_FINGERPRINT:-}"
 EVIDENCE_PUBLIC_KEY="${LOCAL_BUILD_EVIDENCE_PUBLIC_KEY:-}"
 EVIDENCE_PUBLIC_KEY_SHA256="${LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256:-}"
@@ -22,6 +22,7 @@ COORDINATOR_RECEIPT=""
 COORDINATOR_SIGNATURE=""
 COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
 COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
+PUSH_DEPLOYMENT_SOURCE_SEAL=""
 
 usage() {
   cat <<'EOF'
@@ -34,7 +35,6 @@ Options:
   --apply                     Push the already-signed tag and publish the release.
   --roll                      After publication, invoke the local deployment roll script.
   --deployment-repo PATH      Checked-out Kioku deployment repository (required by --roll).
-  --roll-script PATH          Path relative to deployment repo (default scripts/local-operations.sh).
   --frozen-commit SHA          Build a detached frozen commit approved by a signed coordinator receipt.
   --coordinator-advancement-receipt PATH
                               Signed receipt for --frozen-commit (not a skip/force flag).
@@ -64,7 +64,6 @@ while [[ $# -gt 0 ]]; do
     --apply) APPLY=true; shift ;;
     --roll) ROLL=true; shift ;;
     --deployment-repo) DEPLOYMENT_REPO_PATH="${2:-}"; shift 2 ;;
-    --roll-script) LOCAL_ROLL_SCRIPT="${2:-}"; shift 2 ;;
     --frozen-commit) FROZEN_COMMIT="${2:-}"; shift 2 ;;
     --coordinator-advancement-receipt) COORDINATOR_RECEIPT="${2:-}"; shift 2 ;;
     --coordinator-advancement-signature) COORDINATOR_SIGNATURE="${2:-}"; shift 2 ;;
@@ -151,6 +150,25 @@ if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
     || die "active archive-v3 WAL images cannot roll: tag is not an exact archive-v3-wal release tag"
   [[ "${KIOKU_CONFIRM_ARCHIVE_V3_ROLL:-}" == "$TAG" ]] \
     || die "active archive-v3 WAL images cannot roll without KIOKU_CONFIRM_ARCHIVE_V3_ROLL naming the exact tag"
+fi
+
+if [[ "$ROLL" == true ]]; then
+  # APNs pacing and circuit state are process-local. Production therefore
+  # supports push only from the exact reviewed deployment commit and complete
+  # Terraform root-source seal. Discard the caller's path after one strict
+  # realpath check so neither a symlinked ancestor nor an escaping/symlinked
+  # rollout script can redirect the final invocation. Bind the source and exact
+  # tracked executable before origin refresh, publication, registry access, or
+  # rollout mutation; the same token is recomputed at the final boundary below.
+  DEPLOYMENT_REPO_PATH="$(
+    python3 scripts/verify_push_runtime_topology.py --canonical-path \
+      "$DEPLOYMENT_REPO_PATH"
+  )" || die "deployment repository path must be canonical and symlink-free"
+  PUSH_DEPLOYMENT_SOURCE_SEAL="$(
+    python3 scripts/verify_push_runtime_topology.py "$DEPLOYMENT_REPO_PATH"
+  )" || die "push-capable rollout requires the reviewed single-runtime deployment source"
+  [[ -n "$PUSH_DEPLOYMENT_SOURCE_SEAL" ]] \
+    || die "push deployment source verifier returned no seal"
 fi
 
 # Keep the active-image rollout quarantine entirely local. It runs before the
@@ -349,7 +367,13 @@ PY
 if [[ "$ROLL" == true ]]; then
   ROLL_PATH="${DEPLOYMENT_REPO_PATH}/${LOCAL_ROLL_SCRIPT}"
   [[ -f "$ROLL_PATH" && -x "$ROLL_PATH" ]] || die "configured local roll script is not executable: $ROLL_PATH"
-  "$ROLL_PATH" enclave-roll --release-tag "$TAG" --image-uri "$DIGEST_URI" --digest "$DIGEST" --confirm "ROLL ENCLAVE $DIGEST" --apply
+  FINAL_PUSH_DEPLOYMENT_SOURCE_SEAL="$(
+    python3 scripts/verify_push_runtime_topology.py "$DEPLOYMENT_REPO_PATH"
+  )" || die "push deployment source changed before rollout"
+  [[ "$FINAL_PUSH_DEPLOYMENT_SOURCE_SEAL" == "$PUSH_DEPLOYMENT_SOURCE_SEAL" ]] \
+    || die "push deployment source seal changed after release preflight"
+  KIOKU_PUSH_RUNTIME_SOURCE_SEAL="$PUSH_DEPLOYMENT_SOURCE_SEAL" \
+    "$ROLL_PATH" enclave-roll --release-tag "$TAG" --image-uri "$DIGEST_URI" --digest "$DIGEST" --confirm "ROLL ENCLAVE $DIGEST" --apply
 fi
 
 echo "Published ${TAG} for ${DIGEST_URI}."

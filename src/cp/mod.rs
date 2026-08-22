@@ -951,23 +951,19 @@ mod tests {
     #[test]
     fn the_worker_gate_is_inert_until_the_user_is_selected_then_counts_one_skip() {
         let state = state();
+        let domain = wal_domain::MEDIA_WORKER_VOICE_EMBEDDING;
         let (captured, guard) = capture_events();
         assert!(
-            !state.wal_domain_skipped("unselected-user", wal_domain::PUSH_OUTBOX),
+            !state.wal_domain_skipped("unselected-user", domain),
             "an unselected user keeps the legacy path"
         );
         assert_eq!(captured.total_skips(), 0, "{}", captured.text());
 
         select_wal_authoritative(&state.store, "selected-user");
-        assert!(state.wal_domain_skipped("selected-user", wal_domain::PUSH_OUTBOX));
+        assert!(state.wal_domain_skipped("selected-user", domain));
         drop(guard);
 
-        assert_eq!(
-            captured.skips(wal_domain::PUSH_OUTBOX),
-            1,
-            "{}",
-            captured.text()
-        );
+        assert_eq!(captured.skips(domain), 1, "{}", captured.text());
         assert_eq!(captured.total_skips(), 1, "{}", captured.text());
         assert!(
             captured.text().contains(r#""user_id":"selected-user""#),

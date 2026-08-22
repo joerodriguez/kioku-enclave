@@ -2159,6 +2159,180 @@ async fn finalize_commit_settled(
     Ok(delivery_count)
 }
 
+/// Build a routed-owner fixture through the same generation-bound sealed
+/// finalization plan the active selected finalizer uses.
+#[cfg(test)]
+pub(in crate::cp) async fn enqueue_push_delivery_for_activation_test(
+    state: &CpState,
+    user_id: &str,
+    installation_id: &str,
+    delivery_id: &str,
+    handoff_handle: &str,
+    collapse_id: &str,
+) -> Result<i64> {
+    finalize_push_activation_fixture(
+        state,
+        user_id,
+        installation_id,
+        delivery_id,
+        handoff_handle,
+        collapse_id,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_push_activation_fixture(
+    state: &CpState,
+    user_id: &str,
+    installation_id: &str,
+    delivery_id: &str,
+    handoff_handle: &str,
+    collapse_id: &str,
+) -> Result<i64> {
+    let (window_seq, sequence_pin) = state
+        .store
+        .wal_authoritative_read(user_id, |conn| {
+            let progress_table_exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+                 AND name='archive_v3_wal_episode_window_progress'",
+                [],
+                |row| row.get(0),
+            )?;
+            let window_seq = if progress_table_exists == 0 {
+                0
+            } else {
+                conn.query_row(
+                    "SELECT window_seq FROM archive_v3_wal_episode_window_progress \
+                     WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?
+            };
+            let sequence_pin = conn
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='episodes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            Ok((window_seq, sequence_pin))
+        })
+        .await?;
+
+    let committed_at = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let from_iso = isotime::add_seconds(&committed_at, -120.0);
+    let to_iso = isotime::add_seconds(&committed_at, -60.0);
+    let episode = super::summarizer::wal::window::WindowEpisode::insert(
+        super::summarizer::wal::window::WindowEpisodeTarget {
+            started_at: from_iso.clone(),
+            ended_at: to_iso.clone(),
+            episode_type: Some("test".into()),
+            title: "Push delivery activation fixture".into(),
+            summary: Some("A finalized episode with one APNs delivery.".into()),
+            participants_json: Some("[]".into()),
+            languages_json: Some("[]".into()),
+            action_items_json: Some("[]".into()),
+            model: Some("gate-fixture".into()),
+            minutes_json: Some("[]".into()),
+            minutes_text: Some(String::new()),
+            substance: "normal".into(),
+            visual_evidence: "none".into(),
+            member_utterance_ids: Vec::new(),
+            member_screenshot_ids: Vec::new(),
+        },
+    )
+    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    let window = super::summarizer::wal::EpisodeWindowUpsertPlan::new(
+        user_id.to_owned(),
+        window_seq,
+        from_iso,
+        to_iso.clone(),
+        to_iso,
+        sequence_pin,
+        committed_at,
+        vec![episode],
+    )
+    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, window)
+        .await?;
+    let episode_id = sequence_pin
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("push gate episode id overflow".into()))?;
+
+    set_finalization_status(state, user_id, episode_id, "processing", None, true).await?;
+    let model_name = state.config.vertex_model.clone();
+    let vertex_event_id = super::model_usage::begin_invocation(
+        state,
+        user_id,
+        super::vertex::VertexOperation::FinalEpisodeAnalysis,
+        &model_name,
+        &[0x71; 32],
+    )
+    .await?;
+    super::model_usage::settle_response_required(
+        state,
+        user_id,
+        &vertex_event_id,
+        &super::vertex::VertexMetadata {
+            usage: None,
+            model_version: Some(model_name.clone()),
+            traffic_type: None,
+        },
+    )
+    .await?;
+
+    let delivery_count = finalize_commit_settled(
+        state,
+        user_id,
+        SettledFinalizationInputs {
+            episode_id,
+            vertex_event_id,
+            input_identity_revision: 0,
+            model_name,
+            analysis_revision: "a".repeat(64),
+            title: "Push delivery activation fixture".into(),
+            summary: "A finalized episode with one APNs delivery.".into(),
+            minute_summaries_json: "[]".into(),
+            minutes_text: String::new(),
+            action_items_json: "[]".into(),
+            overview: "The finalizer enqueued one push delivery.".into(),
+            decisions_json: "[]".into(),
+            important_links_json: "[]".into(),
+            open_questions_json: "[]".into(),
+            ranked_screens: Vec::new(),
+            elided_screen_ids: Vec::new(),
+            utterance_members: Vec::new(),
+            screenshot_members: Vec::new(),
+            webhook_destinations: Vec::new(),
+            email_preference_include_content: None,
+            push_destinations: vec![(
+                super::push::PushInstallationBinding::new(installation_id, 1)?.encode(),
+                delivery_id.to_owned(),
+                handoff_handle.to_owned(),
+                collapse_id.to_owned(),
+            )],
+        },
+    )
+    .await?;
+    if delivery_count != 1 {
+        return Err(EnclaveError::Store(
+            "push activation finalization produced the wrong delivery count".into(),
+        ));
+    }
+    Ok(episode_id)
+}
+
 /// Evidence for the final brief model input. `reconcile_speakers` runs the
 /// legacy identity reconciliation (mints uuids); the WAL path passes false —
 /// identity mutations are the sanctioned exclusion and have no sealed plan.
@@ -2724,6 +2898,10 @@ async fn finalize_user_episodes_scoped(
         // The worker re-resolves each installation before sending, so a later
         // opt-out cancels its opaque row while a later opt-in receives no
         // historical notification.
+        // Genesis/no-migration activation boundary: pre-lift selected rows
+        // carry only a bare installation UUID and the owner cancels them
+        // before provider I/O. Every row created here uses the distinct p1
+        // shape and binds the exact enabled Control token generation.
         let push_destinations: Vec<(String, String, String, String)> = state
             .control
             .list_push_installations(user_id)
@@ -2731,14 +2909,19 @@ async fn finalize_user_episodes_scoped(
             .into_iter()
             .map(|installation| {
                 let random = super::tokens::random_token_hex();
-                (
-                    installation.id,
+                let binding = super::push::PushInstallationBinding::new(
+                    &installation.id,
+                    installation.token_generation,
+                )?
+                .encode();
+                Ok((
+                    binding,
                     super::tokens::new_uuid(),
                     super::tokens::pkce_s256(&random),
                     super::tokens::new_uuid(),
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // 8. Optimistic commit transaction
         let user_cloned4 = user.clone();

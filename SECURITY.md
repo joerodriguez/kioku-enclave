@@ -994,17 +994,20 @@ This codec/table is not yet route-wired, witnessed, or eligible as idempotency e
 retention and GC remain disabled until source-entity and retry-window semantics are
 implemented.
 
-**ADR-0022 inactive WAL logical-idempotency gate:** a separate fixed-domain codec accepts only
+**ADR-0022 WAL logical-idempotency gate:** a separate fixed-domain codec accepts only
 nonzero caller-stable operation IDs, version/domain-separated request fingerprints, and bounded
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly fifteen inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and admits exactly fifteen production A-domain codecs:
 capture-session finish, local canonical-capture receipt, metadata-only screen-reference batch, selected-screenshot receipt,
 caller-stable finalization queue, exact finalization commit, screen-storyboard result without person evidence,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
 webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
 cursor-bound visual-evidence backfill batch, and Vertex usage terminal outcome.
+Activation remains an explicit owner-by-owner decision. The active push owner additionally wires
+separate sealed pre-send-claim and complete-predecessor general-settlement families; the older
+definitive-acceptance-only APNs codec remains an unwired compatibility family.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -1231,7 +1234,38 @@ exact episode/installation/version/handoff/collapse binding, pending/retry attem
 timestamps, definitive 200 status, and fixed acceptance time form the fingerprint. It full-row-CASes
 only that predecessor to accepted or adopts only the identical terminal row, including the terminal
 `next_attempt_at`, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send, retry,
-mutate an installation, call Store, launch work, or acknowledge delivery. The webhook child accepts
+mutate an installation, call Store, launch work, or acknowledge delivery. The active push owner uses
+separate sealed claim and general-settlement children: before APNs it commits the complete raw
+delivery predecessor, checked attempt, and bounded owner lease, then persists a short Control fence
+binding the exact user, installation, globally monotone token generation, archive claim, and lease.
+No Control/database lock crosses provider I/O. Account deletion and installation mutation conflict
+only with that exact fence; defensive competing-owner CAS cannot close a live lease, while an
+expired crash claim replays any exact typed Control result and synthesizes ambiguity only when that
+receipt is absent. Typed Control provider and cancellation receipts plus the archive claim reconcile
+known accepted/retry/token-terminal/ambiguous/cancelled outcomes after an asymmetric save failure.
+These are recovery checks, not a distributed APNs fence. Push activation requires the checked
+deployment repository to match a reviewed commit plus the exact canonical inventory/digest of
+every Terraform root source. That pinned source defines one Confidential Space VM/container and
+the reserved addresses; release preflight requires a clean checkout, binds its seal before any
+network action, and recomputes it at the roll boundary. Any source change fails closed until the
+pin is reviewed. Only the exact tracked `scripts/local-operations.sh` may receive the seal; after
+its production-infrastructure lock is acquired, the deployment owner recomputes the same
+HEAD/clean/inventory/digest evidence before GCP credentials, plans, or apply. Both verifiers disable
+Git replacement-object resolution and reject any replacement ref before trusting repository
+identity. Horizontal or
+overlapping runtimes are forbidden until an external provider fence exists. Settlement starts from
+the complete pre-send snapshot, admits only typed cancel/defer/retry/accepted/failed/ambiguous
+transitions, and exact-rereads/full-row-CASes or adopts every immutable and nullable mutable field.
+Malformed, exhausted, bare-generation, mismatched, inactive, deleting, and 24-hour-expired rows
+settle or defer without provider spend; fixed-size raw-row commitments prevent oversized poison rows
+from pinning the lane. Pre-lift selected archives may contain bare installation UUID rows, but every
+bare row is cancellation-only; only new `p1` current-generation rows can spend, so no historical
+backlog is replayed. Provider calls are FIFO process-wide paced (and therefore production-service-wide
+only under that enforced singleton), capped per account sweep, bounded by Retry-After/backoff, with
+device-token 429s local and only provider-wide failures opening the process-local circuit,
+and emit only content-free depth, age,
+outcome, cancellation, ambiguity, circuit, and settlement telemetry. The
+webhook child accepts
 only the local settlement half of a
 definitive HTTP 2xx for an already durable outbox event. The exact `evt_` identity is fixed before
 I/O, sent as `webhook-id`, and derives the operation identity; the exact episode/subscription/version
@@ -1274,8 +1308,8 @@ capture, exact-read immutable uploads, CAS/reconcile the witness, and settle pub
 acknowledging the retained result. Cancellation after local commit and before settlement poisons
 that actor until durable reconciliation. The production codecs have no direct Store, route,
 external-launcher, worker, provider, task, runtime-policy, or acknowledgement connection, and
-introduce no detached publication. A private inactive composition owner now accepts only sealed
-prepared plans and retains the sole archive actor; it is not callable outside the WAL-owner family.
+introduce no detached publication. A private composition owner accepts only sealed prepared plans
+and retains the sole archive actor; callers reach it only through the settled WAL-owner boundary.
 
 The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
@@ -1287,8 +1321,9 @@ raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
 exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
-substance and visual-evidence backfills; these are the complete reviewed A set for this inactive
-gate. Every other semantic A operation remains disabled pending its own separately reviewed codec
+substance and visual-evidence backfills; these are the complete reviewed A set for this gate.
+Activation is still per-domain; the live push owner separately uses the sealed claim and general
+settlement families described above. Every other semantic A operation remains disabled pending its own separately reviewed codec
 and activation adapter. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
@@ -1937,7 +1972,18 @@ separated provider keys come from dedicated Secret Manager containers available 
 the enclave runtime identity; production startup fails closed if either key is missing.
 The worker uses a generic alert and a distinct per-installation opaque handoff, rechecks
 registration before send, generation-fences terminal-token responses, and never logs
-tokens, handles, payloads, provider paths, or response bodies. Apple may correlate the
+tokens, handles, payloads, provider paths, or response bodies. Selected Genesis archives may
+contain historical bare-installation rows, but those rows are cancellation-only and can never
+reach APNs; only `p1` current-generation rows can spend, and every row is cancelled before provider
+I/O after 24 hours. A complete archive claim plus a short durable Control outcome-or-cancellation
+receipt linearize the exact installation generation without holding a database lock across the
+network. Ambiguous outcomes are never resent. Bounded FIFO process-wide pacing, per-account work
+caps, and a process-local provider circuit are production-service-wide only because rollout
+preflight enforces the reviewed, clean, exact-source-sealed single VM/container/static-IP
+deployment, rechecks that seal at the roll boundary, and passes it only to the exact tracked roll
+owner for another recomputation inside the production-infrastructure lock before credentials or
+mutation. Horizontal or overlapping senders are unsupported and forbidden until a true external
+provider fence exists. Apple may correlate the
 device token, topic, generic alert, and delivery timing; Focus/device settings determine
 display and an already accepted generic alert cannot be recalled after offline sign-out.
 

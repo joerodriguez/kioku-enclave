@@ -1,20 +1,26 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 push settlement is reviewed before launcher or worker ownership"
+    reason = "the active owner uses claim/general settlement; the older definitive-200-only family remains compatibility-reviewed"
 )]
 
-//! Inactive provider-accepted APNs WAL domain.
+//! APNs WAL families.
 //!
-//! The push delivery and its UUID are durable before provider I/O, and the UUID
-//! is sent as `apns-id`. A future provider boundary may construct this plan only
-//! after a definitive APNs acceptance. This child settles exactly that local
-//! predecessor row and retains unit replay. It cannot send a notification,
-//! allocate or reschedule a delivery, rotate an installation, call Store,
-//! launch work, or acknowledge a request.
+//! `claim` durably binds the complete row before provider I/O and `settlement`
+//! applies only typed transitions from that exact snapshot and claim. The push
+//! delivery UUID is sent as `apns-id`. The retained definitive-acceptance plan
+//! remains compatibility-reviewed but is not used by the active owner. No
+//! child can send a notification, rotate an installation, call Store, or
+//! launch/acknowledge work.
 
+pub(super) mod claim;
 pub(super) mod settlement;
-pub(in crate::cp) use settlement::PushDeliveryPredecessor;
+pub(in crate::cp) use claim::{
+    load_claim_recovery, validate_live_send_authority, PushClaimRecovery, MIN_SEND_LEASE_MILLIS,
+};
+pub(in crate::cp) use claim::{load_open_claim, PushSendClaim};
+pub(crate) use claim::{PushSendClaimDisposition, PushSendClaimLedger, PushSendClaimPlan};
 pub(crate) use settlement::{PushDeliverySettlementLedger, PushDeliverySettlementPlan};
+pub(in crate::cp) use settlement::{PushDeliverySnapshot, PushSettlementKind};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;

@@ -527,6 +527,18 @@ password nor signing secret is a Docker build argument or launch metadata value.
 `ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are neither accepted
 production build arguments nor launch-policy overrides.
 
+APNs pacing and circuit state are process-local. A production roll therefore
+requires `scripts/release.sh --roll` to match a reviewed deployment commit and
+the canonical inventory/digest of every Terraform root source. The pinned source
+defines the single Confidential Space VM/container and reserved addresses; the
+checkout must be clean, and the exact seal is bound before network access and
+rechecked at the roll boundary. Release invokes only the pinned tracked
+`scripts/local-operations.sh` and passes that seal through; the deployment owner
+recomputes it after acquiring the production-infrastructure lock and before GCP
+credentials, planning, or apply. Any deployment-source change requires a reviewed
+pin update. Horizontal or overlapping enclave runtimes are forbidden until a
+separately reviewed external provider fence exists.
+
 ## Local verification and release evidence
 
 GitHub Actions is disabled. `scripts/local_image_pipeline.py` reuses the reviewed hosted

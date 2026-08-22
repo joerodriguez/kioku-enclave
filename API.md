@@ -523,9 +523,29 @@ does not replay it.
 The APNs alert is always `Kioku` / `Your memory is ready.` Its payload contains only a
 schema version and a distinct 43-character URL-safe handoff handle. It contains no
 memory ID, title, people, transcript, summary, action items, timestamps, account identity,
-URL, or credential. `POST /api/push/handoffs/resolve` authenticates the handle owner and
-returns the corresponding memory ID; missing, expired/deleted, and wrong-owner handles
+URL, or credential. Authenticated `GET /api/notifications/{handoff_handle}` resolves the
+handle to the corresponding memory ID; missing, expired/deleted, and wrong-owner handles
 are indistinguishable.
+
+For selected Genesis archives, historical bare-installation delivery rows may
+exist, but they are cancellation-only and can never reach APNs. Push delivery
+is active only for new `p1` rows bound to the current Control token generation,
+so no pre-lift notification is replayed. Each delivery expires within 24 hours and is best-effort
+at-most-once: Kioku retries only a provider response known to be a rejection,
+and never resends after a lost or otherwise ambiguous response. A handoff for a
+possibly delivered notification remains resolvable while its finalized memory
+exists. A truly absent or wrong-owner handoff returns 404; temporary selected
+archive authority failure returns 503 so clients do not mistake unavailability
+for absence.
+
+Push pacing and provider-circuit state are process-local. Production supports
+this endpoint only under the clean, release-verified deployment commit and exact
+Terraform-root source seal whose reviewed source defines one Confidential Space
+VM/container and the reserved addresses. The seal is bound before network access
+and rechecked at roll; the exact tracked deployment owner recomputes it again
+inside its production-infrastructure lock before credentials, planning, or apply.
+Horizontal or overlapping enclave runtimes are forbidden until an external
+provider send fence exists.
 
 ## People learned automatically
 

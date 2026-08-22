@@ -36,6 +36,10 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertIn("--prerelease", RELEASE)
         self.assertIn('if [[ "$ROLL" == true && "$APPLY" != true ]]', RELEASE)
         self.assertIn('enclave-roll --release-tag "$TAG" --image-uri "$DIGEST_URI" --digest "$DIGEST" --confirm "ROLL ENCLAVE $DIGEST" --apply', RELEASE)
+        self.assertIn(
+            'KIOKU_PUSH_RUNTIME_SOURCE_SEAL="$PUSH_DEPLOYMENT_SOURCE_SEAL"',
+            RELEASE,
+        )
 
     def test_tag_digest_and_sbom_are_bound_before_publication(self) -> None:
         tag = RELEASE.index("verify_tag_signer")
@@ -69,6 +73,56 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertIn('KIOKU_CONFIRM_ARCHIVE_V3_ROLL', RELEASE)
         ack = RELEASE.index('KIOKU_CONFIRM_ARCHIVE_V3_ROLL')
         self.assertLess(ack, RELEASE.index('git fetch origin main'))
+
+    def test_push_roll_binds_exact_deployment_source_before_network_and_roll(self) -> None:
+        verifier_call = "scripts/verify_push_runtime_topology.py"
+        self.assertEqual(RELEASE.count(verifier_call), 3)
+        canonical = RELEASE.index(verifier_call)
+        early = RELEASE.index(verifier_call, canonical + len(verifier_call))
+        final = RELEASE.index(verifier_call, early + len(verifier_call))
+        fetch = RELEASE.index("git fetch origin main")
+        registry = RELEASE.index("artifacts docker images describe")
+        publish = RELEASE.index('git push origin "$TAG"')
+        roll = RELEASE.index('"$ROLL_PATH" enclave-roll')
+        self.assertLess(canonical, early)
+        self.assertLess(early, fetch)
+        self.assertLess(early, registry)
+        self.assertLess(early, publish)
+        self.assertLess(final, roll)
+        self.assertIn(
+            '[[ "$FINAL_PUSH_DEPLOYMENT_SOURCE_SEAL" == "$PUSH_DEPLOYMENT_SOURCE_SEAL" ]]',
+            RELEASE[final:roll],
+        )
+        self.assertIn("--canonical-path", RELEASE[canonical:early])
+        self.assertNotIn("--roll-script", RELEASE)
+        self.assertIn('LOCAL_ROLL_SCRIPT="scripts/local-operations.sh"', RELEASE)
+        self.assertIn(
+            'ROLL_PATH="${DEPLOYMENT_REPO_PATH}/${LOCAL_ROLL_SCRIPT}"',
+            RELEASE,
+        )
+        seal_environment = RELEASE.index(
+            'KIOKU_PUSH_RUNTIME_SOURCE_SEAL="$PUSH_DEPLOYMENT_SOURCE_SEAL"'
+        )
+        self.assertLess(final, seal_environment)
+        self.assertLess(seal_environment, roll)
+        verifier = (ROOT / "scripts" / "verify_push_runtime_topology.py").read_text(
+            encoding="utf-8"
+        )
+        for evidence in (
+            "da23a487c5c4060fc579c2b0863747c1b55eff6f",
+            "8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5",
+            "infra/enclave.tf",
+            "--untracked-files=all",
+            "canonical_source_digest",
+            "root_source_inventory",
+            "canonical_repository_path",
+            "verify_roll_script",
+            "hash-object",
+            "GIT_NO_REPLACE_OBJECTS",
+            "refs/replace",
+        ):
+            self.assertIn(evidence, verifier)
+        self.assertNotIn("re.compile", verifier)
 
     def test_evidence_has_only_hashes_for_local_build_inputs(self) -> None:
         for field in ("config_sha256", "dockerfile_sha256", "cargo_lock_sha256", "release_metadata_sha256", "sbom_sha256", "scan_sha256"):
