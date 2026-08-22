@@ -174,6 +174,26 @@ pub(crate) fn selected_evidence_media_object_key(
     ))
 }
 
+/// Build the sole object key accepted for a canonical Cloud Capture asset.
+///
+/// This mirrors the capture manifest's opaque-ID grammar so a persisted
+/// `media_objects.object_key` can be re-derived from authenticated account and
+/// asset identity instead of being trusted as a provider routing capability.
+pub(crate) fn canonical_capture_media_object_key(user_id: &str, asset_id: &str) -> Result<String> {
+    validate_user_id(user_id)?;
+    let valid_asset_id = !asset_id.is_empty()
+        && asset_id.len() <= 128
+        && asset_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !valid_asset_id {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid canonical capture asset identifier".into(),
+        ));
+    }
+    Ok(format!("raw/{user_id}/{asset_id}.enc"))
+}
+
 /// GCS blob metadata we need to track between load and save.
 struct BlobMeta {
     /// GCS object `generation` at load time.  Used for `ifGenerationMatch`.
@@ -4204,6 +4224,28 @@ impl Store {
             Err(EnclaveError::NotFound) => self.legacy_media_gcs.get_object(name).await,
             Err(error) => Err(error),
         }
+    }
+
+    /// Read only the current raw-media provider. Canonical capture receipts
+    /// bind this backend and must never fall back to the legacy bucket.
+    pub(crate) async fn get_current_media(&self, name: &str) -> Result<GcsGetResponse> {
+        self.media_gcs.get_object(name).await
+    }
+
+    /// Read the exact current-provider generation sealed into a canonical
+    /// capture receipt. This is distinct from compatibility media reads, which
+    /// may intentionally fall back to the legacy bucket.
+    pub(crate) async fn get_current_media_generation(
+        &self,
+        name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse> {
+        if generation <= 0 {
+            return Err(EnclaveError::Store(
+                "canonical capture generation must be positive".into(),
+            ));
+        }
+        self.media_gcs.get_object_generation(name, generation).await
     }
 
     fn unique_media_providers(&self) -> impl Iterator<Item = &Arc<dyn GcsClient>> {
@@ -9935,6 +9977,7 @@ pub(crate) mod tests {
         fail_copy: StdMutex<VecDeque<EnclaveError>>,
         fail_copy_after_create: StdMutex<Option<EnclaveError>>,
         fail_get: StdMutex<Option<EnclaveError>>,
+        fail_exact_get: StdMutex<Option<EnclaveError>>,
         fail_put: StdMutex<Option<EnclaveError>>,
         fail_put_for_object: StdMutex<Option<(String, EnclaveError)>>,
         fail_put_after_commit: StdMutex<Option<EnclaveError>>,
@@ -9963,6 +10006,7 @@ pub(crate) mod tests {
                 fail_copy: StdMutex::new(VecDeque::new()),
                 fail_copy_after_create: StdMutex::new(None),
                 fail_get: StdMutex::new(None),
+                fail_exact_get: StdMutex::new(None),
                 fail_put: StdMutex::new(None),
                 fail_put_for_object: StdMutex::new(None),
                 fail_put_after_commit: StdMutex::new(None),
@@ -10136,6 +10180,10 @@ pub(crate) mod tests {
             *self.fail_get.lock().unwrap() = Some(error);
         }
 
+        pub(crate) fn fail_next_exact_get(&self, error: EnclaveError) {
+            *self.fail_exact_get.lock().unwrap() = Some(error);
+        }
+
         pub(crate) fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
             *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
         }
@@ -10205,6 +10253,9 @@ pub(crate) mod tests {
             generation: i64,
         ) -> crate::error::Result<GcsGetResponse> {
             *self.exact_generation_gets.lock().unwrap() += 1;
+            if let Some(error) = self.fail_exact_get.lock().unwrap().take() {
+                return Err(error);
+            }
             let mut vanish = self.vanish_generation_on_get.lock().unwrap();
             let should_vanish = vanish
                 .as_ref()

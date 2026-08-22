@@ -529,16 +529,18 @@ pub(crate) const ROUTED_READ_UNAVAILABLE_REASON: &str = "enclave_unavailable";
 ///   unreadable — it tells the caller their screenshot does not exist.
 ///   `/api/screenshot-images/{id}/content` did this.
 /// * **500**. That is a fault: it invites a bug report instead of a retry, and
-///   it makes a retryable read failure indistinguishable from the genuinely
-///   non-retryable failures (a KMS unwrap, an AEAD authentication failure) that
-///   keep 500 on purpose.
+///   it makes a retryable read failure indistinguishable from genuinely
+///   non-retryable corruption (a malformed wrapped key or an AEAD
+///   authentication failure), which keeps 500 on purpose. KMS transport and
+///   provider outages are retryable and answer 503.
 ///
 /// The one exception, stated here so it cannot be mistaken for drift: a failure
 /// arm that ALSO covers a genuinely non-retryable failure keeps its own status
 /// and says why at the call site. In this lane that is
-/// `query.rs::rest_screenshot_image_content`'s DEK-load and decrypt arms, which
-/// stay 500 because a key that will not unwrap or a blob that will not
-/// authenticate is not fixed by retrying.
+/// `query.rs::rest_screenshot_image_content`'s malformed-key and decrypt arms,
+/// which stay 500 because malformed wrapping or a blob that will not
+/// authenticate is not fixed by retrying; its KMS HTTP/attestation failures
+/// use this 503 boundary instead.
 ///
 /// `sync.rs::export` is NOT such an exception: it keeps its distinct
 /// `export_failed` reason (a client contract) but answers it at 503, because

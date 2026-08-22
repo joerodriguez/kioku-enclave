@@ -194,6 +194,25 @@ pub fn decrypt_bound_blob(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<Open
     ))
 }
 
+/// Open only the current context-bound blob format.
+///
+/// Canonical Cloud Capture objects are minted after the v2 boundary and carry
+/// an exact backend/generation receipt. Accepting either legacy AAD form for
+/// those objects would turn a copied historical ciphertext into plausible
+/// current evidence. Compatibility callers must use [`decrypt_bound_blob`]
+/// explicitly; new capture-v2 serving and lost-response adoption use this
+/// strict entry point.
+pub fn decrypt_bound_blob_v2(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
+    let encrypted = blob
+        .strip_prefix(BOUND_BLOB_V2_MAGIC)
+        .ok_or_else(|| EnclaveError::Crypto("current media blob is not context-bound v2".into()))?;
+    let aad = bound_blob_aad(context);
+    Ok(OpenedBoundBlob {
+        plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
+        requires_rewrite: false,
+    })
+}
+
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
 
 /// Abstraction over Cloud KMS so unit tests can inject a fake.
@@ -487,6 +506,24 @@ mod tests {
         let opened = decrypt_bound_blob(&dek, &legacy, context).unwrap();
         assert_eq!(opened.plaintext, b"legacy data");
         assert!(opened.requires_rewrite);
+    }
+
+    #[test]
+    fn strict_bound_blob_rejects_both_legacy_encodings() {
+        let dek = Dek::generate();
+        let context = b"media\0owner\0raw/owner/asset.enc";
+        let legacy_context = encrypt_blob_with_aad(&dek, b"legacy aad", context).unwrap();
+        let legacy_unbound = encrypt_blob(&dek, b"legacy unbound").unwrap();
+
+        assert!(decrypt_bound_blob(&dek, &legacy_context, context).is_ok());
+        assert!(decrypt_bound_blob(&dek, &legacy_unbound, context).is_ok());
+        assert!(decrypt_bound_blob_v2(&dek, &legacy_context, context).is_err());
+        assert!(decrypt_bound_blob_v2(&dek, &legacy_unbound, context).is_err());
+
+        let current = encrypt_bound_blob(&dek, b"current", context).unwrap();
+        let opened = decrypt_bound_blob_v2(&dek, &current, context).unwrap();
+        assert_eq!(opened.plaintext, b"current");
+        assert!(!opened.requires_rewrite);
     }
 
     #[test]
