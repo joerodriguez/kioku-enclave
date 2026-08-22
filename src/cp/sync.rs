@@ -186,7 +186,8 @@ async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_j
 /// separate from the HTTP route: inactive ADR-0022 shadow verification uses
 /// the same pure value and hashes a version tag before comparing it.  Bump this
 /// when a reviewed export-schema change is intentionally incompatible.
-pub(crate) const CANONICAL_LOGICAL_EXPORT_VERSION: u16 = 2;
+pub(crate) const CANONICAL_LOGICAL_EXPORT_VERSION: u16 = 3;
+const BROWSER_V2_CANONICAL_EXPORT_VERSION: u16 = 3;
 
 #[derive(Clone, Copy)]
 struct CanonicalExportTable {
@@ -247,6 +248,18 @@ const CANONICAL_EXPORT_TABLES: &[CanonicalExportTable] = &[
         table: "capture_events",
         response_order: "started_at, event_id",
         digest_order: "started_at, event_id",
+    },
+    CanonicalExportTable {
+        response_field: "browser_states_v2",
+        table: "browser_states_v2",
+        response_order: "created_at, state_key",
+        digest_order: "created_at, state_key",
+    },
+    CanonicalExportTable {
+        response_field: "browser_observations_v2",
+        table: "browser_observations_v2",
+        response_order: "observed_at, event_id",
+        digest_order: "observed_at, event_id",
     },
     CanonicalExportTable {
         response_field: "media_objects",
@@ -358,6 +371,15 @@ const CANONICAL_EXPORT_TABLES: &[CanonicalExportTable] = &[
     },
 ];
 
+fn canonical_export_tables_for_version(
+    version: u16,
+) -> impl Iterator<Item = &'static CanonicalExportTable> {
+    CANONICAL_EXPORT_TABLES.iter().filter(move |table| {
+        version >= BROWSER_V2_CANONICAL_EXPORT_VERSION
+            || !matches!(table.table, "browser_states_v2" | "browser_observations_v2")
+    })
+}
+
 const MAX_CANONICAL_EXPORT_ROWS_PER_TABLE: u64 = 2_000_000;
 const MAX_CANONICAL_EXPORT_TOTAL_ROWS: u64 = 8_000_000;
 const MAX_CANONICAL_EXPORT_COLUMNS: usize = 256;
@@ -374,7 +396,7 @@ pub(crate) fn canonical_logical_export(
     conn: &rusqlite::Connection,
 ) -> EnclaveResult<serde_json::Value> {
     let mut value = serde_json::Map::new();
-    for table in CANONICAL_EXPORT_TABLES {
+    for table in canonical_export_tables_for_version(CANONICAL_LOGICAL_EXPORT_VERSION) {
         value.insert(
             table.response_field.to_string(),
             serde_json::Value::Array(dump_optional_table(
@@ -423,7 +445,7 @@ where
     hasher.update(b"kioku.adr0022.logical-export-digest\0");
     hasher.update(version.to_be_bytes());
     let mut budget = CanonicalExportDigestBudget::default();
-    for table in CANONICAL_EXPORT_TABLES {
+    for table in canonical_export_tables_for_version(version) {
         if !guard() {
             return Err(EnclaveError::Store(
                 "canonical export digest cancelled".into(),
@@ -1179,12 +1201,91 @@ mod tests {
         GcsClient,
     };
 
+    #[test]
+    fn canonical_export_version_three_adds_browser_v2_tables_without_redefining_v2() {
+        assert_eq!(CANONICAL_LOGICAL_EXPORT_VERSION, 3);
+        let v2_tables: Vec<_> = canonical_export_tables_for_version(2)
+            .map(|table| table.table)
+            .collect();
+        let v3_tables: Vec<_> = canonical_export_tables_for_version(3)
+            .map(|table| table.table)
+            .collect();
+        assert!(!v2_tables.contains(&"browser_states_v2"));
+        assert!(!v2_tables.contains(&"browser_observations_v2"));
+        assert!(v3_tables.contains(&"browser_states_v2"));
+        assert!(v3_tables.contains(&"browser_observations_v2"));
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE browser_states_v2 (
+                 state_key TEXT PRIMARY KEY,
+                 created_at TEXT NOT NULL,
+                 tabs_json TEXT NOT NULL
+             );
+             CREATE TABLE browser_observations_v2 (
+                 event_id TEXT PRIMARY KEY,
+                 observed_at TEXT NOT NULL,
+                 state_key TEXT
+             );
+             INSERT INTO browser_states_v2 VALUES (
+                 'device-1:browser-v2:commitment',
+                 '2026-08-22T12:00:00.000Z',
+                 '[{\"url\":\"https://example.com/one\"}]'
+             );
+             INSERT INTO browser_observations_v2 VALUES (
+                 'event-1',
+                 '2026-08-22T12:00:01.000Z',
+                 'device-1:browser-v2:commitment'
+             );",
+        )
+        .unwrap();
+        let v2_before = canonical_logical_export_stream_digest_at_version(&conn, 2).unwrap();
+        let v3_before = canonical_logical_export_stream_digest_at_version(&conn, 3).unwrap();
+        assert_eq!(
+            v3_before,
+            canonical_logical_export_stream_digest(&conn).unwrap()
+        );
+
+        conn.execute(
+            "UPDATE browser_states_v2 SET tabs_json=?1 WHERE state_key=?2",
+            [
+                "[{\"url\":\"https://example.com/two\"}]",
+                "device-1:browser-v2:commitment",
+            ],
+        )
+        .unwrap();
+        let v2_after = canonical_logical_export_stream_digest_at_version(&conn, 2).unwrap();
+        let v3_after = canonical_logical_export_stream_digest_at_version(&conn, 3).unwrap();
+        assert_eq!(v2_before, v2_after);
+        assert_ne!(v3_before, v3_after);
+    }
+
     #[tokio::test]
     async fn canonical_export_helper_preserves_serialized_body_and_headers() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE utterances (id INTEGER PRIMARY KEY, text TEXT, payload BLOB);
-             INSERT INTO utterances VALUES (1, 'hello', X'010203');",
+             INSERT INTO utterances VALUES (1, 'hello', X'010203');
+             CREATE TABLE browser_states_v2 (
+                 state_key TEXT PRIMARY KEY,
+                 created_at TEXT NOT NULL,
+                 tabs_json TEXT NOT NULL
+             );
+             INSERT INTO browser_states_v2 VALUES (
+                 'device-1:browser-v2:commitment',
+                 '2026-08-22T12:00:00.000Z',
+                 '[{\"url\":\"https://example.com/private?token=opaque\"}]'
+             );
+             CREATE TABLE browser_observations_v2 (
+                 event_id TEXT PRIMARY KEY,
+                 observed_at TEXT NOT NULL,
+                 state_key TEXT
+             );
+             INSERT INTO browser_observations_v2 VALUES (
+                 'event-1',
+                 '2026-08-22T12:00:01.000Z',
+                 'device-1:browser-v2:commitment'
+             );",
         )
         .unwrap();
         let value = canonical_logical_export(&conn).unwrap();
@@ -1197,6 +1298,16 @@ mod tests {
             "capture_sessions": [],
             "capture_streams": [],
             "capture_events": [],
+            "browser_states_v2": [{
+                "state_key": "device-1:browser-v2:commitment",
+                "created_at": "2026-08-22T12:00:00.000Z",
+                "tabs_json": "[{\"url\":\"https://example.com/private?token=opaque\"}]",
+            }],
+            "browser_observations_v2": [{
+                "event_id": "event-1",
+                "observed_at": "2026-08-22T12:00:01.000Z",
+                "state_key": "device-1:browser-v2:commitment",
+            }],
             "media_objects": [],
             "speaker_observations": [],
             "people": [],

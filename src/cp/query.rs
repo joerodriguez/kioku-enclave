@@ -1513,63 +1513,7 @@ async fn rest_browser_snapshot(
     let result = s
         .store
         .wal_authoritative_read(&user.0, move |conn| {
-            let snapshot = conn
-                .query_row(
-                    "SELECT id, source_key, captured_at, browser_bundle_id, browser_name,
-                            permission_status, active_window_index, active_tab_index,
-                            reported_tab_count, truncated
-                     FROM browser_snapshots WHERE source_key=?1",
-                    [&source_key],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<i64>>(6)?,
-                            row.get::<_, Option<i64>>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)? != 0,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some(snapshot) = snapshot else {
-                return Ok(None);
-            };
-            let mut statement = conn.prepare(
-                "SELECT window_index, tab_index, title, url, url_scheme, is_active, is_loading
-                 FROM browser_tabs WHERE browser_snapshot_id=?1
-                 ORDER BY window_index, tab_index LIMIT 500",
-            )?;
-            let tabs: Vec<Value> = statement
-                .query_map([snapshot.0], |row| {
-                    Ok(json!({
-                        "window_index": row.get::<_, i64>(0)?,
-                        "tab_index": row.get::<_, i64>(1)?,
-                        "title": row.get::<_, Option<String>>(2)?,
-                        "url": row.get::<_, Option<String>>(3)?,
-                        "url_scheme": row.get::<_, Option<String>>(4)?,
-                        "is_active": row.get::<_, i64>(5)? != 0,
-                        "is_loading": row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
-                    }))
-                })?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            Ok(Some(json!({
-                "source_key": snapshot.1,
-                "captured_at": snapshot.2,
-                "browser_bundle_id": snapshot.3,
-                "browser_name": snapshot.4,
-                "permission_status": snapshot.5,
-                "active_window_index": snapshot.6,
-                "active_tab_index": snapshot.7,
-                "reported_tab_count": snapshot.8,
-                "truncated": snapshot.9,
-                "tabs": tabs,
-            })))
+            load_browser_snapshot(conn, &source_key)
         })
         .await;
     match result {
@@ -1577,6 +1521,231 @@ async fn rest_browser_snapshot(
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
         Err(e) => super::routed_read_unavailable("api.browser_snapshot", &e),
     }
+}
+
+const CAPTURE_V2_BROWSER_SOURCE_PREFIX: &str = "capture-v2-browser:";
+
+fn load_browser_snapshot(
+    conn: &Connection,
+    source_key: &str,
+) -> crate::error::Result<Option<Value>> {
+    if let Some(event_id) = source_key.strip_prefix(CAPTURE_V2_BROWSER_SOURCE_PREFIX) {
+        return load_browser_v2_snapshot(conn, source_key, event_id);
+    }
+    let snapshot = conn
+        .query_row(
+            "SELECT b.id,b.source_key,b.captured_at,b.browser_bundle_id,b.browser_name,
+                    b.permission_status,b.active_window_index,b.active_tab_index,
+                    b.reported_tab_count,b.truncated
+             FROM browser_snapshots b
+             WHERE b.source_key=?1
+               AND EXISTS (
+                   SELECT 1 FROM screenshots c
+                   JOIN episode_members m ON m.record_type='screenshot' AND m.record_id=c.id
+                   JOIN episodes e ON e.id=m.episode_id
+                   WHERE c.browser_snapshot_source_key=b.source_key
+               )",
+            [source_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT window_index,tab_index,title,url,url_scheme,is_active,is_loading
+         FROM browser_tabs WHERE browser_snapshot_id=?1
+         ORDER BY window_index,tab_index LIMIT 500",
+    )?;
+    let tabs = statement
+        .query_map([snapshot.0], |row| {
+            Ok(json!({
+                "window_index": row.get::<_, i64>(0)?,
+                "tab_index": row.get::<_, i64>(1)?,
+                "title": row.get::<_, Option<String>>(2)?,
+                "url": row.get::<_, Option<String>>(3)?,
+                "url_scheme": row.get::<_, Option<String>>(4)?,
+                "is_active": row.get::<_, i64>(5)? != 0,
+                "is_loading": row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(json!({
+        "source_key": snapshot.1,
+        "captured_at": snapshot.2,
+        "browser_bundle_id": snapshot.3,
+        "browser_name": snapshot.4,
+        "permission_status": snapshot.5,
+        "active_window_index": snapshot.6,
+        "active_tab_index": snapshot.7,
+        "reported_tab_count": snapshot.8,
+        "truncated": snapshot.9,
+        "tabs": tabs,
+    })))
+}
+
+fn load_browser_v2_snapshot(
+    conn: &Connection,
+    source_key: &str,
+    event_id: &str,
+) -> crate::error::Result<Option<Value>> {
+    if event_id.is_empty() || event_id.len() > 512 || event_id.contains('\0') {
+        return Ok(None);
+    }
+    let live_screenshot_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM screenshots c
+         WHERE c.browser_snapshot_source_key=?1
+           AND EXISTS (
+               SELECT 1 FROM episode_members m
+               JOIN episodes episode ON episode.id=m.episode_id
+               WHERE m.record_type='screenshot' AND m.record_id=c.id
+           )",
+        [source_key],
+        |row| row.get(0),
+    )?;
+    if live_screenshot_count == 0 {
+        return Ok(None);
+    }
+    if live_screenshot_count != 1 {
+        return Err(crate::error::EnclaveError::Store(
+            "browser-v2 screenshot association is ambiguous".into(),
+        ));
+    }
+    let screenshot = conn
+        .query_row(
+            "SELECT c.captured_at,c.source_key
+             FROM screenshots c
+             WHERE c.browser_snapshot_source_key=?1
+               AND EXISTS (
+                   SELECT 1 FROM episode_members m
+                   JOIN episodes episode ON episode.id=m.episode_id
+                   WHERE m.record_type='screenshot' AND m.record_id=c.id
+               )",
+            [source_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let (captured_at, screenshot_source_key) = screenshot.ok_or_else(|| {
+        crate::error::EnclaveError::Store("browser-v2 screenshot association changed".into())
+    })?;
+    let expected_screenshot_source_key = format!("cloud-v2:{event_id}");
+    if screenshot_source_key.as_deref() != Some(expected_screenshot_source_key.as_str()) {
+        return Err(crate::error::EnclaveError::Store(
+            "browser-v2 screenshot source is inconsistent".into(),
+        ));
+    }
+    let event = conn
+        .query_row(
+            "SELECT device_id,context_json,started_at,source_wall_at
+             FROM capture_events WHERE event_id=?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            crate::error::EnclaveError::Store("browser-v2 capture event is missing".into())
+        })?;
+    let observation = conn
+        .query_row(
+            "SELECT observation_id,observed_at,state_key,context_status,active_url,active_title
+             FROM browser_observations_v2 WHERE event_id=?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            crate::error::EnclaveError::Store("browser-v2 observation is missing".into())
+        })?;
+    let state_key = observation.2.as_deref().ok_or_else(|| {
+        crate::error::EnclaveError::Store("browser-v2 observation is missing state".into())
+    })?;
+    let state = conn
+        .query_row(
+            "SELECT browser_bundle_id,browser_name,permission_status,content_hash,tabs_json
+             FROM browser_states_v2 WHERE state_key=?1",
+            [state_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| crate::error::EnclaveError::Store("browser-v2 state is missing".into()))?;
+    let context: super::media::CaptureContext = serde_json::from_str(&event.1)
+        .map_err(|_| crate::error::EnclaveError::Store("browser-v2 context is corrupt".into()))?;
+    let snapshot = super::media::validate_browser_v2_persisted_evidence(
+        &context,
+        super::media::BrowserV2PersistedEvidence {
+            event_id,
+            device_id: &event.0,
+            source_wall_at: &event.3,
+            observation_id: &observation.0,
+            observed_at: &observation.1,
+            state_key: observation.2.as_deref(),
+            context_status: &observation.3,
+            active_url: observation.4.as_deref(),
+            active_title: observation.5.as_deref(),
+            browser_bundle_id: &state.0,
+            browser_name: &state.1,
+            permission_status: &state.2,
+            content_hash: &state.3,
+            tabs_json: &state.4,
+        },
+    )?;
+    if captured_at != event.2 {
+        return Err(crate::error::EnclaveError::Store(
+            "browser-v2 evidence is inconsistent".into(),
+        ));
+    }
+    Ok(Some(json!({
+        "source_key": source_key,
+        "captured_at": captured_at,
+        "observed_at": observation.1,
+        "browser_bundle_id": snapshot.browser_bundle_id,
+        "browser_name": snapshot.browser_name,
+        "permission_status": snapshot.permission_status,
+        "active_window_index": snapshot.active_window_index,
+        "active_tab_index": snapshot.active_tab_index,
+        "reported_tab_count": snapshot.reported_tab_count,
+        "truncated": snapshot.truncated,
+        "ambient_tab_collection_enabled": snapshot.ambient_tab_collection_enabled,
+        "tabs": snapshot.tabs,
+    })))
 }
 
 async fn rest_episode_finalize(
@@ -3779,6 +3948,227 @@ mod tests {
         query_test_state_with_media(Arc::clone(&gcs), Arc::clone(&gcs), gcs)
     }
 
+    #[test]
+    fn browser_v2_loader_requires_exact_evidence_and_a_live_episode_member() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE screenshots (
+                 id INTEGER PRIMARY KEY,source_key TEXT,browser_snapshot_source_key TEXT,
+                 captured_at TEXT NOT NULL
+             );
+             CREATE TABLE capture_events (
+                 event_id TEXT PRIMARY KEY,device_id TEXT NOT NULL,context_json TEXT NOT NULL,
+                 started_at TEXT NOT NULL,source_wall_at TEXT NOT NULL
+             );
+             CREATE TABLE browser_states_v2 (
+                 state_key TEXT PRIMARY KEY,browser_bundle_id TEXT NOT NULL,
+                 browser_name TEXT NOT NULL,permission_status TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,tabs_json TEXT NOT NULL,created_at TEXT NOT NULL
+             );
+             CREATE TABLE browser_observations_v2 (
+                 observation_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,
+                 observed_at TEXT NOT NULL,state_key TEXT,context_status TEXT NOT NULL,
+                 active_url TEXT,active_title TEXT,created_at TEXT NOT NULL
+             );
+             CREATE TABLE episodes (id INTEGER PRIMARY KEY);
+             CREATE TABLE episode_members (
+                 episode_id INTEGER NOT NULL,record_type TEXT NOT NULL,record_id INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        let hash = "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
+        let state_key = format!("device-1:browser-v2:{hash}");
+        let tabs = json!([
+            {
+                "window_index":1,
+                "tab_index":1,
+                "title":"Meeting",
+                "url":"https://meet.google.com/abc?authuser=0#frag",
+                "url_scheme":"https",
+                "is_active":true,
+                "is_loading":null
+            },
+            {
+                "window_index":1,
+                "tab_index":2,
+                "title":"Document",
+                "url":"https://docs.google.com/document/d/exact/edit?tab=t.0",
+                "url_scheme":"https",
+                "is_active":false,
+                "is_loading":null
+            }
+        ]);
+        let context = json!({
+            "capture_status":"stable",
+            "active_app":"Safari",
+            "primary_bundle_id":"com.apple.Safari",
+            "primary_window_id":7,
+            "window_title":"Meeting",
+            "display_id":1,
+            "active_url":"https://meet.google.com/abc?authuser=0#frag",
+            "active_url_title":"Meeting",
+            "browser_permission_status":"granted",
+            "browser_state_key":state_key,
+            "browser_snapshot":{
+                "state_key":state_key,
+                "browser_bundle_id":"com.apple.Safari",
+                "browser_name":"Safari",
+                "permission_status":"granted",
+                "active_window_index":1,
+                "active_tab_index":1,
+                "reported_tab_count":2,
+                "truncated":false,
+                "ambient_tab_collection_enabled":true,
+                "content_hash":hash,
+                "tabs":tabs
+            },
+            "visible_windows":[],
+            "visible_windows_truncated":false
+        });
+        let envelope = json!({
+            "schema_version":2,
+            "active_window_index":1,
+            "active_tab_index":1,
+            "reported_tab_count":2,
+            "truncated":false,
+            "ambient_tab_collection_enabled":true,
+            "tabs":tabs
+        });
+        conn.execute(
+            "INSERT INTO capture_events VALUES (
+             'event-1','device-1',?1,'2026-08-22T12:00:01.000Z','2026-08-22T12:00:01.000Z')",
+            [context.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO browser_states_v2 VALUES (?1,'com.apple.Safari','Safari',
+             'granted',?2,?3,'2026-08-22T12:00:00.000Z')",
+            rusqlite::params![state_key, hash, envelope.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO browser_observations_v2 VALUES (
+             'event-1','event-1','2026-08-22T12:00:01.000Z',?1,'stable',
+             'https://meet.google.com/abc?authuser=0#frag','Meeting',
+             '2026-08-22T12:00:01.000Z')",
+            [&state_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO screenshots VALUES (
+             1,'cloud-v2:event-1','capture-v2-browser:event-1','2026-08-22T12:00:01.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO episodes VALUES (1)", []).unwrap();
+        conn.execute("INSERT INTO episode_members VALUES (1,'screenshot',1)", [])
+            .unwrap();
+
+        let loaded = load_browser_snapshot(&conn, "capture-v2-browser:event-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded["ambient_tab_collection_enabled"], true);
+        assert_eq!(
+            loaded["tabs"][1]["url"],
+            "https://docs.google.com/document/d/exact/edit?tab=t.0"
+        );
+
+        conn.execute(
+            "INSERT INTO screenshots VALUES (
+             2,'cloud-v2:event-1','capture-v2-browser:event-1','2026-08-22T12:00:01.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO episode_members VALUES (1,'screenshot',2)", [])
+            .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute("DELETE FROM episode_members WHERE record_id=2", [])
+            .unwrap();
+        conn.execute("DELETE FROM screenshots WHERE id=2", [])
+            .unwrap();
+
+        let mut key_only = context;
+        key_only.as_object_mut().unwrap().remove("browser_snapshot");
+        conn.execute(
+            "UPDATE capture_events SET context_json=?1 WHERE event_id='event-1'",
+            [key_only.to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            load_browser_snapshot(&conn, "capture-v2-browser:event-1")
+                .unwrap()
+                .unwrap()["tabs"][0]["title"],
+            "Meeting",
+            "an unchanged key-only browser-v2 event reconstructs the exact persisted state"
+        );
+
+        conn.execute(
+            "UPDATE capture_events SET started_at='2026-08-22T12:00:02.000Z'
+             WHERE event_id='event-1'",
+            [],
+        )
+        .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute(
+            "UPDATE capture_events SET started_at='2026-08-22T12:00:01.000Z'
+             WHERE event_id='event-1'",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE browser_observations_v2 SET context_status='unstable'",
+            [],
+        )
+        .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute(
+            "UPDATE browser_observations_v2 SET context_status='stable'",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM browser_observations_v2", [])
+            .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute(
+            "INSERT INTO browser_observations_v2 VALUES (
+             'event-1','event-1','2026-08-22T12:00:01.000Z',?1,'stable',
+             'https://meet.google.com/abc?authuser=0#frag','Meeting',
+             '2026-08-22T12:00:01.000Z')",
+            [&state_key],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM browser_states_v2", []).unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute(
+            "INSERT INTO browser_states_v2 VALUES (?1,'com.apple.Safari','Safari',
+             'granted',?2,?3,'2026-08-22T12:00:00.000Z')",
+            rusqlite::params![state_key, hash, envelope.to_string()],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE screenshots SET source_key='cloud-v2:other-event'",
+            [],
+        )
+        .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+        conn.execute("UPDATE screenshots SET source_key='cloud-v2:event-1'", [])
+            .unwrap();
+
+        conn.execute("DELETE FROM episode_members", []).unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1")
+            .unwrap()
+            .is_none());
+        conn.execute("INSERT INTO episode_members VALUES (1,'screenshot',1)", [])
+            .unwrap();
+        conn.execute("UPDATE browser_states_v2 SET tabs_json='[]'", [])
+            .unwrap();
+        assert!(load_browser_snapshot(&conn, "capture-v2-browser:event-1").is_err());
+    }
+
     fn query_test_state_with_media(
         index_gcs: Arc<FakeGcs>,
         current_media_gcs: Arc<FakeGcs>,
@@ -4715,50 +5105,87 @@ mod tests {
             0xd9,
         ];
         let sha256 = format!("{:x}", Sha256::digest(&plaintext));
-        let manifest: super::super::media::CaptureEventManifest = serde_json::from_value(json!({
-            "schema_version": 2,
-            "event_id": "selected-screen-event",
-            "device_id": "selected-device",
-            "install_id": "selected-install",
-            "capture_session_id": "selected-session",
-            "stream_id": "selected-screen-stream",
-            "stream_kind": "mac_screen",
-            "sequence": 0,
-            "source_wall_at": "2026-08-22T10:00:00.000Z",
-            "source_monotonic_ns": 1,
-            "started_at": "2026-08-22T10:00:00.000Z",
-            "ended_at": "2026-08-22T10:00:00.001Z",
-            "timezone_id": "UTC",
-            "utc_offset_minutes": 0,
-            "clock_uncertainty_ms": 1,
-            "media": {
-                "asset_id": "selected-screen-asset",
-                "mime_type": "image/jpeg",
-                "codec": "jpeg",
-                "byte_length": plaintext.len(),
-                "sha256": sha256,
-                "width": 1,
-                "height": 1,
-                "scale": 1,
-                "orientation": "up"
-            },
-            "context": {
-                "capture_status": "stable",
-                "active_app": "Finder",
-                "primary_bundle_id": "com.apple.finder",
-                "primary_window_id": 1,
-                "window_title": "Selected fixture",
-                "display_id": 1,
-                "active_url": null,
-                "active_url_title": null,
-                "browser_permission_status": "unavailable",
-                "browser_state_key": null,
-                "browser_snapshot": null,
-                "visible_windows": [],
-                "visible_windows_truncated": false
-            }
-        }))
-        .unwrap();
+        let mut manifest: super::super::media::CaptureEventManifest =
+            serde_json::from_value(json!({
+                "schema_version": 2,
+                "event_id": "selected-screen-event",
+                "device_id": "selected-device",
+                "install_id": "selected-install",
+                "capture_session_id": "selected-session",
+                "stream_id": "selected-screen-stream",
+                "stream_kind": "mac_screen",
+                "sequence": 0,
+                "source_wall_at": "2026-08-22T10:00:00.000Z",
+                "source_monotonic_ns": 1,
+                "started_at": "2026-08-22T10:00:00.000Z",
+                "ended_at": "2026-08-22T10:00:00.001Z",
+                "timezone_id": "UTC",
+                "utc_offset_minutes": 0,
+                "clock_uncertainty_ms": 1,
+                "media": {
+                    "asset_id": "selected-screen-asset",
+                    "mime_type": "image/jpeg",
+                    "codec": "jpeg",
+                    "byte_length": plaintext.len(),
+                    "sha256": sha256,
+                    "width": 1,
+                    "height": 1,
+                    "scale": 1,
+                    "orientation": "up"
+                },
+                "context": {
+                    "capture_status": "stable",
+                    "active_app": "Safari",
+                    "primary_bundle_id": "com.apple.Safari",
+                    "primary_window_id": 1,
+                    "window_title": "Meeting",
+                    "display_id": 1,
+                    "active_url": "https://meet.google.com/abc?authuser=0#frag",
+                    "active_url_title": "Meeting",
+                    "browser_permission_status": "granted",
+                    "browser_state_key": null,
+                    "browser_snapshot": null,
+                    "visible_windows": [],
+                    "visible_windows_truncated": false
+                }
+            }))
+            .unwrap();
+        let browser_hash = "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
+        let browser_state_key = format!("selected-device:browser-v2:{browser_hash}");
+        let context = manifest.context.as_mut().unwrap();
+        context.browser_state_key = Some(browser_state_key.clone());
+        context.browser_snapshot = Some(super::super::media::BrowserSnapshot {
+            state_key: browser_state_key,
+            browser_bundle_id: "com.apple.Safari".into(),
+            browser_name: "Safari".into(),
+            permission_status: "granted".into(),
+            active_window_index: Some(1),
+            active_tab_index: Some(1),
+            reported_tab_count: 2,
+            truncated: false,
+            ambient_tab_collection_enabled: Some(true),
+            content_hash: browser_hash.into(),
+            tabs: vec![
+                super::super::media::BrowserTab {
+                    window_index: 1,
+                    tab_index: 1,
+                    title: Some("Meeting".into()),
+                    url: Some("https://meet.google.com/abc?authuser=0#frag".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: true,
+                    is_loading: None,
+                },
+                super::super::media::BrowserTab {
+                    window_index: 1,
+                    tab_index: 2,
+                    title: Some("Document".into()),
+                    url: Some("https://docs.google.com/document/d/exact/edit?tab=t.0".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: false,
+                    is_loading: None,
+                },
+            ],
+        });
         let asset_id = super::super::media::submit_selected_screen_capture_fixture(
             &archive.state,
             &archive.user_id,
@@ -4773,6 +5200,24 @@ mod tests {
         )
         .await
         .unwrap();
+        let browser_source_key = archive
+            .state
+            .store
+            .wal_authoritative_read(&archive.user_id, |conn| {
+                conn.query_row(
+                    "SELECT browser_snapshot_source_key FROM screenshots
+                     WHERE source_key='cloud-v2:selected-screen-event'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            browser_source_key.as_deref(),
+            Some("capture-v2-browser:selected-screen-event")
+        );
 
         let response = rest_screenshot_image_content(
             State(Arc::clone(&archive.state)),

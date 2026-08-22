@@ -1044,8 +1044,8 @@ preconditions, every new/duplicate row, contiguous stream acknowledgement, bound
 and its distinct 1,048,576-row/512-MiB ledger commit atomically. Missing or changed canonical evidence,
 a changed manifest under the same batch ID, cap exhaustion, late ledger failure, partial schema, and
 tamper roll back or fail closed; exact replay survives reopen. Canonical media upload remains outside
-this child behind its disabled B-domain media-DEK/provider handoff. The first local half of that
-handoff is now separately sealed: a future KMS boundary must supply one bounded canonical wrapped
+this child behind its separate B-domain media-DEK/provider handoff. The local receipt half of that
+handoff requires the active KMS boundary to supply one bounded canonical wrapped
 value together with the plaintext media DEK it represents. Before actor admission the child derives
 a keyed binding over the account and wrapped-value commitment, then retains no plaintext key. One
 `BEGIN IMMEDIATE` exact-adopts an already installed identical `wrapped_media_dek` or installs it
@@ -1055,8 +1055,8 @@ partial schema, capacity exhaustion, late readback/ledger failure, row/result/co
 reopen fail closed, roll back, or exactly replay. The receipt does not expose the wrapped value.
 This child does not itself prove a KMS wrapper/plaintext pairing, call KMS, encrypt or retain media,
 invoke a provider or Store, launch work, allocate a clock/retry/identity, or acknowledge a request;
-its production KMS producer and every upload/send/provider settlement remain absent. The canonical-capture child
-accepts only the local database receipt for a future B boundary that has already encrypted and durably
+those authorities remain in the production caller and provider boundary. The canonical-capture child
+accepts only the local database receipt for the B boundary that has already encrypted and durably
 uploaded the exact canonical media. It subtype-separates the caller-stable event ID before actor
 admission and fingerprints the account, complete normalized manifest, exact derived account-bound
 object key, and positive provider generation. It rejects any pre-existing event, stream-sequence,
@@ -1067,8 +1067,8 @@ contiguous stream acknowledgement, bounded canonical response, and distinct
 parent mismatch, collision, capacity exhaustion, or late ledger failure rolls back without consuming
 the identity; exact replay survives reopen and a later gap-filling event advances the acknowledgement.
 The child cannot allocate/load a media DEK, accept media bytes, encrypt/upload/read/delete/list provider
-objects, reserve billing, call Store, launch work, schedule a task, or acknowledge a request. The future
-B handoff that authenticates the exact provider receipt remains absent. The historical
+objects, reserve billing, call Store, launch work, schedule a task, or acknowledge a request; the
+production owner supplies and authenticates the exact provider receipt before construction. The historical
 selected-screenshot v2 child accepts only the local receipt half of an already durable
 B-domain upload attempt; its unbound v1 and B-only v2 constructors/contracts are now test-only. The v2 request has a
 distinct operation domain and carries the B receipt's binding commitment. Before any local result write

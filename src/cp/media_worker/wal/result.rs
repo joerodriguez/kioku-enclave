@@ -347,14 +347,32 @@ impl WalLogicalDomainPlan for ScreenStoryboardResultPlan {
             }
         }
         validate_commit_time(transaction, self, &authenticated)?;
+        let browser_snapshot_source_keys =
+            resolve_browser_snapshot_source_keys(transaction, &authenticated.members)?;
         ensure_targets_absent(transaction, &self.frames)?;
-        for (member, frame) in authenticated.members.iter().zip(&self.frames) {
-            write_frame(transaction, self, member, frame)?;
+        for ((member, frame), browser_snapshot_source_key) in authenticated
+            .members
+            .iter()
+            .zip(&self.frames)
+            .zip(&browser_snapshot_source_keys)
+        {
+            write_frame(
+                transaction,
+                self,
+                member,
+                frame,
+                browser_snapshot_source_key.as_deref(),
+            )?;
             settle_job(transaction, self, member)?;
             settle_media(transaction, member)?;
         }
         settle_work(transaction, self, &authenticated.work)?;
-        verify_final_state(transaction, self, &authenticated)?;
+        verify_final_state(
+            transaction,
+            self,
+            &authenticated,
+            &browser_snapshot_source_keys,
+        )?;
         Ok(WalReplayResult::unit())
     }
 
@@ -610,8 +628,25 @@ struct ScreenContext {
     capture_status: Option<String>,
     primary_bundle_id: Option<String>,
     primary_window_id: Option<i64>,
+    browser_state_key: Option<String>,
     visible_windows_json: Option<String>,
     visible_windows_truncated: i64,
+}
+
+struct StoredBrowserV2Evidence {
+    device_id: String,
+    source_wall_at: String,
+    observation_id: String,
+    observed_at: String,
+    state_key: Option<String>,
+    context_status: String,
+    active_url: Option<String>,
+    active_title: Option<String>,
+    browser_bundle_id: String,
+    browser_name: String,
+    permission_status: String,
+    content_hash: String,
+    tabs_json: String,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1224,6 +1259,16 @@ fn hash_screen_work(connection: &Connection, work_unit_id: &str) -> Result<[u8; 
              FROM media_objects o JOIN media_work_members m ON m.event_id=o.event_id
              WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
         ),
+        (
+            b"browser-v2".as_slice(),
+            "SELECT m.event_id,o.observation_id,o.observed_at,o.state_key,o.context_status,
+                    o.active_url,o.active_title,o.created_at,s.state_key,s.browser_bundle_id,
+                    s.browser_name,s.permission_status,s.content_hash,s.tabs_json,s.created_at
+             FROM media_work_members m
+             LEFT JOIN browser_observations_v2 o ON o.event_id=m.event_id
+             LEFT JOIN browser_states_v2 s ON s.state_key=o.state_key
+             WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
+        ),
     ] {
         hash_query(connection, &mut hasher, marker, query, work_unit_id)?;
     }
@@ -1412,6 +1457,7 @@ fn parse_screen_context(raw: Option<&str>) -> Result<ScreenContext> {
         primary_window_id: value
             .get("primary_window_id")
             .and_then(serde_json::Value::as_i64),
+        browser_state_key: string("browser_state_key")?,
         visible_windows_json,
         visible_windows_truncated: i64::from(
             value
@@ -1422,11 +1468,111 @@ fn parse_screen_context(raw: Option<&str>) -> Result<ScreenContext> {
     })
 }
 
+fn resolve_browser_snapshot_source_keys(
+    transaction: &Transaction<'_>,
+    members: &[StoredMember],
+) -> Result<Vec<Option<String>>> {
+    let mut source_keys = Vec::with_capacity(members.len());
+    for member in members {
+        let observed_state_key = transaction
+            .query_row(
+                "SELECT state_key FROM browser_observations_v2 WHERE event_id=?1",
+                [&member.event_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|_| WalIdempotencyError::Unavailable)?
+            .flatten();
+        let observation_carries_browser_v2 = observed_state_key
+            .as_deref()
+            .is_some_and(|key| key.contains(":browser-v2:"));
+        let Some(raw_context) = member.context_json.as_deref() else {
+            if observation_carries_browser_v2 {
+                return Err(WalIdempotencyError::Precondition);
+            }
+            source_keys.push(None);
+            continue;
+        };
+        let legacy_context = parse_screen_context(Some(raw_context))?;
+        let raw_value: serde_json::Value =
+            serde_json::from_str(raw_context).map_err(|_| WalIdempotencyError::Precondition)?;
+        let context_carries_browser_v2 = legacy_context
+            .browser_state_key
+            .as_deref()
+            .is_some_and(|key| key.contains(":browser-v2:"))
+            || raw_value
+                .get("browser_snapshot")
+                .and_then(|snapshot| snapshot.get("state_key"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| key.contains(":browser-v2:"));
+        if !context_carries_browser_v2 && !observation_carries_browser_v2 {
+            source_keys.push(None);
+            continue;
+        }
+        let full_context: crate::cp::media::CaptureContext =
+            serde_json::from_value(raw_value).map_err(|_| WalIdempotencyError::Precondition)?;
+        let evidence = transaction
+            .query_row(
+                "SELECT e.device_id,e.source_wall_at,o.observation_id,o.observed_at,o.state_key,
+                        o.context_status,o.active_url,o.active_title,s.browser_bundle_id,
+                        s.browser_name,s.permission_status,s.content_hash,s.tabs_json
+                 FROM capture_events e
+                 JOIN browser_observations_v2 o ON o.event_id=e.event_id
+                 JOIN browser_states_v2 s ON s.state_key=o.state_key
+                 WHERE e.event_id=?1",
+                [&member.event_id],
+                |row| {
+                    Ok(StoredBrowserV2Evidence {
+                        device_id: row.get(0)?,
+                        source_wall_at: row.get(1)?,
+                        observation_id: row.get(2)?,
+                        observed_at: row.get(3)?,
+                        state_key: row.get(4)?,
+                        context_status: row.get(5)?,
+                        active_url: row.get(6)?,
+                        active_title: row.get(7)?,
+                        browser_bundle_id: row.get(8)?,
+                        browser_name: row.get(9)?,
+                        permission_status: row.get(10)?,
+                        content_hash: row.get(11)?,
+                        tabs_json: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| WalIdempotencyError::Unavailable)?
+            .ok_or(WalIdempotencyError::Precondition)?;
+        crate::cp::media::validate_browser_v2_persisted_evidence(
+            &full_context,
+            crate::cp::media::BrowserV2PersistedEvidence {
+                event_id: &member.event_id,
+                device_id: &evidence.device_id,
+                source_wall_at: &evidence.source_wall_at,
+                observation_id: &evidence.observation_id,
+                observed_at: &evidence.observed_at,
+                state_key: evidence.state_key.as_deref(),
+                context_status: &evidence.context_status,
+                active_url: evidence.active_url.as_deref(),
+                active_title: evidence.active_title.as_deref(),
+                browser_bundle_id: &evidence.browser_bundle_id,
+                browser_name: &evidence.browser_name,
+                permission_status: &evidence.permission_status,
+                content_hash: &evidence.content_hash,
+                tabs_json: &evidence.tabs_json,
+            },
+        )
+        .map_err(|_| WalIdempotencyError::Precondition)?;
+        source_keys.push(Some(format!("capture-v2-browser:{}", member.event_id)));
+    }
+    Ok(source_keys)
+}
+
 fn write_frame(
     transaction: &Transaction<'_>,
     plan: &ScreenStoryboardResultPlan,
     member: &StoredMember,
     frame: &ScreenStoryboardFrameResult,
+    browser_snapshot_source_key: Option<&str>,
 ) -> Result<()> {
     let context = parse_screen_context(member.context_json.as_deref())?;
     let changed = transaction
@@ -1439,7 +1585,7 @@ fn write_frame(
               semantic_context_hash,browser_snapshot_source_key,duplicate_of_id,
               visible_until,dedupe_version)
              VALUES (?1,?2,?3,?4,?5,?6,?7,'done',?8,0,?9,?10,?11,2,?12,?13,?14,
-                     ?15,?16,NULL,NULL,NULL,NULL,NULL,NULL,1)",
+                     ?15,?16,NULL,NULL,NULL,?17,NULL,NULL,1)",
             params![
                 frame.screenshot_id,
                 member.capture_started_at,
@@ -1457,6 +1603,7 @@ fn write_frame(
                 context.primary_window_id,
                 context.visible_windows_json,
                 context.visible_windows_truncated,
+                browser_snapshot_source_key,
             ],
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -1615,8 +1762,17 @@ fn verify_final_state(
     transaction: &Transaction<'_>,
     plan: &ScreenStoryboardResultPlan,
     authenticated: &AuthenticatedScreenWork,
+    browser_snapshot_source_keys: &[Option<String>],
 ) -> Result<()> {
-    for (member, frame) in authenticated.members.iter().zip(&plan.frames) {
+    if browser_snapshot_source_keys.len() != authenticated.members.len() {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    for ((member, frame), browser_snapshot_source_key) in authenticated
+        .members
+        .iter()
+        .zip(&plan.frames)
+        .zip(browser_snapshot_source_keys)
+    {
         let context = parse_screen_context(member.context_json.as_deref())?;
         let screenshot = transaction
             .query_row(
@@ -1682,7 +1838,7 @@ fn verify_final_state(
                 capture_group_id: None,
                 visual_signals_json: None,
                 semantic_context_hash: None,
-                browser_snapshot_source_key: None,
+                browser_snapshot_source_key: browser_snapshot_source_key.clone(),
                 duplicate_of_id: None,
                 visible_until: None,
                 dedupe_version: 1,
@@ -2099,6 +2255,17 @@ pub(super) mod tests {
                     pixel_change_ratio REAL,context_fingerprint TEXT,dedupe_version INTEGER,
                     received_at TEXT NOT NULL
                  ) STRICT;
+                 CREATE TABLE browser_states_v2 (
+                    state_key TEXT PRIMARY KEY,browser_bundle_id TEXT NOT NULL,
+                    browser_name TEXT NOT NULL,permission_status TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,tabs_json TEXT NOT NULL,created_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE browser_observations_v2 (
+                    observation_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,
+                    observed_at TEXT NOT NULL,state_key TEXT,context_status TEXT NOT NULL,
+                    active_url TEXT,active_title TEXT,created_at TEXT NOT NULL,
+                    FOREIGN KEY(state_key) REFERENCES browser_states_v2(state_key)
+                 ) STRICT;
                  CREATE TABLE media_objects (
                     asset_id TEXT PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,object_key TEXT NOT NULL,
                     object_generation INTEGER,object_backend TEXT,mime_type TEXT NOT NULL,codec TEXT NOT NULL,
@@ -2380,6 +2547,253 @@ pub(super) mod tests {
             LogicalMutationDisposition::Replayed
         );
         assert_eq!(load_ledger_state(&connection).unwrap(), (1, 9));
+    }
+
+    #[test]
+    fn screen_result_binds_only_the_exact_event_scoped_browser_v2_observation() {
+        let event_id = "screen-event-1";
+        let hash = "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
+        let state_key = format!("device:browser-v2:{hash}");
+        let seed_browser = |connection: &Connection| {
+            seed_work(connection, WORK_ONE, VERTEX_ONE, 1, 1);
+            let tabs = serde_json::json!([
+                {
+                    "window_index":1,"tab_index":1,"title":"Meeting",
+                    "url":"https://meet.google.com/abc?authuser=0#frag",
+                    "url_scheme":"https","is_active":true,"is_loading":null
+                },
+                {
+                    "window_index":1,"tab_index":2,"title":"Document",
+                    "url":"https://docs.google.com/document/d/exact/edit?tab=t.0",
+                    "url_scheme":"https","is_active":false,"is_loading":null
+                }
+            ]);
+            let context = serde_json::json!({
+                "capture_status":"stable",
+                "active_app":"Safari",
+                "primary_bundle_id":"com.apple.Safari",
+                "primary_window_id":7,
+                "window_title":"Meeting",
+                "display_id":1,
+                "active_url":"https://meet.google.com/abc?authuser=0#frag",
+                "active_url_title":"Meeting",
+                "browser_permission_status":"granted",
+                "browser_state_key":state_key.clone(),
+                "browser_snapshot":{
+                    "state_key":state_key.clone(),
+                    "browser_bundle_id":"com.apple.Safari",
+                    "browser_name":"Safari",
+                    "permission_status":"granted",
+                    "active_window_index":1,
+                    "active_tab_index":1,
+                    "reported_tab_count":2,
+                    "truncated":false,
+                    "ambient_tab_collection_enabled":true,
+                    "content_hash":hash,
+                    "tabs":tabs.clone()
+                },
+                "visible_windows":[],
+                "visible_windows_truncated":false
+            });
+            let envelope = serde_json::json!({
+                "schema_version":2,
+                "active_window_index":1,
+                "active_tab_index":1,
+                "reported_tab_count":2,
+                "truncated":false,
+                "ambient_tab_collection_enabled":true,
+                "tabs":tabs
+            });
+            connection
+                .execute(
+                    "UPDATE capture_events SET context_json=?1 WHERE event_id=?2",
+                    params![context.to_string(), event_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO browser_states_v2
+                     (state_key,browser_bundle_id,browser_name,permission_status,content_hash,
+                      tabs_json,created_at)
+                     VALUES (?1,'com.apple.Safari','Safari','granted',?2,?3,?4)",
+                    params![state_key, hash, envelope.to_string(), CREATED_AT],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO browser_observations_v2
+                     (observation_id,event_id,observed_at,state_key,context_status,active_url,
+                      active_title,created_at)
+                     VALUES (?1,?1,?2,?3,'stable',
+                             'https://meet.google.com/abc?authuser=0#frag','Meeting',?4)",
+                    params![event_id, STARTED_AT, state_key, CREATED_AT],
+                )
+                .unwrap();
+        };
+
+        let mut primary = connection();
+        seed_browser(&primary);
+
+        let result = plan(&primary, WORK_ONE, VERTEX_ONE, 1, 1, "browser-v2");
+        execute(&mut primary, result).unwrap();
+        assert_eq!(
+            primary
+                .query_row(
+                    "SELECT browser_snapshot_source_key FROM screenshots WHERE source_key=?1",
+                    [format!("cloud-v2:{event_id}")],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .as_deref(),
+            Some("capture-v2-browser:screen-event-1")
+        );
+
+        let mut corrupt = connection();
+        seed_browser(&corrupt);
+        corrupt
+            .execute(
+                "UPDATE browser_observations_v2 SET context_status='unstable'",
+                [],
+            )
+            .unwrap();
+        let result = plan(&corrupt, WORK_ONE, VERTEX_ONE, 1, 1, "browser-v2-corrupt");
+        assert_eq!(
+            execute_error(&mut corrupt, result),
+            WalIdempotencyError::Precondition
+        );
+        assert_eq!(
+            corrupt
+                .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "mismatched browser observation evidence must fail before screenshot writes"
+        );
+
+        for removed_fields in [
+            &["browser_state_key"][..],
+            &["browser_state_key", "browser_snapshot"][..],
+        ] {
+            let mut downgraded = connection();
+            seed_browser(&downgraded);
+            let raw: String = downgraded
+                .query_row(
+                    "SELECT context_json FROM capture_events WHERE event_id=?1",
+                    [event_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut context: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            for field in removed_fields {
+                context.as_object_mut().unwrap().remove(*field);
+            }
+            downgraded
+                .execute(
+                    "UPDATE capture_events SET context_json=?1 WHERE event_id=?2",
+                    params![context.to_string(), event_id],
+                )
+                .unwrap();
+            let result = plan(
+                &downgraded,
+                WORK_ONE,
+                VERTEX_ONE,
+                1,
+                1,
+                "browser-v2-downgrade",
+            );
+            assert_eq!(
+                execute_error(&mut downgraded, result),
+                WalIdempotencyError::Precondition
+            );
+            assert_eq!(
+                downgraded
+                    .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "persisted browser-v2 observations cannot be downgraded to no-lineage writes"
+            );
+        }
+
+        let mut context_free = connection();
+        seed_work(&context_free, WORK_ONE, VERTEX_ONE, 1, 1);
+        context_free
+            .execute(
+                "UPDATE capture_events SET context_json=NULL WHERE event_id=?1",
+                [event_id],
+            )
+            .unwrap();
+        let result = plan(&context_free, WORK_ONE, VERTEX_ONE, 1, 1, "context-free");
+        execute(&mut context_free, result).unwrap();
+        assert_eq!(
+            context_free
+                .query_row(
+                    "SELECT browser_snapshot_source_key FROM screenshots WHERE source_key=?1",
+                    [format!("cloud-v2:{event_id}")],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None,
+            "a context-free pre-v2 screen remains a valid no-browser storyboard member"
+        );
+
+        let mut partial_legacy = connection();
+        seed_work(&partial_legacy, WORK_ONE, VERTEX_ONE, 1, 1);
+        partial_legacy
+            .execute(
+                "UPDATE capture_events SET context_json='{}' WHERE event_id=?1",
+                [event_id],
+            )
+            .unwrap();
+        let result = plan(
+            &partial_legacy,
+            WORK_ONE,
+            VERTEX_ONE,
+            1,
+            1,
+            "partial-legacy-context",
+        );
+        execute(&mut partial_legacy, result).unwrap();
+        assert_eq!(
+            partial_legacy
+                .query_row(
+                    "SELECT browser_snapshot_source_key FROM screenshots WHERE source_key=?1",
+                    [format!("cloud-v2:{event_id}")],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None,
+            "a partial pre-v2 context remains on the established no-browser path"
+        );
+
+        let mut forged = connection();
+        seed_browser(&forged);
+        forged
+            .execute(
+                "UPDATE capture_events SET context_json=NULL WHERE event_id=?1",
+                [event_id],
+            )
+            .unwrap();
+        let result = plan(
+            &forged,
+            WORK_ONE,
+            VERTEX_ONE,
+            1,
+            1,
+            "context-free-forged-v2",
+        );
+        assert_eq!(
+            execute_error(&mut forged, result),
+            WalIdempotencyError::Precondition
+        );
+        assert_eq!(
+            forged
+                .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a v2 observation cannot be attached to a context-free event"
+        );
     }
 
     #[test]

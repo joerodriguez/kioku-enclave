@@ -194,27 +194,19 @@ pub mod wal_domain {
     /// read, have their media irreversibly deleted, and then fail on the
     /// legacy purge. Media gone, rows intact, no retry that repairs it.
     pub const QUERY_EPISODE_DELETE: &str = "query.episode_delete";
-    /// `GET /api/browser-snapshots/{source_key}`. Not starved — **orphaned**.
-    /// Its two tables, `browser_snapshots` and `browser_tabs`, have NO writer
-    /// anywhere in this tree, on either lane: grep them and every hit is a
-    /// `CREATE TABLE`, a `SELECT`, or a foreign key. Cloud Capture v2 records
-    /// the same facts in DIFFERENT tables —
-    /// `media::record_browser_observation` writes `browser_states_v2` and
-    /// `browser_observations_v2` — and nothing backfills the v1 pair.
+    /// `GET /api/browser-snapshots/{source_key}`. The writer and read topology
+    /// now exist: capture ingest validates and stores browser-v2 evidence, the
+    /// sealed screen-result family binds `capture-v2-browser:<event_id>` into
+    /// the screenshot, and the routed read exact-joins that event to the v2
+    /// state only while a live episode still owns the screenshot. Legacy v1
+    /// keys retain their strict compatibility read.
     ///
-    /// The client cannot even reach a key for it: the only producer of the
-    /// `source_key` this route takes is `screenshots.browser_snapshot_source_key`,
-    /// and the sealed screen-result family
-    /// (`media_worker/wal/result.rs::write_frame`) binds that column to
-    /// `NULL` unconditionally.
-    ///
-    /// **Lift condition.** A live writer of `browser_snapshots`/`browser_tabs`
-    /// (or this route re-pointed at the `_v2` pair it can actually be answered
-    /// from), AND a live writer of
-    /// `screenshots.browser_snapshot_source_key`. Both, because either alone
-    /// leaves a route that can only 404. Migrating capture ingest did NOT lift
-    /// this one and no amount of further evidence will: the gap is a schema
-    /// rename nobody finished, not a missing upstream domain.
+    /// **Remaining lift condition.** Episode deletion is still gated and its
+    /// legacy purge does not remove Cloud Capture events/observations or GC an
+    /// unreferenced browser state. Keep this route gated for selected users
+    /// until the sealed episode-purge family makes that lifecycle and export
+    /// promise true; serving sensitive tabs while the corresponding deletion
+    /// surface is knowingly incomplete is not an acceptable partial launch.
     pub const QUERY_BROWSER_SNAPSHOT: &str = "query.browser_snapshot";
     // ── The media read domains ──────────────────────────────────────────────
     //

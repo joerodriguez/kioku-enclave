@@ -120,23 +120,25 @@ screenshot.
     "active_url": "https://meet.google.com/abc-defg-hij?authuser=0",
     "active_url_title": "Weekly planning",
     "browser_permission_status": "granted",
-    "browser_state_key": "019fbab2-8413-7053-9117-eb249b72b162",
+    "browser_state_key": "019fbab2-8413-7053-9117-eb249b72b15d:browser-v2:<content_hash>",
     "browser_snapshot": {
-      "state_key": "019fbab2-8413-7053-9117-eb249b72b162",
+      "state_key": "019fbab2-8413-7053-9117-eb249b72b15d:browser-v2:<content_hash>",
       "browser_bundle_id": "com.google.Chrome",
       "browser_name": "Google Chrome",
       "permission_status": "granted",
-      "active_window_index": 0,
+      "active_window_index": 1,
       "active_tab_index": 1,
-      "reported_tab_count": 2,
+      "reported_tab_count": 1,
       "truncated": false,
-      "content_hash": "64 hexadecimal characters over the canonical tab snapshot",
+      "ambient_tab_collection_enabled": false,
+      "content_hash": "64 lowercase hexadecimal characters over the browser-v2 commitment",
       "tabs": [
         {
-          "window_index": 0,
+          "window_index": 1,
           "tab_index": 1,
           "title": "Weekly planning",
           "url": "https://meet.google.com/abc-defg-hij?authuser=0",
+          "url_scheme": "https",
           "is_active": true,
           "is_loading": false
         }
@@ -147,6 +149,15 @@ screenshot.
   }
 }
 ```
+
+Browser-v2 state is event-scoped and content-addressed. `state_key` is exactly
+`<device_id>:browser-v2:<content_hash>`; the commitment covers the browser bundle,
+permission result, active coordinates, reported/truncated counts, the explicit ambient-tab
+consent bit, and every ordered tab field including `url_scheme`. Tab titles and URLs are
+bounded by UTF-8 byte length. When ambient collection is false, a granted snapshot contains
+only the active tab. Non-granted snapshots carry no tab or active-URL evidence. Older
+browser-v1 manifests remain replay-compatible, but new clients always send the explicit v2
+consent bit.
 
 `session_finished` is optional (false by default) and valid only on audio. A client sets
 it on its final durable, gracefully completed audio event. Acceptance atomically records

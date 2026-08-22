@@ -1,3 +1,17 @@
+# ADR-0022 browser evidence
+
+- [x] Accept the Mac browser-v2 wire contract with explicit account/device
+  ambient-tab consent, UTF-8 byte bounds, exact topology validation, and an
+  independently recomputable cross-language commitment.
+- [x] Bind storyboard screenshots only to the exact capture-event browser
+  observation, export both browser-v2 tables, and fail closed on corrupt or
+  missing evidence.
+- [x] Repoint the browser snapshot reader to live canonical capture evidence
+  while preserving strict legacy compatibility and genuine-absence semantics.
+- [ ] Seal episode deletion across canonical media, capture/browser rows, and
+  unreferenced shared-state garbage collection; only then lift the selected
+  browser-snapshot and episode-delete gates.
+
 # ADR-0029 ready-notification delivery
 
 - [x] Persist authenticated, per-installation APNs registrations with account-switch and token-generation fencing.

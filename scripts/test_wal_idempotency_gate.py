@@ -655,7 +655,16 @@ EXPECTED_STORE_CALL_COUNT = 243
 # rejections in the handler then moves only those same eight owner bodies so
 # the selected 410 wins before framework-level validation; keys, classes,
 # expressions, and surviving-key order remain unchanged.
-EXPECTED_STORE_CALL_SHA256 = "c205ca4379cb4074e82548058e348826e0c3f725541099b6e991fee68c22ba83"
+# Browser-v2 evidence compatibility was derived against a fresh pristine
+# `git archive` of exact 21e5db90113674ba8e43826fe8ef8f57a72f0caf. That
+# untouched tree's own gate first reproduced 243/c205ca43 byte-for-byte. The
+# branch remains exactly 243 rows with no additions, removals,
+# reclassifications, or key-order movement. The sole moved row is
+# `rest_browser_snapshot#0::wal_authoritative_read#0`: both its owner-body and
+# call-expression hashes change because the routed read now invokes the strict
+# browser-v2/legacy loader instead of querying the orphaned legacy state table.
+# No other owner or expression moves. The independently derived third state is:
+EXPECTED_STORE_CALL_SHA256 = "a3098fd06deba701a2aa9561e507f5567e59abf5676bf55ecd1348d6b8b5d387"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
