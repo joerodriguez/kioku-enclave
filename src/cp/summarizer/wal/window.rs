@@ -56,7 +56,7 @@ const SUBTYPE: &[u8] = b"adr-0022-episode-window-upsert-v1";
 /// still enforced below; only the owner's response to hitting it changed.
 pub(in crate::cp) const MAX_BATCH_ITEMS: usize = 64;
 const MAX_TIMESTAMP_BYTES: usize = 64;
-const MAX_MEMBERS_PER_ITEM: usize = 65_536;
+pub(in crate::cp) const MAX_MEMBERS_PER_ITEM: usize = 65_536;
 const ENCODED_UNIT_RESULT_BYTES: usize = 9;
 const SCHEMA_TABLE: &str = "archive_v3_wal_episode_window_schema";
 const LEDGER_TABLE: &str = "archive_v3_wal_episode_window_operations";

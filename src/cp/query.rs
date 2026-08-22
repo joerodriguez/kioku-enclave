@@ -15,7 +15,9 @@
 
 pub(crate) mod wal;
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -29,7 +31,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::error::wal_domain;
 use crate::search::{search_all, SearchRequest};
 
 use super::auth::AuthUser;
@@ -1180,18 +1181,10 @@ async fn rest_episode_delete(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
-    // ADR-0022 D4 — deliberately NOT migrated with the rest of the read lane.
-    //
-    // This route only looks like a read. It is a three-step durable purge:
-    // enumerate the episode's media keys, delete those objects from GCS, then
-    // `purge_episode` the rows. The purge is a durable mutation, so it needs a
-    // sealed plan family of its own; routing only the lookup would be strictly
-    // worse than deferring, because a WAL-authoritative user would pass the
-    // routed read, have their media objects irreversibly deleted from GCS, and
-    // then fail on the legacy purge — media gone, rows intact, no retry that
-    // can repair it. The gate stays until that plan family exists.
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_EPISODE_DELETE) {
-        return error.into_response();
+    // ADR-0022 D4: selected archives use the exact sealed deletion family;
+    // unselected archives retain the existing snapshot transaction below.
+    if s.store.is_wal_authoritative(&user.0) {
+        return rest_selected_episode_delete(&s, &user.0, id).await;
     }
     // Remove encrypted media before dropping its durable DB references. If a
     // GCS deletion fails, the operation remains retryable and no orphan is
@@ -1288,6 +1281,470 @@ async fn rest_episode_delete(
                 .into_response()
         }
     }
+}
+
+async fn rest_selected_episode_delete(s: &CpState, user_id: &str, id: i64) -> Response {
+    // Finalization uses this same per-user gate around its Control snapshot and
+    // archive submit. Holding it through the bounded provider cleanup prevents
+    // a stale finalizer snapshot from recreating rows after the logical purge.
+    let _lifecycle_guard = match s.store.lock_user_lifecycle(user_id).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return super::routed_read_unavailable("api.episode_delete", &error);
+        }
+    };
+    let read_user = user_id.to_owned();
+    let start = s
+        .store
+        .wal_authoritative_read(user_id, move |connection| {
+            wal::load_episode_delete_start(connection, &read_user, id).map_err(|_| {
+                crate::error::EnclaveError::Store("episode deletion state is unavailable".into())
+            })
+        })
+        .await;
+    let _preparation = match start {
+        Ok(wal::EpisodeDeleteStart::Complete(receipt)) => {
+            return episode_delete_response(receipt);
+        }
+        Ok(wal::EpisodeDeleteStart::Prepared(preparation)) => preparation,
+        Ok(wal::EpisodeDeleteStart::Evidence(evidence)) => {
+            let plan = match wal::EpisodeDeletePreparePlan::new(user_id.to_owned(), evidence)
+                .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::error!(
+                        episode_id = id,
+                        ?error,
+                        "episode deletion preparation failed"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "enclave_unavailable"})),
+                    )
+                        .into_response();
+                }
+            };
+            match s.store.wal_authoritative_submit(user_id, plan).await {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    tracing::error!(episode_id = id, error = %error, "episode deletion reservation failed");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "enclave_unavailable"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        Ok(wal::EpisodeDeleteStart::Absent) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "episode_not_found"})),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return super::routed_read_unavailable("api.episode_delete", &error);
+        }
+    };
+
+    const DELETE_STEPS_PER_REQUEST: usize = 8;
+    for _ in 0..DELETE_STEPS_PER_REQUEST {
+        let read_user = user_id.to_owned();
+        let work = match s
+            .store
+            .wal_authoritative_read(user_id, move |connection| {
+                wal::load_episode_delete_work(connection, &read_user, id).map_err(|_| {
+                    crate::error::EnclaveError::Store(
+                        "episode deletion progress is unavailable".into(),
+                    )
+                })
+            })
+            .await
+        {
+            Ok(work) => work,
+            Err(error) => {
+                return super::routed_read_unavailable("api.episode_delete", &error);
+            }
+        };
+        let Some(work) = work else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response();
+        };
+        match work {
+            wal::EpisodeDeleteWork::Complete(plan) => {
+                let plan =
+                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+                    {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            tracing::error!(
+                                episode_id = id,
+                                ?error,
+                                "episode deletion completion construction failed"
+                            );
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error": "enclave_unavailable"})),
+                            )
+                                .into_response();
+                        }
+                    };
+                return match s.store.wal_authoritative_submit(user_id, plan).await {
+                    Ok(receipt) => episode_delete_response(receipt),
+                    Err(error) => {
+                        tracing::error!(episode_id = id, error = %error, "episode deletion completion failed");
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "enclave_unavailable"})),
+                        )
+                            .into_response()
+                    }
+                };
+            }
+            wal::EpisodeDeleteWork::Expand(plan) | wal::EpisodeDeleteWork::FinishSelector(plan) => {
+                let prepared =
+                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            tracing::error!(
+                                episode_id = id,
+                                ?error,
+                                "episode deletion progress construction failed"
+                            );
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error": "enclave_unavailable"})),
+                            )
+                                .into_response();
+                        }
+                    };
+                if let Err(error) = s.store.wal_authoritative_submit(user_id, prepared).await {
+                    tracing::error!(episode_id = id, error = %error, "episode deletion progress settlement failed");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "enclave_unavailable", "deletion_pending": true})),
+                    )
+                        .into_response();
+                }
+            }
+            wal::EpisodeDeleteWork::Provider(item) => {
+                let provider_result = match item.target() {
+                    wal::EpisodeDeleteCleanupTarget::Retained(media) => {
+                        s.store
+                            .delete_retained_media(
+                                user_id,
+                                &media.object_key,
+                                media.object_generation,
+                                media.object_backend.as_deref(),
+                                &media.sha256,
+                            )
+                            .await
+                    }
+                    wal::EpisodeDeleteCleanupTarget::Legacy(object_key) => {
+                        match s.store.delete_media(object_key).await {
+                            Ok(()) | Err(crate::error::EnclaveError::NotFound) => Ok(()),
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
+                if let Err(error) = provider_result {
+                    tracing::error!(episode_id = id, error = %error, "episode media deletion step failed");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "media_delete_failed", "deletion_pending": true})),
+                    )
+                        .into_response();
+                }
+                let plan = match wal::EpisodeDeleteCleanupPlan::new(item)
+                    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        tracing::error!(
+                            episode_id = id,
+                            ?error,
+                            "episode deletion progress construction failed"
+                        );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "enclave_unavailable"})),
+                        )
+                            .into_response();
+                    }
+                };
+                if let Err(error) = s.store.wal_authoritative_submit(user_id, plan).await {
+                    tracing::error!(episode_id = id, error = %error, "episode deletion progress settlement failed");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "enclave_unavailable", "deletion_pending": true})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    kick_episode_deletion(user_id);
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "deleted": false,
+            "deletion_pending": true,
+            "episode_id": id,
+        })),
+    )
+        .into_response()
+}
+
+fn episode_delete_response(receipt: wal::EpisodeDeleteReceipt) -> Response {
+    let purge = receipt.purge;
+    Json(json!({
+        "deleted": true,
+        "episode_id": receipt.episode_id,
+        "deleted_utterances": purge.deleted_utterances,
+        "deleted_screenshots": purge.deleted_screenshots,
+        "deleted_segments": purge.deleted_segments,
+        "utterance_source_keys": purge.utterance_source_keys,
+        "screenshot_source_keys": purge.screenshot_source_keys,
+    }))
+    .into_response()
+}
+
+/// Advance a bounded number of already-prepared selected-archive deletion
+/// jobs.  The dedicated immediate/recurring worker is the correctness owner;
+/// the summarizer sweep and a client retry are redundant wakeups, never the
+/// only progress mechanism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EpisodeDeleteResumeOutcome {
+    has_work: bool,
+    had_failure: bool,
+}
+
+pub(crate) async fn resume_user_episode_deletions(
+    state: &CpState,
+    user_id: &str,
+) -> crate::error::Result<EpisodeDeleteResumeOutcome> {
+    if !state.store.is_wal_authoritative(user_id) {
+        return Ok(EpisodeDeleteResumeOutcome {
+            has_work: false,
+            had_failure: false,
+        });
+    }
+    let read_user = user_id.to_owned();
+    let batch = state
+        .store
+        .wal_authoritative_read(user_id, move |connection| {
+            wal::load_pending_episode_delete_batch(connection, &read_user).map_err(|_| {
+                crate::error::EnclaveError::Store(
+                    "episode deletion work inventory is unavailable".into(),
+                )
+            })
+        })
+        .await?;
+    let Some(batch) = batch else {
+        return Ok(EpisodeDeleteResumeOutcome {
+            has_work: false,
+            had_failure: false,
+        });
+    };
+    state
+        .store
+        .wal_authoritative_submit(
+            user_id,
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(batch.plan)
+                .map_err(|_| {
+                    crate::error::EnclaveError::Store(
+                        "episode deletion scheduler state is invalid".into(),
+                    )
+                })?,
+        )
+        .await?;
+    let mut had_failure = false;
+    for episode_id in batch.episode_ids {
+        let response = rest_selected_episode_delete(state, user_id, episode_id).await;
+        if response.status().is_server_error() {
+            had_failure = true;
+            tracing::warn!("episode deletion worker step failed; continuing independent work");
+        }
+    }
+    Ok(EpisodeDeleteResumeOutcome {
+        has_work: true,
+        had_failure,
+    })
+}
+
+const EPISODE_DELETE_WAKE_CAPACITY: usize = 1_024;
+const EPISODE_DELETE_MAX_RETRY_SECONDS: u64 = 30;
+
+static EPISODE_DELETE_KICKS: OnceLock<tokio::sync::mpsc::Sender<String>> = OnceLock::new();
+
+fn kick_episode_deletion(user_id: &str) {
+    if let Some(sender) = EPISODE_DELETE_KICKS.get() {
+        let _ = sender.try_send(user_id.to_owned());
+    }
+}
+
+fn episode_delete_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    Duration::from_secs(
+        1u64.checked_shl(exponent)
+            .unwrap_or(EPISODE_DELETE_MAX_RETRY_SECONDS)
+            .min(EPISODE_DELETE_MAX_RETRY_SECONDS),
+    )
+}
+
+fn episode_delete_worker_wait(
+    queue: &VecDeque<String>,
+    retry_at: &HashMap<String, Instant>,
+    now: Instant,
+) -> Duration {
+    let mut minimum = None;
+    for id in queue {
+        match retry_at.get(id).copied() {
+            None => return Duration::from_millis(1),
+            Some(deadline) if deadline <= now => return Duration::from_millis(1),
+            Some(deadline) => {
+                minimum = Some(minimum.map_or(deadline, |current: Instant| current.min(deadline)));
+            }
+        }
+    }
+    minimum
+        .and_then(|deadline| deadline.checked_duration_since(now))
+        .unwrap_or(Duration::from_millis(1))
+}
+
+fn pop_ready_episode_delete_account(
+    queue: &mut VecDeque<String>,
+    queued: &mut HashSet<String>,
+    retry_at: &HashMap<String, Instant>,
+    now: Instant,
+) -> Option<String> {
+    for _ in 0..queue.len() {
+        let id = queue.pop_front()?;
+        if retry_at.get(&id).is_none_or(|deadline| *deadline <= now) {
+            queued.remove(&id);
+            return Some(id);
+        }
+        queue.push_back(id);
+    }
+    None
+}
+
+/// Run selected-archive deletion as a dedicated fair correctness owner.  The
+/// durable archive cursor rotates the next four episodes before any provider
+/// work, so one unavailable object cannot pin later jobs.  The in-memory queue
+/// is only a wakeup optimization: the immediate and recurring account scans
+/// rebuild it after every restart.
+pub(crate) fn spawn_episode_delete_worker(state: Arc<CpState>) {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(EPISODE_DELETE_WAKE_CAPACITY);
+    if EPISODE_DELETE_KICKS.set(sender).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut scan = tokio::time::interval(Duration::from_secs(30));
+        let mut queue = VecDeque::<String>::new();
+        let mut queued = HashSet::<String>::new();
+        let mut failure_counts = HashMap::<String, u32>::new();
+        let mut retry_at = HashMap::<String, Instant>::new();
+        loop {
+            if queue.is_empty() {
+                tokio::select! {
+                    _ = scan.tick() => {
+                        match state.control.all_user_ids().await {
+                            Ok(ids) => {
+                                for id in ids {
+                                    if queued.insert(id.clone()) {
+                                        queue.push_back(id);
+                                    }
+                                }
+                            }
+                            Err(error) => tracing::warn!(error = %error, "episode deletion account scan failed"),
+                        }
+                    }
+                    Some(id) = receiver.recv() => {
+                        if queued.insert(id.clone()) {
+                            queue.push_back(id);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let worker_wait = episode_delete_worker_wait(&queue, &retry_at, Instant::now());
+            tokio::select! {
+                Some(id) = receiver.recv() => {
+                    if queued.insert(id.clone()) {
+                        queue.push_back(id);
+                    }
+                }
+                _ = scan.tick() => {
+                    match state.control.all_user_ids().await {
+                        Ok(ids) => {
+                            for id in ids {
+                                if queued.insert(id.clone()) {
+                                    queue.push_back(id);
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(error = %error, "episode deletion account scan failed"),
+                    }
+                }
+                _ = tokio::time::sleep(worker_wait) => {
+                    let Some(id) = pop_ready_episode_delete_account(
+                        &mut queue,
+                        &mut queued,
+                        &retry_at,
+                        Instant::now(),
+                    ) else { continue; };
+                    match resume_user_episode_deletions(&state, &id).await {
+                        Ok(outcome) if outcome.has_work => {
+                            if outcome.had_failure {
+                                let failures = failure_counts
+                                    .entry(id.clone())
+                                    .and_modify(|value| *value = value.saturating_add(1))
+                                    .or_insert(1);
+                                retry_at.insert(
+                                    id.clone(),
+                                    Instant::now() + episode_delete_retry_delay(*failures),
+                                );
+                            } else {
+                                failure_counts.remove(&id);
+                                retry_at.remove(&id);
+                            }
+                            if queued.insert(id.clone()) {
+                                queue.push_back(id);
+                            }
+                        }
+                        Ok(_) => {
+                            failure_counts.remove(&id);
+                            retry_at.remove(&id);
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "episode deletion owner pass failed");
+                            let failures = failure_counts
+                                .entry(id.clone())
+                                .and_modify(|value| *value = value.saturating_add(1))
+                                .or_insert(1);
+                            retry_at.insert(
+                                id.clone(),
+                                Instant::now() + episode_delete_retry_delay(*failures),
+                            );
+                            if queued.insert(id.clone()) {
+                                queue.push_back(id);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    });
 }
 
 async fn rest_episode_members(
@@ -1507,9 +1964,6 @@ async fn rest_browser_snapshot(
     Extension(user): Extension<AuthUser>,
     Path(source_key): Path<String>,
 ) -> Response {
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_BROWSER_SNAPSHOT) {
-        return error.into_response();
-    }
     let result = s
         .store
         .wal_authoritative_read(&user.0, move |conn| {
@@ -4530,6 +4984,123 @@ mod tests {
     }
 
     #[test]
+    fn episode_deletion_and_finalization_share_the_complete_lifecycle_boundary() {
+        let finalizer = include_str!("finalizer.rs");
+        let finalizer_lock = finalizer
+            .find("let webhook_lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?")
+            .expect("selected finalization acquires the per-user lifecycle guard");
+        let archive_commit = finalizer[finalizer_lock..]
+            .find("let commit_res: Result<usize>")
+            .map(|offset| finalizer_lock + offset)
+            .expect("selected finalization submits while holding the lifecycle guard");
+        let finalizer_release = finalizer[archive_commit..]
+            .find("drop(webhook_lifecycle_guard)")
+            .map(|offset| archive_commit + offset)
+            .expect("selected finalization releases only after its archive commit");
+        assert!(finalizer_lock < archive_commit && archive_commit < finalizer_release);
+
+        let query = include_str!("query.rs");
+        let owner = query
+            .find("async fn rest_selected_episode_delete(")
+            .expect("selected episode-delete owner exists");
+        let end = query[owner..]
+            .find("fn episode_delete_response(")
+            .map(|offset| owner + offset)
+            .expect("selected episode-delete owner has a bounded body");
+        let body = &query[owner..end];
+        let delete_lock = body
+            .find("s.store.lock_user_lifecycle(user_id).await")
+            .expect("selected deletion acquires the same per-user lifecycle guard");
+        let prepare = body
+            .find("EpisodeDeletePreparePlan::new(")
+            .expect("logical purge and capacity reservation precede provider cleanup");
+        let work = body
+            .find("wal::load_episode_delete_work(")
+            .expect("the owner reloads durable work before each bounded step");
+        let provider = body
+            .find(".delete_retained_media(")
+            .expect("provider cleanup follows durable preparation");
+        let cleanup_submit = body[provider..]
+            .find("EpisodeDeleteCleanupPlan::new(")
+            .map(|offset| provider + offset)
+            .expect("each provider result is durably settled before another step");
+        assert!(delete_lock < prepare && prepare < work && work < provider);
+        assert!(provider < cleanup_submit);
+
+        let ledger = include_str!("query/wal/episode_delete.rs");
+        let completion = ledger
+            .find("impl WalLogicalDomainLedger<EpisodeDeletePlan>")
+            .expect("sealed completion ledger exists");
+        let completion = &ledger[completion..];
+        assert!(completion.contains("final_selector_cleanup_commitment("));
+        assert!(completion.contains("cleanup_items_commitment"));
+        assert!(completion.contains("SELECT COUNT(*) FROM archive_v3_wal_episode_delete_cleanup"));
+        assert!(completion.contains("selector_state<>'complete'"));
+
+        let startup = include_str!("../main.rs");
+        assert!(startup.contains("cp::query::spawn_episode_delete_worker(Arc::clone(&cp_state))"));
+        let resume = query
+            .find("pub(crate) async fn resume_user_episode_deletions(")
+            .expect("durable deletion resume owner exists");
+        let worker = query[resume..]
+            .find("pub(crate) fn spawn_episode_delete_worker(")
+            .map(|offset| resume + offset)
+            .expect("dedicated deletion worker follows the bounded resume owner");
+        let resume_body = &query[resume..worker];
+        let read = resume_body
+            .find("wal::load_pending_episode_delete_batch")
+            .expect("the owner reads a durable rotated batch");
+        let cursor_submit = resume_body
+            .find("wal_authoritative_submit")
+            .expect("the cursor advances durably before provider work");
+        let route_step = resume_body
+            .find("rest_selected_episode_delete")
+            .expect("the owner performs bounded route steps after cursor advance");
+        assert!(read < cursor_submit && cursor_submit < route_step);
+        assert!(resume_body.contains("if response.status().is_server_error()"));
+        assert!(!resume_body.contains("return Err"));
+        let worker_end = query[worker..]
+            .find("async fn rest_episode_members(")
+            .map(|offset| worker + offset)
+            .expect("the dedicated worker has a bounded source body");
+        let worker_body = &query[worker..worker_end];
+        assert!(worker_body.contains("Duration::from_secs(30)"));
+        assert!(worker_body.contains("queue.push_back(id)"));
+        assert!(worker_body.contains("Duration::from_millis(25)"));
+        assert!(worker_body.contains("mpsc::channel::<String>(EPISODE_DELETE_WAKE_CAPACITY)"));
+        assert!(query.contains("sender.try_send"));
+        assert!(!worker_body.contains("unbounded_channel"));
+        assert!(!worker_body.contains("biased;"));
+        assert!(worker_body.contains("episode_delete_retry_delay"));
+    }
+
+    #[test]
+    fn episode_delete_worker_bounds_retry_and_rotates_around_delayed_accounts() {
+        assert_eq!(EPISODE_DELETE_WAKE_CAPACITY, 1_024);
+        assert_eq!(episode_delete_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(episode_delete_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(episode_delete_retry_delay(5), Duration::from_secs(16));
+        assert_eq!(episode_delete_retry_delay(6), Duration::from_secs(30));
+        assert_eq!(
+            episode_delete_retry_delay(u32::MAX),
+            Duration::from_secs(30)
+        );
+
+        let now = Instant::now();
+        let mut queue = VecDeque::from(["delayed".to_owned(), "ready".to_owned()]);
+        let mut queued = HashSet::from(["delayed".to_owned(), "ready".to_owned()]);
+        let retry_at = HashMap::from([("delayed".to_owned(), now + Duration::from_secs(30))]);
+        assert_eq!(
+            pop_ready_episode_delete_account(&mut queue, &mut queued, &retry_at, now).as_deref(),
+            Some("ready")
+        );
+        assert_eq!(queue, VecDeque::from(["delayed".to_owned()]));
+        assert!(queued.contains("delayed"));
+        assert!(!queued.contains("ready"));
+        assert!(episode_delete_worker_wait(&queue, &retry_at, now) >= Duration::from_secs(29));
+    }
+
+    #[test]
     fn mcp_tool_metadata_is_submission_ready_and_read_only() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tool definitions must be an array");
@@ -6395,6 +6966,63 @@ mod tests {
             serde_json::from_slice::<Value>(&body).unwrap(),
             json!({"error": "screenshot_upload_retired"})
         );
+    }
+
+    #[tokio::test]
+    async fn selected_episode_delete_settles_and_replays_from_its_content_free_receipt() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+        use axum::body::to_bytes;
+
+        let archive = answerable_wal_archive("8b6fc0a8-68a2-4a91-bd71-f22a8d13a34d").await;
+        let episode_id = archive
+            .state
+            .store
+            .wal_authoritative_read(&archive.user_id, |connection| {
+                connection
+                    .query_row("SELECT id FROM episodes ORDER BY id LIMIT 1", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+
+        let first = rest_episode_delete(
+            State(Arc::clone(&archive.state)),
+            Extension(AuthUser(archive.user_id.clone())),
+            Path(episode_id),
+        )
+        .await;
+        let first_status = first.status();
+        let first_body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "unexpected delete response: {}",
+            String::from_utf8_lossy(&first_body)
+        );
+        let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["deleted"], true);
+        assert_eq!(first_json["episode_id"], episode_id);
+
+        let replay = rest_episode_delete(
+            State(Arc::clone(&archive.state)),
+            Extension(AuthUser(archive.user_id.clone())),
+            Path(episode_id),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(first_body, replay_body);
+
+        let absent = rest_episode(
+            State(archive.state),
+            Extension(AuthUser(archive.user_id)),
+            Path(episode_id),
+            Query(EpisodeParams { include_low: None }),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 
     /// **Every routed REST read in this module, as one table.**

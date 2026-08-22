@@ -22,12 +22,21 @@
 //! concrete provider, schedule a retry, allocate randomness or a clock, or
 //! acknowledge a request.
 
+mod episode_delete;
 mod finalization_queue;
 mod selected_screenshot_attempt;
 mod selected_screenshot_provider;
 mod selected_screenshot_send;
 mod selected_screenshot_termination;
 mod selected_screenshot_upload;
+pub(in crate::cp) use episode_delete::{
+    load_episode_delete_start, load_episode_delete_work, load_pending_episode_delete_batch,
+    EpisodeDeleteCleanupTarget, EpisodeDeleteReceipt, EpisodeDeleteStart, EpisodeDeleteWork,
+};
+pub(crate) use episode_delete::{
+    EpisodeDeleteCleanupLedger, EpisodeDeleteCleanupPlan, EpisodeDeleteLedger, EpisodeDeletePlan,
+    EpisodeDeletePrepareLedger, EpisodeDeletePreparePlan,
+};
 pub(in crate::cp::query) use finalization_queue::FinalizationQueuePredecessor;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
 pub(crate) use selected_screenshot_attempt::{

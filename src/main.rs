@@ -1302,6 +1302,7 @@ async fn async_main() {
 
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+    cp::query::spawn_episode_delete_worker(Arc::clone(&cp_state));
     cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
     cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
     cp::billing::spawn_detach_worker(Arc::clone(&cp_state));

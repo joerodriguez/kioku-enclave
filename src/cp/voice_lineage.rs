@@ -74,6 +74,113 @@ pub fn backfill_profile_lineage(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Backfill only the voice-profile closure reached by a bounded set of
+/// speaker observations. Selected-archive episode deletion uses this after an
+/// exact predecessor reread, so imported pre-lineage samples participate in
+/// the same deterministic recompute without mutating unrelated account data.
+pub(crate) fn backfill_profile_lineage_for_observations_at(
+    conn: &Connection,
+    observation_ids: &[i64],
+    mutation_stamp: &str,
+) -> Result<Vec<i64>> {
+    if observation_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if observation_ids.len() > 128 || observation_ids.iter().any(|id| *id <= 0) {
+        return Err(EnclaveError::InvalidRequest(
+            "voice lineage observation bound is invalid".into(),
+        ));
+    }
+    if mutation_stamp.is_empty()
+        || mutation_stamp.len() > 64
+        || crate::cp::isotime::parse_epoch_millis(mutation_stamp)
+            .is_none_or(|millis| crate::cp::isotime::format_epoch_millis(millis) != mutation_stamp)
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "voice lineage mutation stamp is invalid".into(),
+        ));
+    }
+    let observations = observation_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn.prepare(&format!(
+        "SELECT profile_id FROM (
+           SELECT DISTINCT assignment.profile_id AS profile_id
+           FROM voice_sample_profile_assignments assignment
+           JOIN voice_samples sample ON sample.id=assignment.sample_id
+           WHERE sample.speaker_observation_id IN ({observations})
+             AND assignment.active=1
+           UNION
+           SELECT DISTINCT sample.voice_profile_id AS profile_id
+           FROM voice_samples sample
+           WHERE sample.speaker_observation_id IN ({observations})
+             AND sample.voice_profile_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM voice_sample_profile_assignments assignment
+               WHERE assignment.sample_id=sample.id
+             )
+         ) WHERE profile_id IS NOT NULL ORDER BY profile_id LIMIT 129"
+    ))?;
+    let profile_ids = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if profile_ids.len() > 128 || profile_ids.iter().any(|id| *id <= 0) {
+        return Err(EnclaveError::InvalidRequest(
+            "voice lineage profile fanout exceeds the deletion bound".into(),
+        ));
+    }
+    if profile_ids.is_empty() {
+        return Ok(profile_ids);
+    }
+
+    // Stable profile/sample order plus the caller-authenticated sqlite_sequence
+    // state makes both AUTOINCREMENT allocations replay-deterministic.
+    for profile_id in &profile_ids {
+        let inserted = conn.execute(
+            "INSERT INTO voice_profile_revisions
+             (profile_id,status,derivation_version,scorer_version,representative_kind,
+              centroid,sample_count,medoid_sample_id,person_id,reason_code,active,created_at)
+             SELECT profile.id,profile.status,?2,profile.scorer_version,
+                    profile.representative_kind,profile.centroid,profile.sample_count,
+                    profile.medoid_sample_id,profile.person_id,'schema_backfill',1,?3
+             FROM voice_profiles profile
+             WHERE profile.id=?1 AND NOT EXISTS (
+               SELECT 1 FROM voice_profile_revisions revision
+               WHERE revision.profile_id=profile.id
+             )",
+            params![profile_id, LINEAGE_DERIVATION_VERSION, mutation_stamp],
+        )?;
+        if inserted > 1 {
+            return Err(EnclaveError::Store(
+                "voice lineage profile backfill was not singular".into(),
+            ));
+        }
+    }
+    let profiles = profile_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(
+        &format!(
+            "INSERT INTO voice_sample_profile_assignments
+             (sample_id,profile_id,active,created_at)
+             SELECT sample.id,sample.voice_profile_id,1,?1
+             FROM voice_samples sample
+             WHERE sample.voice_profile_id IN ({profiles})
+               AND NOT EXISTS (
+                 SELECT 1 FROM voice_sample_profile_assignments assignment
+                 WHERE assignment.sample_id=sample.id
+               )
+             ORDER BY sample.id"
+        ),
+        [mutation_stamp],
+    )?;
+    Ok(profile_ids)
+}
+
 #[cfg(test)]
 fn effective_profile_status(conn: &Connection, profile_id: i64) -> Result<String> {
     backfill_profile_lineage(conn)?;
@@ -123,6 +230,27 @@ pub(crate) fn refresh_profile_revision(
 ) -> Result<()> {
     validate_reason_code(reason_code)?;
     backfill_profile_lineage(conn)?;
+    let mutation_stamp: String =
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })?;
+    refresh_profile_revision_at(conn, profile_id, reason_code, &mutation_stamp)
+}
+
+pub(crate) fn refresh_profile_revision_at(
+    conn: &Connection,
+    profile_id: i64,
+    reason_code: &str,
+    mutation_stamp: &str,
+) -> Result<()> {
+    validate_reason_code(reason_code)?;
+    if mutation_stamp.is_empty()
+        || mutation_stamp.len() > 64
+        || crate::cp::isotime::parse_epoch_millis(mutation_stamp)
+            .is_none_or(|millis| crate::cp::isotime::format_epoch_millis(millis) != mutation_stamp)
+    {
+        return Err(invalid("voice revision mutation stamp is invalid"));
+    }
     let current = conn.query_row(
         "SELECT id,status,scorer_version,representative_kind,centroid,sample_count,\
                 medoid_sample_id,person_id \
@@ -170,13 +298,14 @@ pub(crate) fn refresh_profile_revision(
     {
         return Ok(());
     }
-    append_revision(
+    append_revision_at(
         conn,
         profile_id,
         &profile.0,
         LINEAGE_DERIVATION_VERSION,
         None,
         reason_code,
+        mutation_stamp,
     )?;
     Ok(())
 }
@@ -1082,6 +1211,50 @@ fn append_revision(
             proposal_id,
             predecessor_id,
             reason_code,
+            profile_id
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn append_revision_at(
+    conn: &Connection,
+    profile_id: i64,
+    status: &str,
+    derivation_version: i64,
+    proposal_id: Option<i64>,
+    reason_code: &str,
+    mutation_stamp: &str,
+) -> Result<i64> {
+    validate_reason_code(reason_code)?;
+    if !matches!(
+        status,
+        "tentative" | "stable" | "quarantined" | "superseded" | "split"
+    ) {
+        return Err(invalid("voice profile revision status is invalid"));
+    }
+    let predecessor_id = conn.query_row(
+        "SELECT id FROM voice_profile_revisions WHERE profile_id=?1 AND active=1",
+        [profile_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "UPDATE voice_profile_revisions SET active=0 WHERE id=?1 AND active=1",
+        [predecessor_id],
+    )?;
+    conn.execute(
+        "INSERT INTO voice_profile_revisions \
+         (profile_id,status,derivation_version,scorer_version,representative_kind,centroid,\
+          sample_count,medoid_sample_id,person_id,proposal_id,predecessor_revision_id,reason_code,active,created_at) \
+         SELECT id,?1,?2,scorer_version,representative_kind,centroid,sample_count,\
+                medoid_sample_id,person_id,?3,?4,?5,1,?6 FROM voice_profiles WHERE id=?7",
+        params![
+            status,
+            derivation_version,
+            proposal_id,
+            predecessor_id,
+            reason_code,
+            mutation_stamp,
             profile_id
         ],
     )?;

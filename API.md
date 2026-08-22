@@ -548,6 +548,52 @@ Archive, current-object-provider, or KMS transport unavailability returns
 `503 {"error":"enclave_unavailable"}`. Malformed sealed identity, key mismatch,
 authentication failure, or length/hash corruption returns `500` and no bytes.
 
+## Browser evidence and episode deletion
+
+Authenticated `GET /api/browser-snapshots/{source_key}` returns browser evidence only
+while the exact legacy snapshot or Cloud Capture v2 event observation remains linked to
+a live screenshot in a live episode. The v2 loader reauthenticates the event, observation,
+state commitment, context status, canonical envelope and screenshot source association;
+missing or mismatched required evidence is an authority failure, not a plausible empty
+snapshot. True absence or wrong ownership returns `404`; archive unavailability or corrupt
+authoritative evidence returns `503 {"error":"enclave_unavailable"}`.
+
+Authenticated `DELETE /api/episodes/{id}` returns the deleted utterance and screenshot
+counts plus their local source keys. For selected Genesis archives, one sealed preparation
+first validates the exact immediate tombstone/cascade closure and cross-episode membership.
+The same transaction removes user-visible plaintext, reserves the bounded permanent receipt,
+and stores only compact, ordered event/voice/legacy selectors before external deletion.
+Each selector is then expanded in its own bounded exact transaction (a legal audio window is
+at most 128 event roots). Before voice identity paging, the selector reserves its exact legal
+maximum of 16,384 cleanup rows and bounded bytes against the global ledger; expansion atomically
+replaces that reservation with the exact inventory. Each first-time current voice-progress row
+is separately charged to that same global ledger before identity mutation, an overwrite adds no
+charge, and expansion releases the exact authenticated progress count. Other selectors
+exact-reserve at expansion. No local or
+provider-backed mutation precedes the applicable reservation, and finishing releases exact
+dynamic capacity while retaining content-free inventory and settlement commitments.
+Canonical event subtrees, explicit and historical NULL-linked audio observations, shared voice
+closures, work units, browser states, and legacy snapshots survive while any non-target evidence
+still references them. Imported pre-lineage voice samples are scoped to the exact affected profile
+closure and receive deterministic, fixed-stamp revision/assignment backfill before recompute; no
+unrelated voice row is touched. Affected surviving episodes are queued through authenticated
+rotating 128-episode pages. One globally charged current progress row per affected episode is overwritten rather
+than retaining page history; restart resumes from the durable cursor, higher IDs are reached
+before wraparound, and identity work completed between pages is detected and queued again before
+the voice purge. A dedicated restart-safe worker scans immediately and every 30 seconds,
+rotates a durable cursor across four episodes per account turn, and continues independent jobs
+after one provider failure. Route wakeups are bounded/coalesced, and an unavailable account uses
+a process-local 1-to-30-second exponential delay without delaying ready neighbors. `202` with
+`{"deletion_pending":true}` means the logical deletion is
+durable and that worker will continue; `200` is returned only after the gap-free selector
+sequence and its authenticated provider inventory are complete. Repeating a completed request
+returns the authenticated receipt
+without another provider call. A never-present episode returns `404`.
+Archive corruption, capacity refusal, or provider cleanup failure returns `503` and never
+claims deletion completed. The retained ledger contains fixed commitments and provider
+identities, not transcript, OCR, browser URL/title/tab, final brief, voice embedding, or
+delivery payload content.
+
 ## Finalized-episode webhooks
 
 Authenticated clients manage destinations with `GET`/`POST /api/webhooks`,

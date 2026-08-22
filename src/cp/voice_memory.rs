@@ -695,6 +695,28 @@ pub fn reconcile_profiles(conn: &Connection, limit: usize) -> Result<usize> {
 /// Synchronously recomputes voice profile domain representatives, centroid, medoid,
 /// and stability status following sample deletion.
 pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64) -> Result<()> {
+    super::voice_lineage::backfill_profile_lineage(conn)?;
+    let mutation_stamp: String =
+        conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })?;
+    sync_recompute_profile_representatives_at(conn, profile_id, &mutation_stamp)
+}
+
+pub(crate) fn sync_recompute_profile_representatives_at(
+    conn: &Connection,
+    profile_id: i64,
+    mutation_stamp: &str,
+) -> Result<()> {
+    if mutation_stamp.is_empty()
+        || mutation_stamp.len() > 64
+        || isotime::parse_epoch_millis(mutation_stamp)
+            .is_none_or(|millis| isotime::format_epoch_millis(millis) != mutation_stamp)
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "voice purge mutation stamp is invalid".into(),
+        ));
+    }
     // 1. Find all distinct channel domains for this profile
     let domains: Vec<String> = {
         let mut stmt = conn.prepare(
@@ -702,7 +724,7 @@ pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64
              UNION \
              SELECT DISTINCT s.channel_domain FROM voice_samples s \
              JOIN voice_sample_profile_assignments a ON a.sample_id = s.id \
-             WHERE a.profile_id = ?1 AND a.active = 1",
+             WHERE a.profile_id = ?1 AND a.active = 1 ORDER BY channel_domain",
         )?;
         let rows = stmt
             .query_map([profile_id], |r| r.get(0))?
@@ -741,8 +763,8 @@ pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64
             let effective_count = (samples.len() - rep.excluded_indices.len()) as i64;
             conn.execute(
                 "INSERT INTO voice_profile_representatives \
-                 (profile_id, channel_domain, centroid, sample_count, medoid_sample_id, scorer_version, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+                 (profile_id, channel_domain, centroid, sample_count, medoid_sample_id, scorer_version, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
                  ON CONFLICT(profile_id, channel_domain) DO UPDATE SET \
                      centroid = excluded.centroid, \
                      sample_count = excluded.sample_count, \
@@ -755,7 +777,8 @@ pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64
                     embedding_blob(&rep.centroid),
                     effective_count,
                     medoid_id,
-                    voice_quality::SCORER_VERSION
+                    voice_quality::SCORER_VERSION,
+                    mutation_stamp,
                 ],
             )?;
         }
@@ -779,14 +802,14 @@ pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64
         conn.execute(
             "UPDATE voice_profiles \
              SET status = 'quarantined', sample_count = 0, medoid_sample_id = NULL, person_id = NULL, \
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 updated_at = ?2 \
              WHERE id = ?1",
-            [profile_id],
+            params![profile_id, mutation_stamp],
         )?;
         conn.execute(
-            "UPDATE profile_identity_bindings SET active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+            "UPDATE profile_identity_bindings SET active = 0, updated_at = ?2 \
              WHERE voice_profile_id = ?1",
-            [profile_id],
+            params![profile_id, mutation_stamp],
         )?;
     } else {
         let mut sample_ids = Vec::with_capacity(all_rows.len());
@@ -803,22 +826,24 @@ pub fn sync_recompute_profile_representatives(conn: &Connection, profile_id: i64
              SET centroid = ?1, sample_count = ?2, medoid_sample_id = ?3, \
                  scorer_version = ?4, representative_kind = 'medoid_trimmed_centroid', \
                  status = CASE WHEN ?2 >= 3 THEN 'stable' ELSE 'tentative' END, \
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 updated_at = ?6 \
              WHERE id = ?5",
             params![
                 embedding_blob(&rep.centroid),
                 effective_count,
                 medoid_id,
                 voice_quality::SCORER_VERSION,
-                profile_id
+                profile_id,
+                mutation_stamp,
             ],
         )?;
     }
 
-    super::voice_lineage::refresh_profile_revision(
+    super::voice_lineage::refresh_profile_revision_at(
         conn,
         profile_id,
         "synchronous_purge_recompute",
+        mutation_stamp,
     )?;
     Ok(())
 }

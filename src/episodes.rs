@@ -351,7 +351,7 @@ pub(crate) fn upsert_episodes(
 /// Result of purging one episode: counts plus the `source_key`s of the
 /// deleted records, so the Mac debugger can purge the matching LOCAL rows and
 /// media files (a cloud-only delete would resurrect on a forced resync).
-#[derive(Debug, Serialize, Default)]
+#[derive(Clone, Debug, Serialize, Default, PartialEq, Eq)]
 pub struct EpisodePurge {
     pub deleted_utterances: usize,
     pub deleted_screenshots: usize,
@@ -376,7 +376,63 @@ pub(crate) fn purge_episode(
     conn: &rusqlite::Connection,
     episode_id: i64,
 ) -> Result<Option<EpisodePurge>> {
-    let exists: bool = conn
+    let tx = conn.unchecked_transaction()?;
+    let purge = purge_episode_transaction(&tx, episode_id)?;
+    tx.commit()?;
+    Ok(purge)
+}
+
+/// Transaction-owned form used by sealed mutation families. The caller owns
+/// commit/rollback, so an exact predecessor check, the logical purge, and any
+/// companion capture-lineage cleanup remain one atomic archive mutation.
+pub(crate) fn purge_episode_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    episode_id: i64,
+) -> Result<Option<EpisodePurge>> {
+    // Absence is an established legacy no-op.  Prove it inside the same
+    // transaction before any compatibility backfill or clock read: otherwise
+    // deleting an id that never existed could still mutate voice lineage (or
+    // fail on a partially upgraded voice schema) before returning `None`.
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM episodes WHERE id=?1)",
+        [episode_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    // Legacy archives may predate the append-only voice-lineage tables.  The
+    // backfill itself timestamps the predecessor revisions, so it must run
+    // before we capture the deletion mutation stamp; otherwise a newly
+    // appended deletion revision can sort before the predecessor it replaces.
+    crate::cp::voice_lineage::backfill_profile_lineage(tx)?;
+    let mutation_stamp: String =
+        tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |row| {
+            row.get(0)
+        })?;
+    purge_episode_transaction_impl(tx, episode_id, &mutation_stamp, true)
+}
+
+/// Selected-archive preparation removes the user-visible episode and members
+/// atomically, but leaves uniquely-owned voice observations for the bounded
+/// deletion worker.  The worker needs those immutable source rows to expand
+/// one legal audio work unit at a time without materialising the worst-case
+/// episode fan-out in a request transaction.
+pub(crate) fn purge_episode_transaction_at_deferred_voice(
+    tx: &rusqlite::Transaction<'_>,
+    episode_id: i64,
+    mutation_stamp: &str,
+) -> Result<Option<EpisodePurge>> {
+    purge_episode_transaction_impl(tx, episode_id, mutation_stamp, false)
+}
+
+fn purge_episode_transaction_impl(
+    tx: &rusqlite::Transaction<'_>,
+    episode_id: i64,
+    mutation_stamp: &str,
+    purge_owned_voice_observations: bool,
+) -> Result<Option<EpisodePurge>> {
+    let exists: bool = tx
         .query_row("SELECT 1 FROM episodes WHERE id = ?1", [episode_id], |_| {
             Ok(true)
         })
@@ -384,8 +440,6 @@ pub(crate) fn purge_episode(
     if !exists {
         return Ok(None);
     }
-
-    let tx = conn.unchecked_transaction()?;
 
     let collect = |sql: &str| -> Result<Vec<(i64, Option<String>)>> {
         let mut stmt = tx.prepare(sql)?;
@@ -397,12 +451,12 @@ pub(crate) fn purge_episode(
     let utts = collect(
         "SELECT u.id, u.source_key FROM episode_members m \
          JOIN utterances u ON u.id = m.record_id \
-         WHERE m.episode_id = ?1 AND m.record_type = 'utterance'",
+         WHERE m.episode_id = ?1 AND m.record_type = 'utterance' ORDER BY u.id",
     )?;
     let scrs = collect(
         "SELECT s.id, s.source_key FROM episode_members m \
          JOIN screenshots s ON s.id = m.record_id \
-         WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'",
+         WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' ORDER BY s.id",
     )?;
 
     let id_list = |rows: &[(i64, Option<String>)]| {
@@ -422,7 +476,8 @@ pub(crate) fn purge_episode(
         // Segments touched by these utterances, checked for emptiness after.
         let seg_ids: Vec<i64> = {
             let mut stmt = tx.prepare(&format!(
-                "SELECT DISTINCT audio_segment_id FROM utterances WHERE id IN ({ids})"
+                "SELECT DISTINCT audio_segment_id FROM utterances
+                 WHERE id IN ({ids}) ORDER BY audio_segment_id"
             ))?;
             let rows = stmt
                 .query_map([], |r| r.get(0))?
@@ -430,11 +485,21 @@ pub(crate) fn purge_episode(
             rows
         };
 
-        // Find all speaker_observation_ids linked to these utterances
+        // Only observations owned exclusively by the target utterances may be
+        // removed.  The FK is ON DELETE SET NULL, so treating a shared
+        // observation as target-owned would silently strip audio/voice lineage
+        // from a surviving utterance in another episode.
         let obs_ids: Vec<i64> = {
             let mut stmt = tx.prepare(&format!(
-                "SELECT DISTINCT speaker_observation_id FROM utterances \
-                 WHERE id IN ({ids}) AND speaker_observation_id IS NOT NULL"
+                "SELECT DISTINCT target.speaker_observation_id
+                 FROM utterances target
+                 WHERE target.id IN ({ids}) AND target.speaker_observation_id IS NOT NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM utterances survivor
+                     WHERE survivor.speaker_observation_id=target.speaker_observation_id
+                       AND survivor.id NOT IN ({ids})
+                   )
+                 ORDER BY target.speaker_observation_id"
             ))?;
             let rows = stmt
                 .query_map([], |r| r.get(0))?
@@ -442,7 +507,7 @@ pub(crate) fn purge_episode(
             rows
         };
 
-        if !obs_ids.is_empty() {
+        if purge_owned_voice_observations && !obs_ids.is_empty() {
             let obs_id_str = obs_ids
                 .iter()
                 .map(|i| i.to_string())
@@ -454,7 +519,7 @@ pub(crate) fn purge_episode(
                 let mut stmt = tx.prepare(&format!(
                     "SELECT DISTINCT a.profile_id FROM voice_sample_profile_assignments a \
                      JOIN voice_samples s ON s.id = a.sample_id \
-                     WHERE s.speaker_observation_id IN ({obs_id_str})"
+                     WHERE s.speaker_observation_id IN ({obs_id_str}) ORDER BY a.profile_id"
                 ))?;
                 let rows = stmt
                     .query_map([], |r| r.get(0))?
@@ -475,12 +540,12 @@ pub(crate) fn purge_episode(
                      JOIN speaker_observations o ON o.id = u.speaker_observation_id \
                      JOIN voice_samples s ON s.speaker_observation_id = o.id \
                      JOIN voice_sample_profile_assignments a ON a.sample_id = s.id \
-                     WHERE a.profile_id IN ({prof_str}) AND m.episode_id <> ?1"
+                     WHERE a.profile_id IN ({prof_str}) AND m.episode_id <> ?1
+                     ORDER BY m.episode_id"
                 ))?;
                 let rows = stmt
                     .query_map([episode_id], |r| r.get(0))?
-                    .filter_map(|x| x.ok())
-                    .collect();
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 rows
             } else {
                 Vec::new()
@@ -502,7 +567,11 @@ pub(crate) fn purge_episode(
 
             // Synchronously recompute representatives for each affected profile
             for pid in &affected_profiles {
-                crate::cp::voice_memory::sync_recompute_profile_representatives(&tx, *pid)?;
+                crate::cp::voice_memory::sync_recompute_profile_representatives_at(
+                    tx,
+                    *pid,
+                    mutation_stamp,
+                )?;
             }
 
             // Invalidate other episodes sharing affected profiles
@@ -515,10 +584,10 @@ pub(crate) fn purge_episode(
                 tx.execute(
                     &format!(
                         "UPDATE episodes SET identity_revision = identity_revision + 1, identity_refresh_status = 'queued', \
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                         updated_at = CASE WHEN COALESCE(updated_at,'') < ?1 THEN ?1 ELSE updated_at END \
                          WHERE id IN ({ep_str})"
                     ),
-                    [],
+                    [mutation_stamp],
                 )?;
             }
         }
@@ -559,23 +628,11 @@ pub(crate) fn purge_episode(
                 [],
             )?;
         }
+        // Event-scoped identity rows are removed only by the later exact
+        // capture-event selector. Deleting them here would strip evidence from
+        // a surviving screenshot that shares the same canonical event.
         tx.execute_batch(&format!(
-            "DELETE FROM identity_evidence WHERE source_event_id IN (
-                 SELECT e.event_id FROM capture_events e
-                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
-                 WHERE s.id IN ({ids})
-             );
-             DELETE FROM person_facts WHERE source_event_id IN (
-                 SELECT e.event_id FROM capture_events e
-                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
-                 WHERE s.id IN ({ids})
-             );
-             DELETE FROM person_name_claims WHERE source_event_id IN (
-                 SELECT e.event_id FROM capture_events e
-                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
-                 WHERE s.id IN ({ids})
-             );
-             DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
+            "DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
              DELETE FROM episode_members WHERE record_type='screenshot' AND record_id IN ({ids});
              DELETE FROM screenshots WHERE id IN ({ids});"
         ))?;
@@ -583,9 +640,9 @@ pub(crate) fn purge_episode(
     }
 
     tx.execute(
-        "UPDATE episode_speaker_slots SET status = 'superseded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+        "UPDATE episode_speaker_slots SET status = 'superseded', updated_at = ?2 \
          WHERE episode_id = ?1",
-        [episode_id],
+        rusqlite::params![episode_id, mutation_stamp],
     )?;
     tx.execute(
         "DELETE FROM episode_participants WHERE episode_id = ?1",
@@ -597,9 +654,199 @@ pub(crate) fn purge_episode(
         [episode_id],
     )?;
 
-    tx.commit()?;
-
     Ok(Some(purge))
+}
+
+/// Remove a bounded set of now-unreferenced speaker observations after the
+/// selected episode tombstone is durable.  Callers must exact-read and commit
+/// the complete observation/profile predecessor before invoking this helper.
+#[cfg(test)]
+pub(crate) fn purge_speaker_observations_transaction_at(
+    tx: &rusqlite::Transaction<'_>,
+    observation_ids: &[i64],
+    expected_affected_episode_ids: &[i64],
+    mutation_stamp: &str,
+) -> Result<()> {
+    if observation_ids.is_empty() {
+        return Ok(());
+    }
+    if observation_ids.len() > 128 || observation_ids.iter().any(|id| *id <= 0) {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "speaker observation purge bound is invalid".into(),
+        ));
+    }
+    let ids = observation_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let shared: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM utterances WHERE speaker_observation_id IN ({ids})"),
+        [],
+        |row| row.get(0),
+    )?;
+    if shared != 0 {
+        return Err(crate::error::EnclaveError::Conflict(
+            "speaker observation is still shared".into(),
+        ));
+    }
+    let affected_profiles = crate::cp::voice_lineage::backfill_profile_lineage_for_observations_at(
+        tx,
+        observation_ids,
+        mutation_stamp,
+    )?;
+    let other_affected_episodes: Vec<i64> = if affected_profiles.is_empty() {
+        Vec::new()
+    } else {
+        let profiles = affected_profiles
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT member.episode_id
+             FROM episode_members member
+             JOIN utterances utterance ON utterance.id=member.record_id
+             JOIN voice_samples sample
+               ON sample.speaker_observation_id=utterance.speaker_observation_id
+             JOIN voice_sample_profile_assignments assignment ON assignment.sample_id=sample.id
+             WHERE member.record_type='utterance'
+               AND assignment.active=1
+               AND assignment.profile_id IN ({profiles})
+             ORDER BY member.episode_id LIMIT 129"
+        ))?;
+        let rows = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    if other_affected_episodes.len() > 128
+        || other_affected_episodes != expected_affected_episode_ids
+    {
+        return Err(crate::error::EnclaveError::Conflict(
+            "affected voice episode closure changed".into(),
+        ));
+    }
+    if !other_affected_episodes.is_empty() {
+        let episodes = other_affected_episodes
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let invalid_revisions: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM episodes
+                 WHERE id IN ({episodes})
+                   AND (typeof(identity_revision)<>'integer'
+                        OR identity_revision<0 OR identity_revision>=9223372036854775807)"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_revisions != 0 {
+            return Err(crate::error::EnclaveError::Conflict(
+                "affected episode identity revision cannot advance".into(),
+            ));
+        }
+    }
+
+    tx.execute_batch(&format!(
+        "DELETE FROM voice_sample_profile_assignments WHERE sample_id IN (
+             SELECT id FROM voice_samples WHERE speaker_observation_id IN ({ids})
+         );
+         DELETE FROM voice_samples WHERE speaker_observation_id IN ({ids});
+         DELETE FROM voice_embedding_jobs WHERE speaker_observation_id IN ({ids});
+         DELETE FROM speaker_observation_sources WHERE speaker_observation_id IN ({ids});
+         DELETE FROM identity_evidence WHERE speaker_observation_id IN ({ids});
+         DELETE FROM person_name_claims WHERE speaker_observation_id IN ({ids});
+         DELETE FROM person_facts WHERE speaker_observation_id IN ({ids});
+         DELETE FROM speaker_observations WHERE id IN ({ids});"
+    ))?;
+    for profile_id in affected_profiles {
+        crate::cp::voice_memory::sync_recompute_profile_representatives_at(
+            tx,
+            profile_id,
+            mutation_stamp,
+        )?;
+    }
+    if !other_affected_episodes.is_empty() {
+        let episodes = other_affected_episodes
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!(
+                "UPDATE episodes
+                 SET identity_revision=identity_revision+1,
+                     identity_refresh_status='queued',
+                     updated_at=CASE WHEN COALESCE(updated_at,'')<?1 THEN ?1 ELSE updated_at END
+                 WHERE id IN ({episodes})"
+            ),
+            [mutation_stamp],
+        )?;
+    }
+    Ok(())
+}
+
+/// Finalize an exact selected-archive voice selector after its affected
+/// episodes have already been invalidated through durable bounded pages.
+/// The caller proves in the same transaction that no current affected episode
+/// lacks a fresh page receipt; this helper performs only the observation and
+/// profile mutation so a legal long-lived profile is never materialized here.
+pub(crate) fn purge_speaker_observations_after_invalidation_transaction_at(
+    tx: &rusqlite::Transaction<'_>,
+    observation_ids: &[i64],
+    mutation_stamp: &str,
+) -> Result<()> {
+    if observation_ids.is_empty() {
+        return Ok(());
+    }
+    if observation_ids.len() > 128 || observation_ids.iter().any(|id| *id <= 0) {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "speaker observation purge bound is invalid".into(),
+        ));
+    }
+    let ids = observation_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let shared: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM utterances WHERE speaker_observation_id IN ({ids})"),
+        [],
+        |row| row.get(0),
+    )?;
+    if shared != 0 {
+        return Err(crate::error::EnclaveError::Conflict(
+            "speaker observation is still shared".into(),
+        ));
+    }
+    let affected_profiles = crate::cp::voice_lineage::backfill_profile_lineage_for_observations_at(
+        tx,
+        observation_ids,
+        mutation_stamp,
+    )?;
+    tx.execute_batch(&format!(
+        "DELETE FROM voice_sample_profile_assignments WHERE sample_id IN (
+             SELECT id FROM voice_samples WHERE speaker_observation_id IN ({ids})
+         );
+         DELETE FROM voice_samples WHERE speaker_observation_id IN ({ids});
+         DELETE FROM voice_embedding_jobs WHERE speaker_observation_id IN ({ids});
+         DELETE FROM speaker_observation_sources WHERE speaker_observation_id IN ({ids});
+         DELETE FROM identity_evidence WHERE speaker_observation_id IN ({ids});
+         DELETE FROM person_name_claims WHERE speaker_observation_id IN ({ids});
+         DELETE FROM person_facts WHERE speaker_observation_id IN ({ids});
+         DELETE FROM speaker_observations WHERE id IN ({ids});"
+    ))?;
+    for profile_id in affected_profiles {
+        crate::cp::voice_memory::sync_recompute_profile_representatives_at(
+            tx,
+            profile_id,
+            mutation_stamp,
+        )?;
+    }
+    Ok(())
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -1174,6 +1421,138 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_episode_purge_does_not_backfill_legacy_voice_lineage() {
+        let store = make_store();
+        let before = store
+            .with_user("missing_purge_voice_user", |conn| {
+                conn.execute_batch(
+                    "INSERT INTO capture_sessions
+                       (id,device_id,install_id,started_at,last_event_at,schema_version)
+                     VALUES ('session','device','install','2026-08-22T00:00:00Z',
+                             '2026-08-22T00:00:01Z',2);
+                     INSERT INTO capture_streams
+                       (id,capture_session_id,device_id,stream_kind)
+                     VALUES ('stream','session','device','audio');
+                     INSERT INTO capture_events
+                       (event_id,device_id,install_id,capture_session_id,stream_id,
+                        stream_kind,sequence,source_wall_at,source_monotonic_ns,
+                        started_at,ended_at,timezone_id,utc_offset_minutes,
+                        clock_uncertainty_ms,asset_id,manifest_digest)
+                     VALUES ('event','device','install','session','stream','audio',0,
+                             '2026-08-22T00:00:00Z','1','2026-08-22T00:00:00Z',
+                             '2026-08-22T00:00:01Z','UTC',0,0,'asset','digest');
+                     INSERT INTO speaker_observations
+                       (event_id,turn_id,speaker_local_id,started_at,ended_at,transcript_text)
+                     VALUES ('event','turn','speaker','2026-08-22T00:00:00Z',
+                             '2026-08-22T00:00:01Z','legacy voice');
+                     INSERT INTO voice_profiles
+                       (label,embedding_space,channel_domain,centroid)
+                     VALUES ('legacy-profile','voice-v1','local',X'0000803F');
+                     INSERT INTO voice_samples
+                       (speaker_observation_id,voice_profile_id,embedding_space,
+                        channel_domain,embedding,quality_score)
+                     VALUES (1,1,'voice-v1','local',X'0000803F',1.0);",
+                )?;
+                Ok((
+                    conn.query_row(
+                        "SELECT label,embedding_space,channel_domain,hex(centroid),sample_count,status
+                         FROM voice_profiles WHERE id=1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )?,
+                    conn.query_row(
+                        "SELECT speaker_observation_id,voice_profile_id,embedding_space,
+                                channel_domain,hex(embedding),quality_score
+                         FROM voice_samples WHERE id=1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, f64>(5)?.to_bits(),
+                            ))
+                        },
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+
+        let missing = store
+            .with_user("missing_purge_voice_user", |conn| purge_episode(conn, 9999))
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        store
+            .with_user("missing_purge_voice_user", |conn| {
+                let after = (
+                    conn.query_row(
+                        "SELECT label,embedding_space,channel_domain,hex(centroid),sample_count,status
+                         FROM voice_profiles WHERE id=1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )?,
+                    conn.query_row(
+                        "SELECT speaker_observation_id,voice_profile_id,embedding_space,
+                                channel_domain,hex(embedding),quality_score
+                         FROM voice_samples WHERE id=1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, f64>(5)?.to_bits(),
+                            ))
+                        },
+                    )?,
+                );
+                assert_eq!(after, before);
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM voice_profile_revisions", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM voice_sample_profile_assignments",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
