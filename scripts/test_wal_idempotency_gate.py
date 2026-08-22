@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 242
+EXPECTED_STORE_CALL_COUNT = 243
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -566,7 +566,32 @@ EXPECTED_STORE_CALL_COUNT = 242
 # replacement-ref refusal and replacement-disabled Git reads to both sides of
 # the release seal. The enclave change remains script/docs-only, so this Store
 # pin and owner inventory again remain unchanged.
-EXPECTED_STORE_CALL_SHA256 = "15a16011068918c7cd513bf8e5b53d5471b2622b77e720690611ba21cda42422"
+# Email-outbox activation was re-derived against a fresh `git archive HEAD` at
+# exact 252fb0f26d26c6f666117f075548bea1184a6ddd. The untouched archive ran its
+# own 14-test gate first and reproduced 242/15a16011 byte-for-byte. Each tree
+# was then dumped with its own scanner/classifier and compared key by key. The
+# active branch is 243 rows:
+#   * NINE additions: routed finalized-brief and due-row reads; five A owner
+#     reads for open claim, frozen request, typed recovery, pre-send authority,
+#     and content-free depth; and two B submits for claim and exact settlement.
+#   * EIGHT removals: the two replaced legacy reads; four read/submit sites from
+#     the superseded general/bulk selected settlement owners; and the legacy
+#     retry-time updater's with_user/save pair, now folded atomically into the
+#     existing legacy state update.
+#   * ZERO reclassifications. Three surviving call expressions move for exact,
+#     reviewed reasons: billing's routed query counts the real `accepted`
+#     state; finalizer's legacy closure includes email in its returned delivery
+#     count; and the legacy updater assigns retry time atomically with state.
+#     Exactly fifteen surviving rows move owner-body hashes: billing's one
+#     routed read, the finalizer's ten read/write rows, and the legacy
+#     enqueue/update Store pairs (four rows, with update overlapping the
+#     expression set above); no other surviving expression moves. This is the
+#     merged third state, not an incremental edit of the push pin.
+# Final warning-free boxing of the strict finalized-episode result changes only
+# the body hash of its already-accounted added routed read; count, keys,
+# classes, the three surviving expression moves, and every delta above remain
+# identical. The final re-derived digest is therefore:
+EXPECTED_STORE_CALL_SHA256 = "d7d93932b5c80e1281d050ae3063baed235d59fca4eb0342b523671abefc5a82"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1366,6 +1391,11 @@ A_OWNERS = frozenset(
         # refusal into a driver-less dashboard row.
         "src/cp/billing.rs::current_account_drivers#0",
         "src/cp/delivery.rs::load_finalized_episode#0",
+        "src/cp/email_worker.rs::load_open_email_claim#0",
+        "src/cp/email_worker.rs::load_frozen_email_request#0",
+        "src/cp/email_worker.rs::load_email_claim_recovery#0",
+        "src/cp/email_worker.rs::validate_archive_email_send_authority#0",
+        "src/cp/email_worker.rs::emit_email_depth#0",
         "src/cp/finalizer.rs::finalize_user_episodes_scoped#0",
         "src/cp/media.rs::read_media_dek_wrapped#0",
         "src/cp/media.rs::stream_ack#0",
@@ -1423,8 +1453,10 @@ B_OWNERS = frozenset(
     {
         "src/cp/finalizer.rs::set_finalization_status#0",
         "src/cp/finalizer.rs::read_finalization_predecessor#0",
+        "src/cp/email_worker.rs::submit_email_claim#0",
+        "src/cp/email_worker.rs::settle_exact_email#0",
         "src/cp/email_worker.rs::settle_email_delivery#0",
-        "src/cp/email_worker.rs::cancel_user_email_deliveries_settled#0",
+        "src/cp/email_worker.rs::cancel_user_email_deliveries#0",
         "src/cp/push.rs::submit_send_claim#0",
         "src/cp/push.rs::settle_delivery_at#0",
         "src/cp/finalizer.rs::settle_lifecycle#0",
@@ -2013,6 +2045,14 @@ impl X {
         email_domain = (ROOT / "src/cp/email_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        email_claim_domain = (
+            ROOT / "src/cp/email_worker/wal/claim.rs"
+        ).read_text(encoding="utf-8")
+        email_claim_production = without_cfg_test_items(email_claim_domain)
+        email_exact_domain = (
+            ROOT / "src/cp/email_worker/wal/exact.rs"
+        ).read_text(encoding="utf-8")
+        email_exact_production = without_cfg_test_items(email_exact_domain)
         push = (ROOT / "src/cp/push.rs").read_text(encoding="utf-8")
         push_domain = (ROOT / "src/cp/push/wal.rs").read_text(encoding="utf-8")
         push_claim_domain = (ROOT / "src/cp/push/wal/claim.rs").read_text(
@@ -2736,18 +2776,71 @@ impl X {
         self.assertNotIn("cp::media_worker::wal::", main)
         self.assertIn("pub(crate) mod wal;", email_worker)
         self.assertIn(
-            "impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan",
+            "impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailSendClaimPlan",
             gate,
         )
         self.assertIn(
-            "impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger",
+            "impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailSendClaimLedger",
             gate,
         )
-        self.assertIn("struct EmailAcceptedPlan", email_domain)
-        self.assertIn("struct EmailAcceptedLedger", email_domain)
-        self.assertIn("archive_v3_wal_email_accepted_operations", email_domain)
-        self.assertIn("DomainLedgerBounds::new", email_domain)
-        self.assertIn("WalIdempotencyError::Precondition", email_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::email_worker::wal::ExactEmailDeliverySettlementPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::email_worker::wal::ExactEmailDeliverySettlementLedger",
+            gate,
+        )
+        self.assertIn("mod claim;", email_domain)
+        self.assertIn("mod exact;", email_domain)
+        self.assertNotIn("mod cancellation;", email_domain)
+        self.assertNotIn("mod settlement;", email_domain)
+        self.assertIn("struct EmailSendClaimPlan", email_claim_domain)
+        self.assertIn("struct EmailSendClaimLedger", email_claim_domain)
+        self.assertIn("archive_v3_wal_email_claim_operations", email_claim_domain)
+        self.assertIn("archive_v3_wal_email_send_claims", email_claim_domain)
+        self.assertIn("archive_v3_wal_email_frozen_requests", email_claim_domain)
+        self.assertIn("MAX_DEFERRED_CLAIMS_PER_ATTEMPT", email_claim_domain)
+        self.assertIn("MAX_FROZEN_REQUESTS: u32 = 65_536", email_claim_domain)
+        self.assertIn(
+            "MAX_FROZEN_REQUEST_BYTES: u64 = 1024 * 1024 * 1024",
+            email_claim_domain,
+        )
+        self.assertIn(
+            "archive_v3_wal_email_frozen_request_delete_accounting",
+            email_claim_domain,
+        )
+        claim_table_ddl = email_claim_domain.split(
+            "CREATE TABLE archive_v3_wal_email_send_claims", 1
+        )[1].split(") STRICT;", 1)[0]
+        self.assertIn("request_commitment BLOB NOT NULL", claim_table_ddl)
+        self.assertNotIn("request_text_body TEXT", claim_table_ddl)
+        self.assertNotIn("request_html_body TEXT", claim_table_ddl)
+        self.assertIn("load_frozen_request", email_claim_domain)
+        self.assertIn("DomainLedgerBounds::new", email_claim_domain)
+        self.assertIn("WalIdempotencyError::Precondition", email_claim_domain)
+        self.assertIn("struct ExactEmailDeliverySettlementPlan", email_exact_domain)
+        self.assertIn("struct ExactEmailDeliverySettlementLedger", email_exact_domain)
+        self.assertIn(
+            "archive_v3_wal_email_exact_settlement_operations",
+            email_exact_domain,
+        )
+        self.assertIn("DomainLedgerBounds::new", email_exact_domain)
+        self.assertIn("WalIdempotencyError::Precondition", email_exact_domain)
+        for forbidden in (
+            "crate::store::Store",
+            "ControlStore",
+            "reqwest",
+            "SystemTime",
+            "tokio::spawn",
+            ".send(",
+        ):
+            self.assertNotIn(forbidden, email_claim_production)
+            self.assertNotIn(forbidden, email_exact_production)
+        self.assertIn("EmailSendClaimPlan::new(", email_worker)
+        self.assertIn("ExactEmailDeliverySettlementPlan::new(", email_worker)
+        self.assertIn("begin_email_send_fence(", email_worker)
+        self.assertIn("transport.send(request).await", email_worker)
         self.assertNotIn("EmailAcceptedPlan::", email_worker)
         self.assertNotIn("cp::email_worker::wal::", main)
         self.assertIn("pub(crate) mod wal;", push)

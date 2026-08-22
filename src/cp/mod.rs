@@ -684,6 +684,15 @@ pub(crate) mod wal_gate_test_support {
         pub(crate) user_id: String,
     }
 
+    impl AnswerableArchive {
+        /// Test-only handle for exact Control-save fault injection. The WAL
+        /// archive provider remains private, so this grants no archive write
+        /// shortcut and cannot make an unavailable archive look answerable.
+        pub(crate) fn control_gcs(&self) -> Arc<crate::store::tests::FakeGcs> {
+            self._substrate.control_gcs()
+        }
+    }
+
     /// Converge genesis for `user_id` (which must be a UUID — the fixture plan
     /// validates it), then seed the archive through the WAL lane.
     ///

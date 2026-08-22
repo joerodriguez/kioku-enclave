@@ -367,7 +367,10 @@ pub(super) struct FinalizationEmailDelivery {
 
 impl FinalizationEmailDelivery {
     pub(super) fn new(delivery_id: String, include_content: bool) -> Result<Self> {
-        validate_prefixed_hex(&delivery_id, "deliv_")?;
+        validate_prefixed_hex(
+            &delivery_id,
+            crate::cp::email_worker::SELECTED_EMAIL_DELIVERY_PREFIX,
+        )?;
         Ok(Self {
             delivery_id,
             include_content,
@@ -2266,7 +2269,7 @@ mod tests {
     const WEBHOOK_EVENT: &str =
         "evt_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const EMAIL_DELIVERY: &str =
-        "deliv_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        "e1_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const HANDOFF: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const ATTEMPTED_AT: &str = "2026-08-15T14:00:00.000Z";
     const UPDATED_AT: &str = "2026-08-15T14:00:01.000Z";

@@ -7,7 +7,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::cp::CpState;
-use crate::error::{wal_domain, Result};
+use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecisionDetail {
@@ -44,28 +44,21 @@ pub struct FinalizedEpisode {
     pub open_questions: Vec<String>,
 }
 
-pub fn parse_string_list(raw: Option<String>) -> Vec<String> {
-    raw.and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizedEpisodeLoad {
+    Missing,
+    Malformed(&'static str),
+    Present(Box<FinalizedEpisode>),
 }
 
 pub async fn load_finalized_episode(
     state: &CpState,
     user_id: &str,
     episode_id: i64,
-) -> Result<Option<FinalizedEpisode>> {
-    // ADR-0022 D4: the brief join is not migrated. Every outbound channel
-    // gates its own sweep before reaching here, so this is the backstop —
-    // and it must REFUSE, never answer `Ok(None)`: the webhook worker reads
-    // `None` as `event_data_missing` and terminalises the delivery, so a
-    // silent empty here would destroy the outbox instead of deferring it.
-    if let Some(error) = state.wal_domain_refusal(user_id, wal_domain::DELIVERY_FINALIZED_EPISODE) {
-        return Err(error);
-    }
-    let user = user_id.to_string();
+) -> Result<FinalizedEpisodeLoad> {
     state
         .store
-        .with_user(&user, move |conn| {
+        .wal_authoritative_read(user_id, move |conn| {
             let row = conn
                 .query_row(
                     "SELECT e.title, e.started_at, e.ended_at, e.finalized_at, e.type,
@@ -73,30 +66,75 @@ pub async fn load_finalized_episode(
                             b.important_links, b.open_questions
                      FROM episodes e
                      JOIN episode_final_briefs b ON b.episode_id = e.id
-                     WHERE e.id = ?1",
+                     WHERE e.id = ?1 AND e.finalization_status = 'complete'
+                       AND e.finalized_at IS NOT NULL",
                     [episode_id],
                     |r| {
-                        Ok(FinalizedEpisode {
-                            episode_id,
-                            title: r.get(0)?,
-                            started_at: r.get(1)?,
-                            ended_at: r.get(2)?,
-                            finalized_at: r.get(3)?,
-                            episode_type: r.get(4)?,
-                            participants: parse_string_list(r.get(5)?),
-                            overview: r.get(6)?,
-                            decisions: serde_json::from_str(&r.get::<_, String>(7)?)
-                                .unwrap_or_default(),
-                            action_items: serde_json::from_str(&r.get::<_, String>(8)?)
-                                .unwrap_or_default(),
-                            important_links: serde_json::from_str(&r.get::<_, String>(9)?)
-                                .unwrap_or_default(),
-                            open_questions: parse_string_list(r.get(10)?),
-                        })
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, String>(8)?,
+                            r.get::<_, String>(9)?,
+                            r.get::<_, String>(10)?,
+                        ))
                     },
                 )
                 .optional()?;
-            Ok(row)
+            let Some((
+                title,
+                started_at,
+                ended_at,
+                finalized_at,
+                episode_type,
+                participants,
+                overview,
+                decisions,
+                action_items,
+                important_links,
+                open_questions,
+            )) = row
+            else {
+                return Ok(FinalizedEpisodeLoad::Missing);
+            };
+            let malformed = FinalizedEpisodeLoad::Malformed;
+            Ok(FinalizedEpisodeLoad::Present(Box::new(FinalizedEpisode {
+                episode_id,
+                title,
+                started_at,
+                ended_at,
+                finalized_at,
+                episode_type,
+                participants: match participants {
+                    Some(raw) => match serde_json::from_str(&raw) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(malformed("participants")),
+                    },
+                    None => Vec::new(),
+                },
+                overview,
+                decisions: match serde_json::from_str(&decisions) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(malformed("decisions")),
+                },
+                action_items: match serde_json::from_str(&action_items) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(malformed("action_items")),
+                },
+                important_links: match serde_json::from_str(&important_links) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(malformed("important_links")),
+                },
+                open_questions: match serde_json::from_str(&open_questions) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(malformed("open_questions")),
+                },
+            })))
         })
         .await
 }
@@ -105,38 +143,59 @@ pub async fn load_finalized_episode(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_string_list_roundtrip() {
-        assert_eq!(parse_string_list(None), Vec::<String>::new());
-        assert_eq!(
-            parse_string_list(Some("[\"Alice\",\"Bob\"]".to_string())),
-            vec!["Alice".to_string(), "Bob".to_string()]
-        );
-        assert_eq!(
-            parse_string_list(Some("invalid".to_string())),
-            Vec::<String>::new()
-        );
-    }
-
-    /// ADR-0022 D4. The finalized-brief loader is deferred, and it must REFUSE
-    /// rather than answer `Ok(None)`: the webhook worker reads `None` as
-    /// `event_data_missing` and terminalises the delivery, so a silent empty
-    /// would destroy the outbox instead of deferring it.
+    /// A selected archive without its serving authority must still refuse;
+    /// genuine absence alone is `Ok(Missing)`. This distinction prevents an
+    /// authority outage from being mistaken for a terminal missing brief.
     #[tokio::test]
-    async fn a_deferred_brief_load_refuses_instead_of_reporting_no_brief() {
+    async fn unavailable_selected_brief_authority_refuses_instead_of_reporting_absence() {
         use crate::cp::wal_gate_test_support::{select_wal_authoritative, state};
-        use crate::error::{wal_domain, EnclaveError};
+        use crate::error::EnclaveError;
 
         let state = state();
         let user_id = "delivery-deferred-user";
         select_wal_authoritative(&state.store, user_id);
 
         match load_finalized_episode(&state, user_id, 1).await {
-            Err(EnclaveError::WalDomainUnmigrated(domain)) => {
-                assert_eq!(domain, wal_domain::DELIVERY_FINALIZED_EPISODE);
+            Err(EnclaveError::Store(message)) => {
+                assert!(message.contains("serving authority"), "{message}");
             }
-            Ok(None) => panic!("a deferred brief must never be reported as absent"),
+            Ok(FinalizedEpisodeLoad::Missing) => {
+                panic!("an unavailable brief must never be reported as absent")
+            }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn genuine_absence_is_none_but_malformed_finalized_json_fails_closed() {
+        use crate::cp::wal_gate_test_support::state;
+
+        let state = state();
+        let user_id = "legacy-delivery-loader";
+        assert_eq!(
+            load_finalized_episode(&state, user_id, 1).await.unwrap(),
+            FinalizedEpisodeLoad::Missing
+        );
+        state
+            .store
+            .with_user(user_id, |connection| {
+                connection.execute_batch(
+                    "INSERT INTO episodes
+                       (id,started_at,ended_at,finalized_at,title,substance,finalization_status)
+                     VALUES
+                       (1,'2026-08-20T19:00:00.000Z','2026-08-20T19:30:00.000Z',
+                        '2026-08-20T19:31:00.000Z','Malformed brief','normal','complete');
+                     INSERT INTO episode_final_briefs
+                       (episode_id,overview,decisions,action_items,important_links,open_questions)
+                     VALUES (1,'overview','not-json','[]','[]','[]');",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            load_finalized_episode(&state, user_id, 1).await,
+            Ok(FinalizedEpisodeLoad::Malformed("decisions"))
+        ));
     }
 }

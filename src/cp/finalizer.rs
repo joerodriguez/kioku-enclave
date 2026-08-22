@@ -2078,7 +2078,11 @@ async fn finalize_commit_settled(
         let email = match inputs.email_preference_include_content {
             Some(include_content) => Some(
                 wal::FinalizationEmailDelivery::new(
-                    format!("deliv_{}", super::tokens::random_token_hex()),
+                    format!(
+                        "{}{}",
+                        super::email_worker::SELECTED_EMAIL_DELIVERY_PREFIX,
+                        super::tokens::random_token_hex()
+                    ),
                     include_content,
                 )
                 .map_err(map_construct)?,
@@ -2104,7 +2108,7 @@ async fn finalize_commit_settled(
         (Vec::new(), None, Vec::new())
     };
     let delivery_count = if initial {
-        webhooks.len() + pushes.len()
+        webhooks.len() + usize::from(email.is_some()) + pushes.len()
     } else {
         0
     };
@@ -2170,26 +2174,34 @@ pub(in crate::cp) async fn enqueue_push_delivery_for_activation_test(
     handoff_handle: &str,
     collapse_id: &str,
 ) -> Result<i64> {
-    finalize_push_activation_fixture(
+    finalize_delivery_activation_fixture(
         state,
         user_id,
-        installation_id,
-        delivery_id,
-        handoff_handle,
-        collapse_id,
+        None,
+        Some((installation_id, delivery_id, handoff_handle, collapse_id)),
     )
     .await
 }
 
+/// Build one selected email row through the same sealed finalization owner
+/// used in production. The returned episode is complete and its brief is the
+/// exact source from which the worker freezes the provider request.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn finalize_push_activation_fixture(
+pub(in crate::cp) async fn enqueue_email_delivery_for_activation_test(
     state: &CpState,
     user_id: &str,
-    installation_id: &str,
-    delivery_id: &str,
-    handoff_handle: &str,
-    collapse_id: &str,
+    include_content: bool,
+) -> Result<i64> {
+    finalize_delivery_activation_fixture(state, user_id, Some(include_content), None).await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_delivery_activation_fixture(
+    state: &CpState,
+    user_id: &str,
+    email_preference_include_content: Option<bool>,
+    push_destination: Option<(&str, &str, &str, &str)>,
 ) -> Result<i64> {
     let (window_seq, sequence_pin) = state
         .store
@@ -2235,8 +2247,8 @@ async fn finalize_push_activation_fixture(
             started_at: from_iso.clone(),
             ended_at: to_iso.clone(),
             episode_type: Some("test".into()),
-            title: "Push delivery activation fixture".into(),
-            summary: Some("A finalized episode with one APNs delivery.".into()),
+            title: "Delivery activation fixture".into(),
+            summary: Some("A finalized episode with one outbound delivery.".into()),
             participants_json: Some("[]".into()),
             languages_json: Some("[]".into()),
             action_items_json: Some("[]".into()),
@@ -2249,7 +2261,7 @@ async fn finalize_push_activation_fixture(
             member_screenshot_ids: Vec::new(),
         },
     )
-    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    .map_err(|_| EnclaveError::Store("delivery gate episode plan construction failed".into()))?;
     let window = super::summarizer::wal::EpisodeWindowUpsertPlan::new(
         user_id.to_owned(),
         window_seq,
@@ -2261,7 +2273,7 @@ async fn finalize_push_activation_fixture(
         vec![episode],
     )
     .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
-    .map_err(|_| EnclaveError::Store("push gate episode plan construction failed".into()))?;
+    .map_err(|_| EnclaveError::Store("delivery gate episode plan construction failed".into()))?;
     state
         .store
         .wal_authoritative_submit(user_id, window)
@@ -2301,12 +2313,12 @@ async fn finalize_push_activation_fixture(
             input_identity_revision: 0,
             model_name,
             analysis_revision: "a".repeat(64),
-            title: "Push delivery activation fixture".into(),
-            summary: "A finalized episode with one APNs delivery.".into(),
+            title: "Delivery activation fixture".into(),
+            summary: "A finalized episode with one outbound delivery.".into(),
             minute_summaries_json: "[]".into(),
             minutes_text: String::new(),
             action_items_json: "[]".into(),
-            overview: "The finalizer enqueued one push delivery.".into(),
+            overview: "The finalizer enqueued one outbound delivery.".into(),
             decisions_json: "[]".into(),
             important_links_json: "[]".into(),
             open_questions_json: "[]".into(),
@@ -2315,19 +2327,30 @@ async fn finalize_push_activation_fixture(
             utterance_members: Vec::new(),
             screenshot_members: Vec::new(),
             webhook_destinations: Vec::new(),
-            email_preference_include_content: None,
-            push_destinations: vec![(
-                super::push::PushInstallationBinding::new(installation_id, 1)?.encode(),
-                delivery_id.to_owned(),
-                handoff_handle.to_owned(),
-                collapse_id.to_owned(),
-            )],
+            email_preference_include_content,
+            push_destinations: push_destination
+                .map(
+                    |(installation_id, delivery_id, handoff_handle, collapse_id)| {
+                        super::push::PushInstallationBinding::new(installation_id, 1).map(
+                            |binding| {
+                                vec![(
+                                    binding.encode(),
+                                    delivery_id.to_owned(),
+                                    handoff_handle.to_owned(),
+                                    collapse_id.to_owned(),
+                                )]
+                            },
+                        )
+                    },
+                )
+                .transpose()?
+                .unwrap_or_default(),
         },
     )
     .await?;
     if delivery_count != 1 {
         return Err(EnclaveError::Store(
-            "push activation finalization produced the wrong delivery count".into(),
+            "delivery activation finalization produced the wrong delivery count".into(),
         ));
     }
     Ok(episode_id)
@@ -2887,12 +2910,8 @@ async fn finalize_user_episodes_scoped(
             .map(|subscription| (subscription.id, super::webhook_worker::new_event_id()))
             .collect();
 
-        let email_preference = state
-            .control
-            .get_email_preference(user_id)
-            .await
-            .ok()
-            .filter(|pref| pref.enabled);
+        let email_preference = state.control.get_email_preference(user_id).await?;
+        let email_preference = email_preference.enabled.then_some(email_preference);
 
         // Snapshot active installations before the user-content transaction.
         // The worker re-resolves each installation before sending, so a later
@@ -3246,7 +3265,9 @@ async fn finalize_user_episodes_scoped(
 
             transaction.commit()?;
             Ok(if deliveries_enqueued {
-                webhook_destinations.len() + push_destinations.len()
+                webhook_destinations.len()
+                    + usize::from(email_preference.is_some())
+                    + push_destinations.len()
             } else {
                 0
             })

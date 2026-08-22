@@ -1690,7 +1690,7 @@ async fn current_account_drivers(
                 )?;
                 let accepted_email_count: i64 = conn.query_row(
                     "SELECT count(*) FROM email_deliveries
-                 WHERE state='sent'
+                 WHERE state='accepted'
                    AND substr(updated_at,1,7)=?1",
                     [&period],
                     |row| row.get(0),

@@ -464,16 +464,18 @@ separate activation blockers.
     exactly replay. The future provider deletion boundary must settle the exact
     object before constructing this plan; Store/provider list/read/delete,
     worker/launcher/task/acknowledgement wiring remain absent.
-  - [x] Add the inactive provider-accepted email A-domain: the already durable
-    delivery ID remains the external idempotency key and derives one opaque
-    operation before actor admission. The exact pending/retry predecessor row,
-    provider message ID, 2xx status, and fixed settlement timestamp are all
-    fingerprinted. A full-row CAS or exact terminal adoption and a distinct
-    1,048,576-row/32-MiB permanent ledger commit atomically. Missing or changed
-    predecessors, alternate provider facts, cap exhaustion, late ledger failure,
-    partial schema, tamper, and reopen fail closed or exactly replay. Sending,
-    retry allocation/timing, Store/worker/launcher/task/acknowledgement wiring,
-    and, in that slice, the webhook/push delivery domains remained absent.
+  - [x] Activate the selected email outbox: route the due-row and complete
+    finalized-brief reads, freeze one exact bounded recipient/rendered request
+    per delivery, and durably claim it before Resend behind an exact Control
+    disclosure fence. Typed cancel/defer/retry/accepted/failed/ambiguous
+    settlement carries the complete predecessor across I/O, full-row-CASes or
+    exactly adopts the target, and reconciles either side of an asymmetric
+    Control/archive save. Lost responses never resend; definitive rejects use
+    bounded Retry-After/backoff and ten attempts. A 24-hour activation cutoff,
+    provider-free malformed/consent/deletion/capacity settlements, two-call
+    account sweep, 250-ms singleton-runtime pacing/circuit, content-free
+    telemetry, strict JSON loading, billing parity, and legacy regression are
+    covered. The old acceptance-only and bulk-cancellation children are removed.
   - [x] Add the inactive provider-accepted APNs A-domain: the already durable
     delivery UUID is sent as `apns-id` and derives one opaque operation before
     actor admission. The exact installation/episode/handoff/collapse binding,

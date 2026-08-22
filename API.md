@@ -511,6 +511,32 @@ acceleration. Native clients retry it only after all durable events for that ses
 accepted. Correctness and later finalization do not depend on this request because the
 final accepted audio manifest carries `session_finished=true`.
 
+## Episode-ready email preference
+
+Authenticated clients read and update the account-level preference at
+`GET /api/preferences/episode-email` and `PUT /api/preferences/episode-email`.
+The update body is `{"enabled":true,"include_content":false}`; the response
+also returns the verified account email as `recipient_email` and whether the
+provider is configured as `available`. Responses are `no-store`.
+
+An initial completed memory creates one durable email delivery when the
+preference is enabled; recap regeneration does not enqueue another. A selected
+Genesis archive freezes the exact current recipient, rendered text and HTML,
+content-consent decision, and `e1_` idempotency key before its first provider
+call. Retries reuse those exact bytes. Preference disablement, content downgrade,
+or account deletion cannot pass the durable pre-send disclosure fence; changing
+the preference conflicts while an exact send is in flight.
+
+Deliveries older than 24 hours and malformed, missing, exhausted, or
+capacity-limited rows are cancelled without provider I/O. Known provider
+rejections retry with bounded `Retry-After`/backoff up to ten attempts. A lost
+or otherwise ambiguous response is never resent. Provider acceptance records
+the provider's actual 2xx status and message ID. The selected worker sends at
+most two emails per account per sweep, uses 250-ms process-local pacing, and
+opens a process-local provider circuit for provider-wide failures. Production
+relies on the same release-verified singleton VM/container contract described
+for push; overlapping or horizontal runtimes remain forbidden.
+
 ## Apple ready-notification installation
 
 Authenticated native clients opt in one device with

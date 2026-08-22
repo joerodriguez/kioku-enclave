@@ -999,13 +999,13 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and admits exactly fifteen production A-domain codecs:
+test-only 64-row/262,720-byte exemplar and admits a closed production plan set:
 capture-session finish, local canonical-capture receipt, metadata-only screen-reference batch, selected-screenshot receipt,
 caller-stable finalization queue, exact finalization commit, screen-storyboard result without person evidence,
-raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
+raw-media retention settlement, active email claim/exact settlement, provider-accepted APNs, definitive-success
 webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
 cursor-bound visual-evidence backfill batch, and Vertex usage terminal outcome.
-Activation remains an explicit owner-by-owner decision. The active push owner additionally wires
+Activation remains an explicit owner-by-owner decision. The active email and push owners wire
 separate sealed pre-send-claim and complete-predecessor general-settlement families; the older
 definitive-acceptance-only APNs codec remains an unwired compatibility family.
 Capture-session finish derives an opaque
@@ -1220,14 +1220,19 @@ ready/failed media row pruned or adopt the identical terminal row, and it retain
 distinct 1,048,576-row/32-MiB ledger. An early deadline, changed provider fact, changed terminal time,
 cap exhaustion, late ledger failure, partial schema, tamper, or reopen fails closed or exactly replays.
 The future provider deletion boundary must authenticate and settle the exact object before constructing
-this plan; the child cannot call Store or list/read/delete provider objects. The email child accepts
-only the local settlement half of a definitive provider acceptance for an
-already durable delivery. The same delivery ID is the external idempotency key and derives the
-operation identity; its exact pending/retry row (including prior attempt, response/error, and
-timestamps), provider message ID, 2xx status, and fixed acceptance time form the fingerprint. It
-either full-row-CASes that predecessor to accepted or adopts only the identical terminal row, with
-unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send email, allocate or schedule a
-retry, call Store, launch a worker, or acknowledge delivery. The APNs child similarly accepts only
+this plan; the child cannot call Store or list/read/delete provider objects. The active email
+children persist one random leased claim before Resend and retain the complete due-row predecessor,
+checked next attempt, and commitment to a single frozen recipient/rendered request. That request is
+stored once per delivery under a 65,536-row/1-GiB archive budget and deleted with the delivery;
+every retry uses the same 24-hour idempotency key and exact bytes. A separate exact child admits only
+typed cancel/defer/retry/accepted/failed/ambiguous transitions, full-row-CASes or adopts the complete
+target, and settles the optional claim in the same transaction. Control holds a short exact
+disclosure fence and typed provider receipt, so archive and Control recover each other after an
+asymmetric save. Live competing claims remain inert; expired claims become ambiguous without a
+resend. Claimless cancellation refuses a live claim. Malformed, old, disabled, deleting, absent,
+unrenderable, or capacity-limited work settles provider-free, while archive/Control unavailability
+remains retryable. The children cannot call Store, Control, Resend, launch work, or choose policy.
+The APNs child similarly accepts only
 the local settlement half of a definitive provider acceptance for an already durable delivery. Its
 UUID is fixed before I/O and sent as `apns-id`; that UUID derives the operation identity, while the
 exact episode/installation/version/handoff/collapse binding, pending/retry attempt and prior outcome,
@@ -1317,12 +1322,12 @@ media-work results, Vertex usage outcomes, existing-key webhook/email/push trans
 and reviewer/backfill writes. Only capture-session finish, local canonical-capture receipt,
 metadata-only screen-reference batch,
 selected-screenshot receipt, screen-storyboard result without person evidence,
-raw-media retention settlement, provider-accepted email,
+raw-media retention settlement, active email claim/exact settlement,
 provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
 exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
 substance and visual-evidence backfills; these are the complete reviewed A set for this gate.
-Activation is still per-domain; the live push owner separately uses the sealed claim and general
+Activation is still per-domain; the live email and push owners use the sealed claim and general
 settlement families described above. Every other semantic A operation remains disabled pending its own separately reviewed codec
 and activation adapter. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive

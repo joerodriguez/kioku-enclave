@@ -303,9 +303,11 @@ async fn load_event(
     outbox: &OutboxRow,
     include_content: bool,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(details) = delivery::load_finalized_episode(state, user_id, outbox.episode_id).await?
-    else {
-        return Ok(None);
+    let details = match delivery::load_finalized_episode(state, user_id, outbox.episode_id).await? {
+        delivery::FinalizedEpisodeLoad::Present(details) => details,
+        delivery::FinalizedEpisodeLoad::Missing | delivery::FinalizedEpisodeLoad::Malformed(_) => {
+            return Ok(None)
+        }
     };
 
     let mut data = json!({
@@ -704,19 +706,6 @@ mod tests {
         assert!(sig.starts_with("v1,"));
         let sig2 = signature(&secret, "evt_test123", 1700000000, b"{\"test\":true}").unwrap();
         assert_eq!(sig, sig2);
-    }
-
-    #[test]
-    fn parse_string_list_handles_malformed_and_missing_json() {
-        assert_eq!(delivery::parse_string_list(None), Vec::<String>::new());
-        assert_eq!(
-            delivery::parse_string_list(Some("not json".into())),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            delivery::parse_string_list(Some("[\"alice\", \"bob\"]".into())),
-            vec!["alice".to_string(), "bob".to_string()]
-        );
     }
 
     #[test]
