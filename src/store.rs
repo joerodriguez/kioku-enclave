@@ -2611,15 +2611,16 @@ fn transition_matches(open: &OpenUser, transition: &Arc<RegistryTransition>) -> 
 
 #[derive(Debug, Clone)]
 pub struct EmailDeliveryRow {
+    pub rowid: i64,
     pub episode_id: i64,
-    pub delivery_version: i32,
+    pub delivery_version: i64,
     pub delivery_id: String,
     pub include_content: bool,
     pub state: String,
-    pub attempt_count: i32,
+    pub attempt_count: i64,
     pub next_attempt_at: String,
     pub provider_message_id: Option<String>,
-    pub response_status: Option<u16>,
+    pub response_status: Option<i64>,
     pub error_code: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -5152,7 +5153,7 @@ impl Store {
         &self,
         user_id: &str,
         episode_id: i64,
-        delivery_version: i32,
+        delivery_version: i64,
         include_content: bool,
     ) -> Result<String> {
         let user = user_id.to_string();
@@ -5186,7 +5187,6 @@ impl Store {
     }
 
     pub async fn next_email_delivery(&self, user_id: &str) -> Result<Option<EmailDeliveryRow>> {
-        let user = user_id.to_string();
         let now = crate::cp::isotime::format_epoch_millis(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5194,33 +5194,40 @@ impl Store {
                 .as_millis() as i64,
         );
 
-        self.with_user(&user, move |conn| {
+        self.wal_authoritative_read(user_id, move |conn| {
             Ok(conn
                 .query_row(
-                    "SELECT episode_id, delivery_version, delivery_id, include_content, state,
+                    "SELECT rowid, episode_id, delivery_version, delivery_id, include_content, state,
                             attempt_count, next_attempt_at, provider_message_id, response_status,
                             error_code, created_at, updated_at
                      FROM email_deliveries
-                     WHERE state IN ('pending', 'retry') AND next_attempt_at <= ?1
-                     ORDER BY created_at, episode_id
+                     WHERE state IN ('pending', 'retry')
+                       AND (
+                         next_attempt_at <= ?1
+                         OR length(next_attempt_at) != 24
+                         OR next_attempt_at NOT GLOB
+                           '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+                         OR julianday(next_attempt_at) IS NULL
+                       )
+                     ORDER BY created_at, episode_id, delivery_id
                      LIMIT 1",
                     [&now],
                     |r| {
-                        let include_num: i64 = r.get(3)?;
-                        let resp_status: Option<i64> = r.get(8)?;
+                        let include_num: i64 = r.get(4)?;
                         Ok(EmailDeliveryRow {
-                            episode_id: r.get(0)?,
-                            delivery_version: r.get(1)?,
-                            delivery_id: r.get(2)?,
+                            rowid: r.get(0)?,
+                            episode_id: r.get(1)?,
+                            delivery_version: r.get(2)?,
+                            delivery_id: r.get(3)?,
                             include_content: include_num != 0,
-                            state: r.get(4)?,
-                            attempt_count: r.get(5)?,
-                            next_attempt_at: r.get(6)?,
-                            provider_message_id: r.get(7)?,
-                            response_status: resp_status.map(|s| s as u16),
-                            error_code: r.get(9)?,
-                            created_at: r.get(10)?,
-                            updated_at: r.get(11)?,
+                            state: r.get(5)?,
+                            attempt_count: r.get(6)?,
+                            next_attempt_at: r.get(7)?,
+                            provider_message_id: r.get(8)?,
+                            response_status: r.get(9)?,
+                            error_code: r.get(10)?,
+                            created_at: r.get(11)?,
+                            updated_at: r.get(12)?,
                         })
                     },
                 )
@@ -5234,17 +5241,19 @@ impl Store {
         &self,
         user_id: &str,
         episode_id: i64,
-        delivery_version: i32,
+        delivery_version: i64,
         state: &str,
-        attempt_count: i32,
+        attempt_count: i64,
         provider_message_id: Option<&str>,
         response_status: Option<u16>,
         error_code: Option<&str>,
+        next_attempt_at: Option<&str>,
     ) -> Result<()> {
         let user = user_id.to_string();
         let state = state.to_string();
         let provider_message_id = provider_message_id.map(str::to_string);
         let error_code = error_code.map(str::to_string);
+        let next_attempt_at = next_attempt_at.map(str::to_string);
         let now = crate::cp::isotime::format_epoch_millis(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5256,47 +5265,20 @@ impl Store {
             conn.execute(
                 "UPDATE email_deliveries
                  SET state = ?1, attempt_count = ?2, provider_message_id = ?3,
-                     response_status = ?4, error_code = ?5, updated_at = ?6
-                 WHERE episode_id = ?7 AND delivery_version = ?8",
+                     response_status = ?4, error_code = ?5,
+                     next_attempt_at = COALESCE(?6,next_attempt_at), updated_at = ?7
+                 WHERE episode_id = ?8 AND delivery_version = ?9",
                 rusqlite::params![
                     state,
                     attempt_count,
                     provider_message_id,
                     response_status.map(i64::from),
                     error_code,
+                    next_attempt_at,
                     now,
                     episode_id,
                     delivery_version,
                 ],
-            )?;
-            Ok(())
-        })
-        .await?;
-        self.save_user(user_id).await
-    }
-
-    pub async fn set_email_delivery_next_attempt(
-        &self,
-        user_id: &str,
-        episode_id: i64,
-        delivery_version: i32,
-        next_attempt_at: &str,
-    ) -> Result<()> {
-        let user = user_id.to_string();
-        let next_attempt_at = next_attempt_at.to_string();
-        let now = crate::cp::isotime::format_epoch_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-        );
-
-        self.with_user(&user, move |conn| {
-            conn.execute(
-                "UPDATE email_deliveries
-                 SET next_attempt_at = ?1, updated_at = ?2
-                 WHERE episode_id = ?3 AND delivery_version = ?4",
-                rusqlite::params![next_attempt_at, now, episode_id, delivery_version],
             )?;
             Ok(())
         })
@@ -17355,11 +17337,41 @@ pub(crate) mod tests {
                 Some("msg_resend_1"),
                 Some(200),
                 None,
+                None,
             )
             .await
             .unwrap();
 
         // No more due rows
         assert!(store.next_email_delivery(user_id).await.unwrap().is_none());
+
+        // A malformed future-looking timestamp must be returned to the owner
+        // for provider-free terminal settlement. It must not become an
+        // immortal row merely because lexical ordering puts it after `now`.
+        store
+            .with_user(user_id, |conn| {
+                conn.execute_batch(
+                    "INSERT INTO episodes
+                       (id,started_at,ended_at,title,summary,substance)
+                     VALUES
+                       (101,'2026-07-30T11:00:00Z','2026-07-30T11:30:00Z',
+                        'Malformed retry','Test Summary','normal');
+                     INSERT INTO email_deliveries
+                       (episode_id,delivery_version,delivery_id,include_content,state,
+                        attempt_count,next_attempt_at,created_at,updated_at)
+                     VALUES
+                       (101,1,'deliv_malformed_retry',0,'retry',0,'zzzz-not-a-time',
+                        '2026-07-30T11:30:00.000Z','2026-07-30T11:30:00.000Z');",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let malformed = store
+            .next_email_delivery(user_id)
+            .await
+            .unwrap()
+            .expect("malformed retry is surfaced");
+        assert_eq!(malformed.delivery_id, "deliv_malformed_retry");
     }
 }

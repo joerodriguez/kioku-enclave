@@ -113,6 +113,7 @@ const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "offline_recording_usage_receipts",
     "webhook_subscriptions",
     "episode_email_preferences",
+    "email_send_fences",
     "push_installations",
     "push_send_fences",
     "auth_identities",
@@ -1636,6 +1637,30 @@ CREATE TABLE IF NOT EXISTS episode_email_preferences (
     consented_at     TEXT,
     updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Exact, short-transaction email provider capability and outcome receipt.
+-- Keys deliberately have no FK so a current missing/disabled preference
+-- decision remains durable until the archive half reconciles. No Control
+-- lock crosses provider I/O.
+CREATE TABLE IF NOT EXISTS email_send_fences (
+    user_id            TEXT NOT NULL,
+    delivery_id        TEXT NOT NULL,
+    claim_id           TEXT NOT NULL UNIQUE CHECK(length(claim_id)=36),
+    lease_expires_at   TEXT NOT NULL,
+    recipient_email    TEXT NOT NULL,
+    include_content    INTEGER NOT NULL CHECK(include_content IN (0,1)),
+    outcome_kind       TEXT CHECK(outcome_kind IN (
+                           'accepted','retry','ambiguous','failed',
+                           'cancel_account_inactive','cancel_preference_disabled',
+                           'cancel_recipient_changed','cancel_content_consent_changed')),
+    provider_status    INTEGER,
+    provider_message_id TEXT,
+    provider_error     TEXT,
+    retry_at           TEXT,
+    outcome_at         TEXT,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY(user_id,delivery_id)
+);
+CREATE INDEX IF NOT EXISTS email_send_fences_user_idx ON email_send_fences(user_id);
 CREATE TABLE IF NOT EXISTS push_installations (
     id               TEXT PRIMARY KEY,
     user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
@@ -2090,6 +2115,123 @@ pub struct EpisodeEmailPreference {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EmailControlCancellation {
+    AccountInactive,
+    PreferenceDisabled,
+    RecipientChanged,
+    ContentConsentChanged,
+}
+
+impl EmailControlCancellation {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::AccountInactive => "cancel_account_inactive",
+            Self::PreferenceDisabled => "cancel_preference_disabled",
+            Self::RecipientChanged => "cancel_recipient_changed",
+            Self::ContentConsentChanged => "cancel_content_consent_changed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EmailProviderOutcome {
+    Accepted {
+        status: i64,
+        provider_message_id: String,
+    },
+    Retry {
+        status: Option<i64>,
+        code: String,
+        retry_at: String,
+    },
+    Ambiguous,
+    Failed {
+        status: Option<i64>,
+        code: String,
+    },
+}
+
+impl EmailProviderOutcome {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "accepted",
+            Self::Retry { .. } => "retry",
+            Self::Ambiguous => "ambiguous",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    fn fields(&self) -> (Option<i64>, Option<&str>, Option<&str>, Option<&str>) {
+        match self {
+            Self::Accepted {
+                status,
+                provider_message_id,
+            } => (Some(*status), Some(provider_message_id), None, None),
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => (*status, None, Some(code), Some(retry_at)),
+            Self::Ambiguous => (None, None, None, None),
+            Self::Failed { status, code } => (*status, None, Some(code), None),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Accepted {
+                status,
+                provider_message_id,
+            } => (200..=299).contains(status) && valid_email_fence_text(provider_message_id, 512),
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => {
+                status.is_none_or(|status| (100..=599).contains(&status))
+                    && valid_email_fence_text(code, 256)
+                    && valid_email_fence_timestamp(retry_at)
+            }
+            Self::Ambiguous => true,
+            Self::Failed { status, code } => {
+                status.is_none_or(|status| (100..=599).contains(&status))
+                    && valid_email_fence_text(code, 256)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EmailFenceOutcome {
+    Provider(EmailProviderOutcome),
+    Cancellation(EmailControlCancellation),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct EmailSendFence {
+    pub(crate) user_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) claim_id: String,
+    pub(crate) lease_expires_at: String,
+    pub(crate) recipient_email: String,
+    pub(crate) include_content: bool,
+    pub(crate) outcome: Option<EmailFenceOutcome>,
+    pub(crate) outcome_at: Option<String>,
+}
+
+impl std::fmt::Debug for EmailSendFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EmailSendFence(<redacted>)")
+    }
+}
+
+pub(crate) enum EmailSendFenceDisposition {
+    Authorized(EpisodeEmailPreference),
+    DeletionOwned,
+    Recorded(EmailSendFence),
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PushInstallation {
     pub id: String,
@@ -2293,6 +2435,203 @@ fn load_push_installation_conn(
         .optional()?)
 }
 
+fn valid_email_fence_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && !value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+}
+
+fn valid_email_fence_timestamp(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && isotime::parse_epoch_millis(value)
+            .is_some_and(|millis| isotime::format_epoch_millis(millis) == value)
+}
+
+fn load_email_send_fence_conn(
+    connection: &Connection,
+    user_id: &str,
+    delivery_id: &str,
+) -> Result<Option<EmailSendFence>> {
+    Ok(connection
+        .query_row(
+            "SELECT user_id,delivery_id,claim_id,lease_expires_at,recipient_email,
+                    include_content,outcome_kind,provider_status,provider_message_id,
+                    provider_error,retry_at,outcome_at
+             FROM email_send_fences WHERE user_id=?1 AND delivery_id=?2",
+            rusqlite::params![user_id, delivery_id],
+            email_send_fence_from_row,
+        )
+        .optional()?)
+}
+
+fn load_email_preference_for_fence_conn(
+    connection: &Connection,
+    user_id: &str,
+) -> Result<EpisodeEmailPreference> {
+    let email: Option<String> = connection
+        .query_row("SELECT email FROM users WHERE id=?1", [user_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(email) = email else {
+        return Ok(EpisodeEmailPreference {
+            enabled: false,
+            include_content: false,
+            recipient_email: "missing-account@invalid.invalid".into(),
+            consented_at: None,
+            updated_at: "1970-01-01T00:00:00.000Z".into(),
+        });
+    };
+    Ok(connection
+        .query_row(
+            "SELECT enabled,include_content,consented_at,updated_at
+             FROM episode_email_preferences WHERE user_id=?1",
+            [user_id],
+            |row| {
+                Ok(EpisodeEmailPreference {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    include_content: row.get::<_, i64>(1)? != 0,
+                    recipient_email: email.clone(),
+                    consented_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or(EpisodeEmailPreference {
+            enabled: false,
+            include_content: false,
+            recipient_email: email,
+            consented_at: None,
+            updated_at: "1970-01-01T00:00:00.000Z".into(),
+        }))
+}
+
+fn load_active_email_preference_conn(
+    connection: &Connection,
+    user_id: &str,
+) -> Result<EpisodeEmailPreference> {
+    if user_status_conn(connection, user_id)?.as_deref() != Some("active") {
+        return Err(EnclaveError::Conflict(
+            "email send fence account is not active".into(),
+        ));
+    }
+    load_email_preference_for_fence_conn(connection, user_id)
+}
+
+fn email_send_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmailSendFence> {
+    let kind: Option<String> = row.get(6)?;
+    let status: Option<i64> = row.get(7)?;
+    let provider_message_id: Option<String> = row.get(8)?;
+    let error: Option<String> = row.get(9)?;
+    let retry_at: Option<String> = row.get(10)?;
+    let outcome_at: Option<String> = row.get(11)?;
+    let outcome = match kind.as_deref() {
+        None if status.is_none()
+            && provider_message_id.is_none()
+            && error.is_none()
+            && retry_at.is_none()
+            && outcome_at.is_none() =>
+        {
+            None
+        }
+        Some("accepted")
+            if status.is_some()
+                && provider_message_id.is_some()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(EmailFenceOutcome::Provider(
+                EmailProviderOutcome::Accepted {
+                    status: status.ok_or(rusqlite::Error::InvalidQuery)?,
+                    provider_message_id: provider_message_id
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                },
+            ))
+        }
+        Some("retry")
+            if provider_message_id.is_none()
+                && error.is_some()
+                && retry_at.is_some()
+                && outcome_at.is_some() =>
+        {
+            Some(EmailFenceOutcome::Provider(EmailProviderOutcome::Retry {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+                retry_at: retry_at.ok_or(rusqlite::Error::InvalidQuery)?,
+            }))
+        }
+        Some("ambiguous")
+            if status.is_none()
+                && provider_message_id.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(EmailFenceOutcome::Provider(EmailProviderOutcome::Ambiguous))
+        }
+        Some("failed")
+            if provider_message_id.is_none()
+                && error.is_some()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(EmailFenceOutcome::Provider(EmailProviderOutcome::Failed {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+            }))
+        }
+        Some(kind)
+            if status.is_none()
+                && provider_message_id.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            let cancellation = match kind {
+                "cancel_account_inactive" => EmailControlCancellation::AccountInactive,
+                "cancel_preference_disabled" => EmailControlCancellation::PreferenceDisabled,
+                "cancel_recipient_changed" => EmailControlCancellation::RecipientChanged,
+                "cancel_content_consent_changed" => EmailControlCancellation::ContentConsentChanged,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Some(EmailFenceOutcome::Cancellation(cancellation))
+        }
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let fence = EmailSendFence {
+        user_id: row.get(0)?,
+        delivery_id: row.get(1)?,
+        claim_id: row.get(2)?,
+        lease_expires_at: row.get(3)?,
+        recipient_email: row.get(4)?,
+        include_content: row.get::<_, i64>(5)? != 0,
+        outcome,
+        outcome_at,
+    };
+    if !valid_push_claim_id(&fence.claim_id)
+        || !valid_email_fence_text(&fence.delivery_id, 96)
+        || !valid_email_fence_timestamp(&fence.lease_expires_at)
+        || !valid_email_fence_text(&fence.recipient_email, 320)
+        || !fence.recipient_email.contains('@')
+        || !fence.outcome.as_ref().is_none_or(|outcome| match outcome {
+            EmailFenceOutcome::Provider(outcome) => outcome.is_valid(),
+            EmailFenceOutcome::Cancellation(_) => true,
+        })
+        || !fence
+            .outcome_at
+            .as_deref()
+            .is_none_or(valid_email_fence_timestamp)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(fence)
+}
+
 fn load_push_send_fence_conn(
     conn: &Connection,
     user_id: &str,
@@ -2483,6 +2822,16 @@ fn refuse_push_fenced_identity_rebind_conn(
     if push_send_in_flight {
         return Err(EnclaveError::Conflict(
             "identity rebind conflicts with an in-flight push send".into(),
+        ));
+    }
+    let email_send_in_flight: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE user_id=?1 OR user_id=?2)",
+        rusqlite::params![old_user_id, stable_user_id],
+        |row| row.get(0),
+    )?;
+    if email_send_in_flight {
+        return Err(EnclaveError::Conflict(
+            "identity rebind conflicts with an in-flight email send".into(),
         ));
     }
     Ok(())
@@ -18180,6 +18529,17 @@ fn delete_user_identity_conn(
     fence_object_name: &str,
 ) -> Result<AccountDeletionOperation> {
     let tx = conn.unchecked_transaction()?;
+    let email_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if email_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight email send".into(),
+        ));
+    }
     let push_send_in_flight: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1)",
         [user_id],
@@ -18391,6 +18751,17 @@ fn begin_user_deletion_conn(
     fence_object_name: &str,
 ) -> Result<Option<AccountDeletionOperation>> {
     let tx = conn.unchecked_transaction()?;
+    let email_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if email_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight email send".into(),
+        ));
+    }
     let push_send_in_flight: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1)",
         [user_id],
@@ -19375,14 +19746,14 @@ impl ControlStore {
         }
         drop(temp_file);
         let conn = Connection::open(&temp_path)?;
-        let push_send_fence_schema_missing: bool = conn.query_row(
-            "SELECT COUNT(*)<>2 FROM sqlite_schema WHERE type='table' \
-             AND name IN ('push_send_fences','push_token_generation_clock')",
+        let delivery_fence_schema_missing: bool = conn.query_row(
+            "SELECT COUNT(*)<>3 FROM sqlite_schema WHERE type='table' \
+             AND name IN ('email_send_fences','push_send_fences','push_token_generation_clock')",
             [],
             |row| row.get(0),
         )?;
         conn.execute_batch(SCHEMA)?;
-        let mut schema_migrations = usize::from(push_send_fence_schema_missing);
+        let mut schema_migrations = usize::from(delivery_fence_schema_missing);
         schema_migrations += seed_push_generation_clock_conn(&conn)?;
         schema_migrations += migrate_apple_credentials_schema(&conn)?;
         schema_migrations += migrate_advisory_abort_locus(&conn)?;
@@ -22692,6 +23063,334 @@ impl ControlStore {
         .await
     }
 
+    pub(crate) async fn email_outbox_deletion_owned(&self, user_id: &str) -> Result<bool> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            let status = user_status_conn(connection, &user_id)?;
+            Ok(status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(connection, &user_id)?))
+        })
+        .await
+    }
+
+    /// Linearize one exact email disclosure capability without holding a
+    /// Control lock across provider I/O. Preference mutation and account
+    /// deletion conflict with this fence until the archive outcome reconciles.
+    pub(crate) async fn begin_email_send_fence(
+        &self,
+        requested: &EmailSendFence,
+        decision_at: &str,
+    ) -> Result<EmailSendFenceDisposition> {
+        let EmailSendFence {
+            user_id,
+            delivery_id,
+            claim_id,
+            lease_expires_at,
+            recipient_email,
+            include_content,
+            outcome,
+            outcome_at,
+        } = requested;
+        if !valid_push_claim_id(claim_id)
+            || !valid_email_fence_text(delivery_id, 96)
+            || !valid_email_fence_timestamp(lease_expires_at)
+            || !valid_email_fence_text(recipient_email, 320)
+            || !recipient_email.contains('@')
+            || !valid_email_fence_timestamp(decision_at)
+            || outcome.is_some()
+            || outcome_at.is_some()
+        {
+            return Err(EnclaveError::Store(
+                "email send fence identity is invalid".into(),
+            ));
+        }
+        let include_content = *include_content;
+        let user_id = user_id.to_owned();
+        let delivery_id = delivery_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let lease_expires_at = lease_expires_at.to_owned();
+        let recipient_email = recipient_email.to_owned();
+        let decision_at = decision_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            if let Some(current) = load_email_send_fence_conn(&transaction, &user_id, &delivery_id)?
+            {
+                transaction.rollback()?;
+                if current.claim_id != claim_id
+                    || current.lease_expires_at != lease_expires_at
+                    || current.recipient_email != recipient_email
+                    || current.include_content != include_content
+                {
+                    return Err(EnclaveError::Conflict(
+                        "email delivery already has an in-flight send".into(),
+                    ));
+                }
+                if current.outcome.is_some() {
+                    return Ok((EmailSendFenceDisposition::Recorded(current), false));
+                }
+                let preference = load_active_email_preference_conn(connection, &user_id)?;
+                if !preference.enabled
+                    || preference.recipient_email != recipient_email
+                    || (include_content && !preference.include_content)
+                {
+                    return Err(EnclaveError::Conflict(
+                        "live email fence lost its exact preference".into(),
+                    ));
+                }
+                return Ok((EmailSendFenceDisposition::Authorized(preference), false));
+            }
+            let status = user_status_conn(&transaction, &user_id)?;
+            if status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(&transaction, &user_id)?)
+            {
+                transaction.rollback()?;
+                return Ok((EmailSendFenceDisposition::DeletionOwned, false));
+            }
+            let preference = load_email_preference_for_fence_conn(&transaction, &user_id)?;
+            let cancellation = if status.as_deref() != Some("active") {
+                Some(EmailControlCancellation::AccountInactive)
+            } else if !preference.enabled {
+                Some(EmailControlCancellation::PreferenceDisabled)
+            } else if preference.recipient_email != recipient_email {
+                Some(EmailControlCancellation::RecipientChanged)
+            } else if include_content && !preference.include_content {
+                Some(EmailControlCancellation::ContentConsentChanged)
+            } else {
+                None
+            };
+            if transaction.execute(
+                "INSERT INTO email_send_fences
+                 (user_id,delivery_id,claim_id,lease_expires_at,recipient_email,include_content,
+                  outcome_kind,outcome_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    user_id,
+                    delivery_id,
+                    claim_id,
+                    lease_expires_at,
+                    recipient_email,
+                    i64::from(include_content),
+                    cancellation.as_ref().map(EmailControlCancellation::kind),
+                    cancellation.as_ref().map(|_| decision_at.as_str()),
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email send fence was not inserted exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            if let Some(cancellation) = cancellation {
+                Ok((
+                    EmailSendFenceDisposition::Recorded(EmailSendFence {
+                        user_id,
+                        delivery_id,
+                        claim_id,
+                        lease_expires_at,
+                        recipient_email,
+                        include_content,
+                        outcome: Some(EmailFenceOutcome::Cancellation(cancellation)),
+                        outcome_at: Some(decision_at),
+                    }),
+                    true,
+                ))
+            } else {
+                Ok((EmailSendFenceDisposition::Authorized(preference), true))
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn get_email_send_fence(
+        &self,
+        user_id: &str,
+        delivery_id: &str,
+    ) -> Result<Option<EmailSendFence>> {
+        let user_id = user_id.to_owned();
+        let delivery_id = delivery_id.to_owned();
+        self.read(move |connection| load_email_send_fence_conn(connection, &user_id, &delivery_id))
+            .await
+    }
+
+    pub(crate) async fn list_email_send_fences(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<EmailSendFence>> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT user_id,delivery_id,claim_id,lease_expires_at,recipient_email,
+                        include_content,outcome_kind,provider_status,provider_message_id,
+                        provider_error,retry_at,outcome_at
+                 FROM email_send_fences WHERE user_id=?1 ORDER BY delivery_id",
+            )?;
+            let fences = statement
+                .query_map([user_id], email_send_fence_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(EnclaveError::from)?;
+            Ok(fences)
+        })
+        .await
+    }
+
+    pub(crate) async fn validate_email_send_fence(
+        &self,
+        fence: &EmailSendFence,
+        minimum_valid_at_millis: i64,
+    ) -> Result<bool> {
+        let fence = fence.clone();
+        self.read(move |connection| {
+            let Some(current) =
+                load_email_send_fence_conn(connection, &fence.user_id, &fence.delivery_id)?
+            else {
+                return Ok(false);
+            };
+            Ok(current == fence
+                && current.outcome.is_none()
+                && isotime::parse_epoch_millis(&current.lease_expires_at)
+                    .is_some_and(|expires| expires >= minimum_valid_at_millis))
+        })
+        .await
+    }
+
+    pub(crate) async fn record_email_send_outcome(
+        &self,
+        fence: &EmailSendFence,
+        outcome: EmailProviderOutcome,
+        outcome_at: &str,
+    ) -> Result<()> {
+        if !outcome.is_valid() || !valid_email_fence_timestamp(outcome_at) {
+            return Err(EnclaveError::Store(
+                "email provider outcome is invalid".into(),
+            ));
+        }
+        let fence = fence.clone();
+        let outcome_at = outcome_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let Some(current) =
+                load_email_send_fence_conn(&transaction, &fence.user_id, &fence.delivery_id)?
+            else {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email send fence disappeared before outcome".into(),
+                ));
+            };
+            if current.claim_id != fence.claim_id
+                || current.lease_expires_at != fence.lease_expires_at
+                || current.recipient_email != fence.recipient_email
+                || current.include_content != fence.include_content
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email send fence identity changed".into(),
+                ));
+            }
+            if let Some(existing) = current.outcome {
+                transaction.rollback()?;
+                return if existing == EmailFenceOutcome::Provider(outcome.clone())
+                    && current.outcome_at.as_deref() == Some(&outcome_at)
+                {
+                    Ok(((), false))
+                } else {
+                    Err(EnclaveError::Conflict(
+                        "email send outcome conflicts with durable evidence".into(),
+                    ))
+                };
+            }
+            let (status, provider_message_id, error, retry_at) = outcome.fields();
+            if transaction.execute(
+                "UPDATE email_send_fences
+                 SET outcome_kind=?1,provider_status=?2,provider_message_id=?3,
+                     provider_error=?4,retry_at=?5,outcome_at=?6
+                 WHERE user_id=?7 AND delivery_id=?8 AND claim_id=?9
+                   AND lease_expires_at=?10 AND recipient_email=?11
+                   AND include_content=?12 AND outcome_kind IS NULL",
+                rusqlite::params![
+                    outcome.kind(),
+                    status,
+                    provider_message_id,
+                    error,
+                    retry_at,
+                    outcome_at,
+                    fence.user_id,
+                    fence.delivery_id,
+                    fence.claim_id,
+                    fence.lease_expires_at,
+                    fence.recipient_email,
+                    i64::from(fence.include_content),
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email provider outcome was not recorded exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(((), true))
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_email_send_fence(
+        &self,
+        fence: &EmailSendFence,
+        archive_outcome: EmailFenceOutcome,
+    ) -> Result<()> {
+        let fence = fence.clone();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let Some(current) =
+                load_email_send_fence_conn(&transaction, &fence.user_id, &fence.delivery_id)?
+            else {
+                transaction.rollback()?;
+                return Ok(((), false));
+            };
+            if current.claim_id != fence.claim_id
+                || current.lease_expires_at != fence.lease_expires_at
+                || current.recipient_email != fence.recipient_email
+                || current.include_content != fence.include_content
+                || fence
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value != &archive_outcome)
+                || current
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value != &archive_outcome)
+                || (current.outcome.is_some() && current.outcome_at != fence.outcome_at)
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email send fence cannot adopt archive outcome".into(),
+                ));
+            }
+            if transaction.execute(
+                "DELETE FROM email_send_fences WHERE user_id=?1 AND delivery_id=?2
+                   AND claim_id=?3 AND lease_expires_at=?4 AND recipient_email=?5
+                   AND include_content=?6",
+                rusqlite::params![
+                    fence.user_id,
+                    fence.delivery_id,
+                    fence.claim_id,
+                    fence.lease_expires_at,
+                    fence.recipient_email,
+                    i64::from(fence.include_content),
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "email send fence was not finished exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(((), true))
+        })
+        .await
+    }
+
     pub async fn upsert_push_installation(
         &self,
         installation: PushInstallation,
@@ -23285,6 +23984,16 @@ impl ControlStore {
     ) -> Result<EpisodeEmailPreference> {
         let user_id = user_id.to_string();
         self.write(move |conn| {
+            let send_in_flight: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE user_id=?1)",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            if send_in_flight {
+                return Err(EnclaveError::Conflict(
+                    "email preference has an in-flight send".into(),
+                ));
+            }
             let (email, status): (String, String) = conn
                 .query_row("SELECT email, status FROM users WHERE id = ?1", [&user_id], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -35555,5 +36264,116 @@ mod tests {
 
         let pref_during_deletion = store.get_email_preference(&user.id).await;
         assert!(pref_during_deletion.is_err());
+    }
+
+    #[tokio::test]
+    async fn email_disclosure_fence_blocks_consent_and_deletion_until_exact_outcome() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = store
+            .upsert_user(
+                "google-sub-email-fence",
+                "fenced@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        store
+            .set_email_preference(&user.id, true, true)
+            .await
+            .unwrap();
+        let delivery_id = "e1_2222222222222222222222222222222222222222222222222222222222222222";
+        let claim_id = "44444444-4444-4444-8444-444444444444";
+        let lease = "2026-08-20T20:01:00.000Z";
+        let requested = EmailSendFence {
+            user_id: user.id.clone(),
+            delivery_id: delivery_id.into(),
+            claim_id: claim_id.into(),
+            lease_expires_at: lease.into(),
+            recipient_email: "fenced@example.com".into(),
+            include_content: true,
+            outcome: None,
+            outcome_at: None,
+        };
+        assert!(matches!(
+            store
+                .begin_email_send_fence(&requested, "2026-08-20T20:00:00.000Z",)
+                .await
+                .unwrap(),
+            EmailSendFenceDisposition::Authorized(_)
+        ));
+        assert!(store
+            .set_email_preference(&user.id, false, false)
+            .await
+            .is_err());
+        assert!(store.begin_user_deletion(&user.id).await.is_err());
+
+        let fence = store
+            .get_email_send_fence(&user.id, delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = EmailProviderOutcome::Accepted {
+            status: 202,
+            provider_message_id: "resend-provider-message".into(),
+        };
+        store
+            .record_email_send_outcome(&fence, outcome.clone(), "2026-08-20T20:00:01.000Z")
+            .await
+            .unwrap();
+        let completed = store
+            .get_email_send_fence(&user.id, delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(format!("{completed:?}"), "EmailSendFence(<redacted>)");
+        store
+            .finish_email_send_fence(&completed, EmailFenceOutcome::Provider(outcome))
+            .await
+            .unwrap();
+        store
+            .set_email_preference(&user.id, false, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_disabled_preference_mints_a_durable_cancellation_receipt() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = store
+            .upsert_user(
+                "google-sub-email-cancel-receipt",
+                "disabled@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        let requested = EmailSendFence {
+            user_id: user.id.clone(),
+            delivery_id: "e1_3333333333333333333333333333333333333333333333333333333333333333"
+                .into(),
+            claim_id: "55555555-5555-4555-8555-555555555555".into(),
+            lease_expires_at: "2026-08-20T20:01:00.000Z".into(),
+            recipient_email: "disabled@example.com".into(),
+            include_content: false,
+            outcome: None,
+            outcome_at: None,
+        };
+        let disposition = store
+            .begin_email_send_fence(&requested, "2026-08-20T20:00:00.000Z")
+            .await
+            .unwrap();
+        assert!(matches!(
+            disposition,
+            EmailSendFenceDisposition::Recorded(EmailSendFence {
+                outcome: Some(EmailFenceOutcome::Cancellation(
+                    EmailControlCancellation::PreferenceDisabled
+                )),
+                ..
+            })
+        ));
     }
 }

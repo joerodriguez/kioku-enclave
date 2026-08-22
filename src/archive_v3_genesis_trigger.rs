@@ -1167,6 +1167,12 @@ pub(crate) mod tests {
             }
         }
 
+        /// Failure-injection handle for owner-level tests that must exercise
+        /// an asymmetric Control/archive persistence boundary after genesis.
+        pub(crate) fn control_gcs(&self) -> Arc<FakeGcs> {
+            Arc::clone(&self.control_gcs)
+        }
+
         /// Boot a process over the durable substrate. Nothing carries over
         /// from a previous one.
         pub(crate) fn boot(&self) -> GenesisSmokeProcess {

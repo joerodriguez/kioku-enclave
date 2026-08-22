@@ -141,6 +141,7 @@ impl WalOperationKind {
                 // The retained result is what prevents a competing/random
                 // claim from treating an already-started provider attempt as
                 // fresh authority to send.
+                | Self::EmailDelivery
                 | Self::PushDelivery
         )
     }
@@ -551,12 +552,10 @@ impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowTranscriptP
 impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowTranscriptLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
-impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailDeliverySettlementPlan {}
-impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailDeliverySettlementLedger {}
-impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailDeliveryCancellationPlan {}
-impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailDeliveryCancellationLedger {}
-impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}
-impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger {}
+impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailSendClaimPlan {}
+impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailSendClaimLedger {}
+impl sealed::DomainPlan for crate::cp::email_worker::wal::ExactEmailDeliverySettlementPlan {}
+impl sealed::DomainLedger for crate::cp::email_worker::wal::ExactEmailDeliverySettlementLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushDeliverySettlementPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushDeliverySettlementLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushSendClaimPlan {}
