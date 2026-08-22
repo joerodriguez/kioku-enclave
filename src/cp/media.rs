@@ -152,18 +152,20 @@ pub struct CaptureContext {
     pub visible_windows_truncated: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserTab {
     pub window_index: i64,
     pub tab_index: i64,
     pub title: Option<String>,
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_scheme: Option<String>,
     pub is_active: bool,
     pub is_loading: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserSnapshot {
     pub state_key: String,
@@ -174,8 +176,39 @@ pub struct BrowserSnapshot {
     pub active_tab_index: Option<i64>,
     pub reported_tab_count: i64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient_tab_collection_enabled: Option<bool>,
     pub content_hash: String,
     pub tabs: Vec<BrowserTab>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrowserStateV2Envelope {
+    pub(crate) schema_version: i64,
+    pub(crate) active_window_index: Option<i64>,
+    pub(crate) active_tab_index: Option<i64>,
+    pub(crate) reported_tab_count: i64,
+    pub(crate) truncated: bool,
+    pub(crate) ambient_tab_collection_enabled: bool,
+    pub(crate) tabs: Vec<BrowserTab>,
+}
+
+pub(crate) struct BrowserV2PersistedEvidence<'a> {
+    pub(crate) event_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) source_wall_at: &'a str,
+    pub(crate) observation_id: &'a str,
+    pub(crate) observed_at: &'a str,
+    pub(crate) state_key: Option<&'a str>,
+    pub(crate) context_status: &'a str,
+    pub(crate) active_url: Option<&'a str>,
+    pub(crate) active_title: Option<&'a str>,
+    pub(crate) browser_bundle_id: &'a str,
+    pub(crate) browser_name: &'a str,
+    pub(crate) permission_status: &'a str,
+    pub(crate) content_hash: &'a str,
+    pub(crate) tabs_json: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,7 +425,22 @@ impl CaptureEventManifest {
             }
         }
         if let Some(context) = &self.context {
-            validate_context(context)?;
+            validate_context(context, &self.device_id)?;
+            let carries_browser_v2 = context
+                .browser_state_key
+                .as_deref()
+                .is_some_and(|key| key.contains(":browser-v2:"))
+                || context
+                    .browser_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.state_key.contains(":browser-v2:"));
+            if carries_browser_v2
+                && (self.stream_kind != StreamKind::MacScreen || context.capture_status != "stable")
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "browser-v2 evidence requires a stable mac_screen event".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -543,7 +591,7 @@ fn validate_media(kind: StreamKind, media: &MediaDescriptor) -> Result<()> {
     Ok(())
 }
 
-fn validate_context(context: &CaptureContext) -> Result<()> {
+fn validate_context(context: &CaptureContext, device_id: &str) -> Result<()> {
     if !matches!(
         context.capture_status.as_str(),
         "stable" | "unstable" | "unavailable"
@@ -593,11 +641,19 @@ fn validate_context(context: &CaptureContext) -> Result<()> {
                 "browser snapshot metadata is invalid".into(),
             ));
         }
+        if snapshot.state_key.contains(":browser-v2:") {
+            validate_browser_v2_snapshot(context, snapshot, device_id)?;
+            return Ok(());
+        }
         for tab in &snapshot.tabs {
             if tab.window_index < 0
                 || tab.tab_index < 0
                 || tab.title.as_ref().is_some_and(|value| value.len() > 2_000)
                 || tab.url.as_ref().is_some_and(|value| value.len() > 8_192)
+                || tab
+                    .url_scheme
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 64 || value.contains('\0'))
             {
                 return Err(EnclaveError::InvalidRequest(
                     "browser snapshot tab is invalid".into(),
@@ -611,6 +667,261 @@ fn validate_context(context: &CaptureContext) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(crate) fn validate_browser_v2_snapshot(
+    context: &CaptureContext,
+    snapshot: &BrowserSnapshot,
+    device_id: &str,
+) -> Result<()> {
+    let ambient = snapshot.ambient_tab_collection_enabled.ok_or_else(|| {
+        EnclaveError::InvalidRequest("browser-v2 requires ambient_tab_collection_enabled".into())
+    })?;
+    let expected_name = match snapshot.browser_bundle_id.as_str() {
+        "com.apple.Safari" => "Safari",
+        "com.google.Chrome" => "Google Chrome",
+        "com.brave.Browser" => "Brave Browser",
+        "com.microsoft.edgemac" => "Microsoft Edge",
+        "company.thebrowser.Browser" => "Arc",
+        _ => {
+            return Err(EnclaveError::InvalidRequest(
+                "browser-v2 bundle is unsupported".into(),
+            ))
+        }
+    };
+    if snapshot.browser_name != expected_name
+        || context.capture_status != "stable"
+        || context.primary_bundle_id.as_deref() != Some(snapshot.browser_bundle_id.as_str())
+        || context.browser_permission_status.as_deref() != Some(snapshot.permission_status.as_str())
+        || context.browser_state_key.as_deref() != Some(snapshot.state_key.as_str())
+        || !matches!(
+            snapshot.permission_status.as_str(),
+            "granted"
+                | "not_determined"
+                | "denied"
+                | "unsupported"
+                | "browser_not_running"
+                | "timed_out"
+                | "script_error"
+        )
+        || snapshot
+            .content_hash
+            .bytes()
+            .any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit())
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "browser-v2 metadata is invalid".into(),
+        ));
+    }
+    let expected_key = format!("{device_id}:browser-v2:{}", snapshot.content_hash);
+    if snapshot.state_key != expected_key {
+        return Err(EnclaveError::InvalidRequest(
+            "browser-v2 state key does not bind device and content".into(),
+        ));
+    }
+
+    if snapshot.permission_status != "granted" {
+        if snapshot.active_window_index.is_some()
+            || snapshot.active_tab_index.is_some()
+            || snapshot.reported_tab_count != 0
+            || snapshot.truncated
+            || !snapshot.tabs.is_empty()
+            || context.active_url.is_some()
+            || context.active_url_title.is_some()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "non-granted browser-v2 state must not invent tabs".into(),
+            ));
+        }
+    } else {
+        if snapshot.tabs.is_empty()
+            || snapshot.reported_tab_count < i64::try_from(snapshot.tabs.len()).unwrap_or(i64::MAX)
+            || snapshot.truncated
+                != (snapshot.reported_tab_count
+                    > i64::try_from(snapshot.tabs.len()).unwrap_or(i64::MAX))
+            || (!ambient
+                && (snapshot.tabs.len() != 1
+                    || snapshot.reported_tab_count != 1
+                    || snapshot.truncated))
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "browser-v2 tab count is inconsistent".into(),
+            ));
+        }
+        let mut coordinates = std::collections::HashSet::new();
+        let mut active: Option<&BrowserTab> = None;
+        for tab in &snapshot.tabs {
+            if tab.window_index <= 0
+                || tab.tab_index <= 0
+                || !coordinates.insert((tab.window_index, tab.tab_index))
+                || tab
+                    .title
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 1_000 || value.contains('\0'))
+                || tab
+                    .url
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 4_096 || value.contains('\0'))
+                || tab.url_scheme.as_ref().is_some_and(|value| {
+                    let mut bytes = value.bytes();
+                    value.len() > 64
+                        || value.contains('\0')
+                        || !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                        || !bytes.all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+                        })
+                })
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "browser-v2 tab is invalid".into(),
+                ));
+            }
+            if tab.is_active && active.replace(tab).is_some() {
+                return Err(EnclaveError::InvalidRequest(
+                    "browser-v2 must have exactly one active tab".into(),
+                ));
+            }
+        }
+        let active = active.ok_or_else(|| {
+            EnclaveError::InvalidRequest("browser-v2 must have exactly one active tab".into())
+        })?;
+        if snapshot.active_window_index != Some(active.window_index)
+            || snapshot.active_tab_index != Some(active.tab_index)
+            || context.active_url != active.url
+            || context.active_url_title != active.title
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "browser-v2 active evidence is inconsistent".into(),
+            ));
+        }
+    }
+
+    if browser_v2_content_hash(snapshot)? != snapshot.content_hash {
+        return Err(EnclaveError::InvalidRequest(
+            "browser-v2 content commitment does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_browser_v2_persisted_evidence(
+    context: &CaptureContext,
+    evidence: BrowserV2PersistedEvidence<'_>,
+) -> Result<BrowserSnapshot> {
+    let envelope: BrowserStateV2Envelope = serde_json::from_str(evidence.tabs_json)
+        .map_err(|_| EnclaveError::Store("browser-v2 state is corrupt".into()))?;
+    if envelope.schema_version != 2 {
+        return Err(EnclaveError::Store(
+            "browser-v2 state version is unsupported".into(),
+        ));
+    }
+    let state_key = evidence
+        .state_key
+        .ok_or_else(|| EnclaveError::Store("browser-v2 observation is missing state".into()))?;
+    let snapshot = context
+        .browser_snapshot
+        .clone()
+        .unwrap_or_else(|| BrowserSnapshot {
+            state_key: state_key.to_owned(),
+            browser_bundle_id: evidence.browser_bundle_id.to_owned(),
+            browser_name: evidence.browser_name.to_owned(),
+            permission_status: evidence.permission_status.to_owned(),
+            active_window_index: envelope.active_window_index,
+            active_tab_index: envelope.active_tab_index,
+            reported_tab_count: envelope.reported_tab_count,
+            truncated: envelope.truncated,
+            ambient_tab_collection_enabled: Some(envelope.ambient_tab_collection_enabled),
+            content_hash: evidence.content_hash.to_owned(),
+            tabs: envelope.tabs.clone(),
+        });
+    validate_browser_v2_snapshot(context, &snapshot, evidence.device_id)
+        .map_err(|_| EnclaveError::Store("browser-v2 snapshot is corrupt".into()))?;
+    let expected_envelope = BrowserStateV2Envelope {
+        schema_version: 2,
+        active_window_index: snapshot.active_window_index,
+        active_tab_index: snapshot.active_tab_index,
+        reported_tab_count: snapshot.reported_tab_count,
+        truncated: snapshot.truncated,
+        ambient_tab_collection_enabled: snapshot
+            .ambient_tab_collection_enabled
+            .ok_or_else(|| EnclaveError::Store("browser-v2 consent is missing".into()))?,
+        tabs: snapshot.tabs.clone(),
+    };
+    if evidence.observation_id != evidence.event_id
+        || evidence.observed_at != evidence.source_wall_at
+        || state_key != snapshot.state_key
+        || evidence.context_status != context.capture_status
+        || evidence.active_url != context.active_url.as_deref()
+        || evidence.active_title != context.active_url_title.as_deref()
+        || evidence.browser_bundle_id != snapshot.browser_bundle_id
+        || evidence.browser_name != snapshot.browser_name
+        || evidence.permission_status != snapshot.permission_status
+        || evidence.content_hash != snapshot.content_hash
+        || envelope != expected_envelope
+    {
+        return Err(EnclaveError::Store(
+            "browser-v2 evidence is inconsistent".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn browser_v2_content_hash(snapshot: &BrowserSnapshot) -> Result<String> {
+    fn append_u32(bytes: &mut Vec<u8>, value: usize) -> Result<()> {
+        let value = u32::try_from(value)
+            .map_err(|_| EnclaveError::InvalidRequest("browser-v2 field is too large".into()))?;
+        bytes.extend_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+    fn append_i64(bytes: &mut Vec<u8>, value: i64) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    fn append_text(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
+        append_u32(bytes, value.len())?;
+        bytes.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+    fn append_optional_text(bytes: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
+        bytes.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            append_text(bytes, value)?;
+        }
+        Ok(())
+    }
+    fn append_optional_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
+        bytes.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            append_i64(bytes, value);
+        }
+    }
+    fn append_optional_bool(bytes: &mut Vec<u8>, value: Option<bool>) {
+        bytes.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            bytes.push(u8::from(value));
+        }
+    }
+
+    let mut bytes = b"kioku-browser-state-v2\0".to_vec();
+    append_text(&mut bytes, &snapshot.browser_bundle_id)?;
+    append_text(&mut bytes, &snapshot.permission_status)?;
+    append_optional_i64(&mut bytes, snapshot.active_window_index);
+    append_optional_i64(&mut bytes, snapshot.active_tab_index);
+    append_i64(&mut bytes, snapshot.reported_tab_count);
+    bytes.push(u8::from(snapshot.truncated));
+    bytes.push(u8::from(
+        snapshot.ambient_tab_collection_enabled.unwrap_or(false),
+    ));
+    append_u32(&mut bytes, snapshot.tabs.len())?;
+    for tab in &snapshot.tabs {
+        append_i64(&mut bytes, tab.window_index);
+        append_i64(&mut bytes, tab.tab_index);
+        append_optional_text(&mut bytes, tab.title.as_deref())?;
+        append_optional_text(&mut bytes, tab.url.as_deref())?;
+        append_optional_text(&mut bytes, tab.url_scheme.as_deref())?;
+        bytes.push(u8::from(tab.is_active));
+        append_optional_bool(&mut bytes, tab.is_loading);
+    }
+    Ok(sha256_hex(&bytes))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4945,7 +5256,22 @@ fn record_browser_observation(
         return Ok(());
     };
     if let Some(snapshot) = &context.browser_snapshot {
-        let tabs_json = serde_json::to_string(&snapshot.tabs)?;
+        let tabs_json = if snapshot.state_key.contains(":browser-v2:") {
+            serde_json::to_string(&BrowserStateV2Envelope {
+                schema_version: 2,
+                active_window_index: snapshot.active_window_index,
+                active_tab_index: snapshot.active_tab_index,
+                reported_tab_count: snapshot.reported_tab_count,
+                truncated: snapshot.truncated,
+                ambient_tab_collection_enabled: snapshot
+                    .ambient_tab_collection_enabled
+                    .unwrap_or(false),
+                tabs: snapshot.tabs.clone(),
+            })?
+        } else {
+            serde_json::to_string(&snapshot.tabs)?
+        };
+        let normalized_hash = snapshot.content_hash.to_ascii_lowercase();
         conn.execute(
             "INSERT INTO browser_states_v2 \
              (state_key,browser_bundle_id,browser_name,permission_status,content_hash,tabs_json,\
@@ -4957,30 +5283,89 @@ fn record_browser_observation(
                 snapshot.browser_bundle_id,
                 snapshot.browser_name,
                 snapshot.permission_status,
-                snapshot.content_hash.to_ascii_lowercase(),
+                normalized_hash,
                 tabs_json,
                 commit_stamp
             ],
         )?;
-        let existing_hash: String = conn.query_row(
-            "SELECT content_hash FROM browser_states_v2 WHERE state_key=?1",
+        let existing: (String, String, String, String, String) = conn.query_row(
+            "SELECT browser_bundle_id,browser_name,permission_status,content_hash,tabs_json \
+             FROM browser_states_v2 WHERE state_key=?1",
             [&snapshot.state_key],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
-        if !existing_hash.eq_ignore_ascii_case(&snapshot.content_hash) {
+        if existing
+            != (
+                snapshot.browser_bundle_id.clone(),
+                snapshot.browser_name.clone(),
+                snapshot.permission_status.clone(),
+                normalized_hash,
+                tabs_json,
+            )
+        {
             return Err(EnclaveError::Conflict(
                 "browser state key was reused with different content".into(),
             ));
         }
     }
     let state_key = match context.browser_state_key.as_deref() {
-        Some(key) => conn
-            .query_row(
-                "SELECT state_key FROM browser_states_v2 WHERE state_key=?1",
-                [key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?,
+        Some(key) => {
+            let stored = conn
+                .query_row(
+                    "SELECT state_key,browser_bundle_id,browser_name,permission_status,
+                            content_hash,tabs_json
+                     FROM browser_states_v2 WHERE state_key=?1",
+                    [key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    EnclaveError::InvalidRequest(
+                        "browser_state_key does not name an existing exact state".into(),
+                    )
+                })?;
+            if context.browser_snapshot.is_none() && key.contains(":browser-v2:") {
+                let envelope: BrowserStateV2Envelope = serde_json::from_str(&stored.5)
+                    .map_err(|_| EnclaveError::Store("browser-v2 state is corrupt".into()))?;
+                if envelope.schema_version != 2 {
+                    return Err(EnclaveError::Store(
+                        "browser-v2 state version is unsupported".into(),
+                    ));
+                }
+                let snapshot = BrowserSnapshot {
+                    state_key: stored.0.clone(),
+                    browser_bundle_id: stored.1,
+                    browser_name: stored.2,
+                    permission_status: stored.3,
+                    active_window_index: envelope.active_window_index,
+                    active_tab_index: envelope.active_tab_index,
+                    reported_tab_count: envelope.reported_tab_count,
+                    truncated: envelope.truncated,
+                    ambient_tab_collection_enabled: Some(envelope.ambient_tab_collection_enabled),
+                    content_hash: stored.4,
+                    tabs: envelope.tabs,
+                };
+                validate_browser_v2_snapshot(context, &snapshot, &manifest.device_id)?;
+            }
+            Some(stored.0)
+        }
         None => None,
     };
     conn.execute(
@@ -5271,6 +5656,50 @@ mod tests {
         .expect("valid screen fixture");
         manifest.source_monotonic_ns += sequence as u64;
         manifest
+    }
+
+    fn attach_valid_browser_v2(manifest: &mut CaptureEventManifest) {
+        let state_key =
+            "device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
+        let context = manifest.context.as_mut().expect("screen context");
+        context.primary_bundle_id = Some("com.apple.Safari".into());
+        context.active_app = Some("Safari".into());
+        context.active_url = Some("https://meet.google.com/abc?authuser=0#frag".into());
+        context.active_url_title = Some("Meeting".into());
+        context.browser_permission_status = Some("granted".into());
+        context.browser_state_key = Some(state_key.into());
+        context.browser_snapshot = Some(BrowserSnapshot {
+            state_key: state_key.into(),
+            browser_bundle_id: "com.apple.Safari".into(),
+            browser_name: "Safari".into(),
+            permission_status: "granted".into(),
+            active_window_index: Some(1),
+            active_tab_index: Some(1),
+            reported_tab_count: 2,
+            truncated: false,
+            ambient_tab_collection_enabled: Some(true),
+            content_hash: "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3".into(),
+            tabs: vec![
+                BrowserTab {
+                    window_index: 1,
+                    tab_index: 1,
+                    title: Some("Meeting".into()),
+                    url: Some("https://meet.google.com/abc?authuser=0#frag".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: true,
+                    is_loading: None,
+                },
+                BrowserTab {
+                    window_index: 1,
+                    tab_index: 2,
+                    title: Some("Document".into()),
+                    url: Some("https://docs.google.com/document/d/exact/edit?tab=t.0".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: false,
+                    is_loading: None,
+                },
+            ],
+        });
     }
 
     fn reference_to(
@@ -6643,12 +7072,14 @@ mod tests {
             active_tab_index: Some(1),
             reported_tab_count: 2,
             truncated: false,
+            ambient_tab_collection_enabled: None,
             content_hash: "c".repeat(64),
             tabs: vec![BrowserTab {
                 window_index: 0,
                 tab_index: 1,
                 title: Some("Weekly planning".into()),
                 url: Some("https://meet.google.com/abc-defg-hij?authuser=0".into()),
+                url_scheme: None,
                 is_active: true,
                 is_loading: Some(false),
             }],
@@ -6670,6 +7101,189 @@ mod tests {
             "https://meet.google.com/abc-defg-hij?authuser=0"
         );
         assert!(tabs_json.contains("authuser=0"));
+    }
+
+    #[test]
+    fn browser_v2_cross_language_commitment_topology_and_exact_storage_are_enforced() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut manifest = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        attach_valid_browser_v2(&mut manifest);
+        manifest.validate().unwrap();
+        let snapshot = manifest
+            .context
+            .as_ref()
+            .unwrap()
+            .browser_snapshot
+            .as_ref()
+            .unwrap();
+        let client_wire: BrowserSnapshot = serde_json::from_str(
+            r#"{
+                "state_key":"device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3",
+                "browser_bundle_id":"com.apple.Safari",
+                "browser_name":"Safari",
+                "permission_status":"granted",
+                "active_window_index":1,
+                "active_tab_index":1,
+                "reported_tab_count":2,
+                "truncated":false,
+                "ambient_tab_collection_enabled":true,
+                "content_hash":"43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3",
+                "tabs":[
+                    {
+                        "window_index":1,
+                        "tab_index":1,
+                        "title":"Meeting",
+                        "url":"https://meet.google.com/abc?authuser=0#frag",
+                        "url_scheme":"https",
+                        "is_active":true,
+                        "is_loading":null
+                    },
+                    {
+                        "window_index":1,
+                        "tab_index":2,
+                        "title":"Document",
+                        "url":"https://docs.google.com/document/d/exact/edit?tab=t.0",
+                        "url_scheme":"https",
+                        "is_active":false,
+                        "is_loading":null
+                    }
+                ]
+            }"#,
+        )
+        .expect("the exact 0.8.35 browser-v2 wire shape decodes");
+        assert_eq!(&client_wire, snapshot);
+        assert_eq!(
+            browser_v2_content_hash(snapshot).unwrap(),
+            "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3"
+        );
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-0").unwrap();
+        let stored: (String, String, String) = conn
+            .query_row(
+                "SELECT s.content_hash,s.tabs_json,o.state_key \
+                 FROM browser_observations_v2 o JOIN browser_states_v2 s USING(state_key)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, snapshot.content_hash);
+        let envelope: BrowserStateV2Envelope = serde_json::from_str(&stored.1).unwrap();
+        assert_eq!(envelope.schema_version, 2);
+        assert!(envelope.ambient_tab_collection_enabled);
+        assert_eq!(envelope.tabs[1].url_scheme.as_deref(), Some("https"));
+        assert_eq!(stored.2, snapshot.state_key);
+
+        let mut uppercase_scheme = manifest.clone();
+        let uppercase_context = uppercase_scheme.context.as_mut().unwrap();
+        let uppercase_snapshot = uppercase_context.browser_snapshot.as_mut().unwrap();
+        uppercase_snapshot.tabs[1].url = Some("HTTPS://docs.example.com/exact".into());
+        uppercase_snapshot.tabs[1].url_scheme = Some("HTTPS".into());
+        let uppercase_hash = browser_v2_content_hash(uppercase_snapshot).unwrap();
+        uppercase_snapshot.content_hash = uppercase_hash.clone();
+        uppercase_snapshot.state_key = format!("device-1:browser-v2:{uppercase_hash}");
+        uppercase_context.browser_state_key = Some(uppercase_snapshot.state_key.clone());
+        uppercase_scheme.validate().unwrap();
+
+        let mut key_only = manifest.clone();
+        key_only.event_id = "screen-event-key-only".into();
+        key_only.sequence = 1;
+        key_only.source_monotonic_ns += 1;
+        key_only.media.as_mut().unwrap().asset_id = "screen-asset-key-only".into();
+        key_only.context.as_mut().unwrap().browser_snapshot = None;
+        key_only.validate().unwrap();
+        record_source_event(
+            &conn,
+            "account-1",
+            &key_only,
+            &"c".repeat(64),
+            "object-key-only",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state_key FROM browser_observations_v2 WHERE event_id=?1",
+                [&key_only.event_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(snapshot.state_key.as_str()),
+            "key-only v2 reuse must resolve and revalidate the exact persisted state",
+        );
+
+        let mut unsupported_envelope: serde_json::Value = serde_json::from_str(&stored.1).unwrap();
+        unsupported_envelope["schema_version"] = json!(999);
+        conn.execute(
+            "UPDATE browser_states_v2 SET tabs_json=?1 WHERE state_key=?2",
+            params![unsupported_envelope.to_string(), snapshot.state_key],
+        )
+        .unwrap();
+        let mut wrong_version = key_only.clone();
+        wrong_version.event_id = "screen-event-wrong-version".into();
+        wrong_version.sequence = 2;
+        wrong_version.source_monotonic_ns += 2;
+        wrong_version.media.as_mut().unwrap().asset_id = "screen-asset-wrong-version".into();
+        assert!(record_source_event(
+            &conn,
+            "account-1",
+            &wrong_version,
+            &"e".repeat(64),
+            "object-wrong-version",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("version is unsupported"));
+
+        let mut audio = valid_manifest();
+        attach_valid_browser_v2(&mut audio);
+        assert!(audio.validate().is_err());
+        let mut unstable = valid_screen_manifest(2, "screen-unstable", "screen-unstable-asset");
+        attach_valid_browser_v2(&mut unstable);
+        unstable.context.as_mut().unwrap().capture_status = "unstable".into();
+        assert!(unstable.validate().is_err());
+
+        for poison in [
+            "missing_consent",
+            "duplicate_coordinate",
+            "ambient_false",
+            "wrong_hash",
+        ] {
+            let mut invalid = valid_screen_manifest(0, "screen-invalid", "screen-invalid-asset");
+            attach_valid_browser_v2(&mut invalid);
+            let snapshot = invalid
+                .context
+                .as_mut()
+                .unwrap()
+                .browser_snapshot
+                .as_mut()
+                .unwrap();
+            match poison {
+                "missing_consent" => snapshot.ambient_tab_collection_enabled = None,
+                "duplicate_coordinate" => snapshot.tabs[1].tab_index = 1,
+                "ambient_false" => snapshot.ambient_tab_collection_enabled = Some(false),
+                "wrong_hash" => snapshot.content_hash = "0".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(invalid.validate().is_err(), "{poison} must fail closed");
+        }
+
+        let mut missing = valid_screen_manifest(1, "screen-missing", "screen-missing-asset");
+        missing.context.as_mut().unwrap().browser_state_key = Some(
+            "device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3"
+                .into(),
+        );
+        let fresh = Connection::open_in_memory().unwrap();
+        init_schema(&fresh).unwrap();
+        assert!(record_source_event(
+            &fresh,
+            "account-1",
+            &missing,
+            &"b".repeat(64),
+            "missing-object"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("existing exact state"));
     }
 
     #[test]
