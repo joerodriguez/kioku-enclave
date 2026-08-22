@@ -1,15 +1,13 @@
 # map.md — `src/cp/query/wal/`
 
-Private ADR-0022 query mutation children. They cannot call Store, allocate
-attempts or clocks, launch work, schedule retries, invoke providers, or
-acknowledge routes. Slice 10g wires the pre-provider selected-screenshot
-chain (attempt, ciphertext candidate, `SendStarted`) to the upload route for
-WAL-authoritative users; the route stops fail-closed after the durable
-marker because the provider boundary's execution claim has no routed
-admission lane. Provider execution, provider-accepted A settlement, and the
-definitive-no-object C settlement remain inactive with no production caller.
+Private inactive ADR-0022 query mutation children. They cannot call Store,
+allocate attempts or clocks, launch work, schedule retries, invoke providers,
+or acknowledge routes. The former selected-screenshot upload route is now an
+authenticated Genesis `410 Gone` tombstone before request-body or archive work,
+so the entire attempt/candidate/`SendStarted`/provider/A/C chain has no
+production caller.
 
-The parent selected-screenshot A codec's sole production contract consumes the
+The parent selected-screenshot A codec's strongest typed contract consumes the
 exact provider-accepted proof plus the complete execution-claim, send,
 candidate, media-DEK, and permanent-attempt chain in a typed v3 request; its
 historical unbound v1 and B-bound v2 construction is test-only. Exact replay and
@@ -25,8 +23,8 @@ request, a bounded durable execution claim prevents a second provider attempt.
 A fifth child consumes only the exact definitive-no-object proof and execution
 claim, retains an exact C terminal, releases the episode reservation for a
 different target, and permanently fences the original target. Provider-accepted
-A settlement is present only behind this WAL-private boundary; no
-production caller or launcher exists for the provider, A, or C links.
+A settlement is present only behind this WAL-private boundary; no production
+caller or launcher exists for any selected-screenshot link.
 
 | File | Role |
 |---|---|

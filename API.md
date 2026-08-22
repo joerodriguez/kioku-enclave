@@ -513,6 +513,16 @@ final accepted audio manifest carries `session_finished=true`.
 
 ## Screenshot evidence bytes
 
+Cloud Capture v2 does not use the historical device-sync upload planner. For a
+Genesis-selected archive, authenticated `GET /api/screenshot-images/plan` and
+`POST /api/screenshot-images` return
+`410 {"error":"screenshot_upload_retired"}` before reading an upload body or
+performing archive, KMS, reservation, or object-provider work. Canonical capture
+already uploaded the bounded image under its event receipt, and the native client
+does not retain a second local source to upload later. The old plan and multipart
+behavior remain only for unselected legacy archives during their compatibility
+window; new clients must not call them.
+
 `GET /api/screenshot-images/{cloud_image_id}/content` serves a complete JPEG to the
 authenticated owner. A Cloud Capture v2 ID has the form `capture-v2:{asset_id}` and is
 available only after the canonical screen result is ready. The enclave reads the exact

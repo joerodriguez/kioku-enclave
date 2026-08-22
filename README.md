@@ -251,7 +251,8 @@ The same binary serves all of these surfaces:
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account`, `/api/account/deletion` | Kioku access token or accepted Google ID token |
 | Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
-| Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
+| Screenshot evidence | `/api/screenshot-images/{id}/content` | Kioku access token or accepted Google ID token |
+| Retired selected screenshot upload | `GET /api/screenshot-images/plan`, `POST /api/screenshot-images` | Kioku access token or accepted Google ID token; Genesis-selected archives receive `410 Gone`, while unselected legacy compatibility remains |
 | Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
 | Retired local sync | `/api/sync/batch` | Kioku access token or accepted Google ID token, then `410 Gone` |
 | Retired legacy data plane | `/v1/*` below | Google service identity token, then `410 Gone` |
@@ -261,6 +262,8 @@ Retired compatibility tombstones are:
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/sync/batch` | Authenticated `410 Gone`; no batch mutation |
+| `GET` | `/api/screenshot-images/plan` | Genesis-selected archives: authenticated `410 Gone`; no false empty plan or archive read |
+| `POST` | `/api/screenshot-images` | Genesis-selected archives: authenticated `410 Gone` before multipart, KMS, lease, or provider work |
 | `ANY` | `/v1/ingest` | Authenticated `410 Gone`; no ingest mutation |
 | `ANY` | `/v1/search`, `/v1/context`, `/v1/range`, `/v1/stats` | Authenticated `410 Gone`; no data read |
 | `ANY` | `/v1/episodes/*` | Authenticated `410 Gone`; no episode mutation or read |

@@ -276,6 +276,13 @@ separate activation blockers.
     exactly replay. The KMS producer that proves the wrapper/plaintext pairing,
     media encryption/upload candidate, send-start fence, provider receipt,
     Store/route/launcher/task/retry/acknowledgement wiring remain absent.
+  - [x] Retire the obsolete device-sync screenshot plan and multipart upload
+    for Genesis-selected archives. Both authenticated routes return one stable
+    `410 Gone` before body parsing, archive mutation, KMS, leases, or provider
+    I/O; canonical capture already owns those bytes. The guarded unselected
+    compatibility plan remains, with a bounded device-id grammar and escaped
+    SQL `LIKE` prefix, and the inactive selected-screenshot WAL family has no
+    production route owner.
   - [x] Add the inactive historical selected-screenshot receipt A-domain: a future B
     boundary must durably choose the 128-bit opaque upload attempt and exact
     account-bound object key before provider I/O; that stable attempt derives

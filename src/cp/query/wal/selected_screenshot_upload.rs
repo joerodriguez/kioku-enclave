@@ -3,9 +3,9 @@
     reason = "inactive ADR-0022 selected-screenshot ciphertext candidate is reviewed before send or launcher ownership"
 )]
 
-//! Ciphertext-candidate boundary for one selected-screenshot attempt (wired
-//! to the selected upload route by ADR-0022 slice 10g via the WAL-owned
-//! factory in the parent).
+//! Ciphertext-candidate boundary for one selected-screenshot attempt. Slice
+//! 10g once wired its parent factory to the selected route; Genesis retirement
+//! now leaves the family compiled and sealed with no production route owner.
 //!
 //! A future producer supplies already validated JPEG bytes, the exact
 //! context-bound ciphertext, the borrowed media DEK, and the typed receipts

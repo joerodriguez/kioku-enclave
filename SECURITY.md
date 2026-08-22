@@ -386,10 +386,12 @@ Cloud KMS KEK
 Version 2 uses AES-GCM Additional Authenticated Data containing a domain separator and
 the object's logical identity. User databases are bound to their exact
 `indexes/{user_id}.db.enc` name, raw capture and screenshot evidence objects are bound to
-both the authenticated user and exact media object key. New selected screenshot evidence is
-restricted to `raw/{user_id}/evidence/{opaque_key}.enc`; legacy `media/{opaque_key}` rows
-remain readable and deletable until normal retention or account deletion. Control/ACME state uses fixed,
-distinct contexts.
+both the authenticated user and exact media object key. Historical device-sync screenshot
+evidence uses `raw/{user_id}/evidence/{opaque_key}.enc` only on the guarded legacy lane;
+the Genesis-selected plan and multipart routes are provider-free `410 Gone` tombstones.
+Canonical selected screenshots use the Cloud Capture namespace below. Legacy
+`media/{opaque_key}` rows remain readable and deletable until normal retention or account
+deletion. Control/ACME state uses fixed, distinct contexts.
 Moving ciphertext and its wrapped DEK to another object or user therefore fails
 authentication.
 
@@ -1360,16 +1362,17 @@ general settlement families described above. Every other semantic A operation re
 and activation adapter. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
-screen result now consumes its exact binding. The selected-screenshot upload identity is a second
+screen result now consumes its exact binding. The inactive selected-screenshot upload identity is a second
 sealed B operation, its bounded context-bound ciphertext continuation authenticates that attempt and
 the installed media-DEK receipt without provider authority, and its exact-name send-start continuation
-now commits one deterministic request marker before any future provider call. The production-facing
+now commits one deterministic request marker before any future provider call. The strongest typed
 local A-v3 receipt consumes the exact accepted provider proof and full predecessor chain; historical
 unbound v1 and B-only v2 A contracts are test-only.
 An exact definitive-no-object C terminal now reauthenticates the complete one-shot provider execution
 claim and predecessor chain, releases budget only for another target, and permanently fences local A,
-new candidate admission, and provider re-preparation. Concrete provider calls and every external
-launcher caller remain absent.
+new candidate admission, and provider re-preparation. The selected upload route no longer calls this
+family: Genesis-selected plan and multipart requests return `410 Gone` before archive or provider
+work. Concrete provider calls and every external launcher caller remain absent.
 Generic/audio/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
 unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
