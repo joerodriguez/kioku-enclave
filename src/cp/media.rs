@@ -24,7 +24,7 @@ use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
 
 const MAX_AUDIO_BYTES: i64 = 20 * 1024 * 1024;
-const MAX_SCREENSHOT_BYTES: i64 = 5 * 1024 * 1024;
+pub(crate) const MAX_SCREENSHOT_BYTES: i64 = 5 * 1024 * 1024;
 const MAX_ID_LEN: usize = 128;
 /// The ingest length bound on the device-supplied `started_at`/`ended_at`.
 ///
@@ -1570,10 +1570,15 @@ async fn upload_capture_event(
         Ok(value) => value,
         Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
-    let object_key = manifest
-        .media
-        .as_ref()
-        .map(|media| format!("raw/{user_id}/{}.enc", media.asset_id));
+    let object_key = match manifest.media.as_ref() {
+        Some(media) => {
+            match crate::store::canonical_capture_media_object_key(&user_id, &media.asset_id) {
+                Ok(key) => Some(key),
+                Err(error) => return capture_error_response(started_at, Some(&manifest), error),
+            }
+        }
+        None => None,
+    };
     let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
         Ok(guard) => guard,
         Err(error) => {
@@ -1756,22 +1761,19 @@ async fn upload_capture_event(
         match put.await {
             Ok(Ok(generation)) => media_generation = Some(generation),
             Ok(Err(put_error)) => {
-                if let Err(error) =
-                    verify_existing_media(&state, &user_id, object_key, &media_context, media_bytes)
-                        .await
+                media_generation = match verify_existing_media(
+                    &state,
+                    object_key,
+                    &media_context,
+                    media_bytes,
+                    &media_dek,
+                    &wrapped_dek,
+                )
+                .await
                 {
-                    tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
-                    return capture_failure_response(
-                        started_at,
-                        Some(&manifest),
-                        CaptureIngestFailureReason::MediaStorageUnavailable,
-                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
-                    );
-                }
-                media_generation = match state.store.get_media(object_key).await {
-                    Ok(existing) => Some(existing.generation),
+                    Ok(generation) => Some(generation),
                     Err(error) => {
-                        tracing::error!(error = %error, "capture media generation lookup failed");
+                        tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
                         return capture_failure_response(
                             started_at,
                             Some(&manifest),
@@ -1819,14 +1821,14 @@ async fn upload_capture_event(
                         (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
                     );
                 };
-                let plan = match wal::CanonicalCaptureEventPlan::new(
+                let prepared = match prepare_canonical_capture_event(
                     user_id.clone(),
                     manifest.clone(),
                     object_key.to_string(),
                     generation,
                     enclave_commit_stamp(),
                 ) {
-                    Ok(plan) => plan,
+                    Ok(prepared) => prepared,
                     Err(_) => {
                         return capture_error_response(
                             started_at,
@@ -1837,20 +1839,6 @@ async fn upload_capture_event(
                         )
                     }
                 };
-                let prepared =
-                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-                    {
-                        Ok(prepared) => prepared,
-                        Err(_) => {
-                            return capture_error_response(
-                                started_at,
-                                Some(&manifest),
-                                EnclaveError::Store(
-                                    "canonical capture plan construction failed".into(),
-                                ),
-                            )
-                        }
-                    };
                 match state
                     .store
                     .wal_authoritative_submit(&user_id, prepared)
@@ -3157,23 +3145,100 @@ async fn read_media_dek_wrapped(state: &CpState, user_id: &str) -> Result<Option
         .await
 }
 
+fn prepare_canonical_capture_event(
+    user_id: String,
+    manifest: CaptureEventManifest,
+    object_key: String,
+    generation: i64,
+    commit_stamp: String,
+) -> Result<
+    crate::archive_v3_wal_idempotency::PreparedLogicalMutation<wal::CanonicalCaptureEventPlan>,
+> {
+    let plan = wal::CanonicalCaptureEventPlan::new(
+        user_id,
+        manifest,
+        object_key,
+        generation,
+        commit_stamp,
+    )
+    .map_err(|_| EnclaveError::Store("canonical capture plan construction failed".into()))?;
+    crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| EnclaveError::Store("canonical capture plan construction failed".into()))
+}
+
 async fn verify_existing_media(
     state: &CpState,
-    _user_id: &str,
     object_key: &str,
     context: &[u8],
     expected: &[u8],
-) -> Result<()> {
-    let existing = state.store.get_media(object_key).await?;
-    let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &existing.wrapped_dek_b64).await?;
+    installed_dek: &crate::crypto::Dek,
+    installed_wrapped_dek: &str,
+) -> Result<i64> {
+    // Lost-response adoption is allowed only from the current provider's one
+    // live response. It must be encrypted under the account's already chosen
+    // DEK and strict v2 AAD; the generation returned here is the same response
+    // whose bytes were authenticated, so no verify-N/record-N+1 race exists.
+    let existing = state.store.get_current_media(object_key).await?;
+    if existing.generation <= 0 || existing.wrapped_dek_b64 != installed_wrapped_dek {
+        return Err(EnclaveError::Conflict(
+            "existing canonical media does not match the installed account key".into(),
+        ));
+    }
     let plaintext =
-        crate::crypto::decrypt_bound_blob(&dek, &existing.ciphertext, context)?.plaintext;
+        crate::crypto::decrypt_bound_blob_v2(installed_dek, &existing.ciphertext, context)?
+            .plaintext;
     if plaintext != expected {
         return Err(EnclaveError::Conflict(
             "asset_id was already used for different media".into(),
         ));
     }
-    Ok(())
+    Ok(existing.generation)
+}
+
+/// Test-only production-boundary fixture for consumers that must prove bytes
+/// written by the canonical selected capture path. It deliberately performs
+/// the same DEK install, strict v2 encryption, current-provider PUT and sealed
+/// `CanonicalCaptureEventPlan` submit as `upload_capture_event`; it exposes no
+/// raw SQLite shortcut.
+#[cfg(test)]
+pub(crate) async fn submit_selected_screen_capture_fixture(
+    state: &CpState,
+    user_id: &str,
+    manifest: CaptureEventManifest,
+    media_bytes: &[u8],
+) -> Result<String> {
+    manifest.validate()?;
+    let media = manifest.media.as_ref().ok_or_else(|| {
+        EnclaveError::InvalidRequest("selected screen fixture requires media".into())
+    })?;
+    if manifest.stream_kind.is_audio() {
+        return Err(EnclaveError::InvalidRequest(
+            "selected screen fixture requires a screen stream".into(),
+        ));
+    }
+    validate_media_bytes(&manifest, media_bytes, Some(media.mime_type.as_str()))?;
+    let object_key = crate::store::canonical_capture_media_object_key(user_id, &media.asset_id)?;
+    let (dek, wrapped_dek) = load_or_create_media_dek(state, user_id).await?;
+    let context = crate::store::media_blob_context(user_id, &object_key);
+    let encrypted = crate::crypto::encrypt_bound_blob(&dek, media_bytes, &context)?;
+    let generation = state
+        .store
+        .put_user_media(user_id, &object_key, &encrypted, &wrapped_dek)
+        .await?;
+    let asset_id = media.asset_id.clone();
+    let prepared = prepare_canonical_capture_event(
+        user_id.to_owned(),
+        manifest,
+        object_key,
+        generation,
+        enclave_commit_stamp(),
+    )
+    .map_err(|_| EnclaveError::Store("selected capture fixture plan failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await?;
+    Ok(asset_id)
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -5114,6 +5179,7 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::GcsClient;
     use rusqlite::Connection;
     use serde_json::json;
 
@@ -5435,9 +5501,16 @@ mod tests {
         );
         assert_eq!(
             route
-                .matches(concat!("CanonicalCaptureEventPlan::", "new("))
+                .matches(concat!("prepare_canonical_capture_", "event("))
                 .count(),
             1
+        );
+        assert_eq!(
+            source
+                .matches(concat!("CanonicalCaptureEventPlan::", "new("))
+                .count(),
+            1,
+            "production and selected E2E fixtures share the one sealed constructor"
         );
         assert_eq!(
             route
@@ -6729,12 +6802,26 @@ mod tests {
     }
 
     fn finish_test_state() -> Arc<CpState> {
-        use crate::store::tests::{FakeGcs, FakeKms};
-        let kms = Arc::new(FakeKms);
+        use crate::store::tests::FakeGcs;
         let gcs = Arc::new(FakeGcs::new());
+        finish_test_state_with_media(Arc::clone(&gcs), Arc::clone(&gcs), gcs)
+    }
+
+    fn finish_test_state_with_media(
+        index_gcs: Arc<crate::store::tests::FakeGcs>,
+        current_media_gcs: Arc<crate::store::tests::FakeGcs>,
+        legacy_media_gcs: Arc<crate::store::tests::FakeGcs>,
+    ) -> Arc<CpState> {
+        use crate::store::tests::FakeKms;
+        let kms = Arc::new(FakeKms);
         Arc::new(CpState {
-            store: Arc::new(crate::store::Store::new(kms.clone(), gcs.clone())),
-            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs)),
+            store: Arc::new(crate::store::Store::new_with_media_and_legacy(
+                kms.clone(),
+                index_gcs.clone(),
+                current_media_gcs,
+                legacy_media_gcs,
+            )),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs)),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
@@ -6773,6 +6860,118 @@ mod tests {
             embedding: None,
             voice: None,
         })
+    }
+
+    #[tokio::test]
+    async fn lost_response_adopts_only_one_strict_current_provider_response() {
+        use crate::store::tests::FakeGcs;
+
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let state = finish_test_state_with_media(index, Arc::clone(&current), Arc::clone(&legacy));
+        let user_id = "lost-response-owner";
+        let object_key =
+            crate::store::canonical_capture_media_object_key(user_id, "strict-asset").unwrap();
+        let context = crate::store::media_blob_context(user_id, &object_key);
+        let expected = b"strict current response";
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+            .await
+            .unwrap();
+        let blob = crate::crypto::encrypt_bound_blob(&dek, expected, &context).unwrap();
+        let generation = current
+            .put_object(&object_key, &blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_poison =
+            crate::crypto::encrypt_bound_blob(&dek, b"legacy poison", &context).unwrap();
+        legacy
+            .put_object(&object_key, &legacy_poison, &wrapped_dek, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verify_existing_media(&state, &object_key, &context, expected, &dek, &wrapped_dek,)
+                .await
+                .unwrap(),
+            generation
+        );
+        assert_eq!(legacy.live_get_count(), 0, "recovery must never use legacy");
+
+        let legacy_only_key =
+            crate::store::canonical_capture_media_object_key(user_id, "legacy-only").unwrap();
+        let legacy_only_context = crate::store::media_blob_context(user_id, &legacy_only_key);
+        let legacy_only_blob =
+            crate::crypto::encrypt_bound_blob(&dek, expected, &legacy_only_context).unwrap();
+        legacy
+            .put_object(&legacy_only_key, &legacy_only_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_existing_media(
+                &state,
+                &legacy_only_key,
+                &legacy_only_context,
+                expected,
+                &dek,
+                &wrapped_dek,
+            )
+            .await,
+            Err(EnclaveError::NotFound)
+        ));
+
+        let historical_key =
+            crate::store::canonical_capture_media_object_key(user_id, "historical").unwrap();
+        let historical_context = crate::store::media_blob_context(user_id, &historical_key);
+        let historical_blob = crate::crypto::encrypt_blob(&dek, expected).unwrap();
+        current
+            .put_object(&historical_key, &historical_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_existing_media(
+                &state,
+                &historical_key,
+                &historical_context,
+                expected,
+                &dek,
+                &wrapped_dek,
+            )
+            .await,
+            Err(EnclaveError::Crypto(_))
+        ));
+
+        let wrong_wrapped_key =
+            crate::store::canonical_capture_media_object_key(user_id, "wrong-wrap").unwrap();
+        let wrong_wrapped_context = crate::store::media_blob_context(user_id, &wrong_wrapped_key);
+        let wrong_wrapped_blob =
+            crate::crypto::encrypt_bound_blob(&dek, expected, &wrong_wrapped_context).unwrap();
+        let (_, different_wrapped_dek) =
+            crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+                .await
+                .unwrap();
+        current
+            .put_object(
+                &wrong_wrapped_key,
+                &wrong_wrapped_blob,
+                &different_wrapped_dek,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_existing_media(
+                &state,
+                &wrong_wrapped_key,
+                &wrong_wrapped_context,
+                expected,
+                &dek,
+                &wrapped_dek,
+            )
+            .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(legacy.live_get_count(), 0, "no recovery arm probes legacy");
     }
 
     #[tokio::test]

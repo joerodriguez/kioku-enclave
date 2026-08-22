@@ -393,6 +393,15 @@ distinct contexts.
 Moving ciphertext and its wrapped DEK to another object or user therefore fails
 authentication.
 
+Cloud Capture v2 raw assets use the separately validated
+`raw/{user_id}/{asset_id}.enc` namespace. Their canonical receipt commits the exact
+current-provider generation, backend, byte length, and plaintext SHA-256. Screenshot
+content serving exact-reads that generation, requires the provider wrapped DEK to equal
+the account's installed value, and accepts only the current v2 AAD format; it never reads
+the legacy provider for a `capture-v2:` ID. Provider and KMS transport outages are
+retryable 503 responses, while malformed identity, AEAD, length, or digest failures are
+500 faults that return no content.
+
 User databases, the control database, ACME state, and media evidence are rewritten
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see

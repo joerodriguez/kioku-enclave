@@ -27,6 +27,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::wal_domain;
 use crate::search::{search_all, SearchRequest};
@@ -3350,37 +3351,91 @@ async fn rest_screenshot_image_content(
             .into_response();
     }
 
-    if let Some(error) = s.wal_domain_refusal(&user_id, wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT)
-    {
-        return error.into_response();
-    }
-
     // 1. Resolve either a legacy selected-evidence ID or a namespaced Cloud
-    // Capture v2 asset ID inside this authenticated user's database.
+    // Capture v2 asset ID inside this authenticated user's database. The v2
+    // arm returns the complete immutable media identity; object_key alone is
+    // not authority to read a current provider generation.
     let user_id_cloned = user_id.clone();
     let query_res = s
         .store
         .wal_authoritative_read(&user_id_cloned, {
             let id_clone = id.clone();
-            move |conn| screenshot_image_object_key(conn, &id_clone)
+            let lookup_user = user_id_cloned.clone();
+            move |conn| screenshot_image_object_key(conn, &lookup_user, &id_clone)
         })
         .await;
 
-    let object_key = match query_res {
+    let locator = match query_res {
         Ok(Some(ok)) => ok,
         // A failed read is NOT an absence. This arm used to be byte-identical
         // to the `Ok(None)` arm below and unlogged, so an unreadable archive
         // told the caller their screenshot does not exist and nothing recorded
         // that it had happened. The DEK read further down already answered
         // loudly; this one now matches it.
+        Err(crate::error::EnclaveError::InvalidRequest(_)) => {
+            tracing::error!("canonical screenshot identity is malformed at rest");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         Err(e) => return super::routed_read_unavailable("api.screenshot_image_content.lookup", &e),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // 2. Fetch the encrypted object from GCS
-    let gcs_resp = match s.store.get_media(&object_key).await {
-        Ok(r) => r,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    // 2. Fetch the encrypted object. Capture-v2 is exact-current only; legacy
+    // screenshot evidence preserves its compatibility fallback.
+    let gcs_resp = match &locator {
+        ScreenshotImageLocator::CaptureV2(identity) => {
+            match s
+                .store
+                .get_current_media_generation(&identity.object_key, identity.generation)
+                .await
+            {
+                Ok(response) => response,
+                Err(crate::error::EnclaveError::NotFound) => {
+                    // Retention deletes the provider generation before it
+                    // settles the row. Re-read authority: a now-ineligible row
+                    // is a truthful 404; an unchanged ready tuple means storage
+                    // is unavailable and must not masquerade as absence.
+                    let reread_user = user_id.clone();
+                    let lookup_user = reread_user.clone();
+                    let reread_id = id.clone();
+                    return match s
+                        .store
+                        .wal_authoritative_read(&reread_user, move |conn| {
+                            screenshot_image_object_key(conn, &lookup_user, &reread_id)
+                        })
+                        .await
+                    {
+                        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                        Ok(Some(_)) | Err(_) => super::routed_read_unavailable(
+                            "api.screenshot_image_content.object_missing",
+                            &crate::error::EnclaveError::Store(
+                                "sealed screenshot generation is unavailable".into(),
+                            ),
+                        ),
+                    };
+                }
+                Err(error) => {
+                    return super::routed_read_unavailable(
+                        "api.screenshot_image_content.object",
+                        &error,
+                    )
+                }
+            }
+        }
+        ScreenshotImageLocator::Legacy { object_key } => {
+            match s.store.get_media(object_key).await {
+                Ok(response) => response,
+                Err(crate::error::EnclaveError::NotFound) => {
+                    return StatusCode::NOT_FOUND.into_response()
+                }
+                Err(error) => {
+                    return super::routed_read_unavailable(
+                        "api.screenshot_image_content.legacy_object",
+                        &error,
+                    )
+                }
+            }
+        }
     };
 
     // 3. Load user's media DEK
@@ -3418,6 +3473,10 @@ async fn rest_screenshot_image_content(
 
     let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_b64).await {
         Ok(dek) => dek,
+        Err(
+            error @ (crate::error::EnclaveError::Http(_)
+            | crate::error::EnclaveError::Attestation(_)),
+        ) => return super::routed_read_unavailable("api.screenshot_image_content.kms", &error),
         Err(e) => {
             tracing::error!(error = %e, "media download DEK load failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -3425,15 +3484,51 @@ async fn rest_screenshot_image_content(
     };
 
     // 4. Bind media to both the authenticated user and exact object key.
+    let object_key = locator.object_key();
     let media_context = crate::store::media_blob_context(&user_id, &object_key);
-    let opened =
-        match crate::crypto::decrypt_bound_blob(&media_dek, &gcs_resp.ciphertext, &media_context) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(error = %e, "media download authentication failed");
+    let opened = match &locator {
+        ScreenshotImageLocator::CaptureV2(identity) => {
+            if gcs_resp.generation != identity.generation || gcs_resp.wrapped_dek_b64 != wrapped_b64
+            {
+                tracing::error!("canonical screenshot provider identity mismatch");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-        };
+            match crate::crypto::decrypt_bound_blob_v2(
+                &media_dek,
+                &gcs_resp.ciphertext,
+                &media_context,
+            ) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    tracing::error!(error = %error, "media download authentication failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        ScreenshotImageLocator::Legacy { .. } => {
+            match crate::crypto::decrypt_bound_blob(
+                &media_dek,
+                &gcs_resp.ciphertext,
+                &media_context,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(error = %e, "media download authentication failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+    };
+
+    if let ScreenshotImageLocator::CaptureV2(identity) = &locator {
+        let actual_sha256 = format!("{:x}", Sha256::digest(&opened.plaintext));
+        if opened.plaintext.len() as i64 != identity.byte_length
+            || !actual_sha256.eq_ignore_ascii_case(&identity.sha256)
+        {
+            tracing::error!("canonical screenshot plaintext commitment mismatch");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
 
     (
         StatusCode::OK,
@@ -3443,30 +3538,96 @@ async fn rest_screenshot_image_content(
         .into_response()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureV2ScreenshotIdentity {
+    object_key: String,
+    generation: i64,
+    byte_length: i64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScreenshotImageLocator {
+    CaptureV2(CaptureV2ScreenshotIdentity),
+    Legacy { object_key: String },
+}
+
+impl ScreenshotImageLocator {
+    fn object_key(&self) -> String {
+        match self {
+            Self::CaptureV2(identity) => identity.object_key.clone(),
+            Self::Legacy { object_key } => object_key.clone(),
+        }
+    }
+}
+
 fn screenshot_image_object_key(
     conn: &Connection,
+    user_id: &str,
     id: &str,
-) -> crate::error::Result<Option<String>> {
+) -> crate::error::Result<Option<ScreenshotImageLocator>> {
     if let Some(asset_id) = id.strip_prefix(CLOUD_CAPTURE_IMAGE_ID_PREFIX) {
-        if asset_id.is_empty() {
-            return Ok(None);
-        }
-        return Ok(conn
+        let expected_object_key =
+            match crate::store::canonical_capture_media_object_key(user_id, asset_id) {
+                Ok(key) => key,
+                Err(_) => return Ok(None),
+            };
+        let row = conn
             .query_row(
-                "SELECT object_key FROM media_objects \
+                "SELECT object_key,object_generation,object_backend,byte_length,sha256 FROM media_objects \
                  WHERE asset_id = ?1 AND mime_type = 'image/jpeg' \
                    AND processing_state = 'ready' AND deleted_at IS NULL",
                 [asset_id],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
             )
-            .optional()?);
+            .optional()?;
+        let Some((object_key, generation, backend, byte_length, sha256)) = row else {
+            return Ok(None);
+        };
+        let generation = generation.ok_or_else(|| {
+            crate::error::EnclaveError::InvalidRequest(
+                "canonical screenshot is missing its generation".into(),
+            )
+        })?;
+        if generation <= 0
+            || backend.as_deref() != Some("current")
+            || object_key != expected_object_key
+            || byte_length <= 0
+            || byte_length > super::media::MAX_SCREENSHOT_BYTES
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(crate::error::EnclaveError::InvalidRequest(
+                "canonical screenshot identity is malformed".into(),
+            ));
+        }
+        return Ok(Some(ScreenshotImageLocator::CaptureV2(
+            CaptureV2ScreenshotIdentity {
+                object_key,
+                generation,
+                byte_length,
+                sha256,
+            },
+        )));
     }
 
     Ok(conn
         .query_row(
             "SELECT object_key FROM screenshot_images WHERE id = ?1",
             [id],
-            |row| row.get(0),
+            |row| {
+                Ok(ScreenshotImageLocator::Legacy {
+                    object_key: row.get(0)?,
+                })
+            },
         )
         .optional()?)
 }
@@ -3823,7 +3984,7 @@ async fn rest_test_episode_email(
 mod tests {
     use super::*;
     use crate::store::tests::{FakeGcs, FakeKms};
-    use crate::store::Store;
+    use crate::store::{GcsClient, Store};
 
     /// A read that fails must never present as "nothing found".
     ///
@@ -3995,12 +4156,25 @@ mod tests {
     }
 
     fn query_test_state() -> Arc<CpState> {
-        let kms = Arc::new(FakeKms);
         let gcs = Arc::new(FakeGcs::new());
-        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        query_test_state_with_media(Arc::clone(&gcs), Arc::clone(&gcs), gcs)
+    }
+
+    fn query_test_state_with_media(
+        index_gcs: Arc<FakeGcs>,
+        current_media_gcs: Arc<FakeGcs>,
+        legacy_media_gcs: Arc<FakeGcs>,
+    ) -> Arc<CpState> {
+        let kms = Arc::new(FakeKms);
+        let store = Arc::new(Store::new_with_media_and_legacy(
+            kms.clone(),
+            index_gcs.clone(),
+            current_media_gcs,
+            legacy_media_gcs,
+        ));
         Arc::new(CpState {
             store,
-            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs)),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs)),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
@@ -4039,6 +4213,64 @@ mod tests {
             embedding: None,
             voice: None,
         })
+    }
+
+    async fn seed_capture_v2_screenshot_identity(
+        state: &CpState,
+        user_id: &str,
+        asset_id: &str,
+        object_key: &str,
+        generation: i64,
+        byte_length: i64,
+        sha256: &str,
+    ) {
+        let event_id = format!("event-{asset_id}");
+        let asset_id = asset_id.to_string();
+        let object_key = object_key.to_string();
+        let sha256 = sha256.to_string();
+        state
+            .store
+            .with_user(user_id, move |conn| {
+                conn.execute_batch(
+                    "INSERT OR IGNORE INTO capture_sessions
+                        (id, device_id, install_id, started_at, last_event_at, schema_version)
+                     VALUES ('content-session', 'content-device', 'content-install',
+                             '2026-08-01T10:00:00Z', '2026-08-01T10:05:00Z', 2);
+                     INSERT OR IGNORE INTO capture_streams
+                        (id, capture_session_id, device_id, stream_kind)
+                     VALUES ('content-stream', 'content-session', 'content-device', 'mac_screen');",
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_events
+                        (event_id, device_id, install_id, capture_session_id, stream_id,
+                         stream_kind, sequence, source_wall_at, source_monotonic_ns,
+                         started_at, ended_at, timezone_id, utc_offset_minutes,
+                         clock_uncertainty_ms, asset_id, manifest_digest)
+                     VALUES (?1, 'content-device', 'content-install', 'content-session',
+                             'content-stream', 'mac_screen',
+                             (SELECT COUNT(*) FROM capture_events),
+                             '2026-08-01T10:00:00Z', '1', '2026-08-01T10:00:00Z',
+                             '2026-08-01T10:00:01Z', 'UTC', 0, 0, ?2, ?3)",
+                    rusqlite::params![event_id, asset_id, format!("digest-{asset_id}")],
+                )?;
+                conn.execute(
+                    "INSERT INTO media_objects
+                        (asset_id,event_id,object_key,object_generation,object_backend,mime_type,
+                         codec,byte_length,sha256,processing_state)
+                     VALUES (?1,?2,?3,?4,'current','image/jpeg','jpeg',?5,?6,'ready')",
+                    rusqlite::params![
+                        asset_id,
+                        event_id,
+                        object_key,
+                        generation,
+                        byte_length,
+                        sha256
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -4688,7 +4920,7 @@ mod tests {
     async fn screenshot_content_serves_only_the_owners_ready_cloud_capture_image() {
         let state = query_test_state();
         let user_id = "cloud-image-owner";
-        let object_key = "media/cloud-image";
+        let object_key = "raw/cloud-image-owner/content-asset.enc";
         let legacy_object_key = "media/legacy-image";
         let plaintext = b"test-jpeg-bytes";
         let legacy_plaintext = b"legacy-jpeg-bytes";
@@ -4701,11 +4933,12 @@ mod tests {
             &crate::store::media_blob_context(user_id, object_key),
         )
         .unwrap();
-        state
+        let object_generation = state
             .store
             .put_media(object_key, &encrypted, &wrapped_dek)
             .await
             .unwrap();
+        let plaintext_sha256 = format!("{:x}", Sha256::digest(plaintext));
         let encrypted_legacy = crate::crypto::encrypt_bound_blob(
             &dek,
             legacy_plaintext,
@@ -4719,7 +4952,7 @@ mod tests {
             .unwrap();
         state
             .store
-            .with_user(user_id, |conn| {
+            .with_user(user_id, move |conn| {
                 conn.execute(
                     "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)",
                     rusqlite::params![MEDIA_DEK_METADATA_KEY, wrapped_dek],
@@ -4759,8 +4992,6 @@ mod tests {
                         (asset_id, event_id, object_key, mime_type, codec, byte_length, sha256,
                          processing_state)
                     VALUES
-                        ('content-asset', 'content-event', 'media/cloud-image', 'image/jpeg',
-                         'jpeg', 15, 'content-sha', 'ready'),
                         ('processing-asset', 'processing-event', 'media/processing-image',
                          'image/jpeg', 'jpeg', 15, 'processing-sha', 'processing'),
                         ('deleted-asset', 'deleted-event', 'media/deleted-image', 'image/jpeg',
@@ -4781,6 +5012,19 @@ mod tests {
                          '2026-08-01T10:00:00Z', 'media/legacy-image', 'image/jpeg', 2, 2,
                          17, 'legacy-content-sha');
                     ",
+                )?;
+                conn.execute(
+                    "INSERT INTO media_objects
+                        (asset_id,event_id,object_key,object_generation,object_backend,mime_type,
+                         codec,byte_length,sha256,processing_state)
+                     VALUES ('content-asset','content-event',?1,?2,'current','image/jpeg','jpeg',
+                             ?3,?4,'ready')",
+                    rusqlite::params![
+                        object_key,
+                        object_generation,
+                        plaintext.len() as i64,
+                        plaintext_sha256
+                    ],
                 )?;
                 Ok(())
             })
@@ -4836,6 +5080,380 @@ mod tests {
             .await;
             assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    /// `query.screenshot_image_content` is lifted only on bytes produced by
+    /// the selected production chain: canonical capture upload + sealed
+    /// capture receipt + sealed media claim/attempt/usage/storyboard result.
+    /// A direct table seed would not prove the route's GCS/DEK/AAD boundary.
+    #[tokio::test]
+    async fn selected_capture_and_storyboard_serve_exact_screenshot_bytes() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+
+        let archive = answerable_wal_archive("a0000000-0000-4000-8000-000000000006").await;
+        let plaintext = vec![
+            0xff, 0xd8, 0xff, b'K', b'I', b'O', b'K', b'U', b'-', b'J', b'P', b'E', b'G', 0xff,
+            0xd9,
+        ];
+        let sha256 = format!("{:x}", Sha256::digest(&plaintext));
+        let manifest: super::super::media::CaptureEventManifest = serde_json::from_value(json!({
+            "schema_version": 2,
+            "event_id": "selected-screen-event",
+            "device_id": "selected-device",
+            "install_id": "selected-install",
+            "capture_session_id": "selected-session",
+            "stream_id": "selected-screen-stream",
+            "stream_kind": "mac_screen",
+            "sequence": 0,
+            "source_wall_at": "2026-08-22T10:00:00.000Z",
+            "source_monotonic_ns": 1,
+            "started_at": "2026-08-22T10:00:00.000Z",
+            "ended_at": "2026-08-22T10:00:00.001Z",
+            "timezone_id": "UTC",
+            "utc_offset_minutes": 0,
+            "clock_uncertainty_ms": 1,
+            "media": {
+                "asset_id": "selected-screen-asset",
+                "mime_type": "image/jpeg",
+                "codec": "jpeg",
+                "byte_length": plaintext.len(),
+                "sha256": sha256,
+                "width": 1,
+                "height": 1,
+                "scale": 1,
+                "orientation": "up"
+            },
+            "context": {
+                "capture_status": "stable",
+                "active_app": "Finder",
+                "primary_bundle_id": "com.apple.finder",
+                "primary_window_id": 1,
+                "window_title": "Selected fixture",
+                "display_id": 1,
+                "active_url": null,
+                "active_url_title": null,
+                "browser_permission_status": "unavailable",
+                "browser_state_key": null,
+                "browser_snapshot": null,
+                "visible_windows": [],
+                "visible_windows_truncated": false
+            }
+        }))
+        .unwrap();
+        let asset_id = super::super::media::submit_selected_screen_capture_fixture(
+            &archive.state,
+            &archive.user_id,
+            manifest,
+            &plaintext,
+        )
+        .await
+        .unwrap();
+        super::super::media_worker::settle_selected_screen_result_fixture(
+            &archive.state,
+            &archive.user_id,
+        )
+        .await
+        .unwrap();
+
+        let response = rest_screenshot_image_content(
+            State(Arc::clone(&archive.state)),
+            Extension(AuthUser(archive.user_id)),
+            Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{asset_id}")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test]
+    async fn capture_v2_content_enforces_the_committed_provider_and_plaintext_identity() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let state = query_test_state_with_media(index, Arc::clone(&current), Arc::clone(&legacy));
+        let user_id = "capture-content-integrity";
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+            .await
+            .unwrap();
+        let wrapped_for_db = wrapped_dek.clone();
+        state
+            .store
+            .with_user(user_id, move |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![MEDIA_DEK_METADATA_KEY, wrapped_for_db],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A later live provider version and a poison object in the legacy
+        // provider must not replace the exact committed current generation.
+        let pinned_asset = "pinned-asset";
+        let pinned_key =
+            crate::store::canonical_capture_media_object_key(user_id, pinned_asset).unwrap();
+        let pinned_plaintext = b"pinned jpeg bytes";
+        let pinned_context = crate::store::media_blob_context(user_id, &pinned_key);
+        let pinned_blob =
+            crate::crypto::encrypt_bound_blob(&dek, pinned_plaintext, &pinned_context).unwrap();
+        let pinned_generation = current
+            .put_object(&pinned_key, &pinned_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_poison =
+            crate::crypto::encrypt_bound_blob(&dek, b"legacy poison", &pinned_context).unwrap();
+        legacy
+            .put_object(&pinned_key, &legacy_poison, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let newer_blob =
+            crate::crypto::encrypt_bound_blob(&dek, b"newer wrong bytes", &pinned_context).unwrap();
+        current
+            .put_object(&pinned_key, &newer_blob, &wrapped_dek, pinned_generation)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            pinned_asset,
+            &pinned_key,
+            pinned_generation,
+            pinned_plaintext.len() as i64,
+            &format!("{:x}", Sha256::digest(pinned_plaintext)),
+        )
+        .await;
+        let pinned = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{pinned_asset}")),
+        )
+        .await;
+        assert_eq!(pinned.status(), StatusCode::OK);
+        let pinned_body = axum::body::to_bytes(pinned.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(pinned_body.as_ref(), pinned_plaintext);
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "capture-v2 must never fall back"
+        );
+
+        current.fail_next_exact_get(crate::error::EnclaveError::Gcs(
+            "injected current-provider outage".into(),
+        ));
+        let provider_unavailable = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{pinned_asset}")),
+        )
+        .await;
+        assert_eq!(
+            provider_unavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "outage must not trigger fallback"
+        );
+
+        // Canonical rows refuse both historical ciphertext encodings even
+        // though the separate legacy screenshot-id arm remains compatible.
+        let unbound_asset = "unbound-asset";
+        let unbound_key =
+            crate::store::canonical_capture_media_object_key(user_id, unbound_asset).unwrap();
+        let unbound_plaintext = b"unbound historical bytes";
+        let unbound_blob = crate::crypto::encrypt_blob(&dek, unbound_plaintext).unwrap();
+        let unbound_generation = current
+            .put_object(&unbound_key, &unbound_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            unbound_asset,
+            &unbound_key,
+            unbound_generation,
+            unbound_plaintext.len() as i64,
+            &format!("{:x}", Sha256::digest(unbound_plaintext)),
+        )
+        .await;
+
+        // Plaintext size/hash and installed-wrapped-key commitments are all
+        // independently enforced; every mismatch is a fault, never bytes.
+        let length_asset = "length-asset";
+        let length_key =
+            crate::store::canonical_capture_media_object_key(user_id, length_asset).unwrap();
+        let length_plaintext = b"length committed bytes";
+        let length_blob = crate::crypto::encrypt_bound_blob(
+            &dek,
+            length_plaintext,
+            &crate::store::media_blob_context(user_id, &length_key),
+        )
+        .unwrap();
+        let length_generation = current
+            .put_object(&length_key, &length_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            length_asset,
+            &length_key,
+            length_generation,
+            length_plaintext.len() as i64 + 1,
+            &format!("{:x}", Sha256::digest(length_plaintext)),
+        )
+        .await;
+
+        let hash_asset = "hash-asset";
+        let hash_key =
+            crate::store::canonical_capture_media_object_key(user_id, hash_asset).unwrap();
+        let hash_plaintext = b"hash committed bytes";
+        let hash_blob = crate::crypto::encrypt_bound_blob(
+            &dek,
+            hash_plaintext,
+            &crate::store::media_blob_context(user_id, &hash_key),
+        )
+        .unwrap();
+        let hash_generation = current
+            .put_object(&hash_key, &hash_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            hash_asset,
+            &hash_key,
+            hash_generation,
+            hash_plaintext.len() as i64,
+            &"0".repeat(64),
+        )
+        .await;
+
+        let wrong_key_asset = "wrong-wrapped-key-asset";
+        let wrong_key =
+            crate::store::canonical_capture_media_object_key(user_id, wrong_key_asset).unwrap();
+        let wrong_key_plaintext = b"wrong wrapped key bytes";
+        let (other_dek, other_wrapped_dek) =
+            crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+                .await
+                .unwrap();
+        let wrong_key_blob = crate::crypto::encrypt_bound_blob(
+            &other_dek,
+            wrong_key_plaintext,
+            &crate::store::media_blob_context(user_id, &wrong_key),
+        )
+        .unwrap();
+        let wrong_key_generation = current
+            .put_object(&wrong_key, &wrong_key_blob, &other_wrapped_dek, 0)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            wrong_key_asset,
+            &wrong_key,
+            wrong_key_generation,
+            wrong_key_plaintext.len() as i64,
+            &format!("{:x}", Sha256::digest(wrong_key_plaintext)),
+        )
+        .await;
+
+        let wrong_object_asset = "wrong-object-key-asset";
+        let substituted_object_key =
+            crate::store::canonical_capture_media_object_key(user_id, "different-asset").unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            wrong_object_asset,
+            &substituted_object_key,
+            1,
+            1,
+            &"a".repeat(64),
+        )
+        .await;
+
+        for asset in [
+            unbound_asset,
+            length_asset,
+            hash_asset,
+            wrong_key_asset,
+            wrong_object_asset,
+        ] {
+            let refused = rest_screenshot_image_content(
+                State(Arc::clone(&state)),
+                Extension(AuthUser(user_id.into())),
+                Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{asset}")),
+            )
+            .await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{asset}"
+            );
+        }
+        assert_eq!(legacy.live_get_count(), 0, "capture-v2 never probes legacy");
+
+        // Exact-generation NotFound is ambiguous while the sealed ready row
+        // remains. Once retention settles deleted_at, the same logical lookup
+        // becomes a truthful absence.
+        let missing_asset = "missing-generation-asset";
+        let missing_key =
+            crate::store::canonical_capture_media_object_key(user_id, missing_asset).unwrap();
+        let missing_plaintext = b"vanishing exact generation";
+        let missing_blob = crate::crypto::encrypt_bound_blob(
+            &dek,
+            missing_plaintext,
+            &crate::store::media_blob_context(user_id, &missing_key),
+        )
+        .unwrap();
+        let missing_generation = current
+            .put_object(&missing_key, &missing_blob, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        seed_capture_v2_screenshot_identity(
+            &state,
+            user_id,
+            missing_asset,
+            &missing_key,
+            missing_generation,
+            missing_plaintext.len() as i64,
+            &format!("{:x}", Sha256::digest(missing_plaintext)),
+        )
+        .await;
+        current.vanish_next_exact_generation_get(&missing_key, missing_generation);
+        let unavailable = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{missing_asset}")),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "UPDATE media_objects SET deleted_at='2026-08-22T12:00:00Z' WHERE asset_id=?1",
+                    [missing_asset],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let deleted = rest_screenshot_image_content(
+            State(state),
+            Extension(AuthUser(user_id.into())),
+            Path(format!("{CLOUD_CAPTURE_IMAGE_ID_PREFIX}{missing_asset}")),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

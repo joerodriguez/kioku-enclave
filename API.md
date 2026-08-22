@@ -511,6 +511,22 @@ acceleration. Native clients retry it only after all durable events for that ses
 accepted. Correctness and later finalization do not depend on this request because the
 final accepted audio manifest carries `session_finished=true`.
 
+## Screenshot evidence bytes
+
+`GET /api/screenshot-images/{cloud_image_id}/content` serves a complete JPEG to the
+authenticated owner. A Cloud Capture v2 ID has the form `capture-v2:{asset_id}` and is
+available only after the canonical screen result is ready. The enclave reads the exact
+current-provider generation committed by capture ingest and verifies its owner-derived
+object key, installed wrapped DEK, strict v2 authenticated context, plaintext length, and
+SHA-256 before returning bytes. It never substitutes a newer generation or falls back to
+the legacy media provider for a `capture-v2:` ID. Historical screenshot-image IDs retain
+their separate compatibility read path.
+
+A genuinely absent, non-ready, deleted, non-JPEG, or wrong-owner image returns `404`.
+Archive, current-object-provider, or KMS transport unavailability returns
+`503 {"error":"enclave_unavailable"}`. Malformed sealed identity, key mismatch,
+authentication failure, or length/hash corruption returns `500` and no bytes.
+
 ## Finalized-episode webhooks
 
 Authenticated clients manage destinations with `GET`/`POST /api/webhooks`,

@@ -2606,6 +2606,66 @@ async fn settle_screen_storyboard_result(
         .await
 }
 
+/// Test-only driver for the production selected screen-result boundary. The
+/// caller must first submit a canonical capture through the media fixture;
+/// this helper then uses the real claim, reservation, attempt, terminal usage
+/// and storyboard-result plans in their production order. No direct database
+/// write is available to query-route tests.
+#[cfg(test)]
+pub(crate) async fn settle_selected_screen_result_fixture(
+    state: &CpState,
+    user_id: &str,
+) -> Result<()> {
+    let claimed_at = now_iso();
+    let work = match claim_media_work_unit(state, user_id, WorkClass::Screen, &claimed_at).await {
+        ClaimOutcome::Claimed(work) => work,
+        ClaimOutcome::AudioLaneBlocked => {
+            return Err(EnclaveError::Store(
+                "selected screen fixture hit the audio gate".into(),
+            ))
+        }
+        ClaimOutcome::Refused => {
+            return Err(EnclaveError::Store(
+                "selected screen fixture claim was refused".into(),
+            ))
+        }
+        ClaimOutcome::Idle => {
+            return Err(EnclaveError::Store(
+                "selected screen fixture found no work".into(),
+            ))
+        }
+    };
+    reserve_media_output(state, user_id, &work).await?;
+    let receipt = settle_screen_storyboard_attempt(state, user_id, &work).await?;
+    let metadata = vertex::VertexMetadata::default();
+    super::model_usage::settle_response_required(state, user_id, receipt.event_id(), &metadata)
+        .await?;
+    let generation = vertex::MediaGeneration {
+        text: String::new(),
+        metadata,
+        latency_ms: 1,
+    };
+    persist_actual_media_usage(state, user_id, &work, &generation).await?;
+    let results = work
+        .jobs
+        .iter()
+        .map(|job| {
+            (
+                job.event_id.clone(),
+                ScreenResult {
+                    literal_description: "Canonical selected screenshot".into(),
+                    screen_state: "content".into(),
+                    content_type: "application_ui".into(),
+                    visible_text: "Selected screenshot fixture".into(),
+                    salient_text: "Selected screenshot fixture".into(),
+                    people: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    settle_screen_storyboard_result(state, user_id, &work, &receipt, results).await
+}
+
 /// ADR-0022 slice 11: settle the sealed audio-window attempt boundary for a
 /// WAL-authoritative user. ONE routed read authenticates the complete
 /// reserved leased work topology at one caller-fixed attempt time —
@@ -6073,8 +6133,10 @@ mod tests {
         let egress = route
             .find(concat!("generate_media_parts_", "custom("))
             .unwrap();
+        // The selected end-to-end fixture above also invokes this boundary;
+        // pin the production arm's final invocation in this complete region.
         let bound_result = route
-            .find(concat!("settle_screen_storyboard_", "result(state"))
+            .rfind(concat!("settle_screen_storyboard_", "result(state"))
             .unwrap();
         let legacy = route
             .find(concat!("persist_storyboard_", "results(conn"))

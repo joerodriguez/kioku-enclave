@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 250
+EXPECTED_STORE_CALL_COUNT = 251
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -630,7 +630,20 @@ EXPECTED_STORE_CALL_COUNT = 250
 # owner-body hash of the eight surviving Store sites inside
 # `finalize_user_episodes_scoped`; the status-503, identifier-free logging, and
 # real-ledger adversarial tests add no Store surface. The final third state is:
-EXPECTED_STORE_CALL_SHA256 = "2f26f4d1352ced0760cc1ade999f3012d5a93c4d3bec46af41432a8470fc13d5"
+# Screenshot-content integrity/lift was derived against pristine exact
+# 2cf4a11dfd17ba57ad0f66bf44aa07934741a0e2. Its own 14-test gate first
+# reproduced 250/2f26f4d1 exactly. The branch is 251 rows: exactly one added A
+# routed read revalidates the authoritative screenshot tuple after an exact
+# current-generation NotFound, so a retention race can distinguish truthful
+# absence from storage unavailability. There are zero removals and zero
+# reclassifications. The two surviving screenshot-content read expressions
+# move because the lookup now carries the authenticated user for owner-derived
+# object-key validation and the inserted revalidation shifts the later DEK
+# read's ordinal. The seven surviving upload_capture_event rows move owner-body
+# only with strict single-response lost-PUT recovery, and the two surviving
+# screenshot-content rows move owner-body with exact generation/key/DEK/AAD/
+# length/hash enforcement. No other row or surviving-key order changes.
+EXPECTED_STORE_CALL_SHA256 = "21f575c479bac6d2331a3754eacdba049a6925b3468c7be9e8758594015acc02"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -893,7 +906,13 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # worker_spawn_sites()/classify_worker_spawn()/digest() helpers as the pins
 # above; both reproduced their own 26/e6dac368 pin byte-for-byte, and their
 # inventories are byte-identical to each other, before anything was written.
-EXPECTED_WORKER_SPAWN_SHA256 = "c821c6993a7d244bfc53e143795aad5017ca48b167913dfb09570365576c2e1e"
+# Screenshot-content integrity keeps the same 26 spawn keys, classes, order,
+# and byte-identical call expressions. Only upload_capture_event's owner-body
+# hash moves around the existing cancellation-owned GCS PUT because its
+# ambiguous result now exact-reads the current provider once, authenticates it
+# with the installed DEK/strict v2 context, and returns that same generation.
+# Pristine 2cf4a11 reproduced 26/c821c699 before derivation.
+EXPECTED_WORKER_SPAWN_SHA256 = "5a673c03930330dfcb83c0ee0ff3d29caaac505e8b5d7b38e774e17d4e4b5b6d"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2177,8 +2196,11 @@ impl X {
         # Capture ingest MIGRATED. The former assertNotIn pinned the
         # deliberate pre-wiring state; this pins the wired one just as
         # exactly, the same way MediaDekInstallPlan's did in slice 1 (F1).
-        # The route constructs each plan at exactly ONE site, inside the
-        # `is_wal_authoritative` branch and after the routed preflight.
+        # Canonical construction remains at exactly ONE shared site; the
+        # `is_wal_authoritative` branch invokes that helper after routed
+        # preflight, and the selected E2E fixture reuses it instead of minting
+        # a second test-only constructor. Reference construction remains
+        # directly in the route.
         self.assertEqual(media.count("CanonicalCaptureEventPlan::new("), 1)
         # The single-event reference family: the OTHER media disposition the
         # one ingest route serves. Both arms had to migrate together -- a

@@ -182,7 +182,7 @@ pub mod wal_domain {
     // both have been mistaken for production writers.
     //
     // What survives in this block is therefore NOT "the chain is starved". It
-    // is three specific reads whose own predicates or own tables the live
+    // is two specific reads whose own predicates or own tables the live
     // chain still cannot satisfy, each said exactly once below.
 
     /// `DELETE /api/episodes/{id}`. The ONE read-lane route that is not a
@@ -242,32 +242,6 @@ pub mod wal_domain {
     /// Checkable either way: seed through the WAL lane and assert the route
     /// returns a non-empty `episodes` array.
     pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
-    /// `GET /api/screenshot-images/{id}/content`. **The closest of the
-    /// remaining gates to liftable, and the one whose old rationale is now
-    /// wrong** — it claimed `media_objects` had no live writer. It does:
-    /// canonical capture ingest inserts the row and
-    /// `media_worker/wal/result.rs` flips its `processing_state` to `'ready'`,
-    /// both sealed families on the WAL lane, and ingest encrypts the object
-    /// under the same `store::media_blob_context(user_id, object_key)` this
-    /// route decrypts with. So the `capture-v2:<asset_id>` arm of
-    /// `screenshot_image_object_key` genuinely resolves for a selected user.
-    ///
-    /// It is retained on the weaker of the two grounds, said plainly rather
-    /// than dressed up as the answerability rule: the legacy
-    /// `screenshot_images` arm still has NO WAL-lane writer (see
-    /// [`QUERY_SCREENSHOT_UPLOAD_PLAN`]), and nobody has yet built the
-    /// end-to-end fixture that proves the v2 arm serves BYTES rather than
-    /// merely resolving a key — the route's answer also depends on the GCS
-    /// object, the `app_metadata` DEK install and an AEAD open, none of which
-    /// a table-shaped test exercises.
-    ///
-    /// **Lift condition.** A test that settles a canonical screen capture and
-    /// its storyboard result through `wal_authoritative_submit` for a selected
-    /// user, then asserts this route answers `200 image/jpeg` with the exact
-    /// plaintext. Not "asserts it is no longer 503" — this route has a
-    /// legitimate 404 (`Ok(None)`) and two legitimate 500s (DEK unwrap, AEAD
-    /// open) that a weaker assertion would pass straight through.
-    pub const QUERY_SCREENSHOT_IMAGE_CONTENT: &str = "query.screenshot_image_content";
     // ── The media read domains ──────────────────────────────────────────────
     //
     // THE ANSWERABILITY RULE (ADR-0022 D4). It is the criterion every gate in
@@ -289,7 +263,7 @@ pub mod wal_domain {
     //     every call. That is the delivery group above, and it is why "the
     //     rows exist now" is not on its own a reason to delete a constant.
     //   * routed but UNANSWERABLE — lifting yields `200` with an empty
-    //     collection or a bare 404. That is the three read gates above.
+    //     collection or a bare 404. That is the two read gates above.
     //
     // The registry's "delete a constant only when its domain actually
     // migrates" instruction is read through this rule: a domain migrates when
@@ -567,7 +541,7 @@ mod tests {
         for domain in [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_PEOPLE,
-            wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
+            wal_domain::QUERY_EPISODE_DELETE,
         ] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
             assert_eq!(
@@ -596,7 +570,6 @@ mod tests {
             wal_domain::QUERY_EPISODE_DELETE,
             wal_domain::QUERY_BROWSER_SNAPSHOT,
             wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,
-            wal_domain::QUERY_SCREENSHOT_IMAGE_CONTENT,
             wal_domain::MEDIA_PEOPLE,
         ];
         let unique = domains.iter().collect::<std::collections::BTreeSet<_>>();
