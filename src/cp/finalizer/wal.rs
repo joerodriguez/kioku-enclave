@@ -351,7 +351,15 @@ pub(super) struct FinalizationWebhookDelivery {
 impl FinalizationWebhookDelivery {
     pub(super) fn new(subscription_id: String, event_id: String) -> Result<Self> {
         validate_uuid(&subscription_id)?;
-        validate_prefixed_hex(&event_id, "evt_")?;
+        if validate_prefixed_hex(
+            &event_id,
+            crate::cp::webhook_worker::SELECTED_WEBHOOK_EVENT_PREFIX,
+        )
+        .is_err()
+            && validate_prefixed_hex(&event_id, "evt_").is_err()
+        {
+            return Err(WalIdempotencyError::Malformed);
+        }
         Ok(Self {
             subscription_id,
             event_id,

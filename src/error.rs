@@ -134,41 +134,10 @@ pub mod wal_domain {
     // window reads, the F8 episode upsert at its tail, and the F9 embedding
     // batch all reach the WAL lane — so the constants are deleted rather than
     // left standing over a live domain.
-    // ── The delivery group ──────────────────────────────────────────────────
-    //
-    // The remaining webhook gate is NOT an answerability gate. Its outbox
-    // genuinely FILLS for a selected user: the
-    // finalizer's sealed `FinalizationCommitPlan` writes the brief and the
-    // delivery rows in one `apply`
-    // (`finalizer/wal.rs::write_brief`, `::write_deliveries`), reached from
-    // `finalizer::finalize_commit_settled` on the `is_wal_authoritative`
-    // branch at `finalizer.rs`. There is no gate anywhere on that enqueue
-    // path. So the rows are there and the reads below could answer them.
-    //
-    // The mechanically blocked webhook domain still reaches its rows through
-    // `Store::with_user`, which refuses a selected user outright. Lifting a
-    // gate above an unrouted read does not
-    // produce an answer, it produces an `Err` on every worker pass — the
-    // pathological spin this registry exists to convert into an inert skip.
-    //
-    // Operational consequence worth knowing, and NOT a reason to lift: for a
-    // selected user the webhook rows accumulate in `state='pending'` and
-    // nothing drains them. That is a deferral backlog, not loss — the rows are
-    // durable and a migrated drain will find them. Email and the shared brief
-    // loader were removed from this registry only after their routed reads,
-    // frozen request, disclosure fence, and exact settlement became active.
-    //
-    /// The webhook outbox scan (`webhook_worker::next_delivery` — a private
-    /// free function, not a `Store` method). The delivery-state settlement
-    /// (`::set_delivery_state`) and the subscription-delete cascade behind it
-    /// ARE migrated, and so is the enqueue in front of it.
-    ///
-    /// **Lift condition — both.** (1) `webhook_worker::next_delivery` reads
-    /// through `Store::wal_authoritative_read`. (2)
-    /// `delivery::load_finalized_episode` does too; the webhook sweep reads
-    /// `None` from it as `event_data_missing` and TERMINALISES the delivery,
-    /// so this one must be migrated before the scan is, never after.
-    pub const WEBHOOK_WORKER_OUTBOX: &str = "webhook_worker.outbox";
+    // The delivery group has no remaining D4 gate. Email, push, and webhook
+    // each route their selected scans, freeze the exact provider request
+    // before I/O, acquire a durable Control disclosure fence, and settle from
+    // the carried pre-send predecessor. Their legacy owners remain separate.
 
     // ── Request paths: the read lane ────────────────────────────────────────
     //
@@ -624,7 +593,6 @@ mod tests {
         let domains = [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
-            wal_domain::WEBHOOK_WORKER_OUTBOX,
             wal_domain::QUERY_EPISODE_DELETE,
             wal_domain::QUERY_BROWSER_SNAPSHOT,
             wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,

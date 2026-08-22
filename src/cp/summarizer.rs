@@ -2142,7 +2142,7 @@ async fn finalize_and_deliver_user(state: &CpState, id: &str) {
         warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
     }
     if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, id).await {
-        warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
+        warn!(error = %e, "deliver_user_webhooks failed");
     }
     if let Some(ref transport) = state.email_transport {
         if let Err(e) =

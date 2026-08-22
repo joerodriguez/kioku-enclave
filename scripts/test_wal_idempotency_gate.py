@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 243
+EXPECTED_STORE_CALL_COUNT = 250
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -591,7 +591,46 @@ EXPECTED_STORE_CALL_COUNT = 243
 # the body hash of its already-accounted added routed read; count, keys,
 # classes, the three surviving expression moves, and every delta above remain
 # identical. The final re-derived digest is therefore:
-EXPECTED_STORE_CALL_SHA256 = "d7d93932b5c80e1281d050ae3063baed235d59fca4eb0342b523671abefc5a82"
+# Webhook-outbox activation was then derived against a fresh `git archive HEAD`
+# at exact 2da2ad78d865f23cb9f62016d29387f4360fa301. The untouched archive ran its
+# own 14-test gate and reproduced 243/d7d93932 byte-for-byte before comparison.
+# Each tree was dumped with its own scanner/classifier and compared key by key.
+# The active branch is 248 rows:
+#   * THIRTEEN additions: the selected due-row scan; open claim, frozen request,
+#     typed recovery, pre-send authority, and content-free depth reads; exact
+#     claim and settlement submits; and the selected-read plus retained legacy
+#     write/save sites in the new resumable subscription-cancellation owner.
+#     The renamed legacy state owner contributes its retained write/save pair.
+#   * EIGHT removals: four sites from the superseded general webhook settlement
+#     owner and four from the old query-owned 256-row cascade.
+#   * ZERO reclassifications. The sole surviving call-expression move is
+#     `next_delivery#0::with_user#0`, whose legacy due-row query now carries the
+#     same per-subscription predecessor-order predicate as the selected scan.
+#     That same row is the sole surviving owner-body move. Every other surviving
+#     expression/body hash and the surviving-key order are unchanged.
+# The scanner now reads both active webhook child modules and pins their sealed
+# registrations, bounded ledgers, preconditions, and absence of Store,
+# Control, provider, or runtime escape.
+#
+# The fail-closed review repair was then derived against a fresh `git archive
+# HEAD` at exact 01239d9c2e63f815963cc86c780299592a827961. That untouched
+# archive ran its own 14-test gate and reproduced 248/471870c7 byte-for-byte.
+# The repaired tree is 250 rows: exactly one A status read and one B exact-purge
+# submit are added, with zero removals or reclassifications and unchanged
+# surviving-key order. Two reviewed surviving call expressions move: the
+# selected scan now names malformed far-future retry heads, and the deletion
+# scan now returns exact active-or-terminal purge evidence. Exactly four
+# surviving owner bodies move: those two reads plus the legacy write/save rows
+# owned by the dual-path deletion function. No other surviving expression or
+# owner-body hash moves. The re-derived third state is therefore:
+#
+# The final deletion-linearization repair keeps the same 250 keys, classes,
+# order, and call expressions. Holding the per-user lifecycle guard from the
+# webhook Control snapshot through the final archive commit changes only the
+# owner-body hash of the eight surviving Store sites inside
+# `finalize_user_episodes_scoped`; the status-503, identifier-free logging, and
+# real-ledger adversarial tests add no Store surface. The final third state is:
+EXPECTED_STORE_CALL_SHA256 = "2f26f4d1352ced0760cc1ade999f3012d5a93c4d3bec46af41432a8470fc13d5"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1443,6 +1482,13 @@ A_OWNERS = frozenset(
         "src/cp/sync.rs::dump_user_export#0",
         "src/cp/sync.rs::sync_status#0",
         "src/cp/webhook_worker.rs::next_delivery#0",
+        "src/cp/webhook_worker.rs::next_selected_delivery#0",
+        "src/cp/webhook_worker.rs::load_open_webhook_claim#0",
+        "src/cp/webhook_worker.rs::load_frozen_webhook_request#0",
+        "src/cp/webhook_worker.rs::load_webhook_claim_recovery#0",
+        "src/cp/webhook_worker.rs::validate_archive_webhook_send_authority#0",
+        "src/cp/webhook_worker.rs::emit_webhook_depth#0",
+        "src/cp/webhook_worker.rs::webhook_delivery_status#0",
         "src/store.rs::enqueue_email_delivery#0",
         "src/store.rs::next_email_delivery#0",
         "src/store.rs::next_push_delivery#0",
@@ -1499,6 +1545,11 @@ B_OWNERS = frozenset(
         "src/cp/summarizer.rs::wal_authoritative_upsert#0",
         "src/cp/summarizer.rs::embed_episodes#0",
         "src/cp/webhook_worker.rs::set_delivery_state#0",
+        "src/cp/webhook_worker.rs::set_legacy_delivery_state#0",
+        "src/cp/webhook_worker.rs::cancel_subscription_deliveries#0",
+        "src/cp/webhook_worker.rs::submit_webhook_claim#0",
+        "src/cp/webhook_worker.rs::settle_exact_webhook#0",
+        "src/cp/webhook_worker.rs::purge_exact_webhook#0",
         "src/store.rs::update_email_delivery_state#0",
         "src/store.rs::set_email_delivery_next_attempt#0",
         "src/store.rs::cancel_pending_email_deliveries#0",
@@ -1515,6 +1566,9 @@ C_OWNERS = frozenset(
 )
 
 CALL_OVERRIDES = {
+    # The selected cancellation scan is read-only; the same owner retains the
+    # legacy mutation/save pair for unselected archives.
+    "src/cp/webhook_worker.rs::cancel_subscription_deliveries#0::wal_authoritative_read#0": "A",
     # Speaker-slot reconciliation allocates random participant keys and
     # rewrites labels from live attribution state before the evidence reads
     # (the legacy evidence arm); the second with_user is the legacy commit.
@@ -2071,6 +2125,14 @@ impl X {
         webhook_domain = (ROOT / "src/cp/webhook_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        webhook_claim_domain = (
+            ROOT / "src/cp/webhook_worker/wal/claim.rs"
+        ).read_text(encoding="utf-8")
+        webhook_claim_production = without_cfg_test_items(webhook_claim_domain)
+        webhook_exact_domain = (
+            ROOT / "src/cp/webhook_worker/wal/exact.rs"
+        ).read_text(encoding="utf-8")
+        webhook_exact_production = without_cfg_test_items(webhook_exact_domain)
         reviewer = (ROOT / "src/cp/reviewer.rs").read_text(encoding="utf-8")
         reviewer_domain = (ROOT / "src/cp/reviewer/wal.rs").read_text(
             encoding="utf-8"
@@ -2894,18 +2956,63 @@ impl X {
         self.assertNotIn("cp::push::wal::", main)
         self.assertIn("pub(crate) mod wal;", webhook_worker)
         self.assertIn(
-            "impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSentPlan",
+            "impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSendClaimPlan",
             gate,
         )
         self.assertIn(
-            "impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSentLedger",
+            "impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSendClaimLedger",
             gate,
         )
-        self.assertIn("struct WebhookSentPlan", webhook_domain)
-        self.assertIn("struct WebhookSentLedger", webhook_domain)
-        self.assertIn("archive_v3_wal_webhook_sent_operations", webhook_domain)
-        self.assertIn("DomainLedgerBounds::new", webhook_domain)
-        self.assertIn("WalIdempotencyError::Precondition", webhook_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::webhook_worker::wal::ExactWebhookDeliverySettlementPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::webhook_worker::wal::ExactWebhookDeliverySettlementLedger",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::webhook_worker::wal::ExactWebhookDeliveryPurgePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::webhook_worker::wal::ExactWebhookDeliveryPurgeLedger",
+            gate,
+        )
+        self.assertIn("mod claim;", webhook_domain)
+        self.assertIn("mod exact;", webhook_domain)
+        self.assertNotIn("mod cascade;", webhook_domain)
+        self.assertNotIn("mod settlement;", webhook_domain)
+        self.assertIn("struct WebhookSendClaimPlan", webhook_claim_domain)
+        self.assertIn("struct WebhookSendClaimLedger", webhook_claim_domain)
+        self.assertIn(
+            "archive_v3_wal_webhook_claim_operations", webhook_claim_domain
+        )
+        self.assertIn("archive_v3_wal_webhook_send_claims", webhook_claim_domain)
+        self.assertIn("archive_v3_wal_webhook_frozen_requests", webhook_claim_domain)
+        self.assertIn("MAX_DEFERRED_CLAIMS_PER_ATTEMPT", webhook_claim_domain)
+        self.assertIn("DomainLedgerBounds::new", webhook_claim_domain)
+        self.assertIn("WalIdempotencyError::Precondition", webhook_claim_domain)
+        self.assertIn(
+            "struct ExactWebhookDeliverySettlementPlan", webhook_exact_domain
+        )
+        self.assertIn(
+            "struct ExactWebhookDeliverySettlementLedger", webhook_exact_domain
+        )
+        self.assertIn("struct ExactWebhookDeliveryPurgePlan", webhook_exact_domain)
+        self.assertIn("struct ExactWebhookDeliveryPurgeLedger", webhook_exact_domain)
+        self.assertIn(
+            "archive_v3_wal_webhook_exact_settlement_operations",
+            webhook_exact_domain,
+        )
+        self.assertIn("DomainLedgerBounds::new", webhook_exact_domain)
+        self.assertIn("WalIdempotencyError::Precondition", webhook_exact_domain)
+        self.assertIn("WebhookSendClaimPlan::new(", webhook_worker)
+        self.assertIn("ExactWebhookDeliverySettlementPlan::new(", webhook_worker)
+        self.assertIn("ExactWebhookDeliveryPurgePlan::new(", webhook_worker)
+        self.assertIn("begin_webhook_send_fence(", webhook_worker)
+        self.assertIn("transport.send(request).await", webhook_worker)
+        self.assertIn(".no_proxy()", webhook_worker)
         self.assertNotIn("WebhookSentPlan::", webhook_worker)
         self.assertNotIn("cp::webhook_worker::wal::", main)
         self.assertIn("pub(crate) mod wal;", reviewer)
@@ -2991,6 +3098,8 @@ impl X {
             self.assertNotIn(forbidden, push_claim_production)
             self.assertNotIn(forbidden, push_settlement_production)
             self.assertNotIn(forbidden, webhook_domain)
+            self.assertNotIn(forbidden, webhook_claim_production)
+            self.assertNotIn(forbidden, webhook_exact_production)
             self.assertNotIn(forbidden, reviewer_domain)
             self.assertNotIn(forbidden, substance_domain)
             self.assertNotIn(forbidden, visual_domain)
@@ -3267,7 +3376,7 @@ impl X {
             self.assertNotIn(forbidden, push_settlement_production)
         for forbidden in (
             "send_signed(",
-            "set_delivery_state(",
+            "set_legacy_delivery_state(",
             "next_delivery(",
             "get_webhook_subscription(",
             "disable_webhook_subscription(",
@@ -3278,6 +3387,8 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, webhook_domain)
+            self.assertNotIn(forbidden, webhook_claim_production)
+            self.assertNotIn(forbidden, webhook_exact_production)
         for forbidden in (
             "ensure_demo_archive(",
             "with_user(",

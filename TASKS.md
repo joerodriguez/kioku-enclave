@@ -487,17 +487,28 @@ separate activation blockers.
     exactly replay. Sending, retry allocation/timing, installation mutation,
     Store/worker/launcher/task/acknowledgement wiring, and, in that slice, the
     webhook delivery domain remained absent.
-  - [x] Add the inactive definitive-success webhook A-domain: the already
-    durable event ID is sent as `webhook-id` and derives one opaque operation
-    before actor admission. The exact episode/subscription/version binding,
-    pending/retry predecessor row including nullable due time, 2xx status, and
-    fixed settlement timestamp are all fingerprinted. A full-row CAS or exact
-    terminal adoption and a distinct 1,048,576-row/32-MiB permanent ledger
-    commit atomically. Missing or changed predecessors, alternate provider
-    facts, cap exhaustion, late ledger failure, partial schema, tamper, and
-    reopen fail closed or exactly replay. Signing/sending, subscription lookup
-    or disablement, retry allocation/timing, Store/worker/launcher/task/
-    acknowledgement wiring remain absent.
+  - [x] Activate the selected webhook outbox: new `w1_` rows freeze one exact
+    bounded endpoint, signing secret, content decision, and canonical event
+    body under a complete-row durable claim before provider I/O. Typed
+    cancel/defer/retry/sent/failed/ambiguous settlement full-row-CASes or
+    exactly adopts the predecessor and reconciles either side of an asymmetric
+    Control/archive save. Historical bare `evt_`, malformed, exhausted,
+    missing/disabled, deleting, capacity-limited, and 24-hour-old rows settle
+    without spend; ambiguous outcomes never resend. DNS has a five-second and
+    64-public-answer bound, environment proxies and redirects are disabled,
+    Retry-After/backoff and ten attempts are bounded, each subscription is
+    strictly ordered without blocking another, and a sweep spends at most two
+    calls—checked before claim—with 250-ms process-local pacing shared by
+    recovery under the release-sealed singleton runtime. Malformed retry heads
+    are selected for provider-free settlement instead of pinning a destination.
+    Selected deletion is resumable beyond 256 rows: it exact-cancels active rows,
+    exact-purges every terminal delivery plus frozen endpoint/secret/body/claim
+    subtree, and only then removes Control. Sanitized API status and content-free
+    metrics distinguish every provider outcome; selected status authority failure
+    returns 503. Finalizer snapshot/commit and deletion disable/drain/removal share
+    one per-account lifecycle boundary, preventing a stale post-204 enqueue. An
+    active disclosure fence makes revocation conflict. The obsolete success-only and bulk-cascade children are
+    removed; legacy delivery remains guarded and its attempt increment is checked.
   - [x] Add the inactive exact reviewer-fixture A-domain: the image-baked
     reviewer account UUID plus fixture version derive one opaque operation
     before actor admission. The complete fixed synthetic audio, utterance,

@@ -231,8 +231,13 @@ content-free by default; including a final brief is a separate per-destination o
 Webhook endpoints and signing secrets are encrypted in the control store, destination
 paths are redacted from API responses and logs, and each request is signed with the
 Standard Webhooks headers. Delivery rejects redirects and private, local, link-local,
-documentation, and other non-public network addresses. A configured destination remains
-an explicit egress boundary outside Kioku's enclave and attestation.
+documentation, and other non-public network addresses, and disables environment proxies.
+Selected delivery freezes the
+exact destination and body before its first provider call, never resends an ambiguous
+outcome, expires old/pre-activation rows provider-free, and makes destination deletion a
+durable disclosure fence that removes the frozen endpoint, secret, opted-in body, and
+claim evidence before the destination disappears. A configured destination remains an explicit egress boundary
+outside Kioku's enclave and attestation.
 
 ## API surfaces
 

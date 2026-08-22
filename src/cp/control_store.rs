@@ -112,6 +112,7 @@ const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "capture_reference_batch_receipts",
     "offline_recording_usage_receipts",
     "webhook_subscriptions",
+    "webhook_send_fences",
     "episode_email_preferences",
     "email_send_fences",
     "push_installations",
@@ -1630,6 +1631,32 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
 );
 CREATE INDEX IF NOT EXISTS webhook_subscriptions_user_idx
     ON webhook_subscriptions(user_id);
+-- Exact, short-transaction webhook provider capability and outcome receipt.
+-- The subscription key deliberately has no FK so a current missing/disabled
+-- destination decision remains durable until the archive half reconciles.
+-- No Control lock crosses DNS or provider I/O.
+CREATE TABLE IF NOT EXISTS webhook_send_fences (
+    user_id            TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    subscription_id    TEXT NOT NULL,
+    claim_id           TEXT NOT NULL UNIQUE CHECK(length(claim_id)=36),
+    lease_expires_at   TEXT NOT NULL,
+    endpoint_url       TEXT NOT NULL,
+    signing_secret     TEXT NOT NULL,
+    include_content    INTEGER NOT NULL CHECK(include_content IN (0,1)),
+    outcome_kind       TEXT CHECK(outcome_kind IN (
+                           'sent','retry','ambiguous','failed',
+                           'cancel_account_inactive','cancel_subscription_missing',
+                           'cancel_subscription_disabled','cancel_destination_changed')),
+    provider_status    INTEGER,
+    provider_error     TEXT,
+    retry_at           TEXT,
+    outcome_at         TEXT,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY(user_id,event_id)
+);
+CREATE INDEX IF NOT EXISTS webhook_send_fences_user_idx
+    ON webhook_send_fences(user_id,subscription_id,event_id);
 CREATE TABLE IF NOT EXISTS episode_email_preferences (
     user_id          TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     enabled          INTEGER NOT NULL DEFAULT 0,
@@ -2094,7 +2121,7 @@ impl std::fmt::Debug for IdentityRebindOperation {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, PartialEq, Eq)]
 pub struct WebhookSubscription {
     pub id: String,
     pub user_id: String,
@@ -2104,6 +2131,124 @@ pub struct WebhookSubscription {
     pub include_content: bool,
     pub enabled: bool,
     pub created_at: String,
+}
+
+impl std::fmt::Debug for WebhookSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WebhookSubscription(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WebhookControlCancellation {
+    AccountInactive,
+    SubscriptionMissing,
+    SubscriptionDisabled,
+    DestinationChanged,
+}
+
+impl WebhookControlCancellation {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::AccountInactive => "cancel_account_inactive",
+            Self::SubscriptionMissing => "cancel_subscription_missing",
+            Self::SubscriptionDisabled => "cancel_subscription_disabled",
+            Self::DestinationChanged => "cancel_destination_changed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WebhookProviderOutcome {
+    Sent {
+        status: i64,
+    },
+    Retry {
+        status: Option<i64>,
+        code: String,
+        retry_at: String,
+    },
+    Ambiguous,
+    Failed {
+        status: Option<i64>,
+        code: String,
+    },
+}
+
+impl WebhookProviderOutcome {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Sent { .. } => "sent",
+            Self::Retry { .. } => "retry",
+            Self::Ambiguous => "ambiguous",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    fn fields(&self) -> (Option<i64>, Option<&str>, Option<&str>) {
+        match self {
+            Self::Sent { status } => (Some(*status), None, None),
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => (*status, Some(code), Some(retry_at)),
+            Self::Ambiguous => (None, None, None),
+            Self::Failed { status, code } => (*status, Some(code), None),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Sent { status } => (200..=299).contains(status),
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => {
+                status.is_none_or(|status| (100..=599).contains(&status))
+                    && valid_email_fence_text(code, 256)
+                    && valid_email_fence_timestamp(retry_at)
+            }
+            Self::Ambiguous => true,
+            Self::Failed { status, code } => {
+                status.is_none_or(|status| (100..=599).contains(&status))
+                    && valid_email_fence_text(code, 256)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WebhookFenceOutcome {
+    Provider(WebhookProviderOutcome),
+    Cancellation(WebhookControlCancellation),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WebhookSendFence {
+    pub(crate) user_id: String,
+    pub(crate) event_id: String,
+    pub(crate) subscription_id: String,
+    pub(crate) claim_id: String,
+    pub(crate) lease_expires_at: String,
+    pub(crate) endpoint_url: String,
+    pub(crate) signing_secret: String,
+    pub(crate) include_content: bool,
+    pub(crate) outcome: Option<WebhookFenceOutcome>,
+    pub(crate) outcome_at: Option<String>,
+}
+
+impl std::fmt::Debug for WebhookSendFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WebhookSendFence(<redacted>)")
+    }
+}
+
+pub(crate) enum WebhookSendFenceDisposition {
+    Authorized(WebhookSubscription),
+    DeletionOwned,
+    Recorded(WebhookSendFence),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2448,6 +2593,129 @@ fn valid_email_fence_timestamp(value: &str) -> bool {
         && value.len() <= 64
         && isotime::parse_epoch_millis(value)
             .is_some_and(|millis| isotime::format_epoch_millis(millis) == value)
+}
+
+fn load_webhook_subscription_conn(
+    connection: &Connection,
+    user_id: &str,
+    subscription_id: &str,
+) -> Result<Option<WebhookSubscription>> {
+    Ok(connection
+        .query_row(
+            "SELECT name,endpoint_url,signing_secret,include_content,enabled,created_at
+             FROM webhook_subscriptions WHERE id=?1 AND user_id=?2",
+            rusqlite::params![subscription_id, user_id],
+            |row| {
+                Ok(WebhookSubscription {
+                    id: subscription_id.to_owned(),
+                    user_id: user_id.to_owned(),
+                    name: row.get(0)?,
+                    endpoint_url: row.get(1)?,
+                    signing_secret: row.get(2)?,
+                    include_content: row.get::<_, i64>(3)? != 0,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                    created_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn load_webhook_send_fence_conn(
+    connection: &Connection,
+    user_id: &str,
+    event_id: &str,
+) -> Result<Option<WebhookSendFence>> {
+    Ok(connection
+        .query_row(
+            "SELECT user_id,event_id,subscription_id,claim_id,lease_expires_at,
+                    endpoint_url,signing_secret,include_content,outcome_kind,
+                    provider_status,provider_error,retry_at,outcome_at
+             FROM webhook_send_fences WHERE user_id=?1 AND event_id=?2",
+            rusqlite::params![user_id, event_id],
+            webhook_send_fence_from_row,
+        )
+        .optional()?)
+}
+
+fn webhook_send_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebhookSendFence> {
+    let kind: Option<String> = row.get(8)?;
+    let status: Option<i64> = row.get(9)?;
+    let error: Option<String> = row.get(10)?;
+    let retry_at: Option<String> = row.get(11)?;
+    let outcome_at: Option<String> = row.get(12)?;
+    let outcome = match kind.as_deref() {
+        None if status.is_none()
+            && error.is_none()
+            && retry_at.is_none()
+            && outcome_at.is_none() =>
+        {
+            None
+        }
+        Some("sent")
+            if status.is_some()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(WebhookFenceOutcome::Provider(
+                WebhookProviderOutcome::Sent {
+                    status: status.ok_or(rusqlite::Error::InvalidQuery)?,
+                },
+            ))
+        }
+        Some("retry") if error.is_some() && retry_at.is_some() && outcome_at.is_some() => Some(
+            WebhookFenceOutcome::Provider(WebhookProviderOutcome::Retry {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+                retry_at: retry_at.ok_or(rusqlite::Error::InvalidQuery)?,
+            }),
+        ),
+        Some("ambiguous")
+            if status.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(WebhookFenceOutcome::Provider(
+                WebhookProviderOutcome::Ambiguous,
+            ))
+        }
+        Some("failed") if error.is_some() && retry_at.is_none() && outcome_at.is_some() => Some(
+            WebhookFenceOutcome::Provider(WebhookProviderOutcome::Failed {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+            }),
+        ),
+        Some(kind)
+            if status.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            let cancellation = match kind {
+                "cancel_account_inactive" => WebhookControlCancellation::AccountInactive,
+                "cancel_subscription_missing" => WebhookControlCancellation::SubscriptionMissing,
+                "cancel_subscription_disabled" => WebhookControlCancellation::SubscriptionDisabled,
+                "cancel_destination_changed" => WebhookControlCancellation::DestinationChanged,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Some(WebhookFenceOutcome::Cancellation(cancellation))
+        }
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(WebhookSendFence {
+        user_id: row.get(0)?,
+        event_id: row.get(1)?,
+        subscription_id: row.get(2)?,
+        claim_id: row.get(3)?,
+        lease_expires_at: row.get(4)?,
+        endpoint_url: row.get(5)?,
+        signing_secret: row.get(6)?,
+        include_content: row.get::<_, i64>(7)? != 0,
+        outcome,
+        outcome_at,
+    })
 }
 
 fn load_email_send_fence_conn(
@@ -2832,6 +3100,16 @@ fn refuse_push_fenced_identity_rebind_conn(
     if email_send_in_flight {
         return Err(EnclaveError::Conflict(
             "identity rebind conflicts with an in-flight email send".into(),
+        ));
+    }
+    let webhook_send_in_flight: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM webhook_send_fences WHERE user_id=?1 OR user_id=?2)",
+        rusqlite::params![old_user_id, stable_user_id],
+        |row| row.get(0),
+    )?;
+    if webhook_send_in_flight {
+        return Err(EnclaveError::Conflict(
+            "identity rebind conflicts with an in-flight webhook send".into(),
         ));
     }
     Ok(())
@@ -18540,6 +18818,17 @@ fn delete_user_identity_conn(
             "account has an in-flight email send".into(),
         ));
     }
+    let webhook_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM webhook_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if webhook_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight webhook send".into(),
+        ));
+    }
     let push_send_in_flight: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1)",
         [user_id],
@@ -18760,6 +19049,17 @@ fn begin_user_deletion_conn(
         tx.rollback()?;
         return Err(EnclaveError::Conflict(
             "account has an in-flight email send".into(),
+        ));
+    }
+    let webhook_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM webhook_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if webhook_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight webhook send".into(),
         ));
     }
     let push_send_in_flight: bool = tx.query_row(
@@ -19747,8 +20047,9 @@ impl ControlStore {
         drop(temp_file);
         let conn = Connection::open(&temp_path)?;
         let delivery_fence_schema_missing: bool = conn.query_row(
-            "SELECT COUNT(*)<>3 FROM sqlite_schema WHERE type='table' \
-             AND name IN ('email_send_fences','push_send_fences','push_token_generation_clock')",
+            "SELECT COUNT(*)<>4 FROM sqlite_schema WHERE type='table' \
+             AND name IN ('email_send_fences','webhook_send_fences','push_send_fences',
+                          'push_token_generation_clock')",
             [],
             |row| row.get(0),
         )?;
@@ -22985,6 +23286,17 @@ impl ControlStore {
         let user_id = user_id.to_string();
         let subscription_id = subscription_id.to_string();
         self.write(move |conn| {
+            let send_in_flight: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM webhook_send_fences
+                               WHERE user_id=?1 AND subscription_id=?2)",
+                rusqlite::params![user_id, subscription_id],
+                |row| row.get(0),
+            )?;
+            if send_in_flight {
+                return Err(EnclaveError::Conflict(
+                    "webhook subscription has an in-flight send".into(),
+                ));
+            }
             Ok(conn.execute(
                 "DELETE FROM webhook_subscriptions WHERE id = ?1 AND user_id = ?2",
                 rusqlite::params![subscription_id, user_id],
@@ -23001,6 +23313,17 @@ impl ControlStore {
         let user_id = user_id.to_string();
         let subscription_id = subscription_id.to_string();
         self.write(move |conn| {
+            let send_in_flight: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM webhook_send_fences
+                               WHERE user_id=?1 AND subscription_id=?2)",
+                rusqlite::params![user_id, subscription_id],
+                |row| row.get(0),
+            )?;
+            if send_in_flight {
+                return Err(EnclaveError::Conflict(
+                    "webhook subscription has an in-flight send".into(),
+                ));
+            }
             conn.execute(
                 "UPDATE webhook_subscriptions SET enabled = 0,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -23008,6 +23331,341 @@ impl ControlStore {
                 rusqlite::params![subscription_id, user_id],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn webhook_outbox_deletion_owned(&self, user_id: &str) -> Result<bool> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            let status = user_status_conn(connection, &user_id)?;
+            Ok(status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(connection, &user_id)?))
+        })
+        .await
+    }
+
+    /// Linearize one exact webhook disclosure capability without holding a
+    /// Control lock across DNS or provider I/O.
+    pub(crate) async fn begin_webhook_send_fence(
+        &self,
+        requested: &WebhookSendFence,
+        decision_at: &str,
+    ) -> Result<WebhookSendFenceDisposition> {
+        if !valid_push_claim_id(&requested.claim_id)
+            || !valid_email_fence_text(&requested.event_id, 68)
+            || !valid_email_fence_text(&requested.subscription_id, 36)
+            || !valid_email_fence_timestamp(&requested.lease_expires_at)
+            || !valid_email_fence_text(&requested.endpoint_url, 2_048)
+            || !valid_email_fence_text(&requested.signing_secret, 256)
+            || !valid_email_fence_timestamp(decision_at)
+            || requested.outcome.is_some()
+            || requested.outcome_at.is_some()
+        {
+            return Err(EnclaveError::Store(
+                "webhook send fence identity is invalid".into(),
+            ));
+        }
+        let requested = requested.clone();
+        let decision_at = decision_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            if let Some(current) =
+                load_webhook_send_fence_conn(&transaction, &requested.user_id, &requested.event_id)?
+            {
+                transaction.rollback()?;
+                if current.claim_id != requested.claim_id
+                    || current.subscription_id != requested.subscription_id
+                    || current.lease_expires_at != requested.lease_expires_at
+                    || current.endpoint_url != requested.endpoint_url
+                    || current.signing_secret != requested.signing_secret
+                    || current.include_content != requested.include_content
+                {
+                    return Err(EnclaveError::Conflict(
+                        "webhook delivery already has an in-flight send".into(),
+                    ));
+                }
+                if current.outcome.is_some() {
+                    return Ok((WebhookSendFenceDisposition::Recorded(current), false));
+                }
+                let subscription = load_webhook_subscription_conn(
+                    connection,
+                    &requested.user_id,
+                    &requested.subscription_id,
+                )?
+                .ok_or_else(|| {
+                    EnclaveError::Conflict("live webhook fence lost its subscription".into())
+                })?;
+                if user_status_conn(connection, &requested.user_id)?.as_deref() != Some("active")
+                    || !subscription.enabled
+                    || subscription.endpoint_url != requested.endpoint_url
+                    || subscription.signing_secret != requested.signing_secret
+                    || subscription.include_content != requested.include_content
+                {
+                    return Err(EnclaveError::Conflict(
+                        "live webhook fence lost its exact destination".into(),
+                    ));
+                }
+                return Ok((WebhookSendFenceDisposition::Authorized(subscription), false));
+            }
+            let status = user_status_conn(&transaction, &requested.user_id)?;
+            if status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(&transaction, &requested.user_id)?)
+            {
+                transaction.rollback()?;
+                return Ok((WebhookSendFenceDisposition::DeletionOwned, false));
+            }
+            let subscription = load_webhook_subscription_conn(
+                &transaction,
+                &requested.user_id,
+                &requested.subscription_id,
+            )?;
+            let cancellation = if status.as_deref() != Some("active") {
+                Some(WebhookControlCancellation::AccountInactive)
+            } else if subscription.is_none() {
+                Some(WebhookControlCancellation::SubscriptionMissing)
+            } else if !subscription.as_ref().is_some_and(|value| value.enabled) {
+                Some(WebhookControlCancellation::SubscriptionDisabled)
+            } else if subscription.as_ref().is_some_and(|value| {
+                value.endpoint_url != requested.endpoint_url
+                    || value.signing_secret != requested.signing_secret
+                    || value.include_content != requested.include_content
+            }) {
+                Some(WebhookControlCancellation::DestinationChanged)
+            } else {
+                None
+            };
+            if transaction.execute(
+                "INSERT INTO webhook_send_fences
+                 (user_id,event_id,subscription_id,claim_id,lease_expires_at,endpoint_url,
+                  signing_secret,include_content,outcome_kind,outcome_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![
+                    requested.user_id,
+                    requested.event_id,
+                    requested.subscription_id,
+                    requested.claim_id,
+                    requested.lease_expires_at,
+                    requested.endpoint_url,
+                    requested.signing_secret,
+                    i64::from(requested.include_content),
+                    cancellation.as_ref().map(WebhookControlCancellation::kind),
+                    cancellation.as_ref().map(|_| decision_at.as_str()),
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "webhook send fence was not inserted exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            if let Some(cancellation) = cancellation {
+                let mut recorded = requested;
+                recorded.outcome = Some(WebhookFenceOutcome::Cancellation(cancellation));
+                recorded.outcome_at = Some(decision_at);
+                Ok((WebhookSendFenceDisposition::Recorded(recorded), true))
+            } else {
+                Ok((
+                    WebhookSendFenceDisposition::Authorized(
+                        subscription
+                            .ok_or_else(|| EnclaveError::Store("subscription vanished".into()))?,
+                    ),
+                    true,
+                ))
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn get_webhook_send_fence(
+        &self,
+        user_id: &str,
+        event_id: &str,
+    ) -> Result<Option<WebhookSendFence>> {
+        let user_id = user_id.to_owned();
+        let event_id = event_id.to_owned();
+        self.read(move |connection| load_webhook_send_fence_conn(connection, &user_id, &event_id))
+            .await
+    }
+
+    pub(crate) async fn list_webhook_send_fences(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<WebhookSendFence>> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT user_id,event_id,subscription_id,claim_id,lease_expires_at,
+                        endpoint_url,signing_secret,include_content,outcome_kind,
+                        provider_status,provider_error,retry_at,outcome_at
+                 FROM webhook_send_fences WHERE user_id=?1 ORDER BY event_id",
+            )?;
+            let fences = statement
+                .query_map([user_id], webhook_send_fence_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(EnclaveError::from)?;
+            Ok(fences)
+        })
+        .await
+    }
+
+    pub(crate) async fn validate_webhook_send_fence(
+        &self,
+        fence: &WebhookSendFence,
+        minimum_valid_at_millis: i64,
+    ) -> Result<bool> {
+        let fence = fence.clone();
+        self.read(move |connection| {
+            let Some(current) =
+                load_webhook_send_fence_conn(connection, &fence.user_id, &fence.event_id)?
+            else {
+                return Ok(false);
+            };
+            Ok(current == fence
+                && current.outcome.is_none()
+                && isotime::parse_epoch_millis(&current.lease_expires_at)
+                    .is_some_and(|expires| expires >= minimum_valid_at_millis))
+        })
+        .await
+    }
+
+    pub(crate) async fn record_webhook_send_outcome(
+        &self,
+        fence: &WebhookSendFence,
+        outcome: WebhookProviderOutcome,
+        outcome_at: &str,
+    ) -> Result<()> {
+        if !outcome.is_valid() || !valid_email_fence_timestamp(outcome_at) {
+            return Err(EnclaveError::Store(
+                "webhook provider outcome is invalid".into(),
+            ));
+        }
+        let fence = fence.clone();
+        let outcome_at = outcome_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let Some(current) =
+                load_webhook_send_fence_conn(&transaction, &fence.user_id, &fence.event_id)?
+            else {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "webhook send fence is absent".into(),
+                ));
+            };
+            if current.user_id != fence.user_id
+                || current.event_id != fence.event_id
+                || current.subscription_id != fence.subscription_id
+                || current.claim_id != fence.claim_id
+                || current.lease_expires_at != fence.lease_expires_at
+                || current.endpoint_url != fence.endpoint_url
+                || current.signing_secret != fence.signing_secret
+                || current.include_content != fence.include_content
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict("webhook send fence changed".into()));
+            }
+            if let Some(existing) = current.outcome {
+                transaction.rollback()?;
+                return if existing == WebhookFenceOutcome::Provider(outcome.clone())
+                    && current.outcome_at.as_deref() == Some(outcome_at.as_str())
+                {
+                    Ok(((), false))
+                } else {
+                    Err(EnclaveError::Conflict(
+                        "webhook send outcome conflicts with durable evidence".into(),
+                    ))
+                };
+            }
+            if fence.outcome.is_some() || fence.outcome_at.is_some() {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "webhook outcome requires the open fence predecessor".into(),
+                ));
+            }
+            let (status, error, retry_at) = outcome.fields();
+            if transaction.execute(
+                "UPDATE webhook_send_fences
+                 SET outcome_kind=?1,provider_status=?2,provider_error=?3,retry_at=?4,outcome_at=?5
+                 WHERE user_id=?6 AND event_id=?7 AND subscription_id=?8 AND claim_id=?9
+                   AND lease_expires_at=?10 AND endpoint_url=?11 AND signing_secret=?12
+                   AND include_content=?13 AND outcome_kind IS NULL",
+                rusqlite::params![
+                    outcome.kind(),
+                    status,
+                    error,
+                    retry_at,
+                    outcome_at,
+                    fence.user_id,
+                    fence.event_id,
+                    fence.subscription_id,
+                    fence.claim_id,
+                    fence.lease_expires_at,
+                    fence.endpoint_url,
+                    fence.signing_secret,
+                    i64::from(fence.include_content),
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict("webhook outcome CAS failed".into()));
+            }
+            transaction.commit()?;
+            Ok(((), true))
+        })
+        .await
+    }
+
+    pub(crate) async fn close_webhook_send_fence(&self, fence: &WebhookSendFence) -> Result<()> {
+        let fence = fence.clone();
+        self.write_if_changed(move |connection| {
+            let Some(current) =
+                load_webhook_send_fence_conn(connection, &fence.user_id, &fence.event_id)?
+            else {
+                return Ok(((), false));
+            };
+            if current != fence || current.outcome.is_none() {
+                return Err(EnclaveError::Conflict(
+                    "webhook send fence is not exactly reconciled".into(),
+                ));
+            }
+            if matches!(
+                current.outcome,
+                Some(WebhookFenceOutcome::Provider(
+                    WebhookProviderOutcome::Failed {
+                        status: Some(301..=399 | 401 | 403 | 404 | 410),
+                        ..
+                    }
+                ))
+            ) || matches!(
+                current.outcome,
+                Some(WebhookFenceOutcome::Provider(WebhookProviderOutcome::Failed {
+                    ref code,
+                    ..
+                })) if code == "invalid_endpoint"
+            ) {
+                connection.execute(
+                    "UPDATE webhook_subscriptions SET enabled=0,
+                            updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE user_id=?1 AND id=?2 AND endpoint_url=?3 AND signing_secret=?4
+                       AND include_content=?5 AND enabled=1",
+                    rusqlite::params![
+                        current.user_id,
+                        current.subscription_id,
+                        current.endpoint_url,
+                        current.signing_secret,
+                        i64::from(current.include_content),
+                    ],
+                )?;
+            }
+            let changed = connection.execute(
+                "DELETE FROM webhook_send_fences WHERE user_id=?1 AND event_id=?2 AND claim_id=?3",
+                rusqlite::params![fence.user_id, fence.event_id, fence.claim_id],
+            )?;
+            if changed != 1 {
+                return Err(EnclaveError::Conflict("webhook fence close failed".into()));
+            }
+            Ok(((), true))
         })
         .await
     }

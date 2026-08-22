@@ -2178,6 +2178,7 @@ pub(in crate::cp) async fn enqueue_push_delivery_for_activation_test(
         state,
         user_id,
         None,
+        None,
         Some((installation_id, delivery_id, handoff_handle, collapse_id)),
     )
     .await
@@ -2192,7 +2193,25 @@ pub(in crate::cp) async fn enqueue_email_delivery_for_activation_test(
     user_id: &str,
     include_content: bool,
 ) -> Result<i64> {
-    finalize_delivery_activation_fixture(state, user_id, Some(include_content), None).await
+    finalize_delivery_activation_fixture(state, user_id, None, Some(include_content), None).await
+}
+
+/// Build one selected webhook row through the production finalization owner.
+#[cfg(test)]
+pub(in crate::cp) async fn enqueue_webhook_delivery_for_activation_test(
+    state: &CpState,
+    user_id: &str,
+    subscription_id: &str,
+    event_id: &str,
+) -> Result<i64> {
+    finalize_delivery_activation_fixture(
+        state,
+        user_id,
+        Some((subscription_id, event_id)),
+        None,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2200,6 +2219,7 @@ pub(in crate::cp) async fn enqueue_email_delivery_for_activation_test(
 async fn finalize_delivery_activation_fixture(
     state: &CpState,
     user_id: &str,
+    webhook_destination: Option<(&str, &str)>,
     email_preference_include_content: Option<bool>,
     push_destination: Option<(&str, &str, &str, &str)>,
 ) -> Result<i64> {
@@ -2326,7 +2346,11 @@ async fn finalize_delivery_activation_fixture(
             elided_screen_ids: Vec::new(),
             utterance_members: Vec::new(),
             screenshot_members: Vec::new(),
-            webhook_destinations: Vec::new(),
+            webhook_destinations: webhook_destination
+                .map(|(subscription_id, event_id)| {
+                    vec![(subscription_id.to_owned(), event_id.to_owned())]
+                })
+                .unwrap_or_default(),
             email_preference_include_content,
             push_destinations: push_destination
                 .map(
@@ -2898,9 +2922,13 @@ async fn finalize_user_episodes_scoped(
             })
             .collect();
 
-        // 7. Snapshot enabled webhook destinations. A destination deleted
-        // after this point is still fail-closed: the worker re-checks it and
-        // cancels the opaque outbox row before any network request.
+        // 7. Serialize the Control snapshot and archive commit with webhook
+        // destination deletion. This is the same per-user lifecycle gate the
+        // DELETE route holds through disable, archive drain, and Control
+        // removal, so a stale snapshot cannot enqueue after a successful 204.
+        // The release-sealed singleton runtime makes this process-local gate
+        // the complete production owner boundary.
+        let webhook_lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?;
         let webhook_destinations: Vec<(String, String)> = state
             .control
             .list_webhook_subscriptions(user_id)
@@ -3274,6 +3302,7 @@ async fn finalize_user_episodes_scoped(
         }).await
         };
 
+        drop(webhook_lifecycle_guard);
         match commit_res {
             Ok(webhook_delivery_count) => {
                 info!(

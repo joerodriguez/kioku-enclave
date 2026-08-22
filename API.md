@@ -511,6 +511,51 @@ acceleration. Native clients retry it only after all durable events for that ses
 accepted. Correctness and later finalization do not depend on this request because the
 final accepted audio manifest carries `session_finished=true`.
 
+## Finalized-episode webhooks
+
+Authenticated clients manage destinations with `GET`/`POST /api/webhooks`,
+`DELETE /api/webhooks/{id}`, and `POST /api/webhooks/{id}/test`. Creation accepts
+an HTTPS endpoint, a display name, and `include_content`; the one-time response
+includes the signing secret. List responses and logs redact endpoint paths,
+queries, and secrets. Events are Standard Webhooks-signed CloudEvents and omit
+the final brief unless that destination explicitly enabled content.
+
+Each list item includes a content-free `delivery_status` summary with `pending`,
+`retry`, `sent`, `failed`, `ambiguous`, and `cancelled` counts. Its optional
+`latest` object contains only a normalized outcome, bounded attempt count,
+validated HTTP status, and validated update timestamp; it never returns a
+provider error string, endpoint path, secret, signature, or body.
+If the selected archive authority cannot answer that status read, the list
+request returns `503 {"error":"enclave_unavailable"}` rather than a zeroed
+status or a generic fault.
+
+For selected Genesis archives, only new `w1_` event identities can reach a
+provider. Historical bare `evt_` rows and rows older than 24 hours are cancelled
+without network I/O. Before the first provider call, the worker freezes one exact
+bounded endpoint, signing secret, content decision, and canonical body, then
+durably claims the complete delivery row behind an exact Control disclosure
+fence. Retries reuse those bytes and the same `webhook-id`; a lost or otherwise
+ambiguous response is never resent. Definitive transient rejects use bounded
+`Retry-After`/backoff up to ten attempts.
+
+Every DNS lookup has a five-second deadline and at most 64 answers; all answers
+must be public, the chosen address is pinned, environment proxies are disabled,
+and redirects are disabled. A
+subscription is strictly ordered, while another subscription can progress.
+Selected delivery makes at most two provider calls per account per sweep, checks
+that cap before creating a claim, and is
+paced at 250 ms process-locally; production makes that service-wide through the
+release-verified singleton runtime contract. Deletion first disables the
+destination, exactly cancels its complete backlog in resumable one-row
+transactions, exactly purges terminal archive rows and their frozen endpoint,
+signing secret, opted-in body, and claim evidence, then removes it. The
+permanent logical purge record retains only fixed-size commitments. An in-flight
+disclosure fence makes deletion conflict rather than allowing content to leave
+after revocation. Finalization holds the same per-account lifecycle boundary
+from its enabled-destination snapshot through the atomic archive commit;
+deletion holds it through disable, archive drain, and Control removal, so a
+paused stale snapshot cannot enqueue after a successful `204`.
+
 ## Episode-ready email preference
 
 Authenticated clients read and update the account-level preference at

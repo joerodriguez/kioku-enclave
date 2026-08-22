@@ -3482,6 +3482,7 @@ struct CreateWebhookRequest {
 fn webhook_json(
     subscription: &crate::cp::control_store::WebhookSubscription,
     signing_secret: Option<&str>,
+    delivery_status: Option<&super::webhook_worker::WebhookDeliveryStatusSummary>,
 ) -> Value {
     let mut value = json!({
         "id": subscription.id,
@@ -3490,6 +3491,7 @@ fn webhook_json(
         "include_content": subscription.include_content,
         "enabled": subscription.enabled,
         "created_at": subscription.created_at,
+        "delivery_status": delivery_status.cloned().unwrap_or_default(),
     });
     if let Some(secret) = signing_secret {
         value["signing_secret"] = json!(secret);
@@ -3502,13 +3504,28 @@ async fn rest_list_webhooks(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     match s.control.list_webhook_subscriptions(&user.0).await {
-        Ok(subscriptions) => Json(json!({
-            "webhooks": subscriptions
-                .iter()
-                .map(|subscription| webhook_json(subscription, None))
-                .collect::<Vec<_>>()
-        }))
-        .into_response(),
+        Ok(subscriptions) => {
+            let mut webhooks = Vec::with_capacity(subscriptions.len());
+            for subscription in &subscriptions {
+                let status = match super::webhook_worker::webhook_delivery_status(
+                    &s,
+                    &user.0,
+                    &subscription.id,
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return super::routed_read_unavailable(
+                            "api.webhooks.delivery_status",
+                            &error,
+                        )
+                    }
+                };
+                webhooks.push(webhook_json(subscription, None, Some(&status)));
+            }
+            Json(json!({"webhooks": webhooks})).into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -3557,6 +3574,7 @@ async fn rest_create_webhook(
             Json(webhook_json(
                 &subscription,
                 Some(&subscription.signing_secret),
+                None,
             )),
         )
             .into_response(),
@@ -3570,126 +3588,44 @@ async fn rest_delete_webhook(
     Path(subscription_id): Path<String>,
 ) -> Response {
     let user_id = user.0;
+    // Linearize Control snapshot + archive enqueue in the finalizer against
+    // disable + exact archive drain + Control deletion here. Never replace
+    // this with a final unprotected scan: a paused finalizer could enqueue
+    // after the route returned 204.
+    let _webhook_lifecycle_guard = match s.store.lock_user_lifecycle(&user_id).await {
+        Ok(guard) => guard,
+        Err(error) => return error.into_response(),
+    };
+    match s
+        .control
+        .get_webhook_subscription(&user_id, &subscription_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    if let Err(error) = s
+        .control
+        .disable_webhook_subscription(&user_id, &subscription_id)
+        .await
+    {
+        return error.into_response();
+    }
+    if let Err(error) =
+        super::webhook_worker::cancel_subscription_deliveries(&s, &user_id, &subscription_id).await
+    {
+        return error.into_response();
+    }
     match s
         .control
         .delete_webhook_subscription(&user_id, &subscription_id)
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return error.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => error.into_response(),
     }
-    if s.store.is_wal_authoritative(&user_id) {
-        // ADR-0022 F15: enumerate the exact pending/retry set for this
-        // subscription (R6) and settle the cascade as a sealed plan. An empty
-        // set is a no-op, and if this half is ever missed the worker's
-        // subscription_inactive net converges the orphans -- deliberately
-        // preserved.
-        let probe_subscription = subscription_id.clone();
-        let set = match s
-            .store
-            .wal_authoritative_read(&user_id, move |conn| {
-                let mut statement = conn.prepare(
-                    "SELECT event_id,episode_id,delivery_version,state
-                     FROM webhook_deliveries
-                     WHERE subscription_id=?1 AND state IN ('pending','retry')
-                     ORDER BY event_id LIMIT 256",
-                )?;
-                let rows = statement
-                    .query_map([&probe_subscription], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await
-        {
-            Ok(set) => set,
-            Err(error) => return error.into_response(),
-        };
-        if !set.is_empty() {
-            let deliveries = match set
-                .into_iter()
-                .map(|(event_id, episode_id, version, state)| {
-                    crate::cp::webhook_worker::wal::CascadeDelivery::new(
-                        event_id, episode_id, version, state,
-                    )
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-            {
-                Ok(deliveries) => deliveries,
-                Err(_) => {
-                    return crate::error::EnclaveError::Store(
-                        "webhook cascade plan construction failed".into(),
-                    )
-                    .into_response()
-                }
-            };
-            let committed_at = super::isotime::format_epoch_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-            );
-            let plan = match crate::cp::webhook_worker::wal::WebhookSubscriptionCascadePlan::new(
-                user_id.clone(),
-                subscription_id.clone(),
-                deliveries,
-                committed_at,
-            ) {
-                Ok(plan) => plan,
-                Err(_) => {
-                    return crate::error::EnclaveError::Store(
-                        "webhook cascade plan construction failed".into(),
-                    )
-                    .into_response()
-                }
-            };
-            let prepared =
-                match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
-                    Ok(prepared) => prepared,
-                    Err(_) => {
-                        return crate::error::EnclaveError::Store(
-                            "webhook cascade plan construction failed".into(),
-                        )
-                        .into_response()
-                    }
-                };
-            if let Err(error) = s.store.wal_authoritative_submit(&user_id, prepared).await {
-                return error.into_response();
-            }
-        }
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    let user_for_db = user_id.clone();
-    let id_for_db = subscription_id.clone();
-    match s
-        .store
-        .with_user(&user_for_db, move |conn| {
-            conn.execute(
-                "UPDATE webhook_deliveries
-                 SET state = 'cancelled', error_code = 'subscription_deleted',
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE subscription_id = ?1 AND state IN ('pending', 'retry')",
-                [id_for_db],
-            )?;
-            Ok(())
-        })
-        .await
-    {
-        Ok(()) => {
-            if let Err(error) = s.store.save_user(&user_id).await {
-                return error.into_response();
-            }
-        }
-        Err(error) => return error.into_response(),
-    }
-    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn rest_test_webhook(
@@ -4128,14 +4064,228 @@ mod tests {
             created_at: "2026-07-24T12:00:00.000Z".into(),
         };
 
-        let listed = webhook_json(&subscription, None);
+        let listed = webhook_json(&subscription, None, None);
         assert_eq!(listed["endpoint_display"], "https://hooks.example.com/…");
         assert!(listed.get("endpoint_url").is_none());
         assert!(listed.get("signing_secret").is_none());
+        assert_eq!(listed["delivery_status"]["pending"], 0);
+        assert_eq!(listed["delivery_status"]["retry"], 0);
+        assert_eq!(listed["delivery_status"]["sent"], 0);
+        assert_eq!(listed["delivery_status"]["failed"], 0);
+        assert_eq!(listed["delivery_status"]["ambiguous"], 0);
+        assert_eq!(listed["delivery_status"]["cancelled"], 0);
+        assert!(listed["delivery_status"]["latest"].is_null());
 
-        let created = webhook_json(&subscription, Some(&subscription.signing_secret));
+        let created = webhook_json(&subscription, Some(&subscription.signing_secret), None);
         assert_eq!(created["signing_secret"], "whsec_signing-secret");
         assert!(created.get("endpoint_url").is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_list_reports_selected_status_authority_failure_as_503() {
+        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state};
+
+        let state = state();
+        let user = state
+            .control
+            .upsert_user(
+                "webhook-status-unavailable-subject",
+                "webhook-status-unavailable@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        let user_id = user.id;
+        state
+            .control
+            .create_webhook_subscription(crate::cp::control_store::WebhookSubscription {
+                id: "c1000000-0000-4000-8000-000000000022".into(),
+                user_id: user_id.clone(),
+                name: "Unavailable status fixture".into(),
+                endpoint_url: "https://hooks.example.com/status".into(),
+                signing_secret: crate::cp::webhook_worker::new_signing_secret(),
+                include_content: false,
+                enabled: true,
+                created_at: "2026-08-20T19:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        select_wal_authoritative(&state.store, &user_id);
+
+        let response = rest_list_webhooks(State(state), Extension(AuthUser(user_id))).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "enclave_unavailable"})
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_delete_waits_for_snapshotted_finalization_then_purges_its_commit() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
+
+        let archive = answerable_wal_archive("c0000000-0000-4000-8000-000000000023").await;
+        let subscription_id = "c1000000-0000-4000-8000-000000000023";
+        archive
+            .state
+            .control
+            .create_webhook_subscription(crate::cp::control_store::WebhookSubscription {
+                id: subscription_id.into(),
+                user_id: archive.user_id.clone(),
+                name: "Finalizer deletion race fixture".into(),
+                endpoint_url: "https://hooks.example.com/finalizer-delete".into(),
+                signing_secret: crate::cp::webhook_worker::new_signing_secret(),
+                include_content: true,
+                enabled: true,
+                created_at: "2026-08-20T19:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+
+        // This guard is the production finalizer's boundary immediately
+        // before its Control snapshot. Hold it while the real sealed
+        // finalization fixture commits, exactly modeling a pause after that
+        // snapshot and before archive publication.
+        let finalizer_guard = archive
+            .state
+            .store
+            .lock_user_lifecycle(&archive.user_id)
+            .await
+            .unwrap();
+        let snapshot = archive
+            .state
+            .control
+            .list_webhook_subscriptions(&archive.user_id)
+            .await
+            .unwrap();
+        assert!(snapshot.iter().any(|entry| entry.id == subscription_id));
+
+        let delete_state = Arc::clone(&archive.state);
+        let delete_user = archive.user_id.clone();
+        let delete_subscription = subscription_id.to_owned();
+        let deletion = tokio::spawn(async move {
+            rest_delete_webhook(
+                State(delete_state),
+                Extension(AuthUser(delete_user)),
+                Path(delete_subscription),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !deletion.is_finished(),
+            "DELETE must wait for the finalizer's snapshot/commit boundary"
+        );
+
+        crate::cp::finalizer::enqueue_webhook_delivery_for_activation_test(
+            &archive.state,
+            &archive.user_id,
+            subscription_id,
+            &crate::cp::webhook_worker::new_event_id(),
+        )
+        .await
+        .unwrap();
+        drop(finalizer_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), deletion)
+            .await
+            .expect("DELETE resumes after finalization")
+            .expect("DELETE task does not panic");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let residue = archive
+            .state
+            .store
+            .wal_authoritative_read(&archive.user_id, |connection| {
+                let claim_sidecars: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table' AND name IN (
+                       'archive_v3_wal_webhook_frozen_requests',
+                       'archive_v3_wal_webhook_send_claims'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let (frozen, claims) = if claim_sidecars == 2 {
+                    (
+                        connection.query_row(
+                            "SELECT COUNT(*) FROM archive_v3_wal_webhook_frozen_requests",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        connection.query_row(
+                            "SELECT COUNT(*) FROM archive_v3_wal_webhook_send_claims",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                    )
+                } else {
+                    (0, 0)
+                };
+                Ok((
+                    connection.query_row("SELECT COUNT(*) FROM webhook_deliveries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    frozen,
+                    claims,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(residue, (0, 0, 0));
+        assert!(archive
+            .state
+            .control
+            .get_webhook_subscription(&archive.user_id, subscription_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn webhook_finalization_and_delete_share_one_complete_lifecycle_boundary() {
+        let finalizer = include_str!("finalizer.rs");
+        let lock = finalizer
+            .find("let webhook_lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?")
+            .expect("selected finalization acquires the webhook lifecycle guard");
+        let snapshot = finalizer[lock..]
+            .find(".list_webhook_subscriptions(user_id)")
+            .map(|offset| lock + offset)
+            .expect("the Control snapshot is inside the lifecycle guard");
+        let commit = finalizer[snapshot..]
+            .find("let commit_res: Result<usize>")
+            .map(|offset| snapshot + offset)
+            .expect("the archive commit follows the destination snapshot");
+        let release = finalizer[commit..]
+            .find("drop(webhook_lifecycle_guard)")
+            .map(|offset| commit + offset)
+            .expect("the finalizer explicitly releases after commit");
+        assert!(lock < snapshot && snapshot < commit && commit < release);
+
+        let query = include_str!("query.rs");
+        let owner = query
+            .find("async fn rest_delete_webhook(")
+            .expect("webhook DELETE owner exists");
+        let next_owner = query[owner..]
+            .find("async fn rest_test_webhook(")
+            .map(|offset| owner + offset)
+            .expect("webhook DELETE owner has a bounded source body");
+        let body = &query[owner..next_owner];
+        let delete_lock = body
+            .find("s.store.lock_user_lifecycle(&user_id).await")
+            .expect("DELETE acquires the same lifecycle guard");
+        let disable = body
+            .find(".disable_webhook_subscription(&user_id, &subscription_id)")
+            .expect("DELETE disables Control under the guard");
+        let archive_drain = body
+            .find("cancel_subscription_deliveries(&s, &user_id, &subscription_id)")
+            .expect("DELETE drains the archive under the guard");
+        let control_delete = body
+            .find(".delete_webhook_subscription(&user_id, &subscription_id)")
+            .expect("DELETE removes Control only after the archive drain");
+        assert!(delete_lock < disable && disable < archive_drain && archive_drain < control_delete);
     }
 
     #[test]
