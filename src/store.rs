@@ -2627,19 +2627,27 @@ pub struct EmailDeliveryRow {
 
 #[derive(Clone)]
 pub struct PushDeliveryRow {
+    pub rowid: i64,
     pub episode_id: i64,
-    pub installation_id: String,
-    pub delivery_version: i32,
+    pub installation_binding: String,
+    pub delivery_version: i64,
     pub delivery_id: String,
     pub handoff_handle: String,
     pub collapse_id: String,
-    pub attempt_count: i32,
+    pub state: String,
+    pub attempt_count: i64,
+    pub next_attempt_at: String,
+    pub response_status: Option<i64>,
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl std::fmt::Debug for PushDeliveryRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PushDeliveryRow")
+            .field("rowid", &self.rowid)
             .field("episode_id", &self.episode_id)
             .field("delivery_version", &self.delivery_version)
             .field("attempt_count", &self.attempt_count)
@@ -5322,30 +5330,37 @@ impl Store {
     // ── Push Outbox ────────────────────────────────────────────────────────────
 
     pub async fn next_push_delivery(&self, user_id: &str) -> Result<Option<PushDeliveryRow>> {
-        let user = user_id.to_string();
         let now = crate::cp::isotime::format_epoch_millis(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
         );
-        self.with_user(&user, move |conn| {
+        self.wal_authoritative_read(user_id, move |conn| {
             Ok(conn
                 .query_row(
-                    "SELECT episode_id,installation_id,delivery_version,delivery_id, \
-                            handoff_handle,collapse_id,attempt_count \
+                    "SELECT rowid,episode_id,installation_id,delivery_version,delivery_id, \
+                            handoff_handle,collapse_id,state,attempt_count,next_attempt_at, \
+                            response_status,error_code,created_at,updated_at \
                      FROM push_deliveries WHERE state IN ('pending','retry') \
                        AND next_attempt_at<=?1 ORDER BY created_at,episode_id LIMIT 1",
                     [&now],
                     |row| {
                         Ok(PushDeliveryRow {
-                            episode_id: row.get(0)?,
-                            installation_id: row.get(1)?,
-                            delivery_version: row.get(2)?,
-                            delivery_id: row.get(3)?,
-                            handoff_handle: row.get(4)?,
-                            collapse_id: row.get(5)?,
-                            attempt_count: row.get(6)?,
+                            rowid: row.get(0)?,
+                            episode_id: row.get(1)?,
+                            installation_binding: row.get(2)?,
+                            delivery_version: row.get(3)?,
+                            delivery_id: row.get(4)?,
+                            handoff_handle: row.get(5)?,
+                            collapse_id: row.get(6)?,
+                            state: row.get(7)?,
+                            attempt_count: row.get(8)?,
+                            next_attempt_at: row.get(9)?,
+                            response_status: row.get(10)?,
+                            error_code: row.get(11)?,
+                            created_at: row.get(12)?,
+                            updated_at: row.get(13)?,
                         })
                     },
                 )
@@ -5354,70 +5369,33 @@ impl Store {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_push_delivery_state(
-        &self,
-        user_id: &str,
-        episode_id: i64,
-        installation_id: &str,
-        delivery_version: i32,
-        state: &str,
-        attempt_count: i32,
-        response_status: Option<u16>,
-        error_code: Option<&str>,
-        retry_after_seconds: Option<i64>,
-    ) -> Result<()> {
-        let user = user_id.to_string();
-        let installation_id = installation_id.to_string();
-        let state = state.to_string();
-        let error_code = error_code.map(str::to_string);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let now = crate::cp::isotime::format_epoch_millis(now_ms);
-        let next = crate::cp::isotime::format_epoch_millis(
-            now_ms + retry_after_seconds.unwrap_or(0).max(0) * 1_000,
-        );
-        self.with_user(&user, move |conn| {
-            conn.execute(
-                "UPDATE push_deliveries SET state=?1,attempt_count=?2,response_status=?3, \
-                   error_code=?4,next_attempt_at=?5,updated_at=?6 \
-                 WHERE episode_id=?7 AND installation_id=?8 AND delivery_version=?9",
-                rusqlite::params![
-                    state,
-                    attempt_count,
-                    response_status.map(i64::from),
-                    error_code,
-                    next,
-                    now,
-                    episode_id,
-                    installation_id,
-                    delivery_version,
-                ],
-            )?;
-            Ok(())
-        })
-        .await?;
-        self.save_user(user_id).await
-    }
-
     pub async fn resolve_push_handoff(
         &self,
         user_id: &str,
         handoff_handle: &str,
     ) -> Result<Option<i64>> {
-        let user = user_id.to_string();
         let handoff = handoff_handle.to_string();
-        self.with_user(&user, move |conn| {
+        self.wal_authoritative_read(user_id, move |conn| {
+            let claims_present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' \
+                 AND name='archive_v3_wal_push_send_claims')",
+                [],
+                |row| row.get(0),
+            )?;
+            let query = if claims_present {
+                "SELECT d.episode_id FROM push_deliveries d JOIN episodes e ON e.id=d.episode_id \
+                 WHERE d.handoff_handle=?1 \
+                   AND (d.state IN ('pending','retry','accepted') OR EXISTS ( \
+                     SELECT 1 FROM archive_v3_wal_push_send_claims c \
+                     WHERE c.delivery_id=d.delivery_id AND c.outcome IN ('started','ambiguous'))) \
+                   AND e.finalization_status='complete'"
+            } else {
+                "SELECT d.episode_id FROM push_deliveries d JOIN episodes e ON e.id=d.episode_id \
+                 WHERE d.handoff_handle=?1 AND d.state IN ('pending','retry','accepted') \
+                   AND e.finalization_status='complete'"
+            };
             Ok(conn
-                .query_row(
-                    "SELECT d.episode_id FROM push_deliveries d JOIN episodes e ON e.id=d.episode_id \
-                     WHERE d.handoff_handle=?1 AND d.state IN ('pending','retry','accepted') \
-                       AND e.finalization_status='complete'",
-                    [handoff],
-                    |row| row.get(0),
-                )
+                .query_row(query, [handoff], |row| row.get(0))
                 .optional()?)
         })
         .await
@@ -9974,7 +9952,9 @@ pub(crate) mod tests {
         fail_copy_after_create: StdMutex<Option<EnclaveError>>,
         fail_get: StdMutex<Option<EnclaveError>>,
         fail_put: StdMutex<Option<EnclaveError>>,
+        fail_put_for_object: StdMutex<Option<(String, EnclaveError)>>,
         fail_put_after_commit: StdMutex<Option<EnclaveError>>,
+        fail_put_for_object_after_commit: StdMutex<Option<(String, EnclaveError)>>,
         corrupt_wrapped_dek_after_commit_failure: StdMutex<Option<String>>,
         fail_generation_delete: StdMutex<Option<(String, i64)>>,
         fail_generation_delete_after_commit: StdMutex<Option<(String, i64)>>,
@@ -10000,7 +9980,9 @@ pub(crate) mod tests {
                 fail_copy_after_create: StdMutex::new(None),
                 fail_get: StdMutex::new(None),
                 fail_put: StdMutex::new(None),
+                fail_put_for_object: StdMutex::new(None),
                 fail_put_after_commit: StdMutex::new(None),
+                fail_put_for_object_after_commit: StdMutex::new(None),
                 corrupt_wrapped_dek_after_commit_failure: StdMutex::new(None),
                 fail_generation_delete: StdMutex::new(None),
                 fail_generation_delete_after_commit: StdMutex::new(None),
@@ -10149,6 +10131,23 @@ pub(crate) mod tests {
             *self.fail_put_after_commit.lock().unwrap() = Some(error);
         }
 
+        pub(crate) fn fail_next_put(&self, error: EnclaveError) {
+            *self.fail_put.lock().unwrap() = Some(error);
+        }
+
+        pub(crate) fn fail_next_put_for_object(&self, object_name: &str, error: EnclaveError) {
+            *self.fail_put_for_object.lock().unwrap() = Some((object_name.into(), error));
+        }
+
+        pub(crate) fn fail_next_put_for_object_after_commit(
+            &self,
+            object_name: &str,
+            error: EnclaveError,
+        ) {
+            *self.fail_put_for_object_after_commit.lock().unwrap() =
+                Some((object_name.into(), error));
+        }
+
         pub(crate) fn fail_next_get(&self, error: EnclaveError) {
             *self.fail_get.lock().unwrap() = Some(error);
         }
@@ -10270,6 +10269,20 @@ pub(crate) mod tests {
                     .push((object_name.to_string(), if_generation_match));
             }
             if !is_write_intent {
+                let matching_failure = {
+                    let mut failure = self.fail_put_for_object.lock().unwrap();
+                    if failure
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected == object_name)
+                    {
+                        failure.take().map(|(_, error)| error)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(error) = matching_failure {
+                    return Err(error);
+                }
                 if let Some(error) = self.fail_put.lock().unwrap().take() {
                     return Err(error);
                 }
@@ -10306,6 +10319,20 @@ pub(crate) mod tests {
                 store.insert(object_name.to_string(), vec![new_obj]);
             }
             if !is_write_intent {
+                let matching_failure = {
+                    let mut failure = self.fail_put_for_object_after_commit.lock().unwrap();
+                    if failure
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected == object_name)
+                    {
+                        failure.take().map(|(_, error)| error)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(error) = matching_failure {
+                    return Err(error);
+                }
                 if let Some(error) = self.fail_put_after_commit.lock().unwrap().take() {
                     if let Some(replacement) = self
                         .corrupt_wrapped_dek_after_commit_failure

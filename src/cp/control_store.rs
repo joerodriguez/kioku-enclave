@@ -95,6 +95,30 @@ use crate::{
 };
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
+const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
+    "usage_daily",
+    "billing_accounts",
+    "recording_leases",
+    "recording_lease_requests",
+    "refresh_tokens",
+    "oauth_authorization_codes",
+    "oauth_consents",
+    "query_log",
+    "vertex_coverage_anchors",
+    "recording_lease_denials",
+    "recording_delivery_balances",
+    "recording_delivery_reservations",
+    "capture_reference_batch_events",
+    "capture_reference_batch_receipts",
+    "offline_recording_usage_receipts",
+    "webhook_subscriptions",
+    "episode_email_preferences",
+    "push_installations",
+    "push_send_fences",
+    "auth_identities",
+    "apple_credentials",
+    "archive_bindings",
+];
 const CONTROL_CONTEXT: &[u8] = b"control-db\0control/control.db.enc";
 const MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER: i64 = 1;
 const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
@@ -1628,6 +1652,36 @@ CREATE TABLE IF NOT EXISTS push_installations (
 );
 CREATE INDEX IF NOT EXISTS push_installations_user_idx
     ON push_installations(user_id, enabled, last_seen_at);
+-- Globally monotone installation generations prevent UUID reuse after
+-- privacy-preserving deletion, dedupe displacement, or bounded registry GC.
+CREATE TABLE IF NOT EXISTS push_token_generation_clock (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+    next_generation INTEGER NOT NULL CHECK (next_generation > 0)
+);
+-- A short-transaction provider-send receipt. The user/installation keys
+-- deliberately have no FK: a fresh missing-account/installation cancellation
+-- must itself be durable and prevent a same-key registration until archive
+-- reconciliation finishes. Deletion/rebind explicitly inventory this table.
+-- No Control lock is held while the provider is contacted.
+CREATE TABLE IF NOT EXISTS push_send_fences (
+    user_id          TEXT NOT NULL,
+    installation_id  TEXT NOT NULL,
+    token_generation INTEGER NOT NULL CHECK (token_generation > 0),
+    claim_id          TEXT NOT NULL UNIQUE CHECK (length(claim_id) = 36),
+    lease_expires_at  TEXT NOT NULL,
+    outcome_kind      TEXT CHECK (outcome_kind IN
+                         ('accepted','retry','ambiguous','failed','token_terminal',
+                          'cancel_account_inactive','cancel_installation_missing',
+                          'cancel_installation_disabled','cancel_token_generation_changed')),
+    provider_status   INTEGER,
+    provider_error    TEXT,
+    retry_at          TEXT,
+    outcome_at        TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, installation_id)
+);
+CREATE INDEX IF NOT EXISTS push_send_fences_user_idx
+    ON push_send_fences(user_id);
 -- ADR-0012 removes Gmail delivery and its stored OAuth credentials.
 DROP TABLE IF EXISTS user_gmail_configs;
 "#;
@@ -2048,6 +2102,155 @@ pub struct PushInstallation {
     pub enabled: bool,
 }
 
+pub(crate) enum PushSendFenceDisposition {
+    Authorized(PushInstallation),
+    DeletionOwned,
+    Recorded(PushSendFence),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushControlCancellation {
+    AccountInactive,
+    InstallationMissing,
+    InstallationDisabled,
+    TokenGenerationChanged,
+}
+
+impl PushControlCancellation {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::AccountInactive => "account_inactive",
+            Self::InstallationMissing => "installation_missing",
+            Self::InstallationDisabled => "installation_disabled",
+            Self::TokenGenerationChanged => "token_generation_changed",
+        }
+    }
+
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::AccountInactive => "cancel_account_inactive",
+            Self::InstallationMissing => "cancel_installation_missing",
+            Self::InstallationDisabled => "cancel_installation_disabled",
+            Self::TokenGenerationChanged => "cancel_token_generation_changed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushProviderOutcome {
+    Accepted {
+        status: i64,
+    },
+    Retry {
+        status: Option<i64>,
+        code: String,
+        retry_at: String,
+    },
+    Ambiguous,
+    Failed {
+        status: Option<i64>,
+        code: String,
+    },
+    TokenTerminal {
+        status: i64,
+        code: String,
+    },
+}
+
+impl PushProviderOutcome {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "accepted",
+            Self::Retry { .. } => "retry",
+            Self::Ambiguous => "ambiguous",
+            Self::Failed { .. } => "failed",
+            Self::TokenTerminal { .. } => "token_terminal",
+        }
+    }
+
+    fn fields(&self) -> (Option<i64>, Option<&str>, Option<&str>) {
+        match self {
+            Self::Accepted { status } => (Some(*status), None, None),
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => (*status, Some(code), Some(retry_at)),
+            Self::Ambiguous => (None, None, None),
+            Self::Failed { status, code } => (*status, Some(code), None),
+            Self::TokenTerminal { status, code } => (Some(*status), Some(code), None),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        let status_valid = |status: i64| (100..=599).contains(&status);
+        let code_valid = |code: &str| {
+            !code.is_empty()
+                && code.len() <= 256
+                && !code
+                    .bytes()
+                    .any(|byte| byte == 0 || byte.is_ascii_control())
+        };
+        match self {
+            Self::Accepted { status } | Self::TokenTerminal { status, .. }
+                if !status_valid(*status) =>
+            {
+                false
+            }
+            Self::Retry {
+                status,
+                code,
+                retry_at,
+            } => {
+                status.is_none_or(status_valid)
+                    && code_valid(code)
+                    && valid_push_timestamp(retry_at)
+            }
+            Self::Failed { status, code } => status.is_none_or(status_valid) && code_valid(code),
+            Self::TokenTerminal { code, .. } => code_valid(code),
+            Self::Accepted { status } => *status == 200,
+            Self::Ambiguous => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PushProviderReceipt {
+    outcome: PushProviderOutcome,
+    outcome_at: String,
+}
+
+impl PushProviderReceipt {
+    pub(crate) fn new(outcome: PushProviderOutcome, outcome_at: String) -> Result<Self> {
+        if !outcome.is_valid() || !valid_push_timestamp(&outcome_at) {
+            return Err(EnclaveError::Store(
+                "push provider receipt is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            outcome,
+            outcome_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushFenceOutcome {
+    Provider(PushProviderOutcome),
+    Cancellation(PushControlCancellation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PushSendFence {
+    pub(crate) user_id: String,
+    pub(crate) installation_id: String,
+    pub(crate) token_generation: i64,
+    pub(crate) claim_id: String,
+    pub(crate) lease_expires_at: String,
+    pub(crate) outcome: Option<PushFenceOutcome>,
+    pub(crate) outcome_at: Option<String>,
+}
+
 impl std::fmt::Debug for PushInstallation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2088,6 +2291,201 @@ fn load_push_installation_conn(
             push_installation_from_row,
         )
         .optional()?)
+}
+
+fn load_push_send_fence_conn(
+    conn: &Connection,
+    user_id: &str,
+    installation_id: &str,
+) -> Result<Option<PushSendFence>> {
+    Ok(conn
+        .query_row(
+            "SELECT user_id,installation_id,token_generation,claim_id,lease_expires_at,\
+                    outcome_kind,provider_status,provider_error,retry_at,outcome_at \
+             FROM push_send_fences \
+             WHERE user_id=?1 AND installation_id=?2",
+            rusqlite::params![user_id, installation_id],
+            push_send_fence_from_row,
+        )
+        .optional()?)
+}
+
+fn push_send_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PushSendFence> {
+    let kind: Option<String> = row.get(5)?;
+    let status: Option<i64> = row.get(6)?;
+    let error: Option<String> = row.get(7)?;
+    let retry_at: Option<String> = row.get(8)?;
+    let outcome_at: Option<String> = row.get(9)?;
+    let outcome = match kind.as_deref() {
+        None if status.is_none()
+            && error.is_none()
+            && retry_at.is_none()
+            && outcome_at.is_none() =>
+        {
+            None
+        }
+        Some("accepted") if error.is_none() && retry_at.is_none() && outcome_at.is_some() => {
+            Some(PushFenceOutcome::Provider(PushProviderOutcome::Accepted {
+                status: status.ok_or(rusqlite::Error::InvalidQuery)?,
+            }))
+        }
+        Some("retry") if error.is_some() && retry_at.is_some() && outcome_at.is_some() => {
+            Some(PushFenceOutcome::Provider(PushProviderOutcome::Retry {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+                retry_at: retry_at.ok_or(rusqlite::Error::InvalidQuery)?,
+            }))
+        }
+        Some("ambiguous")
+            if status.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            Some(PushFenceOutcome::Provider(PushProviderOutcome::Ambiguous))
+        }
+        Some("failed") if error.is_some() && retry_at.is_none() && outcome_at.is_some() => {
+            Some(PushFenceOutcome::Provider(PushProviderOutcome::Failed {
+                status,
+                code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+            }))
+        }
+        Some("token_terminal") if error.is_some() && retry_at.is_none() && outcome_at.is_some() => {
+            Some(PushFenceOutcome::Provider(
+                PushProviderOutcome::TokenTerminal {
+                    status: status.ok_or(rusqlite::Error::InvalidQuery)?,
+                    code: error.ok_or(rusqlite::Error::InvalidQuery)?,
+                },
+            ))
+        }
+        Some(kind)
+            if status.is_none()
+                && error.is_none()
+                && retry_at.is_none()
+                && outcome_at.is_some() =>
+        {
+            let cancellation = match kind {
+                "cancel_account_inactive" => PushControlCancellation::AccountInactive,
+                "cancel_installation_missing" => PushControlCancellation::InstallationMissing,
+                "cancel_installation_disabled" => PushControlCancellation::InstallationDisabled,
+                "cancel_token_generation_changed" => {
+                    PushControlCancellation::TokenGenerationChanged
+                }
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Some(PushFenceOutcome::Cancellation(cancellation))
+        }
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let fence = PushSendFence {
+        user_id: row.get(0)?,
+        installation_id: row.get(1)?,
+        token_generation: row.get(2)?,
+        claim_id: row.get(3)?,
+        lease_expires_at: row.get(4)?,
+        outcome,
+        outcome_at,
+    };
+    if fence.token_generation <= 0
+        || !valid_push_claim_id(&fence.installation_id)
+        || !valid_push_claim_id(&fence.claim_id)
+        || !valid_push_timestamp(&fence.lease_expires_at)
+        || !fence.outcome.as_ref().is_none_or(|outcome| match outcome {
+            PushFenceOutcome::Provider(outcome) => outcome.is_valid(),
+            PushFenceOutcome::Cancellation(_) => true,
+        })
+        || !fence.outcome_at.as_deref().is_none_or(valid_push_timestamp)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(fence)
+}
+
+fn seed_push_generation_clock_conn(conn: &Connection) -> Result<usize> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO push_token_generation_clock(singleton,next_generation) \
+         SELECT 1,COALESCE(MAX(token_generation),0)+1 FROM push_installations \
+         HAVING COALESCE(MAX(token_generation),0) < 9223372036854775807",
+        [],
+    )?;
+    let state: Option<(i64, i64)> = conn
+        .query_row(
+        "SELECT next_generation,(SELECT COALESCE(MAX(token_generation),0) FROM push_installations) \
+         FROM push_token_generation_clock WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+        .optional()?;
+    let Some((next_generation, maximum_installed_generation)) = state else {
+        return Err(EnclaveError::Store(
+            "push token generation clock is exhausted".into(),
+        ));
+    };
+    if next_generation <= maximum_installed_generation {
+        return Err(EnclaveError::Store(
+            "push token generation clock is stale".into(),
+        ));
+    }
+    Ok(inserted)
+}
+
+fn allocate_push_generation_conn(conn: &Connection) -> Result<i64> {
+    let _ = seed_push_generation_clock_conn(conn)?;
+    let generation: i64 = conn.query_row(
+        "SELECT next_generation FROM push_token_generation_clock WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next = generation
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("push token generation exhausted".into()))?;
+    if conn.execute(
+        "UPDATE push_token_generation_clock SET next_generation=?1 \
+         WHERE singleton=1 AND next_generation=?2",
+        rusqlite::params![next, generation],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "push token generation allocation conflicted".into(),
+        ));
+    }
+    Ok(generation)
+}
+
+fn valid_push_claim_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn valid_push_timestamp(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && isotime::parse_epoch_millis(value)
+            .is_some_and(|millis| isotime::format_epoch_millis(millis) == value)
+}
+
+fn refuse_push_fenced_identity_rebind_conn(
+    conn: &Connection,
+    old_user_id: &str,
+    stable_user_id: &str,
+) -> Result<()> {
+    let push_send_in_flight: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1 OR user_id=?2)",
+        rusqlite::params![old_user_id, stable_user_id],
+        |row| row.get(0),
+    )?;
+    if push_send_in_flight {
+        return Err(EnclaveError::Conflict(
+            "identity rebind conflicts with an in-flight push send".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17782,6 +18180,17 @@ fn delete_user_identity_conn(
     fence_object_name: &str,
 ) -> Result<AccountDeletionOperation> {
     let tx = conn.unchecked_transaction()?;
+    let push_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if push_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight push send".into(),
+        ));
+    }
     let rebind_operation = identity_rebind_operation_for_user_conn(&tx, user_id)?;
     if rebind_operation
         .as_ref()
@@ -17982,6 +18391,17 @@ fn begin_user_deletion_conn(
     fence_object_name: &str,
 ) -> Result<Option<AccountDeletionOperation>> {
     let tx = conn.unchecked_transaction()?;
+    let push_send_in_flight: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE user_id=?1)",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    if push_send_in_flight {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight push send".into(),
+        ));
+    }
     let status: Option<String> = tx
         .query_row("SELECT status FROM users WHERE id = ?1", [user_id], |r| {
             r.get(0)
@@ -18955,8 +19375,16 @@ impl ControlStore {
         }
         drop(temp_file);
         let conn = Connection::open(&temp_path)?;
+        let push_send_fence_schema_missing: bool = conn.query_row(
+            "SELECT COUNT(*)<>2 FROM sqlite_schema WHERE type='table' \
+             AND name IN ('push_send_fences','push_token_generation_clock')",
+            [],
+            |row| row.get(0),
+        )?;
         conn.execute_batch(SCHEMA)?;
-        let mut schema_migrations = migrate_apple_credentials_schema(&conn)?;
+        let mut schema_migrations = usize::from(push_send_fence_schema_missing);
+        schema_migrations += seed_push_generation_clock_conn(&conn)?;
+        schema_migrations += migrate_apple_credentials_schema(&conn)?;
         schema_migrations += migrate_advisory_abort_locus(&conn)?;
         schema_migrations += migrate_wal_operation_kind_bound(&conn)?;
         for column in [
@@ -19604,6 +20032,7 @@ impl ControlStore {
                         return Err(EnclaveError::Auth("account inactive".into()));
                     }
                     if old_id != &stable_id {
+                        refuse_push_fenced_identity_rebind_conn(conn, old_id, &stable_id)?;
                         validate_archive_rebind_conn(
                             conn,
                             &google_sub,
@@ -19615,29 +20044,7 @@ impl ControlStore {
                             "UPDATE users SET id = ?1, email = ?2 WHERE google_sub = ?3",
                             rusqlite::params![stable_id, email, google_sub],
                         )?;
-                        for table in [
-                            "usage_daily",
-                            "billing_accounts",
-                            "recording_leases",
-                            "recording_lease_requests",
-                            "refresh_tokens",
-                            "oauth_authorization_codes",
-                            "oauth_consents",
-                            "query_log",
-                            "vertex_coverage_anchors",
-                            "recording_lease_denials",
-                            "recording_delivery_balances",
-                            "recording_delivery_reservations",
-                            "capture_reference_batch_events",
-                            "capture_reference_batch_receipts",
-                            "offline_recording_usage_receipts",
-                            "webhook_subscriptions",
-                            "episode_email_preferences",
-                            "push_installations",
-                            "auth_identities",
-                            "apple_credentials",
-                            "archive_bindings",
-                        ] {
+                        for table in IDENTITY_REBIND_USER_ID_TABLES {
                             conn.execute(
                                 &format!("UPDATE {table} SET user_id = ?1 WHERE user_id = ?2"),
                                 rusqlite::params![stable_id, old_id],
@@ -21254,6 +21661,18 @@ impl ControlStore {
             .await
     }
 
+    /// Exact Control-plane proof that account deletion, rather than an
+    /// outbox owner, now owns removal of all remaining archive content.
+    pub(crate) async fn push_outbox_deletion_owned(&self, user_id: &str) -> Result<bool> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            let status = user_status_conn(conn, &user_id)?;
+            Ok(status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(conn, &user_id)?))
+        })
+        .await
+    }
+
     /// Internal inspection seam for future v3 deletion work. It is not a
     /// route, export field, telemetry dimension, or provider integration.
     #[allow(
@@ -22282,6 +22701,57 @@ impl ControlStore {
                 return Err(EnclaveError::Auth("account inactive or deleting".into()));
             }
             let tx = conn.unchecked_transaction()?;
+            let mutating_fenced_destination: bool = tx.query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM push_send_fences f \
+                   LEFT JOIN push_installations p ON p.id=f.installation_id \
+                   WHERE f.installation_id=?1 \
+                      OR (p.topic=?2 AND p.environment=?3 AND p.device_token=?4) \
+                 )",
+                rusqlite::params![
+                    installation.id,
+                    installation.topic,
+                    installation.environment,
+                    installation.device_token,
+                ],
+                |row| row.get(0),
+            )?;
+            if mutating_fenced_destination {
+                tx.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push installation has an in-flight send".into(),
+                ));
+            }
+            let existing: Option<(String, String, String, String, i64, bool)> = tx
+                .query_row(
+                    "SELECT user_id,topic,environment,device_token,token_generation,enabled \
+                     FROM push_installations WHERE id=?1",
+                    [&installation.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get::<_, i64>(5)? != 0,
+                        ))
+                    },
+                )
+                .optional()?;
+            let token_generation = match existing {
+                None => allocate_push_generation_conn(&tx)?,
+                Some((user_id, topic, environment, device_token, generation, enabled))
+                    if enabled
+                        && user_id == installation.user_id
+                        && topic == installation.topic
+                        && environment == installation.environment
+                        && device_token == installation.device_token =>
+                {
+                    generation
+                }
+                Some(_) => allocate_push_generation_conn(&tx)?,
+            };
             tx.execute(
                 "DELETE FROM push_installations WHERE topic=?1 AND environment=?2 \
                  AND device_token=?3 AND id<>?4",
@@ -22295,13 +22765,10 @@ impl ControlStore {
             tx.execute(
                 "INSERT INTO push_installations \
                    (id,user_id,platform,topic,environment,device_token,token_generation,enabled) \
-                 VALUES (?1,?2,?3,?4,?5,?6,1,1) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,1) \
                  ON CONFLICT(id) DO UPDATE SET \
                    user_id=excluded.user_id,platform=excluded.platform,topic=excluded.topic, \
-                   environment=excluded.environment, \
-                   token_generation=CASE WHEN device_token=excluded.device_token \
-                     AND topic=excluded.topic AND environment=excluded.environment \
-                     THEN token_generation ELSE token_generation+1 END, \
+                   environment=excluded.environment,token_generation=excluded.token_generation, \
                    device_token=excluded.device_token,enabled=1, \
                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
                    last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
@@ -22312,6 +22779,7 @@ impl ControlStore {
                     installation.topic,
                     installation.environment,
                     installation.device_token,
+                    token_generation,
                 ],
             )?;
             let excess: i64 = tx.query_row(
@@ -22321,12 +22789,47 @@ impl ControlStore {
                 |row| row.get(0),
             )?;
             if excess > 0 {
+                let evicting_fenced_destination: bool = tx.query_row(
+                    "SELECT EXISTS( \
+                       SELECT 1 FROM push_send_fences f WHERE f.installation_id IN ( \
+                         SELECT id FROM push_installations \
+                         WHERE user_id=?1 AND enabled=1 AND id<>?2 \
+                         ORDER BY last_seen_at ASC,id ASC LIMIT ?3 \
+                       ) \
+                     )",
+                    rusqlite::params![installation.user_id, installation.id, excess],
+                    |row| row.get(0),
+                )?;
+                if evicting_fenced_destination {
+                    tx.rollback()?;
+                    return Err(EnclaveError::Conflict(
+                        "push installation eviction would cross an in-flight send".into(),
+                    ));
+                }
                 tx.execute(
                     "DELETE FROM push_installations WHERE id IN ( \
                        SELECT id FROM push_installations WHERE user_id=?1 AND enabled=1 AND id<>?2 \
                        ORDER BY last_seen_at ASC,id ASC LIMIT ?3)",
                     rusqlite::params![installation.user_id, installation.id, excess],
                 )?;
+            }
+            tx.execute(
+                "DELETE FROM push_installations \
+                 WHERE user_id=?1 AND enabled=0 AND NOT EXISTS( \
+                   SELECT 1 FROM push_send_fences f WHERE f.installation_id=push_installations.id \
+                 )",
+                [&installation.user_id],
+            )?;
+            let total: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM push_installations WHERE user_id=?1",
+                [&installation.user_id],
+                |row| row.get(0),
+            )?;
+            if total > 10 {
+                tx.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push installation registry bound would be exceeded".into(),
+                ));
             }
             let installed =
                 load_push_installation_conn(&tx, &installation.user_id, &installation.id)?
@@ -22353,6 +22856,28 @@ impl ControlStore {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn push_registry_counts_for_test(
+        &self,
+        user_id: &str,
+    ) -> Result<(i64, i64, i64)> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(enabled),0),\
+                            (SELECT next_generation FROM push_token_generation_clock \
+                             WHERE singleton=1) \
+                     FROM push_installations WHERE user_id=?1",
+                    [user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn get_push_installation(
         &self,
         user_id: &str,
@@ -22364,6 +22889,371 @@ impl ControlStore {
             .await
     }
 
+    /// Durably linearize one exact provider-send capability in a short
+    /// Control transaction. The caller releases every Control lock before
+    /// provider I/O; deletion and installation mutation conflict only with
+    /// this exact installation fence until it is closed or reconciled.
+    pub(crate) async fn begin_push_send_fence(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+        token_generation: i64,
+        claim_id: &str,
+        lease_expires_at: &str,
+        decision_at: &str,
+    ) -> Result<PushSendFenceDisposition> {
+        if token_generation <= 0
+            || !valid_push_claim_id(installation_id)
+            || !valid_push_claim_id(claim_id)
+            || !valid_push_timestamp(lease_expires_at)
+            || !valid_push_timestamp(decision_at)
+        {
+            return Err(EnclaveError::Store(
+                "push send fence identity is invalid".into(),
+            ));
+        }
+        let user_id = user_id.to_owned();
+        let installation_id = installation_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let lease_expires_at = lease_expires_at.to_owned();
+        let decision_at = decision_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            if let Some(current) =
+                load_push_send_fence_conn(&transaction, &user_id, &installation_id)?
+            {
+                transaction.rollback()?;
+                if current.token_generation != token_generation
+                    || current.claim_id != claim_id
+                    || current.lease_expires_at != lease_expires_at
+                {
+                    return Err(EnclaveError::Conflict(
+                        "push installation already has an in-flight send".into(),
+                    ));
+                }
+                if current.outcome.is_some() {
+                    return Ok((PushSendFenceDisposition::Recorded(current), false));
+                }
+                let installation =
+                    load_push_installation_conn(connection, &user_id, &installation_id)?
+                        .filter(|installation| {
+                            installation.enabled
+                                && installation.token_generation == token_generation
+                        })
+                        .ok_or_else(|| {
+                            EnclaveError::Conflict(
+                                "live push send fence lost its exact installation".into(),
+                            )
+                        })?;
+                return Ok((PushSendFenceDisposition::Authorized(installation), false));
+            }
+            let status = user_status_conn(&transaction, &user_id)?;
+            if status.as_deref() == Some("deleting")
+                || (status.is_none() && is_deleted_user_conn(&transaction, &user_id)?)
+            {
+                transaction.rollback()?;
+                return Ok((PushSendFenceDisposition::DeletionOwned, false));
+            }
+            let installation =
+                load_push_installation_conn(&transaction, &user_id, &installation_id)?;
+            let cancellation = if status.as_deref() != Some("active") {
+                Some(PushControlCancellation::AccountInactive)
+            } else if installation.is_none() {
+                Some(PushControlCancellation::InstallationMissing)
+            } else if installation.as_ref().is_some_and(|value| !value.enabled) {
+                Some(PushControlCancellation::InstallationDisabled)
+            } else if installation
+                .as_ref()
+                .is_some_and(|value| value.token_generation != token_generation)
+            {
+                Some(PushControlCancellation::TokenGenerationChanged)
+            } else {
+                None
+            };
+            let inserted = transaction.execute(
+                "INSERT INTO push_send_fences \
+                 (user_id,installation_id,token_generation,claim_id,lease_expires_at,
+                  outcome_kind,outcome_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    user_id,
+                    installation_id,
+                    token_generation,
+                    claim_id,
+                    lease_expires_at,
+                    cancellation.map(PushControlCancellation::kind),
+                    cancellation.map(|_| decision_at.as_str()),
+                ],
+            )?;
+            if inserted != 1 {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send fence was not inserted exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            if let Some(cancellation) = cancellation {
+                Ok((
+                    PushSendFenceDisposition::Recorded(PushSendFence {
+                        user_id,
+                        installation_id,
+                        token_generation,
+                        claim_id,
+                        lease_expires_at,
+                        outcome: Some(PushFenceOutcome::Cancellation(cancellation)),
+                        outcome_at: Some(decision_at),
+                    }),
+                    true,
+                ))
+            } else {
+                Ok((
+                    PushSendFenceDisposition::Authorized(installation.ok_or_else(|| {
+                        EnclaveError::Store("push installation disappeared".into())
+                    })?),
+                    true,
+                ))
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn get_push_send_fence(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+    ) -> Result<Option<PushSendFence>> {
+        let user_id = user_id.to_owned();
+        let installation_id = installation_id.to_owned();
+        self.read(move |connection| {
+            load_push_send_fence_conn(connection, &user_id, &installation_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn list_push_send_fences(&self, user_id: &str) -> Result<Vec<PushSendFence>> {
+        let user_id = user_id.to_owned();
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT user_id,installation_id,token_generation,claim_id,lease_expires_at,\
+                        outcome_kind,provider_status,provider_error,retry_at,outcome_at \
+                 FROM push_send_fences WHERE user_id=?1 ORDER BY installation_id",
+            )?;
+            let fences = statement
+                .query_map([user_id], push_send_fence_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(EnclaveError::from)?;
+            Ok(fences)
+        })
+        .await
+    }
+
+    pub(crate) async fn validate_push_send_fence(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+        token_generation: i64,
+        claim_id: &str,
+        lease_expires_at: &str,
+        minimum_valid_at_millis: i64,
+    ) -> Result<bool> {
+        let user_id = user_id.to_owned();
+        let installation_id = installation_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let lease_expires_at = lease_expires_at.to_owned();
+        self.read(move |connection| {
+            let Some(fence) = load_push_send_fence_conn(connection, &user_id, &installation_id)?
+            else {
+                return Ok(false);
+            };
+            Ok(fence.token_generation == token_generation
+                && fence.claim_id == claim_id
+                && fence.lease_expires_at == lease_expires_at
+                && fence.outcome.is_none()
+                && isotime::parse_epoch_millis(&fence.lease_expires_at)
+                    .is_some_and(|expires| expires >= minimum_valid_at_millis))
+        })
+        .await
+    }
+
+    pub(crate) async fn record_push_send_outcome(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+        token_generation: i64,
+        claim_id: &str,
+        lease_expires_at: &str,
+        receipt: PushProviderReceipt,
+    ) -> Result<()> {
+        if token_generation <= 0
+            || !valid_push_claim_id(claim_id)
+            || !valid_push_timestamp(lease_expires_at)
+        {
+            return Err(EnclaveError::Store(
+                "push send outcome identity is invalid".into(),
+            ));
+        }
+        let PushProviderReceipt {
+            outcome,
+            outcome_at,
+        } = receipt;
+        let user_id = user_id.to_owned();
+        let installation_id = installation_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let lease_expires_at = lease_expires_at.to_owned();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let Some(current) =
+                load_push_send_fence_conn(&transaction, &user_id, &installation_id)?
+            else {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send fence disappeared before outcome".into(),
+                ));
+            };
+            if current.token_generation != token_generation
+                || current.claim_id != claim_id
+                || current.lease_expires_at != lease_expires_at
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send fence identity changed".into(),
+                ));
+            }
+            if let Some(existing) = current.outcome {
+                transaction.rollback()?;
+                return if existing == PushFenceOutcome::Provider(outcome.clone())
+                    && current.outcome_at.as_deref() == Some(&outcome_at)
+                {
+                    Ok(((), false))
+                } else {
+                    Err(EnclaveError::Conflict(
+                        "push send outcome conflicts with durable evidence".into(),
+                    ))
+                };
+            }
+            let (provider_status, provider_error, retry_at) = outcome.fields();
+            let changed = transaction.execute(
+                "UPDATE push_send_fences SET outcome_kind=?1,provider_status=?2,\
+                        provider_error=?3,retry_at=?4,outcome_at=?5 \
+                 WHERE user_id=?6 AND installation_id=?7 AND token_generation=?8 \
+                   AND claim_id=?9 AND lease_expires_at=?10 AND outcome_kind IS NULL",
+                rusqlite::params![
+                    outcome.kind(),
+                    provider_status,
+                    provider_error,
+                    retry_at,
+                    outcome_at,
+                    user_id,
+                    installation_id,
+                    token_generation,
+                    claim_id,
+                    lease_expires_at,
+                ],
+            )?;
+            if changed != 1 {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send outcome was not recorded exactly once".into(),
+                ));
+            }
+            if matches!(outcome, PushProviderOutcome::TokenTerminal { .. }) {
+                transaction.execute(
+                    "UPDATE push_installations SET enabled=0, \
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                     WHERE user_id=?1 AND id=?2 AND token_generation=?3 AND enabled=1",
+                    rusqlite::params![user_id, installation_id, token_generation],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(((), true))
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_push_send_fence(
+        &self,
+        fence: &PushSendFence,
+        archive_outcome: PushProviderOutcome,
+    ) -> Result<()> {
+        self.finish_push_fence(fence, PushFenceOutcome::Provider(archive_outcome))
+            .await
+    }
+
+    pub(crate) async fn finish_push_cancellation_fence(
+        &self,
+        fence: &PushSendFence,
+        cancellation: PushControlCancellation,
+    ) -> Result<()> {
+        self.finish_push_fence(fence, PushFenceOutcome::Cancellation(cancellation))
+            .await
+    }
+
+    async fn finish_push_fence(
+        &self,
+        fence: &PushSendFence,
+        archive_outcome: PushFenceOutcome,
+    ) -> Result<()> {
+        let fence = fence.clone();
+        self.write_if_changed(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let Some(current) =
+                load_push_send_fence_conn(&transaction, &fence.user_id, &fence.installation_id)?
+            else {
+                transaction.rollback()?;
+                return Ok(((), false));
+            };
+            if current.token_generation != fence.token_generation
+                || current.claim_id != fence.claim_id
+                || current.lease_expires_at != fence.lease_expires_at
+                || fence
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value != &archive_outcome)
+                || current
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value != &archive_outcome)
+                || (current.outcome.is_some() && current.outcome_at != fence.outcome_at)
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send fence cannot adopt archive outcome".into(),
+                ));
+            }
+            if matches!(
+                archive_outcome,
+                PushFenceOutcome::Provider(PushProviderOutcome::TokenTerminal { .. })
+            ) {
+                transaction.execute(
+                    "UPDATE push_installations SET enabled=0, \
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                     WHERE user_id=?1 AND id=?2 AND token_generation=?3 AND enabled=1",
+                    rusqlite::params![fence.user_id, fence.installation_id, fence.token_generation],
+                )?;
+            }
+            if transaction.execute(
+                "DELETE FROM push_send_fences WHERE user_id=?1 AND installation_id=?2 \
+                 AND token_generation=?3 AND claim_id=?4 AND lease_expires_at=?5",
+                rusqlite::params![
+                    fence.user_id,
+                    fence.installation_id,
+                    fence.token_generation,
+                    fence.claim_id,
+                    fence.lease_expires_at,
+                ],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "push send fence was not finished exactly once".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(((), true))
+        })
+        .await
+    }
+
     pub async fn delete_push_installation(
         &self,
         user_id: &str,
@@ -22372,28 +23262,16 @@ impl ControlStore {
         let user_id = user_id.to_string();
         let installation_id = installation_id.to_string();
         self.write(move |conn| {
-            Ok(conn.execute(
-                "DELETE FROM push_installations WHERE user_id=?1 AND id=?2",
-                rusqlite::params![user_id, installation_id],
-            )? == 1)
-        })
-        .await
-    }
-
-    pub async fn disable_push_installation_generation(
-        &self,
-        user_id: &str,
-        installation_id: &str,
-        token_generation: i64,
-    ) -> Result<bool> {
-        let user_id = user_id.to_string();
-        let installation_id = installation_id.to_string();
-        self.write(move |conn| {
+            if load_push_send_fence_conn(conn, &user_id, &installation_id)?.is_some() {
+                return Err(EnclaveError::Conflict(
+                    "push installation has an in-flight send".into(),
+                ));
+            }
             Ok(conn.execute(
                 "UPDATE push_installations SET enabled=0, \
                  updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-                 WHERE user_id=?1 AND id=?2 AND token_generation=?3",
-                rusqlite::params![user_id, installation_id, token_generation],
+                 WHERE user_id=?1 AND id=?2 AND enabled=1",
+                rusqlite::params![user_id, installation_id],
             )? == 1)
         })
         .await
@@ -24056,6 +24934,47 @@ mod tests {
         .unwrap();
         create_active_archive_binding_conn(&conn, USER_ID).unwrap();
         conn
+    }
+
+    #[test]
+    fn identity_rebind_refuses_push_fences_and_inventory_covers_the_sidecar() {
+        let conn = account_conn();
+        conn.execute(
+            "INSERT INTO push_send_fences \
+             (user_id,installation_id,token_generation,claim_id,lease_expires_at) \
+             VALUES (?1,'22222222-2222-4222-8222-222222222222',1,\
+                     '33333333-3333-4333-8333-333333333333',\
+                     '2026-08-21T12:00:00.000Z')",
+            [USER_ID],
+        )
+        .unwrap();
+        assert!(matches!(
+            refuse_push_fenced_identity_rebind_conn(&conn, USER_ID, "stable-user"),
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert!(matches!(
+            refuse_push_fenced_identity_rebind_conn(&conn, "old-user", USER_ID),
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(
+            IDENTITY_REBIND_USER_ID_TABLES
+                .iter()
+                .filter(|table| **table == "push_send_fences")
+                .count(),
+            1
+        );
+        for table in IDENTITY_REBIND_USER_ID_TABLES {
+            let has_user_id: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='user_id')",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(has_user_id, "identity rebind inventory drifted at {table}");
+        }
+        conn.execute("DELETE FROM push_send_fences", []).unwrap();
+        refuse_push_fenced_identity_rebind_conn(&conn, USER_ID, "stable-user").unwrap();
     }
 
     fn lifecycle_file_conn(path: &std::path::Path) -> Connection {
@@ -28010,6 +28929,167 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first_generation, second_generation);
+    }
+
+    #[tokio::test]
+    async fn generation_clock_seed_is_persisted_once_and_reopens_exactly() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        control
+            .upsert_user(
+                "generation-seed-subject",
+                "generation-seed@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        control
+            .write(|connection| {
+                connection.execute("DELETE FROM push_token_generation_clock", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before_repair = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+        drop(control);
+
+        let repaired = ControlStore::new(kms.clone(), gcs.clone());
+        assert_eq!(
+            repaired
+                .read(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT next_generation FROM push_token_generation_clock \
+                             WHERE singleton=1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .await
+                .unwrap(),
+            1
+        );
+        let repaired_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+        assert!(repaired_generation > before_repair);
+        drop(repaired);
+
+        let reopened = ControlStore::new(kms, gcs.clone());
+        assert_eq!(
+            reopened
+                .read(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT next_generation FROM push_token_generation_clock \
+                             WHERE singleton=1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            gcs.get_object(CONTROL_OBJECT).await.unwrap().generation,
+            repaired_generation
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_control_writers_cannot_reuse_a_token_generation() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let bootstrap = ControlStore::new(kms.clone(), gcs.clone());
+        let user = bootstrap
+            .upsert_user(
+                "generation-race-subject",
+                "generation-race@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        drop(bootstrap);
+
+        let first = ControlStore::new(kms.clone(), gcs.clone());
+        let second = ControlStore::new(kms.clone(), gcs.clone());
+        first.user_status(&user.id).await.unwrap();
+        second.user_status(&user.id).await.unwrap();
+        let installation = |id: &str, token: char| PushInstallation {
+            id: id.into(),
+            user_id: user.id.clone(),
+            platform: "ios".into(),
+            topic: "com.kioku.ios".into(),
+            environment: "production".into(),
+            device_token: token.to_string().repeat(64),
+            token_generation: 1,
+            enabled: true,
+        };
+        let first_id = "22222222-2222-4222-8222-222222222271";
+        let second_id = "22222222-2222-4222-8222-222222222272";
+        let (first_result, second_result) = tokio::join!(
+            first.upsert_push_installation(installation(first_id, 'a')),
+            second.upsert_push_installation(installation(second_id, 'b')),
+        );
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let (winner, loser) = match (first_result, second_result) {
+            (Ok(winner), Err(_)) => (
+                winner,
+                second
+                    .upsert_push_installation(installation(second_id, 'b'))
+                    .await
+                    .unwrap(),
+            ),
+            (Err(_), Ok(winner)) => (
+                winner,
+                first
+                    .upsert_push_installation(installation(first_id, 'a'))
+                    .await
+                    .unwrap(),
+            ),
+            _ => unreachable!("exactly one generation-checked Control write must win"),
+        };
+        assert_ne!(winner.token_generation, loser.token_generation);
+        assert!(winner.token_generation > 0 && loser.token_generation > 0);
+        let reopened = ControlStore::new(kms, gcs);
+        let installations = reopened.list_push_installations(&user.id).await.unwrap();
+        assert_eq!(installations.len(), 2);
+        assert_ne!(
+            installations[0].token_generation,
+            installations[1].token_generation
+        );
+    }
+
+    #[test]
+    fn generation_clock_refuses_stale_or_exhausted_state_without_overflow() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        assert_eq!(seed_push_generation_clock_conn(&connection).unwrap(), 1);
+        assert_eq!(seed_push_generation_clock_conn(&connection).unwrap(), 0);
+        connection
+            .execute(
+                "UPDATE push_token_generation_clock SET next_generation=?1 WHERE singleton=1",
+                [i64::MAX],
+            )
+            .unwrap();
+        assert!(matches!(
+            allocate_push_generation_conn(&connection),
+            Err(EnclaveError::Store(_))
+        ));
+        let storage_type: String = connection
+            .query_row(
+                "SELECT typeof(next_generation) FROM push_token_generation_clock WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(storage_type, "integer");
     }
 
     #[tokio::test]

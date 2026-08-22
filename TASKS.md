@@ -4,6 +4,10 @@
 - [x] Commit first-finalization push deliveries atomically with the final memory result; regeneration does not replay them.
 - [x] Send privacy-safe per-device handoff handles through separate production and sandbox APNs transports.
 - [x] Resolve notification handoffs only for the authenticated owner and canonical browser memory route.
+- [x] Activate selected-archive push without replay: pre-lift bare-installation rows are cancellation-only, while new rows bind the exact Control token generation and expire within 24 hours.
+- [x] Persist exact archive send-start claims plus short Control user/installation/generation/claim fences before APNs; hold no database lock across provider I/O and make deletion/rotation conflict only with the exact in-flight destination.
+- [x] Use best-effort at-most-once ambiguity handling, complete-predecessor typed settlement, fixed-size poison-row quarantine, bounded fair pacing/circuit/Retry-After behavior, content-free telemetry, and restart-safe possibly-sent handoff resolution.
+- [x] Seal push pacing/circuit scope to the production singleton: release rollout requires a clean checkout at the reviewed deployment commit, verifies the exact Terraform-root inventory/digest before network access and again at roll, invokes only the pinned tracked deployment owner, and passes the seal for a third recomputation inside its production-infrastructure lock before credentials/plan/apply; source drift and horizontal/overlapping runtimes refuse until an external provider fence exists.
 - [x] Treat APNs delivery as non-blocking to finalization while failing production startup/release closed on missing provider configuration.
 - [x] Verify the complete Rust suite, lint, formatting, release-selection, and release-preflight contracts.
 - [x] Publish signed production release v0.8.14 from source commit

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structural fail-closed inventory for the inactive ADR-0022 WAL gate."""
+"""Structural fail-closed inventory for the ADR-0022 WAL gate."""
 
 from __future__ import annotations
 
@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 236
+EXPECTED_STORE_CALL_COUNT = 242
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -508,7 +508,65 @@ EXPECTED_STORE_CALL_COUNT = 236
 # remains byte-identical. The construction-context refactor lives outside a
 # tracked Store owner. The resulting inventory is still 236 rows with the same
 # one B addition, zero removals and zero reclassifications.
-EXPECTED_STORE_CALL_SHA256 = "3fbe72eafbf2236494f9b960d40366c8431f5fee9b7c331ed679eea47c90b89b"
+# Push-outbox activation was re-derived against a fresh pristine `git archive
+# HEAD` at exact 1a55872782951024f9970c3b1690ce38fd522c5b. The untouched
+# archive's own 14-test gate first reproduced its declared
+# 236/3fbe72eafbf2236494f9b960d40366c8431f5fee9b7c331ed679eea47c90b89b
+# pin byte-for-byte. Each tree was then dumped with its own scanner and
+# classifier and compared key by key. The branch is 240 rows:
+#   * TEN additions: two A routed reads in the live owner (open claim and
+#     content-free depth), three B sites each for exact claim submit and exact
+#     settlement submit (WAL submit plus retained legacy with_user/save), and
+#     the A routed replacements in Store's scan and handoff resolver.
+#   * SIX removals: the two B sites under the superseded update_delivery owner,
+#     the two B legacy sites in the removed Store updater, and the two A legacy
+#     with_user calls replaced by the Store routed scan/resolver reads.
+#   * ZERO reclassifications and ZERO surviving call-expression moves. Eight
+#     surviving finalizer rows move in owner-body hash only because selected
+#     finalization now snapshots generation-bound APNs destinations; every
+#     one of their call expressions is byte-identical. Surviving-key order is
+#     unchanged. The scanner now also structurally inspects both active push
+#     child modules, including their sealed registrations, bounded ledgers,
+#     preconditions, and absence of Store/provider/runtime escape surfaces.
+#
+# The post-review A--I repair was derived again from a newly extracted archive
+# of the same exact 1a55872782951024f9970c3b1690ce38fd522c5b base. Its own
+# 14-test gate again reproduced
+# 236/3fbe72eafbf2236494f9b960d40366c8431f5fee9b7c331ed679eea47c90b89b
+# before comparison. The final branch is 242 rows: the same ten additions and
+# six removals above, plus exactly TWO A reads --
+# `load_send_claim_recovery#0::wal_authoritative_read#0` for typed cross-store
+# outcome adoption and
+# `validate_archive_send_authority#0::wal_authoritative_read#0` for the
+# immediately-pre-provider exact claim/row/lease check. Key-by-key comparison
+# proves zero reclassifications, zero surviving call-expression moves, and
+# unchanged surviving-key order. The only surviving owner-body moves versus
+# pristine remain the eight pre-existing `finalize_user_episodes_scoped` rows;
+# their call expressions are byte-identical. This final pin therefore comes
+# from the merged third state, not from incrementally editing the earlier
+# 240-row digest.
+#
+# The final receipt/cancellation and singleton-topology review repair was
+# re-derived once more from a fresh archive of that exact 1a55872 base. The
+# pristine 14-test gate reproduced 236/3fbe72ea before comparison. Exact
+# Control receipt replay, claimless live-claim refusal, and release topology
+# verification add no Store escape; key-by-key comparison therefore reproduces
+# the same 242/15a16011 third state, the same 12 additions/six removals, zero
+# reclassifications, zero surviving expression moves, unchanged surviving-key
+# order, and only the same eight finalizer owner-body moves. No pin value moves.
+# The final topology follow-up replaces the release-local semantic regex with a
+# pinned deployment HEAD plus exact Terraform root-source inventory/digest and
+# adds no Rust or Store surface. The branch gate below therefore remains the
+# already re-derived 242/15a16011 third state; no pin or owner inventory moves.
+# The reviewed deployment companion then moved the source HEAD pin to exact
+# 50dd58069e5fe7643640076ecdfe84f38acde704 without changing the Terraform
+# digest, and added only release-script seal handoff/path checks. Rust and the
+# Store inventory remain byte-for-byte unchanged, so the pin still does not move.
+# Deployment correction da23a487c5c4060fc579c2b0863747c1b55eff6f adds
+# replacement-ref refusal and replacement-disabled Git reads to both sides of
+# the release seal. The enclave change remains script/docs-only, so this Store
+# pin and owner inventory again remain unchanged.
+EXPECTED_STORE_CALL_SHA256 = "15a16011068918c7cd513bf8e5b53d5471b2622b77e720690611ba21cda42422"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1343,6 +1401,10 @@ A_OWNERS = frozenset(
         "src/cp/query.rs::rest_screenshot_upload_plan#0",
         "src/cp/query.rs::rest_screenshot_image_content#0",
         "src/cp/reviewer.rs::ensure_demo_archive#0",
+        "src/cp/push.rs::load_open_send_claim#0",
+        "src/cp/push.rs::load_send_claim_recovery#0",
+        "src/cp/push.rs::validate_archive_send_authority#0",
+        "src/cp/push.rs::emit_push_depth#0",
         "src/cp/summarizer.rs::run_substance_backfill#0",
         "src/cp/summarizer.rs::run_visual_evidence_backfill#0",
         "src/cp/summarizer.rs::fetch_range#0",
@@ -1363,7 +1425,8 @@ B_OWNERS = frozenset(
         "src/cp/finalizer.rs::read_finalization_predecessor#0",
         "src/cp/email_worker.rs::settle_email_delivery#0",
         "src/cp/email_worker.rs::cancel_user_email_deliveries_settled#0",
-        "src/cp/push.rs::update_delivery#0",
+        "src/cp/push.rs::submit_send_claim#0",
+        "src/cp/push.rs::settle_delivery_at#0",
         "src/cp/finalizer.rs::settle_lifecycle#0",
         "src/cp/finalizer.rs::finalize_commit_settled#0",
         "src/cp/finalizer.rs::record_finalization_failure#0",
@@ -1407,7 +1470,6 @@ B_OWNERS = frozenset(
         "src/store.rs::update_email_delivery_state#0",
         "src/store.rs::set_email_delivery_next_attempt#0",
         "src/store.rs::cancel_pending_email_deliveries#0",
-        "src/store.rs::update_push_delivery_state#0",
     }
 )
 C_OWNERS = frozenset(
@@ -1953,6 +2015,16 @@ impl X {
         )
         push = (ROOT / "src/cp/push.rs").read_text(encoding="utf-8")
         push_domain = (ROOT / "src/cp/push/wal.rs").read_text(encoding="utf-8")
+        push_claim_domain = (ROOT / "src/cp/push/wal/claim.rs").read_text(
+            encoding="utf-8"
+        )
+        push_claim_production = without_cfg_test_items(push_claim_domain)
+        push_settlement_domain = (
+            ROOT / "src/cp/push/wal/settlement.rs"
+        ).read_text(encoding="utf-8")
+        push_settlement_production = without_cfg_test_items(
+            push_settlement_domain
+        )
         webhook_worker = (ROOT / "src/cp/webhook_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -2687,11 +2759,44 @@ impl X {
             "impl sealed::DomainLedger for crate::cp::push::wal::PushAcceptedLedger",
             gate,
         )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::push::wal::PushSendClaimPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::push::wal::PushSendClaimLedger",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::push::wal::PushDeliverySettlementPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::push::wal::PushDeliverySettlementLedger",
+            gate,
+        )
         self.assertIn("struct PushAcceptedPlan", push_domain)
         self.assertIn("struct PushAcceptedLedger", push_domain)
         self.assertIn("archive_v3_wal_push_accepted_operations", push_domain)
         self.assertIn("DomainLedgerBounds::new", push_domain)
         self.assertIn("WalIdempotencyError::Precondition", push_domain)
+        self.assertIn("struct PushSendClaimPlan", push_claim_domain)
+        self.assertIn("struct PushSendClaimLedger", push_claim_domain)
+        self.assertIn("archive_v3_wal_push_claim_operations", push_claim_domain)
+        self.assertIn("archive_v3_wal_push_send_claims", push_claim_domain)
+        self.assertIn("DomainLedgerBounds::new", push_claim_domain)
+        self.assertIn("WalIdempotencyError::Precondition", push_claim_domain)
+        self.assertIn("struct PushDeliverySettlementPlan", push_settlement_domain)
+        self.assertIn("struct PushDeliverySettlementLedger", push_settlement_domain)
+        self.assertIn(
+            "archive_v3_wal_push_settlement_operations", push_settlement_domain
+        )
+        self.assertIn("DomainLedgerBounds::new", push_settlement_domain)
+        self.assertIn("WalIdempotencyError::Precondition", push_settlement_domain)
+        self.assertIn("PushSendClaimPlan::new(", push)
+        self.assertIn("PushDeliverySettlementPlan::new(", push)
+        self.assertIn("begin_push_send_fence(", push)
+        self.assertIn(".send(PushRequest {", push)
         self.assertNotIn("PushAcceptedPlan::", push)
         self.assertNotIn("cp::push::wal::", main)
         self.assertIn("pub(crate) mod wal;", webhook_worker)
@@ -2790,6 +2895,8 @@ impl X {
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
+            self.assertNotIn(forbidden, push_claim_production)
+            self.assertNotIn(forbidden, push_settlement_production)
             self.assertNotIn(forbidden, webhook_domain)
             self.assertNotIn(forbidden, reviewer_domain)
             self.assertNotIn(forbidden, substance_domain)
@@ -3063,6 +3170,8 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, push_domain)
+            self.assertNotIn(forbidden, push_claim_production)
+            self.assertNotIn(forbidden, push_settlement_production)
         for forbidden in (
             "send_signed(",
             "set_delivery_state(",

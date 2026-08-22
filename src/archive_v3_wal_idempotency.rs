@@ -137,6 +137,11 @@ impl WalOperationKind {
                 | Self::CaptureSessionFinish
                 | Self::SelectedScreenshot
                 | Self::VertexUsage
+                // The pre-send push claim returns only Authorized or Busy.
+                // The retained result is what prevents a competing/random
+                // claim from treating an already-started provider attempt as
+                // fresh authority to send.
+                | Self::PushDelivery
         )
     }
 
@@ -554,6 +559,8 @@ impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}
 impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushDeliverySettlementPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushDeliverySettlementLedger {}
+impl sealed::DomainPlan for crate::cp::push::wal::PushSendClaimPlan {}
+impl sealed::DomainLedger for crate::cp::push::wal::PushSendClaimLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushAcceptedPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushAcceptedLedger {}
 impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookDeliverySettlementPlan {}
