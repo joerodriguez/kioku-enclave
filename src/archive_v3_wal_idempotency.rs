@@ -66,8 +66,12 @@ pub(crate) enum WalIdempotencyError {
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
 
 /// Stable portable domains approved for future conversion. Attempt counters,
-/// wall-clock retry bookkeeping, auto-ID creation, arbitrary SQL, purge, and
-/// account deletion deliberately have no variant and remain disabled.
+/// wall-clock retry bookkeeping, auto-ID creation, arbitrary SQL, and account
+/// deletion deliberately have no variant and remain disabled. The two episode
+/// deletion ordinals are the reviewed exact, content-scoped exception: the
+/// preparation removes logical plaintext and durably reserves/retains the
+/// exact provider-cleanup receipt before provider I/O; completion records only
+/// that the frozen cleanup finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub(crate) enum WalOperationKind {
@@ -90,6 +94,9 @@ pub(crate) enum WalOperationKind {
     /// compile-pinned mutation-set commitment is gone, and the reviewed-plan
     /// seal plus this enum are the whole admission story now.
     SchemaEpochAdvance = 13,
+    EpisodeDeletePrepare = 14,
+    EpisodeDelete = 15,
+    EpisodeDeleteCleanup = 16,
 }
 
 impl WalOperationKind {
@@ -108,6 +115,9 @@ impl WalOperationKind {
             11 => Ok(Self::Retention),
             12 => Ok(Self::ReviewerBackfill),
             13 => Ok(Self::SchemaEpochAdvance),
+            14 => Ok(Self::EpisodeDeletePrepare),
+            15 => Ok(Self::EpisodeDelete),
+            16 => Ok(Self::EpisodeDeleteCleanup),
             _ => Err(WalIdempotencyError::Corrupt),
         }
     }
@@ -126,7 +136,10 @@ impl WalOperationKind {
             | Self::PushDelivery
             | Self::Retention
             | Self::ReviewerBackfill
-            | Self::SchemaEpochAdvance => 1,
+            | Self::SchemaEpochAdvance
+            | Self::EpisodeDeletePrepare
+            | Self::EpisodeDelete
+            | Self::EpisodeDeleteCleanup => 1,
         }
     }
 
@@ -260,7 +273,7 @@ impl fmt::Debug for WalLogicalOperationId {
 pub(crate) struct WalRequestFingerprint([u8; 32]);
 
 impl WalRequestFingerprint {
-    fn derive(kind: WalOperationKind, canonical_request: &[u8]) -> Result<Self> {
+    pub(crate) fn derive(kind: WalOperationKind, canonical_request: &[u8]) -> Result<Self> {
         if canonical_request.is_empty() {
             return Err(WalIdempotencyError::Malformed);
         }
@@ -513,6 +526,12 @@ impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan 
 impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageOutcomeLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeletePlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeleteLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeletePreparePlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeletePrepareLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeleteCleanupPlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeleteCleanupLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotAttemptPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotAttemptLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotUploadCandidatePlan {}
@@ -1314,7 +1333,19 @@ mod tests {
             WalReplayResult::canonical_response(WalOperationKind::SchemaEpochAdvance, vec![1])
                 .is_err()
         );
-        assert!(WalOperationKind::decode(14).is_err());
+        assert_eq!(
+            WalOperationKind::decode(14).unwrap(),
+            WalOperationKind::EpisodeDeletePrepare
+        );
+        assert_eq!(
+            WalOperationKind::decode(15).unwrap(),
+            WalOperationKind::EpisodeDelete
+        );
+        assert_eq!(
+            WalOperationKind::decode(16).unwrap(),
+            WalOperationKind::EpisodeDeleteCleanup
+        );
+        assert!(WalOperationKind::decode(17).is_err());
         assert!(
             WalReplayResult::canonical_response(WalOperationKind::FinalizationCommit, vec![1])
                 .is_err()
@@ -1751,7 +1782,6 @@ mod tests {
             concat!("tokio::", "spawn"),
             concat!("pub struct ", "PreparedLogicalMutation"),
             concat!("OperationKind::", "AccountDelete"),
-            concat!("OperationKind::", "EpisodeDelete"),
             concat!("archive_v3_wal_", "logical_operations"),
             concat!("ORDER BY operation_", "kind"),
         ] {

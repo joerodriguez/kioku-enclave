@@ -404,6 +404,48 @@ the legacy provider for a `capture-v2:` ID. Provider and KMS transport outages a
 retryable 503 responses, while malformed identity, AEAD, length, or digest failures are
 500 faults that return no content.
 
+Browser evidence is served only through a live episode-member screenshot association.
+The Cloud Capture v2 path reauthenticates its exact capture event, observation, context
+status, versioned canonical state envelope and commitment; a missing child or mixed
+event/state association fails closed as 503 rather than being represented as absence.
+
+Selected episode deletion uses a sealed tombstone plus bounded selector state machine. Its
+first transaction hashes every row in the immediate episode/member/screen/outbox cascade,
+including cross-episode membership and rows changed by `ON DELETE SET NULL`, then purges
+user-visible plaintext and reserves the permanent receipt before provider I/O. It stores a
+compact ordered selector for each exact event, owned voice observation, or legacy object;
+it does not materialize the worst-case 65,536-utterance media graph. One selector at a time
+reauthenticates a shared row/byte/query budget, the complete capture/voice/allocator closure,
+and at most the writer-legal 128 audio event roots. Before voice identity paging, the exact legal
+maximum of 16,384 cleanup rows and bounded bytes is atomically reserved against the global ledger
+and expansion exchanges it for exact usage. First-time current progress rows are independently
+charged to the same global ledger before identity mutation, overwrites are charge-neutral, and
+expansion releases the exact authenticated count; other selectors exact-reserve at expansion. No local or provider-backed
+mutation precedes the applicable reservation. Finishing releases exact dynamic capacity but retains fixed inventory/result fingerprints and
+the aggregate selector commitment needed to authenticate final completion. Canonical parents,
+historical NULL-linked audio observations, shared voice closures, work units, browser states,
+observations, and legacy snapshots survive while non-target evidence still references them.
+Imported pre-lineage voice samples are admitted only through a scoped affected-profile fallback;
+the selector authenticates their rows and allocator state before fixed-stamp revision/assignment
+backfill, deletion, and recompute in the final local transaction.
+Affected-episode invalidation itself advances through authenticated rotating 128-episode pages.
+Each page exact-reads integer revisions and overwrites one authenticated, globally charged current progress row per
+affected episode; no append-only page history is retained. The durable cursor reaches higher IDs
+before wrapping, and stale completed identity work is queued again on a later page. Missing or
+altered current progress is reprocessed and cannot authorize the final voice purge, so a legally
+long-lived profile never becomes an undeletable post-tombstone closure.
+A dedicated worker scans immediately and every 30 seconds, advances a durable cursor before
+each four-episode account turn, yields between accounts, and continues independent work after
+one provider failure. Route wakeups use a bounded coalescing channel, selection is non-biased,
+and repeated account failures back off from 1 to 30 seconds without delaying ready accounts; the
+summarizer call is only a redundant wakeup. A bounded route pass may
+return 202 after the logical tombstone. Completion is durable only after exact absence and a
+gap-free authenticated provider inventory; its replay loader derives and verifies the account,
+episode, operation IDs, request fingerprints, result codecs and ordered source/selector
+commitments. Retained delete rows contain commitments, counts and provider identities only—never
+transcript, OCR, browser title/URL/tab, finalization body, voice embedding, webhook
+endpoint/secret/body, or email/push payload content.
+
 User databases, the control database, ACME state, and media evidence are rewritten
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see

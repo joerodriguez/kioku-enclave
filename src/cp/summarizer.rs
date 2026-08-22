@@ -2138,6 +2138,9 @@ pub async fn summarize_all(state: &CpState) {
 /// and push delivery. Every step is idempotent and no-ops when nothing new
 /// finalized, so both the sweep and the session-settled kick run it.
 async fn finalize_and_deliver_user(state: &CpState, id: &str) {
+    if let Err(e) = super::query::resume_user_episode_deletions(state, id).await {
+        warn!(error = %e, "resume_user_episode_deletions failed");
+    }
     if let Err(e) = super::finalizer::finalize_user_episodes(state, id).await {
         warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
     }

@@ -141,14 +141,10 @@ pub mod wal_domain {
 
     // ── Request paths: the read lane ────────────────────────────────────────
     //
-    // Every constant in this block names a surface whose call site routes
-    // through `Store::wal_authoritative_read`, and whose D4 gate is RETAINED
-    // above it. That is the ANSWERABILITY RULE stated in full below, applied
-    // here; read that first. Routing is kept because it is strictly better for
-    // the unselected population — the fallthrough is `with_user_read`, so
-    // their reads now run under SQLite's `query_only` guard, which the raw
-    // `with_user` it replaced did not apply — and because it turns lifting
-    // each gate into a one-line deletion at the gate site.
+    // No request-path D4 constant remains in this block. The routed reads stay
+    // because selected browser evidence and selected two-stage episode deletion
+    // are now answerable, while the unselected fallthrough still benefits from
+    // SQLite's `query_only` guard.
     //
     // **The evidence chain is LIVE end to end, and that is why this block is
     // now short.** It was walked writer by writer, per line, not per file:
@@ -181,33 +177,6 @@ pub mod wal_domain {
     // convincing `INSERT INTO episodes` inside a test `seed()` helper, and
     // both have been mistaken for production writers.
     //
-    // What survives in this block is therefore NOT "the chain is starved". It
-    // is two specific reads whose own predicates or own tables the live
-    // chain still cannot satisfy, each said exactly once below.
-
-    /// `DELETE /api/episodes/{id}`. The ONE read-lane route that is not a
-    /// read, and the one gate here that does NOT rest on the answerability
-    /// rule: it enumerates the episode's media keys, deletes those objects
-    /// from GCS, then purges the rows. The purge is a durable mutation needing
-    /// a sealed plan family of its own, so routing only its lookup would be
-    /// strictly worse than deferring — a selected user would pass the routed
-    /// read, have their media irreversibly deleted, and then fail on the
-    /// legacy purge. Media gone, rows intact, no retry that repairs it.
-    pub const QUERY_EPISODE_DELETE: &str = "query.episode_delete";
-    /// `GET /api/browser-snapshots/{source_key}`. The writer and read topology
-    /// now exist: capture ingest validates and stores browser-v2 evidence, the
-    /// sealed screen-result family binds `capture-v2-browser:<event_id>` into
-    /// the screenshot, and the routed read exact-joins that event to the v2
-    /// state only while a live episode still owns the screenshot. Legacy v1
-    /// keys retain their strict compatibility read.
-    ///
-    /// **Remaining lift condition.** Episode deletion is still gated and its
-    /// legacy purge does not remove Cloud Capture events/observations or GC an
-    /// unreferenced browser state. Keep this route gated for selected users
-    /// until the sealed episode-purge family makes that lifecycle and export
-    /// promise true; serving sensitive tabs while the corresponding deletion
-    /// surface is knowingly incomplete is not an acceptable partial launch.
-    pub const QUERY_BROWSER_SNAPSHOT: &str = "query.browser_snapshot";
     // ── The media read domains ──────────────────────────────────────────────
     //
     // THE ANSWERABILITY RULE (ADR-0022 D4). It is the criterion every gate in
@@ -229,7 +198,8 @@ pub mod wal_domain {
     //     every call. That is the delivery group above, and it is why "the
     //     rows exist now" is not on its own a reason to delete a constant.
     //   * routed but UNANSWERABLE — lifting yields `200` with an empty
-    //     collection or a bare 404. That is the two read gates above.
+    //     collection or a bare 404. That was the historical browser/episode
+    //     read shape before their exact writers and deletion lifecycle landed.
     //
     // The registry's "delete a constant only when its domain actually
     // migrates" instruction is read through this rule: a domain migrates when
@@ -492,11 +462,12 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_domain_answers_503_naming_the_domain() {
         let response =
-            EnclaveError::wal_domain_unmigrated(wal_domain::QUERY_BROWSER_SNAPSHOT).into_response();
+            EnclaveError::wal_domain_unmigrated(wal_domain::MEDIA_WORKER_VOICE_EMBEDDING)
+                .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response_body(response).await;
         assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::QUERY_BROWSER_SNAPSHOT);
+        assert_eq!(body["domain"], wal_domain::MEDIA_WORKER_VOICE_EMBEDDING);
     }
 
     /// The generic arm answers an opaque 500 `internal error`. A deferral
@@ -507,7 +478,6 @@ mod tests {
         for domain in [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_PEOPLE,
-            wal_domain::QUERY_EPISODE_DELETE,
         ] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
             assert_eq!(
@@ -533,8 +503,6 @@ mod tests {
         let domains = [
             wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
-            wal_domain::QUERY_EPISODE_DELETE,
-            wal_domain::QUERY_BROWSER_SNAPSHOT,
             wal_domain::MEDIA_PEOPLE,
         ];
         let unique = domains.iter().collect::<std::collections::BTreeSet<_>>();

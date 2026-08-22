@@ -1,17 +1,17 @@
 # map.md — `src/cp/query/`
 
-Private inactive ADR-0022 logical-operation children. They do not define routes
-or obtain Store, provider, task, acknowledgement, or launcher authority.
+Private ADR-0022 logical-operation children. The selected screenshot-upload
+family remains inactive behind the Genesis `410 Gone` tombstone. The episode
+delete prepare/completion family is active only through the authenticated
+selected route in the production parent.
 
-The production parent `query.rs` also contains the separately gated browser
-snapshot reader. Its browser-v2 arm follows a live episode member through the
+The active browser snapshot reader's browser-v2 arm follows a live episode member through the
 screen result's `capture-v2-browser:<event_id>` reference, exact-matches the
 capture context, observation, persisted state envelope, and recomputed
 cross-language commitment, and fails closed on malformed evidence. The legacy
-arm remains strict and likewise requires a live episode association. This
-reader does not activate the child WAL family below, and its selected route
-stays gated until the episode-deletion/browser-GC lifecycle is sealed.
+arm remains strict and likewise requires a live episode association. Archive
+unavailability/corruption is 503; only authoritative absence is 404.
 
 | File | Role |
 |---|---|
-| [`wal.rs`](wal/map.md) | Closed, inactive selected-screenshot receipt codec plus private selected-screenshot-attempt, ciphertext-candidate, send-start, provider-proof, definitive-no-object termination, and finalization-queue children. The obsolete selected multipart route is now a Genesis `410 Gone` tombstone, so this family has no production route owner. The B attempt child consumes a caller-fixed opaque identity, reauthenticates the exact eligible screenshot ID, derives the account-bound object key, and atomically reserves pending episode count/bytes. The candidate child authenticates that exact unconsumed attempt and the installed media-DEK receipt, verifies the context-bound ciphertext against the borrowed validated JPEG/DEK, and durably retains ciphertext plus keyed commitments before any future send. The send child can consume only that exact-name authenticated candidate, derives one deterministic send request ID, and commits `SendStarted` before any future provider call. The provider-neutral child durably admits only one execution request, grants an injected seam one conditional create plus one bounded exact-name readback, and returns only a non-cloneable exact success or definitive-no-object proof. The C child consumes only the exact rejection proof and execution claim, reauthenticates the complete chain, releases budget for another target, and permanently fences the original target and future provider preparation. The A-v3 codec can consume the accepted proof and atomically retain a local screenshot in tests; historical unbound v1 and B-only v2 are also test-only. The queue child accepts only a caller-stable request and exact predecessor. None is Store/route/provider/launcher wired. |
+| [`wal.rs`](wal/map.md) | Inactive selected-screenshot upload codecs plus the active selected episode-delete family. Preparation authenticates the immediate episode/member/screen/outbox cascade, tombstones plaintext, reserves the permanent receipt, and persists compact ordered event/voice/legacy selectors. Cleanup expands one selector at a time under shared evidence limits. Voice selectors reserve their exact 16,384-row legal maximum before identity paging, then atomically exchange it for exact cleanup usage; first-time current progress rows are globally charged before identity mutation and released exactly, while overwrites are charge-neutral. Other selectors exact-reserve at expansion before mutation. The family authenticates its full capture/voice/allocator mutation closure, applies scoped fixed-stamp lineage backfill for authenticated imported voice samples, protects canonical ancestors and NULL-linked audio sharing, advances affected identity work through rotating authenticated 128-episode revision pages, and advances exact provider identities durably. Stale completed identity work is queued again; one current progress row per affected episode is overwritten rather than retaining append-only page history and is removed at local expansion. A dedicated immediate/30-second worker advances a durable four-episode fair cursor before work, bounds/coalesces non-biased route wakeups, and backs off failed accounts without blocking ready neighbors; the summarizer is only a redundant wakeup. Completion is recorded only after the gap-free selector sequence and authenticated aggregate provider-inventory commitment are complete. Retained rows contain commitments, counts, local source keys, exact encrypted-object identities, and no transcript, OCR, browser URL/title/tab, endpoint/secret/body, or voice content. |

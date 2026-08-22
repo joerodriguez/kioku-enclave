@@ -6996,10 +6996,8 @@ CREATE TABLE IF NOT EXISTS episode_final_briefs (
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- Per-destination signed-webhook outbox. Baseline rows contain only opaque ids.
--- The selected WAL owner may add a bounded frozen request sidecar immediately
--- before sending; destination deletion exact-purges that endpoint, secret, body,
--- and claim subtree before removing the Control subscription.
+-- Per-destination signed-webhook outbox. Endpoint URLs and signing secrets
+-- remain in the encrypted control DB; content blobs keep only opaque ids.
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     episode_id       INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
     subscription_id  TEXT NOT NULL,

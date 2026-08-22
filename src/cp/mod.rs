@@ -986,17 +986,18 @@ mod tests {
     #[test]
     fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
         let state = state();
+        let domain = wal_domain::MEDIA_WORKER_VOICE_EMBEDDING;
         assert!(state
-            .wal_domain_refusal("unselected-user", wal_domain::QUERY_BROWSER_SNAPSHOT)
+            .wal_domain_refusal("unselected-user", domain)
             .is_none());
 
         select_wal_authoritative(&state.store, "selected-user");
         let refusal = state
-            .wal_domain_refusal("selected-user", wal_domain::QUERY_BROWSER_SNAPSHOT)
+            .wal_domain_refusal("selected-user", domain)
             .expect("a selected user is refused");
         assert!(matches!(
             refusal,
-            EnclaveError::WalDomainUnmigrated(domain) if domain == wal_domain::QUERY_BROWSER_SNAPSHOT
+            EnclaveError::WalDomainUnmigrated(refused) if refused == domain
         ));
     }
 }

@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 243
+EXPECTED_STORE_CALL_COUNT = 251
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -664,7 +664,29 @@ EXPECTED_STORE_CALL_COUNT = 243
 # call-expression hashes change because the routed read now invokes the strict
 # browser-v2/legacy loader instead of querying the orphaned legacy state table.
 # No other owner or expression moves. The independently derived third state is:
-EXPECTED_STORE_CALL_SHA256 = "a3098fd06deba701a2aa9561e507f5567e59abf5676bf55ecd1348d6b8b5d387"
+# Episode deletion/browser GC was derived against a fresh pristine `git
+# archive` of exact 595958566c1d46c657e0aa515fe9100e4fc100d8. That
+# untouched tree's own 14-test gate reproduced 243/a3098fd0 before any branch
+# pin was written. The branch is 250/d1c7cbb5: exactly seven additions. Six
+# are C sites under `rest_selected_episode_delete` (two exact state/work reads
+# plus preparation, selector expansion/finish, provider-result, and completion
+# submits); the seventh is the A read that inventories pending work for the
+# bounded summarizer resume owner. There are zero removals, reclassifications, or
+# surviving call-expression moves. Exactly four surviving rows move owner-body
+# only: the legacy delete owner's two reads and save now sit below the selected
+# branch, while the browser read loses its D4 gate. Their call expressions are
+# byte-identical and the relative order of every surviving key is unchanged.
+#
+# The final capacity/authentication/sharing/fairness repair was re-derived from
+# the same fresh pristine archive after its own 14-test gate again reproduced
+# 243/a3098fd0. The branch is now 251 rows. Relative to pristine it has eight
+# additions: the six C route sites above, one A durable rotated-batch read, and
+# one C exact cursor-advance submit. There are still zero removals or
+# reclassifications. Exactly four surviving rows move owner-body only (the
+# legacy delete read/read/save trio and browser read), with byte-identical call
+# expressions. The new dedicated episode-delete worker adds no Store factory or
+# policy escape. This is the final key-by-key third state:
+EXPECTED_STORE_CALL_SHA256 = "798cdef5a11d4445615ae668289e74f46582e47e18ef26b048742e6802b540ca"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -719,7 +741,10 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # written, and their inventories are byte-identical to each other -- #333's
 # main.rs edit is a module-level const array outside async_main's span, so the
 # merged tree is not a third state here.
-EXPECTED_STORE_SURFACE_SHA256 = "6f80aa294dc424877cac64f89fbb5f199ccb42a4cbf7de1e7c0a9d6978264164"
+# Episode deletion's dedicated startup worker moves only async_main's owner
+# body. All 15 construction keys and every construction expression remain
+# byte-identical to pristine 5959585; no factory or policy surface was added.
+EXPECTED_STORE_SURFACE_SHA256 = "d0b746ab3dd0482f2966d2ba2d1f5ab752ce234c658a38c2c2af15b191aecf88"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -826,7 +851,7 @@ EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
 # pass in src/archive_v3_genesis_trigger.rs. It is deliberately a worker and
 # not an awaited call — sign-in must never block on, or fail because of,
 # genesis — and it classifies "C" with the rest of the archive-v3 family.
-EXPECTED_WORKER_SPAWN_COUNT = 26
+EXPECTED_WORKER_SPAWN_COUNT = 27
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
@@ -937,7 +962,12 @@ EXPECTED_WORKER_SPAWN_COUNT = 26
 # and byte-identical expressions. Only the legacy upload owner's existing
 # cancellation child moves in owner-body hash around the early 410 check and
 # captured multipart rejection; the spawn expression itself is unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "5b946c3cd83aa65e07f0b8c51c92f9eabca54c0ce98022443d14085158fbc8d5"
+# Selected episode deletion adds exactly one B worker spawn: the dedicated
+# immediate/30-second fair resume owner. The 26 pristine keys and expressions
+# survive unchanged; async_main's owner body moves with the startup call. A
+# fresh pristine 5959585 archive reproduced 26/5b946c3c before this 27-row
+# branch inventory was derived key by key.
+EXPECTED_WORKER_SPAWN_SHA256 = "a98e2c1248a28e96a0a4f0a2e4de79407b0d642ca2675cca8bf9c3b6d9d7b9d0"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1511,6 +1541,7 @@ A_OWNERS = frozenset(
         "src/cp/query.rs::rest_browser_snapshot#0",
         "src/cp/query.rs::rest_episode_finalize#0",
         "src/cp/query.rs::rest_feed#0",
+        "src/cp/query.rs::resume_user_episode_deletions#0",
         "src/cp/query.rs::rest_screenshot_upload_plan#0",
         "src/cp/query.rs::rest_screenshot_image_content#0",
         "src/cp/reviewer.rs::ensure_demo_archive#0",
@@ -1602,6 +1633,7 @@ C_OWNERS = frozenset(
     {
         "src/cp/model_usage.rs::settle_for_account_deletion#0",
         "src/cp/query.rs::rest_episode_delete#0",
+        "src/cp/query.rs::rest_selected_episode_delete#0",
         "src/store.rs::with_user_read#0",
         "src/store.rs::with_user_if_changed#0",
         "src/store.rs::freeze_wal_authoritative_media_keys#0",
@@ -1609,6 +1641,9 @@ C_OWNERS = frozenset(
 )
 
 CALL_OVERRIDES = {
+    # The durable scheduler inventory is read-only A, while the same owner's
+    # cursor advance is a sealed episode-delete C mutation.
+    "src/cp/query.rs::resume_user_episode_deletions#0::wal_authoritative_submit#0": "C",
     # The selected cancellation scan is read-only; the same owner retains the
     # legacy mutation/save pair for unselected archives.
     "src/cp/webhook_worker.rs::cancel_subscription_deliveries#0::wal_authoritative_read#0": "A",
@@ -2078,6 +2113,7 @@ impl X {
             encoding="utf-8"
         )
         query = (ROOT / "src/cp/query.rs").read_text(encoding="utf-8")
+        query_production = without_cfg_test_items(query)
         selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
             encoding="utf-8"
         )
@@ -2111,6 +2147,10 @@ impl X {
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
+        episode_delete_domain = (
+            ROOT / "src/cp/query/wal/episode_delete.rs"
+        ).read_text(encoding="utf-8")
+        episode_delete_production = without_cfg_test_items(episode_delete_domain)
         finalizer = (ROOT / "src/cp/finalizer.rs").read_text(encoding="utf-8")
         finalization_commit_domain = (
             ROOT / "src/cp/finalizer/wal.rs"
@@ -2319,6 +2359,67 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
         self.assertIn("selected-screenshot-result-bound-v2", selected_domain)
+        self.assertIn("mod episode_delete;", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeletePreparePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeletePrepareLedger",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeletePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeleteLedger",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::EpisodeDeleteCleanupPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::EpisodeDeleteCleanupLedger",
+            gate,
+        )
+        self.assertIn("struct EpisodeDeletePreparePlan", episode_delete_domain)
+        self.assertIn("struct EpisodeDeletePrepareLedger", episode_delete_domain)
+        self.assertIn("struct EpisodeDeletePlan", episode_delete_domain)
+        self.assertIn("struct EpisodeDeleteLedger", episode_delete_domain)
+        self.assertIn(
+            "archive_v3_wal_episode_delete_operations", episode_delete_domain
+        )
+        self.assertIn(
+            "adr-0022-exact-episode-delete-prepare-v1", episode_delete_domain
+        )
+        self.assertIn(
+            "adr-0022-exact-episode-delete-complete-v1", episode_delete_domain
+        )
+        self.assertIn("MAX_MEMBERS_PER_CLASS", episode_delete_domain)
+        self.assertIn("MAX_SOURCE_ROWS", episode_delete_domain)
+        self.assertIn("MAX_SOURCES_PER_EPISODE", episode_delete_domain)
+        self.assertIn("DomainLedgerBounds::new", episode_delete_domain)
+        self.assertIn("WalIdempotencyError::Precondition", episode_delete_domain)
+        self.assertIn("purge_episode_transaction_at", episode_delete_domain)
+        self.assertIn("predecessor_commitment", episode_delete_domain)
+        self.assertIn("AND NOT EXISTS (", episode_delete_domain)
+        self.assertEqual(query_production.count("EpisodeDeletePreparePlan::new("), 1)
+        self.assertEqual(query_production.count("EpisodeDeletePlan::new("), 0)
+        self.assertEqual(episode_delete_production.count("EpisodeDeletePlan::new("), 1)
+        delete_owner = query_production[
+            query_production.index("async fn rest_selected_episode_delete(") :
+        ]
+        prepare_index = delete_owner.index("EpisodeDeletePreparePlan::new(")
+        work_index = delete_owner.index("wal::load_episode_delete_work(")
+        provider_index = delete_owner.index(".delete_retained_media(")
+        settle_index = delete_owner.index("EpisodeDeleteCleanupPlan::new(")
+        self.assertLess(prepare_index, work_index)
+        self.assertLess(work_index, provider_index)
+        self.assertLess(provider_index, settle_index)
+        lifecycle_index = delete_owner.index("s.store.lock_user_lifecycle(user_id).await")
+        self.assertLess(lifecycle_index, prepare_index)
         self.assertIn(
             "selected-screenshot-provider-accepted-result-v3", selected_production
         )
@@ -3124,6 +3225,7 @@ impl X {
             self.assertNotIn(forbidden, selected_provider_production)
             self.assertNotIn(forbidden, selected_termination_production)
             self.assertNotIn(forbidden, finalization_queue_domain)
+            self.assertNotIn(forbidden, episode_delete_production)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
             self.assertNotIn(forbidden, result_domain)
@@ -3319,6 +3421,26 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, finalization_queue_domain)
+        for forbidden in (
+            "strftime(",
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "delete_object",
+            "list_objects",
+            "KmsClient",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "std::time::",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, episode_delete_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

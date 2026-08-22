@@ -8,9 +8,26 @@
   missing evidence.
 - [x] Repoint the browser snapshot reader to live canonical capture evidence
   while preserving strict legacy compatibility and genuine-absence semantics.
-- [ ] Seal episode deletion across canonical media, capture/browser rows, and
-  unreferenced shared-state garbage collection; only then lift the selected
-  browser-snapshot and episode-delete gates.
+- [x] Seal selected episode deletion as a two-stage logical-first operation:
+  exact capacity and the immediate episode/member/screen/outbox cascade are
+  committed before provider I/O; compact event/voice/legacy selectors then
+  expand one bounded exact closure at a time. Voice cleanup reserves its exact 16,384-row legal
+  maximum before identity paging and atomically swaps it for exact usage at expansion;
+  first-time current progress rows are globally charged before mutation and released exactly;
+  other selectors exact-reserve at expansion. Completion releases exact capacity while
+  retaining content-free inventory/result commitments. Voice-profile invalidation advances
+  through a rotating authenticated cursor with one overwritten current row per affected
+  episode, survives restart without append-only page history, and requeues stale identity work before
+  the final purge. A dedicated immediate/30-second worker advances a durable fair
+  cursor across four episodes per account turn, bounds/coalesces route wakeups,
+  and backs off a failing account for 1–30 seconds while continuing independent
+  work. Only authenticated selector/provider completion exposes
+  the receipt. Canonical ancestors, NULL-linked audio, shared voice/browser
+  evidence, and legacy browser subtrees follow exact last-reference rules;
+  imported pre-lineage voice samples receive scoped, fixed-stamp lineage
+  backfill inside the authenticated selector transaction;
+  legal 65,536-member episodes do not eagerly materialize their media fanout,
+  and both query gates lift without changing legacy.
 
 # ADR-0029 ready-notification delivery
 
