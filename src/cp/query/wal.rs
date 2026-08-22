@@ -10,10 +10,9 @@
 //! verifies and retains the exact context-bound ciphertext candidate for that
 //! attempt without send authority. A third private child durably marks the
 //! exact candidate `SendStarted` and derives its stable request identity while
-//! owning no provider. Slice 10g wires exactly that pre-provider chain
-//! (attempt, candidate, `SendStarted`) to the selected-screenshot route for
-//! WAL-authoritative users; the route stops fail-closed after the marker. A
-//! fourth private child exposes only an injected exact
+//! owning no provider. The former selected-screenshot upload route is now a
+//! Genesis `410 Gone` tombstone, so this pre-provider chain is inactive and
+//! has no route owner. A fourth private child exposes only an injected exact
 //! create/readback seam and mints sealed success or definitive-no-object proof;
 //! it has no concrete transport or caller. The sole production A contract
 //! consumes that exact success proof and atomically retains a complete typed
@@ -31,9 +30,6 @@ mod selected_screenshot_termination;
 mod selected_screenshot_upload;
 pub(in crate::cp::query) use finalization_queue::FinalizationQueuePredecessor;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
-pub(in crate::cp::query) use selected_screenshot_attempt::{
-    authenticate_selected_screenshot_upload_predecessor, SelectedScreenshotAttemptTarget,
-};
 pub(crate) use selected_screenshot_attempt::{
     SelectedScreenshotAttemptLedger, SelectedScreenshotAttemptPlan,
     SelectedScreenshotAttemptReceipt,

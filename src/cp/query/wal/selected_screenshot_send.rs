@@ -3,9 +3,9 @@
     reason = "inactive ADR-0022 selected-screenshot send-start marker is reviewed before provider or launcher ownership"
 )]
 
-//! Durable send-start boundary for one selected-screenshot upload (wired to
-//! the selected upload route by ADR-0022 slice 10g; the route stops
-//! fail-closed after this marker, before any provider I/O).
+//! Durable send-start boundary for one selected-screenshot upload. Slice 10g
+//! once wired this marker to the selected route; Genesis retirement now leaves
+//! it compiled and sealed with no production route owner.
 //!
 //! Construction requires the exact-name, DEK-authenticated ciphertext
 //! candidate. This child derives one stable request identity and atomically

@@ -2379,8 +2379,34 @@ struct PlanParams {
     after: Option<String>,
 }
 
+fn legacy_screenshot_source_pattern(device_id: &str) -> crate::error::Result<String> {
+    let valid = !device_id.is_empty()
+        && device_id.len() <= 128
+        && device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !valid {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "device_id has an invalid format".into(),
+        ));
+    }
+
+    // The historical source-key namespace is `<device_id>:...`. Underscore
+    // is valid in a device id but is a LIKE wildcard, so escape it even after
+    // the grammar check. Percent and the escape byte are rejected above.
+    let mut pattern = String::with_capacity(device_id.len() + 3);
+    for byte in device_id.bytes() {
+        if byte == b'_' {
+            pattern.push('\\');
+        }
+        pattern.push(char::from(byte));
+    }
+    pattern.push_str(":%");
+    Ok(pattern)
+}
+
 fn query_screenshot_upload_plan(conn: &Connection, p: &PlanParams) -> crate::error::Result<Value> {
-    let prefix = format!("{}:", p.device_id);
+    let source_pattern = legacy_screenshot_source_pattern(&p.device_id)?;
     let mut stmt = conn.prepare(
         "SELECT e.id, e.started_at, e.ended_at, c.source_key, e.minute_summaries, \
                 COALESCE(usage.image_count, 0), COALESCE(usage.image_bytes, 0) \
@@ -2394,7 +2420,7 @@ fn query_screenshot_upload_plan(conn: &Connection, p: &PlanParams) -> crate::err
              FROM screenshot_images GROUP BY episode_id \
          ) usage ON usage.episode_id = e.id \
          WHERE e.substance = 'normal' AND e.visual_evidence = 'useful' \
-           AND c.source_key LIKE ?1 \
+           AND c.source_key LIKE ?1 ESCAPE '\\' \
            AND c.is_duplicate = 0 \
            AND (?2 IS NULL OR c.captured_at >= ?2) \
            AND c.source_key NOT IN (SELECT source_key FROM screenshot_images) \
@@ -2405,7 +2431,7 @@ fn query_screenshot_upload_plan(conn: &Connection, p: &PlanParams) -> crate::err
 
     let rows = stmt.query_map(
         rusqlite::params![
-            format!("{}%", prefix),
+            source_pattern,
             p.after,
             MAX_EPISODE_IMAGES,
             MAX_EPISODE_IMAGE_BYTES
@@ -2491,7 +2517,7 @@ fn query_screenshot_upload_plan(conn: &Connection, p: &PlanParams) -> crate::err
 async fn rest_screenshot_upload_plan(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
-    Query(p): Query<PlanParams>,
+    query: Result<Query<PlanParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = crate::store::validate_user_id(&user.0) {
         return (
@@ -2501,436 +2527,34 @@ async fn rest_screenshot_upload_plan(
             .into_response();
     }
 
-    // Despite the name this route plans nothing durably: it returns the
-    // eligible candidate set and the remaining per-episode budgets so the Mac
-    // can rank them. Nothing is reserved, and the transactional check inside
-    // the upload route stays authoritative — so this is an ordinary routed
-    // read, not a mutation needing a sealed plan family. It is gated anyway,
-    // for the data reason, not the mutation one: its candidate set is drawn
-    // from `episodes`/`screenshots`, which no live writer can fill.
-    if let Some(error) = s.wal_domain_refusal(&user.0, wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN) {
-        return error.into_response();
+    // Genesis capture already uploads canonical image bytes before the screen
+    // result is planned, and the native client no longer owns a local source
+    // for those cloud-v2 rows. Reusing this retired device-prefix plan would
+    // either return a false empty archive or ask the client to upload bytes it
+    // no longer has. Keep only the guarded legacy compatibility lane.
+    if s.store.is_wal_authoritative(&user.0) {
+        return selected_screenshot_upload_retired();
     }
+    let Query(p) = match query {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
     let result = s
         .store
-        .wal_authoritative_read(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
+        .with_user(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
         .await;
 
     match result {
         Ok(val) => Json(val).into_response(),
+        Err(error @ crate::error::EnclaveError::InvalidRequest(_)) => error.into_response(),
         Err(e) => super::routed_read_unavailable("api.screenshot_upload_plan", &e),
     }
 }
 
-/// Maps a sealed-chain refusal onto the exact client statuses the legacy
-/// branch uses: precondition-class refusals are conflicts the client may
-/// resolve, malformed input is a bad request, and everything else stays
-/// opaque.
-fn wal_selected_screenshot_error(
-    error: crate::archive_v3_wal_idempotency::WalIdempotencyError,
-) -> crate::error::EnclaveError {
-    use crate::archive_v3_wal_idempotency::WalIdempotencyError;
-    match error {
-        WalIdempotencyError::Malformed => crate::error::EnclaveError::InvalidRequest(
-            "selected screenshot upload request is invalid".into(),
-        ),
-        WalIdempotencyError::Precondition
-        | WalIdempotencyError::FingerprintConflict
-        | WalIdempotencyError::Limit => crate::error::EnclaveError::Conflict(
-            "selected screenshot upload predecessor changed".into(),
-        ),
-        WalIdempotencyError::Corrupt
-        | WalIdempotencyError::ResultUnsupported
-        | WalIdempotencyError::Unavailable => {
-            crate::error::EnclaveError::Store("selected screenshot upload is unavailable".into())
-        }
-    }
-}
-
-/// ADR-0022 slice 10g: the sealed selected-screenshot chain for one
-/// WAL-authoritative upload. The durable pre-provider chain runs in order --
-/// eligibility+budget attempt, exact ciphertext candidate, `SendStarted`
-/// marker -- entirely through routed reads and sealed-plan submits, with the
-/// attempt durable BEFORE any encryption. The provider boundary's mandatory
-/// durable execution claim mutates inside its own immediate transaction, and
-/// a selected user has no routed lane that can admit it (the submit lane
-/// accepts only sealed logical plans; the serving read lane is query-only),
-/// so this route stops fail-closed after the durable `SendStarted` marker:
-/// no provider I/O happens, no object bytes leave the enclave, and the
-/// retained attempt/candidate/marker chain is exact restartable state for
-/// the provider slice's executor.
-async fn wal_selected_screenshot_image_upload(
-    s: &Arc<CpState>,
-    user_id: &str,
-    episode_id: i64,
-    source_key: &str,
-    captured_at: &str,
-    jpeg: &ValidatedJpeg,
-    image_bytes: &[u8],
-) -> Response {
-    enum WalScreenshotPreflight {
-        Existing(StoredScreenshotImage),
-        Ready {
-            target: wal::SelectedScreenshotAttemptTarget,
-            media_dek_receipt: crate::cp::media::wal::MediaDekInstallReceipt,
-            wrapped_dek_b64: String,
-        },
-    }
-
-    // 0. Ensure the sealed media-DEK install exists BEFORE the preflight:
-    // the wired media owner is idempotent (loads the existing install or
-    // settles the sealed install plan exactly once), giving a genesis-born
-    // user whose FIRST upload is a screenshot image a converging install
-    // lane instead of a permanent fail-closed 500.
-    if let Err(e) = crate::cp::media::load_or_create_media_dek(s, user_id).await {
-        tracing::error!(error = %e, "selected media upload DEK install failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-    }
-
-    // 1. Routed preflight: the exact legacy eligibility/budget predicate plus
-    // the sealed predecessor binding and the installed media-DEK facts, all
-    // read from one settled snapshot. The attempt's apply re-derives and
-    // re-checks the same predecessor under the owner's own transaction.
-    let preflight = {
-        let account = user_id.to_owned();
-        let source_key = source_key.to_owned();
-        let captured_at = captured_at.to_owned();
-        let jpeg = jpeg.clone();
-        s.store
-            .wal_authoritative_read(user_id, move |conn| {
-                if let ScreenshotUploadTarget::Existing(existing) =
-                    validate_screenshot_upload_target(
-                        conn,
-                        episode_id,
-                        &source_key,
-                        &captured_at,
-                        &jpeg.sha256,
-                        jpeg.byte_length,
-                    )?
-                {
-                    return Ok(WalScreenshotPreflight::Existing(existing));
-                }
-                let target = wal::authenticate_selected_screenshot_upload_predecessor(
-                    conn,
-                    &account,
-                    episode_id,
-                    &source_key,
-                    &captured_at,
-                    &jpeg,
-                )
-                .map_err(wal_selected_screenshot_error)?;
-                // The owner ensured the sealed install ran (via the media
-                // route's own wired constructor) before this preflight, so
-                // reaching this failure means corrupt state, never
-                // first-use.
-                let media_dek_receipt =
-                    wal::load_authenticated_media_dek_install_receipt(conn, &account)
-                        .map_err(wal_selected_screenshot_error)?
-                        .ok_or_else(|| {
-                            crate::error::EnclaveError::Store(
-                                "selected screenshot upload requires the sealed media DEK install"
-                                    .into(),
-                            )
-                        })?;
-                let wrapped_dek_b64 = conn
-                    .query_row(
-                        "SELECT value FROM app_metadata WHERE key = ?1",
-                        [MEDIA_DEK_METADATA_KEY],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .ok_or_else(|| {
-                        crate::error::EnclaveError::Store(
-                            "selected screenshot upload requires an installed media DEK".into(),
-                        )
-                    })?;
-                Ok(WalScreenshotPreflight::Ready {
-                    target,
-                    media_dek_receipt,
-                    wrapped_dek_b64,
-                })
-            })
-            .await
-    };
-    let (target, media_dek_receipt, wrapped_dek_b64) = match preflight {
-        Ok(WalScreenshotPreflight::Existing(existing)) => {
-            return (StatusCode::OK, Json(existing.response_json())).into_response()
-        }
-        Ok(WalScreenshotPreflight::Ready {
-            target,
-            media_dek_receipt,
-            wrapped_dek_b64,
-        }) => (target, media_dek_receipt, wrapped_dek_b64),
-        Err(
-            e @ (crate::error::EnclaveError::InvalidRequest(_)
-            | crate::error::EnclaveError::Conflict(_)),
-        ) => return e.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "selected media upload preflight failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-
-    // 2. KMS-load the installed DEK and bind it to the sealed receipt before
-    // reserving any budget; a mismatch is corrupt state, never a new install.
-    let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_dek_b64).await {
-        Ok(dek) => dek,
-        Err(e) => {
-            tracing::error!(error = %e, "selected media upload DEK load failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-    // Absent-receipt is unreachable-by-construction under genesis-first:
-    // every WAL-authoritative user is genesis-born, and the only DEK lane
-    // that can run for them is the sealed MediaDekInstallPlan, which records
-    // the receipt this route reauthenticates. A legacy-installed DEK without
-    // a receipt would mean a legacy-era user was selected — a state the
-    // no-data-retention replan deleted. Fail closed regardless.
-    if media_dek_receipt
-        .validate_plaintext_dek(user_id, &media_dek)
-        .is_err()
-    {
-        tracing::error!("selected media upload DEK does not match the sealed install receipt");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-    }
-
-    // 3. Caller-fixed opaque attempt identity, derived deterministically
-    // from the upload's stable coordinates so a client retry re-enters the
-    // SAME sealed chain: the attempt replays from its ledger and the
-    // candidate/send links resume. A per-invocation random id here converts
-    // any mid-chain fault into a permanent wedge — the one-attempt fence
-    // refuses every fresh id for the source_key while the episode budget
-    // stays reserved, and no release lane exists before the provider slice.
-    let image_id: String = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        for part in [
-            b"selected-screenshot-attempt-id-v1".as_slice(),
-            user_id.as_bytes(),
-            source_key.as_bytes(),
-            captured_at.as_bytes(),
-            &episode_id.to_be_bytes(),
-        ] {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part);
-        }
-        hasher.finalize()[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    };
-
-    // 4. Durable eligibility+budget attempt BEFORE any encryption or upload.
-    // The plan is constructed exactly once, from the routed facts above.
-    let attempt_prepared = wal::SelectedScreenshotAttemptPlan::new(
-        user_id.to_owned(),
-        image_id.clone(),
-        episode_id,
-        source_key.to_owned(),
-        captured_at.to_owned(),
-        jpeg.clone(),
-        target,
-    )
-    .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
-    let attempt_prepared = match attempt_prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "selected screenshot attempt plan construction failed"
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-    let attempt_receipt = match s
-        .store
-        .wal_authoritative_submit(user_id, attempt_prepared)
-        .await
-    {
-        Ok(receipt) => receipt,
-        Err(e @ crate::error::EnclaveError::Conflict(_)) => return e.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "selected screenshot attempt submit failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-
-    // 5a. Resume probe: with the deterministic attempt identity, a retry
-    // whose earlier invocation already settled the ciphertext candidate must
-    // NOT re-encrypt (a fresh nonce would make a conflicting candidate
-    // fingerprint) — the send-start factory returns Some exactly when the
-    // candidate is durably settled, so the chain resumes at the marker.
-    let resume_send = {
-        let account = user_id.to_owned();
-        let image = image_id.clone();
-        let probe_dek = crate::crypto::Dek(media_dek.0);
-        s.store
-            .wal_authoritative_read(user_id, move |conn| {
-                wal::prepare_selected_screenshot_send_started(conn, &account, &image, &probe_dek)
-                    .map_err(wal_selected_screenshot_error)
-            })
-            .await
-    };
-    match resume_send {
-        Ok(Some(plan)) => {
-            let prepared =
-                match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        tracing::warn!(?error, "selected screenshot resume preparation failed");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
-                            .into_response();
-                    }
-                };
-            if let Err(e) = s.store.wal_authoritative_submit(user_id, prepared).await {
-                return match e {
-                    e @ crate::error::EnclaveError::Conflict(_) => e.into_response(),
-                    e => {
-                        tracing::error!(error = %e, "selected screenshot resume submit failed");
-                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response()
-                    }
-                };
-            }
-            tracing::warn!(
-                "selected screenshot upload resumed durably through send-start; provider send is not wired"
-            );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "selected_screenshot_provider_unavailable"})),
-            )
-                .into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "selected screenshot resume probe failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    }
-
-    // 5. Encrypt in memory, bound to the attempt's exact account-derived
-    // object identity.
-    let object_key = attempt_receipt.object_key().to_owned();
-    let media_context = crate::store::media_blob_context(user_id, &object_key);
-    let encrypted_data =
-        match crate::crypto::encrypt_bound_blob(&media_dek, image_bytes, &media_context) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "selected media upload encryption failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-            }
-        };
-
-    // 6. Durable exact ciphertext candidate. The WAL-owned factory loads and
-    // reauthenticates the media-DEK receipt from the settled snapshot; the
-    // parent receives only the opaque plan.
-    let candidate_prepared = {
-        let account = user_id.to_owned();
-        let attempt_receipt = attempt_receipt.clone();
-        let source_key = source_key.to_owned();
-        let captured_at = captured_at.to_owned();
-        let jpeg = jpeg.clone();
-        let factory_dek = crate::crypto::Dek(media_dek.0);
-        let plaintext = image_bytes.to_vec();
-        s.store
-            .wal_authoritative_read(user_id, move |conn| {
-                wal::prepare_selected_screenshot_upload_candidate(
-                    conn,
-                    &account,
-                    &attempt_receipt,
-                    episode_id,
-                    &source_key,
-                    &captured_at,
-                    &jpeg,
-                    &factory_dek,
-                    &plaintext,
-                    encrypted_data,
-                )
-                .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
-                .map_err(wal_selected_screenshot_error)
-            })
-            .await
-    };
-    let candidate_prepared = match candidate_prepared {
-        Ok(prepared) => prepared,
-        Err(
-            e @ (crate::error::EnclaveError::InvalidRequest(_)
-            | crate::error::EnclaveError::Conflict(_)),
-        ) => return e.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "selected screenshot candidate preparation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-    if let Err(e) = s
-        .store
-        .wal_authoritative_submit(user_id, candidate_prepared)
-        .await
-    {
-        return match e {
-            e @ crate::error::EnclaveError::Conflict(_) => e.into_response(),
-            e => {
-                tracing::error!(error = %e, "selected screenshot candidate submit failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response()
-            }
-        };
-    }
-
-    // 7. Durable `SendStarted` marker from the WAL-owned factory. Only a
-    // future provider slice may consume the marker's send authority.
-    let send_prepared = {
-        let account = user_id.to_owned();
-        let image = image_id.clone();
-        let send_dek = crate::crypto::Dek(media_dek.0);
-        s.store
-            .wal_authoritative_read(user_id, move |conn| {
-                wal::prepare_selected_screenshot_send_started(conn, &account, &image, &send_dek)
-                    .map_err(wal_selected_screenshot_error)?
-                    .ok_or_else(|| {
-                        crate::error::EnclaveError::Store(
-                            "selected screenshot candidate is missing for send start".into(),
-                        )
-                    })
-                    .and_then(|plan| {
-                        crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-                            .map_err(wal_selected_screenshot_error)
-                    })
-            })
-            .await
-    };
-    let send_prepared = match send_prepared {
-        Ok(prepared) => prepared,
-        Err(e @ crate::error::EnclaveError::Conflict(_)) => return e.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "selected screenshot send-start preparation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-    if let Err(e) = s
-        .store
-        .wal_authoritative_submit(user_id, send_prepared)
-        .await
-    {
-        return match e {
-            e @ crate::error::EnclaveError::Conflict(_) => e.into_response(),
-            e => {
-                tracing::error!(error = %e, "selected screenshot send-start submit failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response()
-            }
-        };
-    }
-
-    // 8. STOP fail-closed BEFORE any provider side effect. The provider
-    // boundary requires its durable execution claim to be admitted first,
-    // and no routed lane can admit that claim for a selected user today, so
-    // performing the object PUT here would bypass the sealed single-execution
-    // guarantee. Nothing was sent and nothing needs cleanup; the durable
-    // chain is exact restartable state.
-    tracing::warn!(
-        "selected screenshot upload staged durably through send-start; provider send is not wired"
-    );
+fn selected_screenshot_upload_retired() -> Response {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "selected_screenshot_provider_unavailable"})),
+        StatusCode::GONE,
+        Json(serde_json::json!({"error": "screenshot_upload_retired"})),
     )
         .into_response()
 }
@@ -2938,7 +2562,7 @@ async fn wal_selected_screenshot_image_upload(
 async fn rest_screenshot_image_upload(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let user_id = user.0;
     if let Err(e) = crate::store::validate_user_id(&user_id) {
@@ -2948,6 +2572,18 @@ async fn rest_screenshot_image_upload(
         )
             .into_response();
     }
+
+    // Canonical Cloud Capture v2 already owns the selected archive's image
+    // bytes. The historical multipart endpoint is device-sync compatibility,
+    // not a second upload path: retire it before reading the multipart body,
+    // taking a content-write lease, touching KMS, or calling a provider.
+    if s.store.is_wal_authoritative(&user_id) {
+        return selected_screenshot_upload_retired();
+    }
+    let mut multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(error) => return error.into_response(),
+    };
 
     let mut image_bytes = Vec::new();
     let mut image_content_type = None;
@@ -3083,23 +2719,6 @@ async fn rest_screenshot_image_upload(
         Ok(lease) => lease,
         Err(error) => return error.into_response(),
     };
-
-    // ADR-0022 slice 10g: a WAL-authoritative user's upload routes through
-    // the sealed selected-screenshot chain (attempt -> ciphertext candidate
-    // -> send-start marker) and stops fail-closed before any provider I/O.
-    // The legacy path below stays byte-identical for everyone else.
-    if s.store.is_wal_authoritative(&user_id) {
-        return wal_selected_screenshot_image_upload(
-            &s,
-            &user_id,
-            episode_id,
-            &source_key,
-            &captured_at,
-            &jpeg,
-            &image_bytes,
-        )
-        .await;
-    }
 
     // Reject ineligible bytes before KMS, encryption, or object storage. The
     // same predicate runs again under BEGIN IMMEDIATE when recording the row.
@@ -5630,6 +5249,8 @@ mod tests {
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (5, '2026-01-01T10:04:00Z', 'dev1:5', 0)", [])?;
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (6, '2026-01-01T10:05:00Z', 'dev1:6', 0)", [])?;
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (7, '2026-01-01T10:06:00Z', 'dev1:7', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (8, '2026-01-01T10:07:00Z', 'dev_1:8', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (9, '2026-01-01T10:08:00Z', 'devA1:9', 0)", [])?;
 
             conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T10:05:00Z', 'normal', 'useful')", [])?;
             conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (11, '2026-01-01T10:05:00Z', '2026-01-01T10:10:00Z', 'low', 'useful')", [])?;
@@ -5646,6 +5267,8 @@ mod tests {
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 5)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 6)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 7)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 8)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 9)", [])?;
 
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (11, 'screenshot', 2)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (12, 'screenshot', 2)", [])?;
@@ -5689,6 +5312,23 @@ mod tests {
             json!(["dev1:1", "dev1:2", "dev1:5", "dev1:6", "dev1:7"]),
             "the Mac receives all candidates plus a separate remaining budget"
         );
+
+        let underscore = store
+            .with_user(user_id, |conn| {
+                query_screenshot_upload_plan(
+                    conn,
+                    &PlanParams {
+                        device_id: "dev_1".into(),
+                        after: None,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(underscore["episodes"][0]["source_keys"], json!(["dev_1:8"]));
+        assert!(legacy_screenshot_source_pattern("dev%").is_err());
+        assert!(legacy_screenshot_source_pattern("").is_err());
+        assert!(legacy_screenshot_source_pattern(&"d".repeat(129)).is_err());
 
         let capped = store
             .with_user(user_id, |conn| {
@@ -6219,114 +5859,99 @@ mod tests {
     }
 
     #[test]
-    fn selected_screenshot_upload_route_is_dual_path_and_stops_before_provider_io() {
-        // ADR-0022 slice 10g: the WAL branch runs the sealed pre-provider
-        // chain in order (attempt before encryption, candidate, send-start),
-        // owns no legacy write and no provider I/O, and the legacy branch is
-        // byte-intact behind exactly one routing check.
+    fn selected_screenshot_upload_retirement_precedes_every_work_boundary() {
         let source = include_str!("query.rs");
-        let wal_start = source
-            .find(concat!("async fn wal_selected_screenshot_", "image_upload"))
+
+        let plan_start = source
+            .find(concat!("async fn rest_screenshot_upload_", "plan"))
             .unwrap();
-        let wal_end = source
+        let plan_end = source
+            .find(concat!("fn selected_screenshot_upload_", "retired"))
+            .unwrap();
+        let plan = &source[plan_start..plan_end];
+        let plan_selection = plan.find(concat!("is_wal_", "authoritative(")).unwrap();
+        let legacy_read = plan.find(concat!(".with_", "user(")).unwrap();
+        assert!(plan_selection < legacy_read);
+        assert!(
+            plan.contains("StatusCode::GONE")
+                || source[plan_end..].starts_with("fn selected_screenshot_upload_retired")
+        );
+
+        let upload_start = source
             .find(concat!("async fn rest_screenshot_", "image_upload"))
             .unwrap();
-        let wal_route = &source[wal_start..wal_end];
-        assert_eq!(
-            wal_route
-                .matches(concat!("SelectedScreenshotAttemptPlan::", "new("))
-                .count(),
-            1
-        );
-        assert_eq!(
-            wal_route
-                .matches(concat!("prepare_selected_screenshot_upload_", "candidate("))
-                .count(),
-            1
-        );
-        // Two send-start factory sites: the resume probe (before encryption)
-        // and the fresh-chain marker step.
-        assert_eq!(
-            wal_route
-                .matches(concat!("prepare_selected_screenshot_send_", "started("))
-                .count(),
-            2
-        );
-        assert_eq!(
-            wal_route
-                .matches(concat!("wal_authoritative_", "read("))
-                .count(),
-            4
-        );
-        assert_eq!(
-            wal_route
-                .matches(concat!("wal_authoritative_", "submit("))
-                .count(),
-            4
-        );
-        // The durable attempt precedes encryption; encryption precedes the
-        // candidate; the candidate precedes the send-start marker.
-        let attempt_at = wal_route
-            .find(concat!("SelectedScreenshotAttemptPlan::", "new("))
-            .unwrap();
-        let encrypt_at = wal_route.find(concat!("encrypt_bound_", "blob(")).unwrap();
-        let candidate_at = wal_route
-            .find(concat!("prepare_selected_screenshot_upload_", "candidate("))
-            .unwrap();
-        let probe_at = wal_route
-            .find(concat!("prepare_selected_screenshot_send_", "started("))
-            .unwrap();
-        let send_at = wal_route
-            .rfind(concat!("prepare_selected_screenshot_send_", "started("))
-            .unwrap();
-        assert!(
-            attempt_at < probe_at,
-            "the attempt precedes the resume probe"
-        );
-        assert!(
-            probe_at < encrypt_at,
-            "a settled candidate must resume WITHOUT re-encrypting: a fresh
-             nonce would make a conflicting candidate fingerprint"
-        );
-        assert!(attempt_at < encrypt_at, "attempt must be durable first");
-        assert!(
-            encrypt_at < candidate_at,
-            "candidate consumes the ciphertext"
-        );
-        assert!(candidate_at < send_at, "send-start consumes the candidate");
-        // Fail-closed before any paid/irreversible provider side effect: the
-        // WAL branch owns no legacy write, no object PUT, and no cleanup
-        // delete.
-        assert_eq!(wal_route.matches(concat!(".with_", "user(")).count(), 0);
-        assert_eq!(wal_route.matches(concat!(".save_", "user(")).count(), 0);
-        assert_eq!(wal_route.matches(concat!("put_user_", "media(")).count(), 0);
-        assert_eq!(wal_route.matches(concat!("delete_", "media(")).count(), 0);
-        assert_eq!(wal_route.matches("SERVICE_UNAVAILABLE").count(), 2);
-
-        // The legacy route keeps its exact shape behind one routing check.
-        let legacy_end = source
+        let upload_end = source
             .find(concat!("async fn rest_screenshot_", "image_content"))
             .unwrap();
-        let legacy_route = &source[wal_end..legacy_end];
+        let upload = &source[upload_start..upload_end];
+        let upload_selection = upload.find(concat!("is_wal_", "authoritative(")).unwrap();
+        let multipart_read = upload.find("multipart.next_field()").unwrap();
+        let content_lease = upload.find(concat!("acquire_content_", "write(")).unwrap();
+        let provider_put = upload.find(concat!("put_user_", "media(")).unwrap();
+        assert!(upload_selection < multipart_read);
+        assert!(upload_selection < content_lease);
+        assert!(upload_selection < provider_put);
+        assert!(!upload.contains(concat!("wal_selected_screenshot_", "image_upload")));
+        assert!(!upload.contains(concat!("wal_authoritative_", "read(")));
+        assert!(!upload.contains(concat!("wal_authoritative_", "submit(")));
+
+        // The unselected compatibility arm retains its exact legacy mutation
+        // shape after the early Genesis tombstone.
+        assert_eq!(upload.matches(concat!(".with_", "user(")).count(), 5);
+        assert_eq!(upload.matches(concat!(".save_", "user(")).count(), 2);
+        assert_eq!(upload.matches(concat!("put_user_", "media(")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_screenshot_plan_and_upload_are_explicit_gone_tombstones() {
+        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+        use axum::body::Body;
+        use axum::extract::{FromRequest, FromRequestParts};
+        use axum::http::Request;
+
+        let state = query_test_state();
+        let user_id = "selected-retired-screenshot-upload";
+        select_wal_authoritative(&state.store, user_id);
+
+        let request = Request::builder()
+            .uri("/api/screenshot-images/plan")
+            .body(Body::empty())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+        let query = Query::<PlanParams>::from_request_parts(&mut parts, &()).await;
+        assert!(query.is_err());
+        let plan = rest_screenshot_upload_plan(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            query,
+        )
+        .await;
+        assert_eq!(plan.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(plan.into_body(), 4096).await.unwrap();
         assert_eq!(
-            legacy_route
-                .matches(concat!("is_wal_", "authoritative("))
-                .count(),
-            1
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "screenshot_upload_retired"})
         );
+
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let multipart = Multipart::from_request(request, &()).await;
+        assert!(multipart.is_err());
+        let upload = rest_screenshot_image_upload(
+            State(state),
+            Extension(AuthUser(user_id.into())),
+            multipart,
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(upload.into_body(), 4096)
+            .await
+            .unwrap();
         assert_eq!(
-            legacy_route
-                .matches(concat!("wal_selected_screenshot_", "image_upload("))
-                .count(),
-            1
-        );
-        assert_eq!(legacy_route.matches(concat!(".with_", "user(")).count(), 5);
-        assert_eq!(legacy_route.matches(concat!(".save_", "user(")).count(), 2);
-        assert_eq!(
-            legacy_route.matches(concat!("put_user_", "media(")).count(),
-            1
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "screenshot_upload_retired"})
         );
     }
+
     /// **Every routed REST read in this module, as one table.**
     ///
     /// The property: when the archive behind a read cannot be read, the route
@@ -6441,18 +6066,6 @@ mod tests {
                     .await,
                 ),
                 (
-                    "GET /api/screenshot-images/plan",
-                    rest_screenshot_upload_plan(
-                        State(Arc::clone(state)),
-                        Extension(user()),
-                        Query(PlanParams {
-                            device_id: "device".into(),
-                            after: None,
-                        }),
-                    )
-                    .await,
-                ),
-                (
                     "GET /api/screenshot-images/{id}/content",
                     rest_screenshot_image_content(
                         State(Arc::clone(state)),
@@ -6485,7 +6098,6 @@ mod tests {
             "rest_browser_snapshot",
             "rest_episode_finalize",
             "rest_feed",
-            "rest_screenshot_upload_plan",
             "rest_screenshot_image_content",
         ];
         for handler in routed_read_handlers {

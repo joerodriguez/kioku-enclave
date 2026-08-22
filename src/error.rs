@@ -216,32 +216,6 @@ pub mod wal_domain {
     /// this one and no amount of further evidence will: the gap is a schema
     /// rename nobody finished, not a missing upstream domain.
     pub const QUERY_BROWSER_SNAPSHOT: &str = "query.browser_snapshot";
-    /// `GET /api/screenshot-images/plan`. Its tables fill now — `episodes`,
-    /// `episode_members` and `screenshots` all have live migrated writers —
-    /// and the route still cannot answer, because its own PREDICATE excludes
-    /// every row the WAL lane can produce.
-    ///
-    /// `query_screenshot_upload_plan` selects candidates with
-    /// `c.source_key LIKE '<device_id>:%'`, the shape the retired device-sync
-    /// path minted (`dev1:7`). The only WAL-lane writer of `screenshots`,
-    /// `media_worker/wal/result.rs::write_frame`, mints
-    /// `format!("cloud-v2:{event_id}")` unconditionally, and
-    /// `POST /api/sync/batch` — the source of every device-prefixed key — is a
-    /// 410 tombstone. So the candidate set is structurally empty and the
-    /// answer is always `200 {"episodes": []}`: the exact refusal-wearing-a-
-    /// truthful-empty-face shape the rule forbids. Its budget half is starved
-    /// independently: `screenshot_images` has no WAL-lane writer either,
-    /// because `wal_selected_screenshot_image_upload` stops fail-closed at the
-    /// durable `SendStarted` marker, before any row is recorded.
-    ///
-    /// **Lift condition.** A live writer that produces `screenshots` rows
-    /// whose `source_key` a real caller's `device_id` prefix matches — or the
-    /// predicate re-derived so `cloud-v2:` candidates are eligible, which is a
-    /// product decision (those images are already in GCS as `media_objects`
-    /// and the Mac has nothing to upload for them), not a mechanical one.
-    /// Checkable either way: seed through the WAL lane and assert the route
-    /// returns a non-empty `episodes` array.
-    pub const QUERY_SCREENSHOT_UPLOAD_PLAN: &str = "query.screenshot_upload_plan";
     // ── The media read domains ──────────────────────────────────────────────
     //
     // THE ANSWERABILITY RULE (ADR-0022 D4). It is the criterion every gate in
@@ -569,7 +543,6 @@ mod tests {
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
             wal_domain::QUERY_EPISODE_DELETE,
             wal_domain::QUERY_BROWSER_SNAPSHOT,
-            wal_domain::QUERY_SCREENSHOT_UPLOAD_PLAN,
             wal_domain::MEDIA_PEOPLE,
         ];
         let unique = domains.iter().collect::<std::collections::BTreeSet<_>>();
