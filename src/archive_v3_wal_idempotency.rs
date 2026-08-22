@@ -141,6 +141,7 @@ impl WalOperationKind {
                 // The retained result is what prevents a competing/random
                 // claim from treating an already-started provider attempt as
                 // fresh authority to send.
+                | Self::WebhookDelivery
                 | Self::EmailDelivery
                 | Self::PushDelivery
         )
@@ -562,12 +563,12 @@ impl sealed::DomainPlan for crate::cp::push::wal::PushSendClaimPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushSendClaimLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushAcceptedPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushAcceptedLedger {}
-impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookDeliverySettlementPlan {}
-impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookDeliverySettlementLedger {}
-impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSubscriptionCascadePlan {}
-impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSubscriptionCascadeLedger {}
-impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSentPlan {}
-impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSentLedger {}
+impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSendClaimPlan {}
+impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSendClaimLedger {}
+impl sealed::DomainPlan for crate::cp::webhook_worker::wal::ExactWebhookDeliverySettlementPlan {}
+impl sealed::DomainLedger for crate::cp::webhook_worker::wal::ExactWebhookDeliverySettlementLedger {}
+impl sealed::DomainPlan for crate::cp::webhook_worker::wal::ExactWebhookDeliveryPurgePlan {}
+impl sealed::DomainLedger for crate::cp::webhook_worker::wal::ExactWebhookDeliveryPurgeLedger {}
 impl sealed::DomainPlan for crate::cp::reviewer::wal::ReviewerFixturePlan {}
 impl sealed::DomainLedger for crate::cp::reviewer::wal::ReviewerFixtureLedger {}
 impl sealed::DomainPlan for crate::cp::summarizer::wal::SubstanceBackfillBatchPlan {}

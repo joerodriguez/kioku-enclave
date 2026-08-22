@@ -1269,15 +1269,34 @@ backlog is replayed. Provider calls are FIFO process-wide paced (and therefore p
 only under that enforced singleton), capped per account sweep, bounded by Retry-After/backoff, with
 device-token 429s local and only provider-wide failures opening the process-local circuit,
 and emit only content-free depth, age,
-outcome, cancellation, ambiguity, circuit, and settlement telemetry. The
-webhook child accepts
-only the local settlement half of a
-definitive HTTP 2xx for an already durable outbox event. The exact `evt_` identity is fixed before
-I/O, sent as `webhook-id`, and derives the operation identity; the exact episode/subscription/version
-binding, pending/retry attempt, nullable due time, prior response/error, timestamps, accepted status,
-and fixed sent time form the fingerprint. It full-row-CASes only that predecessor to `sent` or adopts
-only the identical terminal row, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot
-sign or send, load or disable a subscription, retry, call Store, launch work, or acknowledge delivery.
+outcome, cancellation, ambiguity, circuit, and settlement telemetry. The active selected webhook
+owner accepts only new `w1_` identities; historical bare `evt_` rows and rows older than 24 hours are
+cancellation-only. Before any provider call, its sealed claim child freezes the complete delivery
+predecessor plus one bounded endpoint, signing secret, content-scope decision, and canonical
+CloudEvent body under a random 90-second owner lease. A short Control fence binds that exact claim
+and disclosure authority without holding a database lock across HTTP. The exact settlement child
+admits only typed cancel/defer/retry/sent/failed/ambiguous transitions, full-row-CASes or adopts every
+immutable and nullable predecessor field, and reconciles typed Control receipts after asymmetric
+persistence. A live claim blocks claimless cancellation and episode-row cascade; an expired claim
+settles ambiguous with zero resend. Definitive transient rejection alone may retry the identical
+`webhook-id` and bytes through bounded Retry-After/backoff and ten attempts. The sealed children
+cannot sign or send, access Control or Store, resolve DNS, launch work, or acknowledge delivery. The
+production owner bounds DNS to five seconds and 64 all-public answers, pins the selected address,
+disables environment proxies, refuses redirects, strictly orders each subscription while allowing
+another to progress, caps each account sweep at two calls before creating a send claim, and paces at
+250 ms process-locally. Recovery shares that same singleton critical section, and provider admission
+requires at least 30 seconds of lease authority before a bounded five-second DNS plus 15-second HTTP
+attempt. The release-sealed singleton runtime is what makes that serialization service-wide;
+overlapping runtimes remain forbidden. Selected destination deletion soft-disables Control,
+exact-cancels an arbitrarily large active backlog one row at a time, exact-purges each terminal row
+and its frozen endpoint, secret, body, and claim subtree, and physically removes the subscription
+only after the disclosure fence and archive rows are gone. The permanent purge ledger keeps only
+fixed-size commitments and a unit result. Content-free metrics and authenticated list responses
+distinguish sent, retry, failed, ambiguous, and cancelled outcomes without exposing provider bodies
+or error strings; an unavailable selected status read is a machine-readable 503, never a zeroed
+status. Finalization serializes its enabled-destination snapshot and archive commit with deletion's
+disable, complete archive drain, and Control removal under the same per-account lifecycle gate, so
+DELETE cannot return success before a previously snapshotted commit has been purged.
 The reviewer-fixture child accepts only the complete fixed synthetic archive for an already
 authenticated stable reviewer account. Its fixture-version/account pair derives the operation
 identity. It inserts or exactly adopts every fixed audio, utterance, screenshot, episode,
@@ -1322,13 +1341,13 @@ media-work results, Vertex usage outcomes, existing-key webhook/email/push trans
 and reviewer/backfill writes. Only capture-session finish, local canonical-capture receipt,
 metadata-only screen-reference batch,
 selected-screenshot receipt, screen-storyboard result without person evidence,
-raw-media retention settlement, active email claim/exact settlement,
-provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
+raw-media retention settlement, active email/webhook claim and exact settlement,
+provider-accepted APNs, caller-stable finalization queue,
 exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
 substance and visual-evidence backfills; these are the complete reviewed A set for this gate.
-Activation is still per-domain; the live email and push owners use the sealed claim and general
-settlement families described above. Every other semantic A operation remains disabled pending its own separately reviewed codec
+Activation is still per-domain; the live email, push, and webhook owners use the sealed claim and
+general settlement families described above. Every other semantic A operation remains disabled pending its own separately reviewed codec
 and activation adapter. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
@@ -1969,7 +1988,7 @@ the Confidential Space boundary while Vertex processes it. Webhook events simila
 leave Confidential Space for the user-selected destination. They are content-free by
 default and carry final-brief content only when that destination's explicit option is
 enabled. The sender revalidates public DNS addresses on every attempt, pins the validated
-address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
+address, disables environment proxies, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
 
 APNs ready alerts are a separate, explicitly enabled metadata-only boundary. Environment-
