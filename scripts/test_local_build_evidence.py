@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from test_select_build_configuration import environment  # noqa: E402
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
+TAG = "v1.2.3-archive-v3-wal.1"
 
 
 class LocalEvidenceTests(unittest.TestCase):
@@ -48,6 +49,7 @@ class LocalEvidenceTests(unittest.TestCase):
         config_values.pop("PATH", None)
         config_values.pop("GCP_WIF_PROVIDER", None)
         config_values.pop("GCP_SERVICE_ACCOUNT", None)
+        config_values["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
         config_values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
         config.write_text("\n".join(f"{key}={value}" for key, value in sorted(config_values.items())) + "\n", encoding="utf-8")
         config.chmod(0o600)
@@ -60,25 +62,32 @@ class LocalEvidenceTests(unittest.TestCase):
         metadata.write_text(json.dumps({
             "schema_version": 9,
             "source_repository": "https://github.com/owner/repository",
-            "source_ref": "v1.2.3", "source_commit": COMMIT,
+            "source_ref": TAG, "source_commit": COMMIT,
             "image_uri": image_repository + ":release",
             "image_digest_uri": image_repository + "@" + DIGEST,
             "image_digest": DIGEST,
-            "release_url": "https://github.com/owner/repository/releases/tag/v1.2.3",
+            "release_url": "https://github.com/owner/repository/releases/tag/" + TAG,
             "build_profile": "production", "voice_quality_gate": "owner_only_unvalidated",
             "billing_enforcement_mode": "shadow", "gcs_bucket": buckets[0],
             "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
             "archive_witness_shadow_mode": "off", "archive_witness_project_id": "",
             "archive_witness_project_number": "", "archive_witness_database_id": "",
-            "archive_v3_shadow_runtime_mode": "off", "archive_v3_archive_bucket": "",
-            "archive_v3_archive_gcs_project_number": "", "archive_v3_registry_kms_version": "",
-            "archive_v3_witness_project_id": "", "archive_v3_witness_project_number": "",
-            "archive_v3_witness_database_id": "", "archive_v3_archive_binding_commitment": "",
+            "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+            "archive_v3_archive_bucket": "kioku-joerodriguez-archive-v3",
+            "archive_v3_archive_gcs_project_number": "640329636251",
+            "archive_v3_registry_kms_version": "1",
+            "archive_v3_witness_project_id": "kioku-joerodriguez",
+            "archive_v3_witness_project_number": "640329636251",
+            "archive_v3_witness_database_id": "archive-v3-witness",
+            "archive_v3_archive_binding_commitment": (
+                "b541d598e3442fdcf516c0af34a69907"
+                "b44c9767d86b8277cb08d12eb0f1fe48"
+            ),
         }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         evidence = directory / "enclave-local-build-evidence.json"
         create_command = [
             "python3", str(EVIDENCE), "create", "--output", str(evidence),
-            "--repository", "https://github.com/owner/repository", "--tag", "v1.2.3",
+            "--repository", "https://github.com/owner/repository", "--tag", TAG,
             "--commit", COMMIT, "--image-uri", image_repository + ":release",
             "--image-digest-uri", image_repository + "@" + DIGEST, "--image-digest", DIGEST,
             "--config", str(config), "--dockerfile", str(ROOT / "Dockerfile"),
@@ -155,7 +164,7 @@ class LocalEvidenceTests(unittest.TestCase):
             command = [
                 "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(directory),
                 "--public-key", str(public), "--expected-public-key-sha256", fingerprint,
-                "--repository", "owner/repository", "--tag", "v1.2.3", "--commit", COMMIT,
+                "--repository", "owner/repository", "--tag", TAG, "--commit", COMMIT,
                 "--image-repository", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
                 "--expected-gcs-bucket", "kioku-production-indexes",
                 "--expected-gcs-media-bucket", "kioku-production-media",
@@ -187,7 +196,7 @@ class LocalEvidenceTests(unittest.TestCase):
             deployment_contract = [
                 "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(deployment_directory),
                 "--repository", "https://github.com/owner/repository",
-                "--release-tag", "v1.2.3", "--source-commit", COMMIT,
+                "--release-tag", TAG, "--source-commit", COMMIT,
                 "--image-digest-uri", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave@" + DIGEST,
                 "--image-digest", DIGEST,
             ]
@@ -213,7 +222,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(directory),
                 "--public-key", str(directory / "public.pem"),
                 "--expected-public-key-sha256", "",
-                "--repository", "owner/repository", "--tag", "v1.2.3", "--commit", COMMIT,
+                "--repository", "owner/repository", "--tag", TAG, "--commit", COMMIT,
                 "--image-repository", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
                 "--expected-gcs-bucket", "kioku-production-indexes",
                 "--expected-gcs-media-bucket", "kioku-production-media",
@@ -258,8 +267,8 @@ class LocalEvidenceTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_GH_LOG\"\n"
                 "if [[ \"$1\" == api ]]; then echo true; exit 0; fi\n"
-                "if [[ \"$1 $2 $3\" == 'release view v1.2.3' ]]; then\n"
-                "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":false,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
+                f"if [[ \"$1 $2 $3\" == 'release view {TAG}' ]]; then\n"
+                "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":true,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
                 "  echo 'release not found' >&2; exit 1\nfi\n"
                 "if [[ \"$1 $2\" == 'release create' ]]; then touch \"$FAKE_GH_STATE\"; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'release download' ]]; then\n"
@@ -290,19 +299,19 @@ class LocalEvidenceTests(unittest.TestCase):
                 "FAKE_GCLOUD_LOG": str(directory / "gcloud.log"),
             }
             completed = subprocess.run(
-                ["bash", str(RELEASE), "v1.2.3", "--evidence-dir", str(directory), "--config", str(directory / "local.env"), "--repository", "owner/repository", "--apply"],
+                ["bash", str(RELEASE), TAG, "--evidence-dir", str(directory), "--config", str(directory / "local.env"), "--repository", "owner/repository", "--apply"],
                 cwd=ROOT, text=True, capture_output=True, env=environment,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             gh_log = (directory / "gh.log").read_text(encoding="utf-8")
             self.assertIn(
-                "release create v1.2.3",
+                "release create " + TAG,
                 gh_log,
                 f"stdout={completed.stdout!r} stderr={completed.stderr!r} files={sorted(path.name for path in directory.iterdir())}",
             )
             self.assertNotIn("workflow", gh_log)
             self.assertNotIn("dispatch", gh_log)
-            self.assertNotIn("--prerelease", gh_log)
+            self.assertIn("--prerelease", gh_log)
             gcloud_log = (directory / "gcloud.log").read_text(encoding="utf-8")
             self.assertIn("--impersonate-service-account=local-builder@", gcloud_log)
             self.assertEqual(evidence.name, "enclave-local-build-evidence.json")
