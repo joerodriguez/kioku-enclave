@@ -1,15 +1,15 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 Firestore composition is compiled and tested before runtime wiring"
+    reason = "the signed Genesis runtime uses the WAL-owner subset while reviewed maintenance and migration surfaces remain sealed"
 )]
 
-//! Inactive, no-I/O composition seam for the ADR-0022 Firestore witness.
+//! Fixed-origin composition seam for the ADR-0022 Firestore witness.
 //!
 //! One validated [`FirestoreWitnessConfig`] supplies both the exact named
 //! database namespace and its dedicated attestation audience.  Construction
-//! creates fixed-origin clients but performs no network request.  This module
-//! is not connected to Store, startup, routes, environment variables, archive
-//! bootstrap, or production authority.
+//! creates fixed-origin clients but performs no network request. The signed
+//! Genesis runtime constructs this bundle and releases only typed bootstrap,
+//! WAL-owner, and reviewed maintenance authority.
 
 use std::{fmt, sync::Arc};
 
@@ -63,9 +63,8 @@ impl FirestoreShadowWitness {
 
     /// Token-gated release of the underlying Firestore witness adapter for
     /// the reviewed genesis backend composition; the adapter carries the
-    /// sealed commit-start-aware initial-witness create protocol. The token
-    /// has no production minter today, so this stays unreachable until that
-    /// module's launcher slice mints one.
+    /// sealed commit-start-aware initial-witness create protocol. Only the
+    /// signed Genesis runtime can construct the required typed context.
     pub(crate) fn genesis_firestore_witness(
         &self,
         _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
@@ -159,7 +158,7 @@ impl FirestoreShadowWitness {
 
 impl fmt::Debug for FirestoreShadowWitness {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("FirestoreShadowWitness(<inactive>)")
+        formatter.write_str("FirestoreShadowWitness(<sealed>)")
     }
 }
 
@@ -325,10 +324,7 @@ mod tests {
     fn construction_is_fixed_typed_no_io_and_redacted() {
         let config = FirestoreWitnessConfig::new("project-1", "123456789", "witness-db").unwrap();
         let provider = FirestoreShadowWitness::new(config).unwrap();
-        assert_eq!(
-            format!("{provider:?}"),
-            "FirestoreShadowWitness(<inactive>)"
-        );
+        assert_eq!(format!("{provider:?}"), "FirestoreShadowWitness(<sealed>)");
     }
 
     #[test]

@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 256
+EXPECTED_STORE_CALL_COUNT = 258
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -702,7 +702,22 @@ EXPECTED_STORE_CALL_COUNT = 256
 # children and add no further Store surface. The scanner reads both children
 # directly and pins their registration, bounds, preconditions, and absence of
 # Store/provider/runtime escape. This is the independently derived third state:
-EXPECTED_STORE_CALL_SHA256 = "31eb36c9e077eb012ac80223427f4d381b172eab26496f0b220627f0a549c04f"
+#
+# Selected voice/profile completion was derived against a fresh pristine
+# `git archive` of exact 41abc0f7ab6a65ad3b5ded68fa014d5025e29d93. Its own
+# 14-test gate first reproduced 256/31eb36c9 byte-for-byte. The branch has 258
+# rows: exactly one B read and one B submit under the new provider-free
+# `process_user_voice_profiles` owner. There are zero removals,
+# reclassifications, or surviving call-expression moves, and surviving-key
+# order is unchanged. Exactly 17 surviving rows move owner-body only: nine
+# compatibility calls under `process_user`, four transcript settlement calls,
+# and the four lifted people reads. All operation internals remain inside the
+# sealed child modules inventoried below.
+# The final Clippy-only boxing of `VoiceProfileScan::Work` changes the body hash
+# of the new voice-profile owner, so its B read and B submit are two additional
+# owner-body-only moves. Their keys, classifications, and call-expression
+# hashes are byte-identical; the count and surviving-key order remain fixed.
+EXPECTED_STORE_CALL_SHA256 = "f2f02b476c8748846def0ca2901a8474be81ffde40ad244802a031beb171c2a1"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -983,7 +998,12 @@ EXPECTED_WORKER_SPAWN_COUNT = 27
 # survive unchanged; async_main's owner body moves with the startup call. A
 # fresh pristine 5959585 archive reproduced 26/5b946c3c before this 27-row
 # branch inventory was derived key by key.
-EXPECTED_WORKER_SPAWN_SHA256 = "a98e2c1248a28e96a0a4f0a2e4de79407b0d642ca2675cca8bf9c3b6d9d7b9d0"
+# Selected voice/profile completion adds no worker. The existing media sweep
+# spawn alone changes owner and call-expression hashes because its swept future
+# now includes the provider-free profile pass. A pristine 41abc0f archive
+# reproduced the prior 27/a98e2c12 pin; count, classification, and key order
+# are unchanged in this independently derived branch state.
+EXPECTED_WORKER_SPAWN_SHA256 = "fb45f5aafe15fb834a483cafb26845c699725764015b9dad1ecb6728dd12ae6a"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1605,6 +1625,7 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::quarantine_unplannable_jobs#0",
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::process_selected_voice_embedding_jobs#0",
+        "src/cp/media_worker.rs::process_user_voice_profiles#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::settle_media_work_failure#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
@@ -2197,6 +2218,10 @@ impl X {
             ROOT / "src/cp/media_worker/wal/voice_embedding.rs"
         ).read_text(encoding="utf-8")
         voice_embedding_production = without_cfg_test_items(voice_embedding_domain)
+        voice_profile_domain = (
+            ROOT / "src/cp/media_worker/wal/voice_profile.rs"
+        ).read_text(encoding="utf-8")
+        voice_profile_production = without_cfg_test_items(voice_profile_domain)
         email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -2895,7 +2920,7 @@ impl X {
         # a kind-7 attempt boundary and a kind-6 bound transcript, mirroring
         # the sealed screen chain, with the audio-specific facts the design
         # requires: the member bound is the lease LIMIT (128, never the
-        # screen family's 12-frame cap) and the five AUTOINCREMENT ids come
+        # screen family's 12-frame cap) and the six AUTOINCREMENT ids come
         # from fingerprinted sqlite_sequence pins, never MAX(id)+1.
         self.assertIn("pub(super) mod audio_attempt;", retention_domain)
         self.assertIn("pub(super) mod audio_result;", retention_domain)
@@ -2936,7 +2961,7 @@ impl X {
             "archive_v3_wal_audio_transcript_result_operations", audio_result_domain
         )
         self.assertIn(
-            "audio-window-transcript-v2-embedding-jobs-bound-attempt",
+            "audio-window-transcript-v3-literal-identity-evidence",
             audio_result_domain,
         )
         # The member bound is the audio lease LIMIT. MAX_SCREEN_FRAMES (12)
@@ -2950,24 +2975,31 @@ impl X {
         self.assertIn("read_audio_sequence_pins", audio_result_domain)
         # The selected transcript settlement is the only sanctioned F8
         # coupling: one fixed-id pending embedding job per observation in the
-        # same transaction. Profile/sample/person/identity mutation and
-        # MAX(id) allocation remain structurally absent.
+        # same transaction. Literal high-confidence self-identification may
+        # create only an unbound proposed identity-evidence row; profile,
+        # sample and person mutation plus MAX(id) allocation remain absent.
         audio_result_code = sanitize_rust(audio_result_production)
         for forbidden in (
             "voice_samples",
             "voice_profiles",
             "enqueue_embedding_job",
-            "identity_evidence",
             "person_name_claims",
             "resolve_speaker_attribution",
             "MAX(id)",
         ):
             self.assertNotIn(forbidden, audio_result_code)
         self.assertIn("voice_embedding_jobs: i64", audio_result_code)
+        self.assertIn("identity_evidence: i64", audio_result_code)
         self.assertIn(
             "INSERT INTO voice_embedding_jobs", audio_result_production
         )
         self.assertIn("'pending'", audio_result_production)
+        self.assertIn("INSERT INTO identity_evidence", audio_result_production)
+        self.assertIn("'proposed'", audio_result_production)
+        self.assertIn(
+            "value.text.contains(identity.literal_evidence.as_str())",
+            audio_result_production,
+        )
         self.assertNotIn("enqueue_embedding_job", audio_result_code)
         # The audio arm is wired end to end and the legacy tail survives for
         # unselected users.
@@ -3017,6 +3049,62 @@ impl X {
         self.assertIn("VoiceClaimDisposition::ClockDeferred", media_worker)
         self.assertIn("raw_source_count", voice_embedding_domain)
         self.assertIn("self.existing_samples.len() > 1", voice_embedding_domain)
+        # ADR-0022 selected voice-profile boundary: this provider-free child
+        # owns deterministic historical backfill, bounded sample assignment,
+        # representative repair/quarantine, imported-action refusal, episode
+        # speaker-status settlement, and provider-free literal identity
+        # binding. It commits every decision row and allocator pin but has no
+        # provider authority.
+        self.assertIn("pub(super) mod voice_profile;", retention_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::VoiceProfilePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::VoiceProfileLedger",
+            gate,
+        )
+        self.assertIn("struct VoiceProfilePlan", voice_profile_domain)
+        self.assertIn("struct VoiceProfileLedger", voice_profile_domain)
+        self.assertIn(
+            "archive_v3_wal_voice_profile_operations", voice_profile_domain
+        )
+        self.assertIn("adr-0022-voice-profile-backfill-v1", voice_profile_domain)
+        self.assertIn(
+            "adr-0022-voice-assignment-backfill-v1", voice_profile_domain
+        )
+        self.assertIn(
+            "adr-0022-voice-sample-assignment-v1", voice_profile_domain
+        )
+        self.assertIn(
+            "adr-0022-voice-profile-reconcile-v1", voice_profile_domain
+        )
+        self.assertIn(
+            "adr-0022-voice-lineage-action-refusal-v1", voice_profile_domain
+        )
+        self.assertIn("adr-0022-voice-episode-status-v1", voice_profile_domain)
+        self.assertIn("adr-0022-person-self-identification-v1", voice_profile_domain)
+        self.assertIn("const MAX_PROFILES: usize = 32;", voice_profile_domain)
+        self.assertIn(
+            "const MAX_PROFILE_SAMPLES: usize = 100;", voice_profile_domain
+        )
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", voice_profile_domain)
+        self.assertIn("DomainLedgerBounds::new", voice_profile_domain)
+        self.assertIn("WalIdempotencyError::Precondition", voice_profile_domain)
+        self.assertIn("process_user_voice_profiles", media_worker)
+        self.assertIn("wal::voice_profile::observe_next", media_worker)
+        self.assertIn("wal::VoiceProfilePlan::new", media_worker)
+        for required in (
+            "INSERT INTO people",
+            "INSERT INTO person_name_claims",
+            "INSERT INTO person_facts",
+            "UPDATE identity_evidence",
+            "profile_identity_bindings",
+            "transcript_text.contains(envelope.literal_evidence.as_str())",
+            "active,operation_id,conflicts_with_id",
+            "assert_person_identity_poststate",
+        ):
+            self.assertIn(required, voice_profile_production)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
             gate,
@@ -3295,6 +3383,7 @@ impl X {
             self.assertNotIn(forbidden, result_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, voice_embedding_production)
+            self.assertNotIn(forbidden, voice_profile_production)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
             self.assertNotIn(forbidden, push_claim_production)
@@ -3570,6 +3659,24 @@ impl X {
             "INSERT INTO person_facts",
         ):
             self.assertNotIn(forbidden, voice_embedding_production)
+        for forbidden in (
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "get_current_media_generation(",
+            "load_dek(",
+            "decrypt_bound_blob_v2(",
+            "VoiceEngine",
+            "embed_samples(",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "std::time::",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, voice_profile_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

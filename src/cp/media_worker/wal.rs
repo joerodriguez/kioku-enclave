@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 media-worker codecs are reviewed before their external boundaries, launcher, or worker ownership"
+    reason = "private ADR-0022 codecs retain test-only compatibility constructors and inactive sibling families beside the active media/voice owners"
 )]
 
 //! Private ADR-0022 media-worker WAL domains.
@@ -13,14 +13,22 @@
 //! stable screen and audio Vertex attempt identity and billing intent before
 //! provider I/O; the private production-facing result children cover only
 //! screen storyboards without person evidence and audio-window transcripts
-//! without identity rows, each reauthenticating its exact binding before its
-//! local mutation. The active audio transcript v2 subtype has no constructor
-//! slot for speaker names, person facts, or quality flags; its sole voice
-//! coupling is one fixed-id pending embedding job per projected observation.
+//! whose only identity input is literal high-confidence self-identification,
+//! each reauthenticating its exact binding before its local mutation. The
+//! active audio transcript v3 subtype can write only an unbound proposed
+//! identity-evidence row plus one fixed-id pending embedding job per projected
+//! observation; it cannot mutate people, profiles, or facts.
 //! The selected embedding child also has a provider-free exact backfill for
 //! eligible observations settled by the earlier v1 transcript contract before
-//! that coupling existed, and may write a pending sample. Profile, person, and
-//! identity mutation remains unsupported here.
+//! that coupling existed, and may write a pending sample. The active
+//! provider-free profile child then repairs historical revisions/assignments,
+//! makes bounded deterministic sample-to-profile decisions, reconciles
+//! representatives, refuses imported lineage actions, and settles episode
+//! speaker readiness from exact carried evidence. Once a sample has one exact
+//! active profile, it may provider-free bind a proposed literal identity by
+//! creating the person, accepted name claim, bounded facts and profile binding
+//! in the same sealed mutation. The routed people surfaces are therefore
+//! answerable and no production D4 domain remains gated.
 
 pub(super) mod attempt;
 pub(super) mod audio_attempt;
@@ -33,6 +41,7 @@ pub(super) mod result;
 pub(super) mod resurrection;
 pub(super) mod usage;
 pub(super) mod voice_embedding;
+pub(super) mod voice_profile;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
 pub(crate) use audio_attempt::{AudioWindowAttemptLedger, AudioWindowAttemptPlan};
 pub(crate) use audio_result::{AudioWindowTranscriptLedger, AudioWindowTranscriptPlan};
@@ -44,6 +53,7 @@ pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan
 pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};
 pub(crate) use usage::{MediaUsageSettlementLedger, MediaUsageSettlementPlan};
 pub(crate) use voice_embedding::{VoiceEmbeddingLedger, VoiceEmbeddingPlan};
+pub(crate) use voice_profile::{VoiceProfileLedger, VoiceProfilePlan};
 
 /// Test-only: the ingest -> claim regression tests live beside the ingest
 /// writer in `cp::media::wal::capture_event`, because that is the only module

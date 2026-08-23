@@ -1,23 +1,24 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 archive bootstrap seam is compiled and fake-tested before authority wiring"
+    reason = "the active Genesis protocol retains sealed recovery variants not needed by every production pass"
 )]
 
-//! Restart-safe, inactive archive-v3 genesis coordination.
+//! Restart-safe archive-v3 Genesis coordination.
 //!
 //! This module deliberately owns no provider construction. A control-plane
 //! lifecycle ledger supplies a durable reservation and the exact already-
 //! prepared immutable bytes. Construction is synchronous and performs no
 //! provider I/O; the injected backend is used only by [`ArchiveGenesis::resolve`].
 //! In particular, this is not a Store, VFS, route, credential, or feature-flag
-//! integration.
+//! integration. The reviewed Genesis trigger is the production owner that
+//! supplies the sealed backend and durable ledger.
 //!
 //! `resolve` requires a fresh revision-bound create admission before each
 //! registry, root, or witness provider request. It persists the exact witness
 //! bytes before witness create, reconciles ambiguity through exact readback,
 //! and performs a final active-ledger reread. Partial pre-witness creates stay
-//! in the lifecycle deletion inventory. No production ledger/backend composite
-//! is constructed here, so the seam remains inactive.
+//! in the lifecycle deletion inventory. Provider composition remains outside
+//! this protocol and is available only through the trigger's sealed runtime.
 
 use crate::{
     archive_v3::{

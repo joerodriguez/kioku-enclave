@@ -98,6 +98,7 @@ pub(crate) enum WalOperationKind {
     EpisodeDelete = 15,
     EpisodeDeleteCleanup = 16,
     VoiceEmbedding = 17,
+    VoiceProfile = 18,
 }
 
 impl WalOperationKind {
@@ -120,6 +121,7 @@ impl WalOperationKind {
             15 => Ok(Self::EpisodeDelete),
             16 => Ok(Self::EpisodeDeleteCleanup),
             17 => Ok(Self::VoiceEmbedding),
+            18 => Ok(Self::VoiceProfile),
             _ => Err(WalIdempotencyError::Corrupt),
         }
     }
@@ -142,7 +144,8 @@ impl WalOperationKind {
             | Self::EpisodeDeletePrepare
             | Self::EpisodeDelete
             | Self::EpisodeDeleteCleanup
-            | Self::VoiceEmbedding => 1,
+            | Self::VoiceEmbedding
+            | Self::VoiceProfile => 1,
         }
     }
 
@@ -575,6 +578,8 @@ impl sealed::DomainPlan for crate::cp::media_worker::wal::AudioWindowTranscriptP
 impl sealed::DomainLedger for crate::cp::media_worker::wal::AudioWindowTranscriptLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::VoiceEmbeddingPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::VoiceEmbeddingLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::VoiceProfilePlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::VoiceProfileLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
 impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailSendClaimPlan {}
@@ -1355,7 +1360,12 @@ mod tests {
             WalOperationKind::VoiceEmbedding
         );
         assert_eq!(WalOperationKind::VoiceEmbedding.codec_version(), 1);
-        assert!(WalOperationKind::decode(18).is_err());
+        assert_eq!(
+            WalOperationKind::decode(18).unwrap(),
+            WalOperationKind::VoiceProfile
+        );
+        assert_eq!(WalOperationKind::VoiceProfile.codec_version(), 1);
+        assert!(WalOperationKind::decode(19).is_err());
         assert!(
             WalReplayResult::canonical_response(WalOperationKind::FinalizationCommit, vec![1])
                 .is_err()

@@ -2219,7 +2219,7 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_observation(connection: &Connection, id: i64, event: &str) {
+    fn seed_observation_without_job(connection: &Connection, id: i64, event: &str) {
         connection
             .execute(
                 "INSERT INTO capture_events VALUES (?1,'audio','system','microphone')",
@@ -2252,6 +2252,10 @@ mod tests {
                 params![id, event],
             )
             .unwrap();
+    }
+
+    fn seed_observation(connection: &Connection, id: i64, event: &str) {
+        seed_observation_without_job(connection, id, event);
         connection
             .execute(
                 "INSERT INTO voice_embedding_jobs
@@ -2349,16 +2353,19 @@ mod tests {
         let mut evidence = {
             let mut connection = Connection::open(&path).unwrap();
             install_schema(&connection);
-            seed_observation(&connection, 1, "event-1");
-            connection
-                .execute("DELETE FROM voice_embedding_jobs WHERE id=1", [])
-                .unwrap();
+            // This is the exact durable output shape of the production v1
+            // transcript family: the observation and its projected source
+            // exist, while neither a voice sample nor an embedding job does.
+            // Do not obtain the fixture by deleting a v2 job; doing so would
+            // let this compatibility proof drift away from the deployed v1
+            // predecessor it is responsible for repairing.
+            seed_observation_without_job(&connection, 1, "event-1");
             let evidence = observe_next_job_backfill(&connection, ACCOUNT)
                 .unwrap()
                 .unwrap();
             assert_eq!(evidence.sample_count, 0);
             assert_eq!(evidence.job_count, 0);
-            assert_eq!(evidence.job_sequence.next_id(), Some(2));
+            assert_eq!(evidence.job_sequence.next_id(), Some(1));
             assert_eq!(
                 execute(
                     &mut connection,
@@ -2411,7 +2418,7 @@ mod tests {
                 )
                 .unwrap(),
             (
-                2,
+                1,
                 1,
                 "pending".to_owned(),
                 0,

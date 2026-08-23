@@ -239,9 +239,10 @@ pub(crate) trait GenesisRegistryWrapAuthority: Send + Sync {
     ) -> crate::archive_v3::Result<usize>;
 }
 
-/// Released production wrap authority. Constructing it consumes a genesis
-/// backend token, which has no production minter today, so sibling modules
-/// cannot assemble raw registry-wrap authority through this seam.
+/// Released production wrap authority. Constructing it consumes the sealed
+/// genesis-backend context minted only by the signed Genesis runtime, so
+/// sibling modules cannot assemble raw registry-wrap authority through this
+/// seam.
 pub(crate) struct ReleasedGenesisRegistryWrap {
     provider: Arc<GcsArchiveV3RegistryProvider>,
     token: GenesisBackendRuntimeContext,
@@ -290,7 +291,7 @@ pub(crate) struct WalGenesisAuthority<'a> {
 
 impl fmt::Debug for WalGenesisAuthority<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WalGenesisAuthority(<inactive>)")
+        formatter.write_str("WalGenesisAuthority(<sealed>)")
     }
 }
 

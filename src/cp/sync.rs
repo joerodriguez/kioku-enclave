@@ -128,9 +128,10 @@ async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUs
     // `media_objects`, `speaker_observations`, `speaker_clusters`,
     // `speaker_observation_sources` and `episode_final_briefs` all carry rows
     // for a selected user who has captured anything. The arrays that stay
-    // empty (`people`, `person_facts`, `voice_profiles`) are empty because
-    // those rows genuinely do not exist on this lane, which is the one thing
-    // an export is supposed to report faithfully.
+    // empty are empty because no accepted evidence created those rows, while
+    // literal self-identification plus its active profile can now populate
+    // `people`, `person_facts`, and `voice_profiles` on this same lane. The
+    // export reports either state faithfully.
     match dump_user_export(&s.store, &user.0).await {
         Ok(data) => export_success_response(data),
         Err(e) => {
@@ -2222,12 +2223,10 @@ mod tests {
     /// rather than in aggregate: an export that filled `utterances` and left
     /// `episodes` empty would be the same defect in a smaller place.
     ///
-    /// The arrays that legitimately stay empty are asserted empty on purpose.
-    /// `people` and `person_facts` have no WAL-lane writer by construction
-    /// (see `wal_domain::MEDIA_PEOPLE`), and an export is the one surface
-    /// whose job is to report that faithfully rather than hide it — but if a
-    /// future change starts filling them, this fails and the reviewer has to
-    /// decide deliberately rather than by drift.
+    /// Arrays that stay empty in this fixture are asserted deliberately. The
+    /// fixture carries no literal self-identification, so the active sealed
+    /// people writer has nothing to bind; a dedicated media/profile regression
+    /// covers the non-empty selected path.
     #[tokio::test]
     async fn the_lifted_export_route_answers_a_selected_user_with_a_populated_document() {
         use crate::cp::wal_gate_test_support::answerable_wal_archive;
@@ -2276,9 +2275,8 @@ mod tests {
         }
         // `people` is the one that is not empty and still carries no identity:
         // `init_schema` seeds a single `kind='owner'` row at `status='unknown'`,
-        // which every people READ filters out (see `wal_domain::MEDIA_PEOPLE`).
-        // Pinning its shape rather than its emptiness is what would catch a
-        // future change that starts committing identity on this lane.
+        // which every people READ filters out. Pinning its shape rather than
+        // its emptiness ensures an identity-free fixture stays identity-free.
         let people = body["people"]
             .as_array()
             .unwrap_or_else(|| panic!("the export carries a people array: {body}"));

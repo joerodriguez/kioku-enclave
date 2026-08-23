@@ -4,22 +4,24 @@
 //! The subtype accepts only a fully leased audio work unit whose provider
 //! usage has already reached a terminal result, the sealed sibling B
 //! boundary's permanent attempt binding, caller-fixed `sqlite_sequence`
-//! pins, one fixed commit time, and transcript turns with no identity
-//! evidence. It authenticates every work/member/job/capture/media
+//! pins, one fixed commit time, transcript turns, and only literal
+//! high-confidence self-identification evidence. It authenticates every work/member/job/capture/media
 //! predecessor before atomically inserting the audio segment, speaker
 //! clusters, speaker observations (plus exact source projections), and
 //! utterances, settling the exact jobs, media rows, and work unit, and
 //! retaining permanent replay. Every written row id derives from the
 //! fingerprinted `sqlite_sequence` pins with the plain-INSERT +
-//! derived-id-assert discipline. Person, identity, and voice mutation is
-//! structurally absent — the plan has no constructor slot for speaker
-//! names, person facts, or quality flags. Each projected speaker observation
+//! derived-id-assert discipline. Person and voice-profile mutation remains
+//! structurally absent: the plan can persist only an unbound proposed
+//! `identity_evidence` row whose literal name/evidence/facts are committed in
+//! the request. Each projected speaker observation
 //! gets one fixed-id pending `voice_embedding_jobs` row in the same atomic
 //! settlement; profile/person mutation remains structurally absent. Provider
 //! calls, media reads, clocks, automatic IDs, Store, launching, retries, and
 //! acknowledgement are deliberately absent.
 
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -30,9 +32,9 @@ use crate::archive_v3_wal_idempotency::{
 };
 use crate::cp::identity::{OWNER_DISPLAY_NAME, UNIDENTIFIED_SPEAKER_LABEL};
 
-const REQUEST_V2: u16 = 2;
-const SUBTYPE: &[u8] = b"audio-window-transcript-v2-embedding-jobs-bound-attempt";
-const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"audio-window-transcript-bound-v2\0";
+const REQUEST_V3: u16 = 3;
+const SUBTYPE: &[u8] = b"audio-window-transcript-v3-literal-identity-evidence";
+const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"audio-window-transcript-bound-v3\0";
 const WORK_DOMAIN: &[u8] = b"archive-v3-audio-window-predecessor-v1\0";
 const WORK_ATTEMPT_DOMAIN: &[u8] = b"archive-v3-audio-window-work-attempt-v1\0";
 const VERTEX_ATTEMPT_DOMAIN: &[u8] = b"archive-v3-audio-window-vertex-attempt-row-v1\0";
@@ -52,6 +54,7 @@ const MAX_TURNS: usize = crate::cp::media::MAX_TURNS;
 const MAX_TEXT_CHARS: usize = crate::cp::media::MAX_TEXT_LEN;
 /// Keeps the canonical request under the framework's 1 MiB cap.
 const MAX_TURN_TOTAL_BYTES: usize = 512 * 1024;
+const MAX_IDENTITY_EVIDENCE_BYTES: usize = 8_192;
 const MAX_ID_BYTES: usize = 128;
 const MAX_MODEL_BYTES: usize = 128;
 const MAX_TIMESTAMP_BYTES: usize = 64;
@@ -68,10 +71,126 @@ const BOUNDS: DomainLedgerBounds = DomainLedgerBounds::new(MAX_ROWS, MAX_RESULT_
 
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
 
-/// The transcript projection of `media::AudioTurn`. The identity fields
-/// (`speaker_name*`, `person_facts`, `quality_flags`) have NO constructor
-/// slot — the sanctioned person/identity/voice exclusion is structural, at
-/// the type.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::cp::media_worker) struct AudioPersonFact {
+    predicate: String,
+    value: String,
+    evidence: String,
+}
+
+impl AudioPersonFact {
+    pub(in crate::cp::media_worker) fn new(
+        predicate: String,
+        value: String,
+        evidence: String,
+    ) -> Result<Self> {
+        if !matches!(
+            predicate.as_str(),
+            "role"
+                | "organization"
+                | "relationship"
+                | "preference"
+                | "responsibility"
+                | "contact"
+                | "location"
+                | "other"
+        ) || value.trim().is_empty()
+            || value.len() > 2_000
+            || value.contains('\0')
+            || evidence.trim().is_empty()
+            || evidence.len() > 2_000
+            || evidence.contains('\0')
+        {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        Ok(Self {
+            predicate,
+            value,
+            evidence,
+        })
+    }
+
+    fn carried_bytes(&self) -> usize {
+        self.predicate
+            .len()
+            .saturating_add(self.value.len())
+            .saturating_add(self.evidence.len())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::cp::media_worker) struct AudioSelfIdentity {
+    name: String,
+    literal_evidence: String,
+    confidence_millionths: u32,
+    facts: Vec<AudioPersonFact>,
+}
+
+impl AudioSelfIdentity {
+    pub(in crate::cp::media_worker) fn new(
+        name: String,
+        literal_evidence: String,
+        confidence: f64,
+        facts: Vec<AudioPersonFact>,
+    ) -> Result<Self> {
+        if name.trim().is_empty()
+            || name.len() > 256
+            || name.contains('\0')
+            || literal_evidence.trim().is_empty()
+            || literal_evidence.len() > 2_000
+            || literal_evidence.contains('\0')
+            || !confidence.is_finite()
+            || !(0.90..=1.0).contains(&confidence)
+            || facts.len() > 20
+        {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        // The provider-free identity owner commits the complete stored JSON
+        // as exact evidence. Bound the final escaped representation here,
+        // including a maximal turn id, so a provider result can never create
+        // an at-rest row that the downstream sealed snapshot cannot carry.
+        let encoded = json!({
+            "schema_version": 1,
+            "turn_id": "x".repeat(MAX_ID_BYTES),
+            "literal_evidence": literal_evidence,
+            "facts": facts.iter().map(|fact| json!({
+                "predicate": fact.predicate,
+                "value": fact.value,
+                "evidence": fact.evidence,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        if encoded.len() > MAX_IDENTITY_EVIDENCE_BYTES {
+            return Err(WalIdempotencyError::Limit);
+        }
+        let confidence_millionths = (confidence * 1_000_000.0).round() as u32;
+        if !(900_000..=1_000_000).contains(&confidence_millionths) {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        Ok(Self {
+            name,
+            literal_evidence,
+            confidence_millionths,
+            facts,
+        })
+    }
+
+    fn carried_bytes(&self) -> usize {
+        self.name
+            .len()
+            .saturating_add(self.literal_evidence.len())
+            .saturating_add(
+                self.facts
+                    .iter()
+                    .map(AudioPersonFact::carried_bytes)
+                    .sum::<usize>(),
+            )
+    }
+}
+
+/// The transcript projection of `media::AudioTurn`. Only literal,
+/// high-confidence self-identification has a constructor slot. Vocatives,
+/// third-party mentions, quality flags, and inferred identity remain absent.
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::cp::media_worker) struct AudioTurnFact {
     turn_id: String,
@@ -81,6 +200,7 @@ pub(in crate::cp::media_worker) struct AudioTurnFact {
     text: String,
     language: Option<String>,
     overlap: bool,
+    self_identity: Option<AudioSelfIdentity>,
 }
 
 impl std::fmt::Debug for AudioTurnFact {
@@ -120,7 +240,42 @@ impl AudioTurnFact {
             text,
             language,
             overlap,
+            self_identity: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::cp::media_worker) fn new_with_self_identity(
+        turn_id: String,
+        start_ms: i64,
+        end_ms: i64,
+        speaker_local_id: String,
+        text: String,
+        language: Option<String>,
+        overlap: bool,
+        self_identity: Option<AudioSelfIdentity>,
+    ) -> Result<Self> {
+        let mut value = Self::new(
+            turn_id,
+            start_ms,
+            end_ms,
+            speaker_local_id,
+            text,
+            language,
+            overlap,
+        )?;
+        if self_identity.as_ref().is_some_and(|identity| {
+            !value.text.contains(identity.literal_evidence.as_str())
+                || !identity.literal_evidence.contains(identity.name.trim())
+                || identity
+                    .facts
+                    .iter()
+                    .any(|fact| !value.text.contains(fact.evidence.as_str()))
+        }) {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        value.self_identity = self_identity;
+        Ok(value)
     }
 
     fn carried_bytes(&self) -> usize {
@@ -129,10 +284,15 @@ impl AudioTurnFact {
             .saturating_add(self.speaker_local_id.len())
             .saturating_add(self.text.len())
             .saturating_add(self.language.as_deref().map_or(0, str::len))
+            .saturating_add(
+                self.self_identity
+                    .as_ref()
+                    .map_or(0, AudioSelfIdentity::carried_bytes),
+            )
     }
 }
 
-/// The five `sqlite_sequence` pre-state pins, read by the owner's routed
+/// The six `sqlite_sequence` pre-state pins, read by the owner's routed
 /// pre-submit read and fingerprinted into the plan identity's request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::cp::media_worker) struct AudioSequencePins {
@@ -141,6 +301,7 @@ pub(in crate::cp::media_worker) struct AudioSequencePins {
     speaker_observations: i64,
     utterances: i64,
     voice_embedding_jobs: i64,
+    identity_evidence: i64,
 }
 
 impl AudioSequencePins {
@@ -150,6 +311,7 @@ impl AudioSequencePins {
         speaker_observations: i64,
         utterances: i64,
         voice_embedding_jobs: i64,
+        identity_evidence: i64,
     ) -> Self {
         Self {
             audio_segments,
@@ -157,6 +319,7 @@ impl AudioSequencePins {
             speaker_observations,
             utterances,
             voice_embedding_jobs,
+            identity_evidence,
         }
     }
 }
@@ -231,6 +394,7 @@ impl AudioWindowTranscriptPlan {
             || seq_pins.speaker_observations < 0
             || seq_pins.utterances < 0
             || seq_pins.voice_embedding_jobs < 0
+            || seq_pins.identity_evidence < 0
         {
             return Err(WalIdempotencyError::Malformed);
         }
@@ -298,7 +462,7 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::with_capacity(64 * 1024));
-        request.extend_from_slice(&REQUEST_V2.to_be_bytes());
+        request.extend_from_slice(&REQUEST_V3.to_be_bytes());
         encode_bytes(&mut request, SUBTYPE)?;
         request.extend_from_slice(&self.attempt_binding_commitment);
         encode_string(&mut request, &self.account_id)?;
@@ -313,6 +477,7 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
         request.extend_from_slice(&self.seq_pins.speaker_observations.to_be_bytes());
         request.extend_from_slice(&self.seq_pins.utterances.to_be_bytes());
         request.extend_from_slice(&self.seq_pins.voice_embedding_jobs.to_be_bytes());
+        request.extend_from_slice(&self.seq_pins.identity_evidence.to_be_bytes());
         encode_len(&mut request, self.turns.len())?;
         for turn in &self.turns {
             encode_string(&mut request, &turn.turn_id)?;
@@ -328,6 +493,21 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
                 }
             }
             request.push(u8::from(turn.overlap));
+            match turn.self_identity.as_ref() {
+                None => request.push(0),
+                Some(identity) => {
+                    request.push(1);
+                    encode_string(&mut request, &identity.name)?;
+                    encode_string(&mut request, &identity.literal_evidence)?;
+                    request.extend_from_slice(&identity.confidence_millionths.to_be_bytes());
+                    encode_len(&mut request, identity.facts.len())?;
+                    for fact in &identity.facts {
+                        encode_string(&mut request, &fact.predicate)?;
+                        encode_string(&mut request, &fact.value)?;
+                        encode_string(&mut request, &fact.evidence)?;
+                    }
+                }
+            }
         }
         Ok(request)
     }
@@ -1360,19 +1540,20 @@ fn hash_value(hasher: &mut Sha256, value: ValueRef<'_>) {
     }
 }
 
-/// The five `sqlite_sequence` pre-state pins (COALESCE 0 when a table has
+/// The six `sqlite_sequence` pre-state pins (COALESCE 0 when a table has
 /// never allocated), in the fixed segments/clusters/observations/utterances/
-/// embedding-jobs order.
+/// embedding-jobs/identity-evidence order.
 pub(in crate::cp::media_worker) fn read_audio_sequence_pins(
     connection: &Connection,
 ) -> Result<AudioSequencePins> {
-    let mut pins = [0_i64; 5];
+    let mut pins = [0_i64; 6];
     for (slot, table) in [
         "audio_segments",
         "speaker_clusters",
         "speaker_observations",
         "utterances",
         "voice_embedding_jobs",
+        "identity_evidence",
     ]
     .iter()
     .enumerate()
@@ -1391,6 +1572,7 @@ pub(in crate::cp::media_worker) fn read_audio_sequence_pins(
         speaker_observations: pins[2],
         utterances: pins[3],
         voice_embedding_jobs: pins[4],
+        identity_evidence: pins[5],
     })
 }
 
@@ -1595,6 +1777,11 @@ fn ensure_target_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("voice_embedding_jobs", "error_code"),
         ("voice_embedding_jobs", "created_at"),
         ("voice_embedding_jobs", "updated_at"),
+        ("identity_evidence", "source_event_id"),
+        ("identity_evidence", "observed_at"),
+        ("identity_evidence", "speaker_observation_id"),
+        ("identity_evidence", "claimed_name"),
+        ("identity_evidence", "created_at"),
     ] {
         let present = transaction
             .query_row(
@@ -1680,6 +1867,30 @@ fn ensure_audio_targets_absent(
                 )
                 .map_err(|_| WalIdempotencyError::Unavailable)?,
         )?;
+        if turn.self_identity.is_some() {
+            let identity_offset = i64::try_from(
+                plan.turns[..index]
+                    .iter()
+                    .filter(|candidate| candidate.self_identity.is_some())
+                    .count(),
+            )
+            .map_err(|_| WalIdempotencyError::Limit)?;
+            let identity_id = plan
+                .seq_pins
+                .identity_evidence
+                .checked_add(1)
+                .and_then(|base| base.checked_add(identity_offset))
+                .ok_or(WalIdempotencyError::Limit)?;
+            occupied(
+                transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM identity_evidence WHERE id=?1",
+                        [identity_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| WalIdempotencyError::Unavailable)?,
+            )?;
+        }
         let embedding_job_id = plan
             .seq_pins
             .voice_embedding_jobs
@@ -1894,8 +2105,66 @@ fn write_turns(
         if changed != 1 || transaction.last_insert_rowid() != embedding_job_id {
             return Err(WalIdempotencyError::Corrupt);
         }
+        if let Some(identity) = turn.self_identity.as_ref() {
+            let identity_offset = i64::try_from(
+                plan.turns[..index]
+                    .iter()
+                    .filter(|candidate| candidate.self_identity.is_some())
+                    .count(),
+            )
+            .map_err(|_| WalIdempotencyError::Limit)?;
+            let identity_id = plan
+                .seq_pins
+                .identity_evidence
+                .checked_add(1)
+                .and_then(|base| base.checked_add(identity_offset))
+                .ok_or(WalIdempotencyError::Limit)?;
+            let evidence_json = identity_evidence_json(turn, identity);
+            let changed = transaction
+                .execute(
+                    "INSERT INTO identity_evidence
+                     (person_id,source_event_id,observed_at,speaker_observation_id,kind,
+                      claimed_name,evidence_json,score,status,created_at)
+                     VALUES (NULL,?1,?2,?3,'audio_self_identification',?4,?5,?6,
+                             'proposed',?7)",
+                    params![
+                        projected.anchor_event_id,
+                        projected.started_at,
+                        observation_id,
+                        identity.name.trim(),
+                        evidence_json,
+                        f64::from(identity.confidence_millionths) / 1_000_000.0,
+                        plan.committed_at,
+                    ],
+                )
+                .map_err(|_| WalIdempotencyError::Unavailable)?;
+            if changed != 1 || transaction.last_insert_rowid() != identity_id {
+                return Err(WalIdempotencyError::Corrupt);
+            }
+        }
     }
     Ok(())
+}
+
+fn identity_evidence_json(turn: &AudioTurnFact, identity: &AudioSelfIdentity) -> String {
+    let facts = identity
+        .facts
+        .iter()
+        .map(|fact| {
+            json!({
+                "predicate": fact.predicate,
+                "value": fact.value,
+                "evidence": fact.evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "turn_id": turn.turn_id,
+        "literal_evidence": identity.literal_evidence,
+        "facts": facts,
+    })
+    .to_string()
 }
 
 fn settle_job(
@@ -2301,6 +2570,59 @@ fn verify_final_state(
         {
             return Err(WalIdempotencyError::Corrupt);
         }
+        if let Some(identity) = turn.self_identity.as_ref() {
+            let identity_offset = i64::try_from(
+                plan.turns[..index]
+                    .iter()
+                    .filter(|candidate| candidate.self_identity.is_some())
+                    .count(),
+            )
+            .map_err(|_| WalIdempotencyError::Limit)?;
+            let identity_id = plan
+                .seq_pins
+                .identity_evidence
+                .checked_add(1)
+                .and_then(|base| base.checked_add(identity_offset))
+                .ok_or(WalIdempotencyError::Limit)?;
+            let stored = transaction
+                .query_row(
+                    "SELECT person_id,source_event_id,observed_at,speaker_observation_id,kind,
+                            claimed_name,evidence_json,score,status,created_at
+                     FROM identity_evidence WHERE id=?1",
+                    [identity_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<f64>>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                        ))
+                    },
+                )
+                .map_err(|_| WalIdempotencyError::Corrupt)?;
+            if stored
+                != (
+                    None,
+                    Some(projected.anchor_event_id.clone()),
+                    Some(projected.started_at.clone()),
+                    Some(observation_id),
+                    "audio_self_identification".to_owned(),
+                    Some(identity.name.trim().to_owned()),
+                    identity_evidence_json(turn, identity),
+                    Some(f64::from(identity.confidence_millionths) / 1_000_000.0),
+                    "proposed".to_owned(),
+                    plan.committed_at.clone(),
+                )
+            {
+                return Err(WalIdempotencyError::Corrupt);
+            }
+        }
     }
     for member in &authenticated.members {
         let job = load_job(transaction, member.job.id)?;
@@ -2369,10 +2691,25 @@ fn verify_final_state(
             |row| row.get::<_, i64>(0),
         )
         .map_err(|_| WalIdempotencyError::Corrupt)?;
+    let identity_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM identity_evidence WHERE id>?1",
+            [plan.seq_pins.identity_evidence],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    let expected_identity_count = i64::try_from(
+        plan.turns
+            .iter()
+            .filter(|turn| turn.self_identity.is_some())
+            .count(),
+    )
+    .map_err(|_| WalIdempotencyError::Limit)?;
     if utterance_count != turn_count
         || observation_count != turn_count
         || stored_cluster_count != cluster_count
         || embedding_job_count != turn_count
+        || identity_count != expected_identity_count
     {
         return Err(WalIdempotencyError::Corrupt);
     }
@@ -2399,6 +2736,19 @@ fn verify_final_state(
             .seq_pins
             .voice_embedding_jobs
             .checked_add(turn_count)
+            .ok_or(WalIdempotencyError::Limit)?,
+        identity_evidence: plan
+            .seq_pins
+            .identity_evidence
+            .checked_add(
+                i64::try_from(
+                    plan.turns
+                        .iter()
+                        .filter(|turn| turn.self_identity.is_some())
+                        .count(),
+                )
+                .map_err(|_| WalIdempotencyError::Limit)?,
+            )
             .ok_or(WalIdempotencyError::Limit)?,
     };
     if read_audio_sequence_pins(transaction)? != expected {
@@ -2848,7 +3198,7 @@ pub(super) mod tests {
                     confidence REAL NOT NULL,
                     status TEXT NOT NULL
                  );
-                 CREATE TABLE identity_evidence (
+                 CREATE TABLE IF NOT EXISTS identity_evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     person_id INTEGER,
                     source_event_id TEXT,
@@ -2858,7 +3208,8 @@ pub(super) mod tests {
                     claimed_name TEXT,
                     evidence_json TEXT,
                     score REAL,
-                    status TEXT
+                    status TEXT,
+                    created_at TEXT
                  );
                  CREATE TABLE person_facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2991,6 +3342,19 @@ pub(super) mod tests {
                     updated_at TEXT NOT NULL,
                     UNIQUE(speaker_observation_id, embedding_space, processor_version,
                            quality_version, scorer_version)
+                 );
+                 CREATE TABLE identity_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id INTEGER,
+                    source_event_id TEXT,
+                    observed_at TEXT,
+                    speaker_observation_id INTEGER,
+                    kind TEXT,
+                    claimed_name TEXT,
+                    evidence_json TEXT,
+                    score REAL,
+                    status TEXT,
+                    created_at TEXT
                  );",
             )
             .unwrap();
@@ -3383,7 +3747,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             read_audio_sequence_pins(&connection).unwrap(),
-            AudioSequencePins::new(1, 0, 0, 0, 0)
+            AudioSequencePins::new(1, 0, 0, 0, 0, 0)
         );
     }
 
@@ -3984,7 +4348,7 @@ pub(super) mod tests {
                 [3; 32],
                 MODEL.to_owned(),
                 committed_at(1),
-                AudioSequencePins::new(0, 0, 0, 0, 0),
+                AudioSequencePins::new(0, 0, 0, 0, 0, 0),
                 turns,
             )
         };
@@ -4127,6 +4491,163 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn e2b_literal_self_identity_is_frozen_proposed_and_exactly_replayed() {
+        let mut connection = identity_connection();
+        seed_reserved_audio_work(&connection, WORK_ONE, 1, 1);
+        let receipt = terminal_receipt(&mut connection, WORK_ONE, 1);
+        let turns = || {
+            let facts = vec![AudioPersonFact::new(
+                "role".into(),
+                "Engineer".into(),
+                "I work as an engineer".into(),
+            )
+            .unwrap()];
+            let identity = AudioSelfIdentity::new(
+                "Alice Example".into(),
+                "I'm Alice Example".into(),
+                0.99,
+                facts,
+            )
+            .unwrap();
+            vec![AudioTurnFact::new_with_self_identity(
+                "turn-1".into(),
+                0,
+                900,
+                "speaker_0".into(),
+                "I'm Alice Example, and I work as an engineer".into(),
+                Some("en".into()),
+                false,
+                Some(identity),
+            )
+            .unwrap()]
+        };
+        let replay = transcript_plan(&connection, WORK_ONE, &receipt, 1, turns());
+        let plan = transcript_plan(&connection, WORK_ONE, &receipt, 1, turns());
+        assert_eq!(
+            execute(&mut connection, plan).unwrap().disposition(),
+            LogicalMutationDisposition::Applied
+        );
+        let row: (
+            Option<i64>,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            f64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT person_id,source_event_id,observed_at,speaker_observation_id,
+                        claimed_name,evidence_json,score,status
+                 FROM identity_evidence",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "audio-event-1");
+        assert_eq!(row.2, STARTED_AT);
+        assert_eq!(row.3, 1);
+        assert_eq!(row.4, "Alice Example");
+        assert!((row.6 - 0.99).abs() < f64::EPSILON);
+        assert_eq!(row.7, "proposed");
+        let envelope: serde_json::Value = serde_json::from_str(&row.5).unwrap();
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["turn_id"], "turn-1");
+        assert_eq!(envelope["literal_evidence"], "I'm Alice Example");
+        assert_eq!(envelope["facts"][0]["predicate"], "role");
+        assert_eq!(
+            count_of(&connection, "SELECT COUNT(*) FROM voice_embedding_jobs"),
+            1
+        );
+        for table in [
+            "people",
+            "person_name_claims",
+            "person_facts",
+            "voice_profiles",
+        ] {
+            assert_eq!(
+                count_of(&connection, &format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "transcript settlement must not cross the person/profile boundary: {table}"
+            );
+        }
+        assert_eq!(
+            execute(&mut connection, replay).unwrap().disposition(),
+            LogicalMutationDisposition::Replayed
+        );
+        assert_eq!(
+            count_of(&connection, "SELECT COUNT(*) FROM identity_evidence"),
+            1
+        );
+    }
+
+    #[test]
+    fn e2b_self_identity_requires_exact_same_turn_literal_evidence() {
+        let identity = || {
+            AudioSelfIdentity::new(
+                "Alice Example".into(),
+                "I'm Alice Example".into(),
+                0.99,
+                vec![AudioPersonFact::new(
+                    "role".into(),
+                    "Engineer".into(),
+                    "I work as an engineer".into(),
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            AudioTurnFact::new_with_self_identity(
+                "turn-1".into(),
+                0,
+                900,
+                "speaker_0".into(),
+                "A third party says Alice Example is an engineer".into(),
+                Some("en".into()),
+                false,
+                Some(identity()),
+            )
+            .unwrap_err(),
+            WalIdempotencyError::Malformed
+        );
+        let name_not_literal = AudioSelfIdentity::new(
+            "Alice Example".into(),
+            "Someone introduced the speaker".into(),
+            0.99,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            AudioTurnFact::new_with_self_identity(
+                "turn-1".into(),
+                0,
+                900,
+                "speaker_0".into(),
+                "Someone introduced the speaker".into(),
+                Some("en".into()),
+                false,
+                Some(name_not_literal),
+            )
+            .unwrap_err(),
+            WalIdempotencyError::Malformed
+        );
+    }
+
+    #[test]
     fn e3_selected_transcript_job_enters_the_sealed_embedding_settlement() {
         let mut connection = connection();
         seed_reserved_audio_work(&connection, WORK_ONE, 1, 1);
@@ -4213,7 +4734,7 @@ pub(super) mod tests {
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
 
-        // Blocking fact 1, INVERTED: the baseline DDL now declares all five
+        // Blocking fact 1, INVERTED: the baseline DDL now declares all six
         // pinned tables AUTOINCREMENT. The transcript tables used to split
         // allocator policy, which is what blocked the family.
         let ddl = |table: &str| -> String {
@@ -4230,8 +4751,9 @@ pub(super) mod tests {
         assert!(ddl("speaker_clusters").contains("AUTOINCREMENT"));
         assert!(ddl("speaker_observations").contains("AUTOINCREMENT"));
         assert!(ddl("voice_embedding_jobs").contains("AUTOINCREMENT"));
+        assert!(ddl("identity_evidence").contains("AUTOINCREMENT"));
 
-        // Blocking fact 2, INVERTED: inserts into all five tables now move
+        // Blocking fact 2, INVERTED: inserts into all six tables now move
         // sqlite_sequence, so the pin discipline observes them — and, the
         // point of the whole change, DELETING every row leaves the high-water
         // standing so an id can never be reissued.
@@ -4251,13 +4773,23 @@ pub(super) mod tests {
                 [],
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO identity_evidence(kind,evidence_json,status)
+                 VALUES ('sequence_probe','{}','rejected')",
+                [],
+            )
+            .unwrap();
         let pins = read_audio_sequence_pins(&connection).unwrap();
         assert_eq!(
             pins,
-            AudioSequencePins::new(1, 0, 0, 1, 0),
+            AudioSequencePins::new(1, 0, 0, 1, 0, 1),
             "AUTOINCREMENT tables must appear in sqlite_sequence after one insert"
         );
         connection.execute("DELETE FROM utterances", []).unwrap();
+        connection
+            .execute("DELETE FROM identity_evidence", [])
+            .unwrap();
         connection
             .execute("DELETE FROM audio_segments", [])
             .unwrap();
@@ -4267,7 +4799,7 @@ pub(super) mod tests {
         // guardrail removed.
         assert_eq!(
             read_audio_sequence_pins(&connection).unwrap(),
-            AudioSequencePins::new(1, 0, 0, 1, 0),
+            AudioSequencePins::new(1, 0, 0, 1, 0, 1),
             "DELETE must not rewind the high-water; ids are never reissued"
         );
 
@@ -4407,6 +4939,7 @@ pub(super) mod tests {
                 before.speaker_observations + 1,
                 before.utterances + 1,
                 before.voice_embedding_jobs + 1,
+                before.identity_evidence,
             ),
             "pins must advance by the exact per-table deltas"
         );
