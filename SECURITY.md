@@ -122,8 +122,9 @@ surfaces.
   signed release metadata binds the mode and complete-or-empty namespace but grants no
   Firestore, rollout, health, or archive authority.
 - The ADR-0022 single-archive WAL runtime profile is separately image-bound by checked-in
-  schema-2 `config/archive-v3-shadow-runtime.json`, which remains exact `off` with all seven
-  deployment fragments empty. Its sole shared parser accepts an active form only when the
+  schema-2 `config/archive-v3-shadow-runtime.json`, whose reviewed Genesis release form carries
+  the complete exact production tuple and one-way binding commitment. Its sole shared parser
+  accepts that active form only when the
   bucket, three canonical unsigned-64-bit numeric coordinates, named non-UUID Firestore
   project/database, and nonzero lowercase SHA-256 archive-binding commitment are complete.
   Evaluation and `main` pretag selection force off; only exact
@@ -527,8 +528,9 @@ path.
 > The Genesis logical-WAL path is now production-wired under an exact signed active image
 > profile. Startup installs durable WAL-authoritative selections and relaunches their
 > serving owners before request admission; sign-in convergence can create a new archive;
-> routed Store reads/submits expose only settled owner state. The checked-in default profile
-> remains exact `off`, and an off-config image refuses when selected durable state exists.
+> routed Store reads/submits expose only settled owner state. The reviewed Genesis release
+> carries the active tuple; evaluation and ordinary pretag builds still select off, and an
+> off-config image refuses when selected durable state exists.
 > This authority does not reactivate the deleted advisory/Phase-2 migration family or the
 > inactive extent-shadow engine.
 
