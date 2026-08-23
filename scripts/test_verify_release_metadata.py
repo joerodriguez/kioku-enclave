@@ -89,15 +89,23 @@ class ReleaseMetadataTests(unittest.TestCase):
                 config_path = Path(directory) / "archive-witness-probe.json"
                 config_path.write_text(json.dumps(probe_config), encoding="utf-8")
             shadow_runtime_config_path = (
-                ROOT / "config" / "archive-v3-shadow-runtime.json"
+                Path(directory) / "archive-v3-shadow-runtime.json"
             )
-            if shadow_runtime_config is not None:
-                shadow_runtime_config_path = (
-                    Path(directory) / "archive-v3-shadow-runtime.json"
-                )
-                shadow_runtime_config_path.write_text(
-                    json.dumps(shadow_runtime_config), encoding="utf-8"
-                )
+            if shadow_runtime_config is None:
+                shadow_runtime_config = {
+                    "schema_version": 2,
+                    "mode": "off",
+                    "archive_bucket": "",
+                    "archive_gcs_project_number": "",
+                    "registry_kms_version": "",
+                    "witness_project_id": "",
+                    "witness_project_number": "",
+                    "witness_database_id": "",
+                    "archive_binding_commitment": "",
+                }
+            shadow_runtime_config_path.write_text(
+                json.dumps(shadow_runtime_config), encoding="utf-8"
+            )
             return subprocess.run(
                 [
                     "python3",

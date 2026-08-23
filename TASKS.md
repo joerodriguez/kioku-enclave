@@ -1,3 +1,12 @@
+# ADR-0022 Genesis production activation
+
+- [x] Merge every D4 read/mutation lane, bounded historical repair, provider-spend gate,
+  lifecycle/delete owner, and WAL inventory seal required before activation.
+- [x] Deploy the archive-off bootstrap image and obtain the authenticated one-way binding
+  commitment; merge deployment companion `4fe7c283` with exact digest rotation/recovery.
+- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.1`; verify live Genesis/WAL
+  serving and archive/witness state before recording completion.
+
 # ADR-0022 browser evidence
 
 - [x] Accept the Mac browser-v2 wire contract with explicit account/device

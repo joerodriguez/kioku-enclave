@@ -380,11 +380,23 @@ class SelectorTests(unittest.TestCase):
             "project_number": "123456789",
             "database_id": "witness-db",
         }
+        shadow_off = {
+            "schema_version": 2,
+            "mode": "off",
+            "archive_bucket": "",
+            "archive_gcs_project_number": "",
+            "registry_kms_version": "",
+            "witness_project_id": "",
+            "witness_project_number": "",
+            "witness_database_id": "",
+            "archive_binding_commitment": "",
+        }
         completed, selected = self.run_selector(
             "production",
             environment(),
             source_ref="v1.2.3-witness-probe.1",
             probe_config=probe,
+            shadow_runtime_config=shadow_off,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=probe-v1\n", selected)
@@ -395,19 +407,28 @@ class SelectorTests(unittest.TestCase):
             environment(),
             source_ref="v1.2.3-witness-probe.1",
             probe_config=probe,
+            shadow_runtime_config=shadow_off,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
         self.assertNotIn("project-1", selected)
 
         completed, selected = self.run_selector(
-            "production", environment(), source_ref="main", probe_config=probe
+            "production",
+            environment(),
+            source_ref="main",
+            probe_config=probe,
+            shadow_runtime_config=shadow_off,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
 
         completed, selected = self.run_selector(
-            "production", environment(), source_ref="v1.2.3", probe_config=probe
+            "production",
+            environment(),
+            source_ref="v1.2.3",
+            probe_config=probe,
+            shadow_runtime_config=shadow_off,
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(selected, "")
@@ -494,9 +515,17 @@ class SelectorTests(unittest.TestCase):
         completed, selected = self.run_selector(
             "production", environment(), source_ref=wal_tag
         )
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(selected, "")
-        self.assertIn("requires the complete active runtime profile", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", selected)
+        self.assertIn(
+            "ARCHIVE_V3_ARCHIVE_BUCKET=kioku-joerodriguez-archive-v3\n", selected
+        )
+        self.assertIn(
+            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT="
+            "b541d598e3442fdcf516c0af34a69907"
+            "b44c9767d86b8277cb08d12eb0f1fe48\n",
+            selected,
+        )
 
         pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")

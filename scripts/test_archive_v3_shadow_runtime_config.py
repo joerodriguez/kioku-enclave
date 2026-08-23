@@ -131,22 +131,24 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
             "archive_binding_commitment": COMMITMENT,
         }
 
-    def test_checked_in_profile_is_schema_two_exact_off(self) -> None:
+    def test_checked_in_profile_is_schema_two_exact_genesis_tuple(self) -> None:
         config = load_shadow_runtime_config(
             ROOT / "config" / "archive-v3-shadow-runtime.json"
         )
-        self.assertEqual(config, OFF)
         self.assertEqual(
             config.as_environment(),
             {
-                "ARCHIVE_V3_SHADOW_RUNTIME_MODE": "off",
-                "ARCHIVE_V3_ARCHIVE_BUCKET": "",
-                "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER": "",
-                "ARCHIVE_V3_REGISTRY_KMS_VERSION": "",
-                "ARCHIVE_V3_WITNESS_PROJECT_ID": "",
-                "ARCHIVE_V3_WITNESS_PROJECT_NUMBER": "",
-                "ARCHIVE_V3_WITNESS_DATABASE_ID": "",
-                "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT": "",
+                "ARCHIVE_V3_SHADOW_RUNTIME_MODE": "single-archive-wal-v1",
+                "ARCHIVE_V3_ARCHIVE_BUCKET": "kioku-joerodriguez-archive-v3",
+                "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER": "640329636251",
+                "ARCHIVE_V3_REGISTRY_KMS_VERSION": "1",
+                "ARCHIVE_V3_WITNESS_PROJECT_ID": "kioku-joerodriguez",
+                "ARCHIVE_V3_WITNESS_PROJECT_NUMBER": "640329636251",
+                "ARCHIVE_V3_WITNESS_DATABASE_ID": "archive-v3-witness",
+                "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT": (
+                    "b541d598e3442fdcf516c0af34a69907"
+                    "b44c9767d86b8277cb08d12eb0f1fe48"
+                ),
             },
         )
 
