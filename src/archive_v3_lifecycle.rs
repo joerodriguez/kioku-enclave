@@ -1,13 +1,13 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 lifecycle ledger is compiled and fake-tested before authority wiring"
+    reason = "active ADR-0022 lifecycle contract retains the type-separated inactive pre-witness branch"
 )]
 
 //! Durable, fail-closed lifecycle receipts for archive-v3.
 //!
 //! This module is deliberately policy and codec only. It constructs no Store,
 //! provider, credential, route, environment/config reader, or runtime task. A
-//! future writer must first reserve all immutable identifiers, then durably
+//! Each writer must first reserve all immutable identifiers, then durably
 //! retain the exact bytes it intends to create. Every provider request consumes
 //! a fresh revision-bound admission. Deletion freezes that admission stream and
 //! seals a canonical, hash-chained exact-name inventory before key erasure.

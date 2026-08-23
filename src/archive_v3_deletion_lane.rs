@@ -51,8 +51,8 @@ use crate::{
     archive_v3_lifecycle::{ArchiveLifecyclePageStore, DeletionInventorySeal},
     archive_v3_reachability::ExactReachabilityReader,
     archive_v3_witness::{
-        DeletionPrincipal, DeletionPrincipalKey, DeletionState, TombstoneAdvance, Witness,
-        WitnessError,
+        AsyncDeletionWitness, DeletionPrincipal, DeletionPrincipalKey, DeletionState,
+        TombstoneAdvance, WitnessError,
     },
     cp::control_store::ControlStore,
     error::{DeletionPendingReason, EnclaveError, Result},
@@ -140,25 +140,24 @@ pub(crate) struct ResidueDisclosure {
     /// operation. The widened union covers the current cycle's crash window
     /// only. Same crypto-erased, opaque-prefix argument as R1.
     pub(crate) consumed_superseded_attempts: bool,
-    /// R3 — media objects PUT without a durable row. Unlike R1/R2 this is
-    /// **not** crypto-erased (each media object carries its own envelope) and
-    /// its key path is account-linkable. The content-write fence bounds it at
-    /// deletion time; a media create-ahead admission ledger closes it going
-    /// forward. This is the wording the data-processing statement must use.
+    /// R3 — media objects PUT without a durable row. Every production media PUT
+    /// is now preceded by the retained provider write-intent, and WAL deletion
+    /// durably fences/drains that family before proving both owned media
+    /// prefixes empty. This bit therefore remains in the stable disclosure
+    /// schema for old receipts but is false for current completions.
     pub(crate) media_put_without_record: bool,
 }
 
 impl ResidueDisclosure {
     /// What a WAL-authoritative deletion discloses today. R1 and R2 are
     /// structural properties of the current ledgers, not per-account
-    /// observations, so they are always disclosed; R3 is disclosed until every
-    /// one of the account's uploads postdates the media admission ledger,
-    /// which does not exist yet.
+    /// observations, so they are always disclosed. R3 is closed by the durable
+    /// media write-intent plus retained deletion marker and exact prefix drain.
     pub(crate) const fn current() -> Self {
         Self {
             genesis_staging_orphans: true,
             consumed_superseded_attempts: true,
-            media_put_without_record: true,
+            media_put_without_record: false,
         }
     }
 
@@ -227,15 +226,15 @@ pub(crate) trait ArchiveDeletionRuntime: Send + Sync {
 /// with. Concrete witnesses implement both already, so the blanket impl below
 /// is the only implementation anyone needs.
 pub(crate) trait DeletionLaneWitness: Send + Sync {
-    fn as_witness(&self) -> &dyn Witness;
+    fn as_deletion_witness(&self) -> &dyn AsyncDeletionWitness;
     fn as_inventory_witness(&self) -> &dyn DeletionInventoryWitness;
 }
 
 impl<T> DeletionLaneWitness for T
 where
-    T: Witness + DeletionInventoryWitness,
+    T: AsyncDeletionWitness + DeletionInventoryWitness,
 {
-    fn as_witness(&self) -> &dyn Witness {
+    fn as_deletion_witness(&self) -> &dyn AsyncDeletionWitness {
         self
     }
 
@@ -393,8 +392,9 @@ impl WalDeletionLane {
         // pins this worker identity. Already-tombstoned resumes instead.
         let credential = principal.credential().map_err(map_witness)?;
         let session = match witness
-            .as_witness()
-            .read_current(archive_id)
+            .as_deletion_witness()
+            .read_current_deletion(archive_id)
+            .await
             .map_err(map_witness)?
         {
             Some(record) if record.deletion() == DeletionState::Active => {
@@ -403,8 +403,9 @@ impl WalDeletionLane {
                     .stage_proof(DeletionState::Tombstoned)
                     .map_err(map_witness)?;
                 match witness
-                    .as_witness()
-                    .tombstone_current(advance, &credential, &proof)
+                    .as_deletion_witness()
+                    .tombstone_current_deletion(advance, &credential, &proof)
+                    .await
                 {
                     Ok(receipt) => DeletionSession::from_tombstone(&receipt)
                         .map_err(|_| deletion_driver_error())?,
@@ -422,8 +423,9 @@ impl WalDeletionLane {
             }
             Some(_) => {
                 let recovery = witness
-                    .as_witness()
-                    .resume_deletion(archive_id, &credential)
+                    .as_deletion_witness()
+                    .resume_deletion_async_boundary(archive_id, &credential)
+                    .await
                     .map_err(map_witness)?;
                 DeletionSession::from_recovery(&recovery).map_err(|_| deletion_driver_error())?
             }
@@ -583,7 +585,7 @@ impl WalDeletionLane {
             .map_err(map_witness)?;
         let receipt = match driver
             .run(
-                witness.as_witness(),
+                witness.as_deletion_witness(),
                 session,
                 &credential,
                 DeletionStageProofs {
@@ -1627,7 +1629,6 @@ mod tests {
             vec![
                 "r1_staging_orphans".to_string(),
                 "r2_consumed_superseded_attempts".to_string(),
-                "r3_media_put_without_record".to_string(),
             ]
         );
     }
@@ -1754,19 +1755,15 @@ mod tests {
         }
     }
 
-    /// Residue is disclosed, not dropped. All three surviving classes must be
-    /// named on every WAL-authoritative completion until the ledgers that
-    /// would make them enumerable exist.
+    /// Residue is disclosed, not dropped. The two crypto-erased archive upload
+    /// classes remain named; the retained media write-intent closes R3.
     #[test]
-    fn completion_discloses_every_surviving_residue_class() {
+    fn completion_discloses_only_the_surviving_residue_classes() {
         assert_eq!(
             ResidueDisclosure::current().flags(),
-            vec![
-                "r1_staging_orphans",
-                "r2_consumed_superseded_attempts",
-                "r3_media_put_without_record",
-            ]
+            vec!["r1_staging_orphans", "r2_consumed_superseded_attempts",]
         );
+        assert!(!ResidueDisclosure::current().media_put_without_record);
         assert!(ResidueDisclosure::default().flags().is_empty());
     }
 
@@ -1797,7 +1794,6 @@ mod tests {
             vec![
                 "r1_staging_orphans".to_string(),
                 "r2_consumed_superseded_attempts".to_string(),
-                "r3_media_put_without_record".to_string(),
             ]
         );
     }

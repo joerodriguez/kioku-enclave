@@ -1060,8 +1060,8 @@ async fn delete_account_content(
     // The durable ledger-backed lane predicate closes that window.
     if store.is_wal_authoritative(user_id) || control.wal_deletion_lane(user_id).await? {
         // The archive-v3 lane is the only correct erasure for this account.
-        // With a lane installed, drive it; without one — every image today —
-        // keep failing closed, because the alternative is the legacy sweep
+        // With a lane installed, drive it; without one — including the signed
+        // off-profile rollback image — keep failing closed, because the alternative is the legacy sweep
         // succeeding vacuously and finalization stamping the account complete
         // with the whole archive intact. The refusal is never removed, only
         // superseded by real deletion.
@@ -1513,8 +1513,8 @@ mod tests {
     /// The honest refusal is replaced by real deletion, never removed.
     ///
     /// With a lane installed the WAL-authoritative branch drives the archive-v3
-    /// ladder and reports the rung it reached; with no lane — every image
-    /// today — it still fails closed as `archive_v3_deletion_unwired`. Neither
+    /// ladder and reports the rung it reached; with no lane — the off-profile
+    /// rollback shape — it still fails closed as `archive_v3_deletion_unwired`. Neither
     /// arm can return `Ok`, which is what would let finalization stamp the
     /// account complete with the archive intact.
     #[tokio::test]

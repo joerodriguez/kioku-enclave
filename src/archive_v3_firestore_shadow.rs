@@ -9,7 +9,7 @@
 //! database namespace and its dedicated attestation audience.  Construction
 //! creates fixed-origin clients but performs no network request. The signed
 //! Genesis runtime constructs this bundle and releases only typed bootstrap,
-//! WAL-owner, and reviewed maintenance authority.
+//! WAL-owner, deletion-only, and reviewed maintenance authority.
 
 use std::{fmt, sync::Arc};
 
@@ -54,6 +54,25 @@ impl FirestoreShadowWitness {
         Ok(Self { witness })
     }
 
+    pub(crate) fn new_with_deletion_authority(
+        config: FirestoreWitnessConfig,
+        authenticator: Arc<dyn crate::archive_v3_witness::DeletionWorkerAuthenticator>,
+    ) -> Result<Self, WitnessError> {
+        let bearer = Arc::new(
+            FirestoreWitnessAttestationBearer::new(config.provider_audience())
+                .map_err(map_construction_error)?,
+        );
+        let transport = Arc::new(
+            FirestoreWitnessRestTransport::new(config.namespace())
+                .map_err(map_construction_error)?,
+        );
+        let witness = Arc::new(
+            FirestoreWitness::new(config, bearer, transport)?
+                .with_deletion_authority(authenticator),
+        );
+        Ok(Self { witness })
+    }
+
     /// Test-only wrap over a witness built on the shared protocol-faithful
     /// fake transport, for cross-module WAL-owner launch end-to-end tests.
     #[cfg(test)]
@@ -68,6 +87,16 @@ impl FirestoreShadowWitness {
     pub(crate) fn genesis_firestore_witness(
         &self,
         _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
+    ) -> Arc<FirestoreWitness> {
+        Arc::clone(&self.witness)
+    }
+
+    /// Token-gated release of the same fixed-origin witness for the production
+    /// account-deletion runtime. The token is constructible only by the sealed
+    /// archive-v3 runtime composer; ordinary Store/routes cannot mint it.
+    pub(crate) fn deletion_firestore_witness(
+        &self,
+        _token: &crate::archive_v3_shadow_runtime::DeletionRuntimeContext,
     ) -> Arc<FirestoreWitness> {
         Arc::clone(&self.witness)
     }

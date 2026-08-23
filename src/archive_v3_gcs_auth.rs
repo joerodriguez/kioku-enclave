@@ -1,15 +1,16 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 archive-GCS bearer is compiled and tested before runtime wiring"
+    reason = "active signed-runtime archive-GCS bearer retains test-only constructors"
 )]
 
-//! Inactive, dedicated Confidential Space bearer credentials for archive GCS.
+//! Dedicated Confidential Space bearer credentials for archive GCS.
 //!
 //! This is intentionally *not* the legacy GCS client identity, the KMS
 //! credential path, the public attestation path, or the Firestore-witness
 //! bearer source. It has no environment constructor, metadata/default
 //! credential fallback, service-account impersonation, Store/VFS/route
-//! connection, or runtime authority wiring. A typed, exact archive-GCS WIF
+//! connection, or caller-selected authority. The signed runtime alone supplies
+//! its typed, exact archive-GCS WIF
 //! audience is minted without a nonce and exchanged only at fixed Google STS
 //! for the fixed archive-GCS scope.
 

@@ -1,15 +1,15 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 Firestore witness bearer is compiled and unit-tested before runtime wiring"
+    reason = "active signed-runtime Firestore witness bearer retains test-only constructors"
 )]
 
-//! Inactive, dedicated Confidential Space bearer credentials for Firestore.
+//! Dedicated Confidential Space bearer credentials for Firestore.
 //!
 //! This module is intentionally separate from both KMS
 //! [`crate::attestation::AttestationCredentials`] and public attestation. It
 //! has no environment constructor, metadata-server fallback, service-account
-//! impersonation, KMS cache, Store/VFS/route connection, or authority wiring.
-//! It mints a no-nonce launcher OIDC token only for the exact dedicated
+//! impersonation, KMS cache, Store/VFS/route connection, or caller-selected
+//! authority. The signed runtime mints a no-nonce launcher OIDC token only for the exact dedicated
 //! [`FirestoreWitnessAudience`], then exchanges it at the fixed Google STS
 //! endpoint for a short-lived Firestore bearer token.
 

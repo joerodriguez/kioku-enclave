@@ -1,9 +1,9 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 registry KMS adapter is compiled and tested before provider or runtime wiring"
+    reason = "active signed-runtime registry KMS adapter retains test-only constructors"
 )]
 
-//! Inactive Cloud KMS adapter for archive-v3 key-registry envelopes.
+//! Cloud KMS adapter for archive-v3 key-registry envelopes.
 //!
 //! The live legacy [`crate::crypto::KmsClient`] remains unchanged. This seam
 //! accepts only one numeric version below the exact already-configured KMS
@@ -14,8 +14,8 @@
 //! discriminators, so a later decrypt cannot silently select a different key
 //! coordinate.
 //!
-//! This module has no environment constructor, startup construction, Store,
-//! GCS, Firestore, route, witness, bootstrap, or archive authority wiring.
+//! This module has no environment constructor, Store, route, or caller-selected
+//! authority; the signed runtime supplies the fixed KMS version and archive providers.
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -192,7 +192,7 @@ impl ArchiveRegistryKmsWire for GcpArchiveRegistryKmsWire {
     }
 }
 
-/// Exact, inactive archive-registry KMS adapter. Debug never exposes the key
+/// Exact signed-runtime archive-registry KMS adapter. Debug never exposes the key
 /// coordinate, archive context, ciphertext, or plaintext.
 pub(crate) struct GcpArchiveV3RegistryKms {
     key_name: String,

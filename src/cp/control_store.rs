@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::{
     archive_v3::{
@@ -48,7 +49,7 @@ use crate::{
     },
     archive_v3_lifecycle_page_store::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
-        PageCreateDisposition, RecoveredPageCreatePlan,
+        LifecyclePageControlKey, PageCreateDisposition, RecoveredPageCreatePlan,
     },
     archive_v3_maintenance_import::{
         operation_commitment_for_control, AuthenticatedMaintenanceImportPlan,
@@ -83,7 +84,7 @@ use crate::{
         WitnessedWalCandidate, MAX_CHECKPOINT_ARTIFACTS, MAX_WAL_OWNER_ARTIFACTS,
         MAX_WAL_OWNER_ATTEMPTS,
     },
-    archive_v3_witness::AuthenticatedWalRootAdvance,
+    archive_v3_witness::{AuthenticatedWalRootAdvance, DeletionPrincipalKey},
     archive_v3_witness_disposition::{
         AuthenticatedPreWitnessAbsence, ClosedWitnessPhase, ClosedWitnessProtocol,
         ExactNoneObservation, PreWitnessControlState, PreWitnessDispositionControl,
@@ -3380,6 +3381,15 @@ impl LifecyclePersistenceContext {
     fn validated() -> Self {
         Self(())
     }
+}
+
+/// Runtime-only deletion secrets derived from the exact KMS-unwrapped Control
+/// generation. Neither key exposes its bytes, implements `Clone`, or is ever
+/// persisted; `Arc` only lets all per-archive deletion runtimes in this one
+/// process share the same already-derived roots.
+pub(crate) struct ArchiveDeletionRuntimeSecrets {
+    pub(crate) principal_key: Arc<DeletionPrincipalKey>,
+    pub(crate) lifecycle_page_key: Arc<LifecyclePageControlKey>,
 }
 
 impl ArchiveLifecycleState {
@@ -18592,7 +18602,7 @@ fn claim_identity_rebind_deletion_conn(conn: &Connection, user_id: &str) -> Resu
     Ok(claimed.stage >= IdentityRebindStage::DeletionPending)
 }
 
-/// Insert one random binding plus its inactive deletion-ledger row in the
+/// Insert one random binding plus its deletion-lifecycle row in the
 /// caller's transaction. Existing same-user state is idempotently validated;
 /// a random ID owned by another user consumes one bounded retry.
 fn create_active_archive_binding_with_candidates<F>(
@@ -19644,6 +19654,36 @@ impl ControlStore {
                 }
             }
         }
+    }
+
+    /// Load the durable Control generation and derive the two domain-separated
+    /// account-deletion roots from its KMS-unwrapped DEK. This method performs
+    /// no archive/provider I/O and returns no raw key bytes.
+    pub(crate) async fn archive_deletion_runtime_secrets(
+        &self,
+    ) -> Result<ArchiveDeletionRuntimeSecrets> {
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.load().await?);
+        }
+        let wrapped = guard
+            .as_ref()
+            .ok_or_else(|| EnclaveError::Store("control handle disappeared".into()))?
+            .meta
+            .wrapped_dek_b64
+            .clone();
+        let dek = load_dek(self.kms.as_ref(), &wrapped).await?;
+        let principal_key = DeletionPrincipalKey::derive_from_control_root(&dek.0)
+            .map_err(|_| EnclaveError::Store("deletion principal key derivation failed".into()))?;
+        let lifecycle_page_key = LifecyclePageControlKey::from_loaded_control_generation(
+            &LifecyclePersistenceContext::validated(),
+            Zeroizing::new(dek.0),
+        )
+        .map_err(|_| EnclaveError::Store("lifecycle page key derivation failed".into()))?;
+        Ok(ArchiveDeletionRuntimeSecrets {
+            principal_key: Arc::new(principal_key),
+            lifecycle_page_key: Arc::new(lifecycle_page_key),
+        })
     }
 
     async fn identity_rebind_fence_object_name(&self, user_id: &str) -> Result<String> {
@@ -22389,12 +22429,10 @@ impl ControlStore {
             .await
     }
 
-    /// Archive-v3 lifecycle methods. They mutate only the encrypted control
-    /// ledger and are intentionally not called by startup, Store, or routes;
-    /// their sole consumer is this store's `ArchiveLifecycleLedger` impl,
-    /// which the inactive genesis backend composite delegates to. Account
-    /// deletion only atomically freezes an already-existing inactive anchor;
-    /// it constructs no runtime.
+    /// Archive-v3 lifecycle methods. They mutate only the encrypted Control
+    /// ledger; Genesis and the installed deletion lane reach them through the
+    /// narrow lifecycle traits. Store and routes cannot mint their receipts,
+    /// select providers, or construct a runtime.
     pub(crate) async fn reserve_archive_bootstrap(
         &self,
         plan: BootstrapPlan,
@@ -26000,6 +26038,23 @@ mod tests {
     const GOOGLE_SUB: &str = "google-subject-123";
     const OPERATION_ID: &str =
         "del_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn deletion_runtime_roots_derive_from_the_loaded_control_generation() {
+        let control = ControlStore::new(
+            Arc::new(crate::store::tests::FakeKms),
+            Arc::new(crate::store::tests::FakeGcs::new()),
+        );
+        let roots = control.archive_deletion_runtime_secrets().await.unwrap();
+        assert_eq!(
+            format!("{:?}", roots.principal_key),
+            "DeletionPrincipalKey(<opaque>)"
+        );
+        assert_eq!(
+            format!("{:?}", roots.lifecycle_page_key),
+            "LifecyclePageControlKey(<opaque>)"
+        );
+    }
 
     struct PausingGcs {
         inner: Arc<crate::store::tests::FakeGcs>,

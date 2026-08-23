@@ -944,6 +944,40 @@ async fn async_main() {
         .initialize_legacy_fence_key()
         .await
         .unwrap_or_else(|error| panic!("Failed to initialize legacy fence key: {error}"));
+
+    // ADR-0022 Group D: install the exact archive-v3 deletion runtime before
+    // any selected account can enter deletion or the startup reconciler can
+    // revisit an interrupted operation. Off-profile images install nothing;
+    // an active but malformed runtime fails startup closed. The principal and
+    // lifecycle-page roots are derived from the durable encrypted Control DEK
+    // and no raw key material escapes this composition.
+    if let Some(deployment) =
+        archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeDeployment::from_baked_env()
+            .unwrap_or_else(|error| panic!("Failed to validate deletion runtime: {error}"))
+    {
+        let secrets = control_store
+            .archive_deletion_runtime_secrets()
+            .await
+            .unwrap_or_else(|error| panic!("Failed to derive deletion runtime keys: {error}"));
+        let factory = Arc::new(
+            archive_v3_shadow_runtime::ProductionArchiveDeletionRuntimeFactory::new(
+                deployment,
+                Arc::clone(&concrete_kms),
+                Arc::clone(&control_store),
+                secrets.lifecycle_page_key,
+                Arc::clone(&secrets.principal_key),
+            ),
+        );
+        store
+            .install_wal_deletion_lane(Arc::new(archive_v3_deletion_lane::WalDeletionLane::new(
+                secrets.principal_key,
+                factory,
+            )))
+            .unwrap_or_else(|error| {
+                panic!("Failed to install archive-v3 deletion runtime: {error}")
+            });
+        info!("archive-v3 account deletion runtime installed");
+    }
     Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
     let recovered_rebinds = control_store
         .reconcile_pending_identity_rebinds()

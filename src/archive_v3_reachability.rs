@@ -1,9 +1,9 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 authenticated reachability visitor is compiled and fake-tested before lifecycle integration"
+    reason = "active deletion-only reachability visitor retains test-only graph fixtures"
 )]
 
-//! Inactive, non-authorizing authenticated reachability visitor for ADR-0022.
+//! Non-authorizing authenticated reachability visitor for ADR-0022 deletion.
 //!
 //! The visitor starts only from the current and optional predecessor roots in
 //! one witness-produced [`RecoveryRoot`]. It follows exact authenticated

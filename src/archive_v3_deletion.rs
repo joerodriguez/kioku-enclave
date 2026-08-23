@@ -1,16 +1,16 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 deletion driver is compiled and fake-tested before authority wiring"
+    reason = "active ADR-0022 deletion driver retains test-only recovery constructors and protocol witnesses"
 )]
 
-//! Inactive, witness-fenced archive-v3 deletion driver.
+//! Witness-fenced archive-v3 deletion driver.
 //!
 //! This is deliberately a narrow coordinator, not a control-plane deletion
 //! route. It accepts a deletion session only after an exact-current witness
 //! tombstone/restart authorization and a durable lifecycle inventory seal; it
 //! has no account/user identifiers, raw
 //! prefix selector, list-all operation, Store connection, credentials, or
-//! constructor I/O. The separate inactive inventory coordinator authenticates
+//! constructor I/O. The separate deletion inventory coordinator authenticates
 //! exact-name reachability, unions every frozen create-ahead row, and loads the
 //! bounded canonical lifecycle-page inventory. The driver then deletes
 //! each exact object and its permanent ID claim through all generations using
@@ -24,9 +24,10 @@
 //! carry enough location fields to derive every descendant `ObjectContext`
 //! from an object ID alone (notably checkpoint IDs/ranges and extent-tree
 //! ranges).  Consequently this module intentionally does *not* infer keys or
-//! list an archive prefix. The authenticated lifecycle-page loader is compiled
-//! but no runtime constructs it or invokes this driver, so the path remains
-//! inactive and fails closed.
+//! list an archive prefix. The signed single-archive runtime constructs the
+//! authenticated lifecycle-page loader and invokes this driver only from the
+//! account-deletion lane. Off-profile images construct neither and retain the
+//! explicit pending refusal.
 
 use crate::{
     archive_v3::{
@@ -38,9 +39,9 @@ use crate::{
         DeletionInventorySeal, LifecycleInventoryObject, PhysicalDeletionReceipt,
     },
     archive_v3_witness::{
-        DeletionAdvance, DeletionAuthorization, DeletionExecutionBinding, DeletionRecovery,
-        DeletionStageProof, DeletionState, DeletionWorkerCredential, KeyRegistryReference,
-        RootCommitment, TombstoneReceipt, Witness, WitnessError, WitnessRecord,
+        AsyncDeletionWitness, DeletionAdvance, DeletionAuthorization, DeletionExecutionBinding,
+        DeletionRecovery, DeletionStageProof, DeletionState, DeletionWorkerCredential,
+        KeyRegistryReference, RootCommitment, TombstoneReceipt, WitnessError, WitnessRecord,
     },
 };
 use sha2::{Digest, Sha256};
@@ -678,7 +679,8 @@ pub(crate) struct DeletionStageProofs<'a> {
 }
 
 /// Constructs dependencies only. It performs no storage, witness, KMS, or
-/// provider I/O. No production caller constructs this inactive coordinator.
+/// provider I/O. The installed deletion lane constructs it from sealed runtime
+/// dependencies after authenticating the lifecycle inventory.
 pub(crate) struct ArchiveV3DeletionDriver {
     metadata: Arc<dyn SealedArchiveInventoryLedger>,
     provider: Arc<dyn ArchiveV3ExactDeletionProvider>,
@@ -713,7 +715,7 @@ impl ArchiveV3DeletionDriver {
     /// witness rather than guessing/replaying a generation mutation.
     pub(crate) async fn run(
         &self,
-        witness: &dyn Witness,
+        witness: &dyn AsyncDeletionWitness,
         mut session: DeletionSession,
         credential: &DeletionWorkerCredential,
         proofs: DeletionStageProofs<'_>,
@@ -731,7 +733,7 @@ impl ArchiveV3DeletionDriver {
                         return Err(ArchiveDeletionError::ProviderMismatch);
                     }
                     let execution =
-                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                        fresh_execution_context(witness, &session, credential, &inventory).await?;
                     let authorized = inventory.authorize(execution)?;
                     self.reconcile_registry_inventory(&context, &authorized)
                         .await?;
@@ -745,7 +747,8 @@ impl ArchiveV3DeletionDriver {
                         DeletionState::CryptographicallyErased,
                         credential,
                         &key_erasure,
-                    )?;
+                    )
+                    .await?;
                 }
                 DeletionState::CryptographicallyErased => {
                     let inventory = self
@@ -759,7 +762,7 @@ impl ArchiveV3DeletionDriver {
                         return Err(ArchiveDeletionError::ProviderMismatch);
                     }
                     let execution =
-                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                        fresh_execution_context(witness, &session, credential, &inventory).await?;
                     let authorized = inventory.authorize(execution)?;
                     self.reconcile_exact_inventory(&authorized).await?;
                     session.record = advance(
@@ -768,7 +771,8 @@ impl ArchiveV3DeletionDriver {
                         DeletionState::LogicalObjectsAbsent,
                         credential,
                         proofs.inventory,
-                    )?;
+                    )
+                    .await?;
                 }
                 DeletionState::LogicalObjectsAbsent => {
                     let inventory = self
@@ -782,7 +786,7 @@ impl ArchiveV3DeletionDriver {
                         return Err(ArchiveDeletionError::ProviderMismatch);
                     }
                     let execution =
-                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                        fresh_execution_context(witness, &session, credential, &inventory).await?;
                     let authorized = inventory.authorize(execution)?;
                     // Restart-safe final recheck: physical completion is not
                     // inferred from a previous in-memory deletion loop. The
@@ -806,7 +810,8 @@ impl ArchiveV3DeletionDriver {
                         DeletionState::PhysicalComplete,
                         credential,
                         &retention,
-                    )?;
+                    )
+                    .await?;
                     if record.deletion() != DeletionState::PhysicalComplete {
                         return Err(ArchiveDeletionError::Witness);
                     }
@@ -827,7 +832,7 @@ impl ArchiveV3DeletionDriver {
                         return Err(ArchiveDeletionError::ProviderMismatch);
                     }
                     let execution =
-                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                        fresh_execution_context(witness, &session, credential, &inventory).await?;
                     let authorized = inventory.authorize(execution)?;
                     let drain = self
                         .provider
@@ -843,11 +848,12 @@ impl ArchiveV3DeletionDriver {
                     }
                     let retention = drain.into_retention_stage(&authorized)?;
                     let verified = witness
-                        .verify_physical_completion(
+                        .verify_physical_completion_async_boundary(
                             session.record.archive_id(),
                             credential,
                             &retention,
                         )
+                        .await
                         .map_err(map_witness_error)?;
                     if verified.receipt().record() != &session.record {
                         return Err(ArchiveDeletionError::StaleSession);
@@ -974,15 +980,15 @@ impl ArchiveV3DeletionDriver {
     }
 }
 
-fn advance(
-    witness: &dyn Witness,
+async fn advance(
+    witness: &dyn AsyncDeletionWitness,
     session: &DeletionSession,
     next: DeletionState,
     credential: &DeletionWorkerCredential,
     proof: &DeletionStageProof,
 ) -> Result<WitnessRecord> {
     witness
-        .advance_deletion(
+        .advance_deletion_async_boundary(
             DeletionAdvance::new(
                 session.authorization,
                 session.record.root(),
@@ -992,18 +998,20 @@ fn advance(
             credential,
             proof,
         )
+        .await
         .map(|receipt| receipt.record().clone())
         .map_err(map_witness_error)
 }
 
-fn fresh_execution_context(
-    witness: &dyn Witness,
+async fn fresh_execution_context(
+    witness: &dyn AsyncDeletionWitness,
     session: &DeletionSession,
     credential: &DeletionWorkerCredential,
     inventory: &CompleteDeletionInventory,
 ) -> Result<DeletionExecutionContext> {
     let recovery = witness
-        .resume_deletion(session.record.archive_id(), credential)
+        .resume_deletion_async_boundary(session.record.archive_id(), credential)
+        .await
         .map_err(map_witness_error)?;
     if recovery.receipt().record() != &session.record
         || recovery.authorization() != session.authorization
@@ -2152,6 +2160,7 @@ mod tests {
         .unwrap();
         let execution =
             fresh_execution_context(&fixture.witness, &session, &fixture.credential, &inventory)
+                .await
                 .unwrap();
         let authorized = inventory.authorize(execution).unwrap();
         let valid = authorized.entry(0).unwrap();

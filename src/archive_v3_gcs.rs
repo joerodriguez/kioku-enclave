@@ -1,13 +1,13 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 transport boundary is compiled and unit-tested before runtime wiring"
+    reason = "ADR-0022 transport boundary retains test-only and future extent protocol surfaces"
 )]
 
-//! Inactive ADR-0022 GCS adapter boundary.
+//! ADR-0022 GCS adapter boundary.
 //!
-//! This module has production-safe *semantics* and test fakes. Its concrete
-//! sibling HTTP transport is also compiled and tested, but neither is wired to
-//! Store, routes, the VFS, the witness, authority, Terraform, or deployment.
+//! The signed WAL and deletion runtimes use its exact-name provider traits and
+//! concrete sibling HTTP transport. Neither exposes a Store, route, VFS,
+//! Terraform, or request-selectable authority surface.
 
 use crate::{
     archive_v3::{
@@ -171,6 +171,44 @@ pub(crate) trait ArchiveV3GcsTransport: Send + Sync {
         _object_id: ObjectId,
     ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
         Err(GcsArchiveV3TransportError::Protocol)
+    }
+}
+
+/// Exact authenticated reachability reader over the already reviewed archive
+/// transport. It forwards only one canonical [`ObjectKey`] and one explicit
+/// response bound; provider listing and mutation remain absent.
+pub(crate) struct GcsExactReachabilityReader {
+    transport: Arc<dyn ArchiveV3GcsTransport>,
+}
+
+impl GcsExactReachabilityReader {
+    pub(crate) fn new(transport: Arc<dyn ArchiveV3GcsTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::archive_v3_reachability::ExactReachabilityReader for GcsExactReachabilityReader {
+    async fn read_exact(
+        &self,
+        key: &ObjectKey,
+        max_encoded_bytes: usize,
+    ) -> std::result::Result<
+        Option<Vec<u8>>,
+        crate::archive_v3_reachability::ExactReachabilityReadError,
+    > {
+        use crate::archive_v3_reachability::ExactReachabilityReadError as ReadError;
+        self.transport
+            .read_exact(key.as_str(), max_encoded_bytes)
+            .await
+            .map_err(|error| match error {
+                GcsArchiveV3TransportError::Unavailable
+                | GcsArchiveV3TransportError::OutcomeUnknown => ReadError::Unavailable,
+                GcsArchiveV3TransportError::TooLarge => ReadError::TooLarge,
+                GcsArchiveV3TransportError::NotFound
+                | GcsArchiveV3TransportError::PreconditionFailed
+                | GcsArchiveV3TransportError::Protocol => ReadError::Protocol,
+            })
     }
 }
 
