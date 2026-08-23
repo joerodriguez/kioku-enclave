@@ -177,7 +177,11 @@ def operator_values(
         selected_configuration(
             "production",
             values,
-            source_ref="HEAD",
+            # This migration validates the deployed image's ordinary
+            # production coordinates. Release-only profiles are selected only
+            # while building their exact signed tag, never from an ambient
+            # checkout name such as HEAD.
+            source_ref="main",
             probe_config_path=ROOT / "config/archive-witness-probe.json",
             shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
         )
