@@ -71,9 +71,19 @@
   exact row and attempt untouched for a later sweep.
 - [x] Retain only fixed-size replay results in the bounded ledger; transcript,
   media, keys, diagnostics, and vector bytes do not enter permanent receipts.
-- [ ] Migrate the separately gated voice-profile assignment/reconciliation
-  owner, then the people/person-fact owner, before public speaker readiness or
-  a production image can be claimed complete.
+- [x] Migrate the provider-free voice-profile assignment/reconciliation owner:
+  exact historical lineage backfill, bounded deterministic sample assignment,
+  representative repair/quarantine, imported-action refusal, and episode
+  speaker-readiness settlement now route through the selected archive.
+- [x] Migrate literal self-identification and people/person facts: audio v3
+  freezes only same-turn transcript-literal evidence into an unbound proposal;
+  after one exact active voice profile exists, the provider-free profile owner
+  full-row reauthenticates the transcript/observation/sample/profile/person
+  closure and allocator pins, then atomically accepts one active historical
+  binding, name claim, bounded facts, observation/cluster/profile identity and
+  public roster state. Conflicts abstain, malformed evidence terminal-rejects,
+  repeated evidence supersedes exactly one active binding, and replay cannot
+  duplicate or partially expose a person.
 
 ## Encrypted lifecycle page-store seam
 

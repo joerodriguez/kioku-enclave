@@ -140,7 +140,7 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
 /// for every selected user with audio. The probe runs BEFORE the claim, so a
 /// blocked lane makes no claim, no reservation and no paid call.
 ///
-/// The probe asks whether all five tables ARE `AUTOINCREMENT`, by reading their
+/// The probe asks whether all six tables ARE `AUTOINCREMENT`, by reading their
 /// DDL — never whether they currently HAVE `sqlite_sequence` rows.
 ///
 /// That distinction is the whole correctness of this gate. SQLite creates a
@@ -161,6 +161,7 @@ pub(in crate::cp::media_worker) fn audio_sequence_gate_open(connection: &Connect
         "speaker_observations",
         "utterances",
         "voice_embedding_jobs",
+        "identity_evidence",
     ]
     .iter()
     .all(|table| {
@@ -2766,7 +2767,7 @@ pub(in crate::cp::media_worker) mod tests {
             "plain INTEGER PRIMARY KEY stays blocked even with rows present"
         );
 
-        // One of the five converted is not enough.
+        // One of the six converted is not enough.
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         connection
@@ -2777,7 +2778,7 @@ pub(in crate::cp::media_worker) mod tests {
             .unwrap();
         assert!(
             !audio_sequence_gate_open(&connection),
-            "one of the five tables is not enough"
+            "one of the six tables is not enough"
         );
 
         // A missing or plain-primary-key embedding-job allocator must block
@@ -2790,7 +2791,8 @@ pub(in crate::cp::media_worker) mod tests {
                 "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE identity_evidence(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
             )
             .unwrap();
         assert!(!audio_sequence_gate_open(&connection));
@@ -2802,7 +2804,7 @@ pub(in crate::cp::media_worker) mod tests {
             .unwrap();
         assert!(!audio_sequence_gate_open(&connection));
 
-        // THE DEADLOCK CASE: all five AUTOINCREMENT and EMPTY.
+        // THE DEADLOCK CASE: all six AUTOINCREMENT and EMPTY.
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         connection
@@ -2811,14 +2813,15 @@ pub(in crate::cp::media_worker) mod tests {
                  CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE identity_evidence(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
             )
             .unwrap();
         let sequence_rows: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_sequence \
                  WHERE name IN ('audio_segments','speaker_clusters','speaker_observations',
-                                'utterances','voice_embedding_jobs')",
+                                'utterances','voice_embedding_jobs','identity_evidence')",
                 [],
                 |row| row.get(0),
             )
@@ -2978,7 +2981,8 @@ pub(in crate::cp::media_worker) mod tests {
                  CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE identity_evidence(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
             )
             .unwrap();
         let (started, ended): (String, String) = connection

@@ -1,9 +1,9 @@
 #![allow(
     dead_code,
-    reason = "construction-only ADR-0022 runtime bundle is intentionally not wired to startup or authority"
+    reason = "the conditionally active runtime retains sealed migration-only capability variants"
 )]
 
-//! Sealed, inactive ADR-0022 single-archive shadow/WAL runtime composition.
+//! Sealed ADR-0022 single-archive WAL runtime composition.
 //!
 //! This module accepts only typed deployment fragments and builds the fixed
 //! archive-GCS, registry-KMS, and named-Firestore provider graph. Construction
@@ -18,9 +18,10 @@
 //! slice supplies authenticated lifecycle evidence.
 //! The sealed owner has two type-separated consumers: an advisory importer
 //! that can stop only at verified ShadowWal, and the later authority importer.
-//! The advisory handoff may then be consumed by a second token-gated view that
-//! exposes only exact witness read/acquire/same-owner-maintain. None has a
-//! startup caller.
+//! The signed active image profile is consumed only by startup relaunch and the
+//! Genesis trigger. The deleted advisory path cannot be reconstructed; the
+//! surviving maintenance-only variants remain token-gated and are not selected
+//! by the Genesis-first rollout.
 
 use std::{fmt, sync::Arc};
 
@@ -346,8 +347,8 @@ impl ArchiveV3ShadowRuntimeBundle {
     }
 
     /// Token-gated release of the exact-root reader for the reviewed genesis
-    /// backend composition. The token has no production minter today, so this
-    /// stays unreachable until that module's launcher slice mints one.
+    /// backend composition. The Genesis trigger is the token's sole
+    /// production minter.
     pub(crate) fn genesis_exact_roots(
         &self,
         _token: &crate::archive_v3_genesis_backend::GenesisBackendRuntimeContext,
@@ -389,9 +390,8 @@ impl ArchiveV3ShadowRuntimeBundle {
     }
 
     /// Token-gated release of the exact witness-advance provider for the
-    /// reviewed genesis witness ladder (G6). Like the two accessors above,
-    /// the token has no production minter today, so this stays unreachable
-    /// until the genesis backend module's launcher slice mints one. `None`
+    /// reviewed genesis witness ladder (G6). Like the accessors above, this is
+    /// reachable only through the Genesis trigger's private token. `None`
     /// outside the production constructor.
     pub(crate) fn genesis_witness_advance(
         &self,

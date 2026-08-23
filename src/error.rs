@@ -121,9 +121,6 @@ impl std::fmt::Display for DeletionPending {
 /// spin this module exists to prevent.
 pub mod wal_domain {
     // ── Background workers ──────────────────────────────────────────────────
-    /// The bounded voice-profile reconciliation and lineage tail at the end of
-    /// `media_worker::process_user`, after the migrated work-unit lanes.
-    pub const MEDIA_WORKER_VOICE_PROFILES: &str = "media_worker.voice_profiles";
     // The summarizer window (`summarizer.window`) and its ADR-0034
     // settled-tail gate (`summarizer.session_settled_gate`) were registered
     // here until their evidence reads migrated. Both are routed now — the
@@ -223,54 +220,15 @@ pub mod wal_domain {
     // writers) AND already routed, so each lifted as the one-line deletion
     // this block promised. `sync.export` is the widest of them and lifted on
     // the same evidence rather than a fortiori against it: its dominant
-    // collections carry rows, and the arrays that stay empty (`people`,
-    // `person_facts`, `voice_profiles`) are empty because those rows do not
-    // exist, which is what an export is for.
+    // collections carry rows. The last four people reads have now lifted as
+    // well: audio v3 freezes only literal high-confidence self-identification,
+    // and the provider-free VoiceProfile family exact-commits the corresponding
+    // person, accepted name claim, facts, and profile binding. A selected
+    // empty roster is therefore answerable rather than a deferred writer gap.
     //
-    /// The four people reads (`list_people`, `person_profile`,
-    /// `person_evidence`, `person_statements`). Ingest migrating does NOT lift
-    /// this one, and neither does the voice work — the blocker is elsewhere.
-    ///
-    /// **The writers.** Every production `people` row comes from
-    /// `media_worker::create_person` and every `person_facts` row from
-    /// `media_worker::persist_person_fact`. Both are reached ONLY from the
-    /// audio and screen RESULT lanes — `persist_audio_window_result` (directly,
-    /// and via `corroborated_active_screen_person`) and
-    /// `persist_storyboard_results` -> `persist_screen_result_body` ->
-    /// `promote_screen_name_if_corroborated`. Neither voice domain writes
-    /// either table: the only `INSERT INTO people` in `voice_lineage.rs` is
-    /// inside `mod tests`. `init_schema`'s one seeded row (`kind='owner'`) does
-    /// not count — it defaults to `status='unknown'` and every one of these
-    /// reads requires `status='identified'`.
-    ///
-    /// **Why retention is still correct even though those lanes are declared
-    /// migrated.** The sealed result families deliberately commit NO identity,
-    /// and the exclusion is structural rather than conditional:
-    /// `media_worker::wal::audio_result::AudioTurnFact` has no constructor slot
-    /// for `speaker_name*` or `person_facts` at all, and the screen family's
-    /// subtype is literally `screen-storyboard-no-people-v1`. For a selected
-    /// user `process_work_unit` returns early into
-    /// `settle_audio_window_transcript` / `settle_screen_storyboard_result`, so
-    /// the two legacy persisters that DO write these tables are unreachable.
-    /// A routed read would therefore answer `200 {"people": []}` — a refusal
-    /// wearing the face of "you know nobody", the exact shape the rule forbids.
-    ///
-    /// That exclusion is enforced, not merely intended:
-    /// `audio_result::tests::e2_identity_exclusion_red_line_holds_after_apply`
-    /// asserts zero rows in `people`, `person_facts` and every voice table
-    /// after a transcript apply, and `test_wal_idempotency_gate.py` refuses an
-    /// `INSERT INTO people` anywhere in the screen family's production half.
-    /// A change that lifts this gate has to move one of those two first.
-    ///
-    /// **What actually lifts it.** A sealed WAL family that commits `people`
-    /// and `person_facts` for a selected user, wired into those two settles.
-    /// Migrating selected voice embedding and
-    /// `MEDIA_WORKER_VOICE_PROFILES` is NOT sufficient and never was: the
-    /// listing LEFT JOINs `voice_profiles`, so those lanes can only change a
-    /// count on a row that already exists. Lifting on them would leave
-    /// `GET /api/v2/people` permanently answering an authoritative-looking
-    /// empty roster.
-    pub const MEDIA_PEOPLE: &str = "media.people";
+    // No production D4 domain remains registered. Keep this empty module as
+    // the stable home for the generic refusal machinery and as an explicit
+    // assertion that a future deferred domain must be reviewed and named here.
 }
 
 /// The stable machine-readable reason a refused deferred domain reports. It is
@@ -444,6 +402,8 @@ pub type Result<T> = std::result::Result<T, EnclaveError>;
 mod tests {
     use super::*;
 
+    const TEST_DEFERRED_DOMAIN: &str = "test.deferred";
+
     async fn response_body(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024)
             .await
@@ -457,12 +417,11 @@ mod tests {
     /// can retry rather than conclude the data is gone.
     #[tokio::test]
     async fn a_deferred_domain_answers_503_naming_the_domain() {
-        let response = EnclaveError::wal_domain_unmigrated(wal_domain::MEDIA_WORKER_VOICE_PROFILES)
-            .into_response();
+        let response = EnclaveError::wal_domain_unmigrated(TEST_DEFERRED_DOMAIN).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response_body(response).await;
         assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_WORKER_VOICE_PROFILES);
+        assert_eq!(body["domain"], TEST_DEFERRED_DOMAIN);
     }
 
     /// The generic arm answers an opaque 500 `internal error`. A deferral
@@ -470,10 +429,7 @@ mod tests {
     /// exactly the failure D4 exists to prevent.
     #[tokio::test]
     async fn a_deferred_domain_never_falls_into_the_generic_internal_error() {
-        for domain in [
-            wal_domain::MEDIA_WORKER_VOICE_PROFILES,
-            wal_domain::MEDIA_PEOPLE,
-        ] {
+        for domain in [TEST_DEFERRED_DOMAIN] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
             assert_eq!(
                 response.status(),
@@ -494,20 +450,13 @@ mod tests {
     /// Every registered domain name is stable, machine-readable, and unique:
     /// they are metric labels and response fields, not prose.
     #[test]
-    fn every_registered_domain_name_is_a_unique_stable_token() {
-        let domains = [
-            wal_domain::MEDIA_WORKER_VOICE_PROFILES,
-            wal_domain::MEDIA_PEOPLE,
-        ];
-        let unique = domains.iter().collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), domains.len(), "domain names must be unique");
-        for domain in domains {
-            assert!(
-                domain
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'.' | b'_')),
-                "{domain} is not a stable machine-readable token"
-            );
-        }
+    fn the_production_deferred_domain_registry_is_empty() {
+        let registry_source = include_str!("error.rs");
+        let registry = registry_source
+            .split_once("pub mod wal_domain {")
+            .and_then(|(_, tail)| tail.split_once("/// The stable machine-readable reason"))
+            .map(|(body, _)| body)
+            .expect("the named registry module must remain present");
+        assert!(!registry.contains("pub const "));
     }
 }

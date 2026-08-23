@@ -463,8 +463,8 @@ pub struct CpState {
 }
 
 impl CpState {
-    /// ADR-0022 D4 — the unmigrated-domain gate for a background worker's
-    /// per-user pass.
+    /// ADR-0022 D4 — the generic unmigrated-domain gate for a future
+    /// background-worker domain. The current production registry is empty.
     ///
     /// `true` means `domain` still reaches its rows through the legacy
     /// per-user store and this user's archive is WAL-authoritative, so the
@@ -474,10 +474,14 @@ impl CpState {
     /// nothing. Call it once per pass, never once per inner iteration, or the
     /// "exactly one counted skip per pass" contract breaks.
     ///
-    /// Gate the deferred domain, not the worker: several of these workers
+    /// Gate a newly deferred domain, not the worker: several workers
     /// already route migrated domains through `wal_authoritative_read` /
     /// `wal_authoritative_submit`, and gating one of those off would silently
     /// disable live work.
+    #[allow(
+        dead_code,
+        reason = "the empty D4 registry keeps one reviewed fail-closed worker gate for a future explicitly named domain"
+    )]
     pub(crate) fn wal_domain_skipped(&self, user_id: &str, domain: &'static str) -> bool {
         if !self.store.is_wal_authoritative(user_id) {
             return false;
@@ -491,12 +495,17 @@ impl CpState {
         true
     }
 
-    /// ADR-0022 D4 — the same gate on a request path.
+    /// ADR-0022 D4 — the same generic gate on a request path. No current
+    /// production request owner calls it with a registered domain.
     ///
     /// `Some(error)` refuses with the distinguishable 503 that names the
     /// domain; `None` means the legacy path is safe for this user. The
     /// refusal is counted where it becomes a response, so this returns the
     /// error rather than logging it here.
+    #[allow(
+        dead_code,
+        reason = "the empty D4 registry keeps one reviewed fail-closed request gate for a future explicitly named domain"
+    )]
     pub(crate) fn wal_domain_refusal(
         &self,
         user_id: &str,
@@ -957,12 +966,14 @@ pub(crate) mod wal_gate_test_support {
 #[cfg(test)]
 mod tests {
     use super::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-    use crate::error::{wal_domain, EnclaveError};
+    use crate::error::EnclaveError;
+
+    const TEST_DEFERRED_DOMAIN: &str = "test.deferred";
 
     #[test]
     fn the_worker_gate_is_inert_until_the_user_is_selected_then_counts_one_skip() {
         let state = state();
-        let domain = wal_domain::MEDIA_WORKER_VOICE_PROFILES;
+        let domain = TEST_DEFERRED_DOMAIN;
         let (captured, guard) = capture_events();
         assert!(
             !state.wal_domain_skipped("unselected-user", domain),
@@ -986,7 +997,7 @@ mod tests {
     #[test]
     fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
         let state = state();
-        let domain = wal_domain::MEDIA_WORKER_VOICE_PROFILES;
+        let domain = TEST_DEFERRED_DOMAIN;
         assert!(state
             .wal_domain_refusal("unselected-user", domain)
             .is_none());

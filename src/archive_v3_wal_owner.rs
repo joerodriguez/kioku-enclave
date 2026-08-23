@@ -1,18 +1,19 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 single-archive WAL owner is compiled before provider/runtime wiring"
+    reason = "the active single-archive WAL owner retains sealed maintenance and recovery variants"
 )]
 
-//! Inactive one-owner logical mutation, capture, and durable publication
+//! Active one-owner logical mutation, capture, and durable publication
 //! protocol. The owner accepts only a sealed domain plan, runs its exact
 //! domain row and mutation in one SQLite `BEGIN IMMEDIATE`, and retains the
 //! resulting capture until encrypted control durably authenticates witness
 //! settlement. Its private launcher consumes one non-cloneable serving
 //! handoff — parity-certified maintenance or ledger-pinned genesis — owns one
 //! heterogeneous sealed-plan actor, and composes the private
-//! publisher plus mandatory checkpoint recovery. There is no external caller,
-//! route, startup, Store-registry, configuration, acknowledgement, deletion,
-//! list, or cloud construction path.
+//! publisher plus mandatory checkpoint recovery. Startup relaunch and Genesis
+//! convergence are the only production launchers; Store registers the opaque
+//! authority and exposes only settled reads and typed sealed submits. Routes
+//! receive no lane, provider, list, delete, or generic SQL authority.
 
 mod launcher;
 mod publisher;
@@ -2223,8 +2224,8 @@ fn run_wal_store_lane(
 /// and every lane goes through the same publisher owner
 /// reserve/renew/reacquire path. It exposes exactly the typed settled-only
 /// submit and read surfaces and nothing else — no lane, publisher, control,
-/// provider, list, or delete access. No production caller exists until the
-/// reviewed routing slice.
+/// provider, list, or delete access. Startup relaunch and Genesis convergence
+/// construct it; Store routes selected reads/submits through the opaque handle.
 pub(crate) struct SingleArchiveWalServingAuthority {
     launcher: launcher::SingleArchiveWalLauncherOwner,
 }

@@ -499,7 +499,7 @@ v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it ne
 dedicated low-level cryptographic review, including the production range-reader and
 all-or-nothing encrypted staging implementation, before it can be connected to any runtime
 path.
-### ADR-0022 archive-v3 foundation is inactive
+### ADR-0022 Genesis WAL authority and the retired migration stack
 
 > **August 2026 replan.** ADR-0022's route to WAL authority changed. The genesis-first
 > replan drops retention of existing archive data, so the advisory-canary/Phase-2
@@ -516,10 +516,16 @@ path.
 > pinned mutation-set commitment is what allowed `#290` (`6c66842`) to add
 > `WalOperationKind::SchemaEpochAdvance = 13` with no signing ceremony — that commitment
 > had been the gate standing between this tree and both schema evolution and transcript
-> support. Note that **"Phase 3" is unrelated**: it labels the extent/shadow paging
-> architecture, not a rollout stage after Phase 2, and it is untouched and still live.
-> None of this changes the standing position that archive-v3 is inactive: no startup,
-> route, Store, or serving path constructs it, and no image acknowledges a write from it.
+> support. Note that **"Phase 3" is unrelated**: it labels the inactive extent/shadow
+> paging architecture, not a rollout stage after Phase 2.
+>
+> The Genesis logical-WAL path is now production-wired under an exact signed active image
+> profile. Startup installs durable WAL-authoritative selections and relaunches their
+> serving owners before request admission; sign-in convergence can create a new archive;
+> routed Store reads/submits expose only settled owner state. The checked-in default profile
+> remains exact `off`, and an off-config image refuses when selected durable state exists.
+> This authority does not reactivate the deleted advisory/Phase-2 migration family or the
+> inactive extent-shadow engine.
 
 The inactive legacy SQLite extent-candidate coordinator is private to
 `legacy_gcm/extent_candidate/`. It can persist only a content-free
@@ -1008,8 +1014,8 @@ the final frame. These checks do not turn post-commit WAL-file scraping into a v
 mechanism. The compiled inactive SQLite VFS shim observes the exact `xSync` boundary, but archive-v3
 authority still requires reviewed runtime integration plus independent crash and conformance gates.
 
-`src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
-bootstrap seam. Its production constructor accepts only a durable control-plane
+`src/archive_v3_genesis.rs` is the restart-safe bootstrap protocol used by the
+production Genesis trigger. Its constructor accepts only a durable control-plane
 reservation containing the exact bounded registry/root bytes; it
 does not construct credentials or providers and cannot issue I/O. Resolution
 first authenticates an exact existing active witness, registry, and root using
@@ -1032,9 +1038,10 @@ concurrent tombstone is a distinct failure and any root/registry advance fails
 closed. An ambiguous or cancelled request leaves the same planned row unresolved
 and cannot authorize replacement IDs or ciphertext. Partial objects created before
 the witness remain in the lifecycle deletion inventory. No production ledger/backend
-composite is constructed. It also has no
-Store, VFS, route, runtime flag, Firestore/GCS construction,
-environment/default credential path, logging, or production authority.
+composite is assembled inside the protocol itself: the reviewed trigger supplies the
+sealed runtime's exact GCS/KMS/Firestore providers and is the sole production minter of
+that authority. The protocol still has no Store, VFS, route, caller-selected credential,
+logging, or generic provider escape.
 
 The inactive mutation ledger records a stable opaque operation ID, a domain-separated
 canonical request fingerprint, the proposed committed root sequence, an internally
@@ -1265,8 +1272,12 @@ hash excludes only the usage fields and work update time that the existing post-
 settlement is expected to replace; lease, counters, membership, captures, and media provenance
 remain covered. The child does not read media, invoke a model, allocate a clock or random ID, call
 Store, launch/retry work, or acknowledge completion. The
-active selected transcript settlement atomically creates one fixed-id pending embedding job per
-speaker observation (and none for a silent window). Before scanning due work, the selected
+active selected transcript v3 settlement atomically creates one fixed-id pending embedding job per
+speaker observation (and none for a silent window). Its sixth allocator pin covers an optional
+unbound `identity_evidence` proposal. That slot exists only for confidence at least 0.90, an explicit
+self-identification naming the same turn, and a claimed name plus every fact-evidence string that is
+an exact substring of that turn's committed transcript. It cannot create or mutate a person, profile,
+fact, name claim, or binding. Before scanning due work, the selected
 voice-embedding child also enumerates at most one eligible non-overlapped historical v1 observation
 with retained sources and no sample/job, carries its complete committed observation, bounded absence
 counts, and fingerprinted `voice_embedding_jobs` allocator, then provider-free inserts one fixed-id
@@ -1284,10 +1295,27 @@ SHA-256, decodes only the source prefix needed by the existing 30-second biometr
 the in-enclave pinned WeSpeaker model. Settlement reauthenticates the exact claim/source/allocator
 evidence and writes only a caller-fixed pending sample (`accepted=-1`) or a typed quality, retry, or
 terminal outcome. The 1,048,576-row/32-MiB ledger retains fixed-size result receipts, not transcript,
-media, DEK, diagnostic, or vector bytes. Profile assignment/reconciliation and every people/person
-fact mutation remain separately gated, so this boundary alone cannot expose authoritative speaker
-identity or complete ADR-0022 rollout. Its plan cannot call Store, GCS, KMS, model code, clocks,
-randomness, launchers, or retry tasks. The
+media, DEK, diagnostic, or vector bytes. A second active, provider-free selected child repairs
+historical profile revisions and sample assignments before new work, commits the complete bounded
+candidate/sample/representative topology plus exact profile/revision/assignment/representative
+allocator pins, and then makes deterministic sample assignments or creates caller-ID-fixed profiles.
+It also reconciles or quarantines malformed/stale representatives, terminal-refuses imported lineage
+actions whose interactive semantics are not yet migrated, and settles episode speaker readiness from
+exact evidence. Once a proposed literal identity observation has exactly one accepted active profile,
+the same provider-free family commits the complete bounded identity row, transcript and source rows,
+observation, samples and active assignments, profile and active revision, cluster, existing person,
+accepted names, active facts and active binding, plus fingerprinted person/name/fact/binding allocator
+pins. It revalidates the literal transcript evidence and compatible identity topology before atomically
+creating or reinforcing one identified person, accepted name claim, bounded facts, observation and
+cluster attribution, profile/revision person cache, and exactly one active historical binding.
+Repeated evidence deactivates and supersedes the prior binding with a checked evidence count;
+conflicting names/bindings and malformed evidence terminal-reject without partial public state. Every
+written target and allocator is reread before commit, and permanent replay cannot duplicate it.
+Backward-clock observations defer without charging; over-bound candidate/sample/person topology and
+exhausted/malformed allocators are handled provider-free without overflow or silent adoption. Its
+permanent 1,048,576-row/32-MiB ledger retains only fixed-size commitments/results. Neither voice plan
+can call Store, GCS, KMS, model code, clocks, randomness,
+launchers, or retry tasks. The
 retention child likewise accepts only the local receipt half of an already settled exact provider
 deletion. Its account/event pair derives the stable operation identity, while the exact account-bound
 object key, bucket-local generation/provenance, plaintext hash, retention deadline, eligible predecessor
@@ -1411,21 +1439,16 @@ external-launcher, worker, provider, task, runtime-policy, or acknowledgement co
 introduce no detached publication. A private composition owner accepts only sealed prepared plans
 and retains the sole archive actor; callers reach it only through the settled WAL-owner boundary.
 
-The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
-capture events and session finish, selected screenshots, finalization queue/commit, deterministic
-media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
-and reviewer/backfill writes. Only capture-session finish, local canonical-capture receipt,
-metadata-only screen-reference batch,
-selected-screenshot receipt, screen-storyboard result without person evidence,
-raw-media retention settlement, active email/webhook claim and exact settlement,
-provider-accepted APNs, caller-stable finalization queue,
-exact finalization commit, and Vertex terminal outcome have
-production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
-substance and visual-evidence backfills; these are the complete reviewed A set for this gate.
-Activation is still per-domain; the live email, push, and webhook owners use the sealed claim and
-general settlement families described above. Every other semantic A operation remains disabled pending its own separately reviewed codec
-and activation adapter. In particular, screen person
-evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
+The reviewed operation inventory is deliberately asymmetric and activation remains per domain.
+Stable portable domain A now includes the active capture/session/reference writers, selected
+screenshot and browser readers, media claim/result/retention, audio transcript v3, voice embedding,
+provider-free voice profile/person identity, selected episode deletion, finalization, delivery,
+reviewer, summarizer backfill, and usage families described by their owning maps. The selected audio
+chain is split across three independently sealed operations: post-provider transcript settlement can
+only create the observation, fixed embedding job, and unbound literal identity proposal; embedding
+claims current media before model work and can only settle the fixed sample/result; profile/person
+processing is provider-free and requires the complete accepted active profile plus exact literal
+evidence before public identity exists. Screen-person evidence remains absent. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
 screen result now consumes its exact binding. The inactive selected-screenshot upload identity is a second
 sealed B operation, its bounded context-bound ciphertext continuation authenticates that attempt and
@@ -1438,16 +1461,16 @@ claim and predecessor chain, releases budget only for another target, and perman
 new candidate admission, and provider re-preparation. The selected upload route no longer calls this
 family: Genesis-selected plan and multipart requests return `410 Gone` before archive or provider
 work. Concrete provider calls and every external launcher caller remain absent.
-Generic/audio/finalization Vertex begin and
+Generic/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
 unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
 are selected-screenshot KMS production, a concrete provider adapter, and the future domain adapter
 that would supply the reviewed proof-to-A transition to the private archive launcher.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
-semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS
-production and upload/send boundaries, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
-purge, source-keyless legacy ingest, retired episode mutations, arbitrary Store SQL, and account
-deletion. A structural source inventory pins every production Store mutation/save call (including
+semantic refactoring: unsupported leases and failure/retry counters or times, other Vertex begin,
+media-DEK KMS production and upload/send boundaries, and summarizer auto-ID creation. Unsupported
+domain-C families remain closed rather than gaining arbitrary Store SQL. A structural source
+inventory pins every production Store mutation/save call (including
 qualified forms), every factory definition/call and Store literal, every persistence-policy
 reference/assignment, and every async or dedicated-thread worker spawn by exact owner/expression
 hashes. A new factory,

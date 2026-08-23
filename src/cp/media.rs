@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::error::{wal_domain, CaptureReferenceFailureReason, EnclaveError, Result};
+use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
 
 use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
@@ -2782,23 +2782,11 @@ async fn list_people(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<PeopleListQuery>,
 ) -> Response {
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`. FIRST
-    // statement in the handler: a refusal spends nothing, not even the
-    // `to_lowercase` allocation below.
-    //
-    // The other collection endpoint, and the same hazard. `people` and
-    // `person_facts` rows come only from `media_worker::create_person` /
-    // `persist_person_fact`, reached only from the audio and screen RESULT
-    // lanes — and although those lanes are migrated, their sealed families
-    // commit NO identity by construction, so for a selected user
-    // `process_work_unit` returns early and the two legacy persisters that
-    // write these tables are unreachable. A routed read can therefore only
-    // answer `200 {"people": []}` — an authoritative-looking "you know
-    // nobody". It lifts when a sealed family actually commits these rows, NOT
-    // when the voice lanes migrate; see `wal_domain::MEDIA_PEOPLE`.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
+    // ADR-0022 D4 answerability is live: selected audio transcript settlement
+    // freezes literal high-confidence self-identification, and the sealed
+    // provider-free voice-profile owner commits the corresponding person,
+    // accepted name claim, facts, and profile binding before these routed
+    // reads can expose them. Absence is therefore a truthful empty roster.
     let after_id = query.after_id.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let search = query
@@ -2857,11 +2845,6 @@ async fn person_profile(
     if person_id <= 0 {
         return bad_request("person_id must be positive");
     }
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`; see
-    // `list_people` for the writer chain. Nothing is spent above.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
-    }
     match state
         .store
         .wal_authoritative_read(&user.0, move |conn| load_person_profile(conn, person_id))
@@ -2880,11 +2863,6 @@ async fn person_evidence(
 ) -> Response {
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
-    }
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`; see
-    // `list_people` for the writer chain. Nothing is spent above.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let before_id = query.before_id;
@@ -2913,11 +2891,6 @@ async fn person_statements(
 ) -> Response {
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
-    }
-    // ADR-0022 D4, the ANSWERABILITY RULE in `error::wal_domain`; see
-    // `list_people` for the writer chain. Nothing is spent above.
-    if let Some(error) = state.wal_domain_refusal(&user.0, wal_domain::MEDIA_PEOPLE) {
-        return error.into_response();
     }
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let before_id = query.before_id;
@@ -7845,25 +7818,18 @@ mod tests {
         );
     }
 
-    /// The same two-sided proof for the people domain, which carries four
-    /// routes behind one gate. `list_people` answers a COLLECTION, so its
-    /// ungated failure mode is the worst shape the answerability rule names:
-    /// not a 404 but `200 {"people": []}` once a serving authority exists — a
-    /// refusal wearing the face of a truthful empty roster. The assertions
-    /// pin that the refusal is the named 503 and that the served roster is
-    /// non-empty, so neither side can be satisfied by an empty success.
-    ///
-    /// Falsifiability, checked by sabotage: deleting the gate turns the
-    /// selected user's 503 into a 500; naming a different domain breaks the
-    /// `domain` assertion; dropping the `people` insert turns the unselected
-    /// user's roster length from 1 to 0.
+    /// The routed people collection now serves both authorities. A real
+    /// Genesis-selected archive proves the route reaches a serving authority;
+    /// the sealed voice-profile tests independently prove the non-empty
+    /// production writer. The legacy half retains parity with its roster.
     #[tokio::test]
-    async fn a_deferred_people_list_answers_a_named_503_while_legacy_still_reads_its_roster() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
+    async fn the_lifted_people_list_reads_selected_and_legacy_rosters() {
+        use crate::cp::wal_gate_test_support::answerable_wal_archive;
         use axum::extract::{Query, State};
         use axum::Extension;
 
-        let state = finish_test_state();
+        let archive = answerable_wal_archive("d0000000-0000-4000-8000-000000000009").await;
+        let state = Arc::clone(&archive.state);
         let legacy_user = "media-people-legacy";
         state
             .store
@@ -7881,27 +7847,19 @@ mod tests {
             .await
             .unwrap();
 
-        let selected_user = "media-people-selected";
-        select_wal_authoritative(&state.store, selected_user);
-        let refused = list_people(
+        let selected_user = archive.user_id.as_str();
+        let selected = list_people(
             State(Arc::clone(&state)),
             Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
             Query(PeopleListQuery::default()),
         )
         .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
+        assert_eq!(selected.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(selected.into_body(), 16 * 1024)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::error::WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_PEOPLE);
-        assert!(
-            body.get("people").is_none(),
-            "a refusal must never carry a collection: {body}"
-        );
+        assert!(body["people"].is_array(), "{body}");
 
         let served = list_people(
             State(Arc::clone(&state)),

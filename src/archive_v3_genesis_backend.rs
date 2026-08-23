@@ -1,18 +1,17 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 genesis backend composite is compiled and contract-tested before authority wiring"
+    reason = "the active Genesis backend retains sealed adapter variants for exact recovery coverage"
 )]
 
-//! Inactive ADR-0022 genesis backend adapter.
+//! ADR-0022 Genesis backend adapter.
 //!
 //! This module composes the encrypted control-store archive-lifecycle ledger
 //! with injected immutable-object, exact-root, wrapped-registry, and Firestore
 //! witness providers into the one [`ArchiveGenesisBackend`] that
 //! [`crate::archive_v3_genesis::ArchiveGenesis::resolve`] accepts. Construction
-//! is synchronous and performs no provider I/O. Nothing in startup, Store, or
-//! routes constructs it: the provider-release token below has no production
-//! minter yet, so the bundle accessors it gates stay unreachable until a later
-//! reviewed launcher in this module mints one.
+//! is synchronous and performs no provider I/O. The reviewed Genesis trigger
+//! is the sole production minter of the provider-release token below; Store
+//! and routes cannot construct it or access the provider bundle directly.
 
 use std::{fmt, sync::Arc};
 
@@ -39,7 +38,8 @@ use crate::{
 
 /// Producer token proving that bundle-withheld genesis providers were released
 /// to this reviewed composition rather than assembled by a sibling module. It
-/// has no public or sibling constructor and no production minter today.
+/// has no public or sibling constructor; the Genesis trigger below is its sole
+/// production minter.
 pub(crate) struct GenesisBackendRuntimeContext(());
 
 impl GenesisBackendRuntimeContext {
@@ -117,7 +117,7 @@ fn map_create(
 /// durable lifecycle ledger and witness-dispatch ledger, while archive object,
 /// root, registry, and witness authority delegate to the injected providers.
 /// Constructing it grants nothing beyond what the released providers already
-/// carry, and no startup caller exists.
+/// carry; the Genesis trigger constructs it after signed-runtime agreement.
 pub(crate) struct ControlPlaneGenesisBackend {
     control: Arc<ControlStore>,
     objects: Arc<dyn ImmutableObjectBackend>,

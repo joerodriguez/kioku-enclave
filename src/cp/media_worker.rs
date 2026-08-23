@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::error::{wal_domain, EnclaveError, Result};
+use crate::error::{EnclaveError, Result};
 use crate::store::Store;
 
 use super::media::{parse_audio_result, AudioTurn};
@@ -2763,10 +2763,11 @@ async fn settle_audio_window_attempt(
 /// this lane. Every fact the plan carries comes from ONE routed
 /// immediately-pre-submit read (the terminal Vertex attempt commitment on
 /// the attempt's own event id, the exact terminal-stage work predecessor,
-/// and the five `sqlite_sequence` id-allocation pins) or is computed
-/// pre-submit (the transcript projection of the parsed turns — the
-/// identity fields are dropped HERE, at the seam — and one canonical
-/// commit time); the sealed plan is constructed ONCE (R5) and an owner
+/// and the six `sqlite_sequence` id-allocation pins) or is computed
+/// pre-submit (the transcript projection, one optional same-turn literal
+/// high-confidence self-identification proposal, and one canonical commit
+/// time). Vocative, third-party, inferred, or non-literal identity is dropped
+/// HERE at the seam; the sealed plan is constructed ONCE (R5) and an owner
 /// Conflict resubmits the identical prepared object. A projection or turn
 /// failure surfaces as invalid model output; a Precondition propagates to
 /// the job ladder, which re-drives with an advanced attempt_count (a new
@@ -2805,7 +2806,36 @@ async fn settle_audio_window_transcript(
     let facts = turns
         .into_iter()
         .map(|turn| {
-            wal::audio_result::AudioTurnFact::new(
+            let self_identity = if turn.speaker_name_kind.as_deref() == Some("self_identification")
+                && turn.speaker_name_subject_turn_id.as_deref() == Some(turn.turn_id.as_str())
+            {
+                match (
+                    turn.speaker_name.clone(),
+                    turn.speaker_name_evidence.clone(),
+                    turn.speaker_name_confidence,
+                ) {
+                    (Some(name), Some(evidence), Some(confidence)) if confidence >= 0.90 => {
+                        let facts = turn
+                            .person_facts
+                            .iter()
+                            .map(|fact| {
+                                wal::audio_result::AudioPersonFact::new(
+                                    fact.predicate.clone(),
+                                    fact.value.clone(),
+                                    fact.evidence.clone(),
+                                )
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        Some(wal::audio_result::AudioSelfIdentity::new(
+                            name, evidence, confidence, facts,
+                        )?)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            wal::audio_result::AudioTurnFact::new_with_self_identity(
                 turn.turn_id,
                 turn.start_ms,
                 turn.end_ms,
@@ -2813,6 +2843,7 @@ async fn settle_audio_window_transcript(
                 turn.text,
                 turn.language.filter(|language| !language.is_empty()),
                 turn.overlap,
+                self_identity,
             )
         })
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -3749,11 +3780,10 @@ async fn process_user(state: &CpState, user_id: &str) {
         // settled gate re-checks open sessions and remaining media work.
         super::summarizer::kick_session_settled(user_id);
     }
-    // ADR-0022 D4: the voice-profile reconciliation and lineage tail is not
-    // migrated. The gate sits HERE, after the migrated claim/result/failure
-    // lanes above have run — gating this worker at the top would disable the
-    // slice-10i screen lane, which is live for WAL-authoritative users.
-    if state.wal_domain_skipped(user_id, wal_domain::MEDIA_WORKER_VOICE_PROFILES) {
+    // Selected profile assignment is a separately sealed provider-free owner
+    // that runs after the selected embedding lane.  Keep this legacy tail only
+    // for archives that still use the per-user transaction path.
+    if state.store.is_wal_authoritative(user_id) {
         return;
     }
     match state
@@ -4312,6 +4342,49 @@ async fn process_user_voice_embedding_jobs(state: &CpState, user_id: &str) {
         .await;
 }
 
+async fn process_user_voice_profiles(state: &CpState, user_id: &str) {
+    if !state.store.is_wal_authoritative(user_id) {
+        return;
+    }
+    for _ in 0..64 {
+        let observed_at = now_iso();
+        let account = user_id.to_owned();
+        let horizon = observed_at.clone();
+        let scan = match state
+            .store
+            .wal_authoritative_read(user_id, move |connection| {
+                wal::voice_profile::observe_next(connection, &account, &horizon)
+                    .map_err(|_| EnclaveError::Store("voice-profile scan refused".into()))
+            })
+            .await
+        {
+            Ok(scan) => scan,
+            Err(error) => {
+                warn!(error = %error, "selected voice-profile scan failed");
+                return;
+            }
+        };
+        let evidence = match scan {
+            wal::voice_profile::VoiceProfileScan::Idle => return,
+            wal::voice_profile::VoiceProfileScan::ClockDeferred => return,
+            wal::voice_profile::VoiceProfileScan::Work(evidence) => *evidence,
+        };
+        let plan = match wal::VoiceProfilePlan::new(user_id.to_owned(), evidence, observed_at)
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+        {
+            Ok(plan) => plan,
+            Err(_) => {
+                warn!("selected voice-profile plan construction failed");
+                return;
+            }
+        };
+        if let Err(error) = state.store.wal_authoritative_submit(user_id, plan).await {
+            warn!(error = %error, "selected voice-profile settlement failed");
+            return;
+        }
+    }
+}
+
 async fn process_selected_voice_embedding_jobs(state: &CpState, user_id: &str) {
     // Repair the bounded historical v1 transcript gap before scanning due
     // jobs. The backfill is provider-free and inserts at most one exact
@@ -4580,6 +4653,7 @@ async fn sweep(state: &Arc<CpState>) {
             resurrect_user_failed_jobs(&state, &user_id).await;
             process_user(&state, &user_id).await;
             process_user_voice_embedding_jobs(&state, &user_id).await;
+            process_user_voice_profiles(&state, &user_id).await;
             prune_user_media(&state, &user_id).await;
         });
     }
@@ -7139,12 +7213,13 @@ mod tests {
         assert_eq!(failure.matches(concat!(".with_", "user(")).count(), 0);
 
         let process = &source[process_start..process_end];
-        // The class scan, the claim and the failure tail each branch once.
+        // The class scan, claim, failure tail, and final selected/legacy voice
+        // reconciliation split each branch once.
         assert_eq!(
             process
                 .matches(concat!("is_wal_", "authoritative("))
                 .count(),
-            3
+            4
         );
         // ...and every legacy call survives at its original ordinal: the
         // class scan, the lease, the failure tail, and the two out-of-scope
@@ -7269,18 +7344,20 @@ mod tests {
     /// screen lane is live; a gate at the top of this worker would silently
     /// disable it. This pins the placement in production source.
     #[test]
-    fn the_wal_gate_covers_only_the_unmigrated_voice_domains() {
+    fn no_media_worker_wal_gate_remains_after_voice_and_people_migration() {
         let whole = include_str!("media_worker.rs");
         let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
 
-        // Exactly one gate remains, and it names only the profile tail.
+        // No media-worker gate remains. Selected embedding and the
+        // provider-free profile/person owner are both routed, and the four
+        // people surfaces read their now-live sealed output.
         assert_eq!(
             source.matches(concat!("wal_domain_", "skipped(")).count(),
-            1,
-            "the media lanes must not acquire a gate"
+            0,
+            "the migrated media and voice lanes must not acquire a gate"
         );
         assert_eq!(source.matches("MEDIA_WORKER_VOICE_EMBEDDING").count(), 0);
-        assert_eq!(source.matches("MEDIA_WORKER_VOICE_PROFILES").count(), 1);
+        assert_eq!(source.matches("MEDIA_WORKER_VOICE_PROFILES").count(), 0);
 
         let process_start = source.find(concat!("async fn process_", "user(")).unwrap();
         let process_end = source
@@ -7288,10 +7365,7 @@ mod tests {
             .unwrap();
         let process = &source[process_start..process_end];
 
-        // The migrated claim and failure lanes run BEFORE the gate.
-        let gate = process
-            .find(concat!("wal_domain_", "skipped("))
-            .expect("process_user gates its voice tail");
+        // The migrated claim and failure lanes remain reachable.
         for migrated in [
             concat!("claim_media_work_", "unit(state"),
             concat!("settle_media_work_", "failure(state"),
@@ -7299,10 +7373,7 @@ mod tests {
             let at = process
                 .find(migrated)
                 .unwrap_or_else(|| panic!("{migrated} must still run for a selected user"));
-            assert!(
-                at < gate,
-                "{migrated} must run before the voice gate, not behind it"
-            );
+            assert!(at < process.len(), "{migrated} must remain reachable");
         }
 
         // The migrated per-user lanes carry no gate at all.
@@ -7356,6 +7427,23 @@ mod tests {
                 .text()
                 .contains("failed to lease voice embedding jobs"),
             "selected work must never fall through to the legacy lease: {}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_selected_voice_profile_lane_routes_to_the_genesis_archive() {
+        use crate::cp::wal_gate_test_support::{answerable_wal_archive, capture_events};
+
+        let archive = answerable_wal_archive("72727272-7272-4272-8272-727272727272").await;
+        let (captured, guard) = capture_events();
+        process_user_voice_profiles(&archive.state, &archive.user_id).await;
+        drop(guard);
+
+        assert_eq!(captured.total_skips(), 0, "{}", captured.text());
+        assert!(
+            !captured.text().contains("voice-profile scan refused"),
+            "selected profile work must use the routed archive: {}",
             captured.text()
         );
     }
@@ -7473,9 +7561,9 @@ mod tests {
             captured.text()
         );
         assert_eq!(
-            captured.skips(wal_domain::MEDIA_WORKER_VOICE_PROFILES),
+            captured.total_skips(),
             0,
-            "the voice gate sits behind the media lanes, not in front of them: {}",
+            "the media worker has no deferred voice gate: {}",
             captured.text()
         );
     }
