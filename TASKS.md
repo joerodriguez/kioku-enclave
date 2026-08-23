@@ -4,7 +4,7 @@
   lifecycle/delete owner, and WAL inventory seal required before activation.
 - [x] Deploy the archive-off bootstrap image and obtain the authenticated one-way binding
   commitment; merge deployment companion `4fe7c283` with exact digest rotation/recovery.
-- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.1`; verify live Genesis/WAL
+- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.2`; `.1` was superseded before publication after the full verification suite exposed a time-sensitive test fixture. Verify live Genesis/WAL
   serving and archive/witness state before recording completion.
 
 # ADR-0022 browser evidence
