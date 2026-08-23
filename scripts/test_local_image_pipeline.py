@@ -60,7 +60,9 @@ def load_pipeline():
     return module
 
 
-def write_config(path: Path, *, mode: int = 0o600) -> None:
+def write_config(
+    path: Path, *, mode: int = 0o600, genesis_wal_native: str = "off"
+) -> None:
     values = environment()
     values.pop("PATH", None)
     values.pop("GCP_WIF_PROVIDER", None)
@@ -68,6 +70,7 @@ def write_config(path: Path, *, mode: int = 0o600) -> None:
     values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = (
         "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
     )
+    values["PRODUCTION_GENESIS_WAL_NATIVE"] = genesis_wal_native
     path.write_text(
         "\n".join(f"{name}={value}" for name, value in sorted(values.items())) + "\n",
         encoding="utf-8",
@@ -278,7 +281,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 directory = Path(temporary_directory)
                 config = directory / "operator.env"
                 output = directory / "evidence"
-                write_config(config)
+                write_config(config, genesis_wal_native="on")
                 sys.argv = [
                     str(SCRIPTS / "local_image_pipeline.py"),
                     "push",
@@ -287,7 +290,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3",
+                    "refs/tags/v1.2.3-archive-v3-wal.1",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",
@@ -443,6 +446,8 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "verify",
                     "--config",
                     str(config),
+                    "--source-ref",
+                    "main",
                 ]
                 with self.assertRaises(SystemExit) as raised:
                     pipeline.main()
