@@ -4,8 +4,13 @@
   lifecycle/delete owner, and WAL inventory seal required before activation.
 - [x] Deploy the archive-off bootstrap image and obtain the authenticated one-way binding
   commitment; merge deployment companion `3fe93cd` with exact digest rotation/recovery.
-- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.4`; `.1` was superseded after the full verification suite exposed a time-sensitive test fixture, `.2` was published but not rolled because its deployment-source pin correctly preceded the candidate-2 allowlist commit, and `.3` was published but not rolled because its immutable candidate suffix correctly produced a prerelease that the old deployment preflight rejected. Verify live Genesis/WAL
-  serving and archive/witness state before recording completion.
+- [x] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.4`; `.1` was superseded
+  after the full verification suite exposed a time-sensitive test fixture, `.2` was
+  published but not rolled because its deployment-source pin correctly preceded the
+  candidate-2 allowlist commit, and `.3` was published but not rolled because its immutable
+  candidate suffix correctly produced a prerelease that the old deployment preflight
+  rejected. Live public health, exact image/KMS attestation, and candidate-only
+  archive/witness authority all verify; the deployment source now pins the live digest.
 
 # ADR-0022 browser evidence
 
