@@ -11,6 +11,10 @@
   candidate suffix correctly produced a prerelease that the old deployment preflight
   rejected. Live public health, exact image/KMS attestation, and candidate-only
   archive/witness authority all verify; the deployment source now pins the live digest.
+- [~] Build, sign, publish, and roll `v0.8.31-archive-v3-wal.1` from the merged
+  deletion-runtime source. Its rollout verifier pins monorepo companion `c2accb1`,
+  which admits only this exact schema-v9 active tag and preserves the typed confirmation,
+  singleton topology seal, authority rotation, and v0.8.14 emergency rollback.
 
 # ADR-0022 browser evidence
 
