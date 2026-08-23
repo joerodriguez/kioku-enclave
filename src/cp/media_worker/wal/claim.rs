@@ -127,10 +127,10 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
 }
 
 /// T24 is now a residual defence. The sealed epoch-0 re-baseline declares
-/// `audio_segments` and `utterances` `AUTOINCREMENT`, so this gate opens on a
+/// every allocator used by transcript settlement `AUTOINCREMENT`, so this gate opens on a
 /// current production archive. It still refuses a legacy archive materialized
-/// before that re-baseline, where either table is a plain `INTEGER PRIMARY
-/// KEY`: those tables never advance `sqlite_sequence`, so a non-empty archive
+/// before that re-baseline, where any table is a plain `INTEGER PRIMARY KEY`:
+/// those tables never advance `sqlite_sequence`, so a non-empty archive
 /// can collide at a derived id and even an empty one fails the transcript
 /// settle's post-state pin re-validation.
 ///
@@ -140,7 +140,7 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
 /// for every selected user with audio. The probe runs BEFORE the claim, so a
 /// blocked lane makes no claim, no reservation and no paid call.
 ///
-/// The probe asks whether the two tables ARE `AUTOINCREMENT`, by reading their
+/// The probe asks whether all five tables ARE `AUTOINCREMENT`, by reading their
 /// DDL — never whether they currently HAVE `sqlite_sequence` rows.
 ///
 /// That distinction is the whole correctness of this gate. SQLite creates a
@@ -155,7 +155,15 @@ pub(in crate::cp::media_worker) fn enumerate_claimable(
 /// A missing table, or DDL that cannot be read, is itself the blocked
 /// condition, so any query error fails closed.
 pub(in crate::cp::media_worker) fn audio_sequence_gate_open(connection: &Connection) -> bool {
-    ["audio_segments", "utterances"].iter().all(|table| {
+    [
+        "audio_segments",
+        "speaker_clusters",
+        "speaker_observations",
+        "utterances",
+        "voice_embedding_jobs",
+    ]
+    .iter()
+    .all(|table| {
         connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
@@ -2726,8 +2734,8 @@ pub(in crate::cp::media_worker) mod tests {
 
     #[test]
     fn the_audio_lane_is_gated_on_autoincrement_not_on_existing_rows() {
-        // T24 / R1. Without AUTOINCREMENT on audio_segments and utterances the
-        // sealed transcript family's four sqlite_sequence pins read 0 forever
+        // T24 / R1. Without AUTOINCREMENT on every transcript allocator the
+        // sealed transcript family's allocator pins read 0 forever
         // and every settle fails closed -- after a PAID Vertex call.
         //
         // The gate must key on whether the tables ARE AUTOINCREMENT, never on
@@ -2758,7 +2766,7 @@ pub(in crate::cp::media_worker) mod tests {
             "plain INTEGER PRIMARY KEY stays blocked even with rows present"
         );
 
-        // One of the two converted is not enough.
+        // One of the five converted is not enough.
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         connection
@@ -2769,30 +2777,55 @@ pub(in crate::cp::media_worker) mod tests {
             .unwrap();
         assert!(
             !audio_sequence_gate_open(&connection),
-            "one of the two tables is not enough"
+            "one of the five tables is not enough"
         );
 
-        // THE DEADLOCK CASE: both AUTOINCREMENT, and EMPTY. sqlite_sequence
-        // holds no row for either table yet, and the gate must still open.
+        // A missing or plain-primary-key embedding-job allocator must block
+        // before the paid provider boundary even if the transcript tables
+        // themselves are valid.
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         connection
             .execute_batch(
                 "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
                  CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+            )
+            .unwrap();
+        assert!(!audio_sequence_gate_open(&connection));
+        connection
+            .execute(
+                "CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY,x TEXT)",
+                [],
+            )
+            .unwrap();
+        assert!(!audio_sequence_gate_open(&connection));
+
+        // THE DEADLOCK CASE: all five AUTOINCREMENT and EMPTY.
+        let connection = Connection::open_in_memory().unwrap();
+        install_schema(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
             )
             .unwrap();
         let sequence_rows: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_sequence \
-                 WHERE name IN ('audio_segments','utterances')",
+                 WHERE name IN ('audio_segments','speaker_clusters','speaker_observations',
+                                'utterances','voice_embedding_jobs')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
             sequence_rows, 0,
-            "precondition: an unwritten AUTOINCREMENT table has no sequence row"
+            "precondition: unwritten AUTOINCREMENT tables have no sequence rows"
         );
         assert!(
             audio_sequence_gate_open(&connection),
@@ -2942,7 +2975,10 @@ pub(in crate::cp::media_worker) mod tests {
                 "UPDATE media_processing_jobs SET job_kind='gemini_audio';
                  UPDATE capture_events SET stream_kind='audio';
                  CREATE TABLE audio_segments(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
-                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
+                 CREATE TABLE speaker_clusters(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE speaker_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);
+                 CREATE TABLE voice_embedding_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,x TEXT);",
             )
             .unwrap();
         let (started, ended): (String, String) = connection

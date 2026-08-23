@@ -34,7 +34,7 @@ pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
 pub const MODEL_SHA256: &str = "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012";
 const DEFAULT_MODEL_PATH: &str = "/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx";
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
-const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
+pub(crate) const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
 pub(crate) const MATCH_THRESHOLD: f32 = 0.60;
 pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.45;
 pub(crate) const MIN_DECISION_MARGIN: f32 = 0.08;
@@ -156,6 +156,33 @@ impl VoiceEngine {
 }
 
 pub(crate) fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32>> {
+    decode_mono_16khz_with_limit(media, mime_type, None)
+}
+
+/// Decode only the prefix needed to address `max_target_samples` at 16 kHz.
+///
+/// Selected voice reconstruction authenticates the complete encrypted object,
+/// but a short observation may begin late within a source event. Bounding the
+/// decoded prefix prevents a compact or malformed audio object from expanding
+/// without limit when the biometric policy will consume at most 30 seconds.
+pub(crate) fn decode_mono_16khz_prefix(
+    media: &[u8],
+    mime_type: &str,
+    max_target_samples: usize,
+) -> Result<Vec<f32>> {
+    if max_target_samples == 0 {
+        return Err(EnclaveError::InvalidRequest(
+            "voice decode prefix is empty".into(),
+        ));
+    }
+    decode_mono_16khz_with_limit(media, mime_type, Some(max_target_samples))
+}
+
+fn decode_mono_16khz_with_limit(
+    media: &[u8],
+    mime_type: &str,
+    max_target_samples: Option<usize>,
+) -> Result<Vec<f32>> {
     let source = Box::new(Cursor::new(media.to_vec()));
     let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -189,11 +216,37 @@ pub(crate) fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32
         .codec_params
         .sample_rate
         .ok_or_else(|| EnclaveError::Embedding("audio sample rate is missing".into()))?;
+    if source_rate == 0 {
+        return Err(EnclaveError::Embedding(
+            "audio sample rate is invalid".into(),
+        ));
+    }
+    let source_sample_limit = match max_target_samples {
+        Some(limit) => {
+            let numerator = u64::try_from(limit)
+                .ok()
+                .and_then(|value| value.checked_mul(u64::from(source_rate)))
+                .ok_or_else(|| {
+                    EnclaveError::InvalidRequest("voice decode prefix is too large".into())
+                })?;
+            let denominator = u64::from(TARGET_SAMPLE_RATE);
+            let rounded_up = numerator
+                .checked_add(denominator - 1)
+                .map(|value| value / denominator)
+                .and_then(|value| value.checked_add(2))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    EnclaveError::InvalidRequest("voice decode prefix is too large".into())
+                })?;
+            Some(rounded_up)
+        }
+        None => None,
+    };
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| EnclaveError::Embedding(format!("create audio decoder: {error}")))?;
     let mut mono = Vec::new();
-    loop {
+    'packets: loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(error))
@@ -220,13 +273,20 @@ pub(crate) fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buffer.copy_interleaved_ref(decoded);
         for frame in buffer.samples().chunks_exact(channels) {
+            if source_sample_limit.is_some_and(|limit| mono.len() >= limit) {
+                break 'packets;
+            }
             mono.push(frame.iter().copied().sum::<f32>() / channels as f32);
         }
     }
     if mono.is_empty() {
         return Err(EnclaveError::Embedding("decoded audio is empty".into()));
     }
-    Ok(resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE))
+    let mut output = resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE);
+    if let Some(limit) = max_target_samples {
+        output.truncate(limit);
+    }
+    Ok(output)
 }
 
 /// Encode normalized mono samples as a canonical 16 kHz PCM WAV for a bounded
@@ -1281,6 +1341,19 @@ mod tests {
         let decoded = decode_mono_16khz(&wav, "audio/wav").unwrap();
         assert_eq!(decoded.len(), samples.len());
         assert!((decoded[1_000] - samples[1_000]).abs() < 0.001);
+    }
+
+    #[test]
+    fn selected_prefix_decode_never_expands_beyond_the_required_samples() {
+        let samples = (0..TARGET_SAMPLE_RATE * 4)
+            .map(|index| ((index as f32 / 40.0).sin()) * 0.25)
+            .collect::<Vec<_>>();
+        let wav = encode_mono_16khz_wav(&samples).unwrap();
+        let decoded =
+            decode_mono_16khz_prefix(&wav, "audio/wav", TARGET_SAMPLE_RATE as usize).unwrap();
+        assert_eq!(decoded.len(), TARGET_SAMPLE_RATE as usize);
+        assert!((decoded[1_000] - samples[1_000]).abs() < 0.001);
+        assert!(decode_mono_16khz_prefix(&wav, "audio/wav", 0).is_err());
     }
 
     #[test]

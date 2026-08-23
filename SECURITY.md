@@ -1265,6 +1265,29 @@ hash excludes only the usage fields and work update time that the existing post-
 settlement is expected to replace; lease, counters, membership, captures, and media provenance
 remain covered. The child does not read media, invoke a model, allocate a clock or random ID, call
 Store, launch/retry work, or acknowledge completion. The
+active selected transcript settlement atomically creates one fixed-id pending embedding job per
+speaker observation (and none for a silent window). Before scanning due work, the selected
+voice-embedding child also enumerates at most one eligible non-overlapped historical v1 observation
+with retained sources and no sample/job, carries its complete committed observation, bounded absence
+counts, and fingerprinted `voice_embedding_jobs` allocator, then provider-free inserts one fixed-id
+pending job. Exact reopen/replay cannot duplicate the repair, while existing work and intentional
+abstentions remain untouched. The selected voice-embedding child exact-reads
+one bounded due job and its observation, bounded raw source cardinality plus complete projected
+source/media topology, installed wrapped media-DEK commitment, existing-sample topology, and
+fingerprinted `voice_samples` allocator. Missing child rows, duplicate samples, deterministic poison,
+pruned media, exhausted attempts, invalid allocator state, and an already-settled sample resolve
+without provider work. A backward wall clock is global state and defers byte-for-byte without charging
+the job. Authorized
+work persists an exact checked claim before the owner reads the carried current provider generation,
+unwraps the installed DEK, requires strict v2 context binding plus exact plaintext length and
+SHA-256, decodes only the source prefix needed by the existing 30-second biometric cap, or invokes
+the in-enclave pinned WeSpeaker model. Settlement reauthenticates the exact claim/source/allocator
+evidence and writes only a caller-fixed pending sample (`accepted=-1`) or a typed quality, retry, or
+terminal outcome. The 1,048,576-row/32-MiB ledger retains fixed-size result receipts, not transcript,
+media, DEK, diagnostic, or vector bytes. Profile assignment/reconciliation and every people/person
+fact mutation remain separately gated, so this boundary alone cannot expose authoritative speaker
+identity or complete ADR-0022 rollout. Its plan cannot call Store, GCS, KMS, model code, clocks,
+randomness, launchers, or retry tasks. The
 retention child likewise accepts only the local receipt half of an already settled exact provider
 deletion. Its account/event pair derives the stable operation identity, while the exact account-bound
 object key, bucket-local generation/provenance, plaintext hash, retention deadline, eligible predecessor

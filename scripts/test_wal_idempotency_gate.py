@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 251
+EXPECTED_STORE_CALL_COUNT = 256
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -686,7 +686,23 @@ EXPECTED_STORE_CALL_COUNT = 251
 # legacy delete read/read/save trio and browser read), with byte-identical call
 # expressions. The new dedicated episode-delete worker adds no Store factory or
 # policy escape. This is the final key-by-key third state:
-EXPECTED_STORE_CALL_SHA256 = "798cdef5a11d4445615ae668289e74f46582e47e18ef26b048742e6802b540ca"
+# Selected voice embedding was derived against a fresh pristine `git archive`
+# of exact 0f9b536f5ef8355e947fe5571892f2622d46f59b. Its own 14-test
+# gate first reproduced 251/798cdef5 byte-for-byte. The final branch has 256
+# rows: exactly two B reads and three B submits under the new
+# `process_selected_voice_embedding_jobs` owner. The first read/submit pair is
+# the bounded provider-free historical v1 observation/job repair; the second
+# read and final two submits are due evidence, exact claim, and exact result.
+# There are zero removals, reclassifications, or surviving call-expression
+# moves. Exactly seven surviving legacy `process_user_voice_embedding_jobs`
+# rows move owner-body only because the selected branch now returns before
+# that unchanged compatibility lane; their call expressions are byte-identical
+# and surviving-key order is unchanged. The v2 transcript plan's fixed-id job
+# inserts and the clock/source/topology repairs live wholly inside sealed
+# children and add no further Store surface. The scanner reads both children
+# directly and pins their registration, bounds, preconditions, and absence of
+# Store/provider/runtime escape. This is the independently derived third state:
+EXPECTED_STORE_CALL_SHA256 = "31eb36c9e077eb012ac80223427f4d381b172eab26496f0b220627f0a549c04f"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -1588,6 +1604,7 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::claim_media_work_unit#0",
         "src/cp/media_worker.rs::quarantine_unplannable_jobs#0",
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
+        "src/cp/media_worker.rs::process_selected_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::settle_media_work_failure#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
@@ -2176,6 +2193,10 @@ impl X {
             ROOT / "src/cp/media_worker/wal/audio_result.rs"
         ).read_text(encoding="utf-8")
         audio_result_production = without_cfg_test_items(audio_result_domain)
+        voice_embedding_domain = (
+            ROOT / "src/cp/media_worker/wal/voice_embedding.rs"
+        ).read_text(encoding="utf-8")
+        voice_embedding_production = without_cfg_test_items(voice_embedding_domain)
         email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -2874,7 +2895,7 @@ impl X {
         # a kind-7 attempt boundary and a kind-6 bound transcript, mirroring
         # the sealed screen chain, with the audio-specific facts the design
         # requires: the member bound is the lease LIMIT (128, never the
-        # screen family's 12-frame cap) and the four AUTOINCREMENT ids come
+        # screen family's 12-frame cap) and the five AUTOINCREMENT ids come
         # from fingerprinted sqlite_sequence pins, never MAX(id)+1.
         self.assertIn("pub(super) mod audio_attempt;", retention_domain)
         self.assertIn("pub(super) mod audio_result;", retention_domain)
@@ -2915,7 +2936,8 @@ impl X {
             "archive_v3_wal_audio_transcript_result_operations", audio_result_domain
         )
         self.assertIn(
-            "audio-window-transcript-v1-bound-attempt", audio_result_domain
+            "audio-window-transcript-v2-embedding-jobs-bound-attempt",
+            audio_result_domain,
         )
         # The member bound is the audio lease LIMIT. MAX_SCREEN_FRAMES (12)
         # is not an audio cap; pinning 128 keeps a future edit from importing
@@ -2926,15 +2948,12 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", audio_result_domain)
         self.assertIn("WalIdempotencyError::Precondition", audio_result_domain)
         self.assertIn("read_audio_sequence_pins", audio_result_domain)
-        # The sealed identity/voice exclusion is structural, not a comment:
-        # the production half of the transcript domain must contain no voice
-        # or identity table, no embedding-job enqueue, and no MAX(id)
-        # allocation. Scanned with comments and string literals blanked so a
-        # doc-comment mention cannot satisfy or trip the pin. Any change here
-        # re-opens F8's sealed recalculate-exclusion review.
+        # The selected transcript settlement is the only sanctioned F8
+        # coupling: one fixed-id pending embedding job per observation in the
+        # same transaction. Profile/sample/person/identity mutation and
+        # MAX(id) allocation remain structurally absent.
         audio_result_code = sanitize_rust(audio_result_production)
         for forbidden in (
-            "voice_embedding_jobs",
             "voice_samples",
             "voice_profiles",
             "enqueue_embedding_job",
@@ -2944,6 +2963,12 @@ impl X {
             "MAX(id)",
         ):
             self.assertNotIn(forbidden, audio_result_code)
+        self.assertIn("voice_embedding_jobs: i64", audio_result_code)
+        self.assertIn(
+            "INSERT INTO voice_embedding_jobs", audio_result_production
+        )
+        self.assertIn("'pending'", audio_result_production)
+        self.assertNotIn("enqueue_embedding_job", audio_result_code)
         # The audio arm is wired end to end and the legacy tail survives for
         # unselected users.
         self.assertIn("AudioWindowAttemptPlan::new(", media_worker)
@@ -2953,6 +2978,45 @@ impl X {
         self.assertIn("current_audio_vertex_attempt_commitment", media_worker)
         self.assertIn("read_audio_sequence_pins", media_worker)
         self.assertIn("persist_audio_window_result(", media_worker)
+        # ADR-0022 selected voice-embedding boundary: the archive claim is
+        # durable before GCS/KMS/model work and the carried current-generation
+        # topology is reauthenticated by the result plan before an explicit-id
+        # pending sample or a bounded terminal/retry disposition is written.
+        self.assertIn("pub(super) mod voice_embedding;", retention_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::VoiceEmbeddingPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::VoiceEmbeddingLedger",
+            gate,
+        )
+        self.assertIn("struct VoiceEmbeddingPlan", voice_embedding_domain)
+        self.assertIn("struct VoiceEmbeddingLedger", voice_embedding_domain)
+        self.assertIn(
+            "archive_v3_wal_voice_embedding_operations", voice_embedding_domain
+        )
+        self.assertIn("adr-0022-voice-embedding-claim-v1", voice_embedding_domain)
+        self.assertIn("adr-0022-voice-embedding-result-v1", voice_embedding_domain)
+        self.assertIn(
+            "adr-0022-voice-embedding-job-backfill-v1", voice_embedding_domain
+        )
+        self.assertIn("const MAX_SOURCES: usize = 128;", voice_embedding_domain)
+        self.assertIn("const MAX_ATTEMPTS: i64 = 3;", voice_embedding_domain)
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", voice_embedding_domain)
+        self.assertIn("DomainLedgerBounds::new", voice_embedding_domain)
+        self.assertIn("WalIdempotencyError::Precondition", voice_embedding_domain)
+        self.assertIn("VoiceEmbeddingPlan::claim(", media_worker)
+        self.assertIn("VoiceEmbeddingPlan::settle(", media_worker)
+        self.assertIn("VoiceEmbeddingPlan::backfill_job(", media_worker)
+        self.assertIn("observe_next_job_backfill", media_worker)
+        self.assertIn("get_current_media_generation", media_worker)
+        self.assertIn("decrypt_bound_blob_v2", media_worker)
+        self.assertIn("decode_mono_16khz_prefix", media_worker)
+        self.assertIn("MAX_TURN_SAMPLES", media_worker)
+        self.assertIn("VoiceClaimDisposition::ClockDeferred", media_worker)
+        self.assertIn("raw_source_count", voice_embedding_domain)
+        self.assertIn("self.existing_samples.len() > 1", voice_embedding_domain)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
             gate,
@@ -3230,6 +3294,7 @@ impl X {
             self.assertNotIn(forbidden, attempt_domain)
             self.assertNotIn(forbidden, result_domain)
             self.assertNotIn(forbidden, retention_domain)
+            self.assertNotIn(forbidden, voice_embedding_production)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
             self.assertNotIn(forbidden, push_claim_production)
@@ -3422,7 +3487,7 @@ impl X {
         ):
             self.assertNotIn(forbidden, finalization_queue_domain)
         for forbidden in (
-            "strftime(",
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             "GcsClient",
             "ExactImmutableObjectBackend",
             "put_user_media",
@@ -3483,6 +3548,28 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, retention_domain)
+        for forbidden in (
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "get_current_media_generation(",
+            "load_dek(",
+            "decrypt_bound_blob_v2(",
+            "VoiceEngine",
+            "embed_samples(",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "std::time::",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+            "INSERT INTO voice_profiles",
+            "INSERT INTO people",
+            "INSERT INTO person_facts",
+        ):
+            self.assertNotIn(forbidden, voice_embedding_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

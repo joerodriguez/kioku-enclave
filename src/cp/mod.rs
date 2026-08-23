@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn the_worker_gate_is_inert_until_the_user_is_selected_then_counts_one_skip() {
         let state = state();
-        let domain = wal_domain::MEDIA_WORKER_VOICE_EMBEDDING;
+        let domain = wal_domain::MEDIA_WORKER_VOICE_PROFILES;
         let (captured, guard) = capture_events();
         assert!(
             !state.wal_domain_skipped("unselected-user", domain),
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
         let state = state();
-        let domain = wal_domain::MEDIA_WORKER_VOICE_EMBEDDING;
+        let domain = wal_domain::MEDIA_WORKER_VOICE_PROFILES;
         assert!(state
             .wal_domain_refusal("unselected-user", domain)
             .is_none());

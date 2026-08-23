@@ -50,6 +50,31 @@
 
 # ADR-0022 task evidence
 
+## Selected voice-embedding boundary
+
+- [x] Route selected due-job observation through WAL authority and persist one
+  exact checked claim before current-generation media, KMS, or model work.
+- [x] Atomically create one fixed-id pending job per selected transcript turn;
+  silent results create none and replay cannot duplicate the handoff.
+- [x] Repair eligible sample/job-less observations permanently settled by the
+  earlier v1 transcript contract through a bounded provider-free exact job
+  backfill; reopen/replay is idempotent and existing work or overlap-policy
+  abstentions remain untouched.
+- [x] Bind the installed wrapped media DEK and every source's current backend,
+  generation, strict-v2 context, plaintext length, and SHA-256; cap decoding at
+  the required source prefix and the existing 30-second biometric window.
+- [x] Exact-settle deterministic poison without provider work, preserve a
+  checked three-attempt retry ladder, and insert successful samples only at a
+  fingerprinted caller-fixed allocator ID with `accepted=-1`.
+- [x] Treat missing source children and multiple pre-existing samples as
+  provider-free topology poison, while a global backward clock leaves the
+  exact row and attempt untouched for a later sweep.
+- [x] Retain only fixed-size replay results in the bounded ledger; transcript,
+  media, keys, diagnostics, and vector bytes do not enter permanent receipts.
+- [ ] Migrate the separately gated voice-profile assignment/reconciliation
+  owner, then the people/person-fact owner, before public speaker readiness or
+  a production image can be claimed complete.
+
 ## Encrypted lifecycle page-store seam
 
 - [x] Added a strict versioned AES-256-GCM envelope with a control-DEK-derived

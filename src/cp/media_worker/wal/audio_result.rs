@@ -1,5 +1,5 @@
-//! Inactive deterministic audio-window transcript WAL subtype (ADR-0022
-//! slice 11, plan B — bound-only; no unbound contract ships).
+//! Deterministic audio-window transcript WAL subtype (ADR-0022 slice 11,
+//! plan B — bound-only; no unbound contract ships).
 //!
 //! The subtype accepts only a fully leased audio work unit whose provider
 //! usage has already reached a terminal result, the sealed sibling B
@@ -13,10 +13,11 @@
 //! fingerprinted `sqlite_sequence` pins with the plain-INSERT +
 //! derived-id-assert discipline. Person, identity, and voice mutation is
 //! structurally absent — the plan has no constructor slot for speaker
-//! names, person facts, or quality flags, and it never writes
-//! `voice_embedding_jobs`. Provider calls, media reads, clocks, automatic
-//! IDs, Store, launching, retries, and acknowledgement are deliberately
-//! absent.
+//! names, person facts, or quality flags. Each projected speaker observation
+//! gets one fixed-id pending `voice_embedding_jobs` row in the same atomic
+//! settlement; profile/person mutation remains structurally absent. Provider
+//! calls, media reads, clocks, automatic IDs, Store, launching, retries, and
+//! acknowledgement are deliberately absent.
 
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};
@@ -29,9 +30,9 @@ use crate::archive_v3_wal_idempotency::{
 };
 use crate::cp::identity::{OWNER_DISPLAY_NAME, UNIDENTIFIED_SPEAKER_LABEL};
 
-const REQUEST_V1: u16 = 1;
-const SUBTYPE: &[u8] = b"audio-window-transcript-v1-bound-attempt";
-const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"audio-window-transcript-bound-v1\0";
+const REQUEST_V2: u16 = 2;
+const SUBTYPE: &[u8] = b"audio-window-transcript-v2-embedding-jobs-bound-attempt";
+const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"audio-window-transcript-bound-v2\0";
 const WORK_DOMAIN: &[u8] = b"archive-v3-audio-window-predecessor-v1\0";
 const WORK_ATTEMPT_DOMAIN: &[u8] = b"archive-v3-audio-window-work-attempt-v1\0";
 const VERTEX_ATTEMPT_DOMAIN: &[u8] = b"archive-v3-audio-window-vertex-attempt-row-v1\0";
@@ -131,7 +132,7 @@ impl AudioTurnFact {
     }
 }
 
-/// The four `sqlite_sequence` pre-state pins, read by the owner's routed
+/// The five `sqlite_sequence` pre-state pins, read by the owner's routed
 /// pre-submit read and fingerprinted into the plan identity's request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::cp::media_worker) struct AudioSequencePins {
@@ -139,6 +140,7 @@ pub(in crate::cp::media_worker) struct AudioSequencePins {
     speaker_clusters: i64,
     speaker_observations: i64,
     utterances: i64,
+    voice_embedding_jobs: i64,
 }
 
 impl AudioSequencePins {
@@ -147,12 +149,14 @@ impl AudioSequencePins {
         speaker_clusters: i64,
         speaker_observations: i64,
         utterances: i64,
+        voice_embedding_jobs: i64,
     ) -> Self {
         Self {
             audio_segments,
             speaker_clusters,
             speaker_observations,
             utterances,
+            voice_embedding_jobs,
         }
     }
 }
@@ -226,6 +230,7 @@ impl AudioWindowTranscriptPlan {
             || seq_pins.speaker_clusters < 0
             || seq_pins.speaker_observations < 0
             || seq_pins.utterances < 0
+            || seq_pins.voice_embedding_jobs < 0
         {
             return Err(WalIdempotencyError::Malformed);
         }
@@ -293,7 +298,7 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::with_capacity(64 * 1024));
-        request.extend_from_slice(&REQUEST_V1.to_be_bytes());
+        request.extend_from_slice(&REQUEST_V2.to_be_bytes());
         encode_bytes(&mut request, SUBTYPE)?;
         request.extend_from_slice(&self.attempt_binding_commitment);
         encode_string(&mut request, &self.account_id)?;
@@ -307,6 +312,7 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
         request.extend_from_slice(&self.seq_pins.speaker_clusters.to_be_bytes());
         request.extend_from_slice(&self.seq_pins.speaker_observations.to_be_bytes());
         request.extend_from_slice(&self.seq_pins.utterances.to_be_bytes());
+        request.extend_from_slice(&self.seq_pins.voice_embedding_jobs.to_be_bytes());
         encode_len(&mut request, self.turns.len())?;
         for turn in &self.turns {
             encode_string(&mut request, &turn.turn_id)?;
@@ -358,7 +364,7 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
         // (4) One fixed commit time, after every predecessor and inside
         // every live lease.
         validate_commit_time(transaction, self, &authenticated)?;
-        // (5) The four live sqlite_sequence values are exactly the carried
+        // (5) The five live sqlite_sequence values are exactly the carried
         // pins.
         if read_audio_sequence_pins(transaction)? != self.seq_pins {
             return Err(WalIdempotencyError::Precondition);
@@ -378,20 +384,21 @@ impl WalLogicalDomainPlan for AudioWindowTranscriptPlan {
         // (9) One cluster per distinct speaker in first-appearance order;
         // explicit created_at/updated_at defeat the strftime DEFAULTs.
         write_clusters(transaction, self, &projection)?;
-        // (10)+(11) Observations with exact source projections, then
-        // utterances bound to the derived observation ids. The
+        // (10)+(11)+(12) Observations with exact source projections, then
+        // utterances and pending embedding jobs bound to the derived
+        // observation ids. The
         // utterances_fts AFTER-INSERT trigger fires on these deterministic
         // rowids in-transaction; trusted, not re-proven.
         write_turns(transaction, self, &projection)?;
-        // (12) Full-tuple settle of every member job and media row, in
+        // (13) Full-tuple settle of every member job and media row, in
         // ordinal order.
         for member in &authenticated.members {
             settle_job(transaction, self, member)?;
             settle_media(transaction, member)?;
         }
-        // (13) Full-tuple settle of the work unit.
+        // (14) Full-tuple settle of the work unit.
         settle_work(transaction, self, &authenticated.work)?;
-        // (14) Exact re-read of every written row and settled tuple.
+        // (15) Exact re-read of every written row and settled tuple.
         verify_final_state(transaction, self, &authenticated, &projection)?;
         Ok(WalReplayResult::unit())
     }
@@ -1353,18 +1360,19 @@ fn hash_value(hasher: &mut Sha256, value: ValueRef<'_>) {
     }
 }
 
-/// The four `sqlite_sequence` pre-state pins (COALESCE 0 when a table has
-/// never allocated), in the fixed segments/clusters/observations/utterances
-/// order.
+/// The five `sqlite_sequence` pre-state pins (COALESCE 0 when a table has
+/// never allocated), in the fixed segments/clusters/observations/utterances/
+/// embedding-jobs order.
 pub(in crate::cp::media_worker) fn read_audio_sequence_pins(
     connection: &Connection,
 ) -> Result<AudioSequencePins> {
-    let mut pins = [0_i64; 4];
+    let mut pins = [0_i64; 5];
     for (slot, table) in [
         "audio_segments",
         "speaker_clusters",
         "speaker_observations",
         "utterances",
+        "voice_embedding_jobs",
     ]
     .iter()
     .enumerate()
@@ -1382,6 +1390,7 @@ pub(in crate::cp::media_worker) fn read_audio_sequence_pins(
         speaker_clusters: pins[1],
         speaker_observations: pins[2],
         utterances: pins[3],
+        voice_embedding_jobs: pins[4],
     })
 }
 
@@ -1578,6 +1587,14 @@ fn ensure_target_columns(transaction: &Transaction<'_>) -> Result<()> {
     for (table, column) in [
         ("speaker_observations", "cluster_id"),
         ("utterances", "speaker_observation_id"),
+        ("voice_embedding_jobs", "lease_owner"),
+        ("voice_embedding_jobs", "lease_token"),
+        ("voice_embedding_jobs", "lease_until"),
+        ("voice_embedding_jobs", "attempt_count"),
+        ("voice_embedding_jobs", "next_attempt_at"),
+        ("voice_embedding_jobs", "error_code"),
+        ("voice_embedding_jobs", "created_at"),
+        ("voice_embedding_jobs", "updated_at"),
     ] {
         let present = transaction
             .query_row(
@@ -1659,6 +1676,30 @@ fn ensure_audio_targets_absent(
                     "SELECT COUNT(*) FROM speaker_observations
                      WHERE id=?1 OR (event_id=?2 AND turn_id=?3)",
                     params![observation_id, projected.anchor_event_id, turn.turn_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| WalIdempotencyError::Unavailable)?,
+        )?;
+        let embedding_job_id = plan
+            .seq_pins
+            .voice_embedding_jobs
+            .checked_add(1)
+            .and_then(|base| base.checked_add(i64::try_from(index).ok()?))
+            .ok_or(WalIdempotencyError::Limit)?;
+        occupied(
+            transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM voice_embedding_jobs
+                     WHERE id=?1 OR
+                           (speaker_observation_id=?2 AND embedding_space=?3 AND
+                            processor_version=1 AND quality_version=?4 AND scorer_version=?5)",
+                    params![
+                        embedding_job_id,
+                        observation_id,
+                        crate::cp::voice_memory::EMBEDDING_SPACE,
+                        crate::cp::voice_quality::QUALITY_VERSION,
+                        crate::cp::voice_quality::SCORER_VERSION,
+                    ],
                     |row| row.get(0),
                 )
                 .map_err(|_| WalIdempotencyError::Unavailable)?,
@@ -1825,6 +1866,32 @@ fn write_turns(
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
         if changed != 1 || transaction.last_insert_rowid() != utterance_id {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let embedding_job_id = plan
+            .seq_pins
+            .voice_embedding_jobs
+            .checked_add(1)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(WalIdempotencyError::Limit)?;
+        let changed = transaction
+            .execute(
+                "INSERT INTO voice_embedding_jobs
+                 (id,speaker_observation_id,embedding_space,processor_version,
+                  quality_version,scorer_version,state,lease_owner,lease_token,lease_until,
+                  attempt_count,next_attempt_at,error_code,created_at,updated_at)
+                 VALUES (?1,?2,?3,1,?4,?5,'pending',NULL,NULL,NULL,0,NULL,NULL,?6,?6)",
+                params![
+                    embedding_job_id,
+                    observation_id,
+                    crate::cp::voice_memory::EMBEDDING_SPACE,
+                    crate::cp::voice_quality::QUALITY_VERSION,
+                    crate::cp::voice_quality::SCORER_VERSION,
+                    plan.committed_at,
+                ],
+            )
+            .map_err(|_| WalIdempotencyError::Unavailable)?;
+        if changed != 1 || transaction.last_insert_rowid() != embedding_job_id {
             return Err(WalIdempotencyError::Corrupt);
         }
     }
@@ -2159,6 +2226,81 @@ fn verify_final_state(
         {
             return Err(WalIdempotencyError::Corrupt);
         }
+        let embedding_job_id = plan
+            .seq_pins
+            .voice_embedding_jobs
+            .checked_add(1)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(WalIdempotencyError::Limit)?;
+        let embedding_job = transaction
+            .query_row(
+                "SELECT speaker_observation_id,embedding_space,processor_version,
+                        quality_version,scorer_version,state,lease_owner,lease_token,
+                        lease_until,attempt_count,next_attempt_at,error_code,created_at,updated_at
+                 FROM voice_embedding_jobs WHERE id=?1",
+                [embedding_job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                    ))
+                },
+            )
+            .map_err(|_| WalIdempotencyError::Corrupt)?;
+        let (
+            stored_observation_id,
+            embedding_space,
+            processor_version,
+            quality_version,
+            scorer_version,
+            state,
+            lease_owner,
+            lease_token,
+            lease_until,
+            attempt_count,
+            next_attempt_at,
+            error_code,
+            created_at,
+            updated_at,
+        ) = embedding_job;
+        if (
+            stored_observation_id,
+            embedding_space,
+            processor_version,
+            quality_version,
+        ) != (
+            observation_id,
+            crate::cp::voice_memory::EMBEDDING_SPACE.to_owned(),
+            1,
+            crate::cp::voice_quality::QUALITY_VERSION,
+        ) || (scorer_version, state, attempt_count)
+            != (
+                crate::cp::voice_quality::SCORER_VERSION,
+                "pending".to_owned(),
+                0,
+            )
+            || lease_owner.is_some()
+            || lease_token.is_some()
+            || lease_until.is_some()
+            || next_attempt_at.is_some()
+            || error_code.is_some()
+            || created_at != plan.committed_at
+            || updated_at != plan.committed_at
+        {
+            return Err(WalIdempotencyError::Corrupt);
+        }
     }
     for member in &authenticated.members {
         let job = load_job(transaction, member.job.id)?;
@@ -2220,14 +2362,22 @@ fn verify_final_state(
             |row| row.get::<_, i64>(0),
         )
         .map_err(|_| WalIdempotencyError::Corrupt)?;
+    let embedding_job_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM voice_embedding_jobs WHERE id>?1",
+            [plan.seq_pins.voice_embedding_jobs],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
     if utterance_count != turn_count
         || observation_count != turn_count
         || stored_cluster_count != cluster_count
+        || embedding_job_count != turn_count
     {
         return Err(WalIdempotencyError::Corrupt);
     }
     // Every sqlite_sequence advanced by exactly its insert count (for zero
-    // turns: only the segment, deltas 1/0/0/0).
+    // turns: only the segment, deltas 1/0/0/0/0).
     let expected = AudioSequencePins {
         audio_segments: plan.seq_pins.audio_segments + 1,
         speaker_clusters: plan
@@ -2243,6 +2393,11 @@ fn verify_final_state(
         utterances: plan
             .seq_pins
             .utterances
+            .checked_add(turn_count)
+            .ok_or(WalIdempotencyError::Limit)?,
+        voice_embedding_jobs: plan
+            .seq_pins
+            .voice_embedding_jobs
             .checked_add(turn_count)
             .ok_or(WalIdempotencyError::Limit)?,
     };
@@ -2721,7 +2876,7 @@ pub(super) mod tests {
                     label TEXT,
                     status TEXT NOT NULL DEFAULT 'tentative'
                  );
-                 CREATE TABLE voice_samples (
+                 CREATE TABLE IF NOT EXISTS voice_samples (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     speaker_observation_id INTEGER NOT NULL,
                     voice_profile_id INTEGER,
@@ -2749,7 +2904,7 @@ pub(super) mod tests {
                     active INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL DEFAULT 'probationary'
                  );
-                 CREATE TABLE voice_embedding_jobs (
+                 CREATE TABLE IF NOT EXISTS voice_embedding_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     speaker_observation_id INTEGER NOT NULL,
                     embedding_space TEXT NOT NULL,
@@ -2757,6 +2912,13 @@ pub(super) mod tests {
                     quality_version INTEGER NOT NULL DEFAULT 1,
                     scorer_version INTEGER NOT NULL DEFAULT 2,
                     state TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_token TEXT,
+                    lease_until TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     UNIQUE(speaker_observation_id, embedding_space, processor_version, quality_version, scorer_version)
                  );
@@ -2800,6 +2962,38 @@ pub(super) mod tests {
     pub(in crate::cp::media_worker::wal) fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE app_metadata (key TEXT PRIMARY KEY,value TEXT);
+                 CREATE TABLE voice_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    speaker_observation_id INTEGER NOT NULL,
+                    voice_profile_id INTEGER,
+                    accepted INTEGER NOT NULL DEFAULT 0,
+                    outlier INTEGER NOT NULL DEFAULT 0,
+                    embedding_job_id INTEGER
+                 );
+                 CREATE TABLE voice_embedding_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    speaker_observation_id INTEGER NOT NULL,
+                    embedding_space TEXT NOT NULL,
+                    processor_version INTEGER NOT NULL DEFAULT 1,
+                    quality_version INTEGER NOT NULL DEFAULT 1,
+                    scorer_version INTEGER NOT NULL DEFAULT 2,
+                    state TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_token TEXT,
+                    lease_until TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(speaker_observation_id, embedding_space, processor_version,
+                           quality_version, scorer_version)
+                 );",
+            )
+            .unwrap();
         connection
     }
 
@@ -3163,6 +3357,10 @@ pub(super) mod tests {
         );
         assert_eq!(count_of(&connection, "SELECT COUNT(*) FROM utterances"), 0);
         assert_eq!(
+            count_of(&connection, "SELECT COUNT(*) FROM voice_embedding_jobs"),
+            0
+        );
+        assert_eq!(
             count_of(
                 &connection,
                 "SELECT COUNT(*) FROM media_processing_jobs WHERE state='succeeded'"
@@ -3185,7 +3383,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             read_audio_sequence_pins(&connection).unwrap(),
-            AudioSequencePins::new(1, 0, 0, 0)
+            AudioSequencePins::new(1, 0, 0, 0, 0)
         );
     }
 
@@ -3786,7 +3984,7 @@ pub(super) mod tests {
                 [3; 32],
                 MODEL.to_owned(),
                 committed_at(1),
-                AudioSequencePins::new(0, 0, 0, 0),
+                AudioSequencePins::new(0, 0, 0, 0, 0),
                 turns,
             )
         };
@@ -3870,9 +4068,9 @@ pub(super) mod tests {
         assert_eq!(recalculated, 0, "episode recalculation must be a no-op");
     }
 
-    // E2 — the identity-exclusion red line (also the F8-coupling guard:
-    // any future change enqueueing voice jobs on this lane must re-open
-    // F8's review).
+    // E2 — the identity-exclusion red line and reviewed F8 coupling:
+    // pending embedding work is atomic with observations, while samples,
+    // profiles, people, identity and episode rows remain absent.
     #[test]
     fn e2_identity_exclusion_red_line_holds_after_apply() {
         let mut connection = identity_connection();
@@ -3900,7 +4098,6 @@ pub(super) mod tests {
             "voice_profile_revisions",
             "voice_profile_representatives",
             "profile_identity_bindings",
-            "voice_embedding_jobs",
         ] {
             assert_eq!(
                 count_of(&connection, &format!("SELECT COUNT(*) FROM {table}")),
@@ -3911,11 +4108,75 @@ pub(super) mod tests {
         assert_eq!(
             count_of(
                 &connection,
+                "SELECT COUNT(*) FROM voice_embedding_jobs
+                 WHERE state='pending' AND attempt_count=0 AND lease_owner IS NULL
+                   AND lease_token IS NULL AND lease_until IS NULL
+                   AND next_attempt_at IS NULL AND error_code IS NULL"
+            ),
+            2,
+            "one exact pending embedding job must be written per observation"
+        );
+        assert_eq!(
+            count_of(
+                &connection,
                 "SELECT COUNT(*) FROM speaker_observations WHERE person_id IS NOT NULL"
             ),
             0
         );
         assert_eq!(count_of(&connection, "SELECT COUNT(*) FROM episodes"), 0);
+    }
+
+    #[test]
+    fn e3_selected_transcript_job_enters_the_sealed_embedding_settlement() {
+        let mut connection = connection();
+        seed_reserved_audio_work(&connection, WORK_ONE, 1, 1);
+        let receipt = terminal_receipt(&mut connection, WORK_ONE, 1);
+        let plan = transcript_plan(
+            &connection,
+            WORK_ONE,
+            &receipt,
+            1,
+            vec![fact("turn-1", 0, 900, "speaker_0", "voice work")],
+        );
+        execute(&mut connection, plan).unwrap();
+
+        let observed_at = committed_at(2);
+        let evidence =
+            super::super::voice_embedding::observe_next(&connection, ACCOUNT, &observed_at)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            evidence.disposition(),
+            super::super::voice_embedding::VoiceClaimDisposition::Terminal("ERR_MEDIA_DEK_MISSING")
+        );
+        let claim = super::super::VoiceEmbeddingPlan::claim(
+            ACCOUNT.to_owned(),
+            evidence,
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            observed_at.clone(),
+            super::super::super::super::isotime::add_seconds(&observed_at, 300.0),
+        )
+        .unwrap();
+        let prepared = PreparedLogicalMutation::prepare(claim).unwrap();
+        execute_prepared_for_owner(&mut connection, prepared).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state,error_code,attempt_count FROM voice_embedding_jobs",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?
+                    )),
+                )
+                .unwrap(),
+            ("failed".to_owned(), "ERR_MEDIA_DEK_MISSING".to_owned(), 0)
+        );
+        assert_eq!(
+            count_of(&connection, "SELECT COUNT(*) FROM voice_samples"),
+            0
+        );
     }
 
     // T24 — the sqlite_sequence gate over the REAL archive baseline
@@ -3952,9 +4213,9 @@ pub(super) mod tests {
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
 
-        // Blocking fact 1, INVERTED: the baseline DDL now declares all four
-        // pinned tables AUTOINCREMENT. It used to declare only two, and that
-        // split is what blocked the family.
+        // Blocking fact 1, INVERTED: the baseline DDL now declares all five
+        // pinned tables AUTOINCREMENT. The transcript tables used to split
+        // allocator policy, which is what blocked the family.
         let ddl = |table: &str| -> String {
             connection
                 .query_row(
@@ -3968,8 +4229,9 @@ pub(super) mod tests {
         assert!(ddl("utterances").contains("AUTOINCREMENT"));
         assert!(ddl("speaker_clusters").contains("AUTOINCREMENT"));
         assert!(ddl("speaker_observations").contains("AUTOINCREMENT"));
+        assert!(ddl("voice_embedding_jobs").contains("AUTOINCREMENT"));
 
-        // Blocking fact 2, INVERTED: inserts into all four tables now move
+        // Blocking fact 2, INVERTED: inserts into all five tables now move
         // sqlite_sequence, so the pin discipline observes them — and, the
         // point of the whole change, DELETING every row leaves the high-water
         // standing so an id can never be reissued.
@@ -3992,7 +4254,7 @@ pub(super) mod tests {
         let pins = read_audio_sequence_pins(&connection).unwrap();
         assert_eq!(
             pins,
-            AudioSequencePins::new(1, 0, 0, 1),
+            AudioSequencePins::new(1, 0, 0, 1, 0),
             "AUTOINCREMENT tables must appear in sqlite_sequence after one insert"
         );
         connection.execute("DELETE FROM utterances", []).unwrap();
@@ -4005,7 +4267,7 @@ pub(super) mod tests {
         // guardrail removed.
         assert_eq!(
             read_audio_sequence_pins(&connection).unwrap(),
-            AudioSequencePins::new(1, 0, 0, 1),
+            AudioSequencePins::new(1, 0, 0, 1, 0),
             "DELETE must not rewind the high-water; ids are never reissued"
         );
 
@@ -4144,6 +4406,7 @@ pub(super) mod tests {
                 before.speaker_clusters + 1,
                 before.speaker_observations + 1,
                 before.utterances + 1,
+                before.voice_embedding_jobs + 1,
             ),
             "pins must advance by the exact per-table deltas"
         );

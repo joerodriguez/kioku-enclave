@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -2220,6 +2221,38 @@ async fn load_raw_media_bytes(state: &CpState, user_id: &str, object_key: &str) 
     Ok(media)
 }
 
+async fn load_selected_voice_source(
+    state: &CpState,
+    user_id: &str,
+    source: &wal::voice_embedding::VoiceEmbeddingSource,
+    wrapped_media_dek: &str,
+    media_dek: &crate::crypto::Dek,
+) -> Result<Vec<u8>> {
+    let generation = source
+        .generation()
+        .ok_or_else(|| EnclaveError::Store("voice source generation is absent".into()))?;
+    let stored = state
+        .store
+        .get_current_media_generation(source.object_key(), generation)
+        .await?;
+    if stored.generation != generation || stored.wrapped_dek_b64 != wrapped_media_dek {
+        return Err(EnclaveError::Crypto(
+            "voice source provider identity mismatch".into(),
+        ));
+    }
+    let context = crate::store::media_blob_context(user_id, source.object_key());
+    let opened = crate::crypto::decrypt_bound_blob_v2(media_dek, &stored.ciphertext, &context)?;
+    let actual_hash = format!("{:x}", Sha256::digest(&opened.plaintext));
+    if i64::try_from(opened.plaintext.len()).ok() != Some(source.byte_length())
+        || !actual_hash.eq_ignore_ascii_case(source.sha256())
+    {
+        return Err(EnclaveError::Crypto(
+            "voice source plaintext commitment mismatch".into(),
+        ));
+    }
+    Ok(opened.plaintext)
+}
+
 async fn load_job_media(state: &CpState, user_id: &str, job: &MediaJob) -> Result<Vec<u8>> {
     let media = load_raw_media_bytes(state, user_id, &job.object_key).await?;
     let actual_hash = format!("{:x}", Sha256::digest(&media));
@@ -2730,7 +2763,7 @@ async fn settle_audio_window_attempt(
 /// this lane. Every fact the plan carries comes from ONE routed
 /// immediately-pre-submit read (the terminal Vertex attempt commitment on
 /// the attempt's own event id, the exact terminal-stage work predecessor,
-/// and the four `sqlite_sequence` id-allocation pins) or is computed
+/// and the five `sqlite_sequence` id-allocation pins) or is computed
 /// pre-submit (the transcript projection of the parsed turns — the
 /// identity fields are dropped HERE, at the seam — and one canonical
 /// commit time); the sealed plan is constructed ONCE (R5) and an owner
@@ -3913,11 +3946,8 @@ async fn prune_user_media_store(store: &Store, user_id: &str) {
 }
 
 async fn process_user_voice_embedding_jobs(state: &CpState, user_id: &str) {
-    // ADR-0022 D4: the voice-embedding lane is not migrated — every lease,
-    // reconstruction, and enrolment below goes through the legacy per-user
-    // store. The migrated media lanes (claim, work-unit result, retention)
-    // ran earlier in this same sweep and are deliberately untouched.
-    if state.wal_domain_skipped(user_id, wal_domain::MEDIA_WORKER_VOICE_EMBEDDING) {
+    if state.store.is_wal_authoritative(user_id) {
+        process_selected_voice_embedding_jobs(state, user_id).await;
         return;
     }
     let now = now_iso();
@@ -4280,6 +4310,254 @@ async fn process_user_voice_embedding_jobs(state: &CpState, user_id: &str) {
             super::voice_memory::recalculate_all_episode_speaker_processing_status(conn)
         })
         .await;
+}
+
+async fn process_selected_voice_embedding_jobs(state: &CpState, user_id: &str) {
+    // Repair the bounded historical v1 transcript gap before scanning due
+    // jobs. The backfill is provider-free and inserts at most one exact
+    // pending job per sealed WAL mutation; observations with an existing
+    // sample/job or an intentional policy abstention are never touched.
+    for _ in 0..32 {
+        let account = user_id.to_owned();
+        let evidence = match state
+            .store
+            .wal_authoritative_read(user_id, move |connection| {
+                wal::voice_embedding::observe_next_job_backfill(connection, &account)
+                    .map_err(EnclaveError::from)
+            })
+            .await
+        {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(error = %error, "selected voice embedding backfill scan failed");
+                return;
+            }
+        };
+        let plan =
+            match wal::VoiceEmbeddingPlan::backfill_job(user_id.to_owned(), evidence, now_iso())
+                .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            {
+                Ok(plan) => plan,
+                Err(_) => {
+                    warn!("selected voice embedding backfill construction failed");
+                    return;
+                }
+            };
+        if let Err(error) = state.store.wal_authoritative_submit(user_id, plan).await {
+            warn!(error = %error, "selected voice embedding backfill failed");
+            return;
+        }
+    }
+
+    // One random capability per attempt. The WAL plan owns the checked state
+    // transition before any GCS/KMS/model work and reauthenticates the same
+    // capability and source topology at settlement.
+    for _ in 0..32 {
+        let leased_at = now_iso();
+        let probe_at = leased_at.clone();
+        let account = user_id.to_owned();
+        let evidence = match state
+            .store
+            .wal_authoritative_read(user_id, move |connection| {
+                wal::voice_embedding::observe_next(connection, &account, &probe_at)
+                    .map_err(EnclaveError::from)
+            })
+            .await
+        {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(error = %error, "selected voice embedding scan failed");
+                return;
+            }
+        };
+        let disposition = evidence.disposition();
+        if disposition == wal::voice_embedding::VoiceClaimDisposition::ClockDeferred {
+            // A rollback is global enclave state, not attributable row
+            // poison. Preserve the exact job/attempt and retry on a later
+            // sweep after wall time recovers.
+            return;
+        }
+        let mut capability = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut capability);
+        let lease_token = format!("{:032x}", u128::from_be_bytes(capability));
+        let lease_until = isotime::add_seconds(&leased_at, 300.0);
+        let plan = match wal::VoiceEmbeddingPlan::claim(
+            user_id.to_owned(),
+            evidence.clone(),
+            lease_token.clone(),
+            leased_at.clone(),
+            lease_until.clone(),
+        )
+        .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+        {
+            Ok(plan) => plan,
+            Err(_) => {
+                warn!("selected voice embedding claim construction failed");
+                return;
+            }
+        };
+        if let Err(error) = state.store.wal_authoritative_submit(user_id, plan).await {
+            warn!(error = %error, "selected voice embedding claim failed");
+            return;
+        }
+        if disposition != wal::voice_embedding::VoiceClaimDisposition::Authorized {
+            continue;
+        }
+
+        let outcome = selected_voice_embedding_outcome(state, user_id, &evidence).await;
+        let settled_at = now_iso();
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err((error_code, terminal)) => {
+                if terminal {
+                    wal::voice_embedding::VoiceEmbeddingOutcome::Terminal {
+                        error_code: error_code.into(),
+                    }
+                } else {
+                    wal::voice_embedding::VoiceEmbeddingOutcome::Retry {
+                        error_code: error_code.into(),
+                        retry_at: isotime::add_seconds(&settled_at, 60.0),
+                    }
+                }
+            }
+        };
+        let plan = match wal::VoiceEmbeddingPlan::settle(
+            user_id.to_owned(),
+            evidence,
+            lease_token,
+            leased_at,
+            lease_until,
+            settled_at,
+            outcome,
+        )
+        .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+        {
+            Ok(plan) => plan,
+            Err(_) => {
+                warn!("selected voice embedding result construction failed");
+                return;
+            }
+        };
+        if let Err(error) = state.store.wal_authoritative_submit(user_id, plan).await {
+            warn!(error = %error, "selected voice embedding result failed");
+            return;
+        }
+    }
+}
+
+async fn selected_voice_embedding_outcome(
+    state: &CpState,
+    user_id: &str,
+    evidence: &wal::voice_embedding::VoiceEmbeddingEvidence,
+) -> std::result::Result<wal::voice_embedding::VoiceEmbeddingOutcome, (&'static str, bool)> {
+    let wrapped = evidence
+        .wrapped_media_dek()
+        .ok_or(("ERR_MEDIA_DEK_MISSING", true))?;
+    let media_dek = crate::crypto::load_dek(state.store.kms.as_ref(), wrapped)
+        .await
+        .map_err(|error| match error {
+            EnclaveError::Http(_) | EnclaveError::Attestation(_) => ("ERR_KMS_UNAVAILABLE", false),
+            _ => ("ERR_MEDIA_DEK_INVALID", true),
+        })?;
+    let mut full_samples = Vec::new();
+    for source in evidence.sources() {
+        let remaining = super::voice_memory::MAX_TURN_SAMPLES
+            .checked_sub(full_samples.len())
+            .ok_or(("ERR_SOURCE_TOPOLOGY", true))?;
+        if remaining == 0 {
+            break;
+        }
+        let (start_ms, end_ms) = source.event_offsets();
+        let start_sample = usize::try_from(
+            (u64::try_from(start_ms).map_err(|_| ("ERR_SOURCE_TOPOLOGY", true))?
+                * u64::from(super::voice_memory::TARGET_SAMPLE_RATE))
+                / 1_000,
+        )
+        .map_err(|_| ("ERR_SOURCE_TOPOLOGY", true))?;
+        let end_sample = usize::try_from(
+            (u64::try_from(end_ms).map_err(|_| ("ERR_SOURCE_TOPOLOGY", true))?
+                * u64::from(super::voice_memory::TARGET_SAMPLE_RATE))
+                / 1_000,
+        )
+        .map_err(|_| ("ERR_SOURCE_TOPOLOGY", true))?;
+        let required_prefix = end_sample.min(
+            start_sample
+                .checked_add(remaining)
+                .ok_or(("ERR_SOURCE_TOPOLOGY", true))?,
+        );
+        if required_prefix <= start_sample {
+            continue;
+        }
+        let media = load_selected_voice_source(state, user_id, source, wrapped, &media_dek)
+            .await
+            .map_err(|error| match error {
+                EnclaveError::NotFound | EnclaveError::Gcs(_) | EnclaveError::Http(_) => {
+                    ("ERR_MEDIA_UNAVAILABLE", false)
+                }
+                EnclaveError::Crypto(_) => ("ERR_MEDIA_INTEGRITY", true),
+                _ => ("ERR_MEDIA_UNAVAILABLE", false),
+            })?;
+        let decoded = super::voice_memory::decode_mono_16khz_prefix(
+            &media,
+            source.mime_type(),
+            required_prefix,
+        )
+        .map_err(|_| ("ERR_MEDIA_UNDECODABLE", true))?;
+        let slice = super::voice_memory::slice_observation_source(&decoded, start_ms, end_ms);
+        full_samples.extend_from_slice(&slice[..slice.len().min(remaining)]);
+    }
+    if full_samples.is_empty() {
+        return Err(("ERR_EMPTY_SPAN", true));
+    }
+    let diagnostics = super::voice_quality::diagnose(&full_samples, evidence.overlap(), &[]);
+    let diagnostics_json =
+        serde_json::to_string(&diagnostics).map_err(|_| ("ERR_DIAGNOSTICS", true))?;
+    let eligibility = diagnostics.decision.as_str().to_owned();
+    if diagnostics.decision == super::voice_quality::SampleDecision::NoEmbedding {
+        return Ok(
+            wal::voice_embedding::VoiceEmbeddingOutcome::QualityRejected {
+                diagnostics_json,
+                eligibility,
+            },
+        );
+    }
+    let engine = state.voice.as_ref().ok_or(("ERR_NO_VOICE_ENGINE", false))?;
+    let embedding = engine
+        .embed_samples(&full_samples)
+        .map_err(|_| ("ERR_INFERENCE", false))?;
+    let embedding_norm = f64::from(
+        embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt(),
+    );
+    let vector_bytes = embedding
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let sequence_pin = evidence
+        .sample_sequence_pin()
+        .ok_or(("ERR_SAMPLE_CAPACITY", true))?;
+    let payload = wal::voice_embedding::VoiceSamplePayload::new(
+        vector_bytes,
+        diagnostics_json,
+        eligibility,
+        diagnostics.duration_ms,
+        diagnostics.speech_ratio,
+        diagnostics.snr_proxy_db,
+        diagnostics.clipping_ratio,
+        diagnostics.silence_ratio,
+        embedding_norm,
+        evidence.acoustic_domain(),
+    )
+    .map_err(|_| ("ERR_SAMPLE_INVALID", true))?;
+    Ok(wal::voice_embedding::VoiceEmbeddingOutcome::Sample {
+        payload,
+        sequence_pin,
+    })
 }
 
 async fn sweep(state: &Arc<CpState>) {
@@ -6995,13 +7273,13 @@ mod tests {
         let whole = include_str!("media_worker.rs");
         let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
 
-        // Exactly two gates, and both name a voice domain.
+        // Exactly one gate remains, and it names only the profile tail.
         assert_eq!(
             source.matches(concat!("wal_domain_", "skipped(")).count(),
-            2,
+            1,
             "the media lanes must not acquire a gate"
         );
-        assert_eq!(source.matches("MEDIA_WORKER_VOICE_EMBEDDING").count(), 1);
+        assert_eq!(source.matches("MEDIA_WORKER_VOICE_EMBEDDING").count(), 0);
         assert_eq!(source.matches("MEDIA_WORKER_VOICE_PROFILES").count(), 1);
 
         let process_start = source.find(concat!("async fn process_", "user(")).unwrap();
@@ -7055,23 +7333,21 @@ mod tests {
         }
     }
 
-    /// The voice-embedding lane defers inertly: one counted skip, and none of
-    /// the legacy lease refusal it used to log every sweep.
+    /// The selected embedding lane reaches a real readable Genesis archive;
+    /// an empty queue is ordinary idle, never a D4 skip or legacy lease call.
     #[tokio::test]
-    async fn the_deferred_voice_embedding_lane_skips_once_without_leasing() {
-        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
+    async fn the_selected_voice_embedding_lane_routes_to_the_genesis_archive() {
+        use crate::cp::wal_gate_test_support::{answerable_wal_archive, capture_events};
 
-        let state = state();
-        let user_id = "media-voice-deferred-user";
-        select_wal_authoritative(&state.store, user_id);
+        let archive = answerable_wal_archive("71717171-7171-4171-8171-717171717171").await;
 
         let (captured, guard) = capture_events();
-        process_user_voice_embedding_jobs(&state, user_id).await;
+        process_user_voice_embedding_jobs(&archive.state, &archive.user_id).await;
         drop(guard);
 
         assert_eq!(
-            captured.skips(wal_domain::MEDIA_WORKER_VOICE_EMBEDDING),
-            1,
+            captured.skips("media_worker.voice_embedding"),
+            0,
             "{}",
             captured.text()
         );
@@ -7079,8 +7355,98 @@ mod tests {
             !captured
                 .text()
                 .contains("failed to lease voice embedding jobs"),
-            "the gate must stop before the lease, not after it: {}",
+            "selected work must never fall through to the legacy lease: {}",
             captured.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_voice_media_uses_only_the_carried_current_generation_and_strict_v2() {
+        use crate::cp::wal_gate_test_support::state_over;
+
+        let kms = Arc::new(FakeKms);
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new_with_media_and_legacy(
+            kms.clone(),
+            indexes.clone(),
+            current.clone(),
+            legacy.clone(),
+        ));
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(
+            kms.clone(),
+            indexes,
+        ));
+        let state = state_over(store, control);
+        let user_id = "81818181-8181-4181-8181-818181818181";
+        let object_key = format!("raw/{user_id}/voice-source.enc");
+        let plaintext = b"authenticated voice source";
+        let (dek, wrapped) = crate::crypto::generate_and_wrap_dek(kms.as_ref())
+            .await
+            .unwrap();
+        let context = crate::store::media_blob_context(user_id, &object_key);
+        let ciphertext = crate::crypto::encrypt_bound_blob(&dek, plaintext, &context).unwrap();
+        let pinned_generation = current
+            .put_object(&object_key, &ciphertext, &wrapped, 0)
+            .await
+            .unwrap();
+        current
+            .put_object(
+                &object_key,
+                &crate::crypto::encrypt_bound_blob(&dek, b"newer wrong bytes", &context).unwrap(),
+                &wrapped,
+                pinned_generation,
+            )
+            .await
+            .unwrap();
+        legacy
+            .put_object(&object_key, b"legacy poison", "wrong", 0)
+            .await
+            .unwrap();
+        let source = wal::voice_embedding::VoiceEmbeddingSource::for_test(
+            object_key.clone(),
+            pinned_generation,
+            format!("{:x}", Sha256::digest(plaintext)),
+            plaintext.len() as i64,
+        );
+        let opened = load_selected_voice_source(&state, user_id, &source, &wrapped, &dek)
+            .await
+            .unwrap();
+        assert_eq!(opened, plaintext);
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "legacy media must never be read"
+        );
+
+        let legacy_ciphertext =
+            crate::crypto::encrypt_blob_with_aad(&dek, plaintext, &context).unwrap();
+        let legacy_encoding_generation = current
+            .put_object(
+                &object_key,
+                &legacy_ciphertext,
+                &wrapped,
+                pinned_generation + 1,
+            )
+            .await
+            .unwrap();
+        let legacy_source = wal::voice_embedding::VoiceEmbeddingSource::for_test(
+            object_key,
+            legacy_encoding_generation,
+            format!("{:x}", Sha256::digest(plaintext)),
+            plaintext.len() as i64,
+        );
+        assert!(
+            load_selected_voice_source(&state, user_id, &legacy_source, &wrapped, &dek)
+                .await
+                .is_err(),
+            "selected evidence must reject the legacy context-only encoding"
+        );
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "strict failure must not fall back"
         );
     }
 
