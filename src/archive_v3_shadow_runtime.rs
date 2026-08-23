@@ -33,24 +33,32 @@ use crate::{
         resolve_archive_cipher, ArchiveId, ExactKeyRegistryProvider, ImmutableObjectBackend,
         KeyKind, KeyRegistryContext, ObjectId, VerifiedArchiveCipher,
     },
+    archive_v3_deletion_lane::{ArchiveDeletionRuntime, ArchiveDeletionRuntimeFactory},
     archive_v3_firestore_shadow::FirestoreShadowWitness,
-    archive_v3_firestore_witness::{FirestoreWitnessCommitError, FirestoreWitnessConfig},
+    archive_v3_firestore_witness::{
+        FirestoreWitness, FirestoreWitnessCommitError, FirestoreWitnessConfig,
+    },
     archive_v3_gcs::{
         ArchiveV3GcsTransport, GcsArchiveV3Backend, GcsArchiveV3RegistryProvider,
-        GcsArchiveV3RootProvider,
+        GcsArchiveV3RootProvider, GcsExactReachabilityReader,
     },
     archive_v3_gcs_auth::{ArchiveV3GcsAttestationBearer, ArchiveV3GcsAudience},
     archive_v3_gcs_http::{
         valid_archive_v3_bucket_name, ArchiveV3SoftDeleteDrainGate, GcpArchiveV3HttpTransport,
+        GcpLifecyclePageHttpTransport,
     },
+    archive_v3_lifecycle::ArchiveLifecyclePageStore,
+    archive_v3_lifecycle_page_store::{EncryptedLifecyclePageStore, LifecyclePageControlKey},
     archive_v3_maintenance_import::{
         AuthenticatedMaintenanceImportPlan, MaintenanceImportError,
         MaintenanceImportWitnessProvider, SingleArchiveMaintenanceImporter,
     },
+    archive_v3_reachability::ExactReachabilityReader,
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
     archive_v3_witness::{
-        ExactRootProvider, RootAdvance, WitnessError, WitnessLease, WitnessRecord,
+        control_deletion_authenticator, DeletionPrincipalKey, ExactRootProvider, RootAdvance,
+        WitnessError, WitnessLease, WitnessRecord,
     },
     cp::control_store::{ArchiveBinding, ControlStore},
     crypto::GcpKmsClient,
@@ -261,6 +269,196 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ArchiveV3ShadowRuntimeDeployment(<redacted>)")
     }
+}
+
+/// Private-field token proving deletion providers came from this sealed
+/// runtime composer rather than being released from the Firestore bundle by a
+/// route or Store helper.
+pub(crate) struct DeletionRuntimeContext(());
+
+/// Production factory for the one image-bound archive deletion runtime.
+/// Construction is provider-I/O-free; every per-archive call revalidates the
+/// baked commitment before releasing exact-name read/delete capabilities.
+pub(crate) struct ProductionArchiveDeletionRuntimeFactory {
+    deployment: Arc<ArchiveV3ShadowRuntimeDeployment>,
+    kms: Arc<GcpKmsClient>,
+    control: Arc<ControlStore>,
+    lifecycle_page_key: Arc<LifecyclePageControlKey>,
+    principal_key: Arc<DeletionPrincipalKey>,
+}
+
+impl ProductionArchiveDeletionRuntimeFactory {
+    pub(crate) fn new(
+        deployment: ArchiveV3ShadowRuntimeDeployment,
+        kms: Arc<GcpKmsClient>,
+        control: Arc<ControlStore>,
+        lifecycle_page_key: Arc<LifecyclePageControlKey>,
+        principal_key: Arc<DeletionPrincipalKey>,
+    ) -> Self {
+        Self {
+            deployment: Arc::new(deployment),
+            kms,
+            control,
+            lifecycle_page_key,
+            principal_key,
+        }
+    }
+}
+
+struct ProductionArchiveDeletionRuntime {
+    archive_id: ArchiveId,
+    witness: Arc<FirestoreWitness>,
+    reader: Arc<GcsExactReachabilityReader>,
+    pages: Arc<EncryptedLifecyclePageStore>,
+    transport: Arc<dyn ArchiveV3GcsTransport>,
+    registries: Arc<GcsArchiveV3RegistryProvider>,
+}
+
+#[async_trait::async_trait]
+impl ArchiveDeletionRuntimeFactory for ProductionArchiveDeletionRuntimeFactory {
+    async fn runtime_for(
+        &self,
+        archive_id: ArchiveId,
+    ) -> crate::error::Result<Arc<dyn ArchiveDeletionRuntime>> {
+        if ArchiveV3ArchiveBindingCommitment::for_archive(archive_id)
+            != self.deployment.archive_binding_commitment
+        {
+            return Err(crate::error::EnclaveError::Store(
+                "archive deletion binding does not match the baked runtime".into(),
+            ));
+        }
+        let audience =
+            ArchiveV3GcsAudience::for_project_number(&self.deployment.archive_gcs_project_number)
+                .map_err(|_| {
+                crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+            })?;
+        let bearer = Arc::new(ArchiveV3GcsAttestationBearer::new(audience).map_err(|_| {
+            crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+        })?);
+        let concrete_transport = Arc::new(
+            GcpArchiveV3HttpTransport::new(
+                self.deployment.archive_bucket.clone(),
+                bearer,
+                Arc::new(ConstructionOnlyDrainGate),
+            )
+            .map_err(|_| {
+                crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+            })?,
+        );
+        let transport: Arc<dyn ArchiveV3GcsTransport> = concrete_transport.clone();
+        let registry_kms = Arc::new(
+            GcpArchiveV3RegistryKms::new(
+                Arc::clone(&self.kms),
+                &self.deployment.registry_kms_version,
+            )
+            .map_err(|_| {
+                crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+            })?,
+        );
+        let registries = Arc::new(GcsArchiveV3RegistryProvider::new(
+            Arc::clone(&transport),
+            registry_kms,
+        ));
+        let witness_config = FirestoreWitnessConfig::new(
+            &self.deployment.witness_project_id,
+            &self.deployment.witness_project_number,
+            &self.deployment.witness_database_id,
+        )
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+        })?;
+        let witness_owner = FirestoreShadowWitness::new_with_deletion_authority(
+            witness_config,
+            control_deletion_authenticator(Arc::clone(&self.principal_key)),
+        )
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("archive deletion runtime unavailable".into())
+        })?;
+        let witness = witness_owner.deletion_firestore_witness(&DeletionRuntimeContext(()));
+        let lifecycle_transport = Arc::new(GcpLifecyclePageHttpTransport::new(concrete_transport));
+        let admissions: Arc<
+            dyn crate::archive_v3_lifecycle_page_store::LifecyclePageAdmissionLedger,
+        > = self.control.clone();
+        let pages = Arc::new(EncryptedLifecyclePageStore::new(
+            Arc::clone(&self.lifecycle_page_key),
+            lifecycle_transport,
+            admissions,
+        ));
+        Ok(Arc::new(ProductionArchiveDeletionRuntime {
+            archive_id,
+            witness,
+            reader: Arc::new(GcsExactReachabilityReader::new(Arc::clone(&transport))),
+            pages,
+            transport,
+            registries,
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl ArchiveDeletionRuntime for ProductionArchiveDeletionRuntime {
+    fn witness(&self) -> Arc<dyn crate::archive_v3_deletion_lane::DeletionLaneWitness> {
+        self.witness.clone()
+    }
+
+    fn reader(&self) -> Arc<dyn ExactReachabilityReader> {
+        self.reader.clone()
+    }
+
+    fn page_store(&self) -> Arc<dyn ArchiveLifecyclePageStore> {
+        self.pages.clone()
+    }
+
+    fn transport(&self) -> Arc<dyn ArchiveV3GcsTransport> {
+        Arc::clone(&self.transport)
+    }
+
+    async fn ciphers(
+        &self,
+    ) -> crate::error::Result<(VerifiedArchiveCipher, Option<VerifiedArchiveCipher>)> {
+        let record = self
+            .witness
+            .read_current_async(self.archive_id)
+            .await
+            .map_err(|_| {
+                crate::error::EnclaveError::Store("archive deletion witness unavailable".into())
+            })?
+            .ok_or_else(|| {
+                crate::error::EnclaveError::Store("archive deletion witness missing".into())
+            })?;
+        let current =
+            resolve_deletion_cipher(self.archive_id, record.registry(), self.registries.as_ref())
+                .await?;
+        let predecessor = match record.predecessor_registry() {
+            Some(registry) => Some(
+                resolve_deletion_cipher(self.archive_id, registry, self.registries.as_ref())
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok((current, predecessor))
+    }
+}
+
+async fn resolve_deletion_cipher(
+    archive_id: ArchiveId,
+    registry: crate::archive_v3_witness::KeyRegistryReference,
+    provider: &dyn ExactKeyRegistryProvider,
+) -> crate::error::Result<VerifiedArchiveCipher> {
+    let context = KeyRegistryContext::with_rotation_generation(
+        archive_id,
+        KeyKind::Archive,
+        registry.key_epoch(),
+        registry.rotation_generation(),
+    );
+    resolve_archive_cipher(
+        &context,
+        registry.object_id(),
+        registry.ciphertext_hash(),
+        provider,
+    )
+    .await
+    .map_err(|_| crate::error::EnclaveError::Store("archive deletion registry unavailable".into()))
 }
 
 /// Private provider owner. It is never returned without exact durable binding.
@@ -1020,8 +1218,10 @@ impl ShadowCheckpointWitnessProvider for UnavailableShadowWitnessProvider {
     }
 }
 
-/// This is intentionally not configurable. A future deletion-capable runtime
-/// must replace it only with authenticated lifecycle-ledger evidence.
+/// This is intentionally not configurable. The active deletion runtime lists
+/// actual soft-deleted generations while bucket soft delete is enabled. If the
+/// provider reports that policy disabled, this conservative fallback refuses
+/// completion until a separately reviewed authenticated drain proof exists.
 struct ConstructionOnlyDrainGate;
 
 #[async_trait::async_trait]
@@ -1382,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn source_exposes_only_token_gated_operations_and_no_live_wiring() {
+    fn source_exposes_only_token_gated_serving_and_deletion_operations() {
         let source = include_str!("archive_v3_shadow_runtime.rs");
         let main = include_str!("main.rs");
         let control = include_str!("cp/control_store.rs");
@@ -1421,7 +1621,6 @@ mod tests {
             concat!("pub(crate) fn wit", "ness("),
             concat!("tokio::", "spawn"),
             concat!("std::thread::", "spawn"),
-            concat!("Store", "::"),
             concat!("with_", "user"),
             concat!("WalLogical", "Only"),
         ] {
@@ -1478,6 +1677,48 @@ mod tests {
         ] {
             assert!(!main.contains(forbidden), "live wiring: {forbidden}");
         }
+        assert!(main.contains("archive_deletion_runtime_secrets()"));
+        assert!(main.contains("ProductionArchiveDeletionRuntimeFactory::new("));
+        assert!(main.contains("install_wal_deletion_lane("));
+        assert!(source.contains("impl ArchiveDeletionRuntimeFactory"));
+        assert!(source.contains("control_deletion_authenticator("));
+
+        // The deletion authority must exist before any selected persistence
+        // selection, serving relaunch, or account-deletion reconciler can
+        // observe work. These are source-order seals over the one production
+        // startup owner; moving any boundary requires an explicit review.
+        let secrets = main
+            .find("archive_deletion_runtime_secrets()")
+            .expect("deletion roots are derived");
+        let factory = main
+            .find("ProductionArchiveDeletionRuntimeFactory::new(")
+            .expect("deletion factory is constructed");
+        let install = main
+            .find("install_wal_deletion_lane(")
+            .expect("deletion lane is installed");
+        let selections = main
+            .find("load_wal_authoritative_persistence_selections()")
+            .expect("WAL selections are loaded");
+        let relaunch = main
+            .find("relaunch_wal_serving_authorities(")
+            .expect("serving authorities are relaunched");
+        let deletion_reconciler = main
+            .find("spawn_account_deletion_reconciler(")
+            .expect("account deletion reconciler is launched");
+        assert!(
+            secrets < factory
+                && factory < install
+                && install < selections
+                && selections < relaunch
+                && relaunch < deletion_reconciler
+        );
+        assert_eq!(main.matches("install_wal_deletion_lane(").count(), 1);
+        assert_eq!(
+            main.matches("Arc::clone(&secrets.principal_key)").count(),
+            1,
+            "the factory must authenticate deletion workers with the installed lane's key"
+        );
+        assert_eq!(main.matches("secrets.principal_key,").count(), 1);
     }
     #[test]
     fn baked_deployment_off_semantics_are_exact() {

@@ -4911,10 +4911,6 @@ impl Store {
     /// Install the archive-v3 deletion lane. Install-once, like the serving
     /// authority: a second install refuses rather than replacing a lane that a
     /// deletion may already be driving.
-    #[allow(
-        dead_code,
-        reason = "installed once the production archive-v3 deletion runtime factory exists; absent, the WAL deletion branch fails closed"
-    )]
     pub(crate) fn install_wal_deletion_lane(
         &self,
         lane: Arc<crate::archive_v3_deletion_lane::WalDeletionLane>,
@@ -4996,6 +4992,16 @@ impl Store {
                 ));
             }
         }
+        // The archive database cannot enumerate a provider PUT whose durable
+        // media row never landed. Every media PUT is nevertheless preceded by
+        // the retained legacy-write intent, so install the account's durable
+        // provider fence and drain that exact create-ahead family before the
+        // prefix sweep. The marker survives process restart and prevents an
+        // old intent reconciler or another enclave instance from recreating a
+        // media object after this pass proves it absent.
+        let proposed_authority = format!("delete_{}", crate::cp::tokens::random_token_hex());
+        self.fence_and_drain_legacy_writes(user_id, &proposed_authority)
+            .await?;
         self.block_content_writes_for_deletion(user_id).await;
 
         let mut soft_deleted = self
@@ -10927,6 +10933,51 @@ pub(crate) mod tests {
         deleter.delete_user(user_id).await.unwrap();
         assert_eq!(inner.exact_generation_count(&object_name), 0);
         deleter.drain_legacy_write_intents(user_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_media_deletion_fences_intents_and_closes_unrecorded_put_residue() {
+        let user_id = "wal-media-intent-fence";
+        let object_name = format!("raw/{user_id}/capture.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let blocking = Arc::new(BlockingPutGcs::new(inner.clone(), object_name.clone()));
+        let provider: Arc<dyn GcsClient> = blocking.clone();
+        let writer = Arc::new(Store::new(Arc::new(FakeKms), provider.clone()));
+        let deleter = Store::new(Arc::new(FakeKms), provider);
+
+        let write = {
+            let writer = Arc::clone(&writer);
+            let object_name = object_name.clone();
+            tokio::spawn(async move {
+                writer
+                    .put_user_media(user_id, &object_name, b"ciphertext", "wrapped")
+                    .await
+            })
+        };
+        blocking.wait_until_blocked().await;
+        assert!(matches!(
+            deleter.delete_wal_authoritative_media(user_id, &[]).await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+
+        blocking.release();
+        write.await.unwrap().unwrap();
+        deleter
+            .delete_wal_authoritative_media(user_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+        assert!(matches!(
+            writer
+                .put_user_media(user_id, &object_name, b"later", "wrapped")
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
     }
 
     #[tokio::test]

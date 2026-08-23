@@ -1,16 +1,17 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 Firestore witness boundary is compiled and unit-tested before runtime wiring"
+    reason = "active ADR-0022 witness adapter retains reviewed inactive transition surfaces"
 )]
 
-//! Inactive ADR-0022 Firestore witness adapter.
+//! ADR-0022 Firestore witness adapter.
 //!
-//! This is a provider-neutral transaction boundary, not a Firestore client or
-//! production authority.  It is deliberately not wired to credentials from
-//! metadata, Store, VFS, routes, deployment flags, or write authority.  The
+//! This is a provider-neutral transaction boundary, not a route-selected
+//! Firestore client. The signed runtime supplies its fixed transport and
+//! dedicated attestation bearer; metadata, Store, VFS, routes, and deployment
+//! flags cannot choose them. The
 //! only persisted field is `r`, containing the exact fixed-size
-//! [`WitnessRecord`] codec bytes.  A future concrete HTTP transport must use a
-//! narrowly-scoped bearer-token provider and preserve these transaction and
+//! [`WitnessRecord`] codec bytes. The concrete HTTP transport uses a
+//! narrowly-scoped bearer-token provider and preserves these transaction and
 //! compare-and-set semantics.
 
 use crate::{
@@ -1399,6 +1400,20 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(observed, record);
+    }
+
+    #[tokio::test]
+    async fn deletion_boundary_uses_native_async_firestore_under_tokio() {
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let adapter = witness(transport);
+        let record = adapter.bootstrap_async(bootstrap()).await.unwrap();
+        let observed = crate::archive_v3_witness::AsyncDeletionWitness::read_current_deletion(
+            &adapter,
+            record.archive_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.as_ref(), Some(&record));
     }
 
     struct FakeProbeState {
@@ -3990,5 +4005,54 @@ impl Witness for FirestoreWitness {
         proof: &DeletionStageProof,
     ) -> std::result::Result<WitnessReceipt, WitnessError> {
         self.blocking(self.advance_deletion_async(advance, next, credential, proof))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::archive_v3_witness::AsyncDeletionWitness for FirestoreWitness {
+    async fn read_current_deletion(
+        &self,
+        archive_id: ArchiveId,
+    ) -> std::result::Result<Option<WitnessRecord>, WitnessError> {
+        self.read_current_async(archive_id).await
+    }
+
+    async fn tombstone_current_deletion(
+        &self,
+        advance: crate::archive_v3_witness::TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<TombstoneReceipt, WitnessError> {
+        self.tombstone_current_async(advance, credential, proof)
+            .await
+    }
+
+    async fn resume_deletion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+    ) -> std::result::Result<DeletionRecovery, WitnessError> {
+        self.resume_deletion_async(archive_id, credential).await
+    }
+
+    async fn verify_physical_completion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<DeletionRecovery, WitnessError> {
+        self.verify_physical_completion_async(archive_id, credential, proof)
+            .await
+    }
+
+    async fn advance_deletion_async_boundary(
+        &self,
+        advance: DeletionAdvance,
+        next: DeletionState,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<WitnessReceipt, WitnessError> {
+        self.advance_deletion_async(advance, next, credential, proof)
+            .await
     }
 }

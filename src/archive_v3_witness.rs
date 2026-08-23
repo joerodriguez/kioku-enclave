@@ -1,5 +1,8 @@
-#![allow(dead_code, reason = "inactive ADR-0022 witness contract")]
-//! Content-free, inactive ADR-0022 witness contract. Provider persistence is
+#![allow(
+    dead_code,
+    reason = "active ADR-0022 witness contract retains inactive advisory and extent transitions"
+)]
+//! Content-free ADR-0022 witness contract. Provider persistence is
 //! fixed-size and contains every lease/fence/root commitment needed after restart.
 
 use crate::archive_v3::{
@@ -418,6 +421,12 @@ impl fmt::Debug for DeletionPrincipal {
 /// every witness reconstruction that must accept a real deletion worker.
 pub(crate) struct ControlDeletionAuthenticator {
     key: Arc<DeletionPrincipalKey>,
+}
+
+pub(crate) fn control_deletion_authenticator(
+    key: Arc<DeletionPrincipalKey>,
+) -> Arc<dyn DeletionWorkerAuthenticator> {
+    Arc::new(ControlDeletionAuthenticator { key })
 }
 
 impl DeletionWorkerAuthenticator for ControlDeletionAuthenticator {
@@ -3075,6 +3084,91 @@ pub trait Witness: Send + Sync {
         credential: &DeletionWorkerCredential,
         proof: &DeletionStageProof,
     ) -> Result<WitnessReceipt>;
+}
+
+/// Async-only destructive witness boundary.
+///
+/// The general [`Witness`] trait predates the production Firestore adapter and
+/// is intentionally synchronous.  Its compatibility implementation refuses
+/// to block a Tokio worker, which is exactly the context the account-deletion
+/// reconciler runs in.  Destruction therefore uses this smaller native-async
+/// seam instead of attempting to drive the compatibility wrapper.  It exposes
+/// only the five operations the deletion ladder needs; ordinary lease, root,
+/// migration, and registry authority stay on their existing typed paths.
+#[async_trait::async_trait]
+pub(crate) trait AsyncDeletionWitness: Send + Sync {
+    async fn read_current_deletion(&self, archive_id: ArchiveId) -> Result<Option<WitnessRecord>>;
+
+    async fn tombstone_current_deletion(
+        &self,
+        advance: TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<TombstoneReceipt>;
+
+    async fn resume_deletion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+    ) -> Result<DeletionRecovery>;
+
+    async fn verify_physical_completion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<DeletionRecovery>;
+
+    async fn advance_deletion_async_boundary(
+        &self,
+        advance: DeletionAdvance,
+        next: DeletionState,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<WitnessReceipt>;
+}
+
+#[async_trait::async_trait]
+impl AsyncDeletionWitness for InMemoryWitness {
+    async fn read_current_deletion(&self, archive_id: ArchiveId) -> Result<Option<WitnessRecord>> {
+        self.read_current(archive_id)
+    }
+
+    async fn tombstone_current_deletion(
+        &self,
+        advance: TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<TombstoneReceipt> {
+        self.tombstone_current(advance, credential, proof)
+    }
+
+    async fn resume_deletion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+    ) -> Result<DeletionRecovery> {
+        self.resume_deletion(archive_id, credential)
+    }
+
+    async fn verify_physical_completion_async_boundary(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<DeletionRecovery> {
+        self.verify_physical_completion(archive_id, credential, proof)
+    }
+
+    async fn advance_deletion_async_boundary(
+        &self,
+        advance: DeletionAdvance,
+        next: DeletionState,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<WitnessReceipt> {
+        self.advance_deletion(advance, next, credential, proof)
+    }
 }
 
 struct State {

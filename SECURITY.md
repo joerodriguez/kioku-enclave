@@ -628,13 +628,13 @@ confirmed-absent rows remain deletion work. Canonical object-name parsing also b
 stored role, including the v3 WAL segment and WAL commit-descriptor roles, so relabeling an
 object cannot bypass registry-first erasure. Page reordering, truncation, cross-archive use,
 commitment rollback, or conflicting reuse of an object ID fails closed before destructive
-I/O. The inactive external page-store seam derives an independent AES-256-GCM key for each
+I/O. The active deletion-only external page-store seam derives an independent AES-256-GCM key for each
 complete page reference and deletion fence from a producer-sealed control DEK. Its strict
 versioned envelope authenticates the deterministic full-hash exact object name, archive,
 fence, ordinal, page ID, predecessor, hash, and encoded length. Conditional-create success,
 precondition failure, and ambiguous response can mint a durable receipt only after a bounded
 exact read decrypts and decodes to that same canonical page. The narrow transport has no list
-or overwrite operation. The inactive inventory coordinator requires exact Tombstoned witness
+or overwrite operation. The active deletion-only inventory coordinator requires exact Tombstoned witness
 recovery, freezes/loads the settled create-ahead snapshot, authenticates the exact current and
 optional predecessor graphs, and unions facts by object ID; only byte-for-byte identical
 key/role/hash facts deduplicate and every conflict fails closed. It sorts that complete set and
@@ -780,20 +780,22 @@ inventory, drains again after physical purge, and cannot finalize identity state
 `deletion_reconciled`. The content-free old-namespace marker is intentionally retained as a
 ledger-known no-resurrection tombstone; only the later Phase-6 authority-drain/witness cutover may
 retire it.
-`src/archive_v3_gcs.rs` is likewise inactive: it specifies and
-tests a redacted async GCS-shaped transport boundary (conditional immutable creation,
+`src/archive_v3_gcs.rs` is the signed runtime's redacted async GCS-shaped transport
+boundary (conditional immutable creation,
 read-after-create equality, bounded canonical-name pagination, and a contract requiring
 exact all-generation deletion) plus a typed, bounded registry-KMS boundary. Its fake
 verifies wrap/unwrap delegation and multi-generation absence semantics; provider-level deletion
-evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides a concrete,
+evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides the concrete,
 caller-token-only rustls-only/no-proxy/no-redirect/no-retry REST implementation with exact URL encoding, bounded streamed reads/listing,
 generation-zero creates, durable claim CAS, and bounded all-generation deletion. Disabled-policy
 deletion succeeds only through an external provider/audit-and-trusted-time drain gate; no such live
-gate is wired. The transport intentionally has no metadata-service access, environment constructor,
-credentials/runtime/deploy wiring, or authority connection; its provider errors never contain
+gate is wired, so that provider response fails closed. While soft delete is enabled, the active
+deletion runtime instead lists the actual soft-deleted generations and completes only when they
+expire. The transport intentionally has no metadata-service access or environment constructor;
+the signed runtime supplies its fixed credential and deployment binding. Provider errors never contain
 object paths, IDs, hashes, or cursors.
 
-`src/archive_v3_registry_kms.rs` is the concrete but still inactive registry-KMS
+`src/archive_v3_registry_kms.rs` is the concrete signed-runtime registry-KMS
 adapter. It derives only a canonical numeric `CryptoKeyVersion` beneath the exact key
 already selected by the live `GcpKmsClient`; it does not add an environment input or
 change the legacy `KmsClient` encrypt/decrypt path or its production endpoints. Before
@@ -810,10 +812,11 @@ booleans, CRC32C response integrity, strict secret-bearing response shapes, and 
 bodies. Tokens, AAD, request JSON, returned ciphertext, and plaintext use zeroizing owners;
 provider error bodies are neither consumed nor logged, and Debug output is fixed and
 redacted. Cancellation drops the one in-flight operation with the caller destination
-remaining zero; there is no adapter retry or detached task. No startup, Store, provider
-construction, route, flag, release, or persistence authority is wired.
+remaining zero; there is no adapter retry or detached task. Only the sealed WAL and deletion
+runtime composers construct it; Store, routes, flags, and callers cannot select a key version
+or provider.
 
-`src/archive_v3_deletion.rs` is a compiled-but-inactive deletion-driver seam. It accepts
+`src/archive_v3_deletion.rs` is the active deletion-driver seam for the signed profile. It accepts
 only an exact-current witness-issued tombstone/restart authorization, the opaque archive context
 authenticated by that witness, and the matching durable lifecycle inventory seal; no caller can provide an account ID, object key, prefix, or
 list-all selector. It advances the existing key-erasure, inventory, and retention evidence
@@ -833,9 +836,10 @@ unrelated retention assertion. The former independent inventory builder, test-ov
 commitment, and `FullReachabilitySeal` are removed. A complete deletion inventory is now minted
 only after the authenticated lifecycle-page loader verifies the exact durable seal (apart from
 explicit `cfg(test)` fixtures), so the reachability report remains non-authorizing on its own.
-Full activation remains blocked because the type-separated pre-witness execution protocol has no
-production destructive evidence producer, provider capability, cleanup transition, or driver
-invocation, and by the lack of startup/runtime/provider construction.
+The normal Tombstoned-witness path is installed at startup before WAL selections, serving relaunch,
+or account-deletion reconciliation. The type-separated pre-witness execution protocol remains
+inactive: it has no production destructive evidence producer, provider capability, cleanup
+transition, or driver invocation.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
 that never established a witness); reauthenticate that exact Tombstoned worker/operation/fence before
@@ -860,9 +864,9 @@ inactive type-separated execution protocol can durably bind that exact authentic
 record only opaque evidence commitments, but it has no entry/provider capability, destructive
 evidence producer, cleanup producer, or driver invocation; those separately reviewed integrations
 remain activation blockers.
-The authenticated exact-name visitor and lifecycle inventory coordinator are compiled and tested
-but inactive; neither infers paths nor discovers objects by prefix. The driver has no Store, route, runtime,
-credential, or deployment wiring.
+The authenticated exact-name visitor and lifecycle inventory coordinator are active only inside the
+installed deletion lane; neither infers paths nor discovers objects by prefix. The driver still has
+no route-selected Store, credential, provider, or deployment surface.
 
 `src/archive_v3_reachability.rs` is the first inactive, non-authorizing half of that source
 change. It accepts at most the exact current and predecessor root/registry pairs from one
@@ -1826,19 +1830,19 @@ Confidential Space tokens:
    expiry, audience, nonce, relevant Confidential Space claims, and image digest rather
    than merely decoding the JWT.
 
-The compiled-but-inactive ADR-0022 Firestore witness boundary is deliberately a third,
+The signed-runtime ADR-0022 Firestore witness boundary is deliberately a third,
 type-separated credential path. It derives only the exact dedicated
 `archive-witness-attest/archive-witness` provider audience, requests a no-nonce launcher
 OIDC token for that audience, and exchanges it only at fixed Google STS with the
 cloud-platform scope. It has a separate mutex-coalesced zeroizing cache refreshed 60
 seconds early; it does not share KMS credentials or cache state, use metadata/default
-credentials, impersonate a service account, expose its tokens publicly, or enable any
+credentials, impersonate a service account, expose its tokens publicly, or let routes select
 runtime witness authority. The three paths share only the bounded launcher socket protocol;
 the Firestore audience type, STS client, secret-owning request/response buffers, and cache are
 separate. Its STS client is rustls-only, proxy-free, redirect-free, retry-disabled, and
 bounded; neither OIDC/STS tokens, audience, nor provider bodies are logged.
 
-The compiled-but-inactive ADR-0022 archive-GCS bearer is a fourth, separately typed
+The signed-runtime ADR-0022 archive-GCS bearer is a fourth, separately typed
 credential path. It accepts only the dedicated
 `archive-gcs-attest/archive-gcs` provider-resource audience, requests a no-nonce launcher
 OIDC token for that audience, and exchanges it only at fixed Google STS for the fixed
@@ -1847,7 +1851,8 @@ a validated project number (never a full caller-controlled audience); its launch
 no-proxy/no-redirect/no-retry STS client, zeroizing request/response material, and
 mutex-coalesced cache are independent of KMS, public attestation, and Firestore. It has no
 environment/request/header authority selection, metadata/default credentials, service-account
-impersonation, transport/Store/VFS/route connection, or runtime authority. Launcher and STS
+impersonation, or Store/VFS/route connection. Only the sealed WAL/deletion composers connect it
+to the fixed transport. Launcher and STS
 responses are bounded with finite timeouts and strict RFC 8693/response parsing; cancellation
 or refresh failure drops expired cached secret material.
 

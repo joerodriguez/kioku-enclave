@@ -1,9 +1,9 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 authenticated inventory coordinator is compiled and fake-tested before runtime wiring"
+    reason = "active ADR-0022 deletion inventory coordinator retains an inactive type-separated pre-witness branch"
 )]
 
-//! Inactive authenticated deletion-inventory coordinator for ADR-0022.
+//! Authenticated deletion-inventory coordinator for ADR-0022.
 //!
 //! This module joins three already separate authorities without constructing
 //! any of them: exact-current deletion witness recovery, the encrypted control
@@ -12,9 +12,9 @@
 //! settled create-ahead object, and returns only the control-minted
 //! [`DeletionInventorySeal`]. A type-separated pre-witness branch consumes a
 //! fresh exact-absence receipt into a create-ahead-only page seal and returns
-//! no deletion authority. It has no Store, startup, environment/config, route,
-//! provider construction, list operation, deletion-driver invocation, or
-//! cloud/deployment wiring.
+//! no deletion authority. The signed deletion runtime composes the normal
+//! branch with fixed providers; this module itself still has no Store, route,
+//! environment/config, provider construction, or list operation.
 
 use crate::{
     archive_v3::{ArchiveId, ObjectId, VerifiedArchiveCipher},
@@ -962,8 +962,8 @@ pub(crate) async fn load_complete_deletion_inventory(
     .map_err(|_| InventoryCoordinatorError::Lifecycle)
 }
 
-/// Dependency-only adapter for the inactive deletion driver. Construction
-/// performs no I/O and is not connected to startup or a provider factory.
+/// Dependency-only adapter for the active deletion driver. Construction
+/// performs no I/O; the signed runtime supplies its fixed dependencies.
 pub(crate) struct AuthenticatedLifecycleInventoryLedger {
     control: Arc<dyn DeletionInventoryControl>,
     page_store: Arc<dyn ArchiveLifecyclePageStore>,

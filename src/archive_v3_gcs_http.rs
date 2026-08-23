@@ -1,13 +1,13 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 GCS HTTP transport is intentionally not wired to runtime authority"
+    reason = "ADR-0022 GCS transport retains bounded protocol helpers outside the active deletion and WAL paths"
 )]
 
-//! Concrete, but inactive, Google Cloud Storage REST transport for archive-v3.
+//! Concrete Google Cloud Storage REST transport for archive-v3.
 //!
 //! This module deliberately exposes no environment constructor and is not
-//! connected to the Store, VFS, witness, routes, Terraform, or write
-//! authority. Callers must supply a narrow bearer-token provider; this code
+//! connected directly to Store, VFS, routes, Terraform, or a generic write
+//! authority. The signed WAL and deletion runtimes supply a narrow bearer-token provider; this code
 //! neither contacts metadata service nor logs credentials, URLs, object names,
 //! opaque IDs, hashes, response bodies, or pagination tokens.
 
@@ -66,6 +66,162 @@ pub(crate) struct GcpArchiveV3HttpTransport {
     soft_delete_drain: Arc<dyn ArchiveV3SoftDeleteDrainGate>,
 }
 
+/// Deletion-only lifecycle-page adapter over the same fixed GCS origin and
+/// attested bearer as the archive transport. Creates run in provider-owned
+/// Tokio tasks: cancelling the caller cannot detach an untracked request, and
+/// the page store can refuse its final freeze until every exact-name request
+/// owned by this process has reached a terminal response.
+pub(crate) struct GcpLifecyclePageHttpTransport {
+    inner: Arc<GcpArchiveV3HttpTransport>,
+    in_flight_creates: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+}
+
+impl GcpLifecyclePageHttpTransport {
+    pub(crate) fn new(inner: Arc<GcpArchiveV3HttpTransport>) -> Self {
+        Self {
+            inner,
+            in_flight_creates: Arc::new(tokio::sync::Mutex::new(BTreeSet::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::archive_v3_lifecycle_page_store::LifecyclePageTransport
+    for GcpLifecyclePageHttpTransport
+{
+    async fn create_if_absent(
+        &self,
+        exact_name: &str,
+        ciphertext: &[u8],
+    ) -> Result<
+        crate::archive_v3_lifecycle_page_store::LifecyclePageCreateResult,
+        crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError,
+    > {
+        use crate::archive_v3_lifecycle_page_store::{
+            LifecyclePageCreateResult, LifecyclePageTransportError,
+        };
+        if !crate::archive_v3_lifecycle_page_store::valid_lifecycle_page_object_name(exact_name)
+            || ciphertext.is_empty()
+            || ciphertext.len() > crate::archive_v3_lifecycle_page_store::MAX_PAGE_OBJECT_BYTES
+        {
+            return Err(LifecyclePageTransportError::Protocol);
+        }
+        let name = exact_name.to_owned();
+        let bytes = ciphertext.to_vec();
+        {
+            let mut in_flight = self.in_flight_creates.lock().await;
+            if !in_flight.insert(name.clone()) {
+                return Err(LifecyclePageTransportError::OutcomeUnknown);
+            }
+        }
+        let inner = Arc::clone(&self.inner);
+        let in_flight = Arc::clone(&self.in_flight_creates);
+        let task_name = name.clone();
+        let joined = tokio::spawn(async move {
+            let result = inner.create_object(&task_name, &bytes, "0").await;
+            in_flight.lock().await.remove(&task_name);
+            result
+        })
+        .await
+        .map_err(|_| LifecyclePageTransportError::OutcomeUnknown)?;
+        match joined.map_err(map_lifecycle_transport_error)? {
+            GcsArchiveV3CreateResult::Created => Ok(LifecyclePageCreateResult::Created),
+            GcsArchiveV3CreateResult::PreconditionFailed => {
+                Ok(LifecyclePageCreateResult::PreconditionFailed)
+            }
+        }
+    }
+
+    async fn read_exact(
+        &self,
+        exact_name: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError>
+    {
+        use crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError;
+        if !crate::archive_v3_lifecycle_page_store::valid_lifecycle_page_object_name(exact_name)
+            || max_bytes == 0
+            || max_bytes > crate::archive_v3_lifecycle_page_store::MAX_PAGE_OBJECT_BYTES
+        {
+            return Err(LifecyclePageTransportError::Protocol);
+        }
+        self.inner
+            .read_object(exact_name, None, max_bytes)
+            .await
+            .map_err(map_lifecycle_transport_error)
+    }
+
+    async fn delete_all_generations_exact(
+        &self,
+        exact_name: &str,
+    ) -> Result<
+        crate::archive_v3_lifecycle_page_store::LifecyclePageDeleteResult,
+        crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError,
+    > {
+        use crate::archive_v3_lifecycle_page_store::{
+            LifecyclePageDeleteResult, LifecyclePageTransportError,
+        };
+        if !crate::archive_v3_lifecycle_page_store::valid_lifecycle_page_object_name(exact_name) {
+            return Err(LifecyclePageTransportError::Protocol);
+        }
+        match self
+            .inner
+            .delete_all_generations_named(exact_name)
+            .await
+            .map_err(map_lifecycle_transport_error)?
+        {
+            GcsArchiveV3DeleteResult::DeletedAllGenerations => {
+                Ok(LifecyclePageDeleteResult::DeletedAllGenerations)
+            }
+            GcsArchiveV3DeleteResult::Absent => Ok(LifecyclePageDeleteResult::Absent),
+        }
+    }
+
+    async fn verify_all_generations_absent_exact(
+        &self,
+        exact_name: &str,
+    ) -> Result<bool, crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError> {
+        use crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError;
+        if !crate::archive_v3_lifecycle_page_store::valid_lifecycle_page_object_name(exact_name) {
+            return Err(LifecyclePageTransportError::Protocol);
+        }
+        self.inner
+            .verify_all_generations_absent_named(exact_name)
+            .await
+            .map_err(map_lifecycle_transport_error)
+    }
+
+    async fn frozen_create_requests_drained(
+        &self,
+        exact_names: &[&str],
+    ) -> Result<bool, crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError> {
+        use crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError;
+        if exact_names.iter().any(|name| {
+            !crate::archive_v3_lifecycle_page_store::valid_lifecycle_page_object_name(name)
+        }) {
+            return Err(LifecyclePageTransportError::Protocol);
+        }
+        let in_flight = self.in_flight_creates.lock().await;
+        Ok(exact_names.iter().all(|name| !in_flight.contains(*name)))
+    }
+}
+
+fn map_lifecycle_transport_error(
+    error: GcsArchiveV3TransportError,
+) -> crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError {
+    use crate::archive_v3_lifecycle_page_store::LifecyclePageTransportError;
+    match error {
+        GcsArchiveV3TransportError::Unavailable | GcsArchiveV3TransportError::NotFound => {
+            LifecyclePageTransportError::Unavailable
+        }
+        GcsArchiveV3TransportError::OutcomeUnknown => LifecyclePageTransportError::OutcomeUnknown,
+        GcsArchiveV3TransportError::TooLarge => LifecyclePageTransportError::TooLarge,
+        GcsArchiveV3TransportError::PreconditionFailed | GcsArchiveV3TransportError::Protocol => {
+            LifecyclePageTransportError::Protocol
+        }
+    }
+}
+
 impl GcpArchiveV3HttpTransport {
     /// Create a transport for the normal GCS JSON API endpoint. This does not
     /// perform I/O and does not inspect process environment.
@@ -82,8 +238,8 @@ impl GcpArchiveV3HttpTransport {
         )
     }
 
-    /// Endpoint injection is solely an inactive-construction seam for explicit
-    /// deployment wiring and local HTTP tests. It must be an absolute HTTPS
+    /// Endpoint injection is solely a construction seam for the fixed production
+    /// origin and local HTTP tests. It must be an absolute HTTPS
     /// origin without a path/query/fragment; plaintext HTTP is loopback-only.
     pub(crate) fn new_with_endpoint(
         endpoint: &str,
@@ -948,7 +1104,7 @@ fn valid_endpoint(endpoint: &str) -> bool {
         && url.fragment().is_none()
 }
 
-/// Validate the one canonical bucket-name grammar shared by inactive runtime
+/// Validate the one canonical bucket-name grammar shared by signed runtime
 /// deployment construction and this transport. This performs no I/O.
 pub(crate) fn valid_archive_v3_bucket_name(bucket: &str) -> bool {
     let length_ok = if bucket.contains('.') {
@@ -1090,6 +1246,10 @@ impl fmt::Debug for GcpArchiveV3HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_v3_lifecycle_page_store::{
+        LifecyclePageCreateResult, LifecyclePageTransport, LifecyclePageTransportError,
+        MAX_PAGE_OBJECT_BYTES,
+    };
     use std::sync::Mutex;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1241,6 +1401,10 @@ mod tests {
         "archive/v3/01010101010101010101010101010101/extents/02020202020202020202020202020202/7/03030303030303030303030303030303.extx"
     }
 
+    fn lifecycle_page_key() -> &'static str {
+        "control/archive-v3/lifecycle-pages/01010101010101010101010101010101/02020202020202020202020202020202/00000000-0303030303030303030303030303030303030303030303030303030303030303.enc"
+    }
+
     fn enumerated_key(id: u128) -> String {
         format!(
             "archive/v3/01010101010101010101010101010101/extents/02020202020202020202020202020202/7/{id:032x}.extx"
@@ -1368,6 +1532,104 @@ mod tests {
             retransmit.is_none(),
             "create_if_absent retransmitted after provider acceptance"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_page_create_is_exact_bounded_and_rejects_arbitrary_names_before_io() {
+        let server = MockServer::new(vec![reply("200 OK", "")]).await;
+        let transport = GcpLifecyclePageHttpTransport::new(Arc::new(make_transport(&server)));
+        let ciphertext = vec![7; MAX_PAGE_OBJECT_BYTES];
+        assert_eq!(
+            transport
+                .create_if_absent(lifecycle_page_key(), &ciphertext)
+                .await,
+            Ok(LifecyclePageCreateResult::Created)
+        );
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert!(requests[0].target.contains("ifGenerationMatch=0"));
+        assert!(requests[0]
+            .target
+            .contains(&canonical_url_component(lifecycle_page_key())));
+        assert_eq!(requests[0].body_len, MAX_PAGE_OBJECT_BYTES);
+
+        let no_io = MockServer::new(Vec::new()).await;
+        let transport = GcpLifecyclePageHttpTransport::new(Arc::new(make_transport(&no_io)));
+        assert_eq!(
+            transport
+                .create_if_absent("control/archive-v3/lifecycle-pages/not-canonical", b"x")
+                .await,
+            Err(LifecyclePageTransportError::Protocol)
+        );
+        assert_eq!(
+            transport
+                .create_if_absent(lifecycle_page_key(), &vec![0; MAX_PAGE_OBJECT_BYTES + 1])
+                .await,
+            Err(LifecyclePageTransportError::Protocol)
+        );
+        assert!(no_io.finish().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_create_remains_frozen_until_provider_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            accepted_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let inner = Arc::new(
+            GcpArchiveV3HttpTransport::new_with_endpoint(
+                &endpoint,
+                "test-bucket".to_owned(),
+                Arc::new(FixedToken),
+                Arc::new(FixedDrainGate(true)),
+            )
+            .unwrap(),
+        );
+        let transport = Arc::new(GcpLifecyclePageHttpTransport::new(inner));
+        let caller_transport = Arc::clone(&transport);
+        let caller = tokio::spawn(async move {
+            caller_transport
+                .create_if_absent(lifecycle_page_key(), b"ciphertext")
+                .await
+        });
+        accepted_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            transport
+                .frozen_create_requests_drained(&[lifecycle_page_key()])
+                .await,
+            Ok(false)
+        );
+        release_tx.send(()).unwrap();
+        let request = server.await.unwrap();
+        assert_eq!(request.method, "POST");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport
+                    .frozen_create_requests_drained(&[lifecycle_page_key()])
+                    .await
+                    .unwrap()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

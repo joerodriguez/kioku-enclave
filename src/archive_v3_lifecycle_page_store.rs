@@ -1,15 +1,15 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 encrypted lifecycle page store is compiled and fake-tested before runtime wiring"
+    reason = "active ADR-0022 lifecycle page store retains test-only recovery constructors"
 )]
 
-//! Inactive encrypted external storage for ADR-0022 lifecycle inventory pages.
+//! Encrypted external storage for ADR-0022 lifecycle inventory pages.
 //!
 //! This module can create, authenticate, and eventually erase only exact
-//! immutable lifecycle-page object names. It has no list operation, provider
-//! implementation, credential/config source, runtime constructor, walker, or
-//! deletion coordinator. Production key construction requires proof that the
-//! control-store DEK came from a validated encrypted-control generation.
+//! immutable lifecycle-page object names. It has no list operation or generic
+//! credential/config surface. The signed deletion runtime injects its exact-name
+//! provider, admission ledger, and a key derived from the validated encrypted
+//! Control generation.
 
 use crate::{
     archive_v3::{ArchiveId, ObjectId},
@@ -34,7 +34,7 @@ const PAGE_OBJECT_MAGIC: &[u8; 4] = b"KILC";
 const PAGE_OBJECT_VERSION: u16 = 1;
 const PAGE_OBJECT_HEADER_BYTES: usize = PAGE_OBJECT_MAGIC.len() + 2 + 12;
 const PAGE_OBJECT_TAG_BYTES: usize = 16;
-const MAX_PAGE_OBJECT_BYTES: usize =
+pub(crate) const MAX_PAGE_OBJECT_BYTES: usize =
     PAGE_OBJECT_HEADER_BYTES + MAX_LIFECYCLE_PAGE_BYTES + PAGE_OBJECT_TAG_BYTES;
 const PAGE_KEY_SALT: &[u8] = b"kioku/archive-v3/lifecycle-page-control-key/v1\0";
 const PAGE_KEY_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-page-derived-key/v1\0";
@@ -421,14 +421,14 @@ impl fmt::Debug for LifecyclePageObjectName {
 /// Concrete crypto/reconciliation producer over an injected narrow transport.
 /// It is intentionally non-cloneable and exposes no provider or key getter.
 pub(crate) struct EncryptedLifecyclePageStore {
-    control_key: LifecyclePageControlKey,
+    control_key: Arc<LifecyclePageControlKey>,
     transport: Arc<dyn LifecyclePageTransport>,
     admissions: Arc<dyn LifecyclePageAdmissionLedger>,
 }
 
 impl EncryptedLifecyclePageStore {
     pub(crate) fn new(
-        control_key: LifecyclePageControlKey,
+        control_key: Arc<LifecyclePageControlKey>,
         transport: Arc<dyn LifecyclePageTransport>,
         admissions: Arc<dyn LifecyclePageAdmissionLedger>,
     ) -> Self {
@@ -604,6 +604,38 @@ impl EncryptedLifecyclePageStore {
             Err(error) => Err(map_transport_error(error)),
         }
     }
+}
+
+/// Validate the exact provider name this module derives for one encrypted
+/// lifecycle page. The GCS adapter calls this before using its lower-level
+/// exact-name HTTP primitives; accepting arbitrary names there would turn the
+/// deletion-only page transport into a second archive object API.
+pub(crate) fn valid_lifecycle_page_object_name(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix(PAGE_OBJECT_PREFIX)
+        .and_then(|value| value.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let (Some(archive), Some(fence), Some(page), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some((ordinal, hash_with_suffix)) = page.split_once('-') else {
+        return false;
+    };
+    let Some(hash) = hash_with_suffix.strip_suffix(".enc") else {
+        return false;
+    };
+    fn lower_hex(value: &str, bytes: usize) -> bool {
+        value.len() == bytes * 2
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    lower_hex(archive, 16) && lower_hex(fence, 16) && lower_hex(ordinal, 4) && lower_hex(hash, 32)
 }
 
 impl fmt::Debug for EncryptedLifecyclePageStore {
@@ -1271,7 +1303,7 @@ mod tests {
         admissions: Arc<FakeAdmissionLedger>,
     ) -> EncryptedLifecyclePageStore {
         EncryptedLifecyclePageStore::new(
-            LifecyclePageControlKey::for_test([0x5a; 32]),
+            Arc::new(LifecyclePageControlKey::for_test([0x5a; 32])),
             transport,
             admissions,
         )
@@ -1520,7 +1552,7 @@ mod tests {
         let page = page(archive(1), 0, [0; 32], 18);
         first.create_exact_page(fence(2), &page).await.unwrap();
         let wrong = EncryptedLifecyclePageStore::new(
-            LifecyclePageControlKey::for_test([0x6b; 32]),
+            Arc::new(LifecyclePageControlKey::for_test([0x6b; 32])),
             transport,
             Arc::new(FakeAdmissionLedger::default()),
         );
@@ -1823,7 +1855,7 @@ mod tests {
         ] {
             assert!(
                 !source.contains(forbidden),
-                "inactive page store unexpectedly contains {forbidden}"
+                "page store unexpectedly contains {forbidden}"
             );
         }
         let runtime = include_str!("main.rs");
@@ -1839,6 +1871,22 @@ mod tests {
             ".authorize_lifecycle_page_cleanup(",
         ] {
             assert!(!runtime.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn lifecycle_page_provider_name_is_exact_and_fail_closed() {
+        let reference = page(archive(1), 0, [0; 32], 27).reference();
+        let name = LifecyclePageObjectName::derive(fence(2), reference).unwrap();
+        assert!(valid_lifecycle_page_object_name(name.as_str()));
+        for malformed in [
+            name.as_str().to_uppercase(),
+            name.as_str().replace("/00000000-", "/0-"),
+            name.as_str().replace(".enc", ".bin"),
+            format!("{}/extra", name.as_str()),
+            name.as_str().replacen("control/", "archive/", 1),
+        ] {
+            assert!(!valid_lifecycle_page_object_name(&malformed));
         }
     }
 

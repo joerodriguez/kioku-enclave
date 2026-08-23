@@ -117,11 +117,13 @@
 - [x] Bound exact all-generation and soft-delete absence cleanup to durable
   control physical completion, a frozen/drained prior-create proof, and
   producer-private durable/absence receipts.
-- [x] Kept the seam construction-only: no concrete provider, credential,
-  runtime/startup/Store/route wiring, reachability walker, pre-witness
-  coordinator, cloud mutation, or deployment authority was added.
+- [x] Wired the normal lifecycle-page seam only through the signed deletion
+  runtime: fixed attested credential, exact-name GCS adapter, Control-derived
+  key/admission ledger, cancellation-safe create drain, and startup-before-
+  reconciler installation. Store/routes still cannot select names or providers.
 
-This compiled seam does not authorize archive-v3 persistence or deletion.
+The seam authorizes only the normal Tombstoned-witness account-deletion path;
+the type-separated pre-witness path remains inactive.
 
 ## Authenticated deletion-inventory coordinator
 
@@ -150,11 +152,12 @@ This compiled seam does not authorize archive-v3 persistence or deletion.
   and mints deletion inventory with exactly the lifecycle seal commitment.
 - [x] Removed the deletion driver's obsolete independent inventory builder,
   test-overwritten commitment, and `FullReachabilitySeal`.
-- [x] Kept pre-witness absence, Store/startup/runtime/config/routes/health,
-  provider construction, deletion-driver invocation, cloud I/O, and deployment
-  out of scope and disconnected.
+- [x] Connected the normal Tombstoned-witness coordinator to the signed deletion
+  runtime's exact reachability, lifecycle pages, registry erasure, and driver.
+  Pre-witness absence stays non-convertible and disconnected from destructive I/O.
 
-This compiled coordinator does not activate archive-v3 persistence or deletion.
+The coordinator is active only behind the installed account-deletion lane and
+cannot be reached through a route-selected provider or prefix.
 
 ## Pre-witness exact-absence disposition capability
 

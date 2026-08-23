@@ -778,7 +778,17 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # Episode deletion's dedicated startup worker moves only async_main's owner
 # body. All 15 construction keys and every construction expression remain
 # byte-identical to pristine 5959585; no factory or policy surface was added.
-EXPECTED_STORE_SURFACE_SHA256 = "d0b746ab3dd0482f2966d2ba2d1f5ab752ce234c658a38c2c2af15b191aecf88"
+# Archive-v3 deletion runtime wiring was re-derived against a fresh untouched
+# `git archive` of exact 2ebb08c11e0dd8a2fa62800cb392c911081725e1.
+# That tree's own 14-test gate reproduced its declared
+# 15/d0b746ab3dd0482f2966d2ba2d1f5ab752ce234c658a38c2c2af15b191aecf88
+# store-surface pin before comparison. The branch remains exactly 15 rows:
+# zero additions, removals, reclassifications, key-order moves, or call-
+# expression hash moves. The sole delta is async_main's owner-body hash,
+# because startup now derives Control-bound deletion roots and installs the
+# exact lane before loading WAL selections or launching reconcilers. The
+# independently derived third-state digest is:
+EXPECTED_STORE_SURFACE_SHA256 = "b50d6196a8a4d2ac8f5471bb7947d57c47df1f45c33c2d220478f9b58ce0a8bf"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -885,7 +895,7 @@ EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
 # pass in src/archive_v3_genesis_trigger.rs. It is deliberately a worker and
 # not an awaited call — sign-in must never block on, or fail because of,
 # genesis — and it classifies "C" with the rest of the archive-v3 family.
-EXPECTED_WORKER_SPAWN_COUNT = 27
+EXPECTED_WORKER_SPAWN_COUNT = 28
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
@@ -1006,7 +1016,16 @@ EXPECTED_WORKER_SPAWN_COUNT = 27
 # now includes the provider-free profile pass. A pristine 41abc0f archive
 # reproduced the prior 27/a98e2c12 pin; count, classification, and key order
 # are unchanged in this independently derived branch state.
-EXPECTED_WORKER_SPAWN_SHA256 = "fb45f5aafe15fb834a483cafb26845c699725764015b9dad1ecb6728dd12ae6a"
+# Archive-v3 deletion runtime wiring was re-derived against the same untouched
+# 2ebb08c archive used for the Store-surface pin above. Its own gate first
+# reproduced 27/fb45f5aafe15fb834a483cafb26845c699725764015b9dad1ecb6728dd12ae6a.
+# The branch has exactly one added C spawn:
+# `archive_v3_gcs_http.rs::create_if_absent#0::tokio::spawn#0`. It owns one
+# lifecycle-page create until the provider response so caller cancellation
+# cannot make the frozen-create drain lie. No surviving key, class, call
+# expression, or relative order moves. The only surviving owner-body move is
+# async_main's existing spawn, caused by the startup deletion-lane install.
+EXPECTED_WORKER_SPAWN_SHA256 = "9f4435eeaaac5fd3bc1866a74f9f31e70c7c93ebf2e0c611ef0e61bb59865546"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
