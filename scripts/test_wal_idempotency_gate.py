@@ -566,7 +566,7 @@ EXPECTED_STORE_CALL_COUNT = 258
 # replacement-ref refusal and replacement-disabled Git reads to both sides of
 # the release seal. The enclave change remains script/docs-only, so this Store
 # pin and owner inventory again remain unchanged.
-# Genesis deployment policy 4fe7c2830dfd91910a0bdc8f4f2e0e81c6a0b7cd
+# Genesis deployment policy c3849c9f83dfb5fed53e680584c5c1bbc19ba69d
 # adds only exact release admission and a frozen archive-authority helper; its
 # Terraform root digest is unchanged and no Rust or Store surface moves.
 # Email-outbox activation was re-derived against a fresh `git archive HEAD` at
