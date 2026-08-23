@@ -133,18 +133,23 @@ surfaces.
   binds the complete eight-value claim; schema-7/8 metadata remains ineligible. Docker
   independently enforces the same all-empty or complete bucket, canonical-u64,
   named-non-UUID-Firestore, and nonzero-commitment grammar, and `release.sh --roll`
-  rejects active evidence before tag verification, cloud authentication, publication, or
-  deployment because the downstream compatibility PR is not merged.
+  requires the exact WAL tag and explicit matching operator confirmation before
+  an active image can publish or roll. While the preceding image is still off,
+  an authenticated administrator-only route may return the one-way binding
+  commitment for that administrator's already durable Control archive. The raw
+  archive ID never leaves encrypted Control; the route refuses non-admin callers,
+  unavailable/malformed state, and every already-active image.
 
   The compiled capability constructs fixed-origin clients synchronously without provider
   I/O, then remains pending until it consumes one opaque durable encrypted-control
   `ArchiveBinding`. Binding derives `SHA-256("kioku/archive-v3/single-archive-wal-runtime-binding/v1\0" || archive_id[16])`
   and must exactly match the image claim. Consumption is one-shot; the sealed result keeps
   the archive ID and every provider private and exposes no getter, callback, task, operation,
-  acknowledgement, WAL publication, deletion, or hard-delete authority. Its drain gate
-  remains false. Startup does not construct pending, durable, or sealed capability types,
-  so both checked off and active image evidence have zero runtime effect on Store/VFS,
-  lifecycle, routes, health, roots, users, or cloud state.
+  acknowledgement, or hard-delete authority. Under the exact active profile,
+  startup reconstructs only durable WAL-authoritative selections and sign-in
+  convergence can consume the matching binding into the reviewed Genesis owner;
+  off-config startup refuses if such selected state already exists. The deleted
+  advisory migration family and the inactive extent-shadow engine remain unreachable.
 - The compiled maintenance importer is the only consumer allowed to turn that sealed
   single-archive runtime into an offline state machine. Encrypted control first binds one
   active account/archive to random opaque operation, owner, session, and attempt IDs plus a

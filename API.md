@@ -741,6 +741,26 @@ Large histories are available without growing the profile response:
 positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
 person returns `404`. Unknown query fields return `400`.
 
+## Archive-v3 activation binding (owner only)
+
+`GET /api/admin/archive-v3/activation-binding` is a temporary operational
+bootstrap read for the account named in the image-baked `ADMIN_USER_IDS` list.
+It is accepted only while the image's archive-v3 runtime profile is still
+`off` and returns a one-way, non-secret commitment to the caller's already
+durable opaque Control archive binding:
+
+```json
+{
+  "schema_version": 1,
+  "archive_binding_commitment": "64 lowercase hexadecimal characters"
+}
+```
+
+The raw archive identifier never leaves encrypted Control. A non-owner gets
+`403`, a malformed or unreadable binding/configuration gets `503`, and an
+already-active image gets `409`; the route cannot become a general archive
+identity oracle after activation.
+
 ## Owner metrics facade
 
 The owner economics routes require an ordinary authenticated account whose stable enclave
