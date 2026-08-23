@@ -133,6 +133,10 @@ const CLOUD_CAPTURE_IMAGE_ID_PREFIX: &str = "capture-v2:";
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
         .route("/mcp", post(mcp_endpoint))
+        .route(
+            "/api/admin/archive-v3/activation-binding",
+            get(rest_archive_v3_activation_binding),
+        )
         .route("/api/search", get(rest_search))
         .route("/api/episodes", get(rest_episodes))
         .route(
@@ -176,6 +180,55 @@ pub fn router() -> Router<Arc<CpState>> {
             "/api/preferences/episode-email/test",
             post(rest_test_episode_email),
         )
+}
+
+#[derive(serde::Serialize)]
+struct ArchiveV3ActivationBindingResponse {
+    schema_version: u8,
+    archive_binding_commitment: String,
+}
+
+/// Return the one non-secret, one-way commitment needed to bake the existing
+/// administrator archive into an active single-archive WAL image. The route is
+/// useful only on the preceding off-profile image: once the runtime is active,
+/// it refuses rather than becoming a general archive-identity oracle.
+async fn rest_archive_v3_activation_binding(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !s.config.is_admin(&user.0) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response();
+    }
+    match crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeDeployment::from_baked_env() {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "archive_v3_runtime_already_active"})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "archive_v3_config_unavailable"})),
+            )
+                .into_response();
+        }
+    }
+    match s.control.active_archive_binding(&user.0).await {
+        Ok(binding) => Json(ArchiveV3ActivationBindingResponse {
+            schema_version: 1,
+            archive_binding_commitment:
+                crate::archive_v3_shadow_runtime::activation_binding_commitment(binding),
+        })
+        .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "archive_v3_binding_unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -4402,6 +4455,55 @@ mod tests {
         query_test_state_with_media(Arc::clone(&gcs), Arc::clone(&gcs), gcs)
     }
 
+    #[tokio::test]
+    async fn activation_binding_is_admin_only_one_way_and_off_profile_only() {
+        let user_id = crate::cp::tokens::derive_stable_uuid("activation-admin-subject");
+        let gcs = Arc::new(FakeGcs::new());
+        let state = query_test_state_with_media_and_admin(
+            Arc::clone(&gcs),
+            Arc::clone(&gcs),
+            gcs,
+            vec![user_id.clone()],
+        );
+        let user = state
+            .control
+            .upsert_user(
+                "activation-admin-subject",
+                "operator@example.invalid",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(user.id, user_id);
+
+        let forbidden = rest_archive_v3_activation_binding(
+            State(Arc::clone(&state)),
+            Extension(AuthUser("11111111-1111-4111-8111-111111111111".into())),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let response = rest_archive_v3_activation_binding(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.clone())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        let commitment = value["archive_binding_commitment"].as_str().unwrap();
+        assert_eq!(commitment.len(), 64);
+        assert!(commitment
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+        assert!(!bytes
+            .windows(user_id.len())
+            .any(|window| window == user_id.as_bytes()));
+    }
+
     #[test]
     fn browser_v2_loader_requires_exact_evidence_and_a_live_episode_member() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4628,6 +4730,20 @@ mod tests {
         current_media_gcs: Arc<FakeGcs>,
         legacy_media_gcs: Arc<FakeGcs>,
     ) -> Arc<CpState> {
+        query_test_state_with_media_and_admin(
+            index_gcs,
+            current_media_gcs,
+            legacy_media_gcs,
+            Vec::new(),
+        )
+    }
+
+    fn query_test_state_with_media_and_admin(
+        index_gcs: Arc<FakeGcs>,
+        current_media_gcs: Arc<FakeGcs>,
+        legacy_media_gcs: Arc<FakeGcs>,
+        admin_user_ids: Vec<String>,
+    ) -> Arc<CpState> {
         let kms = Arc::new(FakeKms);
         let store = Arc::new(Store::new_with_media_and_legacy(
             kms.clone(),
@@ -4648,7 +4764,7 @@ mod tests {
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
                 apple_sign_in: None,
-                admin_user_ids: Vec::new(),
+                admin_user_ids,
                 signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),

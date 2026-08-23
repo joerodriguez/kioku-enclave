@@ -121,6 +121,21 @@ impl ArchiveV3ArchiveBindingCommitment {
     }
 }
 
+/// Return the image-configuration value for one already durable Control
+/// binding without exposing its opaque archive identifier. This is used only
+/// by the authenticated, administrator-only activation bootstrap route while
+/// the baked runtime profile is still off.
+pub(crate) fn activation_binding_commitment(binding: ArchiveBinding) -> String {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let commitment = ArchiveV3ArchiveBindingCommitment::for_archive(binding.archive_id());
+    let mut encoded = String::with_capacity(64);
+    for byte in commitment.0 {
+        encoded.push(LOWER_HEX[usize::from(byte >> 4)] as char);
+        encoded.push(LOWER_HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
 impl fmt::Debug for ArchiveV3ArchiveBindingCommitment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ArchiveV3ArchiveBindingCommitment(<redacted>)")
@@ -1355,6 +1370,14 @@ mod tests {
                 ArchiveV3ArchiveBindingCommitment::for_archive(ArchiveId::from_bytes([1; 16]))
             ),
             "ArchiveV3ArchiveBindingCommitment(<redacted>)"
+        );
+        assert_eq!(
+            activation_binding_commitment(
+                crate::cp::control_store::ArchiveBinding::for_runtime_test(ArchiveId::from_bytes(
+                    [1; 16]
+                ))
+            ),
+            "c4b01eae95c137ef5d77f908496af2cd87d1a97382c097edc3dffa3aeb11c7e1"
         );
     }
 
