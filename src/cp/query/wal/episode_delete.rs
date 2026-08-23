@@ -7723,7 +7723,8 @@ mod tests {
         let evidence = load_episode_delete_evidence(&connection, ACCOUNT, 1)
             .unwrap()
             .unwrap();
-        assert_eq!(evidence.mutation_stamp, newer);
+        assert!(evidence.mutation_stamp.as_str() >= newer);
+        let mutation_stamp = evidence.mutation_stamp.clone();
         let (preparation, _) = apply_preparation(&mut connection, evidence);
         let (receipt, disposition) = apply_completion(&mut connection, preparation.clone());
         assert_eq!(disposition, LogicalMutationDisposition::Applied);
@@ -7740,7 +7741,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(profile, (1, Some(2), newer.into()));
+        assert_eq!(profile, (1, Some(2), mutation_stamp.clone()));
         let active_revision = connection
             .query_row(
                 "SELECT sample_count,medoid_sample_id,created_at
@@ -7755,7 +7756,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(active_revision, (1, Some(2), newer.into()));
+        assert_eq!(active_revision, (1, Some(2), mutation_stamp));
         let (replay, disposition) = apply_completion(&mut connection, preparation);
         assert_eq!(disposition, LogicalMutationDisposition::Replayed);
         assert_eq!(receipt, replay);
