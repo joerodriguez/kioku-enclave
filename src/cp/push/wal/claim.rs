@@ -32,7 +32,10 @@ const MAX_DEFERRED_CLAIMS_PER_ATTEMPT: i64 = 16;
 #[cfg(not(test))]
 pub(in crate::cp) const CLAIM_LEASE_MILLIS: i64 = 60_000;
 #[cfg(test)]
-pub(in crate::cp) const CLAIM_LEASE_MILLIS: i64 = 3_000;
+// Keep the compressed lease comfortably above the encrypted archive/control
+// round trips exercised by the full parallel suite. Crash-recovery tests wait
+// for this boundary explicitly, so widening it does not weaken their proof.
+pub(in crate::cp) const CLAIM_LEASE_MILLIS: i64 = 10_000;
 #[cfg(not(test))]
 pub(in crate::cp) const MIN_SEND_LEASE_MILLIS: i64 = 20_000;
 #[cfg(test)]

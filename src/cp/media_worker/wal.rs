@@ -3,7 +3,7 @@
     reason = "inactive ADR-0022 media-worker codecs are reviewed before their external boundaries, launcher, or worker ownership"
 )]
 
-//! Inactive media-worker WAL domains.
+//! Private ADR-0022 media-worker WAL domains.
 //!
 //! A future deletion boundary must authenticate and settle the exact retained
 //! provider object before constructing this plan. The plan can only mark the
@@ -14,9 +14,13 @@
 //! provider I/O; the private production-facing result children cover only
 //! screen storyboards without person evidence and audio-window transcripts
 //! without identity rows, each reauthenticating its exact binding before its
-//! local mutation. Every person/identity/voice mutation remains unsupported
-//! — the audio transcript subtype has no constructor slot for speaker names,
-//! person facts, or quality flags and never writes voice tables.
+//! local mutation. The active audio transcript v2 subtype has no constructor
+//! slot for speaker names, person facts, or quality flags; its sole voice
+//! coupling is one fixed-id pending embedding job per projected observation.
+//! The selected embedding child also has a provider-free exact backfill for
+//! eligible observations settled by the earlier v1 transcript contract before
+//! that coupling existed, and may write a pending sample. Profile, person, and
+//! identity mutation remains unsupported here.
 
 pub(super) mod attempt;
 pub(super) mod audio_attempt;
@@ -28,6 +32,7 @@ pub(super) mod reservation;
 pub(super) mod result;
 pub(super) mod resurrection;
 pub(super) mod usage;
+pub(super) mod voice_embedding;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
 pub(crate) use audio_attempt::{AudioWindowAttemptLedger, AudioWindowAttemptPlan};
 pub(crate) use audio_result::{AudioWindowTranscriptLedger, AudioWindowTranscriptPlan};
@@ -38,6 +43,7 @@ pub(crate) use reservation::{MediaWorkReservationLedger, MediaWorkReservationPla
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};
 pub(crate) use usage::{MediaUsageSettlementLedger, MediaUsageSettlementPlan};
+pub(crate) use voice_embedding::{VoiceEmbeddingLedger, VoiceEmbeddingPlan};
 
 /// Test-only: the ingest -> claim regression tests live beside the ingest
 /// writer in `cp::media::wal::capture_event`, because that is the only module

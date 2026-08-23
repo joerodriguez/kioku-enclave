@@ -121,10 +121,6 @@ impl std::fmt::Display for DeletionPending {
 /// spin this module exists to prevent.
 pub mod wal_domain {
     // ── Background workers ──────────────────────────────────────────────────
-    /// `media_worker`'s voice-embedding job lane (`voice_memory` leases,
-    /// reconstruction, and enrolment). The media claim/result/retention lanes
-    /// around it ARE migrated and must keep running.
-    pub const MEDIA_WORKER_VOICE_EMBEDDING: &str = "media_worker.voice_embedding";
     /// The bounded voice-profile reconciliation and lineage tail at the end of
     /// `media_worker::process_user`, after the migrated work-unit lanes.
     pub const MEDIA_WORKER_VOICE_PROFILES: &str = "media_worker.voice_profiles";
@@ -268,7 +264,7 @@ pub mod wal_domain {
     ///
     /// **What actually lifts it.** A sealed WAL family that commits `people`
     /// and `person_facts` for a selected user, wired into those two settles.
-    /// Migrating `MEDIA_WORKER_VOICE_EMBEDDING` and
+    /// Migrating selected voice embedding and
     /// `MEDIA_WORKER_VOICE_PROFILES` is NOT sufficient and never was: the
     /// listing LEFT JOINs `voice_profiles`, so those lanes can only change a
     /// count on a row that already exists. Lifting on them would leave
@@ -461,13 +457,12 @@ mod tests {
     /// can retry rather than conclude the data is gone.
     #[tokio::test]
     async fn a_deferred_domain_answers_503_naming_the_domain() {
-        let response =
-            EnclaveError::wal_domain_unmigrated(wal_domain::MEDIA_WORKER_VOICE_EMBEDDING)
-                .into_response();
+        let response = EnclaveError::wal_domain_unmigrated(wal_domain::MEDIA_WORKER_VOICE_PROFILES)
+            .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response_body(response).await;
         assert_eq!(body["error"], WAL_DOMAIN_UNMIGRATED_REASON);
-        assert_eq!(body["domain"], wal_domain::MEDIA_WORKER_VOICE_EMBEDDING);
+        assert_eq!(body["domain"], wal_domain::MEDIA_WORKER_VOICE_PROFILES);
     }
 
     /// The generic arm answers an opaque 500 `internal error`. A deferral
@@ -476,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_domain_never_falls_into_the_generic_internal_error() {
         for domain in [
-            wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
+            wal_domain::MEDIA_WORKER_VOICE_PROFILES,
             wal_domain::MEDIA_PEOPLE,
         ] {
             let response = EnclaveError::wal_domain_unmigrated(domain).into_response();
@@ -501,7 +496,6 @@ mod tests {
     #[test]
     fn every_registered_domain_name_is_a_unique_stable_token() {
         let domains = [
-            wal_domain::MEDIA_WORKER_VOICE_EMBEDDING,
             wal_domain::MEDIA_WORKER_VOICE_PROFILES,
             wal_domain::MEDIA_PEOPLE,
         ];
