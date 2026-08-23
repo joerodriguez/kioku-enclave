@@ -109,7 +109,7 @@ class LocalReleaseContracts(unittest.TestCase):
             encoding="utf-8"
         )
         for evidence in (
-            "c3849c9f83dfb5fed53e680584c5c1bbc19ba69d",
+            "3fe93cd7753c8ac75ea0e339cb131b0a381ddadc",
             "8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5",
             "infra/enclave.tf",
             "--untracked-files=all",
