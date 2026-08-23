@@ -3,8 +3,8 @@
 - [x] Merge every D4 read/mutation lane, bounded historical repair, provider-spend gate,
   lifecycle/delete owner, and WAL inventory seal required before activation.
 - [x] Deploy the archive-off bootstrap image and obtain the authenticated one-way binding
-  commitment; merge deployment companion `c3849c9` with exact digest rotation/recovery.
-- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.3`; `.1` was superseded after the full verification suite exposed a time-sensitive test fixture, and `.2` was published but not rolled because its deployment-source pin correctly preceded the candidate-2 allowlist commit. Verify live Genesis/WAL
+  commitment; merge deployment companion `3fe93cd` with exact digest rotation/recovery.
+- [~] Build, sign, publish, and roll `v0.8.30-archive-v3-wal.4`; `.1` was superseded after the full verification suite exposed a time-sensitive test fixture, `.2` was published but not rolled because its deployment-source pin correctly preceded the candidate-2 allowlist commit, and `.3` was published but not rolled because its immutable candidate suffix correctly produced a prerelease that the old deployment preflight rejected. Verify live Genesis/WAL
   serving and archive/witness state before recording completion.
 
 # ADR-0022 browser evidence
