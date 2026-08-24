@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,12 @@ from test_select_build_configuration import (  # noqa: E402
     fresh_bootstrap_environment,
 )
 import adr0022_fresh_release as fresh  # noqa: E402
+VERIFIER_SPEC = importlib.util.spec_from_file_location(
+    "verify_local_evidence_bundle_test", BUNDLE_VERIFIER
+)
+assert VERIFIER_SPEC and VERIFIER_SPEC.loader
+VERIFIER_MODULE = importlib.util.module_from_spec(VERIFIER_SPEC)
+VERIFIER_SPEC.loader.exec_module(VERIFIER_MODULE)
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 TAG = "v1.2.3-rc.1"
@@ -52,6 +59,7 @@ class LocalEvidenceTests(unittest.TestCase):
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)], check=True)
         private.chmod(0o600)
         subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True)
+        public.chmod(0o644)
         config = directory / "local.env"
         config_values = (
             fresh_bootstrap_environment() if fresh_bootstrap else environment()
@@ -65,8 +73,10 @@ class LocalEvidenceTests(unittest.TestCase):
         config.chmod(0o600)
         sbom = directory / "enclave-sbom.spdx.json"
         sbom.write_text('{"spdxVersion":"SPDX-2.3"}\n', encoding="utf-8")
+        sbom.chmod(0o600)
         scan = directory / "enclave-scan.json"
         scan.write_text('{"matches":[]}\n', encoding="utf-8")
+        scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
         tag = fresh.BOOTSTRAP_TAG if fresh_bootstrap else TAG
@@ -121,6 +131,7 @@ class LocalEvidenceTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        metadata.chmod(0o600)
         evidence = directory / "enclave-local-build-evidence.json"
         create_command = [
             "python3", str(EVIDENCE), "create", "--output", str(evidence),
@@ -259,9 +270,6 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--tag", fresh.BOOTSTRAP_TAG,
                 "--commit", COMMIT,
                 "--image-repository", fresh.IMAGE_REPOSITORY,
-                "--expected-gcs-bucket", fresh.EXPECTED_INTENT["index_bucket"],
-                "--expected-gcs-media-bucket", fresh.EXPECTED_INTENT["media_bucket"],
-                "--expected-gcs-legacy-media-bucket", fresh.EXPECTED_INTENT["legacy_media_bucket"],
                 "--config", str(directory / "local.env"),
             ]
 
@@ -283,6 +291,25 @@ class LocalEvidenceTests(unittest.TestCase):
                 metadata["adr0022_canary_identity_preparation_sha256"],
                 CANARY_IDENTITY_PREPARATION_SHA256,
             )
+            without_config = verify_command(directory, public, fingerprint)
+            del without_config[without_config.index("--config"):]
+            missing_config = subprocess.run(
+                without_config,
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(missing_config.returncode, 0)
+            self.assertIn("requires the exact configuration", missing_config.stderr)
+            conflicting_bucket = subprocess.run(
+                verify_command(directory, public, fingerprint)
+                + ["--expected-gcs-bucket", "kioku-joerodriguez-enclave-indexes"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(conflicting_bucket.returncode, 0)
+            self.assertIn("differs from the signed configuration", conflicting_bucket.stderr)
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -299,6 +326,61 @@ class LocalEvidenceTests(unittest.TestCase):
             )
             self.assertNotEqual(mismatched.returncode, 0)
             self.assertIn("generation/canary/schema binding is not exact", mismatched.stderr)
+
+    def test_bundle_verifier_rejects_ambient_git_overrides_and_replacement_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = self.create_bundle(directory)
+            command = [
+                "python3", str(BUNDLE_VERIFIER),
+                "--evidence-dir", str(directory),
+                "--public-key", str(public),
+                "--expected-public-key-sha256", fingerprint,
+                "--repository", "owner/repository",
+                "--tag", TAG,
+                "--commit", COMMIT,
+            ]
+            overridden = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                env=os.environ | {"GIT_OBJECT_DIRECTORY": str(directory / "objects")},
+            )
+            self.assertNotEqual(overridden.returncode, 0)
+            self.assertIn("ambient Git overrides", overridden.stderr)
+
+            repository = directory / "replacement-repository"
+            repository.mkdir()
+            subprocess.run(("git", "-C", str(repository), "init"), check=True, capture_output=True)
+            subprocess.run(("git", "-C", str(repository), "config", "user.name", "Bundle Test"), check=True)
+            subprocess.run(("git", "-C", str(repository), "config", "user.email", "bundle@example.invalid"), check=True)
+            source = repository / "source.txt"
+            source.write_text("A\n", encoding="utf-8")
+            subprocess.run(("git", "-C", str(repository), "add", "source.txt"), check=True)
+            subprocess.run(("git", "-C", str(repository), "commit", "-m", "A"), check=True, capture_output=True)
+            first = subprocess.run(
+                ("git", "-C", str(repository), "rev-parse", "HEAD"),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            source.write_text("B\n", encoding="utf-8")
+            subprocess.run(("git", "-C", str(repository), "commit", "-am", "B"), check=True, capture_output=True)
+            second = subprocess.run(
+                ("git", "-C", str(repository), "rev-parse", "HEAD"),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(("git", "-C", str(repository), "replace", first, second), check=True)
+            original_root = VERIFIER_MODULE.ROOT
+            try:
+                VERIFIER_MODULE.ROOT = repository
+                with self.assertRaisesRegex(SystemExit, "replacement refs"):
+                    VERIFIER_MODULE.reject_git_replacement_objects()
+            finally:
+                VERIFIER_MODULE.ROOT = original_root
 
     def test_source_archive_hash_is_signed_and_bundle_verifier_rechecks_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -339,15 +421,22 @@ class LocalEvidenceTests(unittest.TestCase):
             git = fake_bin / "git"
             git.write_text(
                 "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == --no-replace-objects ]]; then shift; fi\n"
+                "if [[ \"$1 $2\" == 'replace -l' ]]; then exit 0; fi\n"
+                "if [[ \"$1 $2 $3 $4\" == 'rev-parse --path-format=absolute --git-path info/grafts' ]]; then echo \"$FAKE_REPO_ROOT/.git/info/grafts\"; exit 0; fi\n"
+                "if [[ \"$1 $2 $3\" == 'rev-parse --path-format=absolute --show-toplevel' ]]; then echo \"$FAKE_REPO_ROOT\"; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'branch --show-current' ]]; then echo main; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'status --porcelain' ]]; then exit 0; fi\n"
                 "if [[ \"$1 $2 $3\" == 'fetch origin main' ]]; then exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'rev-parse HEAD' || \"$1 $2\" == 'rev-parse origin/main' ]]; then echo '" + COMMIT + "'; exit 0; fi\n"
-                "if [[ \"$1 $2 $3\" == 'rev-parse -q --verify' ]]; then exit 0; fi\n"
-                "if [[ \"$1 $2 $3\" == 'rev-list -n 1' ]]; then echo '" + COMMIT + "'; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'rev-parse --verify' && \"$3\" == \"refs/tags/${FAKE_TAG}^{tag}\" ]]; then echo \"$FAKE_TAG_OBJECT\"; exit 0; fi\n"
+                "if [[ \"$1\" == rev-parse && \"$2\" == \"${FAKE_TAG_OBJECT}^{commit}\" ]]; then echo '" + COMMIT + "'; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'cat-file -t' && \"$3\" == \"$FAKE_TAG_OBJECT\" ]]; then echo tag; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'cat-file tag' && \"$3\" == \"$FAKE_TAG_OBJECT\" ]]; then printf 'object %s\\ntype commit\\ntag %s\\ntagger Test <test@example.invalid> 0 +0000\\n\\nrelease\\n' '" + COMMIT + "' \"$FAKE_EMBEDDED_TAG\"; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'archive --format=tar' ]]; then : > \"${3#--output=}\"; exit 0; fi\n"
-                "if [[ \"$1 $2\" == 'verify-tag --raw' ]]; then echo '[GNUPG:] VALIDSIG " + ("d" * 40) + "'; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'verify-tag --raw' && \"$3\" == \"$FAKE_TAG_OBJECT\" ]]; then echo '[GNUPG:] VALIDSIG " + ("d" * 40) + "'; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'push origin' ]]; then exit 0; fi\n"
+                "if [[ \"$1 $2 $3\" == 'ls-remote --tags origin' ]]; then printf '%s\\trefs/tags/%s\\n%s\\trefs/tags/%s^{}\\n' \"$FAKE_TAG_OBJECT\" \"$FAKE_TAG\" '" + COMMIT + "' \"$FAKE_TAG\"; exit 0; fi\n"
                 "echo \"unexpected fake git: $*\" >&2; exit 97\n",
                 encoding="utf-8",
             )
@@ -359,11 +448,16 @@ class LocalEvidenceTests(unittest.TestCase):
                 f"if [[ \"$1 $2 $3\" == 'release view {TAG}' ]]; then\n"
                 "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":true,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
                 "  echo 'release not found' >&2; exit 1\nfi\n"
-                "if [[ \"$1 $2\" == 'release create' ]]; then touch \"$FAKE_GH_STATE\"; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'release create' ]]; then\n"
+                "  shift 3\n"
+                "  while [[ $# -gt 0 && \"$1\" != --repo ]]; do cp \"$1\" \"$FAKE_REMOTE_ASSETS/$(basename \"$1\")\"; shift; done\n"
+                "  printf 'mutated after immutable snapshot\\n' > \"$FAKE_EVIDENCE_DIR/enclave-scan.json\"\n"
+                "  touch \"$FAKE_GH_STATE\"; exit 0\n"
+                "fi\n"
                 "if [[ \"$1 $2\" == 'release download' ]]; then\n"
                 "  pattern= dir=\n"
                 "  while [[ $# -gt 0 ]]; do case \"$1\" in --pattern) pattern=\"$2\"; shift 2;; --dir) dir=\"$2\"; shift 2;; *) shift;; esac; done\n"
-                "  cp \"$FAKE_EVIDENCE_DIR/$pattern\" \"$dir/$pattern\"; exit 0\n"
+                "  cp \"$FAKE_REMOTE_ASSETS/$pattern\" \"$dir/$pattern\"; exit 0\n"
                 "fi\n"
                 "exit 98\n",
                 encoding="utf-8",
@@ -377,6 +471,8 @@ class LocalEvidenceTests(unittest.TestCase):
             )
             for executable in (git, gh, gcloud):
                 executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            remote_assets = directory / "remote-assets"
+            remote_assets.mkdir()
             environment = os.environ | {
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "RELEASE_SIGNER_FINGERPRINT": "d" * 40,
@@ -386,7 +482,21 @@ class LocalEvidenceTests(unittest.TestCase):
                 "FAKE_GH_STATE": str(directory / "gh-state"),
                 "FAKE_EVIDENCE_DIR": str(directory),
                 "FAKE_GCLOUD_LOG": str(directory / "gcloud.log"),
+                "FAKE_REMOTE_ASSETS": str(remote_assets),
+                "FAKE_REPO_ROOT": str(ROOT),
+                "FAKE_TAG": TAG,
+                "FAKE_EMBEDDED_TAG": TAG,
+                "FAKE_TAG_OBJECT": "c" * 40,
             }
+            aliased = subprocess.run(
+                ["bash", str(RELEASE), TAG, "--evidence-dir", str(directory), "--config", str(directory / "local.env"), "--repository", "owner/repository", "--apply"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                env=environment | {"FAKE_EMBEDDED_TAG": "v9.9.9"},
+            )
+            self.assertNotEqual(aliased.returncode, 0)
+            self.assertIn("signed annotated tag name", aliased.stderr)
             completed = subprocess.run(
                 ["bash", str(RELEASE), TAG, "--evidence-dir", str(directory), "--config", str(directory / "local.env"), "--repository", "owner/repository", "--apply"],
                 cwd=ROOT, text=True, capture_output=True, env=environment,
@@ -401,10 +511,16 @@ class LocalEvidenceTests(unittest.TestCase):
             self.assertNotIn("workflow", gh_log)
             self.assertNotIn("dispatch", gh_log)
             self.assertIn("--prerelease", gh_log)
+            create_line = next(line for line in gh_log.splitlines() if line.startswith("release create "))
+            self.assertNotIn(str(directory / evidence.name), create_line)
             gcloud_log = (directory / "gcloud.log").read_text(encoding="utf-8")
             self.assertIn("--impersonate-service-account=local-builder@", gcloud_log)
             self.assertEqual(evidence.name, "enclave-local-build-evidence.json")
             self.assertTrue(signature.is_file())
+            self.assertEqual(
+                (directory / "enclave-scan.json").read_text(encoding="utf-8"),
+                "mutated after immutable snapshot\n",
+            )
 
 
 if __name__ == "__main__":

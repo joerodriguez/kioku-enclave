@@ -174,15 +174,20 @@ class LocalImagePipelineTests(unittest.TestCase):
             pass_fds: tuple[int, ...] = (),
         ):
             calls.append(command)
-            if command[:2] == ["git", "status"]:
+            git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+            if git_command[:2] == ["replace", "-l"]:
                 return SimpleNamespace(stdout="", stderr="")
-            if command[:3] == ["git", "rev-parse", "HEAD"]:
+            if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n", stderr="")
+            if git_command[:2] == ["status", "--porcelain"]:
+                return SimpleNamespace(stdout="", stderr="")
+            if git_command[:2] == ["rev-parse", "HEAD"]:
                 return SimpleNamespace(stdout="b" * 40 + "\n")
-            if command[:3] == ["git", "rev-list", "-n"]:
+            if git_command[:2] == ["rev-list", "-n"]:
                 return SimpleNamespace(stdout="b" * 40 + "\n")
-            if command[:3] == ["git", "log", "-1"]:
+            if git_command[:2] == ["log", "-1"]:
                 return SimpleNamespace(stdout="1700000000\n")
-            if command[:4] == ["git", "remote", "get-url", "origin"]:
+            if git_command[:3] == ["remote", "get-url", "origin"]:
                 return SimpleNamespace(stdout="git@github.com:owner/repository.git\n")
             if command[:3] == ["docker", "buildx", "version"]:
                 return SimpleNamespace(stdout="docker buildx v0.17.0\n")
@@ -507,7 +512,12 @@ class LocalImagePipelineTests(unittest.TestCase):
 
         def fake_run(command, *, capture=False, environment=None, pass_fds=()):
             del capture, environment, pass_fds
-            if command[:4] == ["git", "remote", "get-url", "origin"]:
+            git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+            if git_command[:2] == ["replace", "-l"]:
+                return SimpleNamespace(stdout="")
+            if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+            if git_command[:3] == ["remote", "get-url", "origin"]:
                 return SimpleNamespace(
                     stdout="https://github.com/joerodriguez/kioku-enclave.git\n"
                 )
@@ -1338,20 +1348,33 @@ class LocalImagePipelineTests(unittest.TestCase):
         pipeline = load_pipeline()
         original_run = pipeline.run
         try:
-            pipeline.run = lambda command, capture=False: SimpleNamespace(
-                stdout="?? untracked\n" if command[:2] == ["git", "status"] else ""
-            )
+            def dirty(command, capture=False):
+                del capture
+                git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+                if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                    return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+                return SimpleNamespace(
+                    stdout="?? untracked\n" if git_command[:2] == ["status", "--porcelain"] else ""
+                )
+
+            pipeline.run = dirty
             with self.assertRaisesRegex(pipeline.PipelineError, "clean source tree"):
                 pipeline.source_commit("refs/tags/v1.2.3")
 
             def mismatched(command, capture=False):
-                if command[:2] == ["git", "status"]:
+                del capture
+                git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+                if git_command[:2] == ["replace", "-l"]:
                     return SimpleNamespace(stdout="")
-                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                    return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+                if git_command[:2] == ["status", "--porcelain"]:
+                    return SimpleNamespace(stdout="")
+                if git_command[:2] == ["rev-parse", "HEAD"]:
                     return SimpleNamespace(stdout="a" * 40 + "\n")
-                if command[:3] == ["git", "log", "-1"]:
+                if git_command[:2] == ["log", "-1"]:
                     return SimpleNamespace(stdout="1700000000\n")
-                if command[:3] == ["git", "rev-list", "-n"]:
+                if git_command[:2] == ["rev-list", "-n"]:
                     return SimpleNamespace(stdout="b" * 40 + "\n")
                 return SimpleNamespace(stdout="")
 
@@ -1499,8 +1522,66 @@ class LocalImagePipelineTests(unittest.TestCase):
             with patch.dict(pipeline.os.environ, environment, clear=True):
                 pipeline.configure_direct_child_environment("build")
                 self.assertEqual(pipeline._CHILD_ENVIRONMENT["DOCKER_CONFIG"], str(docker_config.resolve()))
+                self.assertEqual(pipeline._CHILD_ENVIRONMENT["GIT_NO_REPLACE_OBJECTS"], "1")
                 self.assertNotIn("UNREVIEWED_SETTING", pipeline._CHILD_ENVIRONMENT)
                 self.assertNotIn("GH_TOKEN", pipeline._CHILD_ENVIRONMENT)
+
+    def test_direct_child_environment_rejects_ambient_git_object_overrides(self) -> None:
+        pipeline = load_pipeline()
+        with patch.dict(
+            pipeline.os.environ,
+            {"PATH": os.environ.get("PATH", ""), "GIT_OBJECT_DIRECTORY": "/tmp/objects"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(pipeline.PipelineError, "GIT_OBJECT_DIRECTORY"):
+                pipeline.configure_direct_child_environment("verify")
+        with patch.dict(
+            pipeline.os.environ,
+            {"PATH": os.environ.get("PATH", ""), "GIT_NO_REPLACE_OBJECTS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(pipeline.PipelineError, "exactly 1"):
+                pipeline.configure_direct_child_environment("verify")
+
+    def test_replacement_ref_clean_tree_illusion_is_rejected_before_source_use(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+
+            def git(*arguments: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ("git", "-C", str(repository), *arguments),
+                    check=True,
+                    text=True,
+                    capture_output=capture,
+                    env=os.environ | {"GIT_CONFIG_NOSYSTEM": "1"},
+                )
+
+            git("init")
+            git("config", "user.name", "Replacement Test")
+            git("config", "user.email", "replacement@example.invalid")
+            source = repository / "source.txt"
+            source.write_text("source A\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("commit", "-m", "source A")
+            source_a = git("rev-parse", "HEAD", capture=True).stdout.strip()
+            source.write_text("source B\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("commit", "-m", "source B")
+            source_b = git("rev-parse", "HEAD", capture=True).stdout.strip()
+            git("replace", source_a, source_b)
+            git("update-ref", "HEAD", source_a)
+            self.assertEqual(git("status", "--porcelain", capture=True).stdout, "")
+
+            pipeline.ROOT = repository
+            pipeline._CHILD_ENVIRONMENT = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": os.environ.get("HOME", ""),
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+            with self.assertRaisesRegex(pipeline.PipelineError, "replacement refs"):
+                pipeline.source_commit("refs/heads/main")
 
     def test_cloud_config_is_required_and_stage_scoped(self) -> None:
         pipeline = load_pipeline()

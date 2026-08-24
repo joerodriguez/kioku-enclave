@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -35,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, NamedTuple, Sequence
 
 import local_image_pipeline as _image_pipeline
 from local_image_pipeline import PipelineError, configured_environment_snapshot
@@ -66,6 +67,7 @@ _RELEASE_ASSET_NAMES = (
     "enclave-sbom.spdx.json",
     "enclave-scan.json",
 )
+SAFE_AMBIENT_GIT_ENV = frozenset({"GIT_NO_REPLACE_OBJECTS", "GIT_PAGER"})
 
 # Names that must be added to the coordinator's explicit later-phase
 # environment allowlist.  No credential is accepted by prepare.
@@ -118,6 +120,14 @@ CONFIG_SECRET_KEYS = frozenset({
 
 class AdapterError(RuntimeError):
     """A fail-closed adapter error whose detail is safe for stderr."""
+
+
+class VerifiedTag(NamedTuple):
+    """One signed annotated-tag object captured before untrusted work."""
+
+    name: str
+    object_id: str
+    commit: str
 
 
 def fail(message: str) -> "NoReturn":
@@ -254,10 +264,21 @@ def _redacted_diagnostic(value: str) -> str:
 
 def _base_child_env() -> dict[str, str]:
     """Return the non-secret environment allowed for reviewed children."""
-    return {
+    unexpected_git = sorted(
+        name
+        for name in os.environ
+        if name.startswith("GIT_") and name not in SAFE_AMBIENT_GIT_ENV
+    )
+    if unexpected_git:
+        fail("ambient Git overrides are not accepted: " + ", ".join(unexpected_git))
+    if os.environ.get("GIT_NO_REPLACE_OBJECTS", "1") != "1":
+        fail("GIT_NO_REPLACE_OBJECTS must be exactly 1 when supplied")
+    environment = {
         name: value for name, value in os.environ.items()
         if name in {"PATH", "HOME", "XDG_STATE_HOME", "LC_ALL", "TMPDIR"}
     }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
 
 
 def _owned_private_directory(path_value: str, label: str) -> Path:
@@ -532,21 +553,44 @@ def _native_child_env(*, include_cloud: bool) -> dict[str, str]:
     return environment
 
 
-def _git(*args: str, cwd: Path) -> str:
-    output = _run(("git", "-C", str(cwd), *args), cwd=cwd, timeout=120)
+def _git(*args: str, cwd: Path, timeout: int = 120) -> str:
+    output = _run(
+        ("git", "--no-replace-objects", "-C", str(cwd), *args),
+        cwd=cwd,
+        timeout=timeout,
+    )
     return output.strip()
 
 
-def _source_coordinates() -> tuple[str, str, str, str]:
-    commit = _coordinate("KIOKU_RELEASE_SOURCE_COMMIT", COMMIT)
-    tree = _coordinate("KIOKU_RELEASE_SOURCE_TREE", COMMIT)
-    tag = _coordinate("KIOKU_RELEASE_TAG", TAG)
-    version = _coordinate("KIOKU_RELEASE_VERSION", VERSION)
+def _reject_git_replacement_objects(*, cwd: Path = ROOT) -> None:
+    if _git("replace", "-l", cwd=cwd):
+        fail("Git replacement refs are not accepted")
+    graft_path = _git(
+        "rev-parse", "--path-format=absolute", "--git-path", "info/grafts", cwd=cwd
+    )
+    if not graft_path or not Path(graft_path).is_absolute():
+        fail("cannot resolve the repository graft-file path")
+    if os.path.lexists(graft_path):
+        fail("Git graft files are not accepted")
+
+
+def _verify_frozen_source(commit: str, tree: str) -> None:
+    _reject_git_replacement_objects()
     head = _git("rev-parse", "HEAD", cwd=ROOT)
     actual_tree = _git("rev-parse", "HEAD^{tree}", cwd=ROOT)
     if head != commit or actual_tree != tree:
         fail("adapter source is not the frozen commit/tree")
-    if _git("rev-parse", f"{tag}^{{commit}}", cwd=ROOT) != commit:
+
+
+def _source_coordinates(*, verify_tag_ref: bool = True) -> tuple[str, str, str, str]:
+    commit = _coordinate("KIOKU_RELEASE_SOURCE_COMMIT", COMMIT)
+    tree = _coordinate("KIOKU_RELEASE_SOURCE_TREE", COMMIT)
+    tag = _coordinate("KIOKU_RELEASE_TAG", TAG)
+    version = _coordinate("KIOKU_RELEASE_VERSION", VERSION)
+    _verify_frozen_source(commit, tree)
+    if verify_tag_ref and _git(
+        "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}", cwd=ROOT
+    ) != commit:
         fail("release tag does not resolve to the frozen commit")
     return commit, tree, tag, version
 
@@ -626,18 +670,19 @@ def _read_bound_file(
     path: Path,
     *,
     label: str,
+    mode: int = 0o600,
     expected_sha256: str | None = None,
     expected_manifest_digest: str | None = None,
 ) -> bytes:
     """Read one private file through a held descriptor and bind its bytes."""
-    descriptor = _image_pipeline._open_owned(path, label, private=True)
+    descriptor = _image_pipeline._open_owned(path, label, mode=mode)
     try:
         if expected_sha256 is not None and expected_manifest_digest is not None:
             _image_pipeline.verify_oci_archive_fd(
                 descriptor,
                 expected_sha256,
                 expected_manifest_digest,
-                mode=0o600,
+                mode=mode,
             )
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
@@ -748,7 +793,7 @@ def _confirmation(version: str, digest: str) -> str:
 
 
 def prepare() -> Mapping[str, Any]:
-    commit, _tree, tag, version = _source_coordinates()
+    commit, tree, tag, version = _source_coordinates()
     config = _config()
     _check_config_coordinate(config)
     output = _output_dir()
@@ -756,6 +801,7 @@ def prepare() -> Mapping[str, Any]:
     # preflight is selected only by push/preflight, and prepare receives no
     # later credential environment from the coordinator.
     _pipeline("build", config, tag, output)
+    _verify_frozen_source(commit, tree)
     artifact_path, _artifact_hash, digest = _artifact(output)
     files = [artifact_path]
     for name in ("build-evidence.json", "enclave-sbom.spdx.json", "enclave-scan.json"):
@@ -842,6 +888,8 @@ def _verify_bundle(output: Path, config: Path, commit: str, tag: str, digest: st
             commit,
             "--image-repository",
             image_repository,
+            "--image-digest-uri",
+            f"{image_repository}@{digest}",
             "--image-digest",
             digest,
             "--config",
@@ -859,14 +907,107 @@ def _verify_bundle(output: Path, config: Path, commit: str, tag: str, digest: st
     return value
 
 
-def _verify_tag_signer(tag: str) -> None:
-    fingerprint = _env("KIOKU_RELEASE_TAG_SIGNER_FINGERPRINT").lower().removeprefix("gpg:").removeprefix("sha256:")
-    if not re.fullmatch(r"[0-9a-fA-F]{16,64}", fingerprint):
+def _verify_tag_signer(tag_object: str) -> None:
+    """Verify the captured object itself and match its pinned SSH/GPG signer."""
+    expected = _env("KIOKU_RELEASE_TAG_SIGNER_FINGERPRINT")
+    signer_environment = _base_child_env()
+    if "GNUPGHOME" in os.environ:
+        signer_environment["GNUPGHOME"] = os.environ["GNUPGHOME"]
+    try:
+        completed = subprocess.run(
+            (
+                "git", "--no-replace-objects", "verify-tag", "--raw", tag_object,
+            ),
+            cwd=str(ROOT),
+            env=signer_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        fail("release tag signature verification could not run")
+    if completed.returncode:
+        fail("release tag object does not have a valid signature")
+    verification = completed.stdout + "\n" + completed.stderr
+    if expected.startswith("SHA256:"):
+        if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]+={0,2}", expected):
+            fail("tag signer fingerprint is malformed")
+        actual = set(
+            re.findall(r"\bkey (SHA256:[A-Za-z0-9+/]+={0,2})(?:\s|$)", verification)
+        )
+        if expected not in actual:
+            fail("release tag signer does not match the pinned trust anchor")
+        return
+    fingerprint = expected.removeprefix("gpg:").upper()
+    if not re.fullmatch(r"[0-9A-F]{16,64}", fingerprint):
         fail("tag signer fingerprint is malformed")
-    raw = _run(("git", "verify-tag", "--raw", tag), cwd=ROOT, timeout=120)
-    actual = {value.lower() for value in re.findall(r"\[GNUPG:\]\s+VALIDSIG\s+([0-9A-Fa-f]{16,64})", raw)}
+    actual: set[str] = set()
+    for line in verification.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+            actual.add(fields[2].upper())
+            if len(fields) >= 12:
+                actual.add(fields[-1].upper())
     if fingerprint not in actual:
         fail("release tag signer does not match the pinned trust anchor")
+
+
+def _validate_tag_object(tag_object: str, tag: str, commit: str) -> None:
+    if not COMMIT.fullmatch(tag_object):
+        fail("release tag object ID is malformed")
+    if _git("cat-file", "-t", tag_object, cwd=ROOT) != "tag":
+        fail("release tag must be an annotated tag object")
+    payload = _git("cat-file", "tag", tag_object, cwd=ROOT)
+    header = payload.split("\n\n", 1)[0]
+    names = [line.removeprefix("tag ") for line in header.splitlines() if line.startswith("tag ")]
+    if names != [tag]:
+        fail("signed annotated tag name does not exactly match the requested tag")
+    if _git("rev-parse", f"{tag_object}^{{commit}}", cwd=ROOT) != commit:
+        fail("signed annotated tag object does not peel to the frozen commit")
+
+
+def _capture_verified_tag(tag: str, commit: str) -> VerifiedTag:
+    """Resolve the mutable tag ref once, then trust only its immutable object ID."""
+    _reject_git_replacement_objects()
+    tag_object = _git(
+        "rev-parse", "--verify", f"refs/tags/{tag}^{{tag}}", cwd=ROOT
+    )
+    _validate_tag_object(tag_object, tag, commit)
+    _verify_tag_signer(tag_object)
+    return VerifiedTag(tag, tag_object, commit)
+
+
+def _revalidate_verified_tag(tag: VerifiedTag) -> None:
+    _reject_git_replacement_objects()
+    _validate_tag_object(tag.object_id, tag.name, tag.commit)
+    _verify_tag_signer(tag.object_id)
+
+
+def _verify_remote_tag_binding(tag: VerifiedTag) -> None:
+    raw = _git(
+        "ls-remote",
+        "--tags",
+        "origin",
+        f"refs/tags/{tag.name}",
+        f"refs/tags/{tag.name}^{{}}",
+        cwd=ROOT,
+        timeout=300,
+    )
+    actual: dict[str, str] = {}
+    for line in raw.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or not COMMIT.fullmatch(fields[0]) or fields[1] in actual:
+            fail("remote tag readback is malformed or ambiguous")
+        actual[fields[1]] = fields[0]
+    expected = {
+        f"refs/tags/{tag.name}": tag.object_id,
+        f"refs/tags/{tag.name}^{{}}": tag.commit,
+    }
+    if actual != expected:
+        fail("remote tag object or peeled commit differs from the verified tag")
 
 
 def _gcloud_prefix(account: str) -> tuple[str, ...]:
@@ -997,6 +1138,65 @@ def _expected_assets(release: Mapping[str, Any], *, prerelease: bool) -> None:
         fail("GitHub release is not the exact immutable enclave evidence release")
 
 
+@contextmanager
+def _immutable_release_snapshot(
+    output: Path,
+) -> Iterator[tuple[Path, dict[str, str]]]:
+    """Snapshot every release asset once before verification and publication."""
+    directory = Path(tempfile.mkdtemp(prefix=".verified-release-assets-", dir=str(output)))
+    directory.chmod(0o700)
+    digests: dict[str, str] = {}
+    try:
+        for name in _RELEASE_ASSET_NAMES:
+            source = output / name
+            data = _read_bound_file(source, label=f"release asset {name}")
+            destination = directory / name
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        fail(f"cannot snapshot release asset: {name}")
+                    view = view[written:]
+                os.fsync(descriptor)
+                os.fchmod(descriptor, 0o400)
+            finally:
+                os.close(descriptor)
+            digests[name] = "sha256:" + hashlib.sha256(data).hexdigest()
+        directory_descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        directory.chmod(0o500)
+        yield directory, digests
+    except OSError as error:
+        fail(f"cannot create immutable release-asset snapshot: {error}")
+    finally:
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        for name in _RELEASE_ASSET_NAMES:
+            path = directory / name
+            try:
+                path.chmod(0o600)
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def _compare_published_assets(output: Path, repository: str, tag: str) -> None:
     """Prove an existing immutable release contains the exact prepared bytes.
 
@@ -1010,30 +1210,47 @@ def _compare_published_assets(output: Path, repository: str, tag: str) -> None:
         for name in _RELEASE_ASSET_NAMES:
             local = output / name
             remote = downloaded / name
-            _regular(local, private=True)
-            _regular(remote, private=True)
-            if local.read_bytes() != remote.read_bytes():
+            try:
+                local_bytes = _read_bound_file(
+                    local, label=f"snapshotted release asset {name}", mode=0o400
+                )
+                remote_bytes = _read_bound_file(
+                    remote, label=f"downloaded release asset {name}"
+                )
+            except PipelineError as error:
+                fail(str(error))
+            if local_bytes != remote_bytes:
                 fail(f"immutable GitHub asset differs from the prepared evidence: {name}")
     finally:
         shutil.rmtree(downloaded, ignore_errors=True)
 
 
-def _publish_release(output: Path, repository: str, tag: str, digest: str) -> None:
+def _publish_release(
+    output: Path, repository: str, tag: VerifiedTag, digest: str
+) -> None:
+    _revalidate_verified_tag(tag)
     enabled = _gh("api", "-H", "X-GitHub-Api-Version: 2026-03-10", f"repos/{repository}/immutable-releases", "--jq", ".enabled").strip()
     if enabled != "true":
         fail("GitHub immutable releases are not enabled")
-    # The tag is already signed and bound to the detached source.  A plain
-    # fast-forward tag push is the only source-host mutation this adapter does.
-    _run(("git", "push", "origin", tag), cwd=ROOT, timeout=300)
-    current = _release_json(repository, tag)
-    prerelease = not bool(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag))
+    # Push exactly the verified annotated-tag object. Never resolve its mutable
+    # local name again, including on resume.
+    _git(
+        "push",
+        "origin",
+        f"{tag.object_id}:refs/tags/{tag.name}",
+        cwd=ROOT,
+        timeout=300,
+    )
+    _verify_remote_tag_binding(tag)
+    current = _release_json(repository, tag.name)
+    prerelease = not bool(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag.name))
     if current is None:
-        notes = f"Kioku enclave {tag}\nSource commit: {_coordinate('KIOKU_RELEASE_SOURCE_COMMIT', COMMIT)}\nImage digest: {digest}\n"
+        notes = f"Kioku enclave {tag.name}\nSource commit: {tag.commit}\nImage digest: {digest}\n"
         with tempfile.NamedTemporaryFile("w", prefix="release-notes-", suffix=".txt", delete=False) as handle:
             handle.write(notes)
             notes_path = Path(handle.name)
         try:
-            command = ["release", "create", tag, *(str(output / name) for name in _RELEASE_ASSET_NAMES), "--repo", repository, "--verify-tag", "--title", f"Kioku enclave {tag}", "--notes-file", str(notes_path)]
+            command = ["release", "create", tag.name, *(str(output / name) for name in _RELEASE_ASSET_NAMES), "--repo", repository, "--verify-tag", "--title", f"Kioku enclave {tag.name}", "--notes-file", str(notes_path)]
             if prerelease:
                 command.append("--prerelease")
             _gh(*command, timeout=300)
@@ -1042,15 +1259,18 @@ def _publish_release(output: Path, repository: str, tag: str, digest: str) -> No
                 notes_path.unlink()
             except OSError:
                 pass
-        current = _release_json(repository, tag)
+        current = _release_json(repository, tag.name)
     if current is None:
         fail("GitHub release disappeared after publication")
     _expected_assets(current, prerelease=prerelease)
-    _compare_published_assets(output, repository, tag)
+    _compare_published_assets(output, repository, tag.name)
+    _verify_remote_tag_binding(tag)
 
 
 def publish() -> Mapping[str, Any]:
-    commit, _tree, tag, version = _source_coordinates()
+    # Publication resolves the mutable tag ref only once in
+    # ``_capture_verified_tag`` below; every later step uses that object ID.
+    commit, tree, tag, version = _source_coordinates(verify_tag_ref=False)
     config = _config()
     _check_config_coordinate(config)
     output = _output_dir()
@@ -1060,8 +1280,10 @@ def publish() -> Mapping[str, Any]:
     _public_key()
     repository = _repository()
     image_repository, registry_reader = _image_repository(config, tag)
-    _verify_tag_signer(tag)
+    verified_tag = _capture_verified_tag(tag, commit)
     _pipeline("push", config, tag, output)
+    _verify_frozen_source(commit, tree)
+    _revalidate_verified_tag(verified_tag)
     values = _receipt(output, "push")
     digest = values.get("image_digest")
     if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
@@ -1076,24 +1298,41 @@ def publish() -> Mapping[str, Any]:
     if local_manifest_digest != digest:
         fail("remote image digest differs from the local artifact manifest")
     _sign_evidence(output)
-    _verify_bundle(output, config, commit, tag, digest, image_repository=image_repository)
-    if _registry_digest(image_repository, tag, registry_reader) != digest:
-        fail("Artifact Registry digest differs from the signed candidate")
-    _confirmation(version, digest)
-    _publish_release(output, repository, tag, digest)
-    files = [output / name for name in _RELEASE_ASSET_NAMES if (output / name).exists()]
-    # The OCI archive's filename is executor-owned; include it from the build
-    # receipt as well as the immutable release assets.
-    artifact_path = _artifact_path
-    files.append(artifact_path)
-    return {
-        "schema": SCHEMA,
-        "status": "success",
-        "artifact_digest": digest,
-        "version": version,
-        "destination": _destination(),
-        "artifact_files": _artifact_files(output, files),
-    }
+    with _immutable_release_snapshot(output) as (release_assets, release_hashes):
+        _verify_bundle(
+            release_assets,
+            config,
+            commit,
+            tag,
+            digest,
+            image_repository=image_repository,
+        )
+        if _registry_digest(image_repository, tag, registry_reader) != digest:
+            fail("Artifact Registry digest differs from the signed candidate")
+        _confirmation(version, digest)
+        _publish_release(release_assets, repository, verified_tag, digest)
+        files = [output / name for name in _RELEASE_ASSET_NAMES]
+        # The OCI archive's filename is executor-owned; include it from the
+        # build receipt as well as the immutable release assets.
+        artifact_path = _artifact_path
+        files.append(artifact_path)
+        artifacts = _artifact_files(output, files)
+        actual_release_hashes = {
+            Path(item["path"]).name: item["digest"]
+            for item in artifacts
+            if Path(item["path"]).name in _RELEASE_ASSET_NAMES
+        }
+        if actual_release_hashes != release_hashes:
+            fail("prepared release assets changed after their immutable snapshot")
+        result = {
+            "schema": SCHEMA,
+            "status": "success",
+            "artifact_digest": digest,
+            "version": version,
+            "destination": _destination(),
+            "artifact_files": artifacts,
+        }
+    return result
 
 
 def verify() -> Mapping[str, Any]:
@@ -1112,7 +1351,7 @@ def verify() -> Mapping[str, Any]:
 
 
 def _download_release(output: Path, repository: str, tag: str) -> Path:
-    directory = Path(tempfile.mkdtemp(prefix="state-evidence-", dir=str(output)))
+    directory = Path(tempfile.mkdtemp(prefix="state-evidence-", dir=str(output.parent)))
     directory.chmod(0o700)
     _private_directory(directory)
     for name in _RELEASE_ASSET_NAMES:

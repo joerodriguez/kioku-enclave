@@ -148,6 +148,12 @@ Publication refuses a missing or unknown tag signer, modified evidence, mismatch
 source/config/image/SBOM/scan binding, mutable image reference, changed registry digest,
 or a non-immutable existing release. It attaches exactly the signed evidence, signature,
 release metadata, SBOM, and scan result; it does not replace an existing immutable release.
+The publisher resolves the requested annotated tag once, requires its signed embedded tag
+name and peeled commit to match, verifies the signer on that exact object ID, pushes that
+object ID, and reads back both the remote tag object and peeled commit. Release assets are
+copied once to a private read-only snapshot before verification; only those same snapshot
+bytes are uploaded or compared on resume. Git replacement refs, legacy grafts, and ambient
+repository/object/config overrides are rejected throughout these source boundaries.
 
 Rolling the fixed fresh BOOTSTRAP additionally requires
 `KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL=v0.8.35-adr0022-fresh-bootstrap.1` on the
@@ -170,11 +176,17 @@ KIOKU_ENCLAVE_EVIDENCE_VERIFY=/path/to/kioku-enclave/scripts/verify_local_eviden
   --release-tag vX.Y.Z \
   --image-uri us-central1-docker.pkg.dev/PROJECT/REPOSITORY/kioku-enclave@sha256:FULL_DIGEST \
   --digest sha256:FULL_DIGEST \
+  --config /secure/kioku-production.env \
   --confirm "ROLL ENCLAVE sha256:FULL_DIGEST" \
   --apply
 ```
 
 or add `--roll --deployment-repo /path/to/kioku` to the `release.sh --apply` command.
+The direct command must pass the exact mode-0600 configuration used for the signed image.
+For schema 10 the verifier derives and checks the fresh bucket and canary expectations from
+those hash-bound bytes; schema 9 keeps its legacy deployment bucket defaults. The combined
+`release.sh --roll` path passes its once-read mode-0600 configuration snapshot, not the
+caller's mutable pathname.
 The deployment checkout must be clean, synchronized `main`. Record the source commit,
 image digest, rollout result, and live checks in the deployment record/`PROGRESS.md`; do not
 record configuration values, credentials, plaintext, ciphertext, or user identifiers.

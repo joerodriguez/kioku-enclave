@@ -603,8 +603,12 @@ mode-0600 Ed25519 private key signs those exact bytes; verification requires an 
 pinned public-key fingerprint. Two reviewed publication interfaces are available: standalone
 `scripts/release.sh` and the frozen-source `scripts/release_train_enclave.py publish` adapter.
 Both fail before mutation unless the signed source tag and local evidence verify; the adapter
-also binds the coordinator plan, exact artifact, and frozen detached source. GitHub is used for
-immutable public release hosting, not execution or build identity.
+also binds the coordinator plan, exact artifact, and frozen detached source. Both disable Git
+replacement-object resolution and reject replacement refs, grafts, and ambient repository or
+object overrides. Publication captures one annotated-tag object ID, validates its signed embedded
+name, signer, and peeled commit, pushes that exact object, and checks the remote object plus peel.
+Evidence assets are verified, uploaded, and resume-compared only from one private read-only byte
+snapshot. GitHub is used for immutable public release hosting, not execution or build identity.
 
 The fresh-generation BOOTSTRAP has one non-reusable publication role:
 `v0.8.35-adr0022-fresh-bootstrap.1`. Its private operator file must contain exactly one
@@ -622,7 +626,9 @@ from that same snapshot. The synthetic cross-repository fixture is
 (3,094 bytes, SHA-256 `40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`).
 It is a format pin, not production evidence. Generic releases remain schema 9, and
 `scripts/release.sh --roll` additionally requires
-`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL` to name the exact BOOTSTRAP tag.
+`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL` to name the exact BOOTSTRAP tag. Direct rollout
+verification supplies the exact mode-0600 image configuration; schema 10 derives its fresh bucket
+expectations from those hash-bound bytes, while schema 9 retains legacy bucket defaults.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record

@@ -15,6 +15,9 @@ import tempfile
 import unittest
 from unittest import mock
 
+import test_local_build_evidence as bundle_fixtures  # noqa: E402
+import adr0022_fresh_release as fresh  # noqa: E402
+
 
 MODULE_PATH = Path(__file__).with_name("release_train_enclave.py")
 SPEC = importlib.util.spec_from_file_location("release_train_enclave", MODULE_PATH)
@@ -59,7 +62,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                 "KIOKU_RELEASE_ARTIFACT_ROOT": str(state),
                 "KIOKU_RELEASE_CONFIG_PATH": str(config),
                 "KIOKU_RELEASE_CONFIG_DIGEST": "sha256:" + hashlib.sha256(config.read_bytes()).hexdigest(),
-            }, clear=False), mock.patch.object(MODULE, "_source_coordinates", return_value=("a" * 40, "b" * 40, "v1.2.3", "1.2.3")), mock.patch.object(MODULE, "_check_config_coordinate"), mock.patch.object(MODULE, "_pipeline"), mock.patch.object(MODULE, "_native_child_env", return_value={}), mock.patch.object(MODULE, "_artifact", return_value=(artifact, hashlib.sha256(artifact.read_bytes()).hexdigest(), "sha256:" + "a" * 64)):
+            }, clear=False), mock.patch.object(MODULE, "_source_coordinates", return_value=("a" * 40, "b" * 40, "v1.2.3", "1.2.3")), mock.patch.object(MODULE, "_check_config_coordinate"), mock.patch.object(MODULE, "_pipeline"), mock.patch.object(MODULE, "_verify_frozen_source"), mock.patch.object(MODULE, "_native_child_env", return_value={}), mock.patch.object(MODULE, "_artifact", return_value=(artifact, hashlib.sha256(artifact.read_bytes()).hexdigest(), "sha256:" + "a" * 64)):
                 result = MODULE.prepare()
             self.assertEqual(result["schema"], MODULE.SCHEMA)
             self.assertEqual(result["artifact_digest"], "sha256:" + "a" * 64)
@@ -84,7 +87,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                 downloaded = source / name
                 local.write_bytes(f"prepared-{index}".encode())
                 downloaded.write_bytes(f"prepared-{index}".encode())
-                local.chmod(0o600)
+                local.chmod(0o400)
                 downloaded.chmod(0o600)
             def fake_gh(*arguments: str, timeout: int) -> str:
                 directory = Path(arguments[arguments.index("--dir") + 1])
@@ -110,7 +113,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                 downloaded = remote / name
                 local.write_bytes(f"prepared-{index}".encode())
                 downloaded.write_bytes(f"remote-{index}".encode() if index == 2 else f"prepared-{index}".encode())
-                local.chmod(0o600)
+                local.chmod(0o400)
                 downloaded.chmod(0o600)
             with mock.patch.object(MODULE, "_download_release", return_value=remote):
                 with self.assertRaisesRegex(MODULE.AdapterError, "immutable GitHub asset differs"):
@@ -130,12 +133,23 @@ class EnclaveAdapterTests(unittest.TestCase):
                 "isPrerelease": False,
                 "assets": [{"name": name} for name in MODULE._RELEASE_ASSET_NAMES],
             }
+            verified_tag = MODULE.VerifiedTag("v1.2.3", "c" * 40, "d" * 40)
             with mock.patch.object(MODULE, "_gh", return_value="true") as fake_gh, \
-                 mock.patch.object(MODULE, "_run"), \
+                 mock.patch.object(MODULE, "_revalidate_verified_tag"), \
+                 mock.patch.object(MODULE, "_git", return_value="") as fake_git, \
+                 mock.patch.object(MODULE, "_verify_remote_tag_binding") as remote_binding, \
                  mock.patch.object(MODULE, "_release_json", return_value=release), \
                  mock.patch.object(MODULE, "_compare_published_assets") as compare:
-                MODULE._publish_release(output, "example/kioku-enclave", "v1.2.3", "sha256:" + "a" * 64)
+                MODULE._publish_release(output, "example/kioku-enclave", verified_tag, "sha256:" + "a" * 64)
             compare.assert_called_once_with(output, "example/kioku-enclave", "v1.2.3")
+            fake_git.assert_called_once_with(
+                "push",
+                "origin",
+                f"{'c' * 40}:refs/tags/v1.2.3",
+                cwd=MODULE.ROOT,
+                timeout=300,
+            )
+            self.assertEqual(remote_binding.call_count, 2)
             fake_gh.assert_called_once()
 
     def test_state_destination_is_allowlisted(self) -> None:
@@ -274,6 +288,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                     MODULE._gcloud_env()
             unsafe_mode = root / "unsafe-mode"
             unsafe_mode.mkdir(mode=0o755)
+            unsafe_mode.chmod(0o755)
             with mock.patch.dict(os.environ, {"CLOUDSDK_CONFIG": str(unsafe_mode)}, clear=False):
                 with self.assertRaisesRegex(MODULE.AdapterError, "mode-0700"):
                     MODULE._gcloud_env()
@@ -284,6 +299,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                     MODULE._gcloud_env()
             unsafe_child = valid / "nested"
             unsafe_child.mkdir(mode=0o755)
+            unsafe_child.chmod(0o755)
             with mock.patch.dict(os.environ, {"CLOUDSDK_CONFIG": str(valid)}, clear=False):
                 with self.assertRaisesRegex(MODULE.AdapterError, "unsafe directory"):
                     MODULE._gcloud_env()
@@ -337,6 +353,7 @@ class EnclaveAdapterTests(unittest.TestCase):
             self.assertEqual(MODULE._run(("git", "status")), "ok")
         child_env = child.call_args.kwargs["env"]
         self.assertEqual(child_env["PATH"], "/reviewed/path")
+        self.assertEqual(child_env["GIT_NO_REPLACE_OBJECTS"], "1")
         for secret in (
             "KIOKU_RELEASE_GITHUB_TOKEN",
             "KIOKU_RELEASE_EVIDENCE_PRIVATE_KEY",
@@ -452,6 +469,157 @@ class EnclaveAdapterTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {**base, "DOCKER_SSH_COMMAND": "ssh -o StrictHostKeyChecking=no"}, clear=True):
                 with self.assertRaises(MODULE.AdapterError):
                     MODULE._native_child_env(include_cloud=False)
+
+    def test_adapter_bundle_call_reaches_real_schema_ten_verifier_with_exact_digest_uri(self) -> None:
+        helper = bundle_fixtures.LocalEvidenceTests()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = helper.create_bundle(
+                directory, fresh_bootstrap=True
+            )
+            environment = {
+                "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY": str(public),
+                "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY_SHA256": fingerprint,
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                result = MODULE._verify_bundle(
+                    directory,
+                    directory / "local.env",
+                    bundle_fixtures.COMMIT,
+                    fresh.BOOTSTRAP_TAG,
+                    bundle_fixtures.DIGEST,
+                    image_repository=fresh.IMAGE_REPOSITORY,
+                )
+        self.assertEqual(result["metadata"]["schema_version"], 10)
+        self.assertEqual(
+            result["evidence"]["image_digest_uri"],
+            f"{fresh.IMAGE_REPOSITORY}@{bundle_fixtures.DIGEST}",
+        )
+
+    def test_adapter_rejects_git_overrides_replacements_and_grafts(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_OBJECT_DIRECTORY": "/tmp/unreviewed-objects"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(MODULE.AdapterError, "GIT_OBJECT_DIRECTORY"):
+                MODULE._base_child_env()
+        with mock.patch.object(MODULE, "_git", return_value="a" * 40):
+            with self.assertRaisesRegex(MODULE.AdapterError, "replacement refs"):
+                MODULE._reject_git_replacement_objects()
+        with tempfile.TemporaryDirectory() as temporary:
+            graft = Path(temporary) / "grafts"
+            graft.write_text("fixture\n", encoding="utf-8")
+            with mock.patch.object(MODULE, "_git", side_effect=("", str(graft))):
+                with self.assertRaisesRegex(MODULE.AdapterError, "graft files"):
+                    MODULE._reject_git_replacement_objects()
+
+    def test_annotated_tag_capture_rejects_alias_and_verifies_exact_object(self) -> None:
+        object_id = "c" * 40
+        commit = "d" * 40
+
+        def aliased_git(*arguments: str, **_kwargs: object) -> str:
+            if arguments[:2] == ("rev-parse", "--verify"):
+                return object_id
+            if arguments[:2] == ("cat-file", "-t"):
+                return "tag"
+            if arguments[:2] == ("cat-file", "tag"):
+                return (
+                    f"object {commit}\ntype commit\ntag v9.9.9\n"
+                    "tagger Test <test@example.invalid> 0 +0000\n\nrelease"
+                )
+            if arguments == ("rev-parse", f"{object_id}^{{commit}}"):
+                return commit
+            raise AssertionError(arguments)
+
+        with mock.patch.object(MODULE, "_reject_git_replacement_objects"), \
+             mock.patch.object(MODULE, "_git", side_effect=aliased_git), \
+             mock.patch.object(MODULE, "_verify_tag_signer") as signer:
+            with self.assertRaisesRegex(MODULE.AdapterError, "tag name"):
+                MODULE._capture_verified_tag("v1.2.3", commit)
+        signer.assert_not_called()
+
+        def exact_git(*arguments: str, **_kwargs: object) -> str:
+            if arguments[:2] == ("rev-parse", "--verify"):
+                return object_id
+            if arguments[:2] == ("cat-file", "-t"):
+                return "tag"
+            if arguments[:2] == ("cat-file", "tag"):
+                return (
+                    f"object {commit}\ntype commit\ntag v1.2.3\n"
+                    "tagger Test <test@example.invalid> 0 +0000\n\nrelease"
+                )
+            if arguments == ("rev-parse", f"{object_id}^{{commit}}"):
+                return commit
+            raise AssertionError(arguments)
+
+        with mock.patch.object(MODULE, "_reject_git_replacement_objects"), \
+             mock.patch.object(MODULE, "_git", side_effect=exact_git), \
+             mock.patch.object(MODULE, "_verify_tag_signer") as signer:
+            captured = MODULE._capture_verified_tag("v1.2.3", commit)
+        self.assertEqual(captured, MODULE.VerifiedTag("v1.2.3", object_id, commit))
+        signer.assert_called_once_with(object_id)
+
+    def test_tag_signer_accepts_pinned_ssh_fingerprint_from_stderr(self) -> None:
+        object_id = "c" * 40
+        fingerprint = "SHA256:YWJjZGVmZw"
+        completed = mock.Mock(
+            returncode=0,
+            stdout="",
+            stderr=f'Good "git" signature for release with ED25519 key {fingerprint}\n',
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"KIOKU_RELEASE_TAG_SIGNER_FINGERPRINT": fingerprint},
+            clear=False,
+        ), mock.patch.object(MODULE.subprocess, "run", return_value=completed) as child:
+            MODULE._verify_tag_signer(object_id)
+        self.assertEqual(
+            child.call_args.args[0],
+            ("git", "--no-replace-objects", "verify-tag", "--raw", object_id),
+        )
+        self.assertEqual(child.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
+
+    def test_remote_tag_readback_requires_exact_object_and_peel_without_refs_mode(self) -> None:
+        tag = MODULE.VerifiedTag("v1.2.3", "c" * 40, "d" * 40)
+        exact = (
+            f"{tag.object_id}\trefs/tags/{tag.name}\n"
+            f"{tag.commit}\trefs/tags/{tag.name}^{{}}\n"
+        )
+        with mock.patch.object(MODULE, "_git", return_value=exact) as git:
+            MODULE._verify_remote_tag_binding(tag)
+        arguments = git.call_args.args
+        self.assertIn("--tags", arguments)
+        self.assertNotIn("--refs", arguments)
+        mismatched = exact.replace(tag.commit, "e" * 40)
+        with mock.patch.object(MODULE, "_git", return_value=mismatched):
+            with self.assertRaisesRegex(MODULE.AdapterError, "peeled commit"):
+                MODULE._verify_remote_tag_binding(tag)
+
+    def test_release_asset_snapshot_is_read_only_and_survives_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            expected: dict[str, bytes] = {}
+            for index, name in enumerate(MODULE._RELEASE_ASSET_NAMES):
+                data = f"asset-{index}".encode()
+                expected[name] = data
+                path = output / name
+                path.write_bytes(data)
+                path.chmod(0o600)
+            with MODULE._immutable_release_snapshot(output) as (snapshot, hashes):
+                self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o500)
+                for name, data in expected.items():
+                    snapshotted = snapshot / name
+                    self.assertEqual(stat.S_IMODE(snapshotted.stat().st_mode), 0o400)
+                    self.assertEqual(snapshotted.read_bytes(), data)
+                    self.assertEqual(hashes[name], "sha256:" + hashlib.sha256(data).hexdigest())
+                (output / MODULE._RELEASE_ASSET_NAMES[0]).write_bytes(b"mutated")
+                self.assertEqual(
+                    (snapshot / MODULE._RELEASE_ASSET_NAMES[0]).read_bytes(),
+                    expected[MODULE._RELEASE_ASSET_NAMES[0]],
+                )
+                snapshot_path = snapshot
+            self.assertFalse(snapshot_path.exists())
 
 
 if __name__ == "__main__":
