@@ -31,7 +31,7 @@ class DeploymentSourceSeal:
 # Changing any deployment source requires a separate review that updates both
 # the commit and its canonical root-source inventory/digest here.
 REVIEWED_DEPLOYMENT = DeploymentSourceSeal(
-    head="fa749becbf3a60120b2a8eb567d6b98934fbcef9",
+    head="975726700360459ea887dce50ad33fd24294a176",
     inventory=(
         "infra/backend.tf",
         "infra/billing.tf",
