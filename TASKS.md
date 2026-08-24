@@ -23,6 +23,10 @@
 - [x] Repin the singleton deployment seal to `e62caba`, whose reviewed rollout owner
   includes the positive-witness `.3` image in exact archive bucket and witness digest
   rotation rather than admitting the image without its provider authority.
+- [x] Resume Genesis at both native-session entry points: the canonical session route
+  used by Google ID-token clients after account creation and the first durable Apple
+  native access/refresh issuance. Browser OAuth and refresh retain their existing
+  idempotent resumption points.
 
 # ADR-0022 browser evidence
 

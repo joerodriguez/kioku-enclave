@@ -2079,6 +2079,7 @@ pub async fn issue_native_session(
     let raw_refresh = tokens::random_token_hex();
     let refresh_hash = tokens::sha256_hex(&raw_refresh);
     let user_id = user_id.to_string();
+    let genesis_user_id = user_id.clone();
     s.control
         .write(move |conn| {
             let tx = conn.unchecked_transaction()?;
@@ -2110,6 +2111,16 @@ pub async fn issue_native_session(
             Ok(())
         })
         .await?;
+    // Apple-primary native login returns its first access/refresh pair here.
+    // Waiting for the first refresh would leave a newly selected account on
+    // the pre-Genesis archive for up to one access-token lifetime. Resume only
+    // after the session write is durable, matching the existing code-exchange
+    // and refresh-token boundaries.
+    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+        Arc::clone(&s.control),
+        Arc::clone(&s.store),
+        &genesis_user_id,
+    );
     Ok((access, raw_refresh))
 }
 
