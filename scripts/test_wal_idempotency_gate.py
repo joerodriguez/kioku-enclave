@@ -787,8 +787,14 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # expression hash moves. The sole delta is async_main's owner-body hash,
 # because startup now derives Control-bound deletion roots and installs the
 # exact lane before loading WAL selections or launching reconcilers. The
-# independently derived third-state digest is:
-EXPECTED_STORE_SURFACE_SHA256 = "b50d6196a8a4d2ac8f5471bb7947d57c47df1f45c33c2d220478f9b58ce0a8bf"
+# independently derived third-state digest is recorded below.
+# ADR-0022 zero-archive cutover: startup now chooses the dedicated destructive
+# cutover owner when the reviewed signup budget is exactly zero. A fresh,
+# untouched `git archive` of exact 6dbd2fc47a04af9afd801c212ca4cde042cf138b
+# ran its own 14-test gate and reproduced the prior 15/b50d6196... pin before
+# comparison. The count, keys, classifications, order, and all call-expression
+# hashes are unchanged; only async_main's enclosing owner-body hash moves.
+EXPECTED_STORE_SURFACE_SHA256 = "ba584b1b6fc4446ad244c67ee84ed2901ca69c45542453d9e736634cd90de4d8"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -895,7 +901,7 @@ EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
 # pass in src/archive_v3_genesis_trigger.rs. It is deliberately a worker and
 # not an awaited call — sign-in must never block on, or fail because of,
 # genesis — and it classifies "C" with the rest of the archive-v3 family.
-EXPECTED_WORKER_SPAWN_COUNT = 28
+EXPECTED_WORKER_SPAWN_COUNT = 29
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
@@ -1025,7 +1031,14 @@ EXPECTED_WORKER_SPAWN_COUNT = 28
 # cannot make the frozen-create drain lie. No surviving key, class, call
 # expression, or relative order moves. The only surviving owner-body move is
 # async_main's existing spawn, caused by the startup deletion-lane install.
-EXPECTED_WORKER_SPAWN_SHA256 = "9f4435eeaaac5fd3bc1866a74f9f31e70c7c93ebf2e0c611ef0e61bb59865546"
+# ADR-0022 zero-archive cutover adds exactly one C worker spawn:
+# `sync::spawn_adr0022_zero_archive_cutover`. It is the reviewed destructive
+# zero-budget owner and remains separate from the ordinary reconciler. The
+# same pristine 6dbd2fc archive cited by the Store-surface pin reproduced its
+# own 28/9f4435ee... inventory and 14/14 gate first. No key is removed or
+# reclassified, every surviving spawn expression is byte-identical, and only
+# async_main's enclosing owner body moves around the zero-budget branch.
+EXPECTED_WORKER_SPAWN_SHA256 = "88d4563e05d417c78e37e8bda3d97cbd6545d05357d5b00b2938c971feade160"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

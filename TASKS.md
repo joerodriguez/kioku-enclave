@@ -11,10 +11,15 @@
   candidate suffix correctly produced a prerelease that the old deployment preflight
   rejected. Live public health, exact image/KMS attestation, and candidate-only
   archive/witness authority all verify; the deployment source now pins the live digest.
-- [~] Build, sign, publish, and roll `v0.8.31-archive-v3-wal.1` from the merged
-  deletion-runtime source. Its rollout verifier pins monorepo companion `c2accb1`,
-  which admits only this exact schema-v9 active tag and preserves the typed confirmation,
-  singleton topology seal, authority rotation, and v0.8.14 emergency rollback.
+- [x] Build, sign, publish, and roll `v0.8.31-archive-v3-wal.1` from deletion-runtime
+  source `99024cd`; production verified the exact attested image
+  `sha256:3dfb21c79f33b6c20ae7f6e2c1baa0ed60eebf71a1922d8f812016d98d3c369e`,
+  KMS binding, singleton topology seal, health, and predecessor-authority removal.
+- [~] Close signup with an exact baked zero budget, deploy the one-time bounded
+  zero-archive owner, and drive every account through the ordinary lifecycle-fenced
+  deletion lane. Group 1/2 counts are measured in one Control transaction and logged
+  content-free; the production service remains closed until provider-retained
+  soft-deleted generations expire and both zero-proof takes succeed.
 
 # ADR-0022 browser evidence
 

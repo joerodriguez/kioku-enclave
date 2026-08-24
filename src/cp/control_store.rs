@@ -1944,6 +1944,41 @@ pub struct AccountDeletionOperation {
     pub hard_delete_time: Option<String>,
 }
 
+/// One-transaction, content-free ADR-0022 zero-state measurement.
+///
+/// These are exactly Groups 1 and 2 from
+/// `docs/adr/0022/zero-archive-proof.md`. The encrypted Control store is the
+/// only authority that can measure them; callers may log only these aggregate
+/// counts and the derived all-zero bit, never row identities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Adr0022ZeroArchiveCounts {
+    pub(crate) bindings: i64,
+    pub(crate) genesis: i64,
+    pub(crate) imports: i64,
+    pub(crate) import_artifacts: i64,
+    pub(crate) owners: i64,
+    pub(crate) leases: i64,
+    pub(crate) publications: i64,
+    pub(crate) publication_artifacts: i64,
+    pub(crate) checkpoints: i64,
+    pub(crate) checkpoint_artifacts: i64,
+    pub(crate) accounts: i64,
+    pub(crate) identities: i64,
+    pub(crate) pending_deletions: i64,
+    pub(crate) deletion_ledgers: i64,
+    pub(crate) lifecycle_anchors: i64,
+    pub(crate) deleted_users: i64,
+    pub(crate) deleted_identities: i64,
+    pub(crate) residue_disclosures: i64,
+    pub(crate) billing_detach_outbox: i64,
+}
+
+impl Adr0022ZeroArchiveCounts {
+    pub(crate) fn is_zero(self) -> bool {
+        self == Self::default()
+    }
+}
+
 /// Internal-only opaque archive binding.  It is deliberately absent from API
 /// and export models; archive IDs may leave this encrypted control store only
 /// when a later separately-authorized v3 authority path is added.
@@ -23091,6 +23126,115 @@ impl ControlStore {
         .await
     }
 
+    /// A bounded oldest-first active-account page for the one-time ADR-0022
+    /// destructive cutover. Successfully fenced accounts leave this query, so
+    /// repeated pages make monotone progress without retaining an identity
+    /// cursor or materializing the whole account set.
+    pub(crate) async fn active_user_ids_for_cutover(&self, limit: usize) -> Result<Vec<String>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| EnclaveError::Store("cutover account limit is too large".into()))?;
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT id FROM users
+                 WHERE status = 'active'
+                 ORDER BY created_at, id
+                 LIMIT ?1",
+            )?;
+            let user_ids = statement
+                .query_map([limit], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(EnclaveError::from)?;
+            Ok(user_ids)
+        })
+        .await
+    }
+
+    /// Measure both Control-store groups of the ADR-0022 zero proof in one
+    /// read transaction. A missing table or malformed count is an error, never
+    /// an inferred zero.
+    pub(crate) async fn adr0022_zero_archive_counts(&self) -> Result<Adr0022ZeroArchiveCounts> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM archive_bindings),
+                   (SELECT COUNT(*) FROM archive_v3_wal_genesis),
+                   (SELECT COUNT(*) FROM archive_v3_maintenance_imports),
+                   (SELECT COUNT(*) FROM archive_v3_maintenance_import_artifacts),
+                   (SELECT COUNT(*) FROM archive_v3_wal_owners),
+                   (SELECT COUNT(*) FROM archive_v3_wal_owner_leases),
+                   (SELECT COUNT(*) FROM archive_v3_wal_publications),
+                   (SELECT COUNT(*) FROM archive_v3_wal_publication_artifacts),
+                   (SELECT COUNT(*) FROM archive_v3_wal_checkpoints),
+                   (SELECT COUNT(*) FROM archive_v3_wal_checkpoint_artifacts),
+                   (SELECT COUNT(*) FROM users),
+                   (SELECT COUNT(*) FROM auth_identities),
+                   (SELECT COUNT(*) FROM account_deletion_operations),
+                   (SELECT COUNT(*) FROM archive_deletion_ledgers),
+                   (SELECT COUNT(*) FROM archive_lifecycle_anchors),
+                   (SELECT COUNT(*) FROM deleted_users),
+                   (SELECT COUNT(*) FROM deleted_identities),
+                   (SELECT COUNT(*) FROM account_deletion_residue_disclosures),
+                   (SELECT COUNT(*) FROM billing_detach_outbox)",
+                [],
+                |row| {
+                    Ok(Adr0022ZeroArchiveCounts {
+                        bindings: row.get(0)?,
+                        genesis: row.get(1)?,
+                        imports: row.get(2)?,
+                        import_artifacts: row.get(3)?,
+                        owners: row.get(4)?,
+                        leases: row.get(5)?,
+                        publications: row.get(6)?,
+                        publication_artifacts: row.get(7)?,
+                        checkpoints: row.get(8)?,
+                        checkpoint_artifacts: row.get(9)?,
+                        accounts: row.get(10)?,
+                        identities: row.get(11)?,
+                        pending_deletions: row.get(12)?,
+                        deletion_ledgers: row.get(13)?,
+                        lifecycle_anchors: row.get(14)?,
+                        deleted_users: row.get(15)?,
+                        deleted_identities: row.get(16)?,
+                        residue_disclosures: row.get(17)?,
+                        billing_detach_outbox: row.get(18)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// After every account is physically complete and every billing detach is
+    /// durably delivered, remove the cutover-only status/tombstone residue.
+    /// This is not ordinary account-deletion behavior: the public API retains
+    /// those rows for replay and no-resurrection. Signup is transactionally
+    /// closed for this owner, so the destructive reset can safely erase them
+    /// only at the all-account boundary required by ADR-0022.
+    pub(crate) async fn retire_adr0022_cutover_tombstones(&self) -> Result<bool> {
+        self.write_if_changed(|conn| {
+            let unfinished: i64 = conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM users) +
+                   (SELECT COUNT(*) FROM account_deletion_operations
+                    WHERE status != 'physical_complete') +
+                   (SELECT COUNT(*) FROM billing_detach_outbox)",
+                [],
+                |row| row.get(0),
+            )?;
+            if unfinished != 0 {
+                return Ok((false, false));
+            }
+            let changed = conn.execute("DELETE FROM archive_deletion_ledgers", [])?
+                + conn.execute("DELETE FROM account_deletion_residue_disclosures", [])?
+                + conn.execute("DELETE FROM account_deletion_operations", [])?
+                + conn.execute("DELETE FROM deleted_identities", [])?
+                + conn.execute("DELETE FROM deleted_users", [])?;
+            Ok((true, changed != 0))
+        })
+        .await
+    }
+
     /// A bounded, oldest-attempt-first sweep of pending deletion operations for
     /// the serial reconciler. Returning ids is internal only; callers must not
     /// log them. Failed-retryable rows require explicit remediation first.
@@ -30726,6 +30870,23 @@ mod tests {
             reserve_signup_conn(&conn, 3),
             Err(EnclaveError::SignupLimited)
         ));
+
+        // Zero is the reviewed ADR-0022 cutover configuration. It must mean
+        // closed even with no counter row yet, and refusal must not create or
+        // increment one.
+        let closed = Connection::open_in_memory().unwrap();
+        closed.execute_batch(SCHEMA).unwrap();
+        assert!(matches!(
+            reserve_signup_conn(&closed, 0),
+            Err(EnclaveError::SignupLimited)
+        ));
+        assert_eq!(
+            closed
+                .query_row("SELECT COUNT(*) FROM signup_daily", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

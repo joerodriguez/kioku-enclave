@@ -58,9 +58,10 @@ done
 test "$(value GCS_BUCKET)" = "$(value GCS_LEGACY_MEDIA_BUCKET)"
 test "$(value ENCLAVE_ACME)" = 1
 case "$(value ADMIN_USER_IDS)" in *[!0-9A-Fa-f,-]*|'') exit 1 ;; esac
-# Positive decimal, no leading zero: a "0" or empty budget would close signup
-# entirely and a typo must not silently widen it.
-case "$(value SIGNUP_LIMIT_PER_DAY)" in ''|*[!0-9]*|0*) exit 1 ;; esac
+# Non-negative decimal, no leading zero. Zero is the explicit reviewed
+# ADR-0022 cutover state: reserve_signup_conn treats it as closed, never as
+# unlimited. Empty, signed, and ambiguous leading-zero values still refuse.
+case "$(value SIGNUP_LIMIT_PER_DAY)" in ''|*[!0-9]*|0[0-9]*) exit 1 ;; esac
 case "$(value RUN_SA_EMAIL)" in *@*.iam.gserviceaccount.com) ;; *) exit 1 ;; esac
 case "$(value ENCLAVE_AUDIENCE)" in https://*) ;; *) exit 1 ;; esac
 case "$(value ATTEST_STS_AUDIENCE)" in //iam.googleapis.com/*/workloadIdentityPools/*/providers/*) ;; *) exit 1 ;; esac

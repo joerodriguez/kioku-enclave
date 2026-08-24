@@ -1171,6 +1171,33 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(output.read_bytes(), encoded)
             self.assertEqual(__import__("stat").S_IMODE(output.stat().st_mode), 0o600)
+
+            # Zero is an intentional, hash-bound production value for the
+            # ADR-0022 closed-signup cutover image, not an omitted budget or
+            # an unlimited sentinel.
+            closed = encoded.replace(
+                b"SIGNUP_LIMIT_PER_DAY=25\n",
+                b"SIGNUP_LIMIT_PER_DAY=0\n",
+            )
+            self.assertNotEqual(closed, encoded)
+            closed_source = directory / "closed.env"
+            closed_output = directory / "closed-output.env"
+            closed_source.write_bytes(closed)
+            closed_source.chmod(0o600)
+            closed_result = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(closed_source),
+                    str(closed_output),
+                    __import__("hashlib").sha256(closed).hexdigest(),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(closed_result.returncode, 0, closed_result.stderr)
+            self.assertEqual(closed_output.read_bytes(), closed)
+
             source.write_bytes(encoded + b"KIOKU_BUILD_PROFILE=attacker\n")
             rejected = subprocess.run(
                 [str(SCRIPTS / "assemble_image_config.sh"), str(source), str(directory / "second"), expected],

@@ -95,10 +95,14 @@ No step may be skipped or reordered.
 
 1. **Close signup.** Daily cap to 0 (`~/.config/kioku/enclave-production.env`).
    Record the refusal-counter baseline. No new archive can be created from this
-   instant — and note that this is the *only* thing preventing archive creation
-   during the window, and it has no CI or code enforcement. It belongs in the
-   deploy pre-flight.
-2. **Run the destructive cutover.** Delete all archives and all accounts.
+   instant. Zero is an explicit validated image-baked state: the transactional
+   reservation refuses before account/archive creation, and startup selects the
+   dedicated cutover owner only for that exact value. The selected build, baked
+   image file, and live image identity still belong in the deploy evidence.
+2. **Run the destructive cutover.** The signup-closed image pages active accounts
+   into the ordinary lifecycle-fenced deletion state machine, advances pending
+   deletion every 30 seconds, and logs exact aggregate Groups 1-2 counts. Delete
+   all archives and accounts; do not infer provider-byte absence from these counts.
 3. **Proof take #1** — Groups 1-4. Transcribe below.
 4. **Retire the old image before deploying the new one.** Delete or deny-tag
    every pre-re-baseline image and pin the re-baselined digest as the deploy
@@ -125,19 +129,17 @@ No step may be skipped or reordered.
 **Abort rule:** any nonzero count at step 6 means stop. Delete the offending
 archives (empty by construction, minutes old), re-run step 3, restart at step 5.
 
-## Prerequisites that are not yet met
+## Cutover mechanisms and remaining evidence
 
-- The genesis spine is **wired but gated**, and the gate must be flipped
-  before step 5. This corrects an earlier revision of this document, which
+- The genesis spine is **wired and its active image has been production-proven**.
+  This corrects an earlier revision of this document, which
   claimed `initialize_genesis_store` had no production caller: it does. G9
   (#317) hung genesis off the sign-in path, so the live chain is
   `oauth.rs` sign-in / token refresh -> `spawn_genesis_convergence` ->
   `converge_genesis_for_user` -> `run_durable_genesis` ->
-  `initialize_genesis_store`. What holds it shut is `GENESIS_WAL_NATIVE`,
-  which defaults FALSE and additionally requires baked archive-v3
-  coordinates.
-  Two consequences for this runbook. First, step 5 depends on flipping that
-  gate, not on building a caller. Second, the gate is now a **baked, attested
+  `initialize_genesis_store`. Activation is controlled by `GENESIS_WAL_NATIVE`,
+  which additionally requires baked archive-v3 coordinates.
+  The gate is a **baked, attested
   image key**, so flipping it is a build-time act:
   - `GENESIS_WAL_NATIVE` is on `BAKED_IMAGE_CONFIGURATION_KEYS` in
     `src/main.rs` and on the `allowed_keys` allowlist in
@@ -182,10 +184,11 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   so it clears the floor, and un-arming the gate is then a redeploy of that
   digest with no pre-re-baseline binary ever returning to service.
 
-  This bullet records that the *mechanism* is in place. It does **not**
-  discharge anything else in this document.
-- The transcripts lane must merge before the cutover: running this family is
-  the first thing the new archives do.
+  This bullet records that the *mechanism* is in place and the active candidate
+  was rolled successfully. It does **not** discharge either zero proof, image
+  retirement, the positive birth witness, the seal, or the schema ladder.
+- The transcripts and selected voice-embedding lanes are merged and verified;
+  running them is among the first work a new archive performs.
 
 ## Take #1
 

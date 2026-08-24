@@ -171,9 +171,9 @@ impl CpConfig {
                     "SIGNUP_LIMIT_PER_DAY must be a whole number of accounts".into(),
                 )
             })?;
-            if parsed < 1 {
+            if parsed < 0 {
                 return Err(crate::error::EnclaveError::Config(
-                    "SIGNUP_LIMIT_PER_DAY must be at least 1".into(),
+                    "SIGNUP_LIMIT_PER_DAY must be non-negative".into(),
                 ));
             }
             parsed
