@@ -202,7 +202,7 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
     `ed496579f20529d7630e7de67492882203443ffacd881c64a59da86300b98a62`.
 
   Both are signed prereleases with immutable evidence. Deployment commit
-  `4ef98667676c163ce1ff11d72366ab4acfd37168` admits exactly this pair while the
+  `175a27b618c50e40672629d59a27654d232fd688` admits exactly this pair while the
   zero proof remains open and adds the frozen, disabled-until-Take-#1 operators
   for the three-bucket visible-zero floor, both proof takes, and exact registry
   retirement. Shipping those operators proves only that the rollback and proof
