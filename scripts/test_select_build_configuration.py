@@ -268,8 +268,8 @@ class SelectorTests(unittest.TestCase):
 
     def test_invalid_security_values_fail_before_writing_environment(self) -> None:
         for key, value in (
-            ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "0"),
             ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "-1"),
+            ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "00"),
             ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "unlimited"),
             ("EVALUATION_BASE_URL", "http://eval-api.kiokuu.com"),
             ("EVALUATION_ADMIN_USER_IDS", "not-an-id"),
@@ -285,6 +285,13 @@ class SelectorTests(unittest.TestCase):
                 completed, content = self.run_selector("evaluation", env)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
+
+    def test_zero_signup_budget_is_the_explicit_closed_cutover_state(self) -> None:
+        env = environment()
+        env["PRODUCTION_SIGNUP_LIMIT_PER_DAY"] = "0"
+        completed, content = self.run_selector("production", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("SIGNUP_LIMIT_PER_DAY=0\n", content)
 
     def test_billing_audience_must_exactly_match_service_origin(self) -> None:
         env = environment()

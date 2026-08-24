@@ -1907,7 +1907,10 @@ verified identity, bounded by an image-baked service-wide daily new-account budg
 (`SIGNUP_LIMIT_PER_DAY`) consumed inside the same transaction that inserts the account,
 so concurrent first-time sign-ins cannot both pass a full budget. It is shared by the
 Google-token, Google-OAuth, and both Apple paths, is spent only when an account is
-actually created, and fails closed when unset or non-positive. Returning users, legacy
+actually created, and fails closed when unset or negative. Exact zero is the reviewed
+ADR-0022 destructive-cutover state: it refuses every new account before reservation and
+starts the bounded lifecycle-fenced zero-archive owner instead of the ordinary deletion
+reconciler. Returning users, legacy
 identity rebinds, and the exact-matched plugin-review identity do not spend it. Signup
 emits a content-free `signup_v1` observation — fixed provider and outcome literals plus
 service-wide daily counters, never an account id, email, provider subject, token, or

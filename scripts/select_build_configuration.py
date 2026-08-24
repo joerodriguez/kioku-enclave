@@ -213,7 +213,7 @@ def validate(configuration: dict[str, str], profile: str) -> None:
     if not re.fullmatch(rf"mailto:{EMAIL_PATTERN}", configuration["ENCLAVE_ACME_CONTACT"]):
         raise SystemExit("invalid format for build configuration: ENCLAVE_ACME_CONTACT")
 
-    if not re.fullmatch(r"[1-9][0-9]{0,6}", configuration["SIGNUP_LIMIT_PER_DAY"]):
+    if not re.fullmatch(r"(?:0|[1-9][0-9]{0,6})", configuration["SIGNUP_LIMIT_PER_DAY"]):
         raise SystemExit("invalid format for build configuration: SIGNUP_LIMIT_PER_DAY")
 
     admin_ids = [value.strip() for value in configuration["ADMIN_USER_IDS"].split(",")]

@@ -1340,7 +1340,11 @@ async fn async_main() {
     cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
     cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
     cp::billing::spawn_detach_worker(Arc::clone(&cp_state));
-    cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
+    if cp_state.config.signup_limit_per_day == 0 {
+        cp::sync::spawn_adr0022_zero_archive_cutover(Arc::clone(&cp_state));
+    } else {
+        cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
+    }
 
     // ── Retired legacy data-plane tombstones ─────────────────────────────────
     let authenticated = legacy_data_plane_router(Arc::clone(&state));

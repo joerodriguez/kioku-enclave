@@ -19,7 +19,7 @@ use axum::{
 use base64::Engine as _;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{info, warn};
 
 use rusqlite::OptionalExtension;
 
@@ -34,6 +34,8 @@ use super::CpState;
 
 const DELETION_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const DELETION_RECONCILE_BATCH_SIZE: usize = 64;
+const ADR0022_CUTOVER_INTERVAL: Duration = Duration::from_secs(30);
+const ADR0022_CUTOVER_BATCH_SIZE: usize = 64;
 const DELETION_ATTEMPT_UNCONFIRMED: &str = "content_deletion_attempt_unconfirmed";
 #[cfg(test)]
 const LEGACY_GENERATION_UNAVAILABLE: &str = "legacy_generation_unavailable";
@@ -927,6 +929,55 @@ fn deletion_operation_requires_remediation(operation: &AccountDeletionOperation)
     operation.status == "failed_retryable"
 }
 
+/// Admit one active account into the same durable deletion state machine as
+/// the authenticated DELETE route. This is deliberately callable only by the
+/// startup-owned ADR-0022 cutover sweep below: it settles accounting, freezes
+/// selected media evidence, and tombstones Control under the user lifecycle
+/// lock before the ordinary reconciler may perform provider deletion.
+async fn begin_adr0022_cutover_account_deletion(
+    state: &CpState,
+    user_id: &str,
+) -> EnclaveResult<()> {
+    let lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?;
+    let status = state
+        .control
+        .user_status(user_id)
+        .await?
+        .ok_or_else(|| EnclaveError::Store("cutover account disappeared".into()))?;
+    if matches!(status.as_str(), "deleting" | "deleted") {
+        return Ok(());
+    }
+    if status != "active" {
+        return Err(EnclaveError::Conflict(
+            "cutover account is neither active nor deleting".into(),
+        ));
+    }
+
+    let account_id = state
+        .control
+        .billing_account_id_for_deletion(user_id)
+        .await?;
+    super::model_usage::settle_for_account_deletion(state, user_id, &account_id).await?;
+    if let Some(lane) = state.store.wal_deletion_lane() {
+        lane.freeze_media_inventory(state.control.as_ref(), state.store.as_ref(), user_id)
+            .await?;
+    }
+    let operation = state
+        .control
+        .begin_user_deletion(user_id)
+        .await?
+        .ok_or_else(|| EnclaveError::Conflict("cutover account became unavailable".into()))?;
+    drop(lifecycle_guard);
+    if operation.status == "physical_complete" {
+        return Ok(());
+    }
+    state
+        .control
+        .update_user_deletion_status(user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
+        .await?;
+    Ok(())
+}
+
 /// Retry durable `deleting` accounts even if a 202 client signs out and never
 /// repeats DELETE. Work is serial and bounded so one sweep cannot fan out GCS,
 /// KMS, or control-DB writes.
@@ -1147,6 +1198,94 @@ pub fn spawn_account_deletion_reconciler(state: Arc<CpState>) {
                 Ok(_) => {}
                 Err(_) => warn!("account deletion reconciliation sweep unavailable"),
             }
+        }
+    });
+}
+
+/// Run the one-time ADR-0022 destructive cutover while signup is explicitly
+/// closed (`SIGNUP_LIMIT_PER_DAY=0`). The zero budget is baked and attested;
+/// it transactionally refuses every first-time identity before an archive can
+/// be reserved. Active accounts enter the ordinary deletion state machine in
+/// bounded pages, and the same serial reconciler advances already-tombstoned
+/// work. No row identity or content enters logs.
+///
+/// Once Groups 1 and 2 are exactly zero, the worker keeps measuring at a low
+/// cadence. Reopening signup requires a separately built image with a positive
+/// budget, so this process can never manufacture an account after its take.
+pub fn spawn_adr0022_zero_archive_cutover(state: Arc<CpState>) {
+    assert_eq!(
+        state.config.signup_limit_per_day, 0,
+        "ADR-0022 cutover owner requires signup to be closed"
+    );
+    tokio::spawn(async move {
+        loop {
+            let mut admitted = 0usize;
+            let mut admission_failures = 0usize;
+            match state
+                .control
+                .active_user_ids_for_cutover(ADR0022_CUTOVER_BATCH_SIZE)
+                .await
+            {
+                Ok(user_ids) => {
+                    for user_id in user_ids {
+                        match begin_adr0022_cutover_account_deletion(&state, &user_id).await {
+                            Ok(()) => admitted += 1,
+                            Err(_) => admission_failures += 1,
+                        }
+                    }
+                }
+                Err(_) => admission_failures += 1,
+            }
+
+            let reconciliation = reconcile_pending_account_deletions(
+                &state.control,
+                &state.store,
+                state.apple_provider.as_ref(),
+            )
+            .await;
+            let retirement = state.control.retire_adr0022_cutover_tombstones().await;
+            let counts = state.control.adr0022_zero_archive_counts().await;
+            match (reconciliation, retirement, counts) {
+                (Ok(summary), Ok(retired), Ok(counts)) => {
+                    info!(
+                        metric = "adr0022_zero_archive_cutover",
+                        admitted,
+                        admission_failures,
+                        deletion_attempted = summary.attempted,
+                        deletion_completed = summary.completed,
+                        deletion_pending = summary.pending,
+                        deletion_failed_retryable = summary.failed_retryable,
+                        deletion_failures = summary.failures,
+                        terminal_tombstones_retired = retired,
+                        bindings = counts.bindings,
+                        genesis = counts.genesis,
+                        imports = counts.imports,
+                        import_artifacts = counts.import_artifacts,
+                        owners = counts.owners,
+                        leases = counts.leases,
+                        publications = counts.publications,
+                        publication_artifacts = counts.publication_artifacts,
+                        checkpoints = counts.checkpoints,
+                        checkpoint_artifacts = counts.checkpoint_artifacts,
+                        accounts = counts.accounts,
+                        identities = counts.identities,
+                        pending_deletions = counts.pending_deletions,
+                        deletion_ledgers = counts.deletion_ledgers,
+                        lifecycle_anchors = counts.lifecycle_anchors,
+                        deleted_users = counts.deleted_users,
+                        deleted_identities = counts.deleted_identities,
+                        residue_disclosures = counts.residue_disclosures,
+                        billing_detach_outbox = counts.billing_detach_outbox,
+                        zero = counts.is_zero(),
+                        "ADR-0022 zero-archive cutover sweep"
+                    );
+                }
+                _ => warn!(
+                    metric = "adr0022_zero_archive_cutover_unavailable",
+                    admitted, admission_failures, "ADR-0022 zero-archive cutover sweep unavailable"
+                ),
+            }
+            tokio::time::sleep(ADR0022_CUTOVER_INTERVAL).await;
         }
     });
 }
@@ -1427,6 +1566,51 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["deleted"], false);
         assert_eq!(value["status"], "failed_retryable");
+    }
+
+    #[tokio::test]
+    async fn cutover_pages_active_accounts_and_retires_terminal_identity_residue() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Store::new(kms, gcs);
+        let initial = control.adr0022_zero_archive_counts().await.unwrap();
+        assert!(initial.is_zero(), "initial counts were {initial:?}");
+
+        let first = control
+            .upsert_user("cutover-first", "first@example.com", 64)
+            .await
+            .unwrap();
+        let second = control
+            .upsert_user("cutover-second", "second@example.com", 64)
+            .await
+            .unwrap();
+        let page = control.active_user_ids_for_cutover(1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(page[0] == first.id || page[0] == second.id);
+        let counts = control.adr0022_zero_archive_counts().await.unwrap();
+        assert_eq!(counts.accounts, 2);
+        assert_eq!(counts.identities, 2);
+        assert_eq!(counts.bindings, 2);
+
+        for user in [&first, &second] {
+            control
+                .begin_user_deletion(&user.id)
+                .await
+                .unwrap()
+                .unwrap();
+            store.delete_user(&user.id).await.unwrap();
+            control.finalize_user_deletion(&user.id).await.unwrap();
+        }
+        let before_retirement = control.adr0022_zero_archive_counts().await.unwrap();
+        assert_eq!(before_retirement.accounts, 0);
+        assert_eq!(before_retirement.identities, 0);
+        assert_eq!(before_retirement.pending_deletions, 2);
+        assert_eq!(before_retirement.deleted_users, 2);
+        assert_eq!(before_retirement.deleted_identities, 2);
+        assert!(control.retire_adr0022_cutover_tombstones().await.unwrap());
+        let final_counts = control.adr0022_zero_archive_counts().await.unwrap();
+        assert!(final_counts.is_zero(), "final counts were {final_counts:?}");
     }
 
     #[tokio::test]
