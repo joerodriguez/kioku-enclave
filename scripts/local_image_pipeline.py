@@ -1035,6 +1035,7 @@ def verify() -> None:
         "test_local_build_evidence.py",
         "test_coordinator_advancement_receipt.py",
         "test_release.py",
+        "test_repromote_signed_image.py",
         "test_generate_capacity_fixture.py",
         "test_run_archive_capacity_harness.py",
         "test_run_archive_capacity_gate.py",
