@@ -202,10 +202,12 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
     `ed496579f20529d7630e7de67492882203443ffacd881c64a59da86300b98a62`.
 
   Both are signed prereleases with immutable evidence. Deployment commit
-  `5ef4eb4d4222f58aa29ba9b6efb146dc39bace70` admits exactly this pair while the
-  zero proof remains open. Publishing and admitting the pair proves only that
-  the rollback mechanism exists; it is not proof take #1, image retirement,
-  proof take #2, or the positive birth witness.
+  `4ef98667676c163ce1ff11d72366ab4acfd37168` admits exactly this pair while the
+  zero proof remains open and adds the frozen, disabled-until-Take-#1 operators
+  for the three-bucket visible-zero floor, both proof takes, and exact registry
+  retirement. Shipping those operators proves only that the rollback and proof
+  mechanisms exist; it is not proof take #1, image retirement, proof take #2,
+  or the positive birth witness.
 
   This bullet records that the *mechanism* is in place and the active candidate
   was rolled successfully. It does **not** discharge either zero proof, image
