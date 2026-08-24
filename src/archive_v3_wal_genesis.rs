@@ -93,7 +93,7 @@ use crate::{
         DeletionState, MigrationState, RecoveryRoot, WitnessError, WitnessRecord,
     },
     cp::control_store::ControlStore,
-    store::{initialize_genesis_store, GenesisStoreFacts},
+    store::{initialize_genesis_store, GenesisBirthWitness, GenesisStoreFacts},
 };
 
 /// Ladder lease duration, matching the offline maintenance importer's ticks.
@@ -312,6 +312,7 @@ pub(crate) struct ProducedGenesisBytes {
     reservation: DurableBootstrapReservation,
     wrapped_registry: Zeroizing<Vec<u8>>,
     root_envelope: Vec<u8>,
+    birth_witness: GenesisBirthWitness,
 }
 
 impl ProducedGenesisBytes {
@@ -321,6 +322,12 @@ impl ProducedGenesisBytes {
 
     pub(crate) fn root_envelope_hash(&self) -> [u8; 32] {
         Sha256::digest(&self.root_envelope).into()
+    }
+
+    /// The exact database uploaded by this attempt passed the binary's
+    /// canonical birth check before its bytes crossed the provider boundary.
+    pub(crate) const fn birth_witness(&self) -> GenesisBirthWitness {
+        self.birth_witness
     }
 }
 
@@ -575,6 +582,7 @@ pub(crate) async fn produce_genesis_bytes(
         reservation,
         wrapped_registry,
         root_envelope: envelope.encode(),
+        birth_witness: source.facts.birth_witness,
     })
 }
 
@@ -2032,11 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn genesis_checkpoint_source_serves_only_exact_measured_bytes() {
-        let facts = GenesisStoreFacts {
-            logical_file_length: 4,
-            plaintext_sha256: Sha256::digest([1u8, 2, 3, 4]).into(),
-            user_version: 7,
-        };
+        let facts = GenesisStoreFacts::for_test(4, Sha256::digest([1u8, 2, 3, 4]).into(), 7);
         let source =
             GenesisCheckpointSource::from_measured(facts, Zeroizing::new(vec![1, 2, 3, 4]))
                 .unwrap();
@@ -2047,10 +2051,7 @@ mod tests {
         assert_eq!(&*source.read_exact_owned(1, 2).await.unwrap(), &[2, 3]);
         assert!(source.read_exact_owned(3, 2).await.is_err());
         assert!(source.read_exact_owned(0, 0).await.is_err());
-        let mismatched = GenesisStoreFacts {
-            logical_file_length: 5,
-            ..facts
-        };
+        let mismatched = GenesisStoreFacts::for_test(5, facts.plaintext_sha256, 7);
         assert_eq!(
             GenesisCheckpointSource::from_measured(mismatched, Zeroizing::new(vec![1, 2, 3, 4]))
                 .unwrap_err(),

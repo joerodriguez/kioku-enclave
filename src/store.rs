@@ -7895,8 +7895,9 @@ fn open_db(
     Ok((conn, registration, migrated))
 }
 
-/// The three facts a fresh archive-v3 genesis must publish alongside its
-/// first checkpoint.
+/// The three measurements a fresh archive-v3 genesis must publish alongside
+/// its first checkpoint, plus the private proof that the measured connection
+/// passed the exact birth check.
 ///
 /// The WAL owner authenticates the database it later opens by exact file
 /// length, `user_version`, and plaintext SHA-256, so genesis cannot simply
@@ -7906,6 +7907,33 @@ pub(crate) struct GenesisStoreFacts {
     pub(crate) logical_file_length: u64,
     pub(crate) plaintext_sha256: [u8; 32],
     pub(crate) user_version: u32,
+    /// Unforgeable outside this module: possession proves the same connection
+    /// passed the exact birth check before its bytes were checkpointed.
+    pub(crate) birth_witness: GenesisBirthWitness,
+}
+
+/// Capability minted only by the exact schema validator above the genesis
+/// checkpoint boundary. Keeping its field private prevents a sibling producer
+/// from turning an ordinary boolean into operational proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GenesisBirthWitness {
+    _private: (),
+}
+
+#[cfg(test)]
+impl GenesisStoreFacts {
+    pub(crate) fn for_test(
+        logical_file_length: u64,
+        plaintext_sha256: [u8; 32],
+        user_version: u32,
+    ) -> Self {
+        Self {
+            logical_file_length,
+            plaintext_sha256,
+            user_version,
+            birth_witness: GenesisBirthWitness { _private: () },
+        }
+    }
 }
 
 /// Materialize the empty, schema-current SQLite database that a freshly
@@ -7935,6 +7963,7 @@ pub(crate) fn initialize_genesis_store(path: &Path) -> Result<GenesisStoreFacts>
     crate::schema_ladder::apply_steps(&tx, 0, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
     crate::schema_ladder::seed_epoch_marker(&tx, crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
     tx.commit()?;
+    validate_genesis_birth_witness(&conn)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
     let user_version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     // Fold every committed page back into the main file before it is measured.
@@ -7953,6 +7982,7 @@ pub(crate) fn initialize_genesis_store(path: &Path) -> Result<GenesisStoreFacts>
         logical_file_length,
         plaintext_sha256,
         user_version,
+        birth_witness: GenesisBirthWitness { _private: () },
     })
 }
 
@@ -8075,6 +8105,36 @@ pub(crate) fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescripto
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Prove that a just-materialized archive was born at this binary's exact
+/// schema target before any of its bytes can cross a provider boundary.
+///
+/// The epoch row is authenticated separately because table descriptors do not
+/// contain data. Descriptor equality is deliberately stronger than searching
+/// three DDL strings for `AUTOINCREMENT`: it binds every table, index, trigger,
+/// and virtual-table declaration to the frozen baseline plus reviewed ladder,
+/// and therefore includes the allocator declarations without a token/comment
+/// parsing ambiguity.
+fn validate_genesis_birth_witness(conn: &Connection) -> Result<()> {
+    let marker = crate::schema_ladder::read_archive_epoch(conn)
+        .map_err(|_| EnclaveError::Store("genesis birth witness is unavailable".into()))?;
+    if marker.epoch != crate::schema_ladder::SCHEMA_EPOCH_TARGET
+        || marker.chain
+            != crate::schema_ladder::chain_digest(crate::schema_ladder::SCHEMA_EPOCH_TARGET)
+    {
+        return Err(EnclaveError::Store(
+            "genesis birth witness does not match the binary".into(),
+        ));
+    }
+    let canonical = crate::schema_ladder::LadderView::PRODUCTION
+        .build_canonical(crate::schema_ladder::SCHEMA_EPOCH_TARGET)?;
+    if schema_descriptor(conn)? != schema_descriptor(&canonical)? {
+        return Err(EnclaveError::Store(
+            "genesis schema does not match the binary".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Prove the decrypted database already has the exact schema a fresh current
@@ -13005,6 +13065,36 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(sql.contains("AUTOINCREMENT"), "{table} born without it");
         }
+        validate_genesis_birth_witness(&conn).unwrap();
+        let _validated_capability = facts.birth_witness;
+    }
+
+    #[test]
+    fn genesis_birth_witness_refuses_marker_and_schema_drift() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let missing_marker = directory.path().join("missing-marker.db");
+        initialize_genesis_store(&missing_marker).unwrap();
+        let conn = Connection::open(&missing_marker).unwrap();
+        conn.execute("DELETE FROM schema_epoch", []).unwrap();
+        assert!(validate_genesis_birth_witness(&conn).is_err());
+        drop(conn);
+
+        let plain_allocator = directory.path().join("plain-allocator.db");
+        initialize_genesis_store(&plain_allocator).unwrap();
+        let conn = Connection::open(&plain_allocator).unwrap();
+        // Change only the stored canonical declaration. A token/comment
+        // search could still be fooled by unrelated text; descriptor equality
+        // must refuse the actual allocator declaration drift.
+        conn.execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_schema
+                SET sql=replace(sql, ' PRIMARY KEY AUTOINCREMENT', ' PRIMARY KEY')
+              WHERE type='table' AND name='screenshots';
+             PRAGMA writable_schema=OFF;",
+        )
+        .unwrap();
+        assert!(validate_genesis_birth_witness(&conn).is_err());
     }
 
     #[test]

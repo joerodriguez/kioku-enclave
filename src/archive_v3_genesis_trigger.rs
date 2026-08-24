@@ -347,10 +347,21 @@ async fn converge_genesis_over(
         .await
         .map_err(map_control)?
         == Some(WalGenesisStage::WalAuthoritative);
-    if !already_terminal {
-        run_durable_genesis(control, source, binding, user_id, archive_id).await?;
-    }
+    let birth_witness = if already_terminal {
+        None
+    } else {
+        run_durable_genesis(control, source, binding, user_id, archive_id).await?
+    };
     install_and_launch(control, store, source, user_id).await?;
+    if birth_witness.is_some() {
+        info!(
+            metric = "archive_v3_genesis_birth_witness",
+            schema_epoch = crate::schema_ladder::SCHEMA_EPOCH_TARGET,
+            allocator_tables = 3_u64,
+            valid = true,
+            "validated a fresh archive-v3 genesis birth after durable publication and serving launch"
+        );
+    }
     Ok(if already_terminal {
         GenesisConvergence::AlreadyTerminal
     } else {
@@ -517,7 +528,7 @@ async fn run_durable_genesis(
     binding: crate::cp::control_store::ArchiveBinding,
     user_id: &str,
     archive_id: ArchiveId,
-) -> std::result::Result<(), GenesisTriggerError> {
+) -> std::result::Result<Option<crate::store::GenesisBirthWitness>, GenesisTriggerError> {
     let parts = source.genesis_providers(control, binding)?;
     if parts.archive_id != archive_id {
         return Err(GenesisTriggerError::Conflict);
@@ -544,6 +555,7 @@ async fn run_durable_genesis(
             .await
             .map_err(map_genesis)?
     };
+    let mut birth_witness = None;
     let prepared = match start {
         // Past the boundary. The prepared payloads are the only correct bytes
         // for this archive — a post-boundary prepare replays them and discards
@@ -573,6 +585,7 @@ async fn run_durable_genesis(
             let produced = produce_genesis_bytes(&authority, &std::env::temp_dir(), reservation)
                 .await
                 .map_err(map_genesis)?;
+            birth_witness = Some(produced.birth_witness());
             // ◄── CRASH BOUNDARY.
             prepare_genesis_bootstrap(&authority, produced)
                 .await
@@ -630,7 +643,7 @@ async fn run_durable_genesis(
         )
         .await
         .map_err(map_control)?;
-    Ok(())
+    Ok(birth_witness)
 }
 
 /// Process-local tail: install the durable-terminal persistence selection and

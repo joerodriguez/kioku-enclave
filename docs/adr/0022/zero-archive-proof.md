@@ -114,10 +114,15 @@ No step may be skipped or reordered.
 6. **Proof take #2** after healthy, before reopening signup. Full Groups 1-4,
    plus the successful-signup count between takes must be 0. Append below.
 7. **Positive birth-witness check.** Create one throwaway account through the
-   real signup path. Assert its archive carries
-   `schema_epoch = (1, 0, chain_digest(0))` matching the deployed binary, and
-   that `sqlite_master.sql` for `audio_segments`, `utterances` **and
-   `screenshots`** all contain `AUTOINCREMENT`. Delete it; re-run Groups 1-2 to
+   real signup path. Before signup, record the count of the content-free
+   `archive_v3_genesis_birth_witness` metric. Require exactly one new event,
+   with the deployed target epoch, `allocator_tables=3`, and `valid=true`, and
+   no genesis-unavailable event. The event is emitted only when that same pass
+   exact-compares the born database against the binary's canonical schema
+   (including `AUTOINCREMENT` on `audio_segments`, `utterances`, and
+   `screenshots`), publishes it to the durable `wal_authoritative` terminal,
+   and successfully launches its serving authority. A recovered/pre-existing
+   terminal never emits it. Delete the throwaway account; re-run Groups 1-2 to
    zero. **Every other step proves an absence. This is the only one that proves
    the deployed image is the right image.**
 8. **Flip the seal** in one reviewed PR: `scripts/schema_baseline_seal.json`
