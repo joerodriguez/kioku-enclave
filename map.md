@@ -16,11 +16,13 @@ consumers.
 ADR-0022's Genesis WAL path is production-wired behind the signed image profile: startup
 installs every durable WAL-authoritative selection, reconstructs and launches its serving
 authority before request admission, sign-in converges new selected accounts from Genesis,
-and routed Store reads/submits serve only settled owner state. The reviewed Genesis release
-profile is now the complete active production tuple; only the exact signed archive-v3 release
-tag can select it, and startup fails closed when its baked coordinates disagree with durable
-state. Evaluation and ordinary pretag builds still force the effective profile off. This active
-logical-WAL path is distinct from the old advisory/extent migration stack.
+and routed Store reads/submits serve only settled owner state. The current BOOTSTRAP source
+line deliberately checks in the all-empty `off` profile and cannot construct that authority.
+Only a later separately reviewed FINAL source carrying the complete fresh-production tuple,
+one-way commitment, and an exact signed archive-v3 release tag can select the active path;
+startup then fails closed when baked coordinates disagree with durable state. Evaluation and
+ordinary pretag builds also force the effective profile off. This logical-WAL path is distinct
+from the old advisory/extent migration stack.
 
 The route to authority changed in August 2026. The **genesis-first replan** drops retention
 of existing archive data, so the advisory-canary/Phase-2 migration path was deleted rather
@@ -74,7 +76,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 
 | Path | What it is |
 |---|---|
-| [config/](config/map.md) | Checked-in, non-secret, fail-closed attested-image configuration; the archive witness probe stays exact off, while the sealed single-archive WAL profile carries the exact reviewed Genesis production tuple and can be selected only by its canonical signed tag, with no operator, repository-variable, or dispatch override |
+| [config/](config/map.md) | Checked-in, non-secret, fail-closed attested-image configuration; the archive witness probe stays exact off, and this BOOTSTRAP source also carries an exact all-empty archive-v3 profile. Only a later reviewed FINAL source may bind the fresh single-archive WAL tuple and select it through its canonical signed tag, with no operator, repository-variable, or dispatch override. |
 | [docs/](docs/map.md) | Proposed and accepted cross-boundary architecture decisions |
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, capture-session feedback, APNs ready receipts, separate KMS/public/Firestore-witness/archive-GCS attestation boundaries, per-user synchronized encrypted storage, search, episodes |
 | `src/archive_v3_extent.rs` / `src/archive_v3_extent_vfs.rs` / `src/archive_v3_extent_commit.rs` / `src/archive_v3_extent_shadow.rs` / `src/archive_v3_wal_to_extent.rs` / `src/archive_v3_vector_accelerator.rs` / `src/archive_v3_phase3_gates.rs` / `src/archive_v3_shadow_coordinator.rs` / `src/archive_v3_export.rs` | **Inactive ADR-0022 extent/shadow future:** sparse extent storage, extent cutover/parity, vector sidecar, Phase-3 gates, shadow coordinator, and export-publication seams remain compiled/tested only. They have no active Store, route, startup, or deployment authority. This does not include the journal/checkpoint/WAL/VFS primitives used by the active Genesis logical-WAL publisher. |

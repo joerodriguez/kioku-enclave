@@ -122,16 +122,19 @@ surfaces.
   signed release metadata binds the mode and complete-or-empty namespace but grants no
   Firestore, rollout, health, or archive authority.
 - The ADR-0022 single-archive WAL runtime profile is separately image-bound by checked-in
-  schema-2 `config/archive-v3-shadow-runtime.json`, whose reviewed Genesis release form carries
-  the complete exact production tuple and one-way binding commitment. Its sole shared parser
+  schema-2 `config/archive-v3-shadow-runtime.json`. The current BOOTSTRAP source is the exact
+  all-empty off form and therefore constructs no archive-v3 provider authority. A later,
+  separately reviewed FINAL source may carry the complete fresh-production tuple and one-way
+  binding commitment. Its sole shared parser
   accepts that active form only when the
   bucket, three canonical unsigned-64-bit numeric coordinates, named non-UUID Firestore
   project/database, and nonzero lowercase SHA-256 archive-binding commitment are complete.
   Evaluation and `main` pretag selection force off; only exact
   `vX.Y.Z-archive-v3-wal.N` production tags select active, while an active profile on any
   other ref or a WAL tag with off fails closed. Operator configuration, dispatch inputs,
-  and process environment cannot override selection. Schema-9 signed release metadata
-  binds the complete eight-value claim; schema-7/8 metadata remains ineligible. Docker
+  and process environment cannot override selection. Signed release metadata binds either
+  the exact all-empty BOOTSTRAP claim or the complete eight-value FINAL claim; older metadata
+  remains ineligible. Docker
   independently enforces the same all-empty or complete bucket, canonical-u64,
   named-non-UUID-Firestore, and nonzero-commitment grammar, and `release.sh --roll`
   requires the exact WAL tag and explicit matching operator confirmation before

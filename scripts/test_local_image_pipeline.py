@@ -281,7 +281,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 directory = Path(temporary_directory)
                 config = directory / "operator.env"
                 output = directory / "evidence"
-                write_config(config, genesis_wal_native="on")
+                write_config(config, genesis_wal_native="off")
                 sys.argv = [
                     str(SCRIPTS / "local_image_pipeline.py"),
                     "push",
@@ -290,7 +290,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3-archive-v3-wal.1",
+                    "refs/tags/v1.2.3-adr0022-fresh-bootstrap.1",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",

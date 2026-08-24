@@ -522,17 +522,18 @@ class SelectorTests(unittest.TestCase):
         completed, selected = self.run_selector(
             "production", environment(), source_ref=wal_tag
         )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(selected, "")
+        self.assertIn("requires the complete active runtime profile", completed.stderr)
+
+        completed, selected = self.run_selector(
+            "production",
+            environment(),
+            source_ref="v1.2.3-adr0022-fresh-bootstrap.1",
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", selected)
-        self.assertIn(
-            "ARCHIVE_V3_ARCHIVE_BUCKET=kioku-joerodriguez-archive-v3\n", selected
-        )
-        self.assertIn(
-            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT="
-            "b541d598e3442fdcf516c0af34a69907"
-            "b44c9767d86b8277cb08d12eb0f1fe48\n",
-            selected,
-        )
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("kioku-joerodriguez-archive-v3", selected)
 
         pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")

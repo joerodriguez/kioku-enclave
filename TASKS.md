@@ -1,5 +1,14 @@
 # ADR-0022 Genesis production activation
 
+- [~] Launch from a fresh isolated production namespace instead of waiting for the
+  disposable pre-launch namespace's soft-deleted generations. The fresh generation uses
+  new buckets, named witness database, KMS key/version, runtime service-account generation,
+  and one-way binding; no active release, rollback, or recovery owner may name the legacy
+  generation.
+- [~] Publish two fresh-only signed images: an archive-runtime-off, Genesis-off BOOTSTRAP at
+  schema 0/0/0 that creates the sole deterministic binding under the public deny, followed by
+  an active Genesis-on FINAL at schema 1/1/1 that proves canonical birth, routed serving,
+  product canaries, explicit deletion, containment, and final public health before reopening.
 - [~] Expose the content-free startup schema-epoch aggregate required by the retained
   epoch-0 production witness: every selected archive is partitioned into
   relaunched/unavailable, the durable at-target subset and launch-local advancement

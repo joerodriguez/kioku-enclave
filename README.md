@@ -435,11 +435,13 @@ file is exact `off` with an empty namespace.
 
 The eight `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
 [`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). The
-reviewed Genesis release carries the complete canonical `single-archive-wal-v1` production
-tuple and one-way binding commitment. It is eligible only for an exact
-`vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it
-off, an exact WAL tag with an off profile fails, and no operator, repository variable, or dispatch
-input can override it. Under that signed profile startup consumes the one-shot binding
+current BOOTSTRAP source carries the canonical all-empty `off` form, so its signed image
+cannot construct archive-v3 provider authority or arm Genesis. After the fresh namespace and
+one-way binding exist, a separately reviewed FINAL source may carry the complete canonical
+`single-archive-wal-v1` tuple. That active form remains eligible only for an exact
+`vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it off,
+an exact WAL tag with an off profile fails, and no operator, repository variable, or dispatch
+input can override it. Under that signed FINAL profile startup consumes the one-shot binding
 capability to relaunch durable selected archives and the Genesis trigger can use it for
 new-account convergence; construction itself performs no provider I/O and no route receives
 the capability.

@@ -1,11 +1,54 @@
-# ADR-0022 — zero-archive proof for the sealed schema re-baseline
+# ADR-0022 — fresh-generation proof for the sealed schema re-baseline
 
-**Status: NO TAKE HAS BEEN RECORDED. This document is the obligation, not the discharge.**
+**Status: THE FRESH-GENERATION PROOF HAS NOT BEEN RECORDED. This document is the
+obligation, not the discharge.**
 
 `scripts/schema_baseline_seal.json` names this file as the proof for the
 `d5ff84db…2dfb` re-pin. The seal ships `"sealed": false` precisely because the
 proof below has not been taken. Nothing in this file may be read as evidence
-that any archive count was ever observed to be zero.
+that the fresh provider generation exists or that its signed BOOTSTRAP and FINAL
+releases have run.
+
+## Primary launch proof — fresh production generation
+
+The original production namespace is disposable pre-launch history. Its retained and
+soft-deleted objects are quarantined and are not inputs, predecessors, rollback targets, or
+recovery sources for the launch. The baseline may be sealed against a *different*, brand-new
+production generation because the re-baseline failure below is reachable only when an archive
+already exists in the generation being activated.
+
+The fresh proof must bind all of the following before the seal flips:
+
+1. A source-frozen provider receipt proves the exact new index, media, archive, and
+   witness-export buckets; named Firestore database; KMS key/version; and runtime service
+   account were created as a new generation with the reviewed policies. It also proves that
+   no legacy bucket, database, key, runtime principal, release, rollback, or recovery owner is
+   referenced by the active generation.
+2. A signed BOOTSTRAP image, built from this 0/0/0 source with the exact all-empty archive-v3
+   profile and `GENESIS_WAL_NATIVE=off`, runs under the priority-800 public deny. A bounded
+   one-/32 operator authority creates exactly one deterministic canary through the real signup
+   path and records only the one-way archive-binding commitment. The runtime-off image cannot
+   create or serve an archive-v3 WAL owner.
+3. The reviewed FINAL source binds that exact provider receipt and commitment, sets the
+   baseline seal, appends only the reviewed first additive schema step, and compiles schema
+   coordinates 1/1/1. Its signed metadata and image evidence bind the complete fresh tuple;
+   no legacy image remains an admitted predecessor.
+4. While the public deny remains present, FINAL proves one canonical Genesis birth at epoch 1,
+   authenticated routed serving, the reviewed product canaries, complete export, explicit
+   physical deletion, and exact image/KMS/archive containment. The temporary operator identity
+   and /32 rule are removed before the fixed deny can be removed.
+5. Only the sealed FINAL owner removes the named deny, then proves public content-free health
+   and exact live image/provider identity. Failure at any point leaves the fresh generation
+   denied and never falls back to the legacy namespace.
+
+The checked-in receipts, signed release coordinates, and live proof values will be appended to
+this section by the reviewed FINAL source change. Until then `sealed` remains false.
+
+## Superseded fallback — physical zero of the legacy namespace
+
+The remainder of this document records the older physical-zero/Take ceremony. It remains a
+valid fallback if the fresh-generation launch is abandoned, but it grants no authority to wait
+for, adopt, restore, or roll the legacy namespace on the primary launch path.
 
 ## Why a proof is required at all
 
