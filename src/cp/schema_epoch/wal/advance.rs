@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "ADR-0022 Part B: the ladder driver is reviewed before the first shipped step; SCHEMA_LADDER stays empty until the baseline seal flips"
+    reason = "ADR-0022 Part B: the startup-wired driver retains private fixture seams for exact ladder-step verification"
 )]
 
 //! One schema-ladder step as a sealed WAL plan (ADR-0022 Part B, §7.3/§7.4).
@@ -1490,20 +1490,29 @@ mod tests {
     }
 
     #[test]
-    fn the_production_driver_is_a_no_op_while_the_ladder_is_empty() {
-        // The shipped configuration, asserted rather than assumed: with
-        // SCHEMA_LADDER empty and every epoch constant 0, a genesis-born
-        // archive is already at target and nothing is ever submitted.
+    fn the_production_driver_matches_the_declared_target() {
+        // This test deliberately survives the reviewed HEAD -> TARGET source
+        // transition. HEAD knows step 1 but leaves TARGET at 0, so epoch 0 is
+        // already at target and no plan is constructible. TARGET raises the
+        // drive coordinate to 1, so that same marker selects exactly one
+        // 0 -> 1 plan. Keeping the assertion phase-generic lets release
+        // admission freeze this entire file across both binaries rather than
+        // exempting the durable marker decision from its source proof.
         let conn = archive_at_epoch_zero();
         let marker = read_archive_epoch(&conn).unwrap();
         assert_eq!(marker.chain, chain_digest(0));
-        assert_eq!(
-            decide_from_marker(marker, LadderView::PRODUCTION),
-            Some(AdvanceOutcome::AlreadyAtTarget(SCHEMA_EPOCH_TARGET))
-        );
-        // And no plan can be constructed against it, so the family cannot
-        // move an archive by accident before a step ships.
-        assert!(SchemaEpochAdvancePlan::new(ACCOUNT.into(), 0).is_err());
+        if SCHEMA_EPOCH_TARGET == 0 {
+            assert_eq!(
+                decide_from_marker(marker, LadderView::PRODUCTION),
+                Some(AdvanceOutcome::AlreadyAtTarget(0))
+            );
+            assert!(SchemaEpochAdvancePlan::new(ACCOUNT.into(), 0).is_err());
+        } else {
+            assert_eq!(decide_from_marker(marker, LadderView::PRODUCTION), None);
+            let plan = SchemaEpochAdvancePlan::new(ACCOUNT.into(), 0)
+                .expect("a positive production target must expose its first step");
+            assert_eq!((plan.advances_from(), plan.advances_to()), (0, 1));
+        }
     }
 
     // ── The descriptor exclusion ─────────────────────────────────────────
