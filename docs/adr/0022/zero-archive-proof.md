@@ -224,7 +224,9 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   successor `e62cabaac3d67a8e3f0c1a7f74d96bebc515f49f` additionally routes `.3` through
   the same archive-bucket and witness-database authority preauthorization,
   post-health finalization, and failure recovery as `.1`/`.2`; deployment
-  `9e305b2f73cb41689511372fde8e238e97b5c31c` admits `.4` through that same boundary.
+  `9e305b2f73cb41689511372fde8e238e97b5c31c` admits `.4` through that same boundary;
+  deployment `0580e974fd6aa780f44f208e8f7ad6fd765d0fe4` adds the source-frozen,
+  Take-2-bound one-account witness owner without changing the Terraform source digest.
   `.1` and `.2` remain the destructive two-image registry floor; `.4` is the reviewed
   post-Take native-session witness successor and must be promoted again from the same
   signed evidence if retirement removed it. The

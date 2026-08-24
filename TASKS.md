@@ -30,6 +30,8 @@
 - [x] Publish native-session witness successor `v0.8.34-archive-v3-wal.4` at exact
   digest `sha256:a8688a75…5106e`, admit it in deployment #217, and repin the singleton
   rollout seal to deployment `9e305b2` without changing the Terraform source digest.
+- [x] Seal the Take-2-bound one-account production witness in deployment #218 and repin
+  the unchanged singleton/Terraform rollout seal to deployment `0580e97`.
 
 # ADR-0022 browser evidence
 
