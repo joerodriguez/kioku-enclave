@@ -905,13 +905,23 @@ pub(crate) mod tests {
             !body.contains("?;") && !body.contains("await?") && !body.contains(".unwrap()"),
             "the sign-in trigger must not propagate or panic on any genesis failure"
         );
-        // Both resumption points call it, and neither awaits it.
+        // Every OAuth resumption point calls it, and none awaits it: the
+        // interactive consent path, refresh rotation, and first native token
+        // issuance. The canonical Google native session route is the fourth
+        // entry point and is pinned separately below.
         let oauth = include_str!("cp/oauth.rs");
         assert_eq!(
             oauth
                 .matches("archive_v3_genesis_trigger::spawn_genesis_convergence")
                 .count(),
-            2
+            3
+        );
+        let apple = include_str!("cp/apple.rs");
+        assert_eq!(
+            apple
+                .matches("archive_v3_genesis_trigger::spawn_genesis_convergence")
+                .count(),
+            1
         );
         // The module doc carries the crash boundary verbatim, and the
         // enumeration a reviewer checks it against.
@@ -1001,6 +1011,49 @@ pub(crate) mod tests {
                 "{private} must stay private to this module"
             );
         }
+    }
+
+    #[test]
+    fn every_native_session_entry_resumes_genesis_after_durable_account_creation() {
+        let apple = include_str!("cp/apple.rs");
+        let session_start = apple
+            .find("async fn session(")
+            .expect("canonical native session handler moved");
+        let session = &apple[session_start..];
+        let session_end = session
+            .find("\nasync fn link(")
+            .expect("canonical native session handler end moved");
+        let session = &session[..session_end];
+        let linked = session
+            .find("linked_providers")
+            .expect("session must authenticate linked providers first");
+        let genesis = session
+            .find("spawn_genesis_convergence")
+            .expect("Google ID-token session no longer resumes Genesis");
+        let response = session
+            .find("no_store_json")
+            .expect("session response moved");
+        assert!(linked < genesis && genesis < response);
+
+        let oauth = include_str!("cp/oauth.rs");
+        let issue_start = oauth
+            .find("pub async fn issue_native_session(")
+            .expect("native session issuer moved");
+        let issue = &oauth[issue_start..];
+        let issue_end = issue
+            .find("\nfn token_response(")
+            .expect("native session issuer end moved");
+        let issue = &issue[..issue_end];
+        let durable = issue
+            .find(".await?;")
+            .expect("native session durability boundary moved");
+        let genesis = issue
+            .find("spawn_genesis_convergence")
+            .expect("Apple native session no longer resumes Genesis");
+        let success = issue
+            .find("Ok((access, raw_refresh))")
+            .expect("native session success moved");
+        assert!(durable < genesis && genesis < success);
     }
 
     // ------------------------------------------------------------------

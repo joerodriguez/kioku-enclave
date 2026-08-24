@@ -765,6 +765,18 @@ async fn session(
         Ok(providers) => providers,
         Err(_) => return server_error(),
     };
+    // Native Google clients authenticate this route with their Google ID
+    // token instead of traversing the OAuth code exchange. That middleware
+    // may have created the account and its active archive binding on this
+    // request, so this canonical session boundary must resume Genesis too.
+    // Browser OAuth already reaches the same idempotent trigger, while Apple
+    // native sessions also call it at issuance; duplicate calls are contained
+    // by the per-user single-flight and exact durable state machine.
+    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+        Arc::clone(&state.control),
+        Arc::clone(&state.store),
+        &user.0,
+    );
     no_store_json(json!({
         "account_id": user.0,
         "email": email,

@@ -139,8 +139,10 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
 - The genesis spine is **wired and its active image has been production-proven**.
   This corrects an earlier revision of this document, which
   claimed `initialize_genesis_store` had no production caller: it does. G9
-  (#317) hung genesis off the sign-in path, so the live chain is
-  `oauth.rs` sign-in / token refresh -> `spawn_genesis_convergence` ->
+  (#317) hung genesis off the browser sign-in and token-refresh paths; the
+  native-session follow-up additionally covers direct Google ID-token account
+  creation and the first Apple native session. The live chain is therefore
+  `oauth.rs` sign-in / token refresh or the canonical native session boundary -> `spawn_genesis_convergence` ->
   `converge_genesis_for_user` -> `run_durable_genesis` ->
   `initialize_genesis_store`. Activation is controlled by `GENESIS_WAL_NATIVE`,
   which additionally requires baked archive-v3 coordinates.
