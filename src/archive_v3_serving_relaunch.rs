@@ -67,6 +67,10 @@ enum RelaunchOutcome {
 pub(crate) struct RelaunchCounts {
     pub(crate) relaunched: usize,
     pub(crate) unavailable: usize,
+    /// Selections whose durably re-read epoch marker is at or beyond this
+    /// binary's target. Unlike `advanced`, this remains true after a process
+    /// exits between settling the advance and emitting the startup metric.
+    pub(crate) at_target: usize,
     /// Selections whose durable schema marker advanced by at least one rung
     /// during this exact process launch.
     pub(crate) advanced: usize,
@@ -143,6 +147,7 @@ fn count_outcome(outcome: Result<RelaunchOutcome>, counts: &mut RelaunchCounts) 
             counts.relaunched += 1;
             match reached {
                 RelaunchOutcome::Serving { advanced } => {
+                    counts.at_target += 1;
                     counts.advanced += usize::from(advanced);
                 }
                 RelaunchOutcome::ServingBehindTarget { advanced } => {
@@ -389,6 +394,7 @@ mod tests {
             "schema_epoch_min_servable",
             "selected",
             "relaunched",
+            "at_target",
             "advanced",
             "behind_target",
             "unservable_epoch",
@@ -453,8 +459,31 @@ mod tests {
         // Two users are unavailable and two are serving. Before containment
         // the first failure ended startup for the entire fleet.
         assert_eq!((counts.relaunched, counts.unavailable), (2, 2));
-        assert_eq!((counts.selected(), counts.advanced), (4, 1));
+        assert_eq!(
+            (counts.selected(), counts.at_target, counts.advanced),
+            (4, 2, 1)
+        );
         assert_eq!((counts.behind_target, counts.unservable_epoch), (0, 0));
+    }
+
+    #[test]
+    fn at_target_survives_a_crash_after_the_durable_advance_before_the_metric() {
+        // Direct TARGET launch: this process observed the durable apply and
+        // then re-read the marker at target.
+        let mut direct = RelaunchCounts::default();
+        count_outcome(Ok(RelaunchOutcome::Serving { advanced: true }), &mut direct);
+        assert_eq!((direct.at_target, direct.advanced), (1, 1));
+
+        // Lost startup metric: the first process may exit after the durable
+        // 0 -> 1 commit but before logging. Its replacement re-reads the
+        // marker as AlreadyAtTarget and must retain the proof-bearing state
+        // without pretending that the replacement performed the commit.
+        let mut replacement = RelaunchCounts::default();
+        count_outcome(
+            Ok(RelaunchOutcome::Serving { advanced: false }),
+            &mut replacement,
+        );
+        assert_eq!((replacement.at_target, replacement.advanced), (1, 0));
     }
 
     #[test]
@@ -482,6 +511,7 @@ mod tests {
             RelaunchCounts {
                 relaunched: 3,
                 unavailable: 0,
+                at_target: 1,
                 advanced: 1,
                 behind_target: 2,
                 unservable_epoch: 1,
@@ -493,6 +523,7 @@ mod tests {
         // `relaunched` / `unavailable`.
         assert!(counts.behind_target <= counts.relaunched);
         assert!(counts.unservable_epoch <= counts.behind_target);
+        assert_eq!(counts.at_target + counts.behind_target, counts.relaunched);
         assert!(counts.advanced <= counts.relaunched);
     }
 

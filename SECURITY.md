@@ -533,12 +533,15 @@ path.
 > off-config image refuses when selected durable state exists.
 > Serving startup emits one content-free `archive_v3_schema_epoch_rollout` aggregate after
 > relaunch and before request admission. It reports only the image's HEAD/TARGET/minimum
-> servable epochs and aggregate selected/relaunched/advanced/behind/unservable/unavailable
-> counts. `advanced` is set only after the sealed owner durably settles at least one epoch
-> step during that launch; no account, archive, step identity, SQL, or request value enters
-> the event. The production ladder witness retains exactly one epoch-0 account across the
-> HEAD and TARGET image replacements, authenticates this aggregate plus an ordinary routed
-> read, and deletes the account before public admission resumes.
+> servable epochs and aggregate selected/relaunched/at-target/advanced/behind/unservable/
+> unavailable counts. `at_target` is set only after the sealed owner re-reads the durable
+> marker at or beyond this binary's target, so it remains true if a process exits after the
+> commit but before emitting its startup event. `advanced` separately means this exact
+> process observed at least one settled epoch step and remains a launch-local diagnostic;
+> no account, archive, step identity, SQL, or request value enters the event. The production
+> ladder witness retains exactly one epoch-0 account across the HEAD and TARGET image
+> replacements, authenticates this aggregate plus an ordinary routed read, and deletes the
+> account before public admission resumes.
 > This authority does not reactivate the deleted advisory/Phase-2 migration family or the
 > inactive extent-shadow engine.
 

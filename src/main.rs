@@ -1068,6 +1068,7 @@ async fn async_main() {
         schema_epoch_min_servable = crate::schema_ladder::SCHEMA_EPOCH_MIN_SERVABLE,
         selected = wal_serving_relaunch_counts.selected(),
         relaunched = wal_serving_relaunch_counts.relaunched,
+        at_target = wal_serving_relaunch_counts.at_target,
         advanced = wal_serving_relaunch_counts.advanced,
         behind_target = wal_serving_relaunch_counts.behind_target,
         unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
