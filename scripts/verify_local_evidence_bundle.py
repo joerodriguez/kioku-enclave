@@ -3,7 +3,8 @@
 
 This executable is deliberately suitable for ``KIOKU_ENCLAVE_EVIDENCE_VERIFY``:
 it uses an externally pinned Ed25519 key, checks the exact bytes named by the
-signed manifest, validates schema-9 release metadata, and emits the verified
+signed manifest, validates schema-9 or exact fresh-BOOTSTRAP schema-10 release
+metadata, and emits the verified
 source and digest bindings as JSON.  It never reads cloud credentials or
 changes local or remote state.
 """
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import local_build_evidence  # noqa: E402
+import local_image_pipeline  # noqa: E402
 import verify_release_metadata  # noqa: E402
 
 
@@ -41,16 +43,6 @@ def sha256(path: Path) -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        fail(f"cannot parse {path.name}: {error}")
-    if not isinstance(value, dict):
-        fail(f"{path.name} must be a JSON object")
-    return value
 
 
 def verify_signature(arguments: argparse.Namespace, manifest: Path, signature: Path) -> dict[str, Any]:
@@ -72,14 +64,16 @@ def verify_signature(arguments: argparse.Namespace, manifest: Path, signature: P
     return data
 
 
-def metadata_arguments(arguments: argparse.Namespace, metadata: Path) -> argparse.Namespace:
+def metadata_arguments(
+    arguments: argparse.Namespace, metadata: dict[str, Any]
+) -> argparse.Namespace:
     repository = arguments.repository
     if repository.startswith("https://github.com/"):
         repository = repository.removeprefix("https://github.com/")
     image_repository = arguments.image_repository
     if not image_repository:
         try:
-            image_repository = read_json(metadata)["image_digest_uri"].split("@", 1)[0]
+            image_repository = metadata["image_digest_uri"].split("@", 1)[0]
         except (KeyError, AttributeError):
             fail("release metadata does not contain an image digest URI")
     return argparse.Namespace(
@@ -90,6 +84,12 @@ def metadata_arguments(arguments: argparse.Namespace, metadata: Path) -> argpars
         expected_gcs_bucket=arguments.expected_gcs_bucket,
         expected_gcs_media_bucket=arguments.expected_gcs_media_bucket,
         expected_gcs_legacy_media_bucket=arguments.expected_gcs_legacy_media_bucket,
+        expected_adr0022_canary_identity_preparation_sha256=(
+            arguments.expected_adr0022_canary_identity_preparation_sha256
+        ),
+        expected_adr0022_canary_admin_uuid=(
+            arguments.expected_adr0022_canary_admin_uuid
+        ),
         archive_witness_probe_config=arguments.archive_witness_probe_config,
         archive_v3_shadow_runtime_config=arguments.archive_v3_shadow_runtime_config,
         metadata=metadata,
@@ -127,6 +127,8 @@ def main() -> None:
         fail("repository must be an OWNER/REPO name or GitHub HTTPS URL")
     if bool(arguments.image_digest_uri) != bool(arguments.image_digest):
         fail("image digest URI and image digest must be supplied together")
+    arguments.expected_adr0022_canary_identity_preparation_sha256 = ""
+    arguments.expected_adr0022_canary_admin_uuid = ""
 
     directory = arguments.evidence_dir.resolve()
     manifest = directory / "enclave-local-build-evidence.json"
@@ -150,8 +152,13 @@ def main() -> None:
     for path, field in ((ROOT / "Dockerfile", "dockerfile_sha256"), (ROOT / "Cargo.lock", "cargo_lock_sha256")):
         if sha256_bytes(local_build_evidence.read_regular_bytes(path, path.name)) != evidence[field]:
             fail(f"signed evidence {field} differs from checked source")
-    if arguments.config is not None and sha256_bytes(local_build_evidence.read_regular_bytes(arguments.config, "configuration")) != evidence["config_sha256"]:
-        fail("signed evidence config hash differs from the selected local configuration")
+    config_bytes: bytes | None = None
+    if arguments.config is not None:
+        config_bytes = local_build_evidence.read_regular_bytes(
+            arguments.config, "configuration"
+        )
+        if sha256_bytes(config_bytes) != evidence["config_sha256"]:
+            fail("signed evidence config hash differs from the selected local configuration")
     if "source_archive_sha256" in evidence:
         if arguments.source_archive is not None:
             archive_bytes = local_build_evidence.read_regular_bytes(arguments.source_archive, "source archive")
@@ -169,13 +176,31 @@ def main() -> None:
             fail("signed evidence source archive hash differs from the selected immutable archive")
 
     try:
-        metadata = json.loads(metadata_bytes)
+        metadata = verify_release_metadata.parse_metadata_bytes(metadata_bytes)
         sbom_document = json.loads(sbom_bytes)
         json.loads(scan_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"evidence asset is not valid JSON: {error}")
     if not isinstance(metadata, dict) or not isinstance(sbom_document, dict):
         fail("metadata and SBOM must be JSON objects")
+    if metadata["schema_version"] == 10:
+        if config_bytes is None:
+            fail("schema-10 fresh BOOTSTRAP verification requires the exact configuration")
+        try:
+            operator_values = local_image_pipeline._parse_operator_config(config_bytes)
+            configuration = local_image_pipeline.selected_configuration(
+                "production",
+                operator_values,
+                source_ref=arguments.tag,
+                probe_config_path=arguments.archive_witness_probe_config,
+                shadow_runtime_config_path=arguments.archive_v3_shadow_runtime_config,
+            )
+        except (local_image_pipeline.PipelineError, SystemExit):
+            fail("schema-10 fresh BOOTSTRAP configuration is invalid")
+        arguments.expected_adr0022_canary_identity_preparation_sha256 = configuration[
+            "ADR0022_CANARY_IDENTITY_PREPARATION_SHA256"
+        ]
+        arguments.expected_adr0022_canary_admin_uuid = configuration["ADMIN_USER_IDS"]
     sbom_version = sbom_document.get("spdxVersion")
     if not isinstance(sbom_version, str) or not sbom_version.startswith("SPDX-"):
         fail("SBOM does not declare an SPDX version")
@@ -185,7 +210,7 @@ def main() -> None:
             fail("release metadata does not contain an image digest URI")
         arguments.image_repository = image_digest_uri.split("@", 1)[0]
     # Existing verifier has the security-critical checked-config claim logic.
-    verify_release_metadata.validate(metadata_arguments(arguments, metadata_path), metadata)
+    verify_release_metadata.validate(metadata_arguments(arguments, metadata), metadata)
     bindings = ("source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest")
     for field in bindings:
         if metadata.get(field) != evidence.get(field):

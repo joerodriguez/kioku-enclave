@@ -26,7 +26,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from test_select_build_configuration import environment  # noqa: E402
+from test_select_build_configuration import (  # noqa: E402
+    CANARY_ADMIN_UUID,
+    CANARY_IDENTITY_PREPARATION_SHA256,
+    environment,
+    fresh_bootstrap_environment,
+)
+import adr0022_fresh_release as fresh  # noqa: E402
+import verify_release_metadata  # noqa: E402
 
 # The production verifier intentionally invokes this contract suite from a
 # live builder environment. Fixtures must never inherit those coordinates;
@@ -290,7 +297,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3-adr0022-fresh-bootstrap.1",
+                    "refs/tags/v1.2.3",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",
@@ -475,11 +482,110 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn("schema_version\": 9", source)
+        self.assertIn('"schema_version": 10 if bootstrap else 9', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
         self.assertLess(source.index("verify_source_unchanged(arguments.source_ref, commit)"), source.index('if arguments.stage == "push":'))
+
+    def test_fresh_bootstrap_emits_exact_ordered_schema_ten_metadata(self) -> None:
+        pipeline = load_pipeline()
+        configuration = pipeline.selected_configuration(
+            "production",
+            fresh_bootstrap_environment(),
+            source_ref=fresh.BOOTSTRAP_TAG,
+            probe_config_path=ROOT / "config/archive-witness-probe.json",
+            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
+        )
+        fixture_canary_sha256 = "c" * 64
+        fixture_canary_uuid = "12345678-1234-5678-9234-567812345678"
+        configuration[fresh.CANARY_CONFIG_KEY] = fixture_canary_sha256
+        configuration["ADMIN_USER_IDS"] = fixture_canary_uuid
+        runtime = pipeline.runtime_config(configuration, "production")
+        self.assertNotIn(fresh.CANARY_CONFIG_KEY, runtime)
+        self.assertEqual(runtime["ADMIN_USER_IDS"], fixture_canary_uuid)
+
+        def fake_run(command, *, capture=False, environment=None, pass_fds=()):
+            del capture, environment, pass_fds
+            if command[:4] == ["git", "remote", "get-url", "origin"]:
+                return SimpleNamespace(
+                    stdout="https://github.com/joerodriguez/kioku-enclave.git\n"
+                )
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "check_voice_release_gate.py"),
+            ]:
+                return SimpleNamespace(stdout="owner_only_unvalidated\n")
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "verify_release_metadata.py"),
+            ]:
+                completed = subprocess.run(
+                    command, cwd=ROOT, text=True, capture_output=True, check=False
+                )
+                if completed.returncode:
+                    raise pipeline.PipelineError(completed.stderr)
+                return SimpleNamespace(stdout=completed.stdout)
+            if command[:2] == ["gcloud", "version"]:
+                return SimpleNamespace(stdout="Google Cloud SDK 580.0.0\n")
+            if command[:2] == ["docker", "buildx"]:
+                return SimpleNamespace(stdout="github.com/docker/buildx v0.36.1\n")
+            if command[0] in ("syft", "grype"):
+                return SimpleNamespace(stdout=f"{command[0]} 1.0\n")
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "local_build_evidence.py"),
+            ]:
+                return SimpleNamespace(stdout="")
+            raise AssertionError(command)
+
+        original_run = pipeline.run
+        original_cloud_config = pipeline._CLOUDSDK_CONFIG
+        pipeline.run = fake_run
+        pipeline._CLOUDSDK_CONFIG = "/private/provider-free-test"
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                config = directory / "operator.env"
+                config.write_text("fixture\n", encoding="utf-8")
+                pipeline.create_release_evidence(
+                    directory,
+                    config_path=config,
+                    configuration=configuration,
+                    config_sha256="d" * 64,
+                    source_archive_sha256="e" * 64,
+                    source_ref=fresh.BOOTSTRAP_TAG,
+                    source_commit="f" * 40,
+                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.BOOTSTRAP_TAG}",
+                    image_digest="sha256:" + "1" * 64,
+                    created_at="2026-08-24T12:00:00Z",
+                    expected_sbom_sha256="2" * 64,
+                    expected_scan_sha256="3" * 64,
+                )
+                raw = (directory / "enclave-release.json").read_bytes()
+                metadata = verify_release_metadata.parse_metadata_bytes(raw)
+        finally:
+            pipeline.run = original_run
+            pipeline._CLOUDSDK_CONFIG = original_cloud_config
+
+        self.assertEqual(
+            raw,
+            (ROOT / "config/adr0022-fresh-schema10-bootstrap-fixture.json").read_bytes(),
+        )
+        self.assertEqual(len(metadata), 50)
+        self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
+        self.assertEqual(metadata["schema_version"], 10)
+        self.assertEqual(metadata["source_ref"], fresh.BOOTSTRAP_TAG)
+        self.assertEqual(metadata["schema_epoch_head"], 0)
+        self.assertEqual(metadata["schema_epoch_target"], 0)
+        self.assertEqual(metadata["schema_epoch_minimum_servable"], 0)
+        self.assertEqual(metadata["production_genesis_wal_native"], "off")
+        self.assertEqual(metadata["signup_mode"], "positive")
+        self.assertEqual(
+            metadata["adr0022_canary_identity_preparation_sha256"],
+            fixture_canary_sha256,
+        )
+        self.assertEqual(metadata["adr0022_canary_admin_uuid"], fixture_canary_uuid)
 
     def test_runtime_config_is_allowlisted_and_docker_uses_ephemeral_secret(self) -> None:
         pipeline = load_pipeline()

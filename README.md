@@ -606,6 +606,24 @@ Both fail before mutation unless the signed source tag and local evidence verify
 also binds the coordinator plan, exact artifact, and frozen detached source. GitHub is used for
 immutable public release hosting, not execution or build identity.
 
+The fresh-generation BOOTSTRAP has one non-reusable publication role:
+`v0.8.35-adr0022-fresh-bootstrap.1`. Its private operator file must contain exactly one
+nonzero lowercase `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and exactly one
+lowercase UUIDv5 as the sole `PRODUCTION_ADMIN_USER_IDS` value. After production-profile
+selection those claims are named `ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and
+`ADMIN_USER_IDS`. The pipeline does not create, read, or guess either provider value.
+It emits a 50-field schema-10 metadata object whose exact compact insertion-order encoding binds
+the reviewed fresh intent, index/media/archive/witness/KMS/runtime-SA/WIF/custom-role coordinates,
+those two opaque canary commitments, the checked 0/0/0 schema declaration, archive runtime and
+Genesis exact off, and positive signup. The signed evidence binds both those raw metadata bytes and
+the once-read private configuration bytes; bundle verification derives the two expectations again
+from that same snapshot. The synthetic cross-repository fixture is
+[`config/adr0022-fresh-schema10-bootstrap-fixture.json`](config/adr0022-fresh-schema10-bootstrap-fixture.json)
+(3,094 bytes, SHA-256 `40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`).
+It is a format pin, not production evidence. Generic releases remain schema 9, and
+`scripts/release.sh --roll` additionally requires
+`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL` to name the exact BOOTSTRAP tag.
+
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record
 `voice_quality_gate: owner_only_unvalidated`, or carry a complete passing real-corpus trio

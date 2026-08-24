@@ -23,6 +23,7 @@ COORDINATOR_SIGNATURE=""
 COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
 COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 PUSH_DEPLOYMENT_SOURCE_SEAL=""
+ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
 
 usage() {
   cat <<'EOF'
@@ -73,6 +74,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "release tag must look like v1.2.3 or v1.2.3-rc.1"
+if [[ "$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp] && "$TAG" != "$ADR0022_FRESH_BOOTSTRAP_TAG" ]]; then
+  die "ADR-0022 fresh BOOTSTRAP tag must be exactly $ADR0022_FRESH_BOOTSTRAP_TAG"
+fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
 [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || die "--config must name the local build configuration used for this image"
@@ -127,15 +131,20 @@ keys = (
     "PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME",
     "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET",
     "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE",
-    "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE",
 )
 print("\x1f".join((*[configuration[key] for key in keys], builder)))
 PY
 )" || die "local release configuration is invalid"
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
-IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
+IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
+if [[ "$ROLL" == true && "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" ]]; then
+  [[ "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" == off && "$GENESIS_WAL_NATIVE" == off ]] \
+    || die "fresh BOOTSTRAP roll requires archive runtime and Genesis exact off"
+  [[ "${KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL:-}" == "$TAG" ]] \
+    || die "fresh BOOTSTRAP cannot roll without KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL naming the exact tag"
+elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/
   # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed
   # by the pre-serving --run-archive-v3-phase1-canary subcommand and, since the
@@ -242,8 +251,8 @@ if metadata["billing_enforcement_mode"] != sys.argv[2]:
     raise SystemExit("release metadata billing-enforcement mode differs from selected configuration")
 print("ok")
 PY
-)" || die "schema-9 release metadata does not match the checked source/configuration"
-[[ "$METADATA_CHECKS" == ok ]] || die "schema-9 release metadata check did not complete"
+)" || die "signed release metadata does not match the checked source/configuration"
+[[ "$METADATA_CHECKS" == ok ]] || die "signed release metadata check did not complete"
 
 verify_tag_signer() {
   local verification fingerprints

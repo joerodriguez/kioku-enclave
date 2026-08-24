@@ -7,8 +7,19 @@ import argparse
 import json
 from pathlib import Path
 import re
-import sys
+from typing import Any
 
+from adr0022_fresh_release import (
+    EXPECTED_INTENT,
+    IMAGE_REPOSITORY as FRESH_IMAGE_REPOSITORY,
+    RELEASE_BINDING_FIELD_ORDER,
+    SOURCE_REPOSITORY as FRESH_SOURCE_REPOSITORY,
+    FreshReleaseError,
+    bootstrap_release_binding,
+    claims_bootstrap_role,
+    is_bootstrap_tag,
+    validate_checked_bootstrap_source,
+)
 from archive_witness_probe_config import (
     ProbeConfigError,
     load_probe_config,
@@ -24,9 +35,12 @@ from archive_v3_shadow_runtime_config import (
 BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]\Z")
 DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
-RELEASE_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/tag/v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?\Z")
+RELEASE_URL_PATTERN = re.compile(
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/tag/"
+    r"v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?\Z"
+)
 
-FIELDS = (
+SCHEMA_NINE_FIELDS = (
     "schema_version",
     "source_repository",
     "source_ref",
@@ -54,7 +68,12 @@ FIELDS = (
     "archive_v3_witness_database_id",
     "archive_v3_archive_binding_commitment",
 )
-
+SCHEMA_TEN_FIELDS = (*SCHEMA_NINE_FIELDS, *RELEASE_BINDING_FIELD_ORDER)
+SCHEMA_TEN_INTEGER_FIELDS = {
+    "schema_epoch_head",
+    "schema_epoch_target",
+    "schema_epoch_minimum_servable",
+}
 EMPTY_ALLOWED_FIELDS = {
     "archive_witness_project_id",
     "archive_witness_project_number",
@@ -69,8 +88,21 @@ EMPTY_ALLOWED_FIELDS = {
 }
 
 
-def reject(message: str) -> None:
+class DuplicateName(ValueError):
+    pass
+
+
+def reject(message: str) -> "NoReturn":
     raise SystemExit(f"invalid release metadata: {message}")
+
+
+def _exact_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in result:
+            raise DuplicateName("duplicate JSON name")
+        result[name] = value
+    return result
 
 
 def required_string(data: dict[str, object], key: str) -> str:
@@ -85,50 +117,131 @@ def required_string(data: dict[str, object], key: str) -> str:
 def validate_shape(data: object) -> dict[str, object]:
     if not isinstance(data, dict):
         reject("document must be an object")
-    if set(data) != set(FIELDS):
-        reject("document has missing or unexpected fields")
-    if type(data["schema_version"]) is not int:
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int:
         reject("schema_version must be an integer")
-    for key in FIELDS:
-        if key != "schema_version" and key not in EMPTY_ALLOWED_FIELDS:
-            required_string(data, key)
+    fields = {
+        9: SCHEMA_NINE_FIELDS,
+        10: SCHEMA_TEN_FIELDS,
+    }.get(schema_version)
+    if fields is None:
+        reject(
+            "schema_version must be 9 or 10; older manifests are ineligible for promotion"
+        )
+    if set(data) != set(fields):
+        reject("document has missing or unexpected fields")
+    if schema_version == 10 and tuple(data) != SCHEMA_TEN_FIELDS:
+        reject("schema-10 document fields are not in canonical producer order")
+    integer_fields = SCHEMA_TEN_INTEGER_FIELDS if schema_version == 10 else set()
+    for key in fields:
+        if key == "schema_version":
+            continue
+        value = data[key]
+        if key in integer_fields:
+            if type(value) is not int:
+                reject(f"{key} must be an integer")
         elif key in EMPTY_ALLOWED_FIELDS:
-            value = data[key]
             if not isinstance(value, str) or any(
                 ord(character) < 32 or ord(character) == 127 for character in value
             ):
                 reject(f"{key} must be a control-free string")
+        else:
+            required_string(data, key)
     return data
+
+
+def parse_metadata_bytes(raw: bytes) -> dict[str, object]:
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_exact_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateName) as error:
+        reject(f"cannot parse JSON ({error})")
+    validated = validate_shape(data)
+    if validated["schema_version"] == 10:
+        canonical = (
+            json.dumps(validated, separators=(",", ":"), ensure_ascii=True) + "\n"
+        ).encode("utf-8")
+        if raw != canonical:
+            reject("schema-10 document bytes are not canonical compact JSON plus one LF")
+    return validated
 
 
 def parse_metadata(path: Path) -> dict[str, object]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as error:
+        raw = path.read_bytes()
+    except OSError as error:
         reject(f"cannot parse JSON ({error})")
-    return validate_shape(data)
+    return parse_metadata_bytes(raw)
+
+
+def _validate_fresh_bootstrap(
+    arguments: argparse.Namespace, data: dict[str, object]
+) -> None:
+    if not is_bootstrap_tag(arguments.tag):
+        reject("schema-10 metadata is reserved for the exact fresh BOOTSTRAP tag")
+    if arguments.repository != "joerodriguez/kioku-enclave":
+        reject("fresh BOOTSTRAP repository is not the reviewed source repository")
+    if arguments.image_repository != FRESH_IMAGE_REPOSITORY:
+        reject("fresh BOOTSTRAP image repository is not exact")
+    if data["source_repository"] != FRESH_SOURCE_REPOSITORY:
+        reject("fresh BOOTSTRAP source_repository is not exact")
+    if data["image_uri"] != f"{FRESH_IMAGE_REPOSITORY}:{arguments.tag}":
+        reject("fresh BOOTSTRAP tagged image URI is not exact")
+    if (
+        data["gcs_bucket"] != EXPECTED_INTENT["index_bucket"]
+        or data["gcs_media_bucket"] != EXPECTED_INTENT["media_bucket"]
+        or data["gcs_legacy_media_bucket"] != EXPECTED_INTENT["legacy_media_bucket"]
+    ):
+        reject("fresh BOOTSTRAP GCS namespace is not exact")
+    try:
+        validate_checked_bootstrap_source()
+        expected_binding = bootstrap_release_binding(
+            arguments.expected_adr0022_canary_identity_preparation_sha256,
+            arguments.expected_adr0022_canary_admin_uuid,
+        )
+    except FreshReleaseError as error:
+        reject(str(error))
+    actual_binding = {name: data[name] for name in RELEASE_BINDING_FIELD_ORDER}
+    if actual_binding != expected_binding:
+        reject("fresh BOOTSTRAP generation/canary/schema binding is not exact")
 
 
 def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
     validate_shape(data)
-    if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_bucket):
-        reject("expected GCS bucket has an invalid format")
-    if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_media_bucket):
-        reject("expected media GCS bucket has an invalid format")
-    if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_legacy_media_bucket):
-        reject("expected legacy media GCS bucket has an invalid format")
+    for label, value in (
+        ("expected GCS bucket", arguments.expected_gcs_bucket),
+        ("expected media GCS bucket", arguments.expected_gcs_media_bucket),
+        (
+            "expected legacy media GCS bucket",
+            arguments.expected_gcs_legacy_media_bucket,
+        ),
+    ):
+        if not BUCKET_PATTERN.fullmatch(value):
+            reject(f"{label} has an invalid format")
     if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
-        reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 9:
-        reject("schema_version must be 9; older manifests are ineligible for promotion")
+        reject(
+            "expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0"
+        )
+
+    schema_version = data["schema_version"]
+    if schema_version == 10:
+        _validate_fresh_bootstrap(arguments, data)
+    else:
+        if claims_bootstrap_role(arguments.tag):
+            reject("fresh BOOTSTRAP tags require exact schema-10 metadata")
+        if (
+            arguments.expected_adr0022_canary_identity_preparation_sha256
+            or arguments.expected_adr0022_canary_admin_uuid
+        ):
+            reject("fresh canary expectations require schema-10 metadata")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
         reject("source_repository does not match the expected repository")
     if data["source_ref"] != arguments.tag:
         reject("source_ref does not match the requested tag")
-    if data["source_commit"] != arguments.commit or not COMMIT_PATTERN.fullmatch(arguments.commit):
+    if data["source_commit"] != arguments.commit or not COMMIT_PATTERN.fullmatch(
+        arguments.commit
+    ):
         reject("source_commit does not match the requested commit")
 
     digest = required_string(data, "image_digest")
@@ -139,7 +252,9 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("image_uri is outside the expected Artifact Registry repository")
     if data["image_digest_uri"] != f"{arguments.image_repository}@{digest}":
         reject("image_digest_uri does not bind the expected image repository and digest")
-    expected_release_url = f"https://github.com/{arguments.repository}/releases/tag/{arguments.tag}"
+    expected_release_url = (
+        f"https://github.com/{arguments.repository}/releases/tag/{arguments.tag}"
+    )
     if not RELEASE_URL_PATTERN.fullmatch(required_string(data, "release_url")):
         reject("release_url is not an immutable GitHub release URL")
     if data["release_url"] != expected_release_url:
@@ -169,7 +284,9 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
     if legacy_media_bucket != arguments.expected_gcs_legacy_media_bucket:
         reject("gcs_legacy_media_bucket does not match the release configuration")
     if legacy_media_bucket != bucket:
-        reject("gcs_legacy_media_bucket must equal gcs_bucket for the Phase-0 dual-media migration")
+        reject(
+            "gcs_legacy_media_bucket must equal gcs_bucket for the Phase-0 dual-media migration"
+        )
 
     probe_claim = (
         data["archive_witness_shadow_mode"],
@@ -220,7 +337,9 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
     except ShadowRuntimeConfigError as error:
         reject(str(error))
     if shadow_runtime_claim != expected_shadow_runtime_claim:
-        reject("archive-v3 shadow-runtime claim does not match the release configuration")
+        reject(
+            "archive-v3 shadow-runtime claim does not match the release configuration"
+        )
 
 
 def main() -> None:
@@ -234,6 +353,10 @@ def main() -> None:
     parser.add_argument("--expected-gcs-media-bucket", required=True)
     parser.add_argument("--expected-gcs-legacy-media-bucket", required=True)
     parser.add_argument(
+        "--expected-adr0022-canary-identity-preparation-sha256", default=""
+    )
+    parser.add_argument("--expected-adr0022-canary-admin-uuid", default="")
+    parser.add_argument(
         "--archive-witness-probe-config",
         type=Path,
         default=Path("config/archive-witness-probe.json"),
@@ -246,9 +369,6 @@ def main() -> None:
     arguments = parser.parse_args()
     data = parse_metadata(arguments.metadata)
     validate(arguments, data)
-    # Emit the already-validated exact document rather than a whitespace-
-    # delimited record. Several exact-off claims are empty by design; JSON
-    # preserves their positions and types without shell IFS collapsing them.
     print(json.dumps(data, separators=(",", ":"), ensure_ascii=True))
 
 

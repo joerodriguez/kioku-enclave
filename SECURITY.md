@@ -154,6 +154,16 @@ surfaces.
   convergence can consume the matching binding into the reviewed Genesis owner;
   off-config startup refuses if such selected state already exists. The deleted
   advisory migration family and the inactive extent-shadow engine remain unreachable.
+- The fresh BOOTSTRAP release uses schema-10 signed metadata only at the fixed
+  `v0.8.35-adr0022-fresh-bootstrap.1` tag. Its exact 50-field ordered subject binds the
+  checked fresh-generation intent, full KMS/runtime-SA/WIF/custom-role coordinates, schema
+  0/0/0, runtime and Genesis off, positive signup, plus a nonzero raw preparation-receipt
+  SHA-256 and sole lowercase UUIDv5 read from the already-hashed private production config.
+  The enclave publication path performs no provider read and invents no identity value.
+  Provider-side runtime-SA generation is authenticated separately by the signed provider
+  admission receipt and is not overclaimed by the metadata's service-account email. Schema 9,
+  another tag/version/attempt, a duplicate/reordered field, a boolean epoch, a list/admin alias,
+  or drift in any bucket/KMS/WIF/role coordinate fails before publication or rollout.
 - The compiled maintenance importer is the only consumer allowed to turn that sealed
   single-archive runtime into an offline state machine. Encrypted control first binds one
   active account/archive to random opaque operation, owner, session, and attempt IDs plus a

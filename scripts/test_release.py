@@ -74,6 +74,26 @@ class LocalReleaseContracts(unittest.TestCase):
         ack = RELEASE.index('KIOKU_CONFIRM_ARCHIVE_V3_ROLL')
         self.assertLess(ack, RELEASE.index('git fetch origin main'))
 
+    def test_fresh_bootstrap_has_one_fixed_tag_and_separate_roll_confirmation(self) -> None:
+        fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
+        self.assertIn(fixed_tag, RELEASE)
+        self.assertIn(
+            '"$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp]',
+            RELEASE,
+        )
+        role_gate = RELEASE.index("ADR-0022 fresh BOOTSTRAP tag must be exactly")
+        confirmation = RELEASE.index(
+            "KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL"
+        )
+        fetch = RELEASE.index("git fetch origin main")
+        self.assertLess(role_gate, fetch)
+        self.assertLess(confirmation, fetch)
+        self.assertIn(
+            '"$ARCHIVE_V3_SHADOW_RUNTIME_MODE" == off && "$GENESIS_WAL_NATIVE" == off',
+            RELEASE,
+        )
+        self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE"', RELEASE)
+
     def test_push_roll_binds_exact_deployment_source_before_network_and_roll(self) -> None:
         verifier_call = "scripts/verify_push_runtime_topology.py"
         self.assertEqual(RELEASE.count(verifier_call), 3)

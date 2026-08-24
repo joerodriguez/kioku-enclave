@@ -22,6 +22,10 @@ evidence is instead a canonical record signed with an independently pinned Ed255
   symlinks, unsafe permissions, and repository-resident files are rejected. Include the
   reviewed production build inputs plus `LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT`, a
   push-only Artifact Registry identity distinct from the enclave runtime identity.
+  The fixed ADR-0022 fresh BOOTSTRAP additionally requires exactly one
+  `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256=<nonzero-lowercase-hex64>` and
+  a sole lowercase UUIDv5 in `PRODUCTION_ADMIN_USER_IDS`; neither value is derived or
+  read from a provider by this repository.
 - Create a distinct Ed25519 build-evidence signing key outside either repository with
   exact mode `0600`. Independently publish and pin the SHA-256 fingerprint of its public
   DER key. Set `LOCAL_BUILD_EVIDENCE_PUBLIC_KEY` and
@@ -96,15 +100,31 @@ Rust artifacts, while `push` additionally publishes the image.
 ```
 
 The evidence directory contains the canonical evidence JSON and detached signature,
-schema-8 `enclave-release.json`, SPDX SBOM, and scan result. It binds the source tag and
+schema-9 or exact fresh-BOOTSTRAP schema-10 `enclave-release.json`, SPDX SBOM, and scan result. It binds the source tag and
 commit, digest-qualified image, hashes of the build configuration/Dockerfile/Cargo lock,
 release metadata/SBOM/scan, and tool versions. It contains hashes rather than configuration
 values.
 
+### Fixed ADR-0022 fresh BOOTSTRAP role
+
+The fresh BOOTSTRAP can be built and published only as
+`v0.8.35-adr0022-fresh-bootstrap.1` from the checked version-0.8.35, schema-0/0/0,
+archive-runtime-off, witness-probe-off, Genesis-off source. Version or attempt aliases,
+evaluation selection, schema-9 metadata, incomplete canary inputs, and any fresh
+bucket/KMS/runtime-SA/WIF/custom-role drift fail before publication.
+
+For this one tag the producer emits an exact 50-field insertion-order compact JSON object
+with one trailing LF. The signed evidence binds those raw bytes and the once-read private
+configuration bytes. The provider-free cross-repository format pin is
+`config/adr0022-fresh-schema10-bootstrap-fixture.json` (3,094 bytes; SHA-256
+`40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`); its synthetic
+commit, image digest, and canary values are not release evidence or provider authority.
+Generic release roles continue to emit schema 9.
+
 ## Publish the immutable release
 
 Review the release plan first. It checks the trusted source-tag signer, signed evidence,
-schema-8 production claims, bucket configuration, immutable registry digest, and exact
+schema-9 or exact fresh-BOOTSTRAP schema-10 production claims, bucket configuration, immutable registry digest, and exact
 release assets before changing remote state.
 
 ```sh
@@ -127,7 +147,12 @@ RELEASE_SIGNER_FINGERPRINT=<trusted-source-tag-fingerprint> \
 Publication refuses a missing or unknown tag signer, modified evidence, mismatched
 source/config/image/SBOM/scan binding, mutable image reference, changed registry digest,
 or a non-immutable existing release. It attaches exactly the signed evidence, signature,
-schema-8 metadata, SBOM, and scan result; it does not replace an existing immutable release.
+release metadata, SBOM, and scan result; it does not replace an existing immutable release.
+
+Rolling the fixed fresh BOOTSTRAP additionally requires
+`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL=v0.8.35-adr0022-fresh-bootstrap.1` on the
+`release.sh --apply --roll` invocation. That acknowledgment does not bypass signed
+evidence, provider admission, the deployment source seal, or any production deny.
 
 ## Roll the verified digest
 

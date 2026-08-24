@@ -19,10 +19,16 @@ EVIDENCE = ROOT / "scripts" / "local_build_evidence.py"
 RELEASE = ROOT / "scripts" / "release.sh"
 BUNDLE_VERIFIER = ROOT / "scripts" / "verify_local_evidence_bundle.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-from test_select_build_configuration import environment  # noqa: E402
+from test_select_build_configuration import (  # noqa: E402
+    CANARY_ADMIN_UUID,
+    CANARY_IDENTITY_PREPARATION_SHA256,
+    environment,
+    fresh_bootstrap_environment,
+)
+import adr0022_fresh_release as fresh  # noqa: E402
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
-TAG = "v1.2.3-adr0022-fresh-bootstrap.1"
+TAG = "v1.2.3-rc.1"
 
 
 class LocalEvidenceTests(unittest.TestCase):
@@ -38,6 +44,8 @@ class LocalEvidenceTests(unittest.TestCase):
             "kioku-production-media",
             "kioku-production-indexes",
         ),
+        fresh_bootstrap: bool = False,
+        metadata_canary_sha256: str | None = None,
     ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
         public = directory / "public.pem"
@@ -45,7 +53,9 @@ class LocalEvidenceTests(unittest.TestCase):
         private.chmod(0o600)
         subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True)
         config = directory / "local.env"
-        config_values = environment()
+        config_values = (
+            fresh_bootstrap_environment() if fresh_bootstrap else environment()
+        )
         config_values.pop("PATH", None)
         config_values.pop("GCP_WIF_PROVIDER", None)
         config_values.pop("GCP_SERVICE_ACCOUNT", None)
@@ -59,14 +69,27 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.write_text('{"matches":[]}\n', encoding="utf-8")
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        metadata.write_text(json.dumps({
-            "schema_version": 9,
-            "source_repository": "https://github.com/owner/repository",
-            "source_ref": TAG, "source_commit": COMMIT,
-            "image_uri": image_repository + ":release",
+        tag = fresh.BOOTSTRAP_TAG if fresh_bootstrap else TAG
+        source_repository = (
+            fresh.SOURCE_REPOSITORY
+            if fresh_bootstrap
+            else "https://github.com/owner/repository"
+        )
+        image_uri = image_repository + (f":{tag}" if fresh_bootstrap else ":release")
+        if fresh_bootstrap:
+            buckets = (
+                fresh.EXPECTED_INTENT["index_bucket"],
+                fresh.EXPECTED_INTENT["media_bucket"],
+                fresh.EXPECTED_INTENT["legacy_media_bucket"],
+            )
+        metadata_payload: dict[str, object] = {
+            "schema_version": 10 if fresh_bootstrap else 9,
+            "source_repository": source_repository,
+            "source_ref": tag, "source_commit": COMMIT,
+            "image_uri": image_uri,
             "image_digest_uri": image_repository + "@" + DIGEST,
             "image_digest": DIGEST,
-            "release_url": "https://github.com/owner/repository/releases/tag/" + TAG,
+            "release_url": source_repository + "/releases/tag/" + tag,
             "build_profile": "production", "voice_quality_gate": "owner_only_unvalidated",
             "billing_enforcement_mode": "shadow", "gcs_bucket": buckets[0],
             "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
@@ -80,12 +103,29 @@ class LocalEvidenceTests(unittest.TestCase):
             "archive_v3_witness_project_number": "",
             "archive_v3_witness_database_id": "",
             "archive_v3_archive_binding_commitment": "",
-        }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        }
+        if fresh_bootstrap:
+            metadata_payload.update(
+                fresh.bootstrap_release_binding(
+                    metadata_canary_sha256
+                    or CANARY_IDENTITY_PREPARATION_SHA256,
+                    CANARY_ADMIN_UUID,
+                )
+            )
+        metadata.write_text(
+            json.dumps(
+                metadata_payload,
+                sort_keys=not fresh_bootstrap,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         evidence = directory / "enclave-local-build-evidence.json"
         create_command = [
             "python3", str(EVIDENCE), "create", "--output", str(evidence),
-            "--repository", "https://github.com/owner/repository", "--tag", TAG,
-            "--commit", COMMIT, "--image-uri", image_repository + ":release",
+            "--repository", source_repository, "--tag", tag,
+            "--commit", COMMIT, "--image-uri", image_uri,
             "--image-digest-uri", image_repository + "@" + DIGEST, "--image-digest", DIGEST,
             "--config", str(config), "--dockerfile", str(ROOT / "Dockerfile"),
             "--cargo-lock", str(ROOT / "Cargo.lock"), "--release-metadata", str(metadata),
@@ -207,6 +247,58 @@ class LocalEvidenceTests(unittest.TestCase):
             tampered = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("exact enclave-release.json bytes", tampered.stderr)
+
+    def test_bundle_verifier_cross_binds_fresh_schema_ten_to_private_config(self) -> None:
+        def verify_command(directory: Path, public: Path, fingerprint: str) -> list[str]:
+            return [
+                "python3", str(BUNDLE_VERIFIER),
+                "--evidence-dir", str(directory),
+                "--public-key", str(public),
+                "--expected-public-key-sha256", fingerprint,
+                "--repository", "joerodriguez/kioku-enclave",
+                "--tag", fresh.BOOTSTRAP_TAG,
+                "--commit", COMMIT,
+                "--image-repository", fresh.IMAGE_REPOSITORY,
+                "--expected-gcs-bucket", fresh.EXPECTED_INTENT["index_bucket"],
+                "--expected-gcs-media-bucket", fresh.EXPECTED_INTENT["media_bucket"],
+                "--expected-gcs-legacy-media-bucket", fresh.EXPECTED_INTENT["legacy_media_bucket"],
+                "--config", str(directory / "local.env"),
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = self.create_bundle(
+                directory, fresh_bootstrap=True
+            )
+            completed = subprocess.run(
+                verify_command(directory, public, fingerprint),
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            metadata = json.loads(completed.stdout)["metadata"]
+            self.assertEqual(metadata["schema_version"], 10)
+            self.assertEqual(
+                metadata["adr0022_canary_identity_preparation_sha256"],
+                CANARY_IDENTITY_PREPARATION_SHA256,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = self.create_bundle(
+                directory,
+                fresh_bootstrap=True,
+                metadata_canary_sha256="d" * 64,
+            )
+            mismatched = subprocess.run(
+                verify_command(directory, public, fingerprint),
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("generation/canary/schema binding is not exact", mismatched.stderr)
 
     def test_source_archive_hash_is_signed_and_bundle_verifier_rechecks_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

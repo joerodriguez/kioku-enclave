@@ -31,7 +31,14 @@ import time
 import tomllib
 import urllib.parse
 
+from adr0022_fresh_release import (
+    CANARY_CONFIG_KEY,
+    FreshReleaseError,
+    bootstrap_release_binding_from_configuration,
+    is_bootstrap_tag,
+)
 from select_build_configuration import (
+    FRESH_BOOTSTRAP_PROFILE_KEYS,
     OPTIONAL_PROFILE_GROUPS,
     PROFILE_KEYS,
     SERVICE_ACCOUNT_PATTERN,
@@ -99,6 +106,7 @@ OPERATOR_CONFIG_KEYS = frozenset(
             "ARCHIVE_WITNESS_DATABASE_ID",
         )
     )
+    + tuple(f"PRODUCTION_{key}" for key in FRESH_BOOTSTRAP_PROFILE_KEYS)
 )
 
 
@@ -1026,12 +1034,14 @@ def verify() -> None:
     """Run every former CI test/format/lint/audit gate in the former order."""
     contract_tests = (
         "test_local_image_pipeline.py",
+        "test_adr0022_fresh_release.py",
         "test_agent_verify.py",
         "test_rust_build_lifecycle.py",
         "test_bootstrap_local_operator_config.py",
         "test_archive_witness_probe_config.py",
         "test_archive_v3_shadow_runtime_config.py",
         "test_select_build_configuration.py",
+        "test_verify_release_metadata.py",
         "test_local_build_evidence.py",
         "test_coordinator_advancement_receipt.py",
         "test_release.py",
@@ -1738,8 +1748,9 @@ def create_release_evidence(
     voice_quality_gate = run(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
-    metadata = {
-        "schema_version": 9,
+    bootstrap = is_bootstrap_tag(tag)
+    metadata: dict[str, object] = {
+        "schema_version": 10 if bootstrap else 9,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -1766,28 +1777,51 @@ def create_release_evidence(
         "archive_v3_witness_database_id": configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"],
         "archive_v3_archive_binding_commitment": configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"],
     }
+    if bootstrap:
+        try:
+            metadata.update(bootstrap_release_binding_from_configuration(configuration))
+        except FreshReleaseError as error:
+            raise PipelineError(str(error)) from error
     if metadata_path.exists():
         raise PipelineError("refusing to overwrite release metadata")
+    # Schema 10's producer order is part of the reviewed cross-repository
+    # contract. Schema 9 retains its historical canonical sorted encoding.
+    encoded_metadata = (
+        json.dumps(
+            metadata,
+            sort_keys=not bootstrap,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("utf-8")
     write_immutable_file(
         metadata_path,
-        (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        encoded_metadata,
         "release metadata",
     )
-    run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/verify_release_metadata.py"),
-            str(metadata_path),
-            "--repository", owner_repository,
-            "--tag", tag,
-            "--commit", source_commit,
-            "--image-repository", image_uri.rsplit(":", 1)[0],
-            "--expected-gcs-bucket", configuration["ENCLAVE_GCS_BUCKET"],
-            "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
-            "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
-        ],
-        capture=True,
-    )
+    verify_command = [
+        sys.executable,
+        str(ROOT / "scripts/verify_release_metadata.py"),
+        str(metadata_path),
+        "--repository", owner_repository,
+        "--tag", tag,
+        "--commit", source_commit,
+        "--image-repository", image_uri.rsplit(":", 1)[0],
+        "--expected-gcs-bucket", configuration["ENCLAVE_GCS_BUCKET"],
+        "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
+        "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
+    ]
+    if bootstrap:
+        verify_command.extend(
+            [
+                "--expected-adr0022-canary-identity-preparation-sha256",
+                configuration[CANARY_CONFIG_KEY],
+                "--expected-adr0022-canary-admin-uuid",
+                configuration["ADMIN_USER_IDS"],
+            ]
+        )
+    run(verify_command, capture=True)
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     gcloud_version_lines = [
         line.strip()
