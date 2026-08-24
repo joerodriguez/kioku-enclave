@@ -1910,7 +1910,11 @@ Google-token, Google-OAuth, and both Apple paths, is spent only when an account 
 actually created, and fails closed when unset or negative. Exact zero is the reviewed
 ADR-0022 destructive-cutover state: it refuses every new account before reservation and
 starts the bounded lifecycle-fenced zero-archive owner instead of the ordinary deletion
-reconciler. Returning users, legacy
+reconciler. That exact image also suppresses legacy checkpoint reconciliation and all
+content-producing summarizer, episode, media, and model-delivery schedulers; billing
+detach remains active because it is a deletion-completion prerequisite. This prevents
+recovery or provider backlog from retaining content-write admission ahead of the sole
+destructive owner. Returning users, legacy
 identity rebinds, and the exact-matched plugin-review identity do not spend it. Signup
 emits a content-free `signup_v1` observation — fixed provider and outcome literals plus
 service-wide daily counters, never an account id, email, provider subject, token, or

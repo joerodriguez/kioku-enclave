@@ -794,7 +794,16 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # ran its own 14-test gate and reproduced the prior 15/b50d6196... pin before
 # comparison. The count, keys, classifications, order, and all call-expression
 # hashes are unchanged; only async_main's enclosing owner-body hash moves.
-EXPECTED_STORE_SURFACE_SHA256 = "ba584b1b6fc4446ad244c67ee84ed2901ca69c45542453d9e736634cd90de4d8"
+# ADR-0022 production cutover liveness repair: the exact zero-budget image now
+# suppresses legacy checkpoint reconciliation and the content-producing worker
+# schedulers so they cannot retain or recreate archive write admission ahead of
+# the sole destructive owner. A fresh `git archive` of exact
+# deaacbb957ef491f82dcd2e9a9867e775ac689e6 ran its own 14-test gate first and
+# reproduced 15/ba584b1b6fc4446ad244c67ee84ed2901ca69c45542453d9e736634cd90de4d8.
+# The branch remains 15 rows with the identical key set, classification, order,
+# and call-expression hashes. The only third-state delta is async_main's
+# enclosing owner-body hash; no Store constructor or policy surface moved.
+EXPECTED_STORE_SURFACE_SHA256 = "fcc890be7f410b5cd943979e6636abc0a02c55ee69a63f857874c6a6cd879746"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -1038,7 +1047,13 @@ EXPECTED_WORKER_SPAWN_COUNT = 29
 # own 28/9f4435ee... inventory and 14/14 gate first. No key is removed or
 # reclassified, every surviving spawn expression is byte-identical, and only
 # async_main's enclosing owner body moves around the zero-budget branch.
-EXPECTED_WORKER_SPAWN_SHA256 = "88d4563e05d417c78e37e8bda3d97cbd6545d05357d5b00b2938c971feade160"
+# The production cutover liveness repair above moves that same async_main owner
+# body again: zero mode now starts only billing detach plus the destructive
+# owner, while ordinary mode retains all established schedulers. Against the
+# same fresh deaacbb archive recorded by the Store-surface pin, count stays 29
+# with zero additions, removals, reclassifications, order moves, or spawn-call
+# expression moves. All 28 other owner-body hashes are byte-identical.
+EXPECTED_WORKER_SPAWN_SHA256 = "f66254fc4eec2453129198c53787ee9084029799c0d90a5805debe5fe4901fa0"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

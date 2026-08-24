@@ -247,6 +247,34 @@ pub(crate) fn test_mode_enabled() -> bool {
     cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
 }
 
+/// The zero-archive image is destructive by construction: every legacy
+/// archive is about to enter the deletion owner, so minting or refreshing a
+/// recovery checkpoint first is both unnecessary and harmful. In particular,
+/// a large checkpoint upload can retain the same content-write admission for
+/// minutes and repeatedly outrun the deletion owner on restart. Only the exact
+/// attested zero budget selects this exception; ordinary and malformed values
+/// retain the established fail-closed startup path (the latter is rejected by
+/// [`cp::CpConfig`] before request admission).
+fn should_spawn_legacy_checkpoint_reconciler(signup_limit_per_day: &str) -> bool {
+    signup_limit_per_day != "0"
+}
+
+#[cfg(test)]
+mod zero_cutover_startup_tests {
+    use super::should_spawn_legacy_checkpoint_reconciler;
+
+    #[test]
+    fn only_the_exact_closed_signup_budget_skips_legacy_checkpoint_work() {
+        assert!(!should_spawn_legacy_checkpoint_reconciler("0"));
+        for ordinary_or_invalid in ["1", "25", "", "00", "-1", "unlimited"] {
+            assert!(
+                should_spawn_legacy_checkpoint_reconciler(ordinary_or_invalid),
+                "unexpectedly suppressed established startup validation for {ordinary_or_invalid:?}"
+            );
+        }
+    }
+}
+
 const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "KIOKU_BUILD_PROFILE",
     "KMS_PROJECT",
@@ -978,7 +1006,13 @@ async fn async_main() {
             });
         info!("archive-v3 account deletion runtime installed");
     }
-    Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
+    let baked_signup_limit = std::env::var("SIGNUP_LIMIT_PER_DAY")
+        .expect("SIGNUP_LIMIT_PER_DAY must be baked into the image");
+    if should_spawn_legacy_checkpoint_reconciler(&baked_signup_limit) {
+        Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
+    } else {
+        info!("legacy checkpoint reconciliation skipped for the zero-archive cutover");
+    }
     let recovered_rebinds = control_store
         .reconcile_pending_identity_rebinds()
         .await
@@ -1334,15 +1368,23 @@ async fn async_main() {
         voice: voice_engine,
     });
 
-    // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
-    cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
-    cp::query::spawn_episode_delete_worker(Arc::clone(&cp_state));
-    cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
-    cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
+    // Billing detach is part of account-deletion completion and therefore
+    // remains active in both runtime modes.
     cp::billing::spawn_detach_worker(Arc::clone(&cp_state));
     if cp_state.config.signup_limit_per_day == 0 {
+        // This image has one job: erase every account and prove zero. Starting
+        // summarization, episode cleanup, media/model provider work, or their
+        // delivery tails would resurrect/advance backlog immediately before
+        // deletion and can retain the same per-user write admissions for
+        // minutes. The cutover owner directly settles usage and owns the full
+        // account deletion lane, so none of those schedulers are prerequisites.
         cp::sync::spawn_adr0022_zero_archive_cutover(Arc::clone(&cp_state));
     } else {
+        // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
+        cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+        cp::query::spawn_episode_delete_worker(Arc::clone(&cp_state));
+        cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
+        cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
         cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
     }
 
