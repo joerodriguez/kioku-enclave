@@ -178,11 +178,34 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   a gate-off build of the re-baselined image, so **no digest exists that both
   clears the step-4 floor and has `GENESIS_WAL_NATIVE=off`**.
 
-  Therefore build **two** images from the same `vX.Y.Z-archive-v3-wal.N` tag
-  before step 5 — one `off`, one `on` — and register the `off` digest as the
-  designated rollback target alongside the deploy floor. It is re-baselined,
-  so it clears the floor, and un-arming the gate is then a redeploy of that
-  digest with no pre-re-baseline binary ever returning to service.
+  Therefore publish **two independently signed immutable releases** from the
+  reviewed re-baseline source line before step 5 — one `off`, one `on` — and
+  register both exact source/image/config tuples in the deploy policy. One
+  immutable release can bind only one image digest, so claiming two differently
+  configured images under one tag would make the release record ambiguous. The
+  `off` digest is the designated rollback target alongside the deploy floor. It
+  is re-baselined, so it clears the floor, and un-arming the gate is then a
+  redeploy of that digest with no pre-re-baseline binary ever returning to
+  service.
+
+  The reviewed pair prepared for this cutover is:
+
+  - gate on: `v0.8.34-archive-v3-wal.1`, source
+    `0c96cc7930289879392f847bf138571aed17e83e`, image
+    `sha256:71d17b37dfb3aecc02991f3b3a1e43b86e096ff14b6ad23f1821de1551e13f4b`,
+    image-config SHA-256
+    `6a6ce69063147eeace305e57bad6d69db8301a85674821ddf0902f5b07a4b850`;
+  - gate off / rollback: `v0.8.34-archive-v3-wal.2`, source
+    `9f373fe037462cf1f84d24095784c547f102ee12`, image
+    `sha256:faf94ffa593283b02cce438d0dac0611255134b4da7a5a361442e53ac56227c7`,
+    image-config SHA-256
+    `ed496579f20529d7630e7de67492882203443ffacd881c64a59da86300b98a62`.
+
+  Both are signed prereleases with immutable evidence. Deployment commit
+  `5ef4eb4d4222f58aa29ba9b6efb146dc39bace70` admits exactly this pair while the
+  zero proof remains open. Publishing and admitting the pair proves only that
+  the rollback mechanism exists; it is not proof take #1, image retirement,
+  proof take #2, or the positive birth witness.
 
   This bullet records that the *mechanism* is in place and the active candidate
   was rolled successfully. It does **not** discharge either zero proof, image
