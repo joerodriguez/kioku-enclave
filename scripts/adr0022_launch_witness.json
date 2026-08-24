@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "asset": "adr0022_launch_witness.wav",
+  "sha256": "32610744c28205d9b0590f061967a2857b453a578c25a0c675057056576804c9",
+  "byte_length": 68274,
+  "mime_type": "audio/wav",
+  "codec": "pcm_s16le",
+  "sample_rate_hz": 16000,
+  "channels": 1,
+  "sample_width_bytes": 2,
+  "frame_count": 32089,
+  "expected_transcript": "the blue lantern is ready for launch",
+  "transcript_normalization": "unicode-nfkc-lowercase-alphanumeric-space-collapse-v1",
+  "provenance": "Non-private synthetic speech generated with the macOS Samantha system voice on 2026-08-24; checked-in bytes, not regeneration, are authoritative."
+}
