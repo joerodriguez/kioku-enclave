@@ -319,8 +319,10 @@ mod tests {
             GenesisConvergence,
         };
         use crate::cp::control_store::WalGenesisStage;
+        use crate::cp::wal_gate_test_support::capture_events;
 
         let substrate = GenesisSmokeSubstrate::new();
+        let (captured, capture_guard) = capture_events();
 
         // ---- process one: create the user, converge genesis, serve ----
         let first = substrate.boot();
@@ -344,6 +346,8 @@ mod tests {
         .await
         .expect("genesis convergence must reach the durable terminal");
         assert_eq!(outcome, GenesisConvergence::Converged);
+        let birth_metric = r#""metric":"archive_v3_genesis_birth_witness""#;
+        assert_eq!(captured.text().matches(birth_metric).count(), 1);
 
         // The terminal contract, from the durable ledger rather than from the
         // pass that wrote it. `is_exact_unleased_wal_authoritative_terminal`
@@ -460,6 +464,12 @@ mod tests {
         .await
         .expect("the relaunch must reconstruct the serving authority");
         assert_eq!(outcome, GenesisConvergence::AlreadyTerminal);
+        assert_eq!(
+            captured.text().matches(birth_metric).count(),
+            1,
+            "an already-terminal relaunch must not claim a new birth"
+        );
+        drop(capture_guard);
         assert!(second.store.has_wal_serving_authority(SMOKE_USER));
 
         // ---- read the fixture back through the serving read path ----
