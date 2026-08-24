@@ -20,6 +20,9 @@
   deletion lane. Group 1/2 counts are measured in one Control transaction and logged
   content-free; the production service remains closed until provider-retained
   soft-deleted generations expire and both zero-proof takes succeed.
+- [x] Repin the singleton deployment seal to `e62caba`, whose reviewed rollout owner
+  includes the positive-witness `.3` image in exact archive bucket and witness digest
+  rotation rather than admitting the image without its provider authority.
 
 # ADR-0022 browser evidence
 

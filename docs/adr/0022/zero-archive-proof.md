@@ -212,11 +212,13 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
     `69eb07b18016f554a0983da172995e4039a36b1e89af15aa74f00d1aed620d2d`.
 
   All three are signed prereleases with immutable evidence. Deployment commit
-  `e10a20bcc049bd7285ea2a7384b3bae4cdc4f417` admits the exact pair and successor
-  while the zero proof remains open. `.1` and `.2` remain the destructive
-  two-image registry floor; `.3` may roll only after Take #1 and must be promoted
-  again from the same signed evidence if retirement removed it. The deployment
-  source also contains the frozen, disabled-until-Take-#1 operators for the
+  `e10a20bcc049bd7285ea2a7384b3bae4cdc4f417` admitted the exact pair and successor;
+  successor `e62cabaac3d67a8e3f0c1a7f74d96bebc515f49f` additionally routes `.3` through
+  the same archive-bucket and witness-database authority preauthorization,
+  post-health finalization, and failure recovery as `.1`/`.2`. `.1` and `.2` remain
+  the destructive two-image registry floor; `.3` may roll only after Take #1 and
+  must be promoted again from the same signed evidence if retirement removed it. The
+  deployment source also contains the frozen, disabled-until-Take-#1 operators for the
   three-bucket visible-zero floor, both proof takes, and exact registry retirement.
   Shipping those operators proves only that the rollback and proof mechanisms exist;
   it is not proof take #1, image retirement, proof take #2, or the positive birth
