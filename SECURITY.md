@@ -531,6 +531,14 @@ path.
 > routed Store reads/submits expose only settled owner state. The reviewed Genesis release
 > carries the active tuple; evaluation and ordinary pretag builds still select off, and an
 > off-config image refuses when selected durable state exists.
+> Serving startup emits one content-free `archive_v3_schema_epoch_rollout` aggregate after
+> relaunch and before request admission. It reports only the image's HEAD/TARGET/minimum
+> servable epochs and aggregate selected/relaunched/advanced/behind/unservable/unavailable
+> counts. `advanced` is set only after the sealed owner durably settles at least one epoch
+> step during that launch; no account, archive, step identity, SQL, or request value enters
+> the event. The production ladder witness retains exactly one epoch-0 account across the
+> HEAD and TARGET image replacements, authenticates this aggregate plus an ordinary routed
+> read, and deletes the account before public admission resumes.
 > This authority does not reactivate the deleted advisory/Phase-2 migration family or the
 > inactive extent-shadow engine.
 

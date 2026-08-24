@@ -1,5 +1,9 @@
 # ADR-0022 Genesis production activation
 
+- [~] Expose the content-free startup schema-epoch aggregate required by the retained
+  epoch-0 production witness: every selected archive is partitioned into
+  relaunched/unavailable, durable advancement is counted separately, and the image
+  HEAD/TARGET/minimum-servable coordinates are emitted before request admission.
 - [x] Merge every D4 read/mutation lane, bounded historical repair, provider-spend gate,
   lifecycle/delete owner, and WAL inventory seal required before activation.
 - [x] Deploy the archive-off bootstrap image and obtain the authenticated one-way binding
