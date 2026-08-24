@@ -204,15 +204,23 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
     `9f373fe037462cf1f84d24095784c547f102ee12`, image
     `sha256:faf94ffa593283b02cce438d0dac0611255134b4da7a5a361442e53ac56227c7`,
     image-config SHA-256
-    `ed496579f20529d7630e7de67492882203443ffacd881c64a59da86300b98a62`.
+    `ed496579f20529d7630e7de67492882203443ffacd881c64a59da86300b98a62`;
+  - gate on / positive birth witness: `v0.8.34-archive-v3-wal.3`, source
+    `1c022582a44cdf9a3ddab20c5afb8c4e06f56f29`, image
+    `sha256:f5f7949421198332dd040c751a0aa3ab1c114a06b1fe5aef89b49f0b83d348b1`,
+    image-config SHA-256
+    `69eb07b18016f554a0983da172995e4039a36b1e89af15aa74f00d1aed620d2d`.
 
-  Both are signed prereleases with immutable evidence. Deployment commit
-  `175a27b618c50e40672629d59a27654d232fd688` admits exactly this pair while the
-  zero proof remains open and adds the frozen, disabled-until-Take-#1 operators
-  for the three-bucket visible-zero floor, both proof takes, and exact registry
-  retirement. Shipping those operators proves only that the rollback and proof
-  mechanisms exist; it is not proof take #1, image retirement, proof take #2,
-  or the positive birth witness.
+  All three are signed prereleases with immutable evidence. Deployment commit
+  `e10a20bcc049bd7285ea2a7384b3bae4cdc4f417` admits the exact pair and successor
+  while the zero proof remains open. `.1` and `.2` remain the destructive
+  two-image registry floor; `.3` may roll only after Take #1 and must be promoted
+  again from the same signed evidence if retirement removed it. The deployment
+  source also contains the frozen, disabled-until-Take-#1 operators for the
+  three-bucket visible-zero floor, both proof takes, and exact registry retirement.
+  Shipping those operators proves only that the rollback and proof mechanisms exist;
+  it is not proof take #1, image retirement, proof take #2, or the positive birth
+  witness.
 
   This bullet records that the *mechanism* is in place and the active candidate
   was rolled successfully. It does **not** discharge either zero proof, image
