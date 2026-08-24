@@ -101,6 +101,22 @@ def bootstrap_manifest() -> dict[str, object]:
     return data
 
 
+def final_manifest_shape() -> dict[str, object]:
+    data = bootstrap_manifest()
+    data["source_ref"] = fresh.FINAL_TAG
+    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.FINAL_TAG}"
+    data["release_url"] = fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.FINAL_TAG
+    data.update(
+        fresh._release_binding(
+            CANARY_SHA,
+            CANARY_UUID,
+            genesis="on",
+            epoch=1,
+        )
+    )
+    return data
+
+
 class ReleaseMetadataTests(unittest.TestCase):
     def verify(
         self,
@@ -201,6 +217,36 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), data)
 
+    def test_schema_ten_final_is_reserved_but_current_bootstrap_tree_refuses_it(self) -> None:
+        data = final_manifest_shape()
+        completed = self.verify(
+            data,
+            tag=fresh.FINAL_TAG,
+            repository="joerodriguez/kioku-enclave",
+            expected_buckets=(
+                fresh.EXPECTED_INTENT["index_bucket"],
+                fresh.EXPECTED_INTENT["media_bucket"],
+                fresh.EXPECTED_INTENT["legacy_media_bucket"],
+            ),
+            expected_canary_sha=CANARY_SHA,
+            expected_canary_uuid=CANARY_UUID,
+            shadow_runtime_config={
+                "schema_version": 2,
+                "mode": "single-archive-wal-v1",
+                "archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
+                "archive_gcs_project_number": fresh.PROJECT_NUMBER,
+                "registry_kms_version": "1",
+                "witness_project_id": fresh.PROJECT_ID,
+                "witness_project_number": fresh.PROJECT_NUMBER,
+                "witness_database_id": fresh.EXPECTED_INTENT[
+                    "witness_database_id"
+                ],
+                "archive_binding_commitment": "d" * 64,
+            },
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("fresh FINAL schema phase is not exact 1/1/1", completed.stderr)
+
     def test_schema_ten_refuses_every_generation_role_wif_kms_and_phase_drift(self) -> None:
         exact = bootstrap_manifest()
         for field in fresh.RELEASE_BINDING_FIELD_ORDER:
@@ -275,14 +321,15 @@ class ReleaseMetadataTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0)
 
-        schema_nine = manifest()
-        schema_nine["source_ref"] = fresh.BOOTSTRAP_TAG
-        schema_nine["release_url"] = (
-            "https://github.com/owner/repository/releases/tag/" + fresh.BOOTSTRAP_TAG
-        )
-        completed = self.verify(schema_nine, tag=fresh.BOOTSTRAP_TAG)
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("require exact schema-10", completed.stderr)
+        for tag in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG):
+            schema_nine = manifest()
+            schema_nine["source_ref"] = tag
+            schema_nine["release_url"] = (
+                "https://github.com/owner/repository/releases/tag/" + tag
+            )
+            completed = self.verify(schema_nine, tag=tag)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("require exact schema-10", completed.stderr)
 
     def test_schema_ten_refuses_duplicate_and_reordered_json(self) -> None:
         exact = bootstrap_manifest()

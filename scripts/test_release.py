@@ -79,24 +79,24 @@ class LocalReleaseContracts(unittest.TestCase):
         ack = RELEASE.index('KIOKU_CONFIRM_ARCHIVE_V3_ROLL')
         self.assertLess(ack, RELEASE.index('git --no-replace-objects fetch origin main'))
 
-    def test_fresh_bootstrap_has_one_fixed_tag_and_separate_roll_confirmation(self) -> None:
+    def test_fresh_roles_have_fixed_tags_and_never_enter_the_legacy_roll(self) -> None:
         fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
+        final_tag = 'ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.1"'
         self.assertIn(fixed_tag, RELEASE)
+        self.assertIn(final_tag, RELEASE)
         self.assertIn(
             '"$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp]',
             RELEASE,
         )
         role_gate = RELEASE.index("ADR-0022 fresh BOOTSTRAP tag must be exactly")
-        confirmation = RELEASE.index(
-            "KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL"
+        final_gate = RELEASE.index("ADR-0022 fresh FINAL tag must be exactly")
+        roll_refusal = RELEASE.index(
+            "ADR-0022 fresh releases roll only through the sealed deployment"
         )
         fetch = RELEASE.index("git --no-replace-objects fetch origin main")
         self.assertLess(role_gate, fetch)
-        self.assertLess(confirmation, fetch)
-        self.assertIn(
-            '"$ARCHIVE_V3_SHADOW_RUNTIME_MODE" == off && "$GENESIS_WAL_NATIVE" == off',
-            RELEASE,
-        )
+        self.assertLess(final_gate, fetch)
+        self.assertLess(roll_refusal, fetch)
         self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE"', RELEASE)
 
     def test_push_roll_binds_exact_deployment_source_before_network_and_roll(self) -> None:

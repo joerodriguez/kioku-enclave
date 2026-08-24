@@ -24,14 +24,16 @@ The fresh proof must bind all of the following before the seal flips:
    account were created as a new generation with the reviewed policies. It also proves that
    no legacy bucket, database, key, runtime principal, release, rollback, or recovery owner is
    referenced by the active generation.
-2. A signed BOOTSTRAP image, built from this 0/0/0 source with the exact all-empty archive-v3
+2. A signed BOOTSTRAP image at the sole fixed
+   `v0.8.35-adr0022-fresh-bootstrap.1` role, built from this 0/0/0 source with the exact all-empty archive-v3
    profile and `GENESIS_WAL_NATIVE=off`, carries exact schema-10 metadata binding the canonical
    fresh-generation tuple plus the owner-sealed pre-build canary identity receipt SHA and sole
    derived UUIDv5 from the same private config snapshot. It runs under the priority-800 public deny. A bounded
    temporary /32 operator authority creates exactly one deterministic canary through the real signup
    path and records only the one-way archive-binding commitment. The runtime-off image cannot
    create or serve an archive-v3 WAL owner.
-3. The reviewed FINAL source binds that exact provider receipt and commitment, sets the
+3. The reviewed FINAL source at the sole fixed
+   `v0.8.35-archive-v3-wal.1` role binds that exact provider receipt and commitment, sets the
    baseline seal, appends only the reviewed first additive schema step, and compiles schema
    coordinates 1/1/1. Its signed metadata and image evidence bind the complete fresh tuple;
    no legacy image remains an admitted predecessor.

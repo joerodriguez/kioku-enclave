@@ -14,7 +14,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT / "scripts"))
-from adr0022_fresh_release import BOOTSTRAP_TAG  # noqa: E402
+from adr0022_fresh_release import BOOTSTRAP_TAG, FINAL_TAG  # noqa: E402
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
 DOCKERFILE = ROOT / "Dockerfile"
@@ -339,7 +339,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('choices=("production", "evaluation")', pipeline)
         self.assertIn("selected_configuration(", pipeline)
         self.assertIn("check_voice_release_gate.py", pipeline)
-        self.assertIn('"schema_version": 10 if bootstrap else 9', pipeline)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', pipeline)
         self.assertIn('"release_url"', pipeline)
         self.assertIn("enclave-release.json", pipeline)
         self.assertNotIn("GITHUB_OUTPUT", pipeline)
@@ -383,7 +383,7 @@ class SelectorTests(unittest.TestCase):
             self.assertIn(f'"{manifest_field}"', pipeline)
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn("GCS_LEGACY_MEDIA_BUCKET", dockerfile)
-        self.assertIn('"schema_version": 10 if bootstrap else 9', pipeline)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', pipeline)
         self.assertIn("schema_version must be 9 or 10", verifier)
 
     def test_probe_mode_defaults_off_with_empty_baked_namespace(self) -> None:
@@ -729,7 +729,7 @@ class SelectorTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(content, "")
-        self.assertIn("only for the exact fixed tag", completed.stderr)
+        self.assertIn("only for an exact fixed tag", completed.stderr)
         for tag in (
             "v0.8.34-adr0022-fresh-bootstrap.1",
             "v0.8.35-adr0022-fresh-bootstrap.2",
@@ -788,6 +788,46 @@ class SelectorTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
+
+    def test_fresh_final_aliases_and_current_bootstrap_source_are_ineligible(self) -> None:
+        exact = fresh_bootstrap_environment()
+        exact["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
+        active_runtime = {
+            "schema_version": 2,
+            "mode": "single-archive-wal-v1",
+            "archive_bucket": "kioku-joerodriguez-adr0022-v1-archive",
+            "archive_gcs_project_number": "640329636251",
+            "registry_kms_version": "1",
+            "witness_project_id": "kioku-joerodriguez",
+            "witness_project_number": "640329636251",
+            "witness_database_id": "adr0022-v1-witness",
+            "archive_binding_commitment": "d" * 64,
+        }
+        for tag in (
+            "v0.8.35-archive-v3-wal.2",
+            "v0.8.35-archive-v3-wal.1-extra",
+            "v0.8.35-ARCHIVE-V3-WAL.1",
+        ):
+            with self.subTest(tag=tag):
+                completed, content = self.run_selector(
+                    "production",
+                    exact,
+                    source_ref=tag,
+                    shadow_runtime_config=active_runtime,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+                self.assertIn("must be exactly", completed.stderr)
+
+        completed, content = self.run_selector(
+            "production",
+            exact,
+            source_ref=FINAL_TAG,
+            shadow_runtime_config=active_runtime,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("fresh FINAL schema phase is not exact 1/1/1", completed.stderr)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Exact source/configuration contract for the ADR-0022 fresh BOOTSTRAP release.
+"""Exact source/configuration contracts for the two ADR-0022 fresh releases.
 
 This module is deliberately provider-free.  It binds signed release metadata to
 the reviewed checked-in namespace intent and to two opaque values supplied by
 the private production operator configuration: the owner-sealed canary identity
-receipt hash and the sole derived canary administrator UUID.
+receipt hash and the sole derived canary administrator UUID.  The FINAL role is
+reserved here before its live binding exists; a tree remains ineligible until
+its checked runtime, seal, and schema declarations are the exact active form.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
+FINAL_TAG = "v0.8.35-archive-v3-wal.1"
 SOURCE_REPOSITORY = "https://github.com/joerodriguez/kioku-enclave"
 GENERATION_INTENT_SHA256 = (
     "7ece5ba914f76d2f56af178d5891230d3e1ba7df33a6b54dd3d2a7870cce3727"
@@ -26,6 +29,11 @@ GENERATION_INTENT_SHA256 = (
 SCHEMA10_BOOTSTRAP_FIXTURE_SHA256 = (
     "40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9"
 )
+# This remains deliberately empty in the BOOTSTRAP source.  The separately
+# reviewed FINAL source commit must replace it with the exact SHA-256 of its
+# completed baseline-seal bytes.  Merely flipping ``sealed`` or activating the
+# runtime can therefore never make this precursor eligible for publication.
+FINAL_SCHEMA_BASELINE_SEAL_SHA256 = ""
 NAMESPACE_ID = "adr0022-v1"
 PROJECT_ID = "kioku-joerodriguez"
 PROJECT_NUMBER = "640329636251"
@@ -107,7 +115,7 @@ RELEASE_BINDING_FIELD_ORDER = (
     "signup_mode",
 )
 
-_EXPECTED_BOOTSTRAP_CONFIGURATION = {
+_EXPECTED_COMMON_CONFIGURATION = {
     "PROJECT_ID": PROJECT_ID,
     "REGION": REGION,
     "AR_REPOSITORY": "kioku",
@@ -123,6 +131,10 @@ _EXPECTED_BOOTSTRAP_CONFIGURATION = {
     "ENCLAVE_ATTEST_STS_AUDIENCE": (
         "//iam.googleapis.com/" + EXPECTED_INTENT["main_wif_provider"]
     ),
+}
+
+_EXPECTED_BOOTSTRAP_CONFIGURATION = {
+    **_EXPECTED_COMMON_CONFIGURATION,
     "ARCHIVE_WITNESS_SHADOW_MODE": "off",
     "ARCHIVE_WITNESS_PROJECT_ID": "",
     "ARCHIVE_WITNESS_PROJECT_NUMBER": "",
@@ -138,6 +150,22 @@ _EXPECTED_BOOTSTRAP_CONFIGURATION = {
     "GENESIS_WAL_NATIVE": "off",
 }
 
+_EXPECTED_FINAL_CONFIGURATION = {
+    **_EXPECTED_COMMON_CONFIGURATION,
+    "ARCHIVE_WITNESS_SHADOW_MODE": "off",
+    "ARCHIVE_WITNESS_PROJECT_ID": "",
+    "ARCHIVE_WITNESS_PROJECT_NUMBER": "",
+    "ARCHIVE_WITNESS_DATABASE_ID": "",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE": "single-archive-wal-v1",
+    "ARCHIVE_V3_ARCHIVE_BUCKET": EXPECTED_INTENT["archive_bucket"],
+    "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER": PROJECT_NUMBER,
+    "ARCHIVE_V3_REGISTRY_KMS_VERSION": "1",
+    "ARCHIVE_V3_WITNESS_PROJECT_ID": PROJECT_ID,
+    "ARCHIVE_V3_WITNESS_PROJECT_NUMBER": PROJECT_NUMBER,
+    "ARCHIVE_V3_WITNESS_DATABASE_ID": EXPECTED_INTENT["witness_database_id"],
+    "GENESIS_WAL_NATIVE": "on",
+}
+
 _EXPECTED_SCHEMA_PHASE_FRAGMENT = """
 pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[];
 
@@ -146,6 +174,21 @@ pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 0;
 pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 0;
 
 pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 0;
+"""
+
+_EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT = """
+pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[SchemaStep {
+    epoch: 1,
+    id: "0001_capture_events_stream_sequence",
+    class: StepClass::Index,
+    sql: "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence);",
+}];
+
+pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 1;
+
+pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 1;
+
+pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 1;
 """
 
 
@@ -176,6 +219,18 @@ def claims_bootstrap_role(source_ref: str) -> bool:
     return "adr0022-fresh-bootstrap" in normalize_tag(source_ref).lower()
 
 
+def claims_final_role(source_ref: str) -> bool:
+    """Return true for every 0.8.35 WAL ref attempting the fixed FINAL role."""
+
+    return normalize_tag(source_ref).lower().startswith(
+        "v0.8.35-archive-v3-wal"
+    )
+
+
+def claims_fresh_role(source_ref: str) -> bool:
+    return claims_bootstrap_role(source_ref) or claims_final_role(source_ref)
+
+
 def is_bootstrap_tag(source_ref: str) -> bool:
     return normalize_tag(source_ref) == BOOTSTRAP_TAG
 
@@ -185,6 +240,27 @@ def require_exact_bootstrap_tag(source_ref: str) -> None:
         raise FreshReleaseError(
             f"fresh BOOTSTRAP source_ref must be exactly {BOOTSTRAP_TAG}"
         )
+
+
+def is_final_tag(source_ref: str) -> bool:
+    return normalize_tag(source_ref) == FINAL_TAG
+
+
+def require_exact_final_tag(source_ref: str) -> None:
+    if not is_final_tag(source_ref):
+        raise FreshReleaseError(
+            f"fresh FINAL source_ref must be exactly {FINAL_TAG}"
+        )
+
+
+def require_exact_fresh_tag(source_ref: str) -> None:
+    if claims_bootstrap_role(source_ref):
+        require_exact_bootstrap_tag(source_ref)
+        return
+    if claims_final_role(source_ref):
+        require_exact_final_tag(source_ref)
+        return
+    raise FreshReleaseError("source_ref does not name an ADR-0022 fresh release role")
 
 
 def validate_generation_intent(path: Path | None = None) -> dict[str, Any]:
@@ -201,7 +277,8 @@ def validate_generation_intent(path: Path | None = None) -> dict[str, Any]:
     return payload
 
 
-def validate_checked_bootstrap_source(root: Path = ROOT) -> None:
+def validate_checked_bootstrap_source(root: Path | None = None) -> None:
+    root = root or ROOT
     validate_generation_intent(root / "config/adr0022-fresh-generation-intent.json")
     try:
         manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
@@ -263,6 +340,116 @@ def validate_checked_bootstrap_source(root: Path = ROOT) -> None:
         raise FreshReleaseError("fresh BOOTSTRAP archive runtime is not exact off")
 
 
+def validate_checked_final_source(root: Path | None = None) -> str:
+    """Validate the exact active FINAL source and return its live commitment."""
+
+    root = root or ROOT
+    validate_generation_intent(root / "config/adr0022-fresh-generation-intent.json")
+    try:
+        manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+        lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+        schema = (root / "src/schema_ladder.rs").read_text(encoding="utf-8")
+        seal_raw = (root / "scripts/schema_baseline_seal.json").read_bytes()
+        seal = json.loads(
+            seal_raw.decode("utf-8"),
+            object_pairs_hook=_exact_object,
+        )
+        probe = json.loads(
+            (root / "config/archive-witness-probe.json").read_text(encoding="utf-8"),
+            object_pairs_hook=_exact_object,
+        )
+        runtime = json.loads(
+            (root / "config/archive-v3-shadow-runtime.json").read_text(
+                encoding="utf-8"
+            ),
+            object_pairs_hook=_exact_object,
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        tomllib.TOMLDecodeError,
+        DuplicateName,
+    ) as error:
+        raise FreshReleaseError("fresh FINAL checked source is unreadable") from error
+    if manifest.get("package", {}).get("version") != "0.8.35":
+        raise FreshReleaseError("fresh FINAL Cargo version must be 0.8.35")
+    package_versions = [
+        package.get("version")
+        for package in lock.get("package", [])
+        if package.get("name") == "kioku-enclave"
+    ]
+    if package_versions != ["0.8.35"]:
+        raise FreshReleaseError("fresh FINAL lockfile version must be 0.8.35")
+    begin = "// ADR0022_SCHEMA_PHASE_DECLARATION_BEGIN"
+    end = "// ADR0022_SCHEMA_PHASE_DECLARATION_END"
+    if schema.count(begin) != 1 or schema.count(end) != 1:
+        raise FreshReleaseError("schema phase declaration delimiters are not exact")
+    fragment = schema.split(begin, 1)[1].split(end, 1)[0]
+    if fragment != _EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT:
+        raise FreshReleaseError("fresh FINAL schema phase is not exact 1/1/1")
+    if (
+        HEX64.fullmatch(FINAL_SCHEMA_BASELINE_SEAL_SHA256) is None
+        or FINAL_SCHEMA_BASELINE_SEAL_SHA256 == "0" * 64
+        or hashlib.sha256(seal_raw).hexdigest()
+        != FINAL_SCHEMA_BASELINE_SEAL_SHA256
+    ):
+        raise FreshReleaseError("fresh FINAL schema baseline seal is not pinned")
+    if (
+        not isinstance(seal, dict)
+        or set(seal) != {"_comment", "sealed", "digest", "history"}
+        or seal.get("sealed") is not True
+    ):
+        raise FreshReleaseError("fresh FINAL schema baseline is not sealed")
+    history = seal.get("history")
+    if (
+        not isinstance(seal.get("digest"), str)
+        or HEX64.fullmatch(seal["digest"]) is None
+        or seal["digest"] == "0" * 64
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(history[-1], dict)
+        or history[-1].get("digest") != seal["digest"]
+        or not isinstance(history[-1].get("chain"), str)
+        or HEX64.fullmatch(history[-1]["chain"]) is None
+        or history[-1]["chain"] == "0" * 64
+    ):
+        raise FreshReleaseError("fresh FINAL schema baseline history is invalid")
+    if probe != {
+        "schema_version": 1,
+        "mode": "off",
+        "project_id": "",
+        "project_number": "",
+        "database_id": "",
+    }:
+        raise FreshReleaseError("fresh FINAL witness probe is not exact off")
+    expected_runtime = {
+        "schema_version": 2,
+        "mode": "single-archive-wal-v1",
+        "archive_bucket": EXPECTED_INTENT["archive_bucket"],
+        "archive_gcs_project_number": PROJECT_NUMBER,
+        "registry_kms_version": "1",
+        "witness_project_id": PROJECT_ID,
+        "witness_project_number": PROJECT_NUMBER,
+        "witness_database_id": EXPECTED_INTENT["witness_database_id"],
+    }
+    if not isinstance(runtime, dict) or {
+        name: runtime.get(name) for name in expected_runtime
+    } != expected_runtime or set(runtime) != {
+        *expected_runtime,
+        "archive_binding_commitment",
+    }:
+        raise FreshReleaseError("fresh FINAL archive runtime is not exact active")
+    commitment = runtime.get("archive_binding_commitment")
+    if (
+        not isinstance(commitment, str)
+        or HEX64.fullmatch(commitment) is None
+        or commitment == "0" * 64
+    ):
+        raise FreshReleaseError("fresh FINAL archive binding commitment is invalid")
+    return commitment
+
+
 def validate_canary_binding(receipt_sha256: str, admin_uuid: str) -> None:
     if HEX64.fullmatch(receipt_sha256) is None or receipt_sha256 == "0" * 64:
         raise FreshReleaseError(
@@ -287,13 +474,33 @@ def validate_bootstrap_configuration(configuration: dict[str, str]) -> None:
     validate_canary_binding(receipt_sha256, admin_uuid)
 
 
-def bootstrap_release_binding(
+def validate_final_configuration(configuration: dict[str, str]) -> None:
+    commitment = validate_checked_final_source()
+    for name, expected in _EXPECTED_FINAL_CONFIGURATION.items():
+        if configuration.get(name) != expected:
+            raise FreshReleaseError(
+                f"fresh FINAL configuration does not match reviewed {name}"
+            )
+    if configuration.get("ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT") != commitment:
+        raise FreshReleaseError(
+            "fresh FINAL configuration does not match the checked binding commitment"
+        )
+    signup_limit = configuration.get("SIGNUP_LIMIT_PER_DAY", "")
+    if re.fullmatch(r"[1-9][0-9]{0,6}", signup_limit) is None:
+        raise FreshReleaseError("fresh FINAL signup mode must be positive")
+    validate_canary_binding(
+        configuration.get(CANARY_CONFIG_KEY, ""),
+        configuration.get("ADMIN_USER_IDS", ""),
+    )
+
+
+def _release_binding(
     canary_identity_preparation_sha256: str,
     canary_admin_uuid: str,
+    *,
+    genesis: str,
+    epoch: int,
 ) -> dict[str, Any]:
-    """Return the exact ordered schema-10-only BOOTSTRAP binding fields."""
-
-    validate_checked_bootstrap_source()
     validate_canary_binding(canary_identity_preparation_sha256, canary_admin_uuid)
     binding: dict[str, Any] = {
         "adr0022_generation_intent_sha256": GENERATION_INTENT_SHA256,
@@ -325,14 +532,48 @@ def bootstrap_release_binding(
             canary_identity_preparation_sha256
         ),
         "adr0022_canary_admin_uuid": canary_admin_uuid,
-        "production_genesis_wal_native": "off",
-        "schema_epoch_head": 0,
-        "schema_epoch_target": 0,
-        "schema_epoch_minimum_servable": 0,
+        "production_genesis_wal_native": genesis,
+        "schema_epoch_head": epoch,
+        "schema_epoch_target": epoch,
+        "schema_epoch_minimum_servable": epoch,
         "signup_mode": "positive",
     }
     if tuple(binding) != RELEASE_BINDING_FIELD_ORDER:
-        raise FreshReleaseError("fresh BOOTSTRAP release binding order drifted")
+        raise FreshReleaseError("fresh release binding order drifted")
+    return binding
+
+
+def bootstrap_release_binding(
+    canary_identity_preparation_sha256: str,
+    canary_admin_uuid: str,
+) -> dict[str, Any]:
+    """Return the exact ordered schema-10-only BOOTSTRAP binding fields."""
+
+    validate_checked_bootstrap_source()
+    return _release_binding(
+        canary_identity_preparation_sha256,
+        canary_admin_uuid,
+        genesis="off",
+        epoch=0,
+    )
+
+
+def final_release_binding(
+    canary_identity_preparation_sha256: str,
+    canary_admin_uuid: str,
+) -> dict[str, Any]:
+    """Return the exact ordered schema-10-only FINAL binding fields."""
+
+    validate_checked_final_source()
+    validate_canary_binding(canary_identity_preparation_sha256, canary_admin_uuid)
+    binding = _release_binding(
+        canary_identity_preparation_sha256,
+        canary_admin_uuid,
+        genesis="on",
+        epoch=1,
+    )
+    if tuple(binding) != RELEASE_BINDING_FIELD_ORDER:
+        raise FreshReleaseError("fresh FINAL release binding order drifted")
     return binding
 
 
@@ -343,3 +584,21 @@ def bootstrap_release_binding_from_configuration(
     return bootstrap_release_binding(
         configuration[CANARY_CONFIG_KEY], configuration["ADMIN_USER_IDS"]
     )
+
+
+def final_release_binding_from_configuration(
+    configuration: dict[str, str],
+) -> dict[str, Any]:
+    validate_final_configuration(configuration)
+    return final_release_binding(
+        configuration[CANARY_CONFIG_KEY], configuration["ADMIN_USER_IDS"]
+    )
+
+
+def fresh_release_binding_from_configuration(
+    configuration: dict[str, str], source_ref: str
+) -> dict[str, Any]:
+    require_exact_fresh_tag(source_ref)
+    if is_bootstrap_tag(source_ref):
+        return bootstrap_release_binding_from_configuration(configuration)
+    return final_release_binding_from_configuration(configuration)

@@ -22,7 +22,7 @@ evidence is instead a canonical record signed with an independently pinned Ed255
   symlinks, unsafe permissions, and repository-resident files are rejected. Include the
   reviewed production build inputs plus `LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT`, a
   push-only Artifact Registry identity distinct from the enclave runtime identity.
-  The fixed ADR-0022 fresh BOOTSTRAP additionally requires exactly one
+  Both fixed ADR-0022 fresh release roles additionally require the same exact
   `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256=<nonzero-lowercase-hex64>` and
   a sole lowercase UUIDv5 in `PRODUCTION_ADMIN_USER_IDS`; neither value is derived or
   read from a provider by this repository.
@@ -100,12 +100,12 @@ Rust artifacts, while `push` additionally publishes the image.
 ```
 
 The evidence directory contains the canonical evidence JSON and detached signature,
-schema-9 or exact fresh-BOOTSTRAP schema-10 `enclave-release.json`, SPDX SBOM, and scan result. It binds the source tag and
+schema-9 or exact fresh-role schema-10 `enclave-release.json`, SPDX SBOM, and scan result. It binds the source tag and
 commit, digest-qualified image, hashes of the build configuration/Dockerfile/Cargo lock,
 release metadata/SBOM/scan, and tool versions. It contains hashes rather than configuration
 values.
 
-### Fixed ADR-0022 fresh BOOTSTRAP role
+### Fixed ADR-0022 fresh BOOTSTRAP and FINAL roles
 
 The fresh BOOTSTRAP can be built and published only as
 `v0.8.35-adr0022-fresh-bootstrap.1` from the checked version-0.8.35, schema-0/0/0,
@@ -121,10 +121,19 @@ configuration bytes. The provider-free cross-repository format pin is
 commit, image digest, and canary values are not release evidence or provider authority.
 Generic release roles continue to emit schema 9.
 
+The separately reviewed FINAL source is reserved only as
+`v0.8.35-archive-v3-wal.1`. It must retain the exact fresh namespace and canary
+bindings, compile the reviewed additive ladder at 1/1/1, enable native Genesis,
+carry the complete active archive runtime plus the live one-way binding
+commitment, and pin the exact completed baseline-seal bytes. The BOOTSTRAP tree
+intentionally carries an empty FINAL seal pin, so renaming a tag, flipping the
+seal bit, or activating a config file cannot make it FINAL-eligible. FINAL
+aliases and BOOTSTRAP/FINAL role crossing are rejected before publication.
+
 ## Publish the immutable release
 
 Review the release plan first. It checks the trusted source-tag signer, signed evidence,
-schema-9 or exact fresh-BOOTSTRAP schema-10 production claims, bucket configuration, immutable registry digest, and exact
+schema-9 or exact fresh-role schema-10 production claims, bucket configuration, immutable registry digest, and exact
 release assets before changing remote state.
 
 ```sh
@@ -155,10 +164,10 @@ copied once to a private read-only snapshot before verification; only those same
 bytes are uploaded or compared on resume. Git replacement refs, legacy grafts, and ambient
 repository/object/config overrides are rejected throughout these source boundaries.
 
-Rolling the fixed fresh BOOTSTRAP additionally requires
-`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL=v0.8.35-adr0022-fresh-bootstrap.1` on the
-`release.sh --apply --roll` invocation. That acknowledgment does not bypass signed
-evidence, provider admission, the deployment source seal, or any production deny.
+`release.sh --roll` refuses both fixed fresh tags. Fresh rollout is owned only
+by the deployment repository's source-frozen `adr0022-fresh-launch` operation,
+which consumes the signed release plus the fresh provider/health/launch
+receipts without entering the legacy storage/KMS/VM rollout path.
 
 ## Roll the verified digest
 
@@ -167,6 +176,10 @@ operation downloads the immutable release assets and verifies the evidence, tag,
 metadata, image URI, and digest before acquiring deployment credentials. Then it updates
 the KMS digest binding, applies the exact saved Terraform plan, replaces the Confidential
 Space VM, performs health/containment checks, and records a private local ledger.
+
+The generic `enclave-roll` description and example below apply only to the
+legacy/generic release workflow. They are not an ADR-0022 fresh launch path;
+both fixed fresh tags are rejected there and must use `adr0022-fresh-launch`.
 
 Either invoke it from the monorepo:
 

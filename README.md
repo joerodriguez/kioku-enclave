@@ -610,8 +610,9 @@ name, signer, and peeled commit, pushes that exact object, and checks the remote
 Evidence assets are verified, uploaded, and resume-compared only from one private read-only byte
 snapshot. GitHub is used for immutable public release hosting, not execution or build identity.
 
-The fresh-generation BOOTSTRAP has one non-reusable publication role:
-`v0.8.35-adr0022-fresh-bootstrap.1`. Its private operator file must contain exactly one
+The fresh generation has two non-reusable publication roles: BOOTSTRAP
+`v0.8.35-adr0022-fresh-bootstrap.1` and FINAL
+`v0.8.35-archive-v3-wal.1`. Their private operator files must contain the same exact
 nonzero lowercase `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and exactly one
 lowercase UUIDv5 as the sole `PRODUCTION_ADMIN_USER_IDS` value. After production-profile
 selection those claims are named `ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and
@@ -619,15 +620,21 @@ selection those claims are named `ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` an
 It emits a 50-field schema-10 metadata object whose exact compact insertion-order encoding binds
 the reviewed fresh intent, index/media/archive/witness/KMS/runtime-SA/WIF/custom-role coordinates,
 those two opaque canary commitments, the checked 0/0/0 schema declaration, archive runtime and
-Genesis exact off, and positive signup. The signed evidence binds both those raw metadata bytes and
+Genesis exact off, and positive signup for BOOTSTRAP. FINAL retains the same
+namespace/canary tuple, requires exact 1/1/1, Genesis on, the active runtime and
+live one-way binding commitment, and a byte-pinned completed baseline seal.
+The BOOTSTRAP tree's FINAL seal pin is deliberately empty, so it remains
+FINAL-ineligible even if a caller substitutes the FINAL tag or config. The
+signed evidence binds both those raw metadata bytes and
 the once-read private configuration bytes; bundle verification derives the two expectations again
 from that same snapshot. The synthetic cross-repository fixture is
 [`config/adr0022-fresh-schema10-bootstrap-fixture.json`](config/adr0022-fresh-schema10-bootstrap-fixture.json)
 (3,094 bytes, SHA-256 `40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`).
-It is a format pin, not production evidence. Generic releases remain schema 9, and
-`scripts/release.sh --roll` additionally requires
-`KIOKU_CONFIRM_ADR0022_FRESH_BOOTSTRAP_ROLL` to name the exact BOOTSTRAP tag. Direct rollout
-verification supplies the exact mode-0600 image configuration; schema 10 derives its fresh bucket
+It is a BOOTSTRAP format pin, not production evidence. Generic releases remain
+schema 9. `scripts/release.sh --roll` refuses both fixed fresh tags; only the
+deployment repository's sealed `adr0022-fresh-launch` owner may roll them.
+Direct evidence verification supplies the exact mode-0600 image configuration;
+schema 10 derives its fresh bucket
 expectations from those hash-bound bytes, while schema 9 retains legacy bucket defaults.
 
 Production is the sole active owner evaluation environment. Signed releases either carry

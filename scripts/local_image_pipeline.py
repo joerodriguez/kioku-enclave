@@ -34,11 +34,12 @@ import urllib.parse
 from adr0022_fresh_release import (
     CANARY_CONFIG_KEY,
     FreshReleaseError,
-    bootstrap_release_binding_from_configuration,
+    fresh_release_binding_from_configuration,
     is_bootstrap_tag,
+    is_final_tag,
 )
 from select_build_configuration import (
-    FRESH_BOOTSTRAP_PROFILE_KEYS,
+    FRESH_RELEASE_PROFILE_KEYS,
     OPTIONAL_PROFILE_GROUPS,
     PROFILE_KEYS,
     SERVICE_ACCOUNT_PATTERN,
@@ -107,7 +108,7 @@ OPERATOR_CONFIG_KEYS = frozenset(
             "ARCHIVE_WITNESS_DATABASE_ID",
         )
     )
-    + tuple(f"PRODUCTION_{key}" for key in FRESH_BOOTSTRAP_PROFILE_KEYS)
+    + tuple(f"PRODUCTION_{key}" for key in FRESH_RELEASE_PROFILE_KEYS)
 )
 
 
@@ -1811,9 +1812,9 @@ def create_release_evidence(
     voice_quality_gate = run(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
-    bootstrap = is_bootstrap_tag(tag)
+    fresh_release = is_bootstrap_tag(tag) or is_final_tag(tag)
     metadata: dict[str, object] = {
-        "schema_version": 10 if bootstrap else 9,
+        "schema_version": 10 if fresh_release else 9,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -1840,9 +1841,11 @@ def create_release_evidence(
         "archive_v3_witness_database_id": configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"],
         "archive_v3_archive_binding_commitment": configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"],
     }
-    if bootstrap:
+    if fresh_release:
         try:
-            metadata.update(bootstrap_release_binding_from_configuration(configuration))
+            metadata.update(
+                fresh_release_binding_from_configuration(configuration, tag)
+            )
         except FreshReleaseError as error:
             raise PipelineError(str(error)) from error
     if metadata_path.exists():
@@ -1852,7 +1855,7 @@ def create_release_evidence(
     encoded_metadata = (
         json.dumps(
             metadata,
-            sort_keys=not bootstrap,
+            sort_keys=not fresh_release,
             separators=(",", ":"),
             ensure_ascii=True,
         )
@@ -1875,7 +1878,7 @@ def create_release_evidence(
         "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
         "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
     ]
-    if bootstrap:
+    if fresh_release:
         verify_command.extend(
             [
                 "--expected-adr0022-canary-identity-preparation-sha256",

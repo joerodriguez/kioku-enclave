@@ -16,9 +16,12 @@ from adr0022_fresh_release import (
     SOURCE_REPOSITORY as FRESH_SOURCE_REPOSITORY,
     FreshReleaseError,
     bootstrap_release_binding,
-    claims_bootstrap_role,
+    claims_fresh_role,
+    final_release_binding,
     is_bootstrap_tag,
+    is_final_tag,
     validate_checked_bootstrap_source,
+    validate_checked_final_source,
 )
 from archive_witness_probe_config import (
     ProbeConfigError,
@@ -173,36 +176,44 @@ def parse_metadata(path: Path) -> dict[str, object]:
     return parse_metadata_bytes(raw)
 
 
-def _validate_fresh_bootstrap(
+def _validate_fresh_release(
     arguments: argparse.Namespace, data: dict[str, object]
 ) -> None:
-    if not is_bootstrap_tag(arguments.tag):
-        reject("schema-10 metadata is reserved for the exact fresh BOOTSTRAP tag")
+    if not (is_bootstrap_tag(arguments.tag) or is_final_tag(arguments.tag)):
+        reject("schema-10 metadata is reserved for the exact fresh release tags")
+    phase = "BOOTSTRAP" if is_bootstrap_tag(arguments.tag) else "FINAL"
     if arguments.repository != "joerodriguez/kioku-enclave":
-        reject("fresh BOOTSTRAP repository is not the reviewed source repository")
+        reject(f"fresh {phase} repository is not the reviewed source repository")
     if arguments.image_repository != FRESH_IMAGE_REPOSITORY:
-        reject("fresh BOOTSTRAP image repository is not exact")
+        reject(f"fresh {phase} image repository is not exact")
     if data["source_repository"] != FRESH_SOURCE_REPOSITORY:
-        reject("fresh BOOTSTRAP source_repository is not exact")
+        reject(f"fresh {phase} source_repository is not exact")
     if data["image_uri"] != f"{FRESH_IMAGE_REPOSITORY}:{arguments.tag}":
-        reject("fresh BOOTSTRAP tagged image URI is not exact")
+        reject(f"fresh {phase} tagged image URI is not exact")
     if (
         data["gcs_bucket"] != EXPECTED_INTENT["index_bucket"]
         or data["gcs_media_bucket"] != EXPECTED_INTENT["media_bucket"]
         or data["gcs_legacy_media_bucket"] != EXPECTED_INTENT["legacy_media_bucket"]
     ):
-        reject("fresh BOOTSTRAP GCS namespace is not exact")
+        reject(f"fresh {phase} GCS namespace is not exact")
     try:
-        validate_checked_bootstrap_source()
-        expected_binding = bootstrap_release_binding(
-            arguments.expected_adr0022_canary_identity_preparation_sha256,
-            arguments.expected_adr0022_canary_admin_uuid,
-        )
+        if phase == "BOOTSTRAP":
+            validate_checked_bootstrap_source()
+            expected_binding = bootstrap_release_binding(
+                arguments.expected_adr0022_canary_identity_preparation_sha256,
+                arguments.expected_adr0022_canary_admin_uuid,
+            )
+        else:
+            validate_checked_final_source()
+            expected_binding = final_release_binding(
+                arguments.expected_adr0022_canary_identity_preparation_sha256,
+                arguments.expected_adr0022_canary_admin_uuid,
+            )
     except FreshReleaseError as error:
         reject(str(error))
     actual_binding = {name: data[name] for name in RELEASE_BINDING_FIELD_ORDER}
     if actual_binding != expected_binding:
-        reject("fresh BOOTSTRAP generation/canary/schema binding is not exact")
+        reject(f"fresh {phase} generation/canary/schema binding is not exact")
 
 
 def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
@@ -224,10 +235,10 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
 
     schema_version = data["schema_version"]
     if schema_version == 10:
-        _validate_fresh_bootstrap(arguments, data)
+        _validate_fresh_release(arguments, data)
     else:
-        if claims_bootstrap_role(arguments.tag):
-            reject("fresh BOOTSTRAP tags require exact schema-10 metadata")
+        if claims_fresh_role(arguments.tag):
+            reject("fresh release tags require exact schema-10 metadata")
         if (
             arguments.expected_adr0022_canary_identity_preparation_sha256
             or arguments.expected_adr0022_canary_admin_uuid

@@ -3,7 +3,7 @@
 
 This executable is deliberately suitable for ``KIOKU_ENCLAVE_EVIDENCE_VERIFY``:
 it uses an externally pinned Ed25519 key, checks the exact bytes named by the
-signed manifest, validates schema-9 or exact fresh-BOOTSTRAP schema-10 release
+signed manifest, validates schema-9 or either exact fresh schema-10 release
 metadata, and emits the verified
 source and digest bindings as JSON.  It never reads cloud credentials or
 changes local or remote state.
@@ -244,7 +244,7 @@ def main() -> None:
         fail("metadata and SBOM must be JSON objects")
     if metadata["schema_version"] == 10:
         if config_bytes is None:
-            fail("schema-10 fresh BOOTSTRAP verification requires the exact configuration")
+            fail("schema-10 fresh release verification requires the exact configuration")
         try:
             operator_values = local_image_pipeline._parse_operator_config(config_bytes)
             configuration = local_image_pipeline.selected_configuration(
@@ -255,7 +255,7 @@ def main() -> None:
                 shadow_runtime_config_path=arguments.archive_v3_shadow_runtime_config,
             )
         except (local_image_pipeline.PipelineError, SystemExit):
-            fail("schema-10 fresh BOOTSTRAP configuration is invalid")
+            fail("schema-10 fresh release configuration is invalid")
         arguments.expected_adr0022_canary_identity_preparation_sha256 = configuration[
             "ADR0022_CANARY_IDENTITY_PREPARATION_SHA256"
         ]

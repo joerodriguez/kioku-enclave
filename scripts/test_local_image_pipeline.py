@@ -487,7 +487,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn('"schema_version": 10 if bootstrap else 9', source)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
