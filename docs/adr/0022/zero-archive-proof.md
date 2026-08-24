@@ -211,15 +211,23 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
     `1c022582a44cdf9a3ddab20c5afb8c4e06f56f29`, image
     `sha256:f5f7949421198332dd040c751a0aa3ab1c114a06b1fe5aef89b49f0b83d348b1`,
     image-config SHA-256
+    `69eb07b18016f554a0983da172995e4039a36b1e89af15aa74f00d1aed620d2d`;
+  - gate on / native-session Genesis witness successor:
+    `v0.8.34-archive-v3-wal.4`, source
+    `1991273382e301e8513cfc73da1e351f215e5724`, image
+    `sha256:a8688a7510cbf4542f9532600726965e3be42a665e99e3e42fce04d83e05106e`,
+    image-config SHA-256
     `69eb07b18016f554a0983da172995e4039a36b1e89af15aa74f00d1aed620d2d`.
 
-  All three are signed prereleases with immutable evidence. Deployment commit
+  All four are signed prereleases with immutable evidence. Deployment commit
   `e10a20bcc049bd7285ea2a7384b3bae4cdc4f417` admitted the exact pair and successor;
   successor `e62cabaac3d67a8e3f0c1a7f74d96bebc515f49f` additionally routes `.3` through
   the same archive-bucket and witness-database authority preauthorization,
-  post-health finalization, and failure recovery as `.1`/`.2`. `.1` and `.2` remain
-  the destructive two-image registry floor; `.3` may roll only after Take #1 and
-  must be promoted again from the same signed evidence if retirement removed it. The
+  post-health finalization, and failure recovery as `.1`/`.2`; deployment
+  `9e305b2f73cb41689511372fde8e238e97b5c31c` admits `.4` through that same boundary.
+  `.1` and `.2` remain the destructive two-image registry floor; `.4` is the reviewed
+  post-Take native-session witness successor and must be promoted again from the same
+  signed evidence if retirement removed it. The
   deployment source also contains the frozen, disabled-until-Take-#1 operators for the
   three-bucket visible-zero floor, both proof takes, and exact registry retirement.
   Shipping those operators proves only that the rollback and proof mechanisms exist;
