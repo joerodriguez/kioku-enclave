@@ -659,12 +659,18 @@ mod tests {
 
     #[test]
     fn production_phase_declarations_are_coherent() {
-        assert_eq!(
-            usize::try_from(SCHEMA_EPOCH_HEAD).unwrap(),
-            SCHEMA_LADDER.len()
-        );
-        assert!(SCHEMA_EPOCH_TARGET <= SCHEMA_EPOCH_HEAD);
-        assert!(SCHEMA_EPOCH_MIN_SERVABLE <= SCHEMA_EPOCH_TARGET);
+        // Exercise the phase relation through runtime values. BOOTSTRAP is
+        // intentionally 0/0/0, and comparing those declarations directly
+        // makes Clippy constant-fold the assertions instead of checking the
+        // same relation future signed phases must satisfy.
+        let [head, target, minimum] = std::hint::black_box([
+            SCHEMA_EPOCH_HEAD,
+            SCHEMA_EPOCH_TARGET,
+            SCHEMA_EPOCH_MIN_SERVABLE,
+        ]);
+        assert_eq!(usize::try_from(head).unwrap(), SCHEMA_LADDER.len());
+        assert!(target <= head);
+        assert!(minimum <= target);
     }
 
     #[test]
@@ -945,15 +951,16 @@ mod tests {
 
     #[test]
     fn the_declared_servable_floor_is_accepted() {
+        let minimum = std::hint::black_box(SCHEMA_EPOCH_MIN_SERVABLE);
         let floor = ArchiveEpoch {
-            epoch: SCHEMA_EPOCH_MIN_SERVABLE,
-            chain: chain_digest(SCHEMA_EPOCH_MIN_SERVABLE),
+            epoch: minimum,
+            chain: chain_digest(minimum),
         };
         validate_servable_epoch(floor).unwrap();
-        if SCHEMA_EPOCH_MIN_SERVABLE > 0 {
+        if minimum > 0 {
             let below = ArchiveEpoch {
-                epoch: SCHEMA_EPOCH_MIN_SERVABLE - 1,
-                chain: chain_digest(SCHEMA_EPOCH_MIN_SERVABLE - 1),
+                epoch: minimum - 1,
+                chain: chain_digest(minimum - 1),
             };
             assert!(validate_servable_epoch(below).is_err());
         }
