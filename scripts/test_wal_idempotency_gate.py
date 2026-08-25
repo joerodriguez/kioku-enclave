@@ -803,7 +803,14 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # The branch remains 15 rows with the identical key set, classification, order,
 # and call-expression hashes. The only third-state delta is async_main's
 # enclosing owner-body hash; no Store constructor or policy surface moved.
-EXPECTED_STORE_SURFACE_SHA256 = "fcc890be7f410b5cd943979e6636abc0a02c55ee69a63f857874c6a6cd879746"
+# ADR-0022 schema-rollout observation then appended the content-free aggregate
+# in 9b69295 and its durable `at_target` counter in e6af718, both after the
+# already-pinned Store construction. Mechanical scans of exact archived 8ce41f5,
+# 9b69295, e6af718, and d3e1acf sources retain 15 rows, the identical key set,
+# classifications, order, and every call-expression hash. Only async_main's
+# enclosing owner-body hash moves: 2ac9598c -> d93b298d -> 51b06274. The final
+# independently derived third-state digest is recorded below.
+EXPECTED_STORE_SURFACE_SHA256 = "8301a8b0e4a188492902a910288f7231edc539f0c6772d74b6f7fa80a3559db9"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -1053,7 +1060,13 @@ EXPECTED_WORKER_SPAWN_COUNT = 29
 # same fresh deaacbb archive recorded by the Store-surface pin, count stays 29
 # with zero additions, removals, reclassifications, order moves, or spawn-call
 # expression moves. All 28 other owner-body hashes are byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "f66254fc4eec2453129198c53787ee9084029799c0d90a5805debe5fe4901fa0"
+# The schema-rollout observation additions in 9b69295/e6af718 move only that
+# same async_main owner-body hash after the worker topology is established.
+# Exact archived 8ce41f5, 9b69295, e6af718, and d3e1acf scans retain all 29
+# keys, classes, order, and spawn-expression hashes; the async_main owner hash
+# alone follows 2ac9598c -> d93b298d -> 51b06274. The independently derived
+# final inventory digest is pinned below.
+EXPECTED_WORKER_SPAWN_SHA256 = "736db14515770ed40f625ea6042cb59fa6183e96f9f2cf66a1f31570b7b56045"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

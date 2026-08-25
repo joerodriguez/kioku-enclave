@@ -435,11 +435,13 @@ file is exact `off` with an empty namespace.
 
 The eight `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
 [`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). The
-reviewed Genesis release carries the complete canonical `single-archive-wal-v1` production
-tuple and one-way binding commitment. It is eligible only for an exact
-`vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it
-off, an exact WAL tag with an off profile fails, and no operator, repository variable, or dispatch
-input can override it. Under that signed profile startup consumes the one-shot binding
+current BOOTSTRAP source carries the canonical all-empty `off` form, so its signed image
+cannot construct archive-v3 provider authority or arm Genesis. After the fresh namespace and
+one-way binding exist, a separately reviewed FINAL source may carry the complete canonical
+`single-archive-wal-v1` tuple. That active form remains eligible only for an exact
+`vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it off,
+an exact WAL tag with an off profile fails, and no operator, repository variable, or dispatch
+input can override it. Under that signed FINAL profile startup consumes the one-shot binding
 capability to relaunch durable selected archives and the Genesis trigger can use it for
 new-account convergence; construction itself performs no provider I/O and no route receives
 the capability.
@@ -601,8 +603,39 @@ mode-0600 Ed25519 private key signs those exact bytes; verification requires an 
 pinned public-key fingerprint. Two reviewed publication interfaces are available: standalone
 `scripts/release.sh` and the frozen-source `scripts/release_train_enclave.py publish` adapter.
 Both fail before mutation unless the signed source tag and local evidence verify; the adapter
-also binds the coordinator plan, exact artifact, and frozen detached source. GitHub is used for
-immutable public release hosting, not execution or build identity.
+also binds the coordinator plan, exact artifact, and frozen detached source. Both disable Git
+replacement-object resolution and reject replacement refs, grafts, and ambient repository or
+object overrides. Publication captures one annotated-tag object ID, validates its signed embedded
+name, signer, and peeled commit, pushes that exact object, and checks the remote object plus peel.
+Evidence assets are verified, uploaded, and resume-compared only from one private read-only byte
+snapshot. GitHub is used for immutable public release hosting, not execution or build identity.
+
+The fresh generation has two non-reusable publication roles: BOOTSTRAP
+`v0.8.35-adr0022-fresh-bootstrap.1` and FINAL
+`v0.8.35-archive-v3-wal.1`. Their private operator files must contain the same exact
+nonzero lowercase `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and exactly one
+lowercase UUIDv5 as the sole `PRODUCTION_ADMIN_USER_IDS` value. After production-profile
+selection those claims are named `ADR0022_CANARY_IDENTITY_PREPARATION_SHA256` and
+`ADMIN_USER_IDS`. The pipeline does not create, read, or guess either provider value.
+It emits a 50-field schema-10 metadata object whose exact compact insertion-order encoding binds
+the reviewed fresh intent, index/media/archive/witness/KMS/runtime-SA/WIF/custom-role coordinates,
+those two opaque canary commitments, the checked 0/0/0 schema declaration, archive runtime and
+Genesis exact off, and positive signup for BOOTSTRAP. FINAL retains the same
+namespace/canary tuple, requires exact 1/1/1, Genesis on, the active runtime and
+live one-way binding commitment, and a byte-pinned completed baseline seal.
+The BOOTSTRAP tree's FINAL seal pin is deliberately empty, so it remains
+FINAL-ineligible even if a caller substitutes the FINAL tag or config. The
+signed evidence binds both those raw metadata bytes and
+the once-read private configuration bytes; bundle verification derives the two expectations again
+from that same snapshot. The synthetic cross-repository fixture is
+[`config/adr0022-fresh-schema10-bootstrap-fixture.json`](config/adr0022-fresh-schema10-bootstrap-fixture.json)
+(3,094 bytes, SHA-256 `40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`).
+It is a BOOTSTRAP format pin, not production evidence. Generic releases remain
+schema 9. `scripts/release.sh --roll` refuses both fixed fresh tags; only the
+deployment repository's sealed `adr0022-fresh-launch` owner may roll them.
+Direct evidence verification supplies the exact mode-0600 image configuration;
+schema 10 derives its fresh bucket
+expectations from those hash-bound bytes, while schema 9 retains legacy bucket defaults.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record

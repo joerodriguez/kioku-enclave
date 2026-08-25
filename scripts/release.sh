@@ -4,8 +4,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -P "${SCRIPT_DIR}/.." && pwd -P)"
 APPLY=false
 ROLL=false
 TAG=""
@@ -23,6 +23,13 @@ COORDINATOR_SIGNATURE=""
 COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
 COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 PUSH_DEPLOYMENT_SOURCE_SEAL=""
+ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
+ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.1"
+RELEASE_CONFIG_SNAPSHOT=""
+SOURCE_ARCHIVE=""
+NOTES=""
+RELEASE_STATE_ERROR=""
+EVIDENCE_SNAPSHOT=""
 
 usage() {
   cat <<'EOF'
@@ -53,6 +60,36 @@ EOF
 die() { echo "Error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
 
+cleanup() {
+  [[ -z "$RELEASE_STATE_ERROR" ]] || rm -f -- "$RELEASE_STATE_ERROR"
+  [[ -z "$NOTES" ]] || rm -f -- "$NOTES"
+  [[ -z "$SOURCE_ARCHIVE" ]] || rm -f -- "$SOURCE_ARCHIVE"
+  [[ -z "$RELEASE_CONFIG_SNAPSHOT" ]] || rm -f -- "$RELEASE_CONFIG_SNAPSHOT"
+  if [[ -n "$EVIDENCE_SNAPSHOT" && -d "$EVIDENCE_SNAPSHOT" && ! -L "$EVIDENCE_SNAPSHOT" ]]; then
+    chmod 700 "$EVIDENCE_SNAPSHOT" 2>/dev/null || true
+    for asset in enclave-local-build-evidence.json enclave-local-build-evidence.sig enclave-release.json enclave-sbom.spdx.json enclave-scan.json; do
+      chmod 600 "$EVIDENCE_SNAPSHOT/$asset" 2>/dev/null || true
+      rm -f -- "$EVIDENCE_SNAPSHOT/$asset"
+    done
+    rmdir "$EVIDENCE_SNAPSHOT" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+reject_git_object_substitution() {
+  local replacements graft_path repository_root
+  replacements="$(git --no-replace-objects replace -l)" \
+    || die "could not inspect Git replacement refs"
+  [[ -z "$replacements" ]] || die "Git replacement refs are not accepted"
+  graft_path="$(git --no-replace-objects rev-parse --path-format=absolute --git-path info/grafts)" \
+    || die "could not resolve the Git graft-file path"
+  [[ -n "$graft_path" && "$graft_path" == /* ]] || die "Git returned an unsafe graft-file path"
+  [[ ! -e "$graft_path" && ! -L "$graft_path" ]] || die "Git graft files are not accepted"
+  repository_root="$(git --no-replace-objects rev-parse --path-format=absolute --show-toplevel)" \
+    || die "could not resolve the source repository"
+  [[ "$repository_root" == "$REPO_ROOT" ]] || die "Git source repository differs from the release root"
+}
+
 [[ $# -ge 1 ]] || { usage; exit 2; }
 TAG="$1"
 shift
@@ -73,6 +110,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "release tag must look like v1.2.3 or v1.2.3-rc.1"
+if [[ "$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp] && "$TAG" != "$ADR0022_FRESH_BOOTSTRAP_TAG" ]]; then
+  die "ADR-0022 fresh BOOTSTRAP tag must be exactly $ADR0022_FRESH_BOOTSTRAP_TAG"
+fi
+if [[ "$TAG" =~ ^v0\.8\.35-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_FINAL_TAG" ]]; then
+  die "ADR-0022 fresh FINAL tag must be exactly $ADR0022_FRESH_FINAL_TAG"
+fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
 [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || die "--config must name the local build configuration used for this image"
@@ -88,9 +131,28 @@ if [[ "$ROLL" == true && ( -z "$DEPLOYMENT_REPO_PATH" || ! -d "$DEPLOYMENT_REPO_
 fi
 
 for command_name in git gh python3 openssl; do need "$command_name"; done
+python3 - <<'PY' || die "ambient Git overrides are not accepted"
+import os
+
+allowed = {
+    "GIT_ASKPASS",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_PAGER",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_TERMINAL_PROMPT",
+}
+unexpected = sorted(name for name in os.environ if name.startswith("GIT_") and name not in allowed)
+if unexpected:
+    raise SystemExit("ambient Git overrides are not accepted: " + ", ".join(unexpected))
+if os.environ.get("GIT_NO_REPLACE_OBJECTS", "1") != "1":
+    raise SystemExit("GIT_NO_REPLACE_OBJECTS must be exactly 1")
+PY
+export GIT_NO_REPLACE_OBJECTS=1
 cd "$REPO_ROOT"
+reject_git_object_substitution
 if [[ -z "$FROZEN_COMMIT" ]]; then
-  [[ "$(git branch --show-current)" == main ]] || die "releases must be prepared from local main"
+  [[ "$(git --no-replace-objects branch --show-current)" == main ]] || die "releases must be prepared from local main"
 else
   [[ "$FROZEN_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "--frozen-commit must be a lowercase 40-character commit"
   [[ -n "$COORDINATOR_RECEIPT" && -f "$COORDINATOR_RECEIPT" ]] || die "--frozen-commit requires a signed coordinator advancement receipt"
@@ -101,14 +163,13 @@ else
   fi
   [[ -f "$COORDINATOR_SIGNATURE" ]] || die "coordinator advancement signature is missing"
 fi
-[[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
+[[ -z "$(git --no-replace-objects status --porcelain)" ]] || die "working tree is not clean"
 
 # Read the exact local configuration through the same no-shell, ownership- and
 # schema-checked parser used for image builds.  Only non-secret release claims
 # cross this boundary.
 RELEASE_CONFIG_SNAPSHOT="$(mktemp)"
 chmod 600 "$RELEASE_CONFIG_SNAPSHOT"
-trap 'rm -f "$RELEASE_CONFIG_SNAPSHOT"' EXIT
 RELEASE_CONFIG_FIELDS="$(python3 - "$CONFIG_FILE" "$TAG" "$RELEASE_CONFIG_SNAPSHOT" <<'PY'
 import sys
 import os
@@ -127,15 +188,17 @@ keys = (
     "PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME",
     "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET",
     "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE",
-    "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE",
 )
 print("\x1f".join((*[configuration[key] for key in keys], builder)))
 PY
 )" || die "local release configuration is invalid"
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
-IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
+IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
+if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" ) ]]; then
+  die "ADR-0022 fresh releases roll only through the sealed deployment adr0022-fresh-launch owner"
+elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/
   # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed
   # by the pre-serving --run-archive-v3-phase1-canary subcommand and, since the
@@ -173,16 +236,16 @@ fi
 
 # Keep the active-image rollout quarantine entirely local. It runs before the
 # origin refresh so an ineligible roll performs no network or external action.
-git fetch origin main
-ORIGIN_MAIN="$(git rev-parse origin/main)"
+git --no-replace-objects fetch origin main
+ORIGIN_MAIN="$(git --no-replace-objects rev-parse origin/main)"
 if [[ -z "$FROZEN_COMMIT" ]]; then
-  COMMIT="$(git rev-parse HEAD)"
+  COMMIT="$(git --no-replace-objects rev-parse HEAD)"
   [[ "$COMMIT" == "$ORIGIN_MAIN" ]] || die "local main must exactly match origin/main"
 else
   COMMIT="$FROZEN_COMMIT"
-  [[ "$(git rev-parse HEAD)" == "$COMMIT" ]] || die "detached frozen mode requires HEAD to equal --frozen-commit"
-  git cat-file -e "${COMMIT}^{commit}" || die "frozen commit is not present locally"
-  git merge-base --is-ancestor "$COMMIT" "$ORIGIN_MAIN" || die "frozen commit is not an ancestor of fetched origin/main"
+  [[ "$(git --no-replace-objects rev-parse HEAD)" == "$COMMIT" ]] || die "detached frozen mode requires HEAD to equal --frozen-commit"
+  git --no-replace-objects cat-file -e "${COMMIT}^{commit}" || die "frozen commit is not present locally"
+  git --no-replace-objects merge-base --is-ancestor "$COMMIT" "$ORIGIN_MAIN" || die "frozen commit is not an ancestor of fetched origin/main"
   python3 scripts/verify_coordinator_advancement_receipt.py \
     --receipt "$COORDINATOR_RECEIPT" \
     --signature "$COORDINATOR_SIGNATURE" \
@@ -194,14 +257,103 @@ else
 fi
 IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
 
+# Snapshot every release asset through a stable descriptor before verification.
+# Verification, upload, retry comparison, and final readback all use only these
+# read-only bytes; the caller's mutable evidence directory is never reopened.
+EVIDENCE_SNAPSHOT="$(mktemp -d)"
+chmod 700 "$EVIDENCE_SNAPSHOT"
+python3 - "$EVIDENCE_DIR" "$EVIDENCE_SNAPSHOT" <<'PY' \
+  || die "could not create an immutable evidence snapshot"
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+names = (
+    "enclave-local-build-evidence.json",
+    "enclave-local-build-evidence.sig",
+    "enclave-release.json",
+    "enclave-sbom.spdx.json",
+    "enclave-scan.json",
+)
+source_directory = Path(sys.argv[1]).absolute()
+destination_directory = Path(sys.argv[2]).absolute()
+source_metadata = source_directory.lstat()
+destination_metadata = destination_directory.lstat()
+if (
+    stat.S_ISLNK(source_metadata.st_mode)
+    or not stat.S_ISDIR(source_metadata.st_mode)
+    or source_metadata.st_uid != os.geteuid()
+    or stat.S_ISLNK(destination_metadata.st_mode)
+    or not stat.S_ISDIR(destination_metadata.st_mode)
+    or destination_metadata.st_uid != os.geteuid()
+    or stat.S_IMODE(destination_metadata.st_mode) != 0o700
+):
+    raise SystemExit("evidence directories have unsafe ownership, type, or mode")
+for name in names:
+    source = source_directory / name
+    before = source.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        raise SystemExit(f"unsafe release asset: {name}")
+    descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise SystemExit(f"release asset changed while opening: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        data = b"".join(chunks)
+        if (
+            opened.st_size != after.st_size
+            or opened.st_mtime_ns != after.st_mtime_ns
+            or len(data) != after.st_size
+        ):
+            raise SystemExit(f"release asset changed while reading: {name}")
+    finally:
+        os.close(descriptor)
+    destination = destination_directory / name
+    output = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(output, view)
+            if written <= 0:
+                raise SystemExit(f"could not snapshot release asset: {name}")
+            view = view[written:]
+        os.fsync(output)
+        os.fchmod(output, 0o400)
+    finally:
+        os.close(output)
+directory_descriptor = os.open(destination_directory, os.O_RDONLY)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+destination_directory.chmod(0o500)
+PY
+EVIDENCE_DIR="$EVIDENCE_SNAPSHOT"
 MANIFEST="$EVIDENCE_DIR/enclave-local-build-evidence.json"
 SIGNATURE="$EVIDENCE_DIR/enclave-local-build-evidence.sig"
 METADATA="$EVIDENCE_DIR/enclave-release.json"
 SBOM="$EVIDENCE_DIR/enclave-sbom.spdx.json"
 SCAN="$EVIDENCE_DIR/enclave-scan.json"
 SOURCE_ARCHIVE="$(mktemp)"
-trap 'rm -f "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
-git archive --format=tar --output="$SOURCE_ARCHIVE" "$COMMIT" || die "could not materialize the immutable frozen source archive"
+git --no-replace-objects archive --format=tar --output="$SOURCE_ARCHIVE" "$COMMIT" || die "could not materialize the immutable frozen source archive"
 [[ -s "$MANIFEST" && -s "$SIGNATURE" && -s "$METADATA" && -s "$SBOM" && -s "$SCAN" ]] || die "evidence directory must contain the signed manifest, release metadata, SBOM, and scan result"
 
 EVIDENCE_BUNDLE="$(python3 scripts/verify_local_evidence_bundle.py \
@@ -242,24 +394,52 @@ if metadata["billing_enforcement_mode"] != sys.argv[2]:
     raise SystemExit("release metadata billing-enforcement mode differs from selected configuration")
 print("ok")
 PY
-)" || die "schema-9 release metadata does not match the checked source/configuration"
-[[ "$METADATA_CHECKS" == ok ]] || die "schema-9 release metadata check did not complete"
+)" || die "signed release metadata does not match the checked source/configuration"
+[[ "$METADATA_CHECKS" == ok ]] || die "signed release metadata check did not complete"
 
 verify_tag_signer() {
-  local verification fingerprints
-  verification="$(git verify-tag --raw "$TAG" 2>&1)" || die "$TAG does not have a valid signed-tag signature"
+  local tag_object="$1" verification fingerprints expected_fingerprint
+  verification="$(git --no-replace-objects verify-tag --raw "$tag_object" 2>&1)" \
+    || die "$tag_object does not have a valid signed-tag signature"
+  expected_fingerprint="$RELEASE_SIGNER_FINGERPRINT"
   if [[ "$RELEASE_SIGNER_FINGERPRINT" == SHA256:* ]]; then
     fingerprints="$(printf '%s\n' "$verification" | sed -nE 's/^.* key (SHA256:[A-Za-z0-9+\/=]+).*$/\1/p')"
   else
     fingerprints="$(printf '%s\n' "$verification" | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print toupper($3); if (NF >= 12) print toupper($NF) }')"
-    RELEASE_SIGNER_FINGERPRINT="$(printf '%s' "$RELEASE_SIGNER_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
+    expected_fingerprint="$(printf '%s' "$RELEASE_SIGNER_FINGERPRINT" | tr '[:lower:]' '[:upper:]')"
   fi
-  grep -qxF "$RELEASE_SIGNER_FINGERPRINT" <<< "$fingerprints" || die "$TAG was not signed by RELEASE_SIGNER_FINGERPRINT"
+  grep -qxF "$expected_fingerprint" <<< "$fingerprints" || die "$tag_object was not signed by RELEASE_SIGNER_FINGERPRINT"
 }
 
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || die "create the signed local tag before building release evidence"
-[[ "$(git rev-list -n 1 "$TAG")" == "$COMMIT" ]] || die "signed tag does not point at local main"
-verify_tag_signer
+tag_object_embedded_name() {
+  local tag_object="$1"
+  git --no-replace-objects cat-file tag "$tag_object" | python3 -c '
+import sys
+header = sys.stdin.buffer.read().split(b"\n\n", 1)[0]
+names = [line[4:] for line in header.splitlines() if line.startswith(b"tag ")]
+if len(names) != 1:
+    raise SystemExit("annotated tag object has an ambiguous tag header")
+try:
+    sys.stdout.write(names[0].decode("utf-8"))
+except UnicodeDecodeError:
+    raise SystemExit("annotated tag name is not UTF-8")
+'
+}
+
+revalidate_tag_object() {
+  [[ "$(git --no-replace-objects cat-file -t "$TAG_OBJECT")" == tag ]] \
+    || die "release tag must be an annotated tag object"
+  [[ "$(tag_object_embedded_name "$TAG_OBJECT")" == "$TAG" ]] \
+    || die "signed annotated tag name does not exactly match the requested tag"
+  [[ "$(git --no-replace-objects rev-parse "${TAG_OBJECT}^{commit}")" == "$COMMIT" ]] \
+    || die "signed annotated tag object does not peel to the frozen commit"
+  verify_tag_signer "$TAG_OBJECT"
+}
+
+TAG_OBJECT="$(git --no-replace-objects rev-parse --verify "refs/tags/${TAG}^{tag}")" \
+  || die "create the signed annotated local tag before building release evidence"
+[[ "$TAG_OBJECT" =~ ^[0-9a-f]{40}$ ]] || die "release tag object ID is malformed"
+revalidate_tag_object
 
 EXPECTED_ASSETS=(enclave-local-build-evidence.json enclave-local-build-evidence.sig enclave-release.json enclave-sbom.spdx.json enclave-scan.json)
 EXPECTED_PRERELEASE=true
@@ -267,7 +447,6 @@ if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   EXPECTED_PRERELEASE=false
 fi
 NOTES="$(mktemp)"
-trap 'rm -f "$NOTES" "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
 printf '%s\n' \
   "Open-source Kioku enclave release **${TAG}**." "" \
   "| Field | Value |" "|---|---|" \
@@ -296,6 +475,38 @@ compare_existing_release_assets() {
   rm -rf "$downloaded"
 }
 
+verify_remote_tag_binding() {
+  local remote_fields remote_object remote_commit
+  remote_fields="$(git --no-replace-objects ls-remote --tags origin \
+    "refs/tags/$TAG" "refs/tags/$TAG^{}" | python3 -c '
+import re
+import sys
+
+tag = sys.argv[1]
+expected_refs = {f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"}
+values = {}
+for raw_line in sys.stdin.buffer.read().splitlines():
+    fields = raw_line.split(b"\t")
+    if len(fields) != 2:
+        raise SystemExit("remote tag readback is malformed")
+    try:
+        object_id = fields[0].decode("ascii")
+        reference = fields[1].decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("remote tag readback is not textual")
+    if not re.fullmatch(r"[0-9a-f]{40}", object_id) or reference in values:
+        raise SystemExit("remote tag readback is malformed or ambiguous")
+    values[reference] = object_id
+if set(values) != expected_refs:
+    raise SystemExit("remote tag readback did not return object and peeled refs")
+sys.stdout.write(values[f"refs/tags/{tag}"] + "\x1f" + values[f"refs/tags/{tag}^{{}}"])
+' "$TAG"
+)" || die "could not verify the remote annotated tag binding"
+  IFS=$'\x1f' read -r remote_object remote_commit <<< "$remote_fields"
+  [[ "$remote_object" == "$TAG_OBJECT" && "$remote_commit" == "$COMMIT" ]] \
+    || die "remote tag object or peeled commit differs from the verified tag"
+}
+
 echo "Local evidence is valid for ${TAG}: ${DIGEST_URI}"
 if [[ "$APPLY" != true ]]; then
   echo "Dry run only. --apply would push the already-signed tag and create an immutable GitHub Release."
@@ -304,16 +515,20 @@ if [[ "$APPLY" != true ]]; then
 fi
 
 need gcloud
+reject_git_object_substitution
+[[ "$(git --no-replace-objects rev-parse HEAD)" == "$COMMIT" ]] \
+  || die "source commit changed before publication"
+revalidate_tag_object
 IMMUTABLE_RELEASES_ENABLED="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
   "repos/${REPOSITORY}/immutable-releases" --jq .enabled)"
 [[ "$IMMUTABLE_RELEASES_ENABLED" == true ]] || die "GitHub immutable releases must be enabled before publication"
 REGISTRY_DIGEST="$(gcloud --impersonate-service-account="$BUILDER_SERVICE_ACCOUNT" \
   artifacts docker images describe "$DIGEST_URI" --format='value(image_summary.digest)')"
 [[ "$REGISTRY_DIGEST" == "$DIGEST" ]] || die "Artifact Registry did not resolve the signed image digest"
-git push origin "$TAG"
+git --no-replace-objects push origin "${TAG_OBJECT}:refs/tags/${TAG}"
+verify_remote_tag_binding
 
 RELEASE_STATE_ERROR="$(mktemp)"
-trap 'rm -f "$RELEASE_STATE_ERROR" "$NOTES" "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
 if ! release_json="$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isImmutable,isPrerelease,assets 2>"$RELEASE_STATE_ERROR")"; then
   release_error="$(<"$RELEASE_STATE_ERROR")"
   # gh has no machine-readable not-found exit code. Accept only its exact
@@ -364,6 +579,8 @@ PY
   compare_existing_release_assets
   fi
 
+verify_remote_tag_binding
+
 if [[ "$ROLL" == true ]]; then
   ROLL_PATH="${DEPLOYMENT_REPO_PATH}/${LOCAL_ROLL_SCRIPT}"
   [[ -f "$ROLL_PATH" && -x "$ROLL_PATH" ]] || die "configured local roll script is not executable: $ROLL_PATH"
@@ -373,7 +590,7 @@ if [[ "$ROLL" == true ]]; then
   [[ "$FINAL_PUSH_DEPLOYMENT_SOURCE_SEAL" == "$PUSH_DEPLOYMENT_SOURCE_SEAL" ]] \
     || die "push deployment source seal changed after release preflight"
   KIOKU_PUSH_RUNTIME_SOURCE_SEAL="$PUSH_DEPLOYMENT_SOURCE_SEAL" \
-    "$ROLL_PATH" enclave-roll --release-tag "$TAG" --image-uri "$DIGEST_URI" --digest "$DIGEST" --confirm "ROLL ENCLAVE $DIGEST" --apply
+    "$ROLL_PATH" enclave-roll --release-tag "$TAG" --image-uri "$DIGEST_URI" --digest "$DIGEST" --config "$RELEASE_CONFIG_SNAPSHOT" --confirm "ROLL ENCLAVE $DIGEST" --apply
 fi
 
 echo "Published ${TAG} for ${DIGEST_URI}."

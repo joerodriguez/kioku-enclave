@@ -1061,6 +1061,20 @@ async fn async_main() {
         )
         .await
         .unwrap_or_else(|error| panic!("Failed to relaunch WAL serving authorities: {error}"));
+    info!(
+        metric = "archive_v3_schema_epoch_rollout",
+        schema_epoch_head = crate::schema_ladder::SCHEMA_EPOCH_HEAD,
+        schema_epoch_target = crate::schema_ladder::SCHEMA_EPOCH_TARGET,
+        schema_epoch_min_servable = crate::schema_ladder::SCHEMA_EPOCH_MIN_SERVABLE,
+        selected = wal_serving_relaunch_counts.selected(),
+        relaunched = wal_serving_relaunch_counts.relaunched,
+        at_target = wal_serving_relaunch_counts.at_target,
+        advanced = wal_serving_relaunch_counts.advanced,
+        behind_target = wal_serving_relaunch_counts.behind_target,
+        unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
+        unavailable = wal_serving_relaunch_counts.unavailable,
+        "authenticated the content-free schema epoch rollout state before request admission"
+    );
     if wal_serving_relaunch_counts.relaunched > 0 {
         info!(
             relaunched = wal_serving_relaunch_counts.relaunched,

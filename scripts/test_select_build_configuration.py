@@ -12,6 +12,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT / "scripts"))
+from adr0022_fresh_release import BOOTSTRAP_TAG, FINAL_TAG  # noqa: E402
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
 DOCKERFILE = ROOT / "Dockerfile"
@@ -73,6 +76,9 @@ APNS_CONFIGURATION = {
     "APNS_SANDBOX_KEY_ID": "PUSHSBX123",
 }
 
+CANARY_IDENTITY_PREPARATION_SHA256 = "a" * 64
+CANARY_ADMIN_UUID = "12345678-1234-5678-9234-123456789abc"
+
 
 def environment() -> dict[str, str]:
     result = {
@@ -91,6 +97,28 @@ def environment() -> dict[str, str]:
     result["PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"] = "kioku-production-indexes"
     for key, value in APNS_CONFIGURATION.items():
         result[f"PRODUCTION_{key}"] = value
+    return result
+
+
+def fresh_bootstrap_environment() -> dict[str, str]:
+    result = environment()
+    result.update(
+        {
+            "PRODUCTION_ENCLAVE_KMS_PROJECT": "kioku-joerodriguez",
+            "PRODUCTION_ENCLAVE_KMS_LOCATION": "us-central1",
+            "PRODUCTION_ENCLAVE_KMS_KEY_RING": "kioku-adr0022-v1",
+            "PRODUCTION_ENCLAVE_KMS_KEY": "kioku-kek-adr0022-v1",
+            "PRODUCTION_ENCLAVE_GCS_BUCKET": "kioku-joerodriguez-adr0022-v1-indexes",
+            "PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET": "kioku-joerodriguez-adr0022-v1-media",
+            "PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET": "kioku-joerodriguez-adr0022-v1-indexes",
+            "PRODUCTION_ENCLAVE_RUN_SA_EMAIL": "kioku-enclave-adr0022-v1@kioku-joerodriguez.iam.gserviceaccount.com",
+            "PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE": "//iam.googleapis.com/projects/640329636251/locations/global/workloadIdentityPools/enclave-attest/providers/attest",
+            "PRODUCTION_ADMIN_USER_IDS": CANARY_ADMIN_UUID,
+            "PRODUCTION_SIGNUP_LIMIT_PER_DAY": "25",
+            "PRODUCTION_GENESIS_WAL_NATIVE": "off",
+            "PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256": CANARY_IDENTITY_PREPARATION_SHA256,
+        }
+    )
     return result
 
 
@@ -311,7 +339,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('choices=("production", "evaluation")', pipeline)
         self.assertIn("selected_configuration(", pipeline)
         self.assertIn("check_voice_release_gate.py", pipeline)
-        self.assertIn('"schema_version": 9', pipeline)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', pipeline)
         self.assertIn('"release_url"', pipeline)
         self.assertIn("enclave-release.json", pipeline)
         self.assertNotIn("GITHUB_OUTPUT", pipeline)
@@ -355,8 +383,8 @@ class SelectorTests(unittest.TestCase):
             self.assertIn(f'"{manifest_field}"', pipeline)
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn("GCS_LEGACY_MEDIA_BUCKET", dockerfile)
-        self.assertIn('"schema_version": 9', pipeline)
-        self.assertIn("schema_version must be 9", verifier)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', pipeline)
+        self.assertIn("schema_version must be 9 or 10", verifier)
 
     def test_probe_mode_defaults_off_with_empty_baked_namespace(self) -> None:
         completed, selected = self.run_selector("production", environment())
@@ -522,17 +550,16 @@ class SelectorTests(unittest.TestCase):
         completed, selected = self.run_selector(
             "production", environment(), source_ref=wal_tag
         )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(selected, "")
+        self.assertIn("requires the complete active runtime profile", completed.stderr)
+
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref="v1.2.3-rc.1"
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", selected)
-        self.assertIn(
-            "ARCHIVE_V3_ARCHIVE_BUCKET=kioku-joerodriguez-archive-v3\n", selected
-        )
-        self.assertIn(
-            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT="
-            "b541d598e3442fdcf516c0af34a69907"
-            "b44c9767d86b8277cb08d12eb0f1fe48\n",
-            selected,
-        )
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("kioku-joerodriguez-archive-v3", selected)
 
         pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
@@ -676,6 +703,131 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("GENESIS_WAL_NATIVE=on\n", content)
         self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", content)
+
+    def test_fresh_bootstrap_selects_only_the_exact_full_tuple(self) -> None:
+        completed, content = self.run_selector(
+            "production", fresh_bootstrap_environment(), source_ref=BOOTSTRAP_TAG
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for line in (
+            "ENCLAVE_KMS_KEY_RING=kioku-adr0022-v1\n",
+            "ENCLAVE_KMS_KEY=kioku-kek-adr0022-v1\n",
+            "ENCLAVE_GCS_BUCKET=kioku-joerodriguez-adr0022-v1-indexes\n",
+            "ENCLAVE_GCS_MEDIA_BUCKET=kioku-joerodriguez-adr0022-v1-media\n",
+            "ENCLAVE_RUN_SA_EMAIL=kioku-enclave-adr0022-v1@kioku-joerodriguez.iam.gserviceaccount.com\n",
+            f"ADMIN_USER_IDS={CANARY_ADMIN_UUID}\n",
+            f"ADR0022_CANARY_IDENTITY_PREPARATION_SHA256={CANARY_IDENTITY_PREPARATION_SHA256}\n",
+            "GENESIS_WAL_NATIVE=off\n",
+            "ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n",
+        ):
+            self.assertIn(line, content)
+
+    def test_fresh_bootstrap_refuses_wrong_tag_profile_and_image_tuple(self) -> None:
+        exact = fresh_bootstrap_environment()
+        completed, content = self.run_selector(
+            "production", exact, source_ref="main"
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("only for an exact fixed tag", completed.stderr)
+        for tag in (
+            "v0.8.34-adr0022-fresh-bootstrap.1",
+            "v0.8.35-adr0022-fresh-bootstrap.2",
+            "v0.8.35-adr0022-fresh-bootstrap.1-extra",
+            "v0.8.35.adr0022-fresh-bootstrap.1",
+            "v0.8.35-ADR0022-FRESH-BOOTSTRAP.1",
+        ):
+            with self.subTest(tag=tag):
+                completed, content = self.run_selector(
+                    "production", exact, source_ref=tag
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+                self.assertIn("must be exactly", completed.stderr)
+        completed, content = self.run_selector(
+            "evaluation", exact, source_ref=BOOTSTRAP_TAG
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+
+        for key, value in (
+            ("PROJECT_ID", "wrong-project"),
+            ("PRODUCTION_ENCLAVE_KMS_KEY_RING", "legacy-ring"),
+            ("PRODUCTION_ENCLAVE_KMS_KEY", "legacy-key"),
+            ("PRODUCTION_ENCLAVE_GCS_BUCKET", "legacy-indexes"),
+            ("PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET", "legacy-media"),
+            ("PRODUCTION_ENCLAVE_RUN_SA_EMAIL", "legacy-sa@kioku-joerodriguez.iam.gserviceaccount.com"),
+            ("PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE", "//iam.googleapis.com/projects/640329636251/locations/global/workloadIdentityPools/other/providers/other"),
+            ("PRODUCTION_GENESIS_WAL_NATIVE", "on"),
+            ("PRODUCTION_SIGNUP_LIMIT_PER_DAY", "0"),
+        ):
+            with self.subTest(key=key):
+                changed = dict(exact)
+                changed[key] = value
+                completed, content = self.run_selector(
+                    "production", changed, source_ref=BOOTSTRAP_TAG
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+
+    def test_fresh_bootstrap_refuses_missing_or_malformed_canary_binding(self) -> None:
+        exact = fresh_bootstrap_environment()
+        for key, value in (
+            ("PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256", ""),
+            ("PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256", "0" * 64),
+            ("PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256", "A" * 64),
+            ("PRODUCTION_ADMIN_USER_IDS", "12345678-1234-4678-9234-123456789abc"),
+            ("PRODUCTION_ADMIN_USER_IDS", CANARY_ADMIN_UUID.upper()),
+            ("PRODUCTION_ADMIN_USER_IDS", CANARY_ADMIN_UUID + "," + CANARY_ADMIN_UUID),
+        ):
+            with self.subTest(key=key, value=value):
+                changed = dict(exact)
+                changed[key] = value
+                completed, content = self.run_selector(
+                    "production", changed, source_ref=BOOTSTRAP_TAG
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+
+    def test_fresh_final_aliases_and_current_bootstrap_source_are_ineligible(self) -> None:
+        exact = fresh_bootstrap_environment()
+        exact["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
+        active_runtime = {
+            "schema_version": 2,
+            "mode": "single-archive-wal-v1",
+            "archive_bucket": "kioku-joerodriguez-adr0022-v1-archive",
+            "archive_gcs_project_number": "640329636251",
+            "registry_kms_version": "1",
+            "witness_project_id": "kioku-joerodriguez",
+            "witness_project_number": "640329636251",
+            "witness_database_id": "adr0022-v1-witness",
+            "archive_binding_commitment": "d" * 64,
+        }
+        for tag in (
+            "v0.8.35-archive-v3-wal.2",
+            "v0.8.35-archive-v3-wal.1-extra",
+            "v0.8.35-ARCHIVE-V3-WAL.1",
+        ):
+            with self.subTest(tag=tag):
+                completed, content = self.run_selector(
+                    "production",
+                    exact,
+                    source_ref=tag,
+                    shadow_runtime_config=active_runtime,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(content, "")
+                self.assertIn("must be exactly", completed.stderr)
+
+        completed, content = self.run_selector(
+            "production",
+            exact,
+            source_ref=FINAL_TAG,
+            shadow_runtime_config=active_runtime,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("fresh FINAL schema phase is not exact 1/1/1", completed.stderr)
 
 
 if __name__ == "__main__":

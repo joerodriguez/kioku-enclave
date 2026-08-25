@@ -1,11 +1,58 @@
-# ADR-0022 — zero-archive proof for the sealed schema re-baseline
+# ADR-0022 — fresh-generation proof for the sealed schema re-baseline
 
-**Status: NO TAKE HAS BEEN RECORDED. This document is the obligation, not the discharge.**
+**Status: THE FRESH-GENERATION PROOF HAS NOT BEEN RECORDED. This document is the
+obligation, not the discharge.**
 
 `scripts/schema_baseline_seal.json` names this file as the proof for the
 `d5ff84db…2dfb` re-pin. The seal ships `"sealed": false` precisely because the
 proof below has not been taken. Nothing in this file may be read as evidence
-that any archive count was ever observed to be zero.
+that the fresh provider generation exists or that its signed BOOTSTRAP and FINAL
+releases have run.
+
+## Primary launch proof — fresh production generation
+
+The original production namespace is disposable pre-launch history. Its retained and
+soft-deleted objects are quarantined and are not inputs, predecessors, rollback targets, or
+recovery sources for the launch. The baseline may be sealed against a *different*, brand-new
+production generation because the re-baseline failure below is reachable only when an archive
+already exists in the generation being activated.
+
+The fresh proof must bind all of the following before the seal flips:
+
+1. A source-frozen provider receipt proves the exact new index, media, archive, and
+   witness-export buckets; named Firestore database; KMS key/version; and runtime service
+   account were created as a new generation with the reviewed policies. It also proves that
+   no legacy bucket, database, key, runtime principal, release, rollback, or recovery owner is
+   referenced by the active generation.
+2. A signed BOOTSTRAP image at the sole fixed
+   `v0.8.35-adr0022-fresh-bootstrap.1` role, built from this 0/0/0 source with the exact all-empty archive-v3
+   profile and `GENESIS_WAL_NATIVE=off`, carries exact schema-10 metadata binding the canonical
+   fresh-generation tuple plus the owner-sealed pre-build canary identity receipt SHA and sole
+   derived UUIDv5 from the same private config snapshot. It runs under the priority-800 public deny. A bounded
+   temporary /32 operator authority creates exactly one deterministic canary through the real signup
+   path and records only the one-way archive-binding commitment. The runtime-off image cannot
+   create or serve an archive-v3 WAL owner.
+3. The reviewed FINAL source at the sole fixed
+   `v0.8.35-archive-v3-wal.1` role binds that exact provider receipt and commitment, sets the
+   baseline seal, appends only the reviewed first additive schema step, and compiles schema
+   coordinates 1/1/1. Its signed metadata and image evidence bind the complete fresh tuple;
+   no legacy image remains an admitted predecessor.
+4. While the public deny remains present, FINAL proves one canonical Genesis birth at epoch 1,
+   authenticated routed serving, the reviewed product canaries, complete export, explicit
+   physical deletion, and exact image/KMS/archive containment. The temporary operator identity
+   and /32 rule are removed before the fixed deny can be removed.
+5. Only the sealed FINAL owner removes the named deny, then proves public content-free health
+   and exact live image/provider identity. Failure at any point leaves the fresh generation
+   denied and never falls back to the legacy namespace.
+
+The checked-in receipts, signed release coordinates, and live proof values will be appended to
+this section by the reviewed FINAL source change. Until then `sealed` remains false.
+
+## Superseded fallback — physical zero of the legacy namespace
+
+The remainder of this document records the older physical-zero/Take ceremony. It remains a
+valid fallback if the fresh-generation launch is abandoned, but it grants no authority to wait
+for, adopt, restore, or roll the legacy namespace on the primary launch path.
 
 ## Why a proof is required at all
 
@@ -110,10 +157,14 @@ No step may be skipped or reordered.
    genesis. The birth-witness latch now makes that fail *closed* at owner open
    rather than corrupt silently, but it must be **prevented**, not merely
    detected.
-5. **Deploy the re-baselined image** (instance replacement).
-6. **Proof take #2** after healthy, before reopening signup. Full Groups 1-4,
-   plus the successful-signup count between takes must be 0. Append below.
-7. **Positive birth-witness check.** Create one throwaway account through the
+5. **Deploy a fresh exact signup-zero re-baselined image** (instance
+   replacement). This is the reviewed `.1` image, not the later positive
+   witness image and not any schema-ladder phase.
+6. **Proof take #2** after healthy, while signup and public ingress remain
+   closed. Full Groups 1-4, plus the successful-signup count between takes
+   must be 0. Append below.
+7. **Positive birth-witness check.** Promote and roll the immutable signed
+   `.4` bytes, then create one throwaway account through the
    real signup path. Before signup, record the count of the content-free
    `archive_v3_genesis_birth_witness` metric. Require exactly one new event,
    with the deployed target epoch, `allocator_tables=3`, and `valid=true`, and
@@ -122,17 +173,64 @@ No step may be skipped or reordered.
    (including `AUTOINCREMENT` on `audio_segments`, `utterances`, and
    `screenshots`), publishes it to the durable `wal_authoritative` terminal,
    and successfully launches its serving authority. A recovered/pre-existing
-   terminal never emits it. Delete the throwaway account; re-run Groups 1-2 to
-   zero. **Every other step proves an absence. This is the only one that proves
-   the deployed image is the right image.**
-8. **Flip the seal** in one reviewed PR: `scripts/schema_baseline_seal.json`
-   `"sealed": true`, and `SEALED_EXPECTED = True` in
-   `scripts/test_schema_ladder_gate.py`. Both, or the gate fails — which is the
-   point.
-9. **Reopen signup.** Restore the daily cap.
+   terminal never emits it. Delete the throwaway account through the ordinary
+   lifecycle owner. **Every other step proves an absence. This is the only one
+   that proves the deployed image is the right image.**
+8. **Restore exact zero on a third fresh signup-zero `.1`.** Replace `.4`,
+   retire the witness account's terminal tombstones through the ordinary
+   owner, and require newest logical zero plus a stable full provider-zero
+   read. Complete the same receipt that began the positive witness; neither a
+   logical delete nor a `.4` shutdown alone completes it.
+9. **Seal the baseline and append the first step in reviewed source.** Bind
+   the two authenticated zero takes, positive witness, explicit physical
+   deletion, and restored-zero receipts into this document. In the same
+   reviewed source line, set `scripts/schema_baseline_seal.json` to
+   `"sealed": true`, set `SEALED_EXPECTED = True` in
+   `scripts/test_schema_ladder_gate.py`, append only the reviewed
+   `0001_capture_events_stream_sequence` step, and set the schema coordinates
+   to HEAD/TARGET/minimum `1/0/0`. The gate must refuse any step before those
+   proof bytes exist.
+10. **Roll a distinct signed signup-positive HEAD (`1/0/0`).** Require its
+    startup aggregate to report `selected=0`, `relaunched=0`, `at_target=0`,
+    `advanced=0`, `behind_target=0`, `unservable_epoch=0`, and
+    `unavailable=0`, then create exactly one account through the real signup
+    path and retain it. Its Genesis marker is epoch 0 because TARGET is still
+    0; this is the sole archive carried into the next phase.
+11. **Roll a distinct signed signup-positive TARGET (`1/1/0`).** The structured
+    owner must bind the exact HEAD receipt and account/archive lineage and
+    require `selected=1`, `relaunched=1`, `at_target=1`,
+    `behind_target=0`, `unservable_epoch=0`, and `unavailable=0`. `at_target`
+    comes from the durably re-read marker and survives a process exit after
+    the commit but before the startup metric. `advanced` is only a
+    launch-local diagnostic and is therefore either 1 on the direct launch or
+    0 on the replacement; the exact HEAD receipt, singleton/audit/attempt
+    chain, and monotone epoch marker prove the sole 0 -> 1 transition. Reject
+    more than one bound `advanced=1` aggregate. Prove an authenticated,
+    non-creating routed read, then delete the retained account to explicit
+    `physical_complete`; do not claim global zero yet.
+12. **Roll a distinct signed signup-zero MINIMUM (`1/1/1`).** Its startup
+    aggregate must have `selected=0`, `relaunched=0`, `at_target=0`,
+    `advanced=0`, `behind_target=0`, `unservable_epoch=0`, and
+    `unavailable=0`. Select the dedicated cutover owner, retire the TARGET
+    account's tombstones, and require newest logical zero plus a stable full
+    provider-zero read before proceeding.
+13. **Roll a distinct signed signup-positive FINAL (`1/1/1`).** While the
+    public deny remains present, require the same exact all-zero startup
+    aggregate as MINIMUM, then prove a fresh valid Genesis birth at epoch 1,
+    authenticated routed serving, and explicit physical deletion of the
+    witness account. FINAL is a separate tag, image digest, and baked-config
+    binding even though its schema coordinates equal MINIMUM's.
+14. **Reopen only through the sealed FINAL owner.** That owner alone may
+    remove the named public deny and restore the reviewed positive signup
+    policy. Finish with public content-free health and exact image, KMS, and
+    archive-authority verification. No earlier phase may reopen signup.
 
 **Abort rule:** any nonzero count at step 6 means stop. Delete the offending
 archives (empty by construction, minutes old), re-run step 3, restart at step 5.
+After step 6, any phase mismatch means stop with signup closed and the public
+deny present; recover or replace only through that phase's reviewed owner and
+repeat its complete proof. Never skip forward to FINAL or reopen around a
+failed receipt.
 
 ## Cutover mechanisms and remaining evidence
 
@@ -227,9 +325,11 @@ archives (empty by construction, minutes old), re-run step 3, restart at step 5.
   `9e305b2f73cb41689511372fde8e238e97b5c31c` admits `.4` through that same boundary;
   deployment `0580e974fd6aa780f44f208e8f7ad6fd765d0fe4` adds the source-frozen,
   Take-2-bound one-account witness owner without changing the Terraform source digest.
-  `.1` and `.2` remain the destructive two-image registry floor; `.4` is the reviewed
-  post-Take native-session witness successor and must be promoted again from the same
-  signed evidence if retirement removed it. The
+  `.1` and `.2` remain the destructive two-image registry floor; they are not
+  the later schema HEAD/TARGET/MINIMUM/FINAL releases and cannot substitute
+  for one of those four roles. `.4` is the reviewed post-Take native-session
+  witness successor and must be promoted again from the same signed evidence
+  if retirement removed it. The
   deployment source also contains the frozen, disabled-until-Take-#1 operators for the
   three-bucket visible-zero floor, both proof takes, and exact registry retirement.
   Shipping those operators proves only that the rollback and proof mechanisms exist;

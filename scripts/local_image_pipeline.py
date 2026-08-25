@@ -31,7 +31,15 @@ import time
 import tomllib
 import urllib.parse
 
+from adr0022_fresh_release import (
+    CANARY_CONFIG_KEY,
+    FreshReleaseError,
+    fresh_release_binding_from_configuration,
+    is_bootstrap_tag,
+    is_final_tag,
+)
 from select_build_configuration import (
+    FRESH_RELEASE_PROFILE_KEYS,
     OPTIONAL_PROFILE_GROUPS,
     PROFILE_KEYS,
     SERVICE_ACCOUNT_PATTERN,
@@ -68,6 +76,7 @@ CONFIG_SECRET_KEYS = frozenset({
 DIRECT_ENV_BASE = frozenset({
     "PATH", "HOME", "XDG_STATE_HOME", "LC_ALL", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME",
 })
+SAFE_AMBIENT_GIT_ENV = frozenset({"GIT_NO_REPLACE_OBJECTS", "GIT_PAGER"})
 DIRECT_ENV_TRANSPORT = frozenset({
     "KIOKU_NATIVE_BUILDER_NAME", "KIOKU_NATIVE_BUILDER_ID", "DOCKER_HOST",
     "DOCKER_SSH_KNOWN_HOSTS", "DOCKER_SSH_HOST_KEY_SHA256", "DOCKER_SSH_COMMAND",
@@ -99,6 +108,7 @@ OPERATOR_CONFIG_KEYS = frozenset(
             "ARCHIVE_WITNESS_DATABASE_ID",
         )
     )
+    + tuple(f"PRODUCTION_{key}" for key in FRESH_RELEASE_PROFILE_KEYS)
 )
 
 
@@ -603,6 +613,18 @@ def reviewed_cloud_config_directory(path_value: str) -> Path:
 def configure_direct_child_environment(stage: str) -> None:
     """Install the direct CLI's reviewed, stage-scoped child environment."""
     global _CHILD_ENVIRONMENT, _CLOUDSDK_CONFIG
+    unexpected_git = sorted(
+        name
+        for name in os.environ
+        if name.startswith("GIT_") and name not in SAFE_AMBIENT_GIT_ENV
+    )
+    if unexpected_git:
+        raise PipelineError(
+            "ambient Git overrides are not accepted by the local release pipeline: "
+            + ", ".join(unexpected_git)
+        )
+    if os.environ.get("GIT_NO_REPLACE_OBJECTS", "1") != "1":
+        raise PipelineError("GIT_NO_REPLACE_OBJECTS must be exactly 1 when supplied")
     present_credentials = sorted(
         name for name in DIRECT_CREDENTIAL_ENV if os.environ.get(name)
     )
@@ -616,6 +638,7 @@ def configure_direct_child_environment(stage: str) -> None:
     child = {
         name: value for name, value in os.environ.items() if name in DIRECT_ENV_BASE
     }
+    child["GIT_NO_REPLACE_OBJECTS"] = "1"
     if stage in {"preflight", "build", "push"}:
         docker_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_DOCKER_CONFIG", "")
         buildx_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_BUILDX_CONFIG", "")
@@ -906,22 +929,50 @@ def cargo_audit_executable() -> str:
 
 
 def source_commit(source_ref: str) -> tuple[str, int]:
-    if run(["git", "status", "--porcelain"], capture=True).stdout:
+    reject_git_replacement_objects()
+    if run(["git", "--no-replace-objects", "status", "--porcelain"], capture=True).stdout:
         raise PipelineError("release/image builds require a clean source tree, including no untracked files")
-    commit = run(["git", "rev-parse", "HEAD"], capture=True).stdout.strip()
+    commit = run(["git", "--no-replace-objects", "rev-parse", "HEAD"], capture=True).stdout.strip()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise PipelineError("could not determine the source commit")
-    timestamp = run(["git", "log", "-1", "--format=%ct", commit], capture=True).stdout.strip()
+    timestamp = run(
+        ["git", "--no-replace-objects", "log", "-1", "--format=%ct", commit],
+        capture=True,
+    ).stdout.strip()
     if not timestamp.isdecimal():
         raise PipelineError("could not determine the source commit timestamp")
     tag = release_tag(source_ref)
     if tag is not None:
         tag_commit = run(
-            ["git", "rev-list", "-n", "1", f"refs/tags/{tag}"], capture=True
+            [
+                "git", "--no-replace-objects", "rev-list", "-n", "1",
+                f"refs/tags/{tag}",
+            ],
+            capture=True,
         ).stdout.strip()
         if tag_commit != commit:
             raise PipelineError("release tag must exist locally and resolve exactly to HEAD")
     return commit, int(timestamp)
+
+
+def reject_git_replacement_objects() -> None:
+    """Reject every repository-local object substitution mechanism."""
+    replacements = run(
+        ["git", "--no-replace-objects", "replace", "-l"], capture=True
+    ).stdout.splitlines()
+    if replacements:
+        raise PipelineError("Git replacement refs are not accepted by the local release pipeline")
+    graft_path = run(
+        [
+            "git", "--no-replace-objects", "rev-parse", "--path-format=absolute",
+            "--git-path", "info/grafts",
+        ],
+        capture=True,
+    ).stdout.strip()
+    if not graft_path or not Path(graft_path).is_absolute():
+        raise PipelineError("could not resolve the repository graft-file path")
+    if os.path.lexists(graft_path):
+        raise PipelineError("Git graft files are not accepted by the local release pipeline")
 
 
 def verify_source_unchanged(source_ref: str, expected_commit: str) -> None:
@@ -932,9 +983,13 @@ def verify_source_unchanged(source_ref: str, expected_commit: str) -> None:
 
 def immutable_source_archive_digest(commit: str) -> str:
     """Hash the exact deterministic tar stream used for the Docker context."""
+    reject_git_replacement_objects()
+    if _CHILD_ENVIRONMENT is None:
+        raise PipelineError("reviewed child environment has not been configured")
     completed = subprocess.run(
-        ["git", "archive", "--format=tar", commit],
+        ["git", "--no-replace-objects", "archive", "--format=tar", commit],
         cwd=ROOT,
+        env=dict(_CHILD_ENVIRONMENT),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -948,9 +1003,16 @@ def immutable_source_subset_digest(commit: str, *paths: str) -> str:
     """Hash one exact committed input subset for an explicit BuildKit cache key."""
     if not paths or any(not re.fullmatch(r"[A-Za-z0-9._/-]+", path) for path in paths):
         raise PipelineError("immutable source subset paths are invalid")
+    reject_git_replacement_objects()
+    if _CHILD_ENVIRONMENT is None:
+        raise PipelineError("reviewed child environment has not been configured")
     completed = subprocess.run(
-        ["git", "archive", "--format=tar", commit, "--", *paths],
+        [
+            "git", "--no-replace-objects", "archive", "--format=tar", commit,
+            "--", *paths,
+        ],
         cwd=ROOT,
+        env=dict(_CHILD_ENVIRONMENT),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -1003,7 +1065,13 @@ def source_snapshot(commit: str, *, expected_archive_digest: str | None = None):
         archive = directory / "source.tar"
         context = directory / "context"
         context.mkdir(mode=0o700)
-        run(["git", "archive", "--format=tar", f"--output={archive}", commit])
+        reject_git_replacement_objects()
+        run(
+            [
+                "git", "--no-replace-objects", "archive", "--format=tar",
+                f"--output={archive}", commit,
+            ]
+        )
         archive_digest = sha256(archive)
         if expected_archive_digest is not None and archive_digest != expected_archive_digest:
             raise PipelineError("immutable source archive changed between attestation and build")
@@ -1026,12 +1094,14 @@ def verify() -> None:
     """Run every former CI test/format/lint/audit gate in the former order."""
     contract_tests = (
         "test_local_image_pipeline.py",
+        "test_adr0022_fresh_release.py",
         "test_agent_verify.py",
         "test_rust_build_lifecycle.py",
         "test_bootstrap_local_operator_config.py",
         "test_archive_witness_probe_config.py",
         "test_archive_v3_shadow_runtime_config.py",
         "test_select_build_configuration.py",
+        "test_verify_release_metadata.py",
         "test_local_build_evidence.py",
         "test_coordinator_advancement_receipt.py",
         "test_release.py",
@@ -1411,7 +1481,11 @@ def sha256(path: Path, *, mode: int | None = None) -> str:
 
 
 def source_repository() -> str:
-    value = run(["git", "remote", "get-url", "origin"], capture=True).stdout.strip()
+    reject_git_replacement_objects()
+    value = run(
+        ["git", "--no-replace-objects", "remote", "get-url", "origin"],
+        capture=True,
+    ).stdout.strip()
     if value.startswith("git@github.com:"):
         value = "https://github.com/" + value.removeprefix("git@github.com:")
     if value.endswith(".git"):
@@ -1738,8 +1812,9 @@ def create_release_evidence(
     voice_quality_gate = run(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
-    metadata = {
-        "schema_version": 9,
+    fresh_release = is_bootstrap_tag(tag) or is_final_tag(tag)
+    metadata: dict[str, object] = {
+        "schema_version": 10 if fresh_release else 9,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -1766,28 +1841,53 @@ def create_release_evidence(
         "archive_v3_witness_database_id": configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"],
         "archive_v3_archive_binding_commitment": configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"],
     }
+    if fresh_release:
+        try:
+            metadata.update(
+                fresh_release_binding_from_configuration(configuration, tag)
+            )
+        except FreshReleaseError as error:
+            raise PipelineError(str(error)) from error
     if metadata_path.exists():
         raise PipelineError("refusing to overwrite release metadata")
+    # Schema 10's producer order is part of the reviewed cross-repository
+    # contract. Schema 9 retains its historical canonical sorted encoding.
+    encoded_metadata = (
+        json.dumps(
+            metadata,
+            sort_keys=not fresh_release,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("utf-8")
     write_immutable_file(
         metadata_path,
-        (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        encoded_metadata,
         "release metadata",
     )
-    run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/verify_release_metadata.py"),
-            str(metadata_path),
-            "--repository", owner_repository,
-            "--tag", tag,
-            "--commit", source_commit,
-            "--image-repository", image_uri.rsplit(":", 1)[0],
-            "--expected-gcs-bucket", configuration["ENCLAVE_GCS_BUCKET"],
-            "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
-            "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
-        ],
-        capture=True,
-    )
+    verify_command = [
+        sys.executable,
+        str(ROOT / "scripts/verify_release_metadata.py"),
+        str(metadata_path),
+        "--repository", owner_repository,
+        "--tag", tag,
+        "--commit", source_commit,
+        "--image-repository", image_uri.rsplit(":", 1)[0],
+        "--expected-gcs-bucket", configuration["ENCLAVE_GCS_BUCKET"],
+        "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
+        "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
+    ]
+    if fresh_release:
+        verify_command.extend(
+            [
+                "--expected-adr0022-canary-identity-preparation-sha256",
+                configuration[CANARY_CONFIG_KEY],
+                "--expected-adr0022-canary-admin-uuid",
+                configuration["ADMIN_USER_IDS"],
+            ]
+        )
+    run(verify_command, capture=True)
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     gcloud_version_lines = [
         line.strip()

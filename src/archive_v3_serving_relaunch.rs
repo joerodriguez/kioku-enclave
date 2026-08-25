@@ -48,14 +48,14 @@ fn require_config_agreement(selected_users: usize, deployment_active: bool) -> R
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelaunchOutcome {
     /// Installed, serving, and at this binary's target epoch.
-    Serving,
+    Serving { advanced: bool },
     /// Installed and serving, at the epoch the archive recorded. Every
     /// intermediate epoch is a complete servable state, so this is a degraded
     /// but correct outcome — not an outage.
-    ServingBehindTarget,
+    ServingBehindTarget { advanced: bool },
     /// Installed and serving, at an epoch this binary cannot describe.
     /// Structurally unreachable — see [`advance_to_target_epoch`].
-    ServingUnservableEpoch,
+    ServingUnservableEpoch { advanced: bool },
 }
 
 /// Content-free startup counts. Counts only — never a user id or an epoch.
@@ -67,8 +67,24 @@ enum RelaunchOutcome {
 pub(crate) struct RelaunchCounts {
     pub(crate) relaunched: usize,
     pub(crate) unavailable: usize,
+    /// Selections whose durably re-read epoch marker is at or beyond this
+    /// binary's target. Unlike `advanced`, this remains true after a process
+    /// exits between settling the advance and emitting the startup metric.
+    pub(crate) at_target: usize,
+    /// Selections whose durable schema marker advanced by at least one rung
+    /// during this exact process launch.
+    pub(crate) advanced: usize,
     pub(crate) behind_target: usize,
     pub(crate) unservable_epoch: usize,
+}
+
+impl RelaunchCounts {
+    /// Every durable selection lands in exactly one of relaunched/unavailable.
+    pub(crate) fn selected(self) -> usize {
+        self.relaunched
+            .checked_add(self.unavailable)
+            .expect("relaunch subsets cannot exceed the loaded selection set")
+    }
 }
 
 /// Relaunch every selected user's WAL serving authority before request
@@ -130,9 +146,16 @@ fn count_outcome(outcome: Result<RelaunchOutcome>, counts: &mut RelaunchCounts) 
         Ok(reached) => {
             counts.relaunched += 1;
             match reached {
-                RelaunchOutcome::Serving => {}
-                RelaunchOutcome::ServingBehindTarget => counts.behind_target += 1,
-                RelaunchOutcome::ServingUnservableEpoch => {
+                RelaunchOutcome::Serving { advanced } => {
+                    counts.at_target += 1;
+                    counts.advanced += usize::from(advanced);
+                }
+                RelaunchOutcome::ServingBehindTarget { advanced } => {
+                    counts.advanced += usize::from(advanced);
+                    counts.behind_target += 1;
+                }
+                RelaunchOutcome::ServingUnservableEpoch { advanced } => {
+                    counts.advanced += usize::from(advanced);
                     counts.behind_target += 1;
                     counts.unservable_epoch += 1;
                 }
@@ -216,14 +239,18 @@ async fn advance_to_target_epoch(store: &Arc<Store>, user_id: &str) -> RelaunchO
     // Every intermediate epoch is a complete, servable state, so an
     // interruption anywhere in this loop leaves a servable archive at a
     // well-defined epoch and the next relaunch resumes from its marker.
+    let mut advanced = false;
     loop {
         match advance_one_epoch(store, user_id).await {
-            Ok(AdvanceOutcome::Advanced { .. }) => continue,
-            Ok(AdvanceOutcome::AlreadyAtTarget(_)) => return RelaunchOutcome::Serving,
-            Ok(AdvanceOutcome::RefusedNotServable(_)) => {
-                return RelaunchOutcome::ServingUnservableEpoch
+            Ok(AdvanceOutcome::Advanced { .. }) => {
+                advanced = true;
+                continue;
             }
-            Err(_) => return RelaunchOutcome::ServingBehindTarget,
+            Ok(AdvanceOutcome::AlreadyAtTarget(_)) => return RelaunchOutcome::Serving { advanced },
+            Ok(AdvanceOutcome::RefusedNotServable(_)) => {
+                return RelaunchOutcome::ServingUnservableEpoch { advanced }
+            }
+            Err(_) => return RelaunchOutcome::ServingBehindTarget { advanced },
         }
     }
 }
@@ -347,12 +374,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, RelaunchCounts::default());
+        assert_eq!((counts.selected(), counts.advanced), (0, 0));
+    }
+
+    #[test]
+    fn the_rollout_metric_is_content_free_complete_and_before_request_admission() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("metric = \"archive_v3_schema_epoch_rollout\"")
+            .expect("schema rollout metric is missing");
+        let block = &source[start
+            ..source[start..]
+                .find("    );")
+                .map(|end| start + end + 7)
+                .expect("schema rollout metric is unterminated")];
+        for field in [
+            "schema_epoch_head",
+            "schema_epoch_target",
+            "schema_epoch_min_servable",
+            "selected",
+            "relaunched",
+            "at_target",
+            "advanced",
+            "behind_target",
+            "unservable_epoch",
+            "unavailable",
+        ] {
+            assert!(block.contains(field), "rollout metric omitted {field}");
+        }
+        for forbidden in ["user_id", "archive_id", "account_id", "step_id", "step_sql"] {
+            assert!(
+                !block.contains(forbidden),
+                "rollout metric contains sensitive/per-account field {forbidden}"
+            );
+        }
+        let relaunch = source
+            .find("archive_v3_serving_relaunch::relaunch_wal_serving_authorities(")
+            .expect("startup relaunch moved");
+        let admission = source
+            .find("install_wal_serving_relaunch(")
+            .expect("startup serving supervisor moved");
+        assert!(
+            relaunch < start && start < admission,
+            "the aggregate must authenticate the completed startup relaunch before admission plumbing"
+        );
+    }
+
+    #[test]
+    fn only_a_durable_advanced_outcome_sets_the_advanced_count() {
+        let source = include_str!("archive_v3_serving_relaunch.rs");
+        let production = &source[..source.find(concat!("mod ", "tests")).unwrap()];
+        let advance = &production[production
+            .find("async fn advance_to_target_epoch(")
+            .expect("advance function moved")..];
+        let applied = advance
+            .find("Ok(AdvanceOutcome::Advanced { .. })")
+            .expect("durable advanced outcome moved");
+        let mark = advance
+            .find("advanced = true")
+            .expect("advanced marker moved");
+        let already = advance
+            .find("Ok(AdvanceOutcome::AlreadyAtTarget(_))")
+            .expect("already-at-target outcome moved");
+        assert!(applied < mark && mark < already);
+        assert_eq!(advance.matches("advanced = true").count(), 1);
     }
 
     #[test]
     fn a_failed_selection_is_counted_unavailable_and_never_propagates() {
         let mut counts = RelaunchCounts::default();
-        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
+        count_outcome(
+            Ok(RelaunchOutcome::Serving { advanced: false }),
+            &mut counts,
+        );
         count_outcome(
             Err(EnclaveError::Conflict("reconstruction failed".into())),
             &mut counts,
@@ -361,11 +455,35 @@ mod tests {
             Err(EnclaveError::Store("the authority failed to launch".into())),
             &mut counts,
         );
-        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
+        count_outcome(Ok(RelaunchOutcome::Serving { advanced: true }), &mut counts);
         // Two users are unavailable and two are serving. Before containment
         // the first failure ended startup for the entire fleet.
         assert_eq!((counts.relaunched, counts.unavailable), (2, 2));
+        assert_eq!(
+            (counts.selected(), counts.at_target, counts.advanced),
+            (4, 2, 1)
+        );
         assert_eq!((counts.behind_target, counts.unservable_epoch), (0, 0));
+    }
+
+    #[test]
+    fn at_target_survives_a_crash_after_the_durable_advance_before_the_metric() {
+        // Direct TARGET launch: this process observed the durable apply and
+        // then re-read the marker at target.
+        let mut direct = RelaunchCounts::default();
+        count_outcome(Ok(RelaunchOutcome::Serving { advanced: true }), &mut direct);
+        assert_eq!((direct.at_target, direct.advanced), (1, 1));
+
+        // Lost startup metric: the first process may exit after the durable
+        // 0 -> 1 commit but before logging. Its replacement re-reads the
+        // marker as AlreadyAtTarget and must retain the proof-bearing state
+        // without pretending that the replacement performed the commit.
+        let mut replacement = RelaunchCounts::default();
+        count_outcome(
+            Ok(RelaunchOutcome::Serving { advanced: false }),
+            &mut replacement,
+        );
+        assert_eq!((replacement.at_target, replacement.advanced), (1, 0));
     }
 
     #[test]
@@ -376,14 +494,25 @@ mod tests {
         // read and submit for the whole process lifetime. Counting them
         // `unavailable` said the exact opposite, and nothing retried.
         let mut counts = RelaunchCounts::default();
-        count_outcome(Ok(RelaunchOutcome::ServingBehindTarget), &mut counts);
-        count_outcome(Ok(RelaunchOutcome::ServingUnservableEpoch), &mut counts);
-        count_outcome(Ok(RelaunchOutcome::Serving), &mut counts);
+        count_outcome(
+            Ok(RelaunchOutcome::ServingBehindTarget { advanced: true }),
+            &mut counts,
+        );
+        count_outcome(
+            Ok(RelaunchOutcome::ServingUnservableEpoch { advanced: false }),
+            &mut counts,
+        );
+        count_outcome(
+            Ok(RelaunchOutcome::Serving { advanced: false }),
+            &mut counts,
+        );
         assert_eq!(
             counts,
             RelaunchCounts {
                 relaunched: 3,
                 unavailable: 0,
+                at_target: 1,
+                advanced: 1,
                 behind_target: 2,
                 unservable_epoch: 1,
             },
@@ -394,6 +523,8 @@ mod tests {
         // `relaunched` / `unavailable`.
         assert!(counts.behind_target <= counts.relaunched);
         assert!(counts.unservable_epoch <= counts.behind_target);
+        assert_eq!(counts.at_target + counts.behind_target, counts.relaunched);
+        assert!(counts.advanced <= counts.relaunched);
     }
 
     #[test]

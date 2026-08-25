@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "ADR-0022 schema epoch ladder: slice 0 is the frozen baseline pin and its plumbing; the owner-side driver arrives with the reviewed epoch domain"
+    reason = "ADR-0022 schema epoch ladder: the frozen baseline, phased declarations, and owner-side driver deliberately land before every surface is live"
 )]
 
 //! Append-only product schema ladder.
@@ -47,11 +47,13 @@
 //! (a different position or different spacing is enough). The freeze is what
 //! makes the question moot instead of a coin flip, and the gate enforces it.
 //!
-//! # Slice 0
+//! # Production phase declaration
 //!
-//! The ladder is empty and every epoch constant is 0, so this module changes
-//! no behaviour. What it establishes is the pin: `BASELINE_DIGEST` fixes the
-//! epoch-0 text, and the gate fails the build if anyone edits it.
+//! The ladder and its three epoch constants move through the ordered releases
+//! in the runbook below. Their declarations live in one explicitly delimited
+//! source region; runtime logic, documentation, and tests outside that region
+//! are phase-generic. `BASELINE_DIGEST` fixes the epoch-0 text in every phase,
+//! and the gate fails the build if anyone edits it.
 //!
 //! # The one-time non-additive sweep (2026-08-21)
 //!
@@ -245,25 +247,13 @@ pub(crate) struct SchemaStep {
     pub(crate) sql: &'static str,
 }
 
-/// The ladder. **Append only** — editing or reordering a shipped step changes
-/// its digest, which the gate rejects and which a live archive would refuse.
+/// The production phase declarations. The ladder is **append only** — editing
+/// or reordering a shipped step changes its digest, which the gate rejects and
+/// which a live archive would refuse. The boundary comments below must each
+/// occur exactly once: reviewed release admission treats the bytes strictly
+/// between them as the sole phase-mutable declaration fragment.
 ///
-/// # Still empty, and why
-///
-/// Not because nothing wants a step. Gate rule **G4** refuses any entry here
-/// while `scripts/schema_baseline_seal.json` reads `"sealed": false`, and it
-/// still does: the zero-archive proof in `docs/adr/0022/zero-archive-proof.md`
-/// declares itself undischarged. Appending a step now would fail CI, and
-/// satisfying the gate by flipping the seal without the proof is the exact act
-/// the seal exists to prevent. So the first step ships in the PR that follows
-/// the cutover, not before.
-///
-/// The mechanism that will apply it is finished and tested:
-/// [`crate::cp::schema_epoch::wal`]. Its end-to-end tests drive a real archive
-/// from epoch 0 to epoch 1 through the production plan, ledger and canonical
-/// comparison, over a fixture ladder carrying the reviewed step below.
-///
-/// # The reviewed candidate for step 1
+/// # The reviewed first step
 ///
 /// ```ignore
 /// SchemaStep {
@@ -287,33 +277,28 @@ pub(crate) struct SchemaStep {
 /// able to do that. An index also needs no "tolerate `epoch < N`" branch in
 /// product code, which makes it the cheapest possible first rung of the
 /// runbook above.
+// ADR0022_SCHEMA_PHASE_DECLARATION_BEGIN
 pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[];
 
-/// Highest epoch this binary knows how to build.
 pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 0;
 
-/// Highest epoch this binary will drive an archive to. Held below
-/// `SCHEMA_EPOCH_HEAD` while a step rolls out, so the step ships and is
-/// observed before anything applies it.
 pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 0;
 
-/// Lowest epoch this binary can still serve. Lets an older binary keep serving
-/// an archive a newer binary advanced, instead of refusing it.
 pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 0;
+// ADR0022_SCHEMA_PHASE_DECLARATION_END
 
 // Enforced at compile time rather than in a test: a binary must never be asked
 // to drive an archive past what it knows how to build, and must never refuse to
-// serve an epoch it is itself willing to create. Both comparisons are trivially
-// true while every epoch is 0 — which is precisely why they are pinned now,
-// before the first step makes them load-bearing and easy to violate silently.
+// serve an epoch it is itself willing to create. These remain load-bearing in
+// every release phase, including phases in which one or more values are zero.
 #[allow(
     clippy::absurd_extreme_comparisons,
-    reason = "vacuous at epoch 0 by construction; becomes meaningful with the first ladder step"
+    reason = "the reviewed phase constants may include zero; the ordering assertion remains mandatory"
 )]
 const _: () = assert!(SCHEMA_EPOCH_TARGET <= SCHEMA_EPOCH_HEAD);
 #[allow(
     clippy::absurd_extreme_comparisons,
-    reason = "vacuous at epoch 0 by construction; becomes meaningful with the first ladder step"
+    reason = "the reviewed phase constants may include zero; the ordering assertion remains mandatory"
 )]
 const _: () = assert!(SCHEMA_EPOCH_MIN_SERVABLE <= SCHEMA_EPOCH_TARGET);
 
@@ -327,22 +312,14 @@ const _: () = assert!(SCHEMA_EPOCH_MIN_SERVABLE <= SCHEMA_EPOCH_TARGET);
 ///
 /// # Why the seam exists
 ///
-/// Gate rule **G4** (`scripts/test_schema_ladder_gate.py`) refuses any step in
-/// `SCHEMA_LADDER` while `scripts/schema_baseline_seal.json` still reads
-/// `"sealed": false`, because a step shipped over a movable `BASELINE_DIGEST`
-/// anchor produces a chain that changes retroactively. The seal flips at
-/// cutover, under the zero-archive proof — not here. So the production ladder
-/// must stay empty for now, and an empty ladder cannot exercise a single line
-/// of the advance machinery: every check would pass vacuously.
-///
-/// The test-only constructor closes that gap. A fixture view carries a real
-/// step and real epoch constants, and the advance plan, the driver, the
-/// canonical builder and the descriptor comparison all run over it through
-/// **exactly** the production code path — the same `apply_each`, the same
-/// `schema_descriptor`, the same marker writes. The only thing a fixture
-/// changes is *which* DDL is in the ladder. It also buys coverage a shipped
-/// step never could: a step that fails mid-batch, so the whole-transaction
-/// rollback is provable.
+/// The test-only constructor keeps coverage independent of whichever phase is
+/// currently declared. A fixture view carries multiple real steps and its own
+/// epoch constants, and the advance plan, the driver, the canonical builder
+/// and the descriptor comparison all run over it through **exactly** the
+/// production code path — the same `apply_each`, the same `schema_descriptor`,
+/// the same marker writes. The only thing a fixture changes is *which* DDL is
+/// in the ladder. It also buys coverage a shipped step never could: a step
+/// that fails mid-batch, so the whole-transaction rollback is provable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LadderView {
     steps: &'static [SchemaStep],
@@ -441,11 +418,11 @@ impl LadderView {
 
     /// See [`validate_servable_epoch`].
     pub(crate) fn validate_servable(self, marker: ArchiveEpoch) -> Result<()> {
-        // Written as a full range even though the lower bound is vacuous while
-        // `SCHEMA_EPOCH_MIN_SERVABLE` is 0. Writing it as half a range would
-        // make raising the floor a silent no-op. (No `absurd_extreme_comparisons`
-        // allow is needed here, unlike the module-level const assertions: these
-        // are runtime fields, so the lint cannot see a constant to fold.)
+        // Always written as the full range. Simplifying this to only the upper
+        // bound during a phase whose floor is zero would make a later floor
+        // raise a silent no-op. (No `absurd_extreme_comparisons` allow is
+        // needed here, unlike the module-level const assertions: these are
+        // runtime fields, so the lint cannot see a constant to fold.)
         if marker.epoch < self.min_servable || marker.epoch > self.head {
             return Err(epoch_marker_error(
                 "recorded epoch is outside this binary's servable range",
@@ -681,19 +658,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slice_zero_ladder_is_empty_and_epochs_are_coherent() {
-        assert!(SCHEMA_LADDER.is_empty());
-        assert_eq!(SCHEMA_EPOCH_HEAD, 0);
-        assert_eq!(SCHEMA_EPOCH_TARGET, 0);
-        assert_eq!(SCHEMA_EPOCH_MIN_SERVABLE, 0);
-        // The ordering invariants are compile-time assertions above.
+    fn production_phase_declarations_are_coherent() {
+        // Exercise the phase relation through runtime values. BOOTSTRAP is
+        // intentionally 0/0/0, and comparing those declarations directly
+        // makes Clippy constant-fold the assertions instead of checking the
+        // same relation future signed phases must satisfy.
+        let [head, target, minimum] = std::hint::black_box([
+            SCHEMA_EPOCH_HEAD,
+            SCHEMA_EPOCH_TARGET,
+            SCHEMA_EPOCH_MIN_SERVABLE,
+        ]);
+        assert_eq!(usize::try_from(head).unwrap(), SCHEMA_LADDER.len());
+        assert!(target <= head);
+        assert!(minimum <= target);
     }
 
     #[test]
     fn ladder_epochs_are_contiguous_from_one_with_unique_ids() {
-        // Holds vacuously at slice 0 and is the invariant every future step
-        // must preserve: a gap or a duplicate id would make the chain digest
-        // ambiguous.
+        // A gap or duplicate id would make the chain digest ambiguous in any
+        // production phase.
         let mut expected = 1;
         let mut seen = std::collections::HashSet::new();
         for step in SCHEMA_LADDER {
@@ -746,22 +729,31 @@ mod tests {
 
     #[test]
     fn chain_digest_is_stable_and_anchored_to_the_baseline() {
-        // At slice 0 the chain is exactly the baseline anchor.
-        assert_eq!(chain_digest(0), chain_digest(SCHEMA_EPOCH_HEAD));
         let mut anchor = Sha256::new();
         anchor.update(LADDER_DOMAIN);
         anchor.update(BASELINE_DIGEST);
-        assert_eq!(chain_digest(0), <[u8; 32]>::from(anchor.finalize()));
+        let mut expected: [u8; 32] = anchor.finalize().into();
+        assert_eq!(chain_digest(0), expected);
+        for step in SCHEMA_LADDER {
+            let mut link = Sha256::new();
+            link.update(expected);
+            link.update(step_digest(step));
+            expected = link.finalize().into();
+        }
+        assert_eq!(chain_digest(SCHEMA_EPOCH_HEAD), expected);
     }
 
     #[test]
     fn steps_between_selects_the_half_open_range() {
-        assert_eq!(steps_between(0, SCHEMA_EPOCH_HEAD).count(), 0);
+        assert_eq!(
+            steps_between(0, SCHEMA_EPOCH_HEAD).count(),
+            SCHEMA_LADDER.len()
+        );
         assert_eq!(steps_between(0, 0).count(), 0);
     }
 
-    /// A fixture ladder, so the executor is exercised before the production
-    /// ladder has any steps. These are the three permitted step classes.
+    /// A fixture ladder keeps the executor coverage independent of the
+    /// production phase. These are the three permitted step classes.
     const FIXTURE_LADDER: &[SchemaStep] = &[
         SchemaStep {
             epoch: 1,
@@ -889,18 +881,18 @@ mod tests {
         let baseline = Connection::open_in_memory().unwrap();
         baseline.execute_batch(crate::store::SCHEMA_SQL).unwrap();
         crate::store::run_migrations(&baseline).unwrap();
-        // At epoch 0 the ladder contributes nothing, so the canonical database
-        // is exactly the frozen baseline. This is what makes slice 0's
-        // BASELINE_DIGEST describe `build_canonical(0)` too.
+        // At epoch 0 the ladder contributes nothing in every phase, so the
+        // canonical database is exactly the frozen baseline and is what
+        // BASELINE_DIGEST describes.
         assert_eq!(descriptor(&canonical), descriptor(&baseline));
     }
 
     #[test]
-    fn apply_steps_is_a_no_op_while_the_production_ladder_is_empty() {
+    fn apply_steps_reaches_the_declared_production_head() {
         let conn = build_canonical(0).unwrap();
-        let before = descriptor(&conn);
         apply_steps(&conn, 0, SCHEMA_EPOCH_HEAD).unwrap();
-        assert_eq!(descriptor(&conn), before);
+        let canonical = build_canonical(SCHEMA_EPOCH_HEAD).unwrap();
+        assert_eq!(descriptor(&conn), descriptor(&canonical));
     }
 
     // ── The epoch marker: a birth witness, not an absence ──────────────────
@@ -926,7 +918,6 @@ mod tests {
         let marker = read_archive_epoch(&conn).unwrap();
         assert_eq!(marker.epoch, 0);
         assert_eq!(marker.chain, chain_digest(0));
-        validate_servable_epoch(marker).unwrap();
     }
 
     #[test]
@@ -944,17 +935,35 @@ mod tests {
         // Closes D3: the archive supplies the value that would otherwise
         // select its own comparand. The chain is recomputed here, from THIS
         // binary's BASELINE_DIGEST, so an archive cannot certify itself.
-        let conn = build_canonical(0).unwrap();
-        seed_epoch_marker(&conn, 0).unwrap();
+        let epoch = SCHEMA_EPOCH_MIN_SERVABLE;
+        let conn = build_canonical(epoch).unwrap();
+        seed_epoch_marker(&conn, epoch).unwrap();
         conn.execute(
             "UPDATE schema_epoch SET chain_digest = ?1 WHERE singleton = 1",
             [&[7_u8; 32][..]],
         )
         .unwrap();
         let marker = read_archive_epoch(&conn).unwrap();
-        assert_ne!(marker.chain, chain_digest(0));
+        assert_ne!(marker.chain, chain_digest(epoch));
         let error = validate_servable_epoch(marker).unwrap_err().to_string();
         assert!(error.contains("chain does not match"), "{error}");
+    }
+
+    #[test]
+    fn the_declared_servable_floor_is_accepted() {
+        let minimum = std::hint::black_box(SCHEMA_EPOCH_MIN_SERVABLE);
+        let floor = ArchiveEpoch {
+            epoch: minimum,
+            chain: chain_digest(minimum),
+        };
+        validate_servable_epoch(floor).unwrap();
+        if minimum > 0 {
+            let below = ArchiveEpoch {
+                epoch: minimum - 1,
+                chain: chain_digest(minimum - 1),
+            };
+            assert!(validate_servable_epoch(below).is_err());
+        }
     }
 
     #[test]
@@ -1045,8 +1054,8 @@ mod tests {
 
     #[test]
     fn assert_canonical_at_pins_the_archive_against_its_recorded_epoch() {
-        let conn = build_canonical(0).unwrap();
-        seed_epoch_marker(&conn, 0).unwrap();
+        let conn = build_canonical(SCHEMA_EPOCH_TARGET).unwrap();
+        seed_epoch_marker(&conn, SCHEMA_EPOCH_TARGET).unwrap();
         let marker = read_archive_epoch(&conn).unwrap();
         // The marker row itself is data, not schema, so a seeded archive is
         // still descriptor-identical to the canonical.
@@ -1059,7 +1068,10 @@ mod tests {
 
     #[test]
     fn step_at_selects_the_single_step_that_reaches_an_epoch() {
-        assert!(step_at(1).is_none(), "vacuous while the ladder is empty");
         assert!(step_at(0).is_none());
+        for step in SCHEMA_LADDER {
+            assert_eq!(step_at(step.epoch), Some(step));
+        }
+        assert!(step_at(SCHEMA_EPOCH_HEAD + 1).is_none());
     }
 }

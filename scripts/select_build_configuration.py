@@ -19,6 +19,18 @@ from archive_v3_shadow_runtime_config import (
     load_shadow_runtime_config,
     select_shadow_runtime_config,
 )
+from adr0022_fresh_release import (
+    CANARY_CONFIG_KEY,
+    FreshReleaseError,
+    claims_bootstrap_role,
+    claims_final_role,
+    is_bootstrap_tag,
+    is_final_tag,
+    require_exact_bootstrap_tag,
+    require_exact_final_tag,
+    validate_bootstrap_configuration,
+    validate_final_configuration,
+)
 
 
 SHARED_KEYS = (
@@ -75,6 +87,14 @@ OPTIONAL_PROFILE_GROUPS = (
         "APNS_SANDBOX_KEY_ID",
     ),
 )
+
+# This receipt commitment is an operator-only publication input. It is selected
+# only for the one fixed production BOOTSTRAP role and never enters the runtime
+# configuration assembled into the image.
+FRESH_RELEASE_PROFILE_KEYS = (CANARY_CONFIG_KEY,)
+# Compatibility name for callers that have not yet learned the second fixed
+# role. Both names intentionally denote the same one operator-only input.
+FRESH_BOOTSTRAP_PROFILE_KEYS = FRESH_RELEASE_PROFILE_KEYS
 
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 SERVICE_ACCOUNT_PATTERN = (
@@ -261,12 +281,35 @@ def selected_configuration(
     shadow_runtime_config_path: Path,
 ) -> dict[str, str]:
     prefix = profile.upper()
+    if claims_bootstrap_role(source_ref):
+        try:
+            require_exact_bootstrap_tag(source_ref)
+        except FreshReleaseError as error:
+            raise SystemExit(str(error)) from error
+        if profile != "production":
+            raise SystemExit("fresh BOOTSTRAP is eligible only for the production profile")
+    elif claims_final_role(source_ref):
+        try:
+            require_exact_final_tag(source_ref)
+        except FreshReleaseError as error:
+            raise SystemExit(str(error)) from error
+        if profile != "production":
+            raise SystemExit("fresh FINAL is eligible only for the production profile")
+    elif any(
+        f"PRODUCTION_{name}" in environment for name in FRESH_RELEASE_PROFILE_KEYS
+    ):
+        raise SystemExit(
+            "fresh release operator inputs are eligible only for an exact fixed tag"
+        )
     configuration = {
         name: require_value(environment, name) for name in SHARED_KEYS
     }
     for name in PROFILE_KEYS:
         source_name = f"{prefix}_{name}"
         configuration[name] = require_value(environment, source_name)
+    if is_bootstrap_tag(source_ref) or is_final_tag(source_ref):
+        for name in FRESH_RELEASE_PROFILE_KEYS:
+            configuration[name] = require_value(environment, f"{prefix}_{name}")
     try:
         probe_config = select_probe_config(
             load_probe_config(probe_config_path),
@@ -304,6 +347,16 @@ def selected_configuration(
             "PRODUCTION_APNS_SANDBOX_KEY_ID"
         )
     validate(configuration, profile)
+    if is_bootstrap_tag(source_ref):
+        try:
+            validate_bootstrap_configuration(configuration)
+        except FreshReleaseError as error:
+            raise SystemExit(str(error)) from error
+    elif is_final_tag(source_ref):
+        try:
+            validate_final_configuration(configuration)
+        except FreshReleaseError as error:
+            raise SystemExit(str(error)) from error
     return configuration
 
 

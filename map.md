@@ -16,11 +16,13 @@ consumers.
 ADR-0022's Genesis WAL path is production-wired behind the signed image profile: startup
 installs every durable WAL-authoritative selection, reconstructs and launches its serving
 authority before request admission, sign-in converges new selected accounts from Genesis,
-and routed Store reads/submits serve only settled owner state. The reviewed Genesis release
-profile is now the complete active production tuple; only the exact signed archive-v3 release
-tag can select it, and startup fails closed when its baked coordinates disagree with durable
-state. Evaluation and ordinary pretag builds still force the effective profile off. This active
-logical-WAL path is distinct from the old advisory/extent migration stack.
+and routed Store reads/submits serve only settled owner state. The current BOOTSTRAP source
+line deliberately checks in the all-empty `off` profile and cannot construct that authority.
+Only a later separately reviewed FINAL source carrying the complete fresh-production tuple,
+one-way commitment, and an exact signed archive-v3 release tag can select the active path;
+startup then fails closed when baked coordinates disagree with durable state. Evaluation and
+ordinary pretag builds also force the effective profile off. This logical-WAL path is distinct
+from the old advisory/extent migration stack.
 
 The route to authority changed in August 2026. The **genesis-first replan** drops retention
 of existing archive data, so the advisory-canary/Phase-2 migration path was deleted rather
@@ -74,7 +76,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 
 | Path | What it is |
 |---|---|
-| [config/](config/map.md) | Checked-in, non-secret, fail-closed attested-image configuration; the archive witness probe stays exact off, while the sealed single-archive WAL profile carries the exact reviewed Genesis production tuple and can be selected only by its canonical signed tag, with no operator, repository-variable, or dispatch override |
+| [config/](config/map.md) | Checked-in, non-secret, fail-closed attested-image configuration; the archive witness probe stays exact off, and this BOOTSTRAP source also carries an exact all-empty archive-v3 profile. The canonical fresh-generation intent and synthetic schema-10 cross-repository fixture pin the fixed BOOTSTRAP publication tuple and encoding without provider authority. Only a later reviewed FINAL source may bind the fresh single-archive WAL tuple and select it through its canonical signed tag, with no operator, repository-variable, or dispatch override. |
 | [docs/](docs/map.md) | Proposed and accepted cross-boundary architecture decisions |
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, capture-session feedback, APNs ready receipts, separate KMS/public/Firestore-witness/archive-GCS attestation boundaries, per-user synchronized encrypted storage, search, episodes |
 | `src/archive_v3_extent.rs` / `src/archive_v3_extent_vfs.rs` / `src/archive_v3_extent_commit.rs` / `src/archive_v3_extent_shadow.rs` / `src/archive_v3_wal_to_extent.rs` / `src/archive_v3_vector_accelerator.rs` / `src/archive_v3_phase3_gates.rs` / `src/archive_v3_shadow_coordinator.rs` / `src/archive_v3_export.rs` | **Inactive ADR-0022 extent/shadow future:** sparse extent storage, extent cutover/parity, vector sidecar, Phase-3 gates, shadow coordinator, and export-publication seams remain compiled/tested only. They have no active Store, route, startup, or deployment authority. This does not include the journal/checkpoint/WAL/VFS primitives used by the active Genesis logical-WAL publisher. |
@@ -97,7 +99,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `README.md` | What the enclave does + the attestation/privacy claim |
 | `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, bounded Mac screenshot-reference batches, durable session finish, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, and learned people profiles |
 | [eval/](eval/map.md) | Public, content-free voice/identity quality scoring plus archive-capacity contracts, synthetic regression inputs, and real-corpus methodology |
-| [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools |
+| [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools, including the exact provider-free fresh-BOOTSTRAP schema-10 producer/verifier |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |
 | `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
 | `CONTRIBUTING.md` | PR rules and lightweight/exhaustive local verification gates |

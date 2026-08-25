@@ -26,7 +26,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from test_select_build_configuration import environment  # noqa: E402
+from test_select_build_configuration import (  # noqa: E402
+    CANARY_ADMIN_UUID,
+    CANARY_IDENTITY_PREPARATION_SHA256,
+    environment,
+    fresh_bootstrap_environment,
+)
+import adr0022_fresh_release as fresh  # noqa: E402
+import verify_release_metadata  # noqa: E402
 
 # The production verifier intentionally invokes this contract suite from a
 # live builder environment. Fixtures must never inherit those coordinates;
@@ -167,15 +174,20 @@ class LocalImagePipelineTests(unittest.TestCase):
             pass_fds: tuple[int, ...] = (),
         ):
             calls.append(command)
-            if command[:2] == ["git", "status"]:
+            git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+            if git_command[:2] == ["replace", "-l"]:
                 return SimpleNamespace(stdout="", stderr="")
-            if command[:3] == ["git", "rev-parse", "HEAD"]:
+            if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n", stderr="")
+            if git_command[:2] == ["status", "--porcelain"]:
+                return SimpleNamespace(stdout="", stderr="")
+            if git_command[:2] == ["rev-parse", "HEAD"]:
                 return SimpleNamespace(stdout="b" * 40 + "\n")
-            if command[:3] == ["git", "rev-list", "-n"]:
+            if git_command[:2] == ["rev-list", "-n"]:
                 return SimpleNamespace(stdout="b" * 40 + "\n")
-            if command[:3] == ["git", "log", "-1"]:
+            if git_command[:2] == ["log", "-1"]:
                 return SimpleNamespace(stdout="1700000000\n")
-            if command[:4] == ["git", "remote", "get-url", "origin"]:
+            if git_command[:3] == ["remote", "get-url", "origin"]:
                 return SimpleNamespace(stdout="git@github.com:owner/repository.git\n")
             if command[:3] == ["docker", "buildx", "version"]:
                 return SimpleNamespace(stdout="docker buildx v0.17.0\n")
@@ -281,7 +293,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 directory = Path(temporary_directory)
                 config = directory / "operator.env"
                 output = directory / "evidence"
-                write_config(config, genesis_wal_native="on")
+                write_config(config, genesis_wal_native="off")
                 sys.argv = [
                     str(SCRIPTS / "local_image_pipeline.py"),
                     "push",
@@ -290,7 +302,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3-archive-v3-wal.1",
+                    "refs/tags/v1.2.3",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",
@@ -475,11 +487,115 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn("schema_version\": 9", source)
+        self.assertIn('"schema_version": 10 if fresh_release else 9', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
         self.assertLess(source.index("verify_source_unchanged(arguments.source_ref, commit)"), source.index('if arguments.stage == "push":'))
+
+    def test_fresh_bootstrap_emits_exact_ordered_schema_ten_metadata(self) -> None:
+        pipeline = load_pipeline()
+        configuration = pipeline.selected_configuration(
+            "production",
+            fresh_bootstrap_environment(),
+            source_ref=fresh.BOOTSTRAP_TAG,
+            probe_config_path=ROOT / "config/archive-witness-probe.json",
+            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
+        )
+        fixture_canary_sha256 = "c" * 64
+        fixture_canary_uuid = "12345678-1234-5678-9234-567812345678"
+        configuration[fresh.CANARY_CONFIG_KEY] = fixture_canary_sha256
+        configuration["ADMIN_USER_IDS"] = fixture_canary_uuid
+        runtime = pipeline.runtime_config(configuration, "production")
+        self.assertNotIn(fresh.CANARY_CONFIG_KEY, runtime)
+        self.assertEqual(runtime["ADMIN_USER_IDS"], fixture_canary_uuid)
+
+        def fake_run(command, *, capture=False, environment=None, pass_fds=()):
+            del capture, environment, pass_fds
+            git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+            if git_command[:2] == ["replace", "-l"]:
+                return SimpleNamespace(stdout="")
+            if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+            if git_command[:3] == ["remote", "get-url", "origin"]:
+                return SimpleNamespace(
+                    stdout="https://github.com/joerodriguez/kioku-enclave.git\n"
+                )
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "check_voice_release_gate.py"),
+            ]:
+                return SimpleNamespace(stdout="owner_only_unvalidated\n")
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "verify_release_metadata.py"),
+            ]:
+                completed = subprocess.run(
+                    command, cwd=ROOT, text=True, capture_output=True, check=False
+                )
+                if completed.returncode:
+                    raise pipeline.PipelineError(completed.stderr)
+                return SimpleNamespace(stdout=completed.stdout)
+            if command[:2] == ["gcloud", "version"]:
+                return SimpleNamespace(stdout="Google Cloud SDK 580.0.0\n")
+            if command[:2] == ["docker", "buildx"]:
+                return SimpleNamespace(stdout="github.com/docker/buildx v0.36.1\n")
+            if command[0] in ("syft", "grype"):
+                return SimpleNamespace(stdout=f"{command[0]} 1.0\n")
+            if command[:2] == [
+                sys.executable,
+                str(SCRIPTS / "local_build_evidence.py"),
+            ]:
+                return SimpleNamespace(stdout="")
+            raise AssertionError(command)
+
+        original_run = pipeline.run
+        original_cloud_config = pipeline._CLOUDSDK_CONFIG
+        pipeline.run = fake_run
+        pipeline._CLOUDSDK_CONFIG = "/private/provider-free-test"
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                config = directory / "operator.env"
+                config.write_text("fixture\n", encoding="utf-8")
+                pipeline.create_release_evidence(
+                    directory,
+                    config_path=config,
+                    configuration=configuration,
+                    config_sha256="d" * 64,
+                    source_archive_sha256="e" * 64,
+                    source_ref=fresh.BOOTSTRAP_TAG,
+                    source_commit="f" * 40,
+                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.BOOTSTRAP_TAG}",
+                    image_digest="sha256:" + "1" * 64,
+                    created_at="2026-08-24T12:00:00Z",
+                    expected_sbom_sha256="2" * 64,
+                    expected_scan_sha256="3" * 64,
+                )
+                raw = (directory / "enclave-release.json").read_bytes()
+                metadata = verify_release_metadata.parse_metadata_bytes(raw)
+        finally:
+            pipeline.run = original_run
+            pipeline._CLOUDSDK_CONFIG = original_cloud_config
+
+        self.assertEqual(
+            raw,
+            (ROOT / "config/adr0022-fresh-schema10-bootstrap-fixture.json").read_bytes(),
+        )
+        self.assertEqual(len(metadata), 50)
+        self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
+        self.assertEqual(metadata["schema_version"], 10)
+        self.assertEqual(metadata["source_ref"], fresh.BOOTSTRAP_TAG)
+        self.assertEqual(metadata["schema_epoch_head"], 0)
+        self.assertEqual(metadata["schema_epoch_target"], 0)
+        self.assertEqual(metadata["schema_epoch_minimum_servable"], 0)
+        self.assertEqual(metadata["production_genesis_wal_native"], "off")
+        self.assertEqual(metadata["signup_mode"], "positive")
+        self.assertEqual(
+            metadata["adr0022_canary_identity_preparation_sha256"],
+            fixture_canary_sha256,
+        )
+        self.assertEqual(metadata["adr0022_canary_admin_uuid"], fixture_canary_uuid)
 
     def test_runtime_config_is_allowlisted_and_docker_uses_ephemeral_secret(self) -> None:
         pipeline = load_pipeline()
@@ -1232,20 +1348,33 @@ class LocalImagePipelineTests(unittest.TestCase):
         pipeline = load_pipeline()
         original_run = pipeline.run
         try:
-            pipeline.run = lambda command, capture=False: SimpleNamespace(
-                stdout="?? untracked\n" if command[:2] == ["git", "status"] else ""
-            )
+            def dirty(command, capture=False):
+                del capture
+                git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+                if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                    return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+                return SimpleNamespace(
+                    stdout="?? untracked\n" if git_command[:2] == ["status", "--porcelain"] else ""
+                )
+
+            pipeline.run = dirty
             with self.assertRaisesRegex(pipeline.PipelineError, "clean source tree"):
                 pipeline.source_commit("refs/tags/v1.2.3")
 
             def mismatched(command, capture=False):
-                if command[:2] == ["git", "status"]:
+                del capture
+                git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
+                if git_command[:2] == ["replace", "-l"]:
                     return SimpleNamespace(stdout="")
-                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
+                    return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
+                if git_command[:2] == ["status", "--porcelain"]:
+                    return SimpleNamespace(stdout="")
+                if git_command[:2] == ["rev-parse", "HEAD"]:
                     return SimpleNamespace(stdout="a" * 40 + "\n")
-                if command[:3] == ["git", "log", "-1"]:
+                if git_command[:2] == ["log", "-1"]:
                     return SimpleNamespace(stdout="1700000000\n")
-                if command[:3] == ["git", "rev-list", "-n"]:
+                if git_command[:2] == ["rev-list", "-n"]:
                     return SimpleNamespace(stdout="b" * 40 + "\n")
                 return SimpleNamespace(stdout="")
 
@@ -1393,8 +1522,66 @@ class LocalImagePipelineTests(unittest.TestCase):
             with patch.dict(pipeline.os.environ, environment, clear=True):
                 pipeline.configure_direct_child_environment("build")
                 self.assertEqual(pipeline._CHILD_ENVIRONMENT["DOCKER_CONFIG"], str(docker_config.resolve()))
+                self.assertEqual(pipeline._CHILD_ENVIRONMENT["GIT_NO_REPLACE_OBJECTS"], "1")
                 self.assertNotIn("UNREVIEWED_SETTING", pipeline._CHILD_ENVIRONMENT)
                 self.assertNotIn("GH_TOKEN", pipeline._CHILD_ENVIRONMENT)
+
+    def test_direct_child_environment_rejects_ambient_git_object_overrides(self) -> None:
+        pipeline = load_pipeline()
+        with patch.dict(
+            pipeline.os.environ,
+            {"PATH": os.environ.get("PATH", ""), "GIT_OBJECT_DIRECTORY": "/tmp/objects"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(pipeline.PipelineError, "GIT_OBJECT_DIRECTORY"):
+                pipeline.configure_direct_child_environment("verify")
+        with patch.dict(
+            pipeline.os.environ,
+            {"PATH": os.environ.get("PATH", ""), "GIT_NO_REPLACE_OBJECTS": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(pipeline.PipelineError, "exactly 1"):
+                pipeline.configure_direct_child_environment("verify")
+
+    def test_replacement_ref_clean_tree_illusion_is_rejected_before_source_use(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "repository"
+            repository.mkdir()
+
+            def git(*arguments: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ("git", "-C", str(repository), *arguments),
+                    check=True,
+                    text=True,
+                    capture_output=capture,
+                    env=os.environ | {"GIT_CONFIG_NOSYSTEM": "1"},
+                )
+
+            git("init")
+            git("config", "user.name", "Replacement Test")
+            git("config", "user.email", "replacement@example.invalid")
+            source = repository / "source.txt"
+            source.write_text("source A\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("commit", "-m", "source A")
+            source_a = git("rev-parse", "HEAD", capture=True).stdout.strip()
+            source.write_text("source B\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("commit", "-m", "source B")
+            source_b = git("rev-parse", "HEAD", capture=True).stdout.strip()
+            git("replace", source_a, source_b)
+            git("update-ref", "HEAD", source_a)
+            self.assertEqual(git("status", "--porcelain", capture=True).stdout, "")
+
+            pipeline.ROOT = repository
+            pipeline._CHILD_ENVIRONMENT = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": os.environ.get("HOME", ""),
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+            with self.assertRaisesRegex(pipeline.PipelineError, "replacement refs"):
+                pipeline.source_commit("refs/heads/main")
 
     def test_cloud_config_is_required_and_stage_scoped(self) -> None:
         pipeline = load_pipeline()
