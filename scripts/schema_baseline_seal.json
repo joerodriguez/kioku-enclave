@@ -1,6 +1,6 @@
 {
   "_comment": "ADR-0022 epoch-0 baseline seal. See scripts/test_schema_ladder_gate.py (G-SEAL-1..5, G4) and docs/adr/0022/zero-archive-proof.md. Editing this file alone can never satisfy the gate: the history length, the history prefix, the history chain head and the seal bit are all pinned as literals in the gate script.",
-  "sealed": false,
+  "sealed": true,
   "digest": "d5ff84db4c22ac093b52640aca6ead6d1db5d9726f27927de701d791b1792dfb",
   "history": [
     {

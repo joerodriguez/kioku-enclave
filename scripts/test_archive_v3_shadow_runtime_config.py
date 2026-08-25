@@ -131,12 +131,23 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
             "archive_binding_commitment": COMMITMENT,
         }
 
-    def test_checked_in_profile_is_schema_two_exact_bootstrap_off(self) -> None:
+    def test_checked_in_profile_is_the_exact_fresh_final_tuple(self) -> None:
         config = load_shadow_runtime_config(
             ROOT / "config" / "archive-v3-shadow-runtime.json"
         )
-        self.assertEqual(config, OFF)
-        self.assertEqual(config.as_claim(), ("off", "", "", "", "", "", "", ""))
+        self.assertEqual(
+            config.as_claim(),
+            (
+                "single-archive-wal-v1",
+                "kioku-joerodriguez-adr0022-v1-archive",
+                "640329636251",
+                "1",
+                "kioku-joerodriguez",
+                "640329636251",
+                "adr0022-v1-witness",
+                "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            ),
+        )
 
     def test_active_profile_roundtrips_the_exact_eight_element_claim(self) -> None:
         config = self.load(self.active())

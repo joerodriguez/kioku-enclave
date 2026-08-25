@@ -35,7 +35,7 @@ VERIFIER_MODULE = importlib.util.module_from_spec(VERIFIER_SPEC)
 VERIFIER_SPEC.loader.exec_module(VERIFIER_MODULE)
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
-TAG = "v1.2.3-rc.1"
+TAG = "v1.2.3-archive-v3-wal.1"
 
 
 class LocalEvidenceTests(unittest.TestCase):
@@ -67,7 +67,9 @@ class LocalEvidenceTests(unittest.TestCase):
         config_values.pop("PATH", None)
         config_values.pop("GCP_WIF_PROVIDER", None)
         config_values.pop("GCP_SERVICE_ACCOUNT", None)
-        config_values["PRODUCTION_GENESIS_WAL_NATIVE"] = "off"
+        config_values["PRODUCTION_GENESIS_WAL_NATIVE"] = (
+            "on" if fresh_bootstrap else "off"
+        )
         config_values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
         config.write_text("\n".join(f"{key}={value}" for key, value in sorted(config_values.items())) + "\n", encoding="utf-8")
         config.chmod(0o600)
@@ -79,7 +81,7 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        tag = fresh.BOOTSTRAP_TAG if fresh_bootstrap else TAG
+        tag = fresh.FINAL_TAG if fresh_bootstrap else TAG
         source_repository = (
             fresh.SOURCE_REPOSITORY
             if fresh_bootstrap
@@ -105,18 +107,20 @@ class LocalEvidenceTests(unittest.TestCase):
             "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
             "archive_witness_shadow_mode": "off", "archive_witness_project_id": "",
             "archive_witness_project_number": "", "archive_witness_database_id": "",
-            "archive_v3_shadow_runtime_mode": "off",
-            "archive_v3_archive_bucket": "",
-            "archive_v3_archive_gcs_project_number": "",
-            "archive_v3_registry_kms_version": "",
-            "archive_v3_witness_project_id": "",
-            "archive_v3_witness_project_number": "",
-            "archive_v3_witness_database_id": "",
-            "archive_v3_archive_binding_commitment": "",
+            "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+            "archive_v3_archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
+            "archive_v3_archive_gcs_project_number": fresh.PROJECT_NUMBER,
+            "archive_v3_registry_kms_version": "1",
+            "archive_v3_witness_project_id": fresh.PROJECT_ID,
+            "archive_v3_witness_project_number": fresh.PROJECT_NUMBER,
+            "archive_v3_witness_database_id": fresh.EXPECTED_INTENT[
+                "witness_database_id"
+            ],
+            "archive_v3_archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
         }
         if fresh_bootstrap:
             metadata_payload.update(
-                fresh.bootstrap_release_binding(
+                fresh.final_release_binding(
                     metadata_canary_sha256
                     or CANARY_IDENTITY_PREPARATION_SHA256,
                     CANARY_ADMIN_UUID,
@@ -267,7 +271,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--public-key", str(public),
                 "--expected-public-key-sha256", fingerprint,
                 "--repository", "joerodriguez/kioku-enclave",
-                "--tag", fresh.BOOTSTRAP_TAG,
+                "--tag", fresh.FINAL_TAG,
                 "--commit", COMMIT,
                 "--image-repository", fresh.IMAGE_REPOSITORY,
                 "--config", str(directory / "local.env"),

@@ -64,10 +64,10 @@ FORBIDDEN_STEP_SQL = (
 # --print-ladder-pins`.
 
 # Every shipped step, `(epoch, id, step_digest_hex)`, in declaration order.
-# Empty because SCHEMA_LADDER is empty; G4 already refuses a step over an
-# unsealed baseline. Appending a step means appending here too -- runbook
-# step 3.
-SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = ()
+# Every step in FINAL is pinned here; appending a step means appending here too.
+SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = (
+    (1, "0001_capture_events_stream_sequence", "00721b2e0796349ebb9200f0f2595b2537d9250212f0b0bf0dd77e5d21622887"),
+)
 
 # `chain_digest(SCHEMA_EPOCH_HEAD)` over the declared ladder, anchored on
 # BASELINE_DIGEST.
@@ -78,7 +78,7 @@ SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = ()
 # nothing about BASELINE_DIGEST, and the chain is built from it, so a baseline
 # re-pin moves this even when no step moved. Not vacuous with an empty ladder
 # either -- it is then exactly `SHA256(LADDER_DOMAIN || BASELINE_DIGEST)`.
-SEALED_LADDER_CHAIN_HEAD = "44c94f297c002b76892e96f1449398610eaf981dc1f6c123cfa69630d8c72c98"
+SEALED_LADDER_CHAIN_HEAD = "74336a506af544588f1572e592cb2e238090247fba8aea25187836a4d8c35701"
 
 # One fixture triple digested by BOTH implementations of `step_digest`: this
 # file's and `schema_ladder::step_digest`'s. The identical constant is asserted
@@ -136,9 +136,9 @@ SEALED_HISTORY_PREFIX = (
 # the head, and the head is a literal in this file.
 SEALED_HISTORY_HEAD = "5a1617bcfecfac7ef35791f73074e5252fac1a262cd75ce5b84b521776bc4fb1"
 
-# The seal bit itself, pinned. Ships `False`: the machinery lands now, the flip
-# is a separate cutover-time PR gated on the zero-archive proof.
-SEALED_EXPECTED = False
+# The seal bit itself, pinned. FINAL ships `True` only after the fresh-generation
+# take recorded by the proof document.
+SEALED_EXPECTED = True
 
 
 def framed(value: bytes) -> bytes:

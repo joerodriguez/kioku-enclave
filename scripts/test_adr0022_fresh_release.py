@@ -39,23 +39,8 @@ class FreshReleaseTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, target)
 
-        schema_path = directory / "src/schema_ladder.rs"
-        schema = schema_path.read_text(encoding="utf-8")
-        self.assertIn(fresh._EXPECTED_SCHEMA_PHASE_FRAGMENT, schema)
-        schema_path.write_text(
-            schema.replace(
-                fresh._EXPECTED_SCHEMA_PHASE_FRAGMENT,
-                fresh._EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT,
-                1,
-            ),
-            encoding="utf-8",
-        )
-
         seal_path = directory / "scripts/schema_baseline_seal.json"
-        seal = json.loads(seal_path.read_text(encoding="utf-8"))
-        seal["sealed"] = True
-        seal_raw = (json.dumps(seal, indent=2) + "\n").encode("utf-8")
-        seal_path.write_bytes(seal_raw)
+        seal_raw = seal_path.read_bytes()
 
         commitment = "d" * 64
         runtime_path = directory / "config/archive-v3-shadow-runtime.json"
@@ -88,7 +73,7 @@ class FreshReleaseTests(unittest.TestCase):
             fresh.GENERATION_INTENT_SHA256,
         )
         self.assertEqual(fresh.validate_generation_intent(intent), fresh.EXPECTED_INTENT)
-        binding = fresh.bootstrap_release_binding(CANARY_SHA, CANARY_UUID)
+        binding = fresh.final_release_binding(CANARY_SHA, CANARY_UUID)
         self.assertEqual(tuple(binding), fresh.RELEASE_BINDING_FIELD_ORDER)
         self.assertEqual(len(binding), 24)
         self.assertEqual(
@@ -102,7 +87,7 @@ class FreshReleaseTests(unittest.TestCase):
                 binding["schema_epoch_target"],
                 binding["schema_epoch_minimum_servable"],
             ),
-            (0, 0, 0),
+            (1, 1, 1),
         )
 
     def test_cross_repository_schema_ten_fixture_bytes_are_exact(self) -> None:
@@ -121,8 +106,11 @@ class FreshReleaseTests(unittest.TestCase):
                 name: payload[name]
                 for name in fresh.RELEASE_BINDING_FIELD_ORDER
             },
-            fresh.bootstrap_release_binding(
-                "c" * 64, "12345678-1234-5678-9234-567812345678"
+            fresh._release_binding(
+                "c" * 64,
+                "12345678-1234-5678-9234-567812345678",
+                genesis="off",
+                epoch=0,
             ),
         )
         self.assertEqual(
@@ -194,10 +182,16 @@ class FreshReleaseTests(unittest.TestCase):
         for exact in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG):
             fresh.require_exact_fresh_tag(exact)
 
-    def test_final_source_stays_ineligible_until_exact_seal_pin_is_filled(self) -> None:
-        self.assertEqual(fresh.FINAL_SCHEMA_BASELINE_SEAL_SHA256, "")
-        with self.assertRaises(fresh.FreshReleaseError):
-            fresh.validate_checked_final_source()
+    def test_final_source_has_an_exact_seal_pin_and_is_eligible(self) -> None:
+        seal = ROOT / "scripts/schema_baseline_seal.json"
+        self.assertEqual(
+            fresh.FINAL_SCHEMA_BASELINE_SEAL_SHA256,
+            hashlib.sha256(seal.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            fresh.validate_checked_final_source(),
+            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+        )
 
     def test_exact_final_source_configuration_and_binding_are_role_specific(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +291,35 @@ class FreshReleaseTests(unittest.TestCase):
                 target = directory / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, target)
+            schema_path = directory / "src/schema_ladder.rs"
+            schema = schema_path.read_text(encoding="utf-8")
+            schema_path.write_text(
+                schema.replace(
+                    fresh._EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT,
+                    fresh._EXPECTED_SCHEMA_PHASE_FRAGMENT,
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            runtime_path = directory / "config/archive-v3-shadow-runtime.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mode": "off",
+                        "archive_bucket": "",
+                        "archive_gcs_project_number": "",
+                        "registry_kms_version": "",
+                        "witness_project_id": "",
+                        "witness_project_number": "",
+                        "witness_database_id": "",
+                        "archive_binding_commitment": "",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         mutations = (
             ("Cargo.toml", 'version = "0.8.35"', 'version = "0.8.36"'),
