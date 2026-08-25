@@ -1543,7 +1543,7 @@ class LocalImagePipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(pipeline.PipelineError, "exactly 1"):
                 pipeline.configure_direct_child_environment("verify")
 
-    def test_replacement_ref_clean_tree_illusion_is_rejected_before_source_use(self) -> None:
+    def test_replacement_ref_is_rejected_before_source_use(self) -> None:
         pipeline = load_pipeline()
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary) / "repository"
@@ -1572,7 +1572,11 @@ class LocalImagePipelineTests(unittest.TestCase):
             source_b = git("rev-parse", "HEAD", capture=True).stdout.strip()
             git("replace", source_a, source_b)
             git("update-ref", "HEAD", source_a)
-            self.assertEqual(git("status", "--porcelain", capture=True).stdout, "")
+
+            # Git versions differ on whether status compares the index with the
+            # replacement commit or the replaced commit.  The release boundary
+            # must reject the replacement ref before either interpretation can
+            # influence source selection.
 
             pipeline.ROOT = repository
             pipeline._CHILD_ENVIRONMENT = {
