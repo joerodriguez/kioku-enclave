@@ -1,7 +1,8 @@
 {
-  "_comment": "ADR-0022 epoch-0 baseline seal. See scripts/test_schema_ladder_gate.py (G-SEAL-1..5, G4) and docs/adr/0022/zero-archive-proof.md. Editing this file alone can never satisfy the gate: the history length, the history prefix, the history chain head and the seal bit are all pinned as literals in the gate script.",
+  "_comment": "ADR-0022 epoch-0 baseline seal. See scripts/test_schema_ladder_gate.py (G-SEAL-1..5, G4) and docs/adr/0022/zero-archive-proof.md. Editing this file alone can never satisfy the gate: the history length, history prefix, history chain head and seal bit are pinned in the gate, while evidence_sha256 must bind the exact canonical bootstrap_reclosed owner projection embedded in the named proof.",
   "sealed": false,
   "digest": "d5ff84db4c22ac093b52640aca6ead6d1db5d9726f27927de701d791b1792dfb",
+  "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "history": [
     {
       "digest": "c9f277faac1419964b3f8f3c6a3c257808a43b7210490f28fdcb3e42a2b9c551",

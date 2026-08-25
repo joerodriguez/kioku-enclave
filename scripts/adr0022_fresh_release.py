@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import tomllib
@@ -43,8 +44,72 @@ IMAGE_REPOSITORY = (
 )
 CANARY_CONFIG_KEY = "ADR0022_CANARY_IDENTITY_PREPARATION_SHA256"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+COMMIT40 = re.compile(r"[0-9a-f]{40}\Z")
 UUID_V5 = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
+)
+RFC3339_NANO = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z\Z"
+)
+BASELINE_SEAL_EVIDENCE_SCHEMA = (
+    "kioku-adr0022-fresh-baseline-seal-evidence-v1"
+)
+BASELINE_SEAL_PROOF = "docs/adr/0022/zero-archive-proof.md"
+BASELINE_SEAL_EVIDENCE_BEGIN = "<!-- ADR0022_BASELINE_SEAL_EVIDENCE_BEGIN\n"
+BASELINE_SEAL_EVIDENCE_END = "ADR0022_BASELINE_SEAL_EVIDENCE_END -->"
+BASELINE_SEAL_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "owner_ledger_receipt_sha256",
+        "generation_intent_sha256",
+        "owner_source_commit",
+        "owner_source_closure_sha256",
+        "provider_transport_authority_sha256",
+        "provision_receipt_sha256",
+        "provision_token_sha256",
+        "identity_preparation_sha256",
+        "canary_admin_uuid",
+        "launch_witness_source_closure_sha256",
+        "bootstrap_issuer_predecessor_source_commit",
+        "bootstrap_issuer_source_commit",
+        "bootstrap_issuer_source_closure_sha256",
+        "bootstrap_release_manifest_sha256",
+        "bootstrap_provider_admission_sha256",
+        "bootstrap_release_admission_token_sha256",
+        "bootstrap_release_source_commit",
+        "bootstrap_release_tag",
+        "bootstrap_image_digest",
+        "bootstrap_config_sha256",
+        "bootstrap_metadata_sha256",
+        "bootstrap_evidence_sha256",
+        "bootstrap_provider_effect_plan_sha256",
+        "bootstrap_provider_effect_receipt_sha256",
+        "bootstrap_digest_authority_sha256",
+        "bootstrap_instance_projection_sha256",
+        "bootstrap_singleton_inventory_sha256",
+        "bootstrap_network_boundary_sha256",
+        "bootstrap_kms_boundary_sha256",
+        "bootstrap_archive_boundary_sha256",
+        "bootstrap_schema_runtime_sha256",
+        "bootstrap_no_genesis_birth_sha256",
+        "binding_session_boundary_sha256",
+        "binding_activation_boundary_sha256",
+        "binding_account_id_sha256",
+        "binding_email_sha256",
+        "binding_archive_binding_commitment",
+        "binding_bootstrap_log_topology_sha256",
+        "binding_bootstrap_observed_through",
+        "reclosed_fixed_deny_readback_sha256",
+        "reclosed_network_effective_firewall_sha256",
+        "reclosed_active_firewall_operations_sha256",
+        "reclosed_temporary_firewall_absence_sha256",
+        "reclosed_token_grant_absence_sha256",
+        "reclosed_identity_readback_sha256",
+        "bootstrap_serving_recorded_at",
+        "binding_sealed_recorded_at",
+        "bootstrap_reclosed_recorded_at",
+    }
 )
 
 EXPECTED_INTENT = {
@@ -212,6 +277,128 @@ def _exact_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _rfc3339_nanoseconds(value: Any) -> int:
+    if not isinstance(value, str) or RFC3339_NANO.fullmatch(value) is None:
+        raise FreshReleaseError("fresh baseline-seal evidence time is invalid")
+    seconds_text, _, fraction_text = value[:-1].partition(".")
+    try:
+        seconds = int(
+            datetime.strptime(seconds_text, "%Y-%m-%dT%H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except (OverflowError, ValueError) as error:
+        raise FreshReleaseError("fresh baseline-seal evidence time is invalid") from error
+    nanoseconds = int(fraction_text.ljust(9, "0")) if fraction_text else 0
+    return seconds * 1_000_000_000 + nanoseconds
+
+
+def validate_baseline_seal_evidence(
+    root: Path, *, expected_sha256: str
+) -> dict[str, Any]:
+    """Read the exact canonical BOOT owner projection embedded in its proof."""
+
+    if HEX64.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
+        raise FreshReleaseError("fresh baseline-seal evidence SHA-256 is invalid")
+    proof = root / BASELINE_SEAL_PROOF
+    if not proof.is_file() or proof.is_symlink():
+        raise FreshReleaseError("fresh baseline-seal proof is not a regular source file")
+    cursor = proof.parent
+    while cursor != root:
+        if cursor.is_symlink() or cursor.parent == cursor:
+            raise FreshReleaseError("fresh baseline-seal proof ancestry is invalid")
+        cursor = cursor.parent
+    try:
+        if not 1 <= proof.stat().st_size <= 262_144:
+            raise FreshReleaseError("fresh baseline-seal proof size is invalid")
+        source = proof.read_bytes()
+        source.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise FreshReleaseError("fresh baseline-seal proof is unreadable") from error
+    begin = BASELINE_SEAL_EVIDENCE_BEGIN.encode("ascii")
+    end = BASELINE_SEAL_EVIDENCE_END.encode("ascii")
+    if (
+        source.count(begin) != 1
+        or source.count(end) != 1
+    ):
+        raise FreshReleaseError("fresh baseline-seal evidence block is not unique")
+    raw = source.split(begin, 1)[1].split(end, 1)[0]
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_exact_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateName) as error:
+        raise FreshReleaseError("fresh baseline-seal evidence JSON is invalid") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != BASELINE_SEAL_EVIDENCE_FIELDS
+        or raw != _canonical_json(payload)
+        or hashlib.sha256(raw).hexdigest() != expected_sha256
+        or payload.get("schema") != BASELINE_SEAL_EVIDENCE_SCHEMA
+        or payload.get("status") != "bootstrap_reclosed"
+        or payload.get("generation_intent_sha256") != GENERATION_INTENT_SHA256
+        or payload.get("bootstrap_release_tag") != BOOTSTRAP_TAG
+        or not isinstance(payload.get("bootstrap_image_digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", payload["bootstrap_image_digest"])
+        is None
+        or payload["bootstrap_image_digest"] == "sha256:" + "0" * 64
+        or UUID_V5.fullmatch(payload.get("canary_admin_uuid", "")) is None
+        or HEX64.fullmatch(payload.get("binding_archive_binding_commitment", ""))
+        is None
+        or payload["binding_archive_binding_commitment"] == "0" * 64
+    ):
+        raise FreshReleaseError("fresh baseline-seal evidence projection drifted")
+    commit_fields = {
+        "owner_source_commit",
+        "bootstrap_issuer_predecessor_source_commit",
+        "bootstrap_issuer_source_commit",
+        "bootstrap_release_source_commit",
+    }
+    if any(
+        COMMIT40.fullmatch(payload.get(name, "")) is None
+        or payload[name] == "0" * 40
+        for name in commit_fields
+    ):
+        raise FreshReleaseError("fresh baseline-seal source coordinate is invalid")
+    if (
+        payload["bootstrap_issuer_predecessor_source_commit"]
+        != payload["owner_source_commit"]
+        or payload["bootstrap_issuer_source_commit"]
+        == payload["owner_source_commit"]
+    ):
+        raise FreshReleaseError("fresh baseline-seal source lineage drifted")
+    hash_fields = {
+        name
+        for name in BASELINE_SEAL_EVIDENCE_FIELDS
+        if name.endswith("_sha256")
+    }
+    if any(
+        HEX64.fullmatch(payload.get(name, "")) is None
+        or payload[name] == "0" * 64
+        for name in hash_fields
+    ):
+        raise FreshReleaseError("fresh baseline-seal commitment is invalid")
+    times = {
+        name: _rfc3339_nanoseconds(payload.get(name))
+        for name in (
+            "bootstrap_serving_recorded_at",
+            "binding_bootstrap_observed_through",
+            "binding_sealed_recorded_at",
+            "bootstrap_reclosed_recorded_at",
+        )
+    }
+    if not (
+        times["bootstrap_serving_recorded_at"]
+        < times["binding_bootstrap_observed_through"]
+        <= times["binding_sealed_recorded_at"]
+        < times["bootstrap_reclosed_recorded_at"]
+    ):
+        raise FreshReleaseError("fresh baseline-seal chronology drifted")
+    return payload
+
+
 def normalize_tag(source_ref: str) -> str:
     return source_ref.removeprefix("refs/tags/")
 
@@ -287,6 +474,11 @@ def validate_checked_bootstrap_source(root: Path | None = None) -> None:
         manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
         lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
         schema = (root / "src/schema_ladder.rs").read_text(encoding="utf-8")
+        seal = json.loads(
+            (root / "scripts/schema_baseline_seal.json").read_text(encoding="utf-8"),
+            object_pairs_hook=_exact_object,
+        )
+        proof = (root / BASELINE_SEAL_PROOF).read_text(encoding="utf-8")
         probe = json.loads(
             (root / "config/archive-witness-probe.json").read_text(encoding="utf-8"),
             object_pairs_hook=_exact_object,
@@ -321,6 +513,20 @@ def validate_checked_bootstrap_source(root: Path | None = None) -> None:
     fragment = schema.split(begin, 1)[1].split(end, 1)[0]
     if fragment != _EXPECTED_SCHEMA_PHASE_FRAGMENT:
         raise FreshReleaseError("fresh BOOTSTRAP schema phase is not exact 0/0/0")
+    history = seal.get("history") if isinstance(seal, dict) else None
+    if (
+        not isinstance(seal, dict)
+        or set(seal) != {"_comment", "sealed", "digest", "evidence_sha256", "history"}
+        or seal.get("sealed") is not False
+        or seal.get("evidence_sha256") != "0" * 64
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(history[-1], dict)
+        or history[-1].get("proof") != BASELINE_SEAL_PROOF
+        or BASELINE_SEAL_EVIDENCE_BEGIN in proof
+        or BASELINE_SEAL_EVIDENCE_END in proof
+    ):
+        raise FreshReleaseError("fresh BOOTSTRAP baseline source is not exact unsealed")
     if probe != {
         "schema_version": 1,
         "mode": "off",
@@ -343,7 +549,9 @@ def validate_checked_bootstrap_source(root: Path | None = None) -> None:
         raise FreshReleaseError("fresh BOOTSTRAP archive runtime is not exact off")
 
 
-def validate_checked_final_source(root: Path | None = None) -> str:
+def _validate_checked_final_source(
+    root: Path | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Validate the exact active FINAL source and return its live commitment."""
 
     root = root or ROOT
@@ -400,7 +608,8 @@ def validate_checked_final_source(root: Path | None = None) -> str:
         raise FreshReleaseError("fresh FINAL schema baseline seal is not pinned")
     if (
         not isinstance(seal, dict)
-        or set(seal) != {"_comment", "sealed", "digest", "history"}
+        or set(seal)
+        != {"_comment", "sealed", "digest", "evidence_sha256", "history"}
         or seal.get("sealed") is not True
     ):
         raise FreshReleaseError("fresh FINAL schema baseline is not sealed")
@@ -413,11 +622,15 @@ def validate_checked_final_source(root: Path | None = None) -> str:
         or not history
         or not isinstance(history[-1], dict)
         or history[-1].get("digest") != seal["digest"]
+        or history[-1].get("proof") != BASELINE_SEAL_PROOF
         or not isinstance(history[-1].get("chain"), str)
         or HEX64.fullmatch(history[-1]["chain"]) is None
         or history[-1]["chain"] == "0" * 64
     ):
         raise FreshReleaseError("fresh FINAL schema baseline history is invalid")
+    baseline_evidence = validate_baseline_seal_evidence(
+        root, expected_sha256=seal.get("evidence_sha256", "")
+    )
     if probe != {
         "schema_version": 1,
         "mode": "off",
@@ -448,9 +661,17 @@ def validate_checked_final_source(root: Path | None = None) -> str:
         not isinstance(commitment, str)
         or HEX64.fullmatch(commitment) is None
         or commitment == "0" * 64
+        or commitment
+        != baseline_evidence["binding_archive_binding_commitment"]
     ):
         raise FreshReleaseError("fresh FINAL archive binding commitment is invalid")
-    return commitment
+    return commitment, baseline_evidence
+
+
+def validate_checked_final_source(root: Path | None = None) -> str:
+    """Validate the exact active FINAL source and return its live commitment."""
+
+    return _validate_checked_final_source(root)[0]
 
 
 def validate_canary_binding(receipt_sha256: str, admin_uuid: str) -> None:
@@ -478,7 +699,7 @@ def validate_bootstrap_configuration(configuration: dict[str, str]) -> None:
 
 
 def validate_final_configuration(configuration: dict[str, str]) -> None:
-    commitment = validate_checked_final_source()
+    commitment, baseline_evidence = _validate_checked_final_source()
     for name, expected in _EXPECTED_FINAL_CONFIGURATION.items():
         if configuration.get(name) != expected:
             raise FreshReleaseError(
@@ -495,6 +716,15 @@ def validate_final_configuration(configuration: dict[str, str]) -> None:
         configuration.get(CANARY_CONFIG_KEY, ""),
         configuration.get("ADMIN_USER_IDS", ""),
     )
+    if (
+        configuration.get(CANARY_CONFIG_KEY)
+        != baseline_evidence["identity_preparation_sha256"]
+        or configuration.get("ADMIN_USER_IDS")
+        != baseline_evidence["canary_admin_uuid"]
+    ):
+        raise FreshReleaseError(
+            "fresh FINAL configuration lost the baseline-seal canary roots"
+        )
 
 
 def _release_binding(
@@ -567,8 +797,14 @@ def final_release_binding(
 ) -> dict[str, Any]:
     """Return the exact ordered schema-10-only FINAL binding fields."""
 
-    validate_checked_final_source()
+    _, baseline_evidence = _validate_checked_final_source()
     validate_canary_binding(canary_identity_preparation_sha256, canary_admin_uuid)
+    if (
+        canary_identity_preparation_sha256
+        != baseline_evidence["identity_preparation_sha256"]
+        or canary_admin_uuid != baseline_evidence["canary_admin_uuid"]
+    ):
+        raise FreshReleaseError("fresh FINAL release lost the baseline-seal canary roots")
     binding = _release_binding(
         canary_identity_preparation_sha256,
         canary_admin_uuid,

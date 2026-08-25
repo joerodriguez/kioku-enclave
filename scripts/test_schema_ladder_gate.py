@@ -17,6 +17,9 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adr0022_fresh_release as fresh_release
+
 ROOT = Path(__file__).resolve().parent.parent
 STORE = ROOT / "src/store.rs"
 LADDER = ROOT / "src/schema_ladder.rs"
@@ -599,12 +602,19 @@ class SchemaLadderGateTest(unittest.TestCase):
         Note what this does NOT do: it does not forbid `true` -> `false`.
         G-SEAL-5 is what forbids it, by pinning the bit itself.
         """
-        if not self.seal["sealed"]:
-            return
         proof = ROOT / self.seal["history"][-1]["proof"]
         self.assertTrue(
             proof.is_file(),
-            f"sealed, but the proof it names does not exist: {proof}",
+            f"the baseline proof it names does not exist: {proof}",
+        )
+        if not self.seal["sealed"]:
+            self.assertEqual(self.seal["evidence_sha256"], "0" * 64)
+            recorded = proof.read_text(encoding="utf-8")
+            self.assertNotIn(fresh_release.BASELINE_SEAL_EVIDENCE_BEGIN, recorded)
+            self.assertNotIn(fresh_release.BASELINE_SEAL_EVIDENCE_END, recorded)
+            return
+        fresh_release.validate_baseline_seal_evidence(
+            ROOT, expected_sha256=self.seal["evidence_sha256"]
         )
         recorded = proof.read_text(encoding="utf-8")
         self.assertNotIn(

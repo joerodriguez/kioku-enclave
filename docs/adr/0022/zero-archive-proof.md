@@ -45,8 +45,15 @@ The fresh proof must bind all of the following before the seal flips:
    and exact live image/provider identity. Failure at any point leaves the fresh generation
    denied and never falls back to the legacy namespace.
 
-The checked-in receipts, signed release coordinates, and live proof values will be appended to
-this section by the reviewed FINAL source change. Until then `sealed` remains false.
+The reviewed FINAL source change must append exactly one hidden canonical
+`kioku-adr0022-fresh-baseline-seal-evidence-v1` JSON block to this section. The block is the
+fixed projection returned by the source-frozen launch-ledger validator at exact
+`bootstrap_reclosed`; `scripts/schema_baseline_seal.json.evidence_sha256` must equal the SHA-256
+of its sorted compact-plus-LF bytes. The release source gate checks the exact field set, nonzero
+commitments, C→BOOT source lineage, fixed BOOT tag/image shape, and serving→binding→reclose
+chronology. An arbitrary receipt hash, prose edit, duplicate block, or locally consistent
+replacement projection cannot flip the seal. Until that same-read projection exists,
+`evidence_sha256` stays all-zero, the block must be absent, and `sealed` remains false.
 
 ## Superseded fallback — physical zero of the legacy namespace
 
