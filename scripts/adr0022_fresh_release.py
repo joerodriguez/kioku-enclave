@@ -131,6 +131,9 @@ _EXPECTED_COMMON_CONFIGURATION = {
     "ENCLAVE_ATTEST_STS_AUDIENCE": (
         "//iam.googleapis.com/" + EXPECTED_INTENT["main_wif_provider"]
     ),
+    "ENCLAVE_AUDIENCE": "https://api.kiokuu.com",
+    "BASE_URL": "https://api.kiokuu.com",
+    "WEB_ORIGIN": "https://kiokuu.com",
 }
 
 _EXPECTED_BOOTSTRAP_CONFIGURATION = {

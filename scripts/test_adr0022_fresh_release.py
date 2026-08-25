@@ -160,6 +160,27 @@ class FreshReleaseTests(unittest.TestCase):
                 with self.assertRaises(fresh.FreshReleaseError):
                     fresh.validate_canary_binding(receipt_sha, admin_uuid)
 
+    def test_fixed_fresh_roles_refuse_audience_and_origin_drift(self) -> None:
+        configuration = {
+            **fresh._EXPECTED_BOOTSTRAP_CONFIGURATION,
+            "SIGNUP_LIMIT_PER_DAY": "10",
+            fresh.CANARY_CONFIG_KEY: CANARY_SHA,
+            "ADMIN_USER_IDS": CANARY_UUID,
+        }
+        fresh.validate_bootstrap_configuration(configuration)
+        for name, substituted in (
+            ("ENCLAVE_AUDIENCE", "https://other.example"),
+            ("ENCLAVE_AUDIENCE", "http://api.kiokuu.com"),
+            ("BASE_URL", "https://other.example"),
+            ("WEB_ORIGIN", "https://other.example"),
+        ):
+            with self.subTest(name=name, substituted=substituted):
+                drifted = {**configuration, name: substituted}
+                with self.assertRaisesRegex(
+                    fresh.FreshReleaseError, rf"reviewed {name}"
+                ):
+                    fresh.validate_bootstrap_configuration(drifted)
+
     def test_bootstrap_tag_role_has_no_version_or_attempt_alias(self) -> None:
         self.assertTrue(fresh.is_bootstrap_tag(fresh.BOOTSTRAP_TAG))
         self.assertTrue(fresh.is_bootstrap_tag("refs/tags/" + fresh.BOOTSTRAP_TAG))
