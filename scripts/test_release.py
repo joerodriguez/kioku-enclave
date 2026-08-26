@@ -81,7 +81,7 @@ class LocalReleaseContracts(unittest.TestCase):
 
     def test_fresh_roles_have_fixed_tags_and_never_enter_the_legacy_roll(self) -> None:
         fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
-        final_tag = 'ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.8"'
+        final_tag = 'ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.9"'
         self.assertIn(fixed_tag, RELEASE)
         self.assertIn(final_tag, RELEASE)
         self.assertIn(
