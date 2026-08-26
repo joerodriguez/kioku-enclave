@@ -24,9 +24,8 @@ COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
 COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 PUSH_DEPLOYMENT_SOURCE_SEAL=""
 ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
-ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.14"
-ADR0022_FRESH_SUCCESSOR_TAG="v0.8.36-archive-v3-wal.15"
-ADR0022_FRESH_FLEET_CONVERGENCE_TAG="v0.8.36-archive-v3-wal.17"
+ADR0022_CURRENT_TAG=""
+ADR0022_CURRENT_VERSION=""
 RELEASE_CONFIG_SNAPSHOT=""
 SOURCE_ARCHIVE=""
 NOTES=""
@@ -115,12 +114,6 @@ done
 if [[ "$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp] && "$TAG" != "$ADR0022_FRESH_BOOTSTRAP_TAG" ]]; then
   die "ADR-0022 fresh BOOTSTRAP tag must be exactly $ADR0022_FRESH_BOOTSTRAP_TAG"
 fi
-if [[ "$TAG" =~ ^v0\.8\.35-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_FINAL_TAG" ]]; then
-  die "ADR-0022 fresh FINAL tag must be exactly $ADR0022_FRESH_FINAL_TAG"
-fi
-if [[ "$TAG" =~ ^v0\.8\.36-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_SUCCESSOR_TAG" && "$TAG" != "$ADR0022_FRESH_FLEET_CONVERGENCE_TAG" ]]; then
-  die "ADR-0022 fresh successor tag must be an exact reviewed tag"
-fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
 [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || die "--config must name the local build configuration used for this image"
@@ -156,6 +149,18 @@ PY
 export GIT_NO_REPLACE_OBJECTS=1
 cd "$REPO_ROOT"
 reject_git_object_substitution
+ADR0022_CURRENT_FIELDS="$(python3 - <<'PY'
+from scripts.archive_v3_release_tag import load_current_release_receipt
+tag = load_current_release_receipt()[1]
+print(tag.name + "\x1f" + tag.version)
+PY
+)" || die "current Archive V3 release receipt is invalid"
+IFS=$'\x1f' read -r ADR0022_CURRENT_TAG ADR0022_CURRENT_VERSION <<< "$ADR0022_CURRENT_FIELDS"
+[[ -n "$ADR0022_CURRENT_TAG" && -n "$ADR0022_CURRENT_VERSION" ]] \
+  || die "current Archive V3 release receipt is incomplete"
+if [[ "$TAG" =~ ^v${ADR0022_CURRENT_VERSION//./\.}-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_CURRENT_TAG" ]]; then
+  die "Archive V3 release tag must match the generated current release $ADR0022_CURRENT_TAG"
+fi
 if [[ -z "$FROZEN_COMMIT" ]]; then
   [[ "$(git --no-replace-objects branch --show-current)" == main ]] || die "releases must be prepared from local main"
 else
@@ -201,7 +206,7 @@ PY
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
 IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" || "$TAG" == "$ADR0022_FRESH_SUCCESSOR_TAG" || "$TAG" == "$ADR0022_FRESH_FLEET_CONVERGENCE_TAG" ) ]]; then
+if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_CURRENT_TAG" ) ]]; then
   die "ADR-0022 fresh releases roll only through the sealed deployment direct-provider operation"
 elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/
@@ -243,6 +248,11 @@ fi
 # origin refresh so an ineligible roll performs no network or external action.
 git --no-replace-objects fetch origin main
 ORIGIN_MAIN="$(git --no-replace-objects rev-parse origin/main)"
+if [[ "$TAG" == "$ADR0022_CURRENT_TAG" ]]; then
+  python3 scripts/archive_v3_release_tag.py check \
+    --tag "$TAG" --remote origin --allow-existing >/dev/null \
+    || die "Archive V3 release is not the exact next published WAL sequence"
+fi
 if [[ -z "$FROZEN_COMMIT" ]]; then
   COMMIT="$(git --no-replace-objects rev-parse HEAD)"
   [[ "$COMMIT" == "$ORIGIN_MAIN" ]] || die "local main must exactly match origin/main"

@@ -18,17 +18,15 @@ import re
 import tomllib
 from typing import Any
 
+from archive_v3_release_tag import (
+    ReleaseTagError,
+    load_current_release_receipt,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
+CURRENT_TAG = load_current_release_receipt(ROOT)[1].name
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
-FINAL_TAG = "v0.8.35-archive-v3-wal.14"
-SUCCESSOR_TAG = "v0.8.36-archive-v3-wal.15"
-FLEET_CONVERGENCE_TAG = "v0.8.36-archive-v3-wal.17"
-FINAL_TAG_VERSIONS = {
-    FINAL_TAG: "0.8.35",
-    SUCCESSOR_TAG: "0.8.36",
-    FLEET_CONVERGENCE_TAG: "0.8.36",
-}
 SOURCE_REPOSITORY = "https://github.com/joerodriguez/kioku-enclave"
 GENERATION_INTENT_SHA256 = (
     "7ece5ba914f76d2f56af178d5891230d3e1ba7df33a6b54dd3d2a7870cce3727"
@@ -228,15 +226,14 @@ def claims_bootstrap_role(source_ref: str) -> bool:
 
 
 def claims_final_role(source_ref: str) -> bool:
-    """Return true for every ref attempting one of the fixed active roles."""
+    """Return true for refs attempting this source version's WAL role."""
 
-    normalized = normalize_tag(source_ref).lower()
-    return any(
-        normalized.startswith(prefix)
-        for prefix in (
-            "v0.8.35-archive-v3-wal",
-            "v0.8.36-archive-v3-wal",
-        )
+    try:
+        _, current = load_current_release_receipt(ROOT)
+    except ReleaseTagError:
+        return False
+    return normalize_tag(source_ref).lower().startswith(
+        f"v{current.version}-archive-v3-wal"
     )
 
 
@@ -256,19 +253,27 @@ def require_exact_bootstrap_tag(source_ref: str) -> None:
 
 
 def is_final_tag(source_ref: str) -> bool:
-    return normalize_tag(source_ref) in FINAL_TAG_VERSIONS
+    try:
+        _, current = load_current_release_receipt(ROOT)
+    except ReleaseTagError:
+        return False
+    return normalize_tag(source_ref) == current.name
 
 
 def require_exact_final_tag(source_ref: str) -> None:
     if not is_final_tag(source_ref):
         raise FreshReleaseError(
-            "fresh active source_ref must be exactly one reviewed tag"
+            "fresh active source_ref must match the generated current-release receipt"
         )
 
 
 def final_version(source_ref: str) -> str:
     require_exact_final_tag(source_ref)
-    return FINAL_TAG_VERSIONS[normalize_tag(source_ref)]
+    try:
+        _, current = load_current_release_receipt(ROOT)
+    except ReleaseTagError as error:
+        raise FreshReleaseError("current release receipt is invalid") from error
+    return current.version
 
 
 def require_exact_fresh_tag(source_ref: str) -> None:
@@ -359,11 +364,20 @@ def validate_checked_bootstrap_source(root: Path | None = None) -> None:
 
 
 def validate_checked_final_source(
-    root: Path | None = None, *, source_ref: str = SUCCESSOR_TAG
+    root: Path | None = None, *, source_ref: str | None = None
 ) -> str:
     """Validate the exact active FINAL source and return its live commitment."""
 
     root = root or ROOT
+    try:
+        _, current_release = load_current_release_receipt(root)
+    except ReleaseTagError as error:
+        raise FreshReleaseError("current release receipt is invalid") from error
+    source_ref = source_ref or current_release.name
+    if normalize_tag(source_ref) != current_release.name:
+        raise FreshReleaseError(
+            "fresh active source_ref must match the generated current-release receipt"
+        )
     validate_generation_intent(root / "config/adr0022-fresh-generation-intent.json")
     try:
         manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
@@ -498,7 +512,7 @@ def validate_bootstrap_configuration(configuration: dict[str, str]) -> None:
 
 
 def validate_final_configuration(
-    configuration: dict[str, str], *, source_ref: str = SUCCESSOR_TAG
+    configuration: dict[str, str], *, source_ref: str | None = None
 ) -> None:
     commitment = validate_checked_final_source(source_ref=source_ref)
     for name, expected in _EXPECTED_FINAL_CONFIGURATION.items():
@@ -587,7 +601,7 @@ def final_release_binding(
     canary_identity_preparation_sha256: str,
     canary_admin_uuid: str,
     *,
-    source_ref: str = SUCCESSOR_TAG,
+    source_ref: str | None = None,
 ) -> dict[str, Any]:
     """Return the exact ordered schema-10-only FINAL binding fields."""
 
@@ -616,7 +630,7 @@ def bootstrap_release_binding_from_configuration(
 def final_release_binding_from_configuration(
     configuration: dict[str, str],
     *,
-    source_ref: str = SUCCESSOR_TAG,
+    source_ref: str | None = None,
 ) -> dict[str, Any]:
     validate_final_configuration(configuration, source_ref=source_ref)
     return final_release_binding(

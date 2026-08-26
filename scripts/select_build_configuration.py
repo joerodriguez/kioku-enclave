@@ -299,7 +299,7 @@ def selected_configuration(
         f"PRODUCTION_{name}" in environment for name in FRESH_RELEASE_PROFILE_KEYS
     ):
         raise SystemExit(
-            "fresh release operator inputs are eligible only for an exact fixed tag"
+            "fresh release operator inputs require the generated current-release tag"
         )
     configuration = {
         name: require_value(environment, name) for name in SHARED_KEYS

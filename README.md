@@ -629,7 +629,8 @@ from that same snapshot. The synthetic cross-repository fixture is
 [`config/adr0022-fresh-schema10-bootstrap-fixture.json`](config/adr0022-fresh-schema10-bootstrap-fixture.json)
 (3,094 bytes, SHA-256 `40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`).
 It is a BOOTSTRAP format pin, not production evidence. Generic releases remain
-schema 9. `scripts/release.sh --roll` refuses both fixed fresh tags; only the
+schema 9. `scripts/release.sh --roll` refuses BOOTSTRAP and the generated current
+Archive V3 release tag; only the
 deployment repository's sealed `adr0022-fresh-launch` owner may roll them.
 Direct evidence verification supplies the exact mode-0600 image configuration;
 schema 10 derives its fresh bucket
