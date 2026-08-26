@@ -2074,6 +2074,15 @@ impl WitnessRecord {
         forged
     }
     #[cfg(test)]
+    pub(crate) fn heartbeated_wal_owner_lease_for_test(&self) -> Self {
+        let mut heartbeated = self.clone();
+        heartbeated.last_server_tick = self
+            .last_server_tick
+            .checked_add(1)
+            .expect("test WAL-owner heartbeat tick overflow");
+        heartbeated
+    }
+    #[cfg(test)]
     pub(crate) fn renewed_maintenance_lease_for_test(&self) -> Self {
         let mut renewed = self.clone();
         renewed.last_server_tick = self
