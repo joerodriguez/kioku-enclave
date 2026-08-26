@@ -98,19 +98,27 @@ use crate::{
 };
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
-// GCS replaces one immutable generation of this singleton object for every
-// durable Control transition.  Sustained sub-second replacements are provider
-// throttled even though short bursts can succeed, so WAL publication's
-// reserve/materialize ladder must share one process-wide dispatch interval
-// with every other Control writer.  Keep a full extra second of provider
-// headroom: production sustained seventeen 1.1-second replacements before
-// GCS refused the eighteenth.
+const CONTROL_OBJECT_SLOT_COUNT: usize = 32;
+const CONTROL_SNAPSHOT_MAGIC: &[u8] = b"KIOKU-CONTROL-SNAPSHOT\x01";
+// GCS throttles sustained replacements of one object name. Control has
+// durability boundaries between every WAL publication step, so serializing
+// all of them through one name put capture latency on the provider's
+// replacement cadence. Production rotates a fixed 32-name encrypted snapshot
+// ring. Each name retains the conservative interval while the ring preserves
+// the exact whole-Control snapshot and generation-CAS discipline.
 #[cfg(not(test))]
 const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::from_millis(2_100);
 // Keep the broad unit suite fast.  The focused pacing regression below installs
 // a non-zero interval and a fake provider that rejects an unpaced second PUT.
 #[cfg(test)]
 const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::ZERO;
+#[cfg(not(test))]
+const DEFAULT_CONTROL_OBJECT_SLOT_COUNT: usize = CONTROL_OBJECT_SLOT_COUNT;
+// Existing failure/cancellation tests exercise the original single-slot
+// schedule. A focused test below opts into the full ring and pins rotation and
+// restart selection independently.
+#[cfg(test)]
+const DEFAULT_CONTROL_OBJECT_SLOT_COUNT: usize = 1;
 const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "usage_daily",
     "billing_accounts",
@@ -138,6 +146,93 @@ const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "archive_bindings",
 ];
 const CONTROL_CONTEXT: &[u8] = b"control-db\0control/control.db.enc";
+
+fn control_object_name(slot: usize) -> String {
+    debug_assert!(slot < CONTROL_OBJECT_SLOT_COUNT);
+    if slot == 0 {
+        CONTROL_OBJECT.to_string()
+    } else {
+        format!("control/control.db.slot-{slot:02}.enc")
+    }
+}
+
+fn validate_control_object_slot_count(slot_count: usize) -> Result<()> {
+    if !(1..=CONTROL_OBJECT_SLOT_COUNT).contains(&slot_count) {
+        return Err(EnclaveError::Store(
+            "control snapshot ring size is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn is_control_snapshot_object(object_name: &str) -> bool {
+    object_name == CONTROL_OBJECT || object_name.starts_with("control/control.db.slot-")
+}
+
+fn control_object_context(object_name: &str, sequence: u64) -> Vec<u8> {
+    if sequence == 0 {
+        if object_name == CONTROL_OBJECT {
+            return CONTROL_CONTEXT.to_vec();
+        }
+        let mut context = Vec::with_capacity(b"control-db\0".len() + object_name.len());
+        context.extend_from_slice(b"control-db\0");
+        context.extend_from_slice(object_name.as_bytes());
+        return context;
+    }
+    let mut context = Vec::with_capacity(
+        b"control-db-snapshot-v1\0".len() + object_name.len() + std::mem::size_of::<u64>(),
+    );
+    context.extend_from_slice(b"control-db-snapshot-v1\0");
+    context.extend_from_slice(object_name.as_bytes());
+    context.extend_from_slice(&sequence.to_be_bytes());
+    context
+}
+
+fn encode_control_snapshot(sequence: u64, ciphertext: Vec<u8>) -> Result<Vec<u8>> {
+    if sequence == 0 {
+        return Err(EnclaveError::Store(
+            "control snapshot sequence must be positive".into(),
+        ));
+    }
+    let mut encoded = Vec::with_capacity(
+        CONTROL_SNAPSHOT_MAGIC.len() + std::mem::size_of::<u64>() + ciphertext.len(),
+    );
+    encoded.extend_from_slice(CONTROL_SNAPSHOT_MAGIC);
+    encoded.extend_from_slice(&sequence.to_be_bytes());
+    encoded.extend_from_slice(&ciphertext);
+    Ok(encoded)
+}
+
+fn decode_control_snapshot(slot: usize, encoded: &[u8]) -> Result<(u64, &[u8])> {
+    let Some(rest) = encoded.strip_prefix(CONTROL_SNAPSHOT_MAGIC) else {
+        if slot == 0 {
+            // The pre-ring singleton is the genesis snapshot. Its original
+            // context and bytes remain valid until the first rotating write.
+            return Ok((0, encoded));
+        }
+        return Err(EnclaveError::Store(
+            "control snapshot slot is missing its versioned header".into(),
+        ));
+    };
+    if rest.len() <= std::mem::size_of::<u64>() {
+        return Err(EnclaveError::Store(
+            "control snapshot header is truncated".into(),
+        ));
+    }
+    let (sequence, ciphertext) = rest.split_at(std::mem::size_of::<u64>());
+    let sequence = u64::from_be_bytes(
+        sequence
+            .try_into()
+            .map_err(|_| EnclaveError::Store("control snapshot sequence is malformed".into()))?,
+    );
+    if sequence == 0 {
+        return Err(EnclaveError::Store(
+            "control snapshot header is invalid".into(),
+        ));
+    }
+    Ok((sequence, ciphertext))
+}
 const MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER: i64 = 1;
 const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
 const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
@@ -1881,7 +1976,8 @@ fn migrate_advisory_abort_locus(conn: &Connection) -> Result<usize> {
 }
 
 struct BlobMeta {
-    generation: i64,
+    sequence: u64,
+    slot_generations: [i64; CONTROL_OBJECT_SLOT_COUNT],
     wrapped_dek_b64: String,
 }
 
@@ -1936,8 +2032,9 @@ pub struct ControlStore {
     inner: Arc<Mutex<Option<Handle>>>,
     kms: Arc<dyn KmsClient>,
     gcs: Arc<dyn GcsClient>,
-    next_control_put: Arc<Mutex<Instant>>,
+    next_control_put: Arc<Mutex<[Instant; CONTROL_OBJECT_SLOT_COUNT]>>,
     control_put_interval: Duration,
+    control_object_slot_count: usize,
     /// Production authority for serializing legacy identity rebinding with
     /// account deletion. Tests which do not exercise rebinding may omit it;
     /// the rebind path itself always fails closed when it is absent.
@@ -19398,8 +19495,9 @@ impl ControlStore {
             inner: Arc::new(Mutex::new(None)),
             kms,
             gcs,
-            next_control_put: Arc::new(Mutex::new(Instant::now())),
+            next_control_put: Arc::new(Mutex::new(std::array::from_fn(|_| Instant::now()))),
             control_put_interval: CONTROL_OBJECT_PUT_INTERVAL,
+            control_object_slot_count: DEFAULT_CONTROL_OBJECT_SLOT_COUNT,
             lifecycle_store: None,
         }
     }
@@ -19808,8 +19906,9 @@ impl ControlStore {
             inner: Arc::new(Mutex::new(None)),
             kms,
             gcs,
-            next_control_put: Arc::new(Mutex::new(Instant::now())),
+            next_control_put: Arc::new(Mutex::new(std::array::from_fn(|_| Instant::now()))),
             control_put_interval: CONTROL_OBJECT_PUT_INTERVAL,
+            control_object_slot_count: DEFAULT_CONTROL_OBJECT_SLOT_COUNT,
             lifecycle_store: Some(lifecycle_store),
         }
     }
@@ -20226,32 +20325,102 @@ impl ControlStore {
     }
 
     async fn load(&self) -> Result<Handle> {
-        let (plaintext, meta, durable_fence_key) = match self.gcs.get_object(CONTROL_OBJECT).await {
-            Ok(resp) => {
-                let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
-                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT)?;
-                (
-                    opened.plaintext,
-                    BlobMeta {
-                        generation: resp.generation,
-                        wrapped_dek_b64: resp.wrapped_dek_b64,
-                    },
-                    Some(dek.0),
-                )
+        validate_control_object_slot_count(self.control_object_slot_count)?;
+        let mut slot_generations = [0_i64; CONTROL_OBJECT_SLOT_COUNT];
+        let mut snapshots = Vec::with_capacity(self.control_object_slot_count);
+        for (slot, slot_generation) in slot_generations
+            .iter_mut()
+            .enumerate()
+            .take(self.control_object_slot_count)
+        {
+            let object_name = control_object_name(slot);
+            match self.gcs.get_object(&object_name).await {
+                Ok(response) => {
+                    let (sequence, _) = decode_control_snapshot(slot, &response.ciphertext)?;
+                    if sequence > 0
+                        && sequence % self.control_object_slot_count as u64 != slot as u64
+                    {
+                        return Err(EnclaveError::Store(
+                            "control snapshot occupies the wrong ring slot".into(),
+                        ));
+                    }
+                    *slot_generation = response.generation;
+                    snapshots.push((slot, sequence, response));
+                }
+                Err(EnclaveError::NotFound) => {}
+                Err(error) => return Err(error),
             }
-            Err(EnclaveError::NotFound) => {
-                info!("creating new control DB");
-                let (_, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
-                (
-                    Vec::new(),
-                    BlobMeta {
-                        generation: 0,
-                        wrapped_dek_b64: wrapped,
-                    },
-                    None,
-                )
+        }
+
+        let (plaintext, meta, durable_fence_key) = if snapshots.is_empty() {
+            info!("creating new control DB");
+            let (_, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
+            (
+                Vec::new(),
+                BlobMeta {
+                    sequence: 0,
+                    slot_generations,
+                    wrapped_dek_b64: wrapped,
+                },
+                None,
+            )
+        } else {
+            let wrapped_dek_b64 = snapshots[0].2.wrapped_dek_b64.clone();
+            if snapshots
+                .iter()
+                .any(|(_, _, response)| response.wrapped_dek_b64 != wrapped_dek_b64)
+            {
+                return Err(EnclaveError::Store(
+                    "control snapshot ring changed encryption roots".into(),
+                ));
             }
-            Err(e) => return Err(e),
+            let dek = load_dek(self.kms.as_ref(), &wrapped_dek_b64).await?;
+            let mut opened = Vec::with_capacity(snapshots.len());
+            for (slot, sequence, response) in snapshots {
+                let (_, ciphertext) = decode_control_snapshot(slot, &response.ciphertext)?;
+                let object_name = control_object_name(slot);
+                let context = control_object_context(&object_name, sequence);
+                let snapshot = decrypt_bound_blob(&dek, ciphertext, &context)?;
+                opened.push((sequence, snapshot.plaintext));
+            }
+            let max_sequence = opened
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .max()
+                .ok_or_else(|| EnclaveError::Store("control snapshot ring is empty".into()))?;
+            let sequences: HashSet<u64> = opened.iter().map(|(sequence, _)| *sequence).collect();
+            if sequences.len() != opened.len() {
+                return Err(EnclaveError::Store(
+                    "control snapshot ring repeats a sequence".into(),
+                ));
+            }
+            let first_required = if max_sequence < self.control_object_slot_count as u64 {
+                1
+            } else {
+                max_sequence - self.control_object_slot_count as u64 + 1
+            };
+            if (first_required..=max_sequence).any(|sequence| !sequences.contains(&sequence))
+                || sequences
+                    .iter()
+                    .any(|sequence| *sequence != 0 && *sequence < first_required)
+            {
+                return Err(EnclaveError::Store(
+                    "control snapshot ring is not contiguous".into(),
+                ));
+            }
+            let plaintext = opened
+                .into_iter()
+                .find_map(|(sequence, plaintext)| (sequence == max_sequence).then_some(plaintext))
+                .ok_or_else(|| EnclaveError::Store("control snapshot head disappeared".into()))?;
+            (
+                plaintext,
+                BlobMeta {
+                    sequence: max_sequence,
+                    slot_generations,
+                    wrapped_dek_b64,
+                },
+                Some(dek.0),
+            )
         };
 
         if let (Some(store), Some(key)) = (self.lifecycle_store.as_ref(), durable_fence_key) {
@@ -20333,36 +20502,46 @@ impl ControlStore {
     }
 
     async fn flush(&self, handle: &mut Handle) -> Result<()> {
+        validate_control_object_slot_count(self.control_object_slot_count)?;
         handle
             .conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         let db_bytes = tokio::fs::read(&handle.temp_path).await?;
         let dek = load_dek(self.kms.as_ref(), &handle.meta.wrapped_dek_b64).await?;
-        let ciphertext = encrypt_bound_blob(&dek, &db_bytes, CONTROL_CONTEXT)?;
+        let sequence =
+            handle.meta.sequence.checked_add(1).ok_or_else(|| {
+                EnclaveError::Store("control snapshot sequence overflowed".into())
+            })?;
+        let slot = (sequence % self.control_object_slot_count as u64) as usize;
+        let object_name = control_object_name(slot);
+        let context = control_object_context(&object_name, sequence);
+        let ciphertext = encrypt_bound_blob(&dek, &db_bytes, &context)?;
+        let encoded = encode_control_snapshot(sequence, ciphertext)?;
         if !self.control_put_interval.is_zero() {
             let mut next = self.next_control_put.lock().await;
             let now = Instant::now();
-            if *next > now {
-                tokio::time::sleep_until(*next).await;
+            if next[slot] > now {
+                tokio::time::sleep_until(next[slot]).await;
             }
-            *next = Instant::now() + self.control_put_interval;
+            next[slot] = Instant::now() + self.control_put_interval;
         }
+        let previous_generation = handle.meta.slot_generations[slot];
         let put_result = self
             .gcs
             .put_object(
-                CONTROL_OBJECT,
-                &ciphertext,
+                &object_name,
+                &encoded,
                 &handle.meta.wrapped_dek_b64,
-                handle.meta.generation,
+                previous_generation,
             )
             .await;
         let new_gen = match put_result {
             Ok(generation) => generation,
-            Err(error) => match self.gcs.get_object(CONTROL_OBJECT).await {
+            Err(error) => match self.gcs.get_object(&object_name).await {
                 Ok(current)
-                    if current.generation > handle.meta.generation
+                    if current.generation > previous_generation
                         && current.wrapped_dek_b64 == handle.meta.wrapped_dek_b64
-                        && current.ciphertext == ciphertext =>
+                        && current.ciphertext == encoded =>
                 {
                     // Exact reread is the only authority for a control PUT
                     // whose response was lost. A different ciphertext is a
@@ -20373,7 +20552,8 @@ impl ControlStore {
                 _ => return Err(error),
             },
         };
-        handle.meta.generation = new_gen;
+        handle.meta.sequence = sequence;
+        handle.meta.slot_generations[slot] = new_gen;
         if let Some(store) = self.lifecycle_store.as_ref() {
             let dek = load_dek(self.kms.as_ref(), &handle.meta.wrapped_dek_b64).await?;
             store.install_legacy_fence_key(dek.0)?;
@@ -23516,19 +23696,33 @@ impl ControlStore {
             return Err(error);
         }
 
-        // The shared object is versioned. Keep the control-store mutex until
-        // every older generation containing identity or billing mappings has
-        // been deleted and the sanitized generation has been re-observed.
-        let current_generation = guard
+        // Every live ring slot is an encrypted whole-Control snapshot. Cycle
+        // the sanitized database through all remaining names before purging
+        // their older generations, so account deletion remains complete and
+        // no prior identity/billing mapping survives in a noncurrent object.
+        for _ in 1..self.control_object_slot_count {
+            self.flush(guard.as_mut().ok_or(EnclaveError::NotFound)?)
+                .await?;
+        }
+        let current_generations = guard
             .as_ref()
-            .map(|handle| handle.meta.generation)
+            .map(|handle| handle.meta.slot_generations)
             .ok_or(EnclaveError::NotFound)?;
-        crate::store::delete_object_generations_except(
-            self.gcs.as_ref(),
-            CONTROL_OBJECT,
-            current_generation,
-        )
-        .await?;
+        for (slot, generation) in current_generations
+            .into_iter()
+            .enumerate()
+            .take(self.control_object_slot_count)
+        {
+            if generation <= 0 {
+                continue;
+            }
+            crate::store::delete_object_generations_except(
+                self.gcs.as_ref(),
+                &control_object_name(slot),
+                generation,
+            )
+            .await?;
+        }
         Ok(operation)
     }
 
@@ -26392,7 +26586,8 @@ mod tests {
         pause_after_get_target: std::sync::Mutex<Option<String>>,
         get_completed: Notify,
         resume_get: Notify,
-        minimum_control_put_interval: std::sync::Mutex<Option<(Duration, Option<Instant>)>>,
+        minimum_control_put_interval:
+            std::sync::Mutex<Option<(Duration, BTreeMap<String, Instant>)>>,
     }
 
     impl PausingGcs {
@@ -26432,7 +26627,8 @@ mod tests {
         }
 
         fn reject_rapid_control_puts(&self, minimum_interval: Duration) {
-            *self.minimum_control_put_interval.lock().unwrap() = Some((minimum_interval, None));
+            *self.minimum_control_put_interval.lock().unwrap() =
+                Some((minimum_interval, BTreeMap::new()));
         }
     }
 
@@ -26483,16 +26679,19 @@ mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> Result<i64> {
-            if object_name == CONTROL_OBJECT {
+            if is_control_snapshot_object(object_name) {
                 let now = Instant::now();
                 let mut limiter = self.minimum_control_put_interval.lock().unwrap();
-                if let Some((minimum, previous)) = limiter.as_mut() {
-                    if previous.is_some_and(|previous| now.duration_since(previous) < *minimum) {
+                if let Some((minimum, previous_by_object)) = limiter.as_mut() {
+                    if previous_by_object
+                        .get(object_name)
+                        .is_some_and(|previous| now.duration_since(*previous) < *minimum)
+                    {
                         return Err(EnclaveError::Gcs(
                             "simulated same-object replacement throttle".into(),
                         ));
                     }
-                    *previous = Some(now);
+                    previous_by_object.insert(object_name.to_string(), now);
                 }
             }
             let should_pause_before = {
@@ -30725,6 +30924,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_snapshot_ring_rotates_names_and_reloads_the_exact_newest_snapshot() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        const TEST_SLOTS: usize = 4;
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        gcs.reject_rapid_control_puts(Duration::from_millis(1));
+        let mut control = ControlStore::new(Arc::new(FakeKms), gcs.clone());
+        control.control_object_slot_count = TEST_SLOTS;
+        control.control_put_interval = Duration::from_millis(2);
+
+        for value in 1..=9 {
+            control
+                .write_owned_if_changed(|connection| {
+                    connection.execute(
+                        "INSERT OR REPLACE INTO config (key,value) VALUES ('ring-test',?1)",
+                        [value.to_string()],
+                    )?;
+                    Ok(((), true))
+                })
+                .await
+                .unwrap();
+        }
+
+        for slot in 0..TEST_SLOTS {
+            assert!(inner.exact_generation_count(&control_object_name(slot)) >= 2);
+        }
+        drop(control);
+
+        let mut reopened = ControlStore::new(Arc::new(FakeKms), gcs);
+        reopened.control_object_slot_count = TEST_SLOTS;
+        let value = reopened
+            .read(|connection| {
+                connection
+                    .query_row(
+                        "SELECT value FROM config WHERE key='ring-test'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "9");
+    }
+
+    #[test]
+    fn control_snapshot_sequence_header_is_authenticated() {
+        let dek = crate::crypto::Dek([0x5a; 32]);
+        let object_name = control_object_name(3);
+        let ciphertext = encrypt_bound_blob(
+            &dek,
+            b"durable-control",
+            &control_object_context(&object_name, 3),
+        )
+        .unwrap();
+        let mut encoded = encode_control_snapshot(3, ciphertext).unwrap();
+        let sequence_offset = CONTROL_SNAPSHOT_MAGIC.len();
+        encoded[sequence_offset..sequence_offset + 8].copy_from_slice(&7_u64.to_be_bytes());
+        let (tampered_sequence, ciphertext) = decode_control_snapshot(3, &encoded).unwrap();
+
+        assert_eq!(tampered_sequence, 7);
+        assert!(decrypt_bound_blob(
+            &dek,
+            ciphertext,
+            &control_object_context(&object_name, tampered_sequence),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn generation_clock_seed_is_persisted_once_and_reopens_exactly() {
         use crate::store::tests::{FakeGcs, FakeKms};
 
@@ -32617,7 +32887,8 @@ mod tests {
 
         let kms = Arc::new(FakeKms);
         let gcs = Arc::new(FakeGcs::new());
-        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let mut control = ControlStore::new(kms.clone(), gcs.clone());
+        control.control_object_slot_count = 4;
         let user = control
             .upsert_user(
                 "privacy-purge-subject",
@@ -32628,7 +32899,12 @@ mod tests {
             .unwrap();
         control.billing_account_id(&user.id).await.unwrap();
         control.begin_user_deletion(&user.id).await.unwrap();
-        assert!(gcs.exact_generation_count(CONTROL_OBJECT) >= 3);
+        assert!(
+            (0..control.control_object_slot_count)
+                .map(|slot| gcs.exact_generation_count(&control_object_name(slot)))
+                .sum::<usize>()
+                >= 4
+        );
 
         assert_eq!(
             control
@@ -32638,11 +32914,14 @@ mod tests {
                 .status,
             "physical_complete"
         );
-        assert_eq!(gcs.exact_generation_count(CONTROL_OBJECT), 1);
+        for slot in 0..control.control_object_slot_count {
+            assert_eq!(gcs.exact_generation_count(&control_object_name(slot)), 1);
+        }
 
         // A clean restart sees only the sanitized current generation.
         drop(control);
-        let reloaded = ControlStore::new(kms, gcs);
+        let mut reloaded = ControlStore::new(kms, gcs);
+        reloaded.control_object_slot_count = 4;
         assert_eq!(
             reloaded.user_status(&user.id).await.unwrap().as_deref(),
             Some("deleted")
