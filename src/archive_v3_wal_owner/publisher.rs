@@ -1211,6 +1211,16 @@ pub(crate) trait WalPublisherControl: WalOwnerControl {
 
     async fn has_pending_owner_work(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
 
+    /// Re-prepare a pre-candidate mutation captured by a prior process only
+    /// after the new process has recovered the last witnessed Store root.
+    /// The operation identity and superseded artifact inventory stay durable;
+    /// candidate/send-sensitive stages are never eligible.
+    async fn reprepare_captured_after_restart(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<()>;
+
     async fn has_pending_checkpoint(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
 
     async fn rebind_owner_after_expiry(
@@ -1570,6 +1580,13 @@ impl SingleArchiveWalPublisher {
         )
         .await
         .map_err(|error| report_publisher_launch_refusal("open_store_lane", error))?;
+        publisher
+            .control
+            .reprepare_captured_after_restart(store.binding(), store.instance_id())
+            .await
+            .map_err(|error| {
+                report_publisher_launch_refusal("reprepare_captured_operation", error)
+            })?;
         let control: Arc<dyn WalOwnerControl> = publisher.control.clone();
         Ok(super::SingleArchiveWalOwner::spawn_lane_with_fence(
             store,

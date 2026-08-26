@@ -16854,6 +16854,142 @@ fn inspect_wal_owner_operation_conn(
         .map(WalOwnerAdmission::Retained)
 }
 
+/// A captured attempt belongs to the plaintext Store instance that applied
+/// it, so a live instance must never discard or replace it. After restart,
+/// however, the new instance has recovered the last externally witnessed
+/// root and therefore cannot contain that un-witnessed transaction. Rebase
+/// only that exact pre-candidate row to a fresh attempt of the same operation;
+/// the old attempt and any reserved artifacts remain superseded inventory.
+fn reprepare_captured_wal_operation_after_restart_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    owner_instance_id: WalOwnerInstanceId,
+) -> Result<bool> {
+    type CapturedRestartRow = (Vec<u8>, Vec<u8>, i64, String, Vec<u8>);
+    let tx = conn.unchecked_transaction()?;
+    validate_wal_owner_binding_conn(&tx, binding)?
+        .ok_or_else(|| EnclaveError::Auth("durable WAL owner lease is absent".into()))?;
+    let existing: Option<CapturedRestartRow> = tx
+        .query_row(
+            "SELECT operation_id,request_fingerprint,operation_kind,stage,owner_instance_id
+             FROM archive_v3_wal_publications WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((operation, fingerprint, kind, stage, stored_instance)) = existing else {
+        return Ok(false);
+    };
+    if stage != "captured" {
+        return Ok(false);
+    }
+    if stored_instance.as_slice() == owner_instance_id.as_bytes() {
+        return Ok(false);
+    }
+    let identity = WalOperationIdentity::from_control_parts(
+        WalOwnerPersistenceContext(()),
+        kind,
+        &operation,
+        &fingerprint,
+    )
+    .map_err(map_wal_owner_error)?;
+    let retained = load_wal_owner_attempt_conn(&tx, binding, identity)?;
+    if retained.stage() != WalPublicationStage::Captured
+        || retained.owner_instance_id().as_bytes() != stored_instance.as_slice()
+    {
+        return Err(EnclaveError::Conflict(
+            "captured WAL restart tuple changed".into(),
+        ));
+    }
+    let next_attempt = retained
+        .attempt()
+        .checked_add(1)
+        .filter(|attempt| *attempt <= MAX_WAL_OWNER_ATTEMPTS)
+        .ok_or_else(|| EnclaveError::Conflict("WAL attempt cap reached".into()))?;
+    let next_attempt_id = ShadowAttemptId::random();
+    if next_attempt_id.as_bytes() == &[0; 16]
+        || tx.execute(
+            "UPDATE archive_v3_wal_publication_attempts SET state='superseded'
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND attempt_id=?5 AND owner_instance_id=?6
+               AND state='active'",
+            rusqlite::params![
+                binding.archive_id().as_bytes().as_slice(),
+                identity.kind() as i64,
+                identity.operation_id().as_bytes().as_slice(),
+                i64::from(retained.attempt()),
+                retained.attempt_id().as_bytes().as_slice(),
+                retained.owner_instance_id().as_bytes().as_slice(),
+            ],
+        )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_publications
+             SET owner_instance_id=?1,attempt=?2,attempt_id=?3,
+                 expected_witness=?4,expected_binding_commitment=?5,
+                 expected_wal_generation=NULL,stage='prepared',
+                 capture_commitment=NULL,first_frame_no=NULL,frame_count=NULL,
+                 candidate_root_seq=NULL,candidate_root_object_id=NULL,
+                 candidate_root_hash=NULL,candidate_owner_fencing_epoch=NULL,
+                 candidate_commitment=NULL,candidate_artifact_commitment=NULL,
+                 candidate_segment_count=NULL,observed_witness=NULL,
+                 observed_binding_commitment=NULL,revision=revision+1,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id=?6 AND operation_id=?7 AND operation_kind=?8
+               AND revision=?9 AND stage='captured' AND owner_instance_id=?10",
+            rusqlite::params![
+                owner_instance_id.as_bytes().as_slice(),
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+                binding.witness_bytes().as_slice(),
+                binding.commitment().as_slice(),
+                binding.archive_id().as_bytes().as_slice(),
+                identity.operation_id().as_bytes().as_slice(),
+                identity.kind() as i64,
+                i64::try_from(retained.revision())
+                    .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+                retained.owner_instance_id().as_bytes().as_slice(),
+            ],
+        )? != 1
+        || tx.execute(
+            "INSERT INTO archive_v3_wal_publication_attempts
+             (archive_id,operation_kind,operation_id,attempt,attempt_id,
+              owner_instance_id,state)
+             VALUES (?1,?2,?3,?4,?5,?6,'active')",
+            rusqlite::params![
+                binding.archive_id().as_bytes().as_slice(),
+                identity.kind() as i64,
+                identity.operation_id().as_bytes().as_slice(),
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+                owner_instance_id.as_bytes().as_slice(),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "captured WAL restart recovery raced".into(),
+        ));
+    }
+    let reprepared = load_wal_owner_attempt_conn(&tx, binding, identity)?;
+    if reprepared.stage() != WalPublicationStage::Prepared
+        || reprepared.owner_instance_id() != owner_instance_id
+        || reprepared.attempt() != next_attempt
+    {
+        return Err(EnclaveError::Conflict(
+            "captured WAL restart recovery changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 fn prepare_wal_owner_operation_conn(
     conn: &Connection,
     binding: &WalOwnerStoreBinding,
@@ -25717,6 +25853,19 @@ impl WalPublisherControl for ControlStore {
         self.read(|conn| has_pending_wal_owner_work_conn(conn, binding))
             .await
             .map_err(map_wal_persistence_error)
+    }
+
+    async fn reprepare_captured_after_restart(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            reprepare_captured_wal_operation_after_restart_conn(conn, binding, owner_instance_id)
+                .map(|changed| ((), changed))
+        })
+        .await
+        .map_err(map_wal_persistence_error)
     }
 
     async fn has_pending_checkpoint(
@@ -36492,6 +36641,107 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         assert_eq!(stage, "captured");
+    }
+
+    #[test]
+    fn restart_reprepares_captured_operation_before_admitting_the_next() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captured-publication-restart.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (_terminal, _acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
+
+        let held_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0x61,
+            0x62,
+        );
+        let held_instance = wal_owner_instance(0x63);
+        let held = prepare_wal_owner_operation_conn(&conn, &binding, held_instance, held_identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            held_identity,
+            held.owner_id(),
+            held_instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0x64; 16]),
+            held,
+            1,
+        )
+        .unwrap();
+        record_wal_captured_conn(&conn, &context, [0x65; 32], 1, 1).unwrap();
+        reserve_one_wal_test_segment(&conn, &context, 0);
+
+        assert!(
+            !reprepare_captured_wal_operation_after_restart_conn(&conn, &binding, held_instance,)
+                .unwrap(),
+            "the live plaintext owner must not re-prepare its own capture"
+        );
+        assert_eq!(
+            conn.query_row("SELECT stage FROM archive_v3_wal_publications", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "captured"
+        );
+
+        let restarted_instance = wal_owner_instance(0x66);
+        assert!(reprepare_captured_wal_operation_after_restart_conn(
+            &conn,
+            &binding,
+            restarted_instance,
+        )
+        .unwrap());
+        let recovered = load_wal_owner_attempt_conn(&conn, &binding, held_identity).unwrap();
+        assert_eq!(recovered.stage(), WalPublicationStage::Prepared);
+        assert_eq!(recovered.owner_instance_id(), restarted_instance);
+        assert_eq!(recovered.attempt(), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_wal_publication_artifacts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the superseded attempt keeps its artifact inventory"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_wal_publication_attempts
+                 WHERE operation_id=?1 AND attempt=1",
+                [held_identity.operation_id().as_bytes()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "superseded"
+        );
+
+        let next_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::CaptureSessionFinish,
+            0x67,
+            0x68,
+        );
+        assert!(matches!(
+            inspect_wal_owner_operation_conn(&conn, &binding, next_identity).unwrap(),
+            WalOwnerAdmission::SettledHead
+        ));
+        assert!(
+            prepare_wal_owner_operation_conn(&conn, &binding, restarted_instance, next_identity,)
+                .is_ok(),
+            "a different operation may replace the now-prepared residue"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_wal_publication_artifacts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "admission must not delete superseded artifacts"
+        );
     }
 
     fn reserve_one_wal_test_segment(
