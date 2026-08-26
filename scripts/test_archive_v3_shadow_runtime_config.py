@@ -131,6 +131,13 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
             "archive_binding_commitment": COMMITMENT,
         }
 
+    @classmethod
+    def fleet(cls) -> dict[str, object]:
+        value = cls.active()
+        value["mode"] = "durable-fleet-wal-v1"
+        value["archive_binding_commitment"] = ""
+        return value
+
     def test_checked_in_profile_is_the_exact_fresh_final_tuple(self) -> None:
         config = load_shadow_runtime_config(
             ROOT / "config" / "archive-v3-shadow-runtime.json"
@@ -138,14 +145,14 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(
             config.as_claim(),
             (
-                "single-archive-wal-v1",
+                "durable-fleet-wal-v1",
                 "kioku-joerodriguez-adr0022-v1-archive",
                 "640329636251",
                 "1",
                 "kioku-joerodriguez",
                 "640329636251",
                 "adr0022-v1-witness",
-                "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+                "",
             ),
         )
 
@@ -164,6 +171,10 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
                 COMMITMENT,
             ),
         )
+
+        fleet = self.load(self.fleet())
+        self.assertEqual(fleet.as_claim()[0], "durable-fleet-wal-v1")
+        self.assertEqual(fleet.as_claim()[-1], "")
 
     def test_off_is_all_empty_and_active_is_all_complete(self) -> None:
         for key in tuple(self.off())[2:]:
@@ -201,6 +212,15 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
     def test_direct_docker_validator_has_exact_active_and_off_parity(self) -> None:
         self.assertEqual(self.docker_validate(self.off()).returncode, 0)
         self.assertEqual(self.docker_validate(self.active()).returncode, 0)
+        self.assertEqual(self.docker_validate(self.fleet()).returncode, 0)
+
+        fleet_with_canary_commitment = self.fleet()
+        fleet_with_canary_commitment["archive_binding_commitment"] = COMMITMENT
+        with self.assertRaises(ShadowRuntimeConfigError):
+            self.load(fleet_with_canary_commitment)
+        self.assertNotEqual(
+            self.docker_validate(fleet_with_canary_commitment).returncode, 0
+        )
 
         for key, values in INVALID_ACTIVE_VALUES.items():
             for value in values:

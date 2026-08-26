@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
 FINAL_TAG = "v0.8.35-archive-v3-wal.14"
 SUCCESSOR_TAG = "v0.8.36-archive-v3-wal.15"
-FLEET_CONVERGENCE_TAG = "v0.8.36-archive-v3-wal.16"
+FLEET_CONVERGENCE_TAG = "v0.8.36-archive-v3-wal.17"
 FINAL_TAG_VERSIONS = {
     FINAL_TAG: "0.8.35",
     SUCCESSOR_TAG: "0.8.36",
@@ -164,7 +164,7 @@ _EXPECTED_FINAL_CONFIGURATION = {
     "ARCHIVE_WITNESS_PROJECT_ID": "",
     "ARCHIVE_WITNESS_PROJECT_NUMBER": "",
     "ARCHIVE_WITNESS_DATABASE_ID": "",
-    "ARCHIVE_V3_SHADOW_RUNTIME_MODE": "single-archive-wal-v1",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE": "durable-fleet-wal-v1",
     "ARCHIVE_V3_ARCHIVE_BUCKET": EXPECTED_INTENT["archive_bucket"],
     "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER": PROJECT_NUMBER,
     "ARCHIVE_V3_REGISTRY_KMS_VERSION": "1",
@@ -450,7 +450,7 @@ def validate_checked_final_source(
         raise FreshReleaseError("fresh FINAL witness probe is not exact off")
     expected_runtime = {
         "schema_version": 2,
-        "mode": "single-archive-wal-v1",
+        "mode": "durable-fleet-wal-v1",
         "archive_bucket": EXPECTED_INTENT["archive_bucket"],
         "archive_gcs_project_number": PROJECT_NUMBER,
         "registry_kms_version": "1",
@@ -466,12 +466,10 @@ def validate_checked_final_source(
     }:
         raise FreshReleaseError("fresh FINAL archive runtime is not exact active")
     commitment = runtime.get("archive_binding_commitment")
-    if (
-        not isinstance(commitment, str)
-        or HEX64.fullmatch(commitment) is None
-        or commitment == "0" * 64
-    ):
-        raise FreshReleaseError("fresh FINAL archive binding commitment is invalid")
+    if commitment != "":
+        raise FreshReleaseError(
+            "fresh FINAL durable fleet runtime must not retain a canary binding commitment"
+        )
     return commitment
 
 

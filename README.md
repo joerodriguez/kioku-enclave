@@ -433,18 +433,16 @@ and release verification derive them through one strict parser from the reviewed
 [`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
 file is exact `off` with an empty namespace.
 
-The eight `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
+The eight `ARCHIVE_V3_*` runtime arguments are likewise derived only from
 [`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). The
-current BOOTSTRAP source carries the canonical all-empty `off` form, so its signed image
-cannot construct archive-v3 provider authority or arm Genesis. After the fresh namespace and
-one-way binding exist, a separately reviewed FINAL source may carry the complete canonical
-`single-archive-wal-v1` tuple. That active form remains eligible only for an exact
+checked source carries the complete canonical `durable-fleet-wal-v1` provider tuple and an
+empty canary commitment. That active form remains eligible only for an exact
 `vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it off,
 an exact WAL tag with an off profile fails, and no operator, repository variable, or dispatch
-input can override it. Under that signed FINAL profile startup consumes the one-shot binding
-capability to relaunch durable selected archives and the Genesis trigger can use it for
-new-account convergence; construction itself performs no provider I/O and no route receives
-the capability.
+input can override it. Under that signed profile, each one-shot runtime consumes only an opaque
+archive binding already minted and validated by encrypted Control, allowing startup and Genesis
+to converge every account without accepting an archive identity from a route or environment.
+Construction itself performs no provider I/O and each launched owner remains single-archive.
 
 ```sh
 docker build --platform linux/amd64 \
@@ -505,7 +503,7 @@ binding.
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
 | `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, operator configuration/commands cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
-| `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID`, `ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT` | Image-bound ADR-0022 single-archive runtime claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. `off` requires every fragment empty; the complete active form is canonical-tag-only, independently grammar-checked by Docker, and commits to one opaque durable archive ID. Under that signed active profile, startup reconstructs selected WAL serving authorities and the Genesis sign-in trigger can create new selected archives; Store exposes only routed settled reads and sealed submits. An off-config image with selected durable state fails startup closed. This does not activate the retired advisory/extent migration stack. |
+| `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID`, `ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT` | Image-bound ADR-0022 runtime claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. `off` requires every fragment empty. The canonical-tag-only `durable-fleet-wal-v1` form fixes all provider coordinates, requires the retired canary commitment empty, and consumes only opaque bindings from encrypted Control. Startup reconstructs every selected WAL authority and Genesis creates new selected archives; each owner remains single-archive and Store exposes only routed settled reads and sealed submits. |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |

@@ -83,7 +83,7 @@ class LocalReleaseContracts(unittest.TestCase):
         fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
         final_tag = 'ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.14"'
         successor_tag = 'ADR0022_FRESH_SUCCESSOR_TAG="v0.8.36-archive-v3-wal.15"'
-        convergence_tag = 'ADR0022_FRESH_FLEET_CONVERGENCE_TAG="v0.8.36-archive-v3-wal.16"'
+        convergence_tag = 'ADR0022_FRESH_FLEET_CONVERGENCE_TAG="v0.8.36-archive-v3-wal.17"'
         self.assertIn(fixed_tag, RELEASE)
         self.assertIn(final_tag, RELEASE)
         self.assertIn(successor_tag, RELEASE)

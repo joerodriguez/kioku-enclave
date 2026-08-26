@@ -193,7 +193,7 @@ def load_shadow_runtime_config(path: Path) -> ArchiveV3ShadowRuntimeConfig:
                 "archive-v3 shadow runtime off mode requires every deployment fragment empty"
             )
         return config
-    if config.mode != "single-archive-wal-v1":
+    if config.mode not in ("single-archive-wal-v1", "durable-fleet-wal-v1"):
         raise ShadowRuntimeConfigError("archive-v3 shadow-runtime mode is unsupported")
     if not _valid_bucket(config.archive_bucket):
         raise ShadowRuntimeConfigError("archive-v3 archive bucket is invalid")
@@ -208,8 +208,13 @@ def load_shadow_runtime_config(path: Path) -> ArchiveV3ShadowRuntimeConfig:
         raise ShadowRuntimeConfigError("archive-v3 witness project ID is invalid")
     if not _valid_database_id(config.witness_database_id):
         raise ShadowRuntimeConfigError("archive-v3 witness database ID is invalid")
-    if not _valid_commitment(config.archive_binding_commitment):
-        raise ShadowRuntimeConfigError("archive-v3 archive binding commitment is invalid")
+    if config.mode == "single-archive-wal-v1":
+        if not _valid_commitment(config.archive_binding_commitment):
+            raise ShadowRuntimeConfigError("archive-v3 archive binding commitment is invalid")
+    elif config.archive_binding_commitment:
+        raise ShadowRuntimeConfigError(
+            "archive-v3 durable fleet mode requires the canary binding commitment empty"
+        )
     return config
 
 
@@ -236,6 +241,6 @@ def select_shadow_runtime_config(
         return OFF
     if not is_wal_tag:
         raise ShadowRuntimeConfigError(
-            "single-archive-wal-v1 requires an exact vX.Y.Z-archive-v3-wal.N tag"
+            "an active archive-v3 runtime requires an exact vX.Y.Z-archive-v3-wal.N tag"
         )
     return config

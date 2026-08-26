@@ -14,7 +14,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT / "scripts"))
-from adr0022_fresh_release import BOOTSTRAP_TAG, SUCCESSOR_TAG  # noqa: E402
+from adr0022_fresh_release import (  # noqa: E402
+    BOOTSTRAP_TAG,
+    FLEET_CONVERGENCE_TAG,
+)
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
 DOCKERFILE = ROOT / "Dockerfile"
@@ -789,19 +792,19 @@ class SelectorTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
 
-    def test_fresh_final_accepts_only_the_exact_tag_and_checked_commitment(self) -> None:
+    def test_fresh_final_accepts_only_the_exact_fleet_tag_and_checked_scope(self) -> None:
         exact = fresh_bootstrap_environment()
         exact["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
         active_runtime = {
             "schema_version": 2,
-            "mode": "single-archive-wal-v1",
+            "mode": "durable-fleet-wal-v1",
             "archive_bucket": "kioku-joerodriguez-adr0022-v1-archive",
             "archive_gcs_project_number": "640329636251",
             "registry_kms_version": "1",
             "witness_project_id": "kioku-joerodriguez",
             "witness_project_number": "640329636251",
             "witness_database_id": "adr0022-v1-witness",
-            "archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "archive_binding_commitment": "",
         }
         for tag in (
             "v0.8.35-archive-v3-wal.2",
@@ -822,16 +825,13 @@ class SelectorTests(unittest.TestCase):
         completed, content = self.run_selector(
             "production",
             exact,
-            source_ref=SUCCESSOR_TAG,
+            source_ref=FLEET_CONVERGENCE_TAG,
             shadow_runtime_config=active_runtime,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("GENESIS_WAL_NATIVE=on\n", content)
-        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", content)
-        self.assertIn(
-            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT=f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e\n",
-            content,
-        )
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=durable-fleet-wal-v1\n", content)
+        self.assertIn("ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT=\n", content)
 
 
 if __name__ == "__main__":

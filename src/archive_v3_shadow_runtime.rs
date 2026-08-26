@@ -3,7 +3,7 @@
     reason = "the conditionally active runtime retains sealed migration-only capability variants"
 )]
 
-//! Sealed ADR-0022 single-archive WAL runtime composition.
+//! Sealed ADR-0022 per-archive WAL runtime composition.
 //!
 //! This module accepts only typed deployment fragments and builds the fixed
 //! archive-GCS, registry-KMS, and named-Firestore provider graph. Construction
@@ -150,6 +150,28 @@ impl fmt::Debug for ArchiveV3ArchiveBindingCommitment {
     }
 }
 
+/// Which encrypted-Control archive bindings the fixed provider coordinates may
+/// consume. The one-archive scope is retained for canary and historical
+/// images. The fleet scope accepts only an opaque [`ArchiveBinding`] already
+/// validated and minted by encrypted Control; it does not accept a caller ID,
+/// archive string, environment value, or route input.
+#[derive(PartialEq, Eq)]
+enum ArchiveV3ArchiveBindingScope {
+    Exact(ArchiveV3ArchiveBindingCommitment),
+    DurableFleet,
+}
+
+impl ArchiveV3ArchiveBindingScope {
+    fn permits(&self, archive_id: ArchiveId) -> bool {
+        match self {
+            Self::Exact(expected) => {
+                ArchiveV3ArchiveBindingCommitment::for_archive(archive_id) == *expected
+            }
+            Self::DurableFleet => true,
+        }
+    }
+}
+
 /// Exact, image-bound fragments from which all provider coordinates are
 /// derived. Full GCS endpoints, WIF audiences, KMS resource names, and
 /// Firestore document paths are deliberately not accepted.
@@ -160,7 +182,7 @@ pub(crate) struct ArchiveV3ShadowRuntimeDeployment {
     witness_project_id: String,
     witness_project_number: String,
     witness_database_id: String,
-    archive_binding_commitment: ArchiveV3ArchiveBindingCommitment,
+    archive_binding_scope: ArchiveV3ArchiveBindingScope,
 }
 
 impl ArchiveV3ShadowRuntimeDeployment {
@@ -170,8 +192,9 @@ impl ArchiveV3ShadowRuntimeDeployment {
     /// Semantics mirror the config grammar exactly: mode `off` (or an entirely
     /// absent mode, the pre-activation image shape) requires every coordinate to
     /// be empty and yields `None`; any stray fragment alongside `off` fails
-    /// closed. Only the exact mode `single-archive-wal-v1` constructs a
-    /// deployment, revalidating every coordinate through `Self::new`.
+    /// closed. `single-archive-wal-v1` requires the original exact commitment;
+    /// `durable-fleet-wal-v1` requires that field empty and admits only opaque
+    /// durable bindings read from encrypted Control.
     pub(crate) fn from_baked_env() -> Result<Option<Self>, ArchiveV3ShadowRuntimeConstructionError>
     {
         fn baked(name: &str) -> String {
@@ -223,6 +246,20 @@ impl ArchiveV3ShadowRuntimeDeployment {
                 coordinates[6],
             )
             .map(Some),
+            "durable-fleet-wal-v1" => {
+                if !coordinates[6].is_empty() {
+                    return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
+                }
+                Self::new_fleet(
+                    coordinates[0],
+                    coordinates[1],
+                    coordinates[2],
+                    coordinates[3],
+                    coordinates[4],
+                    coordinates[5],
+                )
+                .map(Some)
+            }
             _ => Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment),
         }
     }
@@ -237,6 +274,63 @@ impl ArchiveV3ShadowRuntimeDeployment {
         witness_database_id: &str,
         archive_binding_commitment: &str,
     ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
+        Self::validate_coordinates(
+            archive_bucket,
+            archive_gcs_project_number,
+            registry_kms_version,
+            witness_project_id,
+            witness_project_number,
+            witness_database_id,
+        )?;
+        let archive_binding_scope = ArchiveV3ArchiveBindingScope::Exact(
+            ArchiveV3ArchiveBindingCommitment::from_lower_hex(archive_binding_commitment)?,
+        );
+        Ok(Self {
+            archive_bucket: archive_bucket.to_owned(),
+            archive_gcs_project_number: archive_gcs_project_number.to_owned(),
+            registry_kms_version: registry_kms_version.to_owned(),
+            witness_project_id: witness_project_id.to_owned(),
+            witness_project_number: witness_project_number.to_owned(),
+            witness_database_id: witness_database_id.to_owned(),
+            archive_binding_scope,
+        })
+    }
+
+    fn new_fleet(
+        archive_bucket: &str,
+        archive_gcs_project_number: &str,
+        registry_kms_version: &str,
+        witness_project_id: &str,
+        witness_project_number: &str,
+        witness_database_id: &str,
+    ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
+        Self::validate_coordinates(
+            archive_bucket,
+            archive_gcs_project_number,
+            registry_kms_version,
+            witness_project_id,
+            witness_project_number,
+            witness_database_id,
+        )?;
+        Ok(Self {
+            archive_bucket: archive_bucket.to_owned(),
+            archive_gcs_project_number: archive_gcs_project_number.to_owned(),
+            registry_kms_version: registry_kms_version.to_owned(),
+            witness_project_id: witness_project_id.to_owned(),
+            witness_project_number: witness_project_number.to_owned(),
+            witness_database_id: witness_database_id.to_owned(),
+            archive_binding_scope: ArchiveV3ArchiveBindingScope::DurableFleet,
+        })
+    }
+
+    fn validate_coordinates(
+        archive_bucket: &str,
+        archive_gcs_project_number: &str,
+        registry_kms_version: &str,
+        witness_project_id: &str,
+        witness_project_number: &str,
+        witness_database_id: &str,
+    ) -> Result<(), ArchiveV3ShadowRuntimeConstructionError> {
         if !valid_archive_v3_bucket_name(archive_bucket)
             || !canonical_numeric_id(archive_gcs_project_number)
             || !canonical_numeric_id(registry_kms_version)
@@ -251,17 +345,7 @@ impl ArchiveV3ShadowRuntimeDeployment {
         {
             return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
         }
-        let archive_binding_commitment =
-            ArchiveV3ArchiveBindingCommitment::from_lower_hex(archive_binding_commitment)?;
-        Ok(Self {
-            archive_bucket: archive_bucket.to_owned(),
-            archive_gcs_project_number: archive_gcs_project_number.to_owned(),
-            registry_kms_version: registry_kms_version.to_owned(),
-            witness_project_id: witness_project_id.to_owned(),
-            witness_project_number: witness_project_number.to_owned(),
-            witness_database_id: witness_database_id.to_owned(),
-            archive_binding_commitment,
-        })
+        Ok(())
     }
 }
 
@@ -276,9 +360,10 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
 /// route or Store helper.
 pub(crate) struct DeletionRuntimeContext(());
 
-/// Production factory for the one image-bound archive deletion runtime.
-/// Construction is provider-I/O-free; every per-archive call revalidates the
-/// baked commitment before releasing exact-name read/delete capabilities.
+/// Production factory for image-bound archive deletion runtimes.
+/// Construction is provider-I/O-free; every call remains scoped to exactly the
+/// archive selected by the deletion lane before releasing exact-name
+/// read/delete capabilities.
 pub(crate) struct ProductionArchiveDeletionRuntimeFactory {
     deployment: Arc<ArchiveV3ShadowRuntimeDeployment>,
     kms: Arc<GcpKmsClient>,
@@ -320,9 +405,7 @@ impl ArchiveDeletionRuntimeFactory for ProductionArchiveDeletionRuntimeFactory {
         &self,
         archive_id: ArchiveId,
     ) -> crate::error::Result<Arc<dyn ArchiveDeletionRuntime>> {
-        if ArchiveV3ArchiveBindingCommitment::for_archive(archive_id)
-            != self.deployment.archive_binding_commitment
-        {
+        if !self.deployment.archive_binding_scope.permits(archive_id) {
             return Err(crate::error::EnclaveError::Store(
                 "archive deletion binding does not match the baked runtime".into(),
             ));
@@ -791,7 +874,7 @@ impl fmt::Debug for WalPublisherRuntimeOwner {
 /// binding, and consumption makes a second bind impossible.
 pub(crate) struct PendingSingleArchiveWalRuntime {
     bundle: ArchiveV3ShadowRuntimeBundle,
-    expected_binding: ArchiveV3ArchiveBindingCommitment,
+    binding_scope: ArchiveV3ArchiveBindingScope,
 }
 
 impl PendingSingleArchiveWalRuntime {
@@ -802,7 +885,7 @@ impl PendingSingleArchiveWalRuntime {
         let bundle = ArchiveV3ShadowRuntimeBundle::new(&deployment, kms)?;
         Ok(Self {
             bundle,
-            expected_binding: deployment.archive_binding_commitment,
+            binding_scope: deployment.archive_binding_scope,
         })
     }
 
@@ -812,9 +895,7 @@ impl PendingSingleArchiveWalRuntime {
         self,
         binding: DurableSingleArchiveBinding,
     ) -> Result<SealedSingleArchiveWalRuntime, ArchiveV3ShadowRuntimeConstructionError> {
-        if ArchiveV3ArchiveBindingCommitment::for_archive(binding.binding.archive_id())
-            != self.expected_binding
-        {
+        if !self.binding_scope.permits(binding.binding.archive_id()) {
             return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
         }
         Ok(SealedSingleArchiveWalRuntime {
@@ -830,7 +911,15 @@ impl PendingSingleArchiveWalRuntime {
     ) -> Self {
         Self {
             bundle: ArchiveV3ShadowRuntimeBundle::from_components(components),
-            expected_binding,
+            binding_scope: ArchiveV3ArchiveBindingScope::Exact(expected_binding),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_test_fleet_components(components: ShadowRuntimeComponents) -> Self {
+        Self {
+            bundle: ArchiveV3ShadowRuntimeBundle::from_components(components),
+            binding_scope: ArchiveV3ArchiveBindingScope::DurableFleet,
         }
     }
 }
@@ -1547,6 +1636,32 @@ mod tests {
     }
 
     #[test]
+    fn durable_fleet_binding_accepts_two_distinct_control_archives_without_provider_calls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for archive_byte in [31_u8, 32_u8] {
+            let component = || {
+                Arc::new(NeverCalled {
+                    calls: Arc::clone(&calls),
+                })
+            };
+            let pending = PendingSingleArchiveWalRuntime::from_test_fleet_components(
+                ShadowRuntimeComponents {
+                    objects: component(),
+                    roots: component(),
+                    registries: component(),
+                    witness: component(),
+                },
+            );
+            let archive_id = crate::archive_v3::ArchiveId::from_bytes([archive_byte; 16]);
+            let binding = DurableSingleArchiveBinding::from_control_store(
+                crate::cp::control_store::ArchiveBinding::for_runtime_test(archive_id),
+            );
+            drop(pending.bind_once(binding).expect("durable fleet binding"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn commitment_is_domain_separated_and_capabilities_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PendingSingleArchiveWalRuntime>();
@@ -1764,6 +1879,32 @@ mod tests {
             ],
         );
         assert!(active.expect("valid coordinates").is_some());
+        let fleet = ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "durable-fleet-wal-v1",
+            [
+                "kioku-joerodriguez-archive-v3",
+                "640329636251",
+                "1",
+                "kioku-joerodriguez",
+                "640329636251",
+                "archive-v3-witness",
+                "",
+            ],
+        );
+        assert!(fleet.expect("valid fleet coordinates").is_some());
+        assert!(ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "durable-fleet-wal-v1",
+            [
+                "kioku-joerodriguez-archive-v3",
+                "640329636251",
+                "1",
+                "kioku-joerodriguez",
+                "640329636251",
+                "archive-v3-witness",
+                &commitment,
+            ],
+        )
+        .is_err());
         // An invalid coordinate under the active mode fails closed.
         assert!(ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
             "single-archive-wal-v1",

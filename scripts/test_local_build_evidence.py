@@ -81,7 +81,7 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        tag = fresh.SUCCESSOR_TAG if fresh_bootstrap else TAG
+        tag = fresh.FLEET_CONVERGENCE_TAG if fresh_bootstrap else TAG
         source_repository = (
             fresh.SOURCE_REPOSITORY
             if fresh_bootstrap
@@ -107,7 +107,7 @@ class LocalEvidenceTests(unittest.TestCase):
             "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
             "archive_witness_shadow_mode": "off", "archive_witness_project_id": "",
             "archive_witness_project_number": "", "archive_witness_database_id": "",
-            "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+            "archive_v3_shadow_runtime_mode": "durable-fleet-wal-v1",
             "archive_v3_archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
             "archive_v3_archive_gcs_project_number": fresh.PROJECT_NUMBER,
             "archive_v3_registry_kms_version": "1",
@@ -116,7 +116,7 @@ class LocalEvidenceTests(unittest.TestCase):
             "archive_v3_witness_database_id": fresh.EXPECTED_INTENT[
                 "witness_database_id"
             ],
-            "archive_v3_archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "archive_v3_archive_binding_commitment": "",
         }
         if fresh_bootstrap:
             metadata_payload.update(
@@ -271,7 +271,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--public-key", str(public),
                 "--expected-public-key-sha256", fingerprint,
                 "--repository", "joerodriguez/kioku-enclave",
-                "--tag", fresh.SUCCESSOR_TAG,
+                "--tag", fresh.FLEET_CONVERGENCE_TAG,
                 "--commit", COMMIT,
                 "--image-repository", fresh.IMAGE_REPOSITORY,
                 "--config", str(directory / "local.env"),

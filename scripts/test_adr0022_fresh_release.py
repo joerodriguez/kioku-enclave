@@ -42,13 +42,13 @@ class FreshReleaseTests(unittest.TestCase):
         seal_path = directory / "scripts/schema_baseline_seal.json"
         seal_raw = seal_path.read_bytes()
 
-        commitment = "d" * 64
+        commitment = ""
         runtime_path = directory / "config/archive-v3-shadow-runtime.json"
         runtime_path.write_text(
             json.dumps(
                 {
                     "schema_version": 2,
-                    "mode": "single-archive-wal-v1",
+                    "mode": "durable-fleet-wal-v1",
                     "archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
                     "archive_gcs_project_number": fresh.PROJECT_NUMBER,
                     "registry_kms_version": "1",
@@ -203,13 +203,13 @@ class FreshReleaseTests(unittest.TestCase):
         )
         self.assertEqual(
             fresh.validate_checked_final_source(),
-            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "",
         )
         self.assertEqual(
             fresh.validate_checked_final_source(
                 source_ref=fresh.FLEET_CONVERGENCE_TAG
             ),
-            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "",
         )
 
     def test_exact_final_source_configuration_and_binding_are_role_specific(self) -> None:
@@ -258,13 +258,13 @@ class FreshReleaseTests(unittest.TestCase):
             ("src/schema_ladder.rs", "SCHEMA_EPOCH_HEAD: u32 = 1", "SCHEMA_EPOCH_HEAD: u32 = 0"),
             (
                 "config/archive-v3-shadow-runtime.json",
-                '"mode": "single-archive-wal-v1"',
+                '"mode": "durable-fleet-wal-v1"',
                 '"mode": "off"',
             ),
             (
                 "config/archive-v3-shadow-runtime.json",
+                '"archive_binding_commitment": ""',
                 '"archive_binding_commitment": "' + "d" * 64 + '"',
-                '"archive_binding_commitment": "' + "0" * 64 + '"',
             ),
             ("scripts/schema_baseline_seal.json", '"sealed": true', '"sealed": false'),
         )
