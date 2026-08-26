@@ -805,7 +805,7 @@ class SelectorTests(unittest.TestCase):
         }
         for tag in (
             "v0.8.35-archive-v3-wal.2",
-            "v0.8.35-archive-v3-wal.13-extra",
+            "v0.8.35-archive-v3-wal.14-extra",
             "v0.8.35-ARCHIVE-V3-WAL.1",
         ):
             with self.subTest(tag=tag):
