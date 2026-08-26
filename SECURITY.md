@@ -22,6 +22,14 @@ surfaces.
 - The repository's local verification, dependency audit, image scanning, signed local
   build evidence, and release process.
 
+The encrypted Control database is a complete context-bound SQLite snapshot rotated over
+a fixed 32-name GCS ring. The sequence header is authenticated by each slot's distinct
+object-name AEAD context; restart accepts only the contiguous newest sequence, every
+replacement is generation-CASed, and a lost response is adopted only after exact
+ciphertext readback. This changes write distribution, not authority or durability:
+every WAL transition remains remotely durable at the same boundary, and account deletion
+rewrites every live slot with the sanitized snapshot before purging older generations.
+
 ### Out of scope or accepted external trust
 
 - The macOS client, which is a separate binary with its own threat model.

@@ -48,6 +48,15 @@ commitment advance the permanent completion receipt. Browser
 snapshot and episode deletion are therefore live without retaining browser,
 transcript, OCR, finalization, voice, or webhook content in the delete ledger.
 
+Control still persists one complete context-bound encrypted SQLite snapshot per
+durability boundary, but `control/control.db.enc` is now the root slot of a fixed
+32-name snapshot ring rather than the only replacement target. Every slot has a
+distinct object-name AEAD context and generation CAS; an authenticated monotone
+header and contiguous-ring check select the newest restart state, lost responses
+require exact ciphertext readback, and account deletion sanitizes every live slot
+before older generations are purged. Per-name pacing therefore no longer serializes
+the WAL reserve/materialize ladder through one hot GCS object.
+
 | File | Role |
 |---|---|
 | `mod.rs` | `CpConfig` validates image-baked OAuth/APNs identifiers, optional atomic Apple login identifiers, the required service-wide daily signup budget, HTTPS API/browser origins, the optional exact-match Identity Platform reviewer identity, Vertex, and quotas; production JWT secrets come from the KMS-protected control store and web/Apple/APNs private credentials come from Secret Manager. `CpState` holds shared stores, verifiers, limiters, push transport, and the embedder. ADR-0022's generic `wal_domain_skipped`/`wal_domain_refusal` fail-closed helpers remain available for a newly deferred domain, but the production registry is intentionally empty after the final people/person-fact writer and routed roster reads migrated; adding a new constant requires a reviewed domain-specific deferral. |
@@ -86,6 +95,7 @@ transcript, OCR, finalization, voice, or webhook content in the delete ledger.
 | `limits.rs` | Token-bucket limiter + persistent daily ingest quotas and atomic pre-inference Vertex output-token reservations. The global ceiling is fail-closed into protected 50% audio, 25% screen, and 25% derived-text allocations; screens cannot borrow audio capacity. The full possible response remains reserved on timeouts. MCP tools use only the volatile rate limiter so read-only calls do not persist user or query state |
 | `isotime.rs` | RFC3339-UTC parse/format/add (no `chrono`; musl-friendly) |
 
-> Identity/accounting writes are low-volume, so the control store persists the whole blob
-> per write (fine here, unlike user indexes — see ADR-0002). Keep this `map.md` and the
+> Control transitions persist the whole encrypted SQLite snapshot per write, but rotate
+> through a fixed bounded object ring so high-frequency WAL durability steps do not replace
+> one GCS name continuously. Keep this `map.md` and the
 > public API documentation and downstream clients in sync when routes change.
