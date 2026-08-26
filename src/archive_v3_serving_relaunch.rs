@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::{
     archive_v3_shadow_runtime::{
         ArchiveV3ShadowRuntimeDeployment, DurableSingleArchiveBinding,
@@ -189,9 +191,12 @@ async fn relaunch_one(
     store: &Arc<Store>,
     selection: &crate::cp::control_store::WalAuthoritativePersistenceSelection,
 ) -> Result<RelaunchOutcome> {
-    let (archive_id, authority) =
-        build_wal_serving_authority(kms, control, selection.user_id()).await?;
-    store.install_wal_serving_authority(selection.user_id(), archive_id, Arc::new(authority))?;
+    let (archive_id, authority) = build_wal_serving_authority(kms, control, selection.user_id())
+        .await
+        .map_err(|error| report_relaunch_refusal("build_authority", error))?;
+    store
+        .install_wal_serving_authority(selection.user_id(), archive_id, Arc::new(authority))
+        .map_err(|error| report_relaunch_refusal("install_authority", error))?;
     // Past this line the user is registered and serving. Nothing below may
     // propagate: it reports how far the ladder got, and that is all.
     Ok(advance_to_target_epoch(store, selection.user_id()).await)
@@ -282,18 +287,27 @@ pub(crate) async fn build_wal_serving_authority(
     // re-read the baked deployment for each selection.
     let deployment = ArchiveV3ShadowRuntimeDeployment::from_baked_env()
         .map_err(|_| {
+            report_relaunch_stage("load_runtime_coordinates");
             EnclaveError::Store("baked archive-v3 runtime coordinates are invalid".into())
         })?
         .ok_or_else(|| {
+            report_relaunch_stage("runtime_coordinates_inactive");
             EnclaveError::Store("baked archive-v3 runtime coordinates changed".into())
         })?;
-    let pending = PendingSingleArchiveWalRuntime::new(deployment, Arc::clone(kms))
-        .map_err(|_| EnclaveError::Store("archive-v3 runtime construction failed".into()))?;
-    let binding = control.active_archive_binding(user_id).await?;
+    let pending =
+        PendingSingleArchiveWalRuntime::new(deployment, Arc::clone(kms)).map_err(|_| {
+            report_relaunch_stage("construct_runtime");
+            EnclaveError::Store("archive-v3 runtime construction failed".into())
+        })?;
+    let binding = control
+        .active_archive_binding(user_id)
+        .await
+        .map_err(|error| report_relaunch_refusal("load_archive_binding", error))?;
     let archive_id = *binding.archive_id().as_bytes();
     let sealed = pending
         .bind_once(DurableSingleArchiveBinding::from_control_store(binding))
         .map_err(|_| {
+            report_relaunch_stage("bind_runtime");
             EnclaveError::Conflict(
                 "the bound archive does not match the image's baked binding commitment".into(),
             )
@@ -302,14 +316,32 @@ pub(crate) async fn build_wal_serving_authority(
         .reconstruct_wal_serving_handoff(Arc::clone(control))
         .await
         .map_err(|_| {
+            report_relaunch_stage("reconstruct_handoff");
             EnclaveError::Conflict(
                 "the durable WAL-owner handoff could not be reconstructed".into(),
             )
         })?;
     let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
         .await
-        .map_err(|_| EnclaveError::Store("the WAL serving authority failed to launch".into()))?;
+        .map_err(|_| {
+            report_relaunch_stage("launch_authority");
+            EnclaveError::Store("the WAL serving authority failed to launch".into())
+        })?;
     Ok((archive_id, authority))
+}
+
+/// Emit only the static launch rung. No identity, archive coordinate, witness,
+/// provider response, or error text is logged.
+fn report_relaunch_stage(stage: &'static str) {
+    warn!(
+        metric = "archive_v3_wal_serving_relaunch_refusal",
+        stage, "WAL serving authority relaunch refused"
+    );
+}
+
+fn report_relaunch_refusal(stage: &'static str, error: EnclaveError) -> EnclaveError {
+    report_relaunch_stage(stage);
+    error
 }
 
 /// The in-process relaunch driver. It holds the same two dependencies the
@@ -620,13 +652,14 @@ mod tests {
             concat!("std::env::", "var"),
             concat!("user_id ", "="),
             concat!("info!", "("),
-            concat!("warn!", "("),
         ] {
             assert!(
                 !production.contains(forbidden),
                 "found forbidden {forbidden}"
             );
         }
+        assert!(production.contains("archive_v3_wal_serving_relaunch_refusal"));
+        assert!(production.contains("report_relaunch_stage(stage)"));
     }
 
     #[test]
