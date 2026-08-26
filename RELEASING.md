@@ -22,7 +22,7 @@ evidence is instead a canonical record signed with an independently pinned Ed255
   symlinks, unsafe permissions, and repository-resident files are rejected. Include the
   reviewed production build inputs plus `LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT`, a
   push-only Artifact Registry identity distinct from the enclave runtime identity.
-  Both fixed ADR-0022 fresh release roles additionally require the same exact
+  All fixed ADR-0022 fresh release coordinates additionally require the same exact
   `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256=<nonzero-lowercase-hex64>` and
   a sole lowercase UUIDv5 in `PRODUCTION_ADMIN_USER_IDS`; neither value is derived or
   read from a provider by this repository.
@@ -105,7 +105,7 @@ commit, digest-qualified image, hashes of the build configuration/Dockerfile/Car
 release metadata/SBOM/scan, and tool versions. It contains hashes rather than configuration
 values.
 
-### Fixed ADR-0022 fresh BOOTSTRAP and FINAL roles
+### Fixed ADR-0022 fresh release coordinates
 
 The fresh BOOTSTRAP can be built and published only as
 `v0.8.35-adr0022-fresh-bootstrap.1` from the checked version-0.8.35, schema-0/0/0,
@@ -129,6 +129,14 @@ commitment, and pin the exact completed baseline-seal bytes. The BOOTSTRAP tree
 intentionally carries an empty FINAL seal pin, so renaming a tag, flipping the
 seal bit, or activating a config file cannot make it FINAL-eligible. FINAL
 aliases and BOOTSTRAP/FINAL role crossing are rejected before publication.
+
+The capture-latency successor is reserved only as
+`v0.8.36-archive-v3-wal.15`. It retains FINAL.14's exact fresh namespace,
+canary, active archive runtime, Genesis, schema 1/1/1, and completed baseline
+seal bindings while requiring the checked Cargo/lockfile version 0.8.36. No
+other 0.8.36 archive-v3 tag can claim this coordinate, and FINAL.14 remains
+verifiable from its own signed source without becoming an alias for the new
+image.
 
 ## Publish the immutable release
 
@@ -164,10 +172,10 @@ copied once to a private read-only snapshot before verification; only those same
 bytes are uploaded or compared on resume. Git replacement refs, legacy grafts, and ambient
 repository/object/config overrides are rejected throughout these source boundaries.
 
-`release.sh --roll` refuses both fixed fresh tags. Fresh rollout is owned only
-by the deployment repository's source-frozen `adr0022-fresh-launch` operation,
-which consumes the signed release plus the fresh provider/health/launch
-receipts without entering the legacy storage/KMS/VM rollout path.
+`release.sh --roll` refuses every fixed fresh tag. Fresh rollout is owned only
+by the deployment repository's source-frozen direct-provider operation, which
+consumes the signed release plus the fresh provider and health evidence without
+entering the legacy storage/KMS/VM rollout path.
 
 ## Roll the verified digest
 
@@ -178,8 +186,9 @@ the KMS digest binding, applies the exact saved Terraform plan, replaces the Con
 Space VM, performs health/containment checks, and records a private local ledger.
 
 The generic `enclave-roll` description and example below apply only to the
-legacy/generic release workflow. They are not an ADR-0022 fresh launch path;
-both fixed fresh tags are rejected there and must use `adr0022-fresh-launch`.
+legacy/generic release workflow. They are not an ADR-0022 fresh rollout path;
+all fixed fresh tags are rejected there and must use the deployment repository's
+source-frozen direct-provider operation.
 
 Either invoke it from the monorepo:
 

@@ -204,10 +204,11 @@ def _validate_fresh_release(
                 arguments.expected_adr0022_canary_admin_uuid,
             )
         else:
-            validate_checked_final_source()
+            validate_checked_final_source(source_ref=arguments.tag)
             expected_binding = final_release_binding(
                 arguments.expected_adr0022_canary_identity_preparation_sha256,
                 arguments.expected_adr0022_canary_admin_uuid,
+                source_ref=arguments.tag,
             )
     except FreshReleaseError as error:
         reject(str(error))

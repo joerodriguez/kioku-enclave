@@ -166,20 +166,24 @@ class FreshReleaseTests(unittest.TestCase):
 
     def test_final_tag_role_has_no_version_attempt_case_or_cross_role_alias(self) -> None:
         self.assertTrue(fresh.is_final_tag(fresh.FINAL_TAG))
+        self.assertTrue(fresh.is_final_tag(fresh.SUCCESSOR_TAG))
         self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.FINAL_TAG))
+        self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.SUCCESSOR_TAG))
         self.assertFalse(fresh.is_bootstrap_tag(fresh.FINAL_TAG))
         for tag in (
             "v0.8.35-archive-v3-wal.2",
             "v0.8.35-archive-v3-wal.14-extra",
             "v0.8.35-ARCHIVE-V3-WAL.1",
             "v0.8.35-archive-v3-walish.1",
+            "v0.8.36-archive-v3-wal.14",
+            "v0.8.36-archive-v3-wal.15-extra",
         ):
             with self.subTest(tag=tag):
                 self.assertTrue(fresh.claims_final_role(tag))
                 self.assertFalse(fresh.is_final_tag(tag))
                 with self.assertRaises(fresh.FreshReleaseError):
                     fresh.require_exact_final_tag(tag)
-        for exact in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG):
+        for exact in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG, fresh.SUCCESSOR_TAG):
             fresh.require_exact_fresh_tag(exact)
 
     def test_final_source_has_an_exact_seal_pin_and_is_eligible(self) -> None:
@@ -213,7 +217,7 @@ class FreshReleaseTests(unittest.TestCase):
                 }
                 fresh.validate_final_configuration(configuration)
                 binding = fresh.fresh_release_binding_from_configuration(
-                    configuration, fresh.FINAL_TAG
+                    configuration, fresh.SUCCESSOR_TAG
                 )
                 self.assertEqual(tuple(binding), fresh.RELEASE_BINDING_FIELD_ORDER)
                 self.assertEqual(binding["production_genesis_wal_native"], "on")
@@ -291,6 +295,22 @@ class FreshReleaseTests(unittest.TestCase):
                 target = directory / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, target)
+            cargo_path = directory / "Cargo.toml"
+            cargo_path.write_text(
+                cargo_path.read_text(encoding="utf-8").replace(
+                    'version = "0.8.36"', 'version = "0.8.35"', 1
+                ),
+                encoding="utf-8",
+            )
+            lock_path = directory / "Cargo.lock"
+            lock_path.write_text(
+                lock_path.read_text(encoding="utf-8").replace(
+                    'name = "kioku-enclave"\nversion = "0.8.36"',
+                    'name = "kioku-enclave"\nversion = "0.8.35"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
             schema_path = directory / "src/schema_ladder.rs"
             schema = schema_path.read_text(encoding="utf-8")
             schema_path.write_text(

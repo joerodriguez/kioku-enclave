@@ -354,7 +354,7 @@ def selected_configuration(
             raise SystemExit(str(error)) from error
     elif is_final_tag(source_ref):
         try:
-            validate_final_configuration(configuration)
+            validate_final_configuration(configuration, source_ref=source_ref)
         except FreshReleaseError as error:
             raise SystemExit(str(error)) from error
     return configuration
