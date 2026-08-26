@@ -248,14 +248,11 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   likewise still compile and are called by the sibling lease functions in the same
   module, but nothing outside the witness/Firestore pair calls those lease
   functions: treat them as compilation keepers.
-  Store capture injection remains narrowed to one exact validated user, and
-  production constructors still install no VFS. `StoreShadowCaptureSelection`
-  survives, but after `#289` the crate-private test seam is its only injector:
-  the advisory-owner resume transition that was the sole production installer is
-  gone, so no production path can select a user for capture, and the selection
-  is permanently `None` in a release image. Unrelated users always use the
-  unchanged legacy open, and a named-open failure still preserves the legacy
-  result. This grants no live canary or acknowledgement authority.
+  The retired advisory Store capture selector and its constructor/test seam are
+  deleted. Only the Archive V3 WAL-owner launcher can install the shared capture
+  VFS and register its private recovery path; no route, request, legacy Store
+  open, or caller can select capture authority. This grants no canary or generic
+  acknowledgement authority.
 
   Everything that would have consumed such a selector was deleted with the
   family, and none of it remains in the tree: the parity-certified advisory

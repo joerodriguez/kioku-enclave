@@ -315,20 +315,20 @@ pub(crate) async fn converge_genesis_for_user(
     converge_genesis_over(&BakedImageGenesisRuntime, control, store, user_id).await
 }
 
-/// Convert every live legacy archive before request admission.
+/// Convert every active account before request admission.
 ///
-/// This is the one-time fleet bridge for accounts that existed before the
-/// sign-in trigger was armed. Discovery uses the Store's strict live-object
-/// scan and convergence reuses the identical per-user durable Genesis path;
-/// no second provider, witness, or mutation implementation exists here.
-/// Identities never leave this function. Any incomplete scan or refused user
-/// fails startup closed, and the whole pass is safe to retry after rollback or
-/// restart because per-user Genesis is resumable.
-pub(crate) async fn converge_all_live_legacy_users(
+/// Discovery uses encrypted Control rather than the retired per-user snapshot
+/// bucket. This also repairs an account created just before a crash whose
+/// detached sign-in convergence had not created a legacy object. Identities
+/// never leave this function.
+pub(crate) async fn converge_all_active_users(
     control: &Arc<ControlStore>,
     store: &Arc<Store>,
 ) -> std::result::Result<usize, GenesisTriggerError> {
-    let users = store.live_legacy_index_users().await.map_err(map_control)?;
+    let users = control
+        .load_active_archive_user_ids()
+        .await
+        .map_err(map_control)?;
     let total = users.len();
     for user_id in users {
         converge_genesis_for_user(control, store, &user_id).await?;

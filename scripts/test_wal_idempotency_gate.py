@@ -721,10 +721,11 @@ EXPECTED_STORE_CALL_COUNT = 258
 # owner-body-only moves. Their keys, classifications, and call-expression
 # hashes are byte-identical; the count and surviving-key order remain fixed.
 EXPECTED_STORE_CALL_SHA256 = "f2f02b476c8748846def0ca2901a8474be81ffde40ad244802a031beb171c2a1"
-EXPECTED_STORE_SURFACE_COUNT = 15
+EXPECTED_STORE_SURFACE_COUNT = 13
 # Slice F-c: the internal constructor's Store literal additionally initializes
-# the always-empty per-user WAL-authority selection map; no construction
-# surface was added or removed.
+# the always-empty per-user WAL-authority selection map. Later history below
+# records the two retired advisory-capture construction nodes removed by the
+# Archive V3-only cleanup (15 -> 13).
 # Slice J-a: async_main's owner body gained the pre-admission WAL-authority
 # selection installation; both constructor call expressions are unchanged.
 # Slice J-b3: the internal constructor's Store literal additionally
@@ -810,7 +811,10 @@ EXPECTED_STORE_SURFACE_COUNT = 15
 # classifications, order, and every call-expression hash. Only async_main's
 # enclosing owner-body hash moves: 2ac9598c -> d93b298d -> 51b06274. The final
 # independently derived third-state digest is recorded below.
-EXPECTED_STORE_SURFACE_SHA256 = "8301a8b0e4a188492902a910288f7231edc539f0c6772d74b6f7fa80a3559db9"
+# Archive V3-only cleanup: the retired exact-user advisory capture constructor
+# and its optional selection were deleted. The construction graph loses those
+# two nodes (15 -> 13); the remaining chain is pinned below.
+EXPECTED_STORE_SURFACE_SHA256 = "8656c58920205527a629a6855314bfdb17ab8017f8af82a997dcfc5763777053"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -818,12 +822,10 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
         "src/store.rs::new#2::factory_definition::new#0",
         "src/store.rs::new_internal#0::Self::new_internal_with_max_open#0",
         "src/store.rs::new_internal#0::factory_definition::new_internal#0",
-        "src/store.rs::new_internal_with_max_open#0::Self::new_internal_with_max_open_and_shadow_capture#0",
+        "src/store.rs::new_internal_with_max_open#0::Self::new_internal_with_max_open_and_policy#0",
         "src/store.rs::new_internal_with_max_open#0::factory_definition::new_internal_with_max_open#0",
-        "src/store.rs::new_internal_with_max_open_and_shadow_capture#0::Self::new_internal_with_max_open_shadow_capture_and_policy#0",
-        "src/store.rs::new_internal_with_max_open_and_shadow_capture#0::factory_definition::new_internal_with_max_open_and_shadow_capture#0",
-        "src/store.rs::new_internal_with_max_open_shadow_capture_and_policy#0::Store_literal#0",
-        "src/store.rs::new_internal_with_max_open_shadow_capture_and_policy#0::factory_definition::new_internal_with_max_open_shadow_capture_and_policy#0",
+        "src/store.rs::new_internal_with_max_open_and_policy#0::Store_literal#0",
+        "src/store.rs::new_internal_with_max_open_and_policy#0::factory_definition::new_internal_with_max_open_and_policy#0",
         "src/store.rs::new_with_media#0::Self::new_internal#0",
         "src/store.rs::new_with_media#0::factory_definition::new_with_media#0",
         "src/store.rs::new_with_media_and_legacy#0::Self::new_internal#0",
@@ -836,7 +838,7 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
 # fails closed to WAL-logical). Every consult site keeps its exact refusal
 # comparison but reads the resolver instead of the field; only the resolver
 # and the construction chain touch `persistence_policy` directly.
-EXPECTED_POLICY_SITE_COUNT = 42
+EXPECTED_POLICY_SITE_COUNT = 46
 # Slice J-b3: owner-body hashes moved for the constructor (serving-authority
 # registry init), with_user (selected-user legacy-load refusal), and
 # save_user (selected-user provider-silent no-op); every policy expression
@@ -873,7 +875,10 @@ EXPECTED_POLICY_SITE_COUNT = 42
 # rows are again the two persistence_policy sites inside the internal
 # constructor, whose owner body gained the relaunch-driver slot; their
 # expressions are byte-identical, and every `open_db#0` row is unchanged.
-EXPECTED_POLICY_SITE_SHA256 = "7b4d15912ada202d44b85fe68ec2862d245632e983874b58b6d049370ce6319d"
+# Removing the retired capture constructor also exposes the shared open core as
+# the direct policy owner in the structural scanner. Four policy references
+# move into that named owner; no target or classification changes.
+EXPECTED_POLICY_SITE_SHA256 = "92d066143e38e52fc6cf8eef68a318b9daff99b9e44a48c962d52bc307ac4ecb"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -882,7 +887,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::flush_handle_with_admission#0::WalLogicalOnly#0",
         "src/store.rs::load_user#0::WalLogicalOnly#0",
         "src/store.rs::load_user#0::WalLogicalOnly#1",
-        "src/store.rs::open_db#0::WalLogicalOnly#0",
+        "src/store.rs::open_db_inner#0::WalLogicalOnly#0",
         "src/store.rs::persistence_policy_for#0::WalLogicalOnly#0",
         "src/store.rs::persistence_policy_for#0::WalLogicalOnly#1",
         "src/store.rs::persistence_policy_for#0::WalLogicalOnly#2",
@@ -904,7 +909,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
 EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
     {
         "src/store.rs::from_authenticated_staging#0::StorePersistencePolicy::WalOwnerAuthoritative#0",
-        "src/store.rs::open_db#0::StorePersistencePolicy::WalOwnerAuthoritative#0",
+        "src/store.rs::open_db_inner#0::StorePersistencePolicy::WalOwnerAuthoritative#0",
     }
 )
 # Deliberate ADR-0022 Phase-2 re-pin (upstream: run_phase2's owned spawn) plus
@@ -1066,7 +1071,10 @@ EXPECTED_WORKER_SPAWN_COUNT = 29
 # keys, classes, order, and spawn-expression hashes; the async_main owner hash
 # alone follows 2ac9598c -> d93b298d -> 51b06274. The independently derived
 # final inventory digest is pinned below.
-EXPECTED_WORKER_SPAWN_SHA256 = "736db14515770ed40f625ea6042cb59fa6183e96f9f2cf66a1f31570b7b56045"
+# Control-backed fleet discovery changes only the enclosing bodies of the
+# existing Genesis convergence spawn and startup spawn; all 29 spawn sites,
+# call expressions, and classifications are unchanged.
+EXPECTED_WORKER_SPAWN_SHA256 = "d21650eecde432b644b20eb592d2e60880f998b2c6299cacdbc5b1bb5c1d968e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

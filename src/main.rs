@@ -1130,14 +1130,14 @@ async fn async_main() {
     if genesis_native_signin {
         info!("new-user archive-v3 genesis is armed for sign-in");
         let converged =
-            archive_v3_genesis_trigger::converge_all_live_legacy_users(&control_store, &store)
+            archive_v3_genesis_trigger::converge_all_active_users(&control_store, &store)
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("Failed to converge every live legacy archive to Archive v3: {error}")
+                    panic!("Failed to converge every active account to Archive V3: {error}")
                 });
         info!(
             converged,
-            "converged every live legacy archive to Archive v3 before request admission"
+            "converged every active account to Archive V3 before request admission"
         );
     }
 

@@ -12183,6 +12183,28 @@ fn load_wal_authoritative_persistence_selections_conn(
         .collect()
 }
 
+/// Enumerate every active account with its durable archive binding. Archive
+/// V3 startup convergence uses encrypted Control as the account authority;
+/// the presence of an old per-user GCS snapshot is neither required nor
+/// sufficient.
+fn load_active_archive_user_ids_conn(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT u.id
+         FROM users u
+         JOIN archive_bindings b ON b.user_id = u.id
+         WHERE u.status = 'active' AND b.state = 'active_legacy'
+         ORDER BY u.id",
+    )?;
+    let users: Vec<String> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for user_id in &users {
+        validate_user_id(user_id)?;
+        validate_active_archive_binding_conn(conn, user_id)?;
+    }
+    Ok(users)
+}
+
 const WAL_GENESIS_LEDGER_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/wal-genesis-ledger/v1\0";
 const WAL_GENESIS_LEDGER_FORMAT_VERSION: u32 = 1;
 
@@ -19614,6 +19636,12 @@ impl ControlStore {
     ) -> Result<Vec<WalAuthoritativePersistenceSelection>> {
         self.read(load_wal_authoritative_persistence_selections_conn)
             .await
+    }
+
+    /// Load the complete active-account convergence inventory. Identities
+    /// remain in-process; the startup caller publishes only the count.
+    pub(crate) async fn load_active_archive_user_ids(&self) -> Result<Vec<String>> {
+        self.read(load_active_archive_user_ids_conn).await
     }
 
     /// Record (or exactly replay) one durable genesis control-ledger stage
@@ -31786,6 +31814,42 @@ mod tests {
             .active_archive_binding("22222222-2222-4222-8222-222222222222")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn active_archive_inventory_comes_from_control_not_legacy_objects() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let first = control
+            .upsert_user("inventory-first", "first@example.com", TEST_SIGNUP_LIMIT)
+            .await
+            .unwrap();
+        let second = control
+            .upsert_user("inventory-second", "second@example.com", TEST_SIGNUP_LIMIT)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            control.load_active_archive_user_ids().await.unwrap(),
+            vec![first.id.clone(), second.id.clone()]
+        );
+
+        let second_id = second.id.clone();
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE users SET status='deleting' WHERE id=?1",
+                    [&second_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            control.load_active_archive_user_ids().await.unwrap(),
+            vec![first.id]
+        );
     }
 
     #[tokio::test]

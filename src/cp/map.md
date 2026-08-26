@@ -7,6 +7,12 @@ of this runs in the one attested binary; handlers call the data-plane query/stor
 `episodes::upsert_episodes` / `write_episode_embedding` / `purge_episode` from
 `summarizer.rs` and `query.rs`. Routes are wired in [`../main.rs`](../map.md).
 
+Archive V3 fleet convergence now enumerates active accounts from encrypted
+Control's `users` plus validated `archive_bindings` transaction, not from the
+presence of old per-user snapshot objects. This lets startup repair an account
+whose detached Genesis pass was interrupted before any legacy object existed;
+only the aggregate convergence count is logged.
+
 Capture manifests cap device `started_at`/`ended_at` at the media settle
 families' 64-byte ceiling. The media claim lane also names exact durable legacy
 row, duplicate-event, and stored-work-unit violations before payment, preflights
