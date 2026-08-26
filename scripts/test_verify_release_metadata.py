@@ -110,12 +110,14 @@ def bootstrap_manifest() -> dict[str, object]:
 
 def final_manifest_shape() -> dict[str, object]:
     data = bootstrap_manifest()
-    data["source_ref"] = fresh.SUCCESSOR_TAG
-    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.SUCCESSOR_TAG}"
-    data["release_url"] = fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.SUCCESSOR_TAG
+    data["source_ref"] = fresh.FLEET_CONVERGENCE_TAG
+    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.FLEET_CONVERGENCE_TAG}"
+    data["release_url"] = (
+        fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.FLEET_CONVERGENCE_TAG
+    )
     data.update(
         {
-            "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+            "archive_v3_shadow_runtime_mode": "durable-fleet-wal-v1",
             "archive_v3_archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
             "archive_v3_archive_gcs_project_number": fresh.PROJECT_NUMBER,
             "archive_v3_registry_kms_version": "1",
@@ -124,7 +126,7 @@ def final_manifest_shape() -> dict[str, object]:
             "archive_v3_witness_database_id": fresh.EXPECTED_INTENT[
                 "witness_database_id"
             ],
-            "archive_v3_archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "archive_v3_archive_binding_commitment": "",
         }
     )
     data.update(
@@ -242,7 +244,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         data = final_manifest_shape()
         completed = self.verify(
             data,
-            tag=fresh.SUCCESSOR_TAG,
+            tag=fresh.FLEET_CONVERGENCE_TAG,
             repository="joerodriguez/kioku-enclave",
             expected_buckets=(
                 fresh.EXPECTED_INTENT["index_bucket"],
@@ -253,7 +255,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             expected_canary_uuid=CANARY_UUID,
             shadow_runtime_config={
                 "schema_version": 2,
-                "mode": "single-archive-wal-v1",
+                "mode": "durable-fleet-wal-v1",
                 "archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
                 "archive_gcs_project_number": fresh.PROJECT_NUMBER,
                 "registry_kms_version": "1",
@@ -262,7 +264,7 @@ class ReleaseMetadataTests(unittest.TestCase):
                 "witness_database_id": fresh.EXPECTED_INTENT[
                     "witness_database_id"
                 ],
-                "archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+                "archive_binding_commitment": "",
             },
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)

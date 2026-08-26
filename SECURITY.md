@@ -129,22 +129,20 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   never blindly retried and is confirmed only by rereading the exact attempt. Schema-9
   signed release metadata binds the mode and complete-or-empty namespace but grants no
   Firestore, rollout, health, or archive authority.
-- The ADR-0022 single-archive WAL runtime profile is separately image-bound by checked-in
-  schema-2 `config/archive-v3-shadow-runtime.json`. The current BOOTSTRAP source is the exact
-  all-empty off form and therefore constructs no archive-v3 provider authority. A later,
-  separately reviewed FINAL source may carry the complete fresh-production tuple and one-way
-  binding commitment. Its sole shared parser
-  accepts that active form only when the
-  bucket, three canonical unsigned-64-bit numeric coordinates, named non-UUID Firestore
-  project/database, and nonzero lowercase SHA-256 archive-binding commitment are complete.
+- The ADR-0022 WAL runtime profile is separately image-bound by checked-in schema-2
+  `config/archive-v3-shadow-runtime.json`. The checked source carries the complete
+  fresh-production `durable-fleet-wal-v1` tuple. Its sole shared parser accepts that active
+  form only when the bucket, three canonical unsigned-64-bit numeric coordinates, and named
+  non-UUID Firestore project/database are complete and the retired canary-only binding
+  commitment is empty. Historical `single-archive-wal-v1` profiles retain their exact
+  nonzero lowercase SHA-256 commitment grammar.
   Evaluation and `main` pretag selection force off; only exact
   `vX.Y.Z-archive-v3-wal.N` production tags select active, while an active profile on any
   other ref or a WAL tag with off fails closed. Operator configuration, dispatch inputs,
   and process environment cannot override selection. Signed release metadata binds either
-  the exact all-empty BOOTSTRAP claim or the complete eight-value FINAL claim; older metadata
-  remains ineligible. Docker
-  independently enforces the same all-empty or complete bucket, canonical-u64,
-  named-non-UUID-Firestore, and nonzero-commitment grammar, and `release.sh --roll`
+  the exact all-empty BOOTSTRAP claim or the complete eight-value active claim; older metadata
+  remains ineligible. Docker independently enforces the same off, historical canary, or durable
+  fleet grammar, and `release.sh --roll`
   requires the exact WAL tag and explicit matching operator confirmation before
   an active image can publish or roll. While the preceding image is still off,
   an authenticated administrator-only route may return the one-way binding
@@ -152,14 +150,17 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   archive ID never leaves encrypted Control; the route refuses non-admin callers,
   unavailable/malformed state, and every already-active image.
 
-  The compiled capability constructs fixed-origin clients synchronously without provider
-  I/O, then remains pending until it consumes one opaque durable encrypted-control
-  `ArchiveBinding`. Binding derives `SHA-256("kioku/archive-v3/single-archive-wal-runtime-binding/v1\0" || archive_id[16])`
-  and must exactly match the image claim. Consumption is one-shot; the sealed result keeps
-  the archive ID and every provider private and exposes no getter, callback, task, operation,
-  acknowledgement, or hard-delete authority. Under the exact active profile,
-  startup reconstructs only durable WAL-authoritative selections and sign-in
-  convergence can consume the matching binding into the reviewed Genesis owner;
+  The compiled capability constructs fixed-origin clients synchronously without provider I/O,
+  then remains pending until it consumes one opaque durable encrypted-control `ArchiveBinding`.
+  Historical canary mode derives
+  `SHA-256("kioku/archive-v3/single-archive-wal-runtime-binding/v1\0" || archive_id[16])`
+  and requires an exact image match. Durable fleet mode has no route-, request-, or
+  environment-supplied archive selector: it accepts only the private `ArchiveBinding` value
+  returned by encrypted Control's validated active-binding loader. Consumption is still
+  one-shot; each sealed result is still bound to one archive and keeps its archive ID and every
+  provider private. Under the exact active profile, startup reconstructs durable
+  WAL-authoritative selections and sign-in convergence consumes each validated binding into the
+  reviewed Genesis owner;
   off-config startup refuses if such selected state already exists. The deleted
   advisory migration family and the inactive extent-shadow engine remain unreachable.
 - The fresh BOOTSTRAP release uses schema-10 signed metadata only at the fixed

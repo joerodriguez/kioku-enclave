@@ -744,7 +744,7 @@ person returns `404`. Unknown query fields return `400`.
 ## Archive-v3 activation binding (owner only)
 
 `GET /api/admin/archive-v3/activation-binding` is a temporary operational
-bootstrap read for the account named in the image-baked `ADMIN_USER_IDS` list.
+bootstrap read retained for historical one-canary images and for the account named in the image-baked `ADMIN_USER_IDS` list.
 It is accepted only while the image's archive-v3 runtime profile is still
 `off` and returns a one-way, non-secret commitment to the caller's already
 durable opaque Control archive binding:

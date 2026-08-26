@@ -944,7 +944,7 @@ This gate does not activate WAL persistence or change any user-visible runtime b
 These release and runtime boundaries do not create a Firestore database, grant provider
 IAM, publish a probe release, deploy an image, or activate archive-v3 authority.
 
-## Sealed single-archive WAL runtime release boundary
+## Sealed per-archive WAL runtime release boundary
 
 - [x] Added a domain-separated SHA-256 commitment over one opaque archive ID and
   non-cloneable pending/durable/sealed capability types; binding consumes the
@@ -954,10 +954,14 @@ IAM, publish a probe release, deploy an image, or activate archive-v3 authority.
   no getters/callbacks/tasks/operations/acknowledgements/deletion methods, and an
   always-false hard-delete drain gate.
 - [x] Versioned the sole checked runtime profile to schema 2. The checked file stays
-  exact off/empty; a complete canonical `single-archive-wal-v1` profile is selected
-  only for exact `vX.Y.Z-archive-v3-wal.N` production tags, while evaluation/main
+  image-bound and a complete canonical active profile is selected only for exact
+  `vX.Y.Z-archive-v3-wal.N` production tags, while evaluation/main
   pretag force off, WAL-tag-plus-off fails, and environment/operator/dispatch inputs
   cannot override it.
+- [x] Added `durable-fleet-wal-v1` after the canary-only binding rejected the second
+  production account. It keeps provider coordinates image-fixed and each launched runtime
+  single-archive/bind-once, while accepting archive identity only from encrypted Control's
+  validated opaque binding. A two-distinct-binding regression covers the production failure.
 - [x] Bound the full eight-element claim into schema-9 release metadata and Docker's
   independent exact off/complete provider grammar while leaving schema-7/8 evidence
   ineligible.

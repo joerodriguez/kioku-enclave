@@ -500,7 +500,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         configuration = pipeline.selected_configuration(
             "production",
             final_environment,
-            source_ref=fresh.SUCCESSOR_TAG,
+            source_ref=fresh.FLEET_CONVERGENCE_TAG,
             probe_config_path=ROOT / "config/archive-witness-probe.json",
             shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
         )
@@ -566,9 +566,9 @@ class LocalImagePipelineTests(unittest.TestCase):
                     configuration=configuration,
                     config_sha256="d" * 64,
                     source_archive_sha256="e" * 64,
-                    source_ref=fresh.SUCCESSOR_TAG,
+                    source_ref=fresh.FLEET_CONVERGENCE_TAG,
                     source_commit="f" * 40,
-                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.SUCCESSOR_TAG}",
+                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.FLEET_CONVERGENCE_TAG}",
                     image_digest="sha256:" + "1" * 64,
                     created_at="2026-08-24T12:00:00Z",
                     expected_sbom_sha256="2" * 64,
@@ -587,14 +587,14 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(len(metadata), 50)
         self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
         self.assertEqual(metadata["schema_version"], 10)
-        self.assertEqual(metadata["source_ref"], fresh.SUCCESSOR_TAG)
+        self.assertEqual(metadata["source_ref"], fresh.FLEET_CONVERGENCE_TAG)
         self.assertEqual(metadata["schema_epoch_head"], 1)
         self.assertEqual(metadata["schema_epoch_target"], 1)
         self.assertEqual(metadata["schema_epoch_minimum_servable"], 1)
         self.assertEqual(metadata["production_genesis_wal_native"], "on")
         self.assertEqual(
             metadata["archive_v3_archive_binding_commitment"],
-            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+            "",
         )
         self.assertEqual(metadata["signup_mode"], "positive")
         self.assertEqual(

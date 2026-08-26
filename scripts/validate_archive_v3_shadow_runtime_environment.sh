@@ -95,5 +95,17 @@ case "$mode" in
         printf '%s\n' "$archive_binding_commitment" | grep -Eq '^[0-9a-f]{64}$'
         [ "$archive_binding_commitment" != "0000000000000000000000000000000000000000000000000000000000000000" ]
         ;;
+    durable-fleet-wal-v1)
+        valid_bucket "$archive_bucket"
+        canonical_u64 "$archive_project_number"
+        canonical_u64 "$registry_kms_version"
+        printf '%s\n' "$witness_project_id" | grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+        canonical_u64 "$witness_project_number"
+        printf '%s\n' "$witness_database_id" | grep -Eq '^[a-z][a-z0-9-]{2,61}[a-z0-9]$'
+        if printf '%s\n' "$witness_database_id" | grep -Eq '^[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}$'; then
+            exit 1
+        fi
+        [ -z "$archive_binding_commitment" ]
+        ;;
     *) exit 1 ;;
 esac
