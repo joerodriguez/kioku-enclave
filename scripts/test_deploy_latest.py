@@ -21,6 +21,7 @@ class DeployLatestTests(unittest.TestCase):
             output_dir=Path("/private/evidence"),
             apply=True,
             resume=True,
+            tag_signing_key=Path("/private/release-key.pub"),
         )
         command = deploy_latest.pipeline_command(
             arguments, "v0.8.37-archive-v3-wal.18"
@@ -39,6 +40,9 @@ class DeployLatestTests(unittest.TestCase):
         self.assertIn('f"refs/tags/{tag}^{{tag}}"', source)
         self.assertIn('f"refs/tags/{tag}^{{commit}}"', source)
         self.assertIn('"origin/main"', source)
+        self.assertIn('"gpg.format=ssh"', source)
+        self.assertIn('f"user.signingkey={signing_key}"', source)
+        self.assertIn('release.add_argument("--tag-signing-key", type=Path, required=True)', source)
 
 
 if __name__ == "__main__":
