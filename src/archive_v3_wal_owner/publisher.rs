@@ -1718,7 +1718,9 @@ impl SingleArchiveWalPublisher {
                             WalOwnerError::Publication,
                         )
                     })?;
-                if let Ok(lease) =
+                if current == previous {
+                    (previous, retained)
+                } else if let Ok(lease) =
                     current.exact_wal_owner_heartbeat_from(&previous, retained.owner_id.as_bytes())
                 {
                     let live = control

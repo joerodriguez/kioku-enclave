@@ -36039,10 +36039,14 @@ mod tests {
     fn wal_owner_lease_successions_consume_witnessed_comparison_before_reopen() {
         use crate::archive_v3_witness::RootReference;
 
-        for (reacquire, fixture_byte) in [(false, 0xdc), (true, 0xe0)] {
+        for (reacquire, same_expiry_heartbeat, fixture_byte) in
+            [(false, false, 0xdc), (false, true, 0xe0), (true, false, 0xe4)]
+        {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join(if reacquire {
                 "wal-owner-reacquire-after-witnessed.sqlite"
+            } else if same_expiry_heartbeat {
+                "wal-owner-same-expiry-heartbeat-after-witnessed.sqlite"
             } else {
                 "wal-owner-heartbeat-after-witnessed.sqlite"
             });
@@ -36085,6 +36089,8 @@ mod tests {
                 .0;
             let successor = if reacquire {
                 settled_record.reacquired_maintenance_lease_for_test()
+            } else if same_expiry_heartbeat {
+                settled_record.heartbeated_wal_owner_lease_for_test()
             } else {
                 // This fixture advances the trusted provider tick, exercising
                 // a genuine later-second same-fence heartbeat rather than the
@@ -36097,9 +36103,14 @@ mod tests {
                     .unwrap()
             } else {
                 successor
-                    .exact_wal_owner_renewal_from(&settled_record, owner.as_bytes())
+                    .exact_wal_owner_heartbeat_from(&settled_record, owner.as_bytes())
                     .unwrap()
             };
+            if same_expiry_heartbeat {
+                assert!(successor
+                    .exact_wal_owner_renewal_from(&settled_record, owner.as_bytes())
+                    .is_err());
+            }
             let persisted = persist_wal_owner_lease_successor_conn(
                 &conn,
                 &settled_record,
