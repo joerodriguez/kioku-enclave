@@ -21,7 +21,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
-FINAL_TAG = "v0.8.35-archive-v3-wal.7"
+FINAL_TAG = "v0.8.35-archive-v3-wal.8"
 SOURCE_REPOSITORY = "https://github.com/joerodriguez/kioku-enclave"
 GENERATION_INTENT_SHA256 = (
     "7ece5ba914f76d2f56af178d5891230d3e1ba7df33a6b54dd3d2a7870cce3727"

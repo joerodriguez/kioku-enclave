@@ -122,7 +122,7 @@ commit, image digest, and canary values are not release evidence or provider aut
 Generic release roles continue to emit schema 9.
 
 The separately reviewed FINAL source is reserved only as
-`v0.8.35-archive-v3-wal.7`. It must retain the exact fresh namespace and canary
+`v0.8.35-archive-v3-wal.8`. It must retain the exact fresh namespace and canary
 bindings, compile the reviewed additive ladder at 1/1/1, enable native Genesis,
 carry the complete active archive runtime plus the live one-way binding
 commitment, and pin the exact completed baseline-seal bytes. The BOOTSTRAP tree
