@@ -36039,9 +36039,11 @@ mod tests {
     fn wal_owner_lease_successions_consume_witnessed_comparison_before_reopen() {
         use crate::archive_v3_witness::RootReference;
 
-        for (reacquire, same_expiry_heartbeat, fixture_byte) in
-            [(false, false, 0xdc), (false, true, 0xe0), (true, false, 0xe4)]
-        {
+        for (reacquire, same_expiry_heartbeat, fixture_byte) in [
+            (false, false, 0xdc),
+            (false, true, 0xe0),
+            (true, false, 0xe4),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join(if reacquire {
                 "wal-owner-reacquire-after-witnessed.sqlite"
