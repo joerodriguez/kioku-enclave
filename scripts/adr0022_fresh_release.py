@@ -23,9 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
 FINAL_TAG = "v0.8.35-archive-v3-wal.14"
 SUCCESSOR_TAG = "v0.8.36-archive-v3-wal.15"
+FLEET_CONVERGENCE_TAG = "v0.8.36-archive-v3-wal.16"
 FINAL_TAG_VERSIONS = {
     FINAL_TAG: "0.8.35",
     SUCCESSOR_TAG: "0.8.36",
+    FLEET_CONVERGENCE_TAG: "0.8.36",
 }
 SOURCE_REPOSITORY = "https://github.com/joerodriguez/kioku-enclave"
 GENERATION_INTENT_SHA256 = (

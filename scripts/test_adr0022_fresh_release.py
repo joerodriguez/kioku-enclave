@@ -167,8 +167,12 @@ class FreshReleaseTests(unittest.TestCase):
     def test_final_tag_role_has_no_version_attempt_case_or_cross_role_alias(self) -> None:
         self.assertTrue(fresh.is_final_tag(fresh.FINAL_TAG))
         self.assertTrue(fresh.is_final_tag(fresh.SUCCESSOR_TAG))
+        self.assertTrue(fresh.is_final_tag(fresh.FLEET_CONVERGENCE_TAG))
         self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.FINAL_TAG))
         self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.SUCCESSOR_TAG))
+        self.assertTrue(
+            fresh.is_final_tag("refs/tags/" + fresh.FLEET_CONVERGENCE_TAG)
+        )
         self.assertFalse(fresh.is_bootstrap_tag(fresh.FINAL_TAG))
         for tag in (
             "v0.8.35-archive-v3-wal.2",
@@ -183,7 +187,12 @@ class FreshReleaseTests(unittest.TestCase):
                 self.assertFalse(fresh.is_final_tag(tag))
                 with self.assertRaises(fresh.FreshReleaseError):
                     fresh.require_exact_final_tag(tag)
-        for exact in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG, fresh.SUCCESSOR_TAG):
+        for exact in (
+            fresh.BOOTSTRAP_TAG,
+            fresh.FINAL_TAG,
+            fresh.SUCCESSOR_TAG,
+            fresh.FLEET_CONVERGENCE_TAG,
+        ):
             fresh.require_exact_fresh_tag(exact)
 
     def test_final_source_has_an_exact_seal_pin_and_is_eligible(self) -> None:
@@ -194,6 +203,12 @@ class FreshReleaseTests(unittest.TestCase):
         )
         self.assertEqual(
             fresh.validate_checked_final_source(),
+            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+        )
+        self.assertEqual(
+            fresh.validate_checked_final_source(
+                source_ref=fresh.FLEET_CONVERGENCE_TAG
+            ),
             "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
         )
 
@@ -218,6 +233,12 @@ class FreshReleaseTests(unittest.TestCase):
                 fresh.validate_final_configuration(configuration)
                 binding = fresh.fresh_release_binding_from_configuration(
                     configuration, fresh.SUCCESSOR_TAG
+                )
+                self.assertEqual(
+                    fresh.fresh_release_binding_from_configuration(
+                        configuration, fresh.FLEET_CONVERGENCE_TAG
+                    ),
+                    binding,
                 )
                 self.assertEqual(tuple(binding), fresh.RELEASE_BINDING_FIELD_ORDER)
                 self.assertEqual(binding["production_genesis_wal_native"], "on")
