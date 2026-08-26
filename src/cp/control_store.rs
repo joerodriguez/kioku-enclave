@@ -36163,6 +36163,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wal_owner_same_fence_heartbeat_persists_and_reopens_without_expiry_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-owner-heartbeat-reopen.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (_terminal, acquired, acquired_lease, _binding) = bound_wal_publisher_fixture(&conn);
+        let owner = load_bound_wal_owner_conn(&conn, &acquired)
+            .unwrap()
+            .control_view(WalOwnerPersistenceContext::for_test())
+            .0;
+        let heartbeated = acquired.heartbeated_wal_owner_lease_for_test();
+        assert!(
+            heartbeated
+                .exact_wal_owner_renewal_from(&acquired, owner.as_bytes())
+                .is_err(),
+            "a trusted-tick-only heartbeat is not a lease extension"
+        );
+        let lease = heartbeated
+            .exact_wal_owner_heartbeat_from(&acquired, owner.as_bytes())
+            .unwrap();
+        assert_eq!(lease.expires_at_tick(), acquired_lease.expires_at_tick());
+        let persisted =
+            persist_wal_owner_lease_successor_conn(&conn, &acquired, &heartbeated, lease, false)
+                .unwrap();
+        assert!(persisted.1);
+        assert_eq!(
+            persisted
+                .0
+                .control_view(WalOwnerPersistenceContext::for_test())
+                .3,
+            &heartbeated
+        );
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let reopened = load_bound_wal_owner_conn(&conn, &heartbeated).unwrap();
+        assert_eq!(
+            reopened
+                .control_view(WalOwnerPersistenceContext::for_test())
+                .3,
+            &heartbeated
+        );
+    }
+
     /// A publication row stranded at `'prepared'` is provably
     /// non-authoritative: the table CHECK forces `expected_wal_generation`,
     /// `capture_commitment`, `candidate_root_seq` and `observed_witness` all

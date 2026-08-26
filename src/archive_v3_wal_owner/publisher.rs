@@ -311,7 +311,7 @@ impl LiveWalOwnerLease {
             observed
                 .exact_wal_owner_reacquire_from(&predecessor, owner_id.as_bytes())
                 .or_else(|_| {
-                    observed.exact_wal_owner_renewal_from(&predecessor, owner_id.as_bytes())
+                    observed.exact_wal_owner_heartbeat_from(&predecessor, owner_id.as_bytes())
                 })
         }
         .map_err(|_| WalOwnerError::Conflict)?;
@@ -1719,7 +1719,7 @@ impl SingleArchiveWalPublisher {
                         )
                     })?;
                 if let Ok(lease) =
-                    current.exact_wal_owner_renewal_from(&previous, retained.owner_id.as_bytes())
+                    current.exact_wal_owner_heartbeat_from(&previous, retained.owner_id.as_bytes())
                 {
                     let live = control
                         .persist_owner_renewal(&previous, &current, lease)
