@@ -40,7 +40,10 @@ def git_output(*arguments: str) -> str:
     return completed.stdout.strip()
 
 
-def ensure_release_source(tag: str) -> None:
+def ensure_release_source(tag: str, signing_key: Path) -> None:
+    if not signing_key.is_file():
+        raise SystemExit("deploy-latest: tag signing key is not a regular file")
+    signing_key = signing_key.resolve()
     if git_output("status", "--porcelain"):
         raise SystemExit("deploy-latest: source checkout is not clean")
     head = git_output("rev-parse", "HEAD")
@@ -64,6 +67,10 @@ def ensure_release_source(tag: str) -> None:
             [
                 "git",
                 "--no-replace-objects",
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                f"user.signingkey={signing_key}",
                 "tag",
                 "-s",
                 tag,
@@ -154,6 +161,11 @@ def main() -> int:
     pipeline.add_argument("--output-dir", type=Path)
     pipeline.add_argument("--apply", action="store_true")
     pipeline.add_argument("--resume", action="store_true")
+    pipeline.add_argument(
+        "--tag-signing-key",
+        type=Path,
+        help="SSH public-key path used to create an absent signed release tag",
+    )
 
     release = subparsers.add_parser(
         "release", help="build, push, sign, and publish the current release"
@@ -165,6 +177,7 @@ def main() -> int:
     release.add_argument("--evidence-public-key", type=Path, required=True)
     release.add_argument("--evidence-public-key-sha256", required=True)
     release.add_argument("--release-signer-fingerprint", required=True)
+    release.add_argument("--tag-signing-key", type=Path, required=True)
     arguments = parser.parse_args()
 
     try:
@@ -176,7 +189,9 @@ def main() -> int:
         print(tag)
         return 0
     if arguments.command == "release" or arguments.stage in ("build", "push"):
-        ensure_release_source(tag)
+        if arguments.tag_signing_key is None:
+            parser.error("build and push require --tag-signing-key")
+        ensure_release_source(tag, arguments.tag_signing_key)
     if arguments.command == "pipeline":
         run(pipeline_command(arguments, tag))
         return 0
