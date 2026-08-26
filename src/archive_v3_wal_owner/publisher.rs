@@ -23,6 +23,7 @@ use std::{
 use async_trait::async_trait;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::{
     archive_v3::{ArchiveId, ObjectId, VerifiedArchiveCipher},
@@ -1533,7 +1534,8 @@ impl SingleArchiveWalPublisher {
                     Some(parity),
                     store_fence,
                 )
-                .await?
+                .await
+                .map_err(|error| report_publisher_launch_refusal("compose_maintenance", error))?
             }
             crate::archive_v3_shadow_runtime::WalServingHandoff::Genesis(handoff) => {
                 let crate::archive_v3_shadow_runtime::GenesisWalHandoffView {
@@ -1556,7 +1558,8 @@ impl SingleArchiveWalPublisher {
                     None,
                     None,
                 )
-                .await?
+                .await
+                .map_err(|error| report_publisher_launch_refusal("compose_genesis", error))?
             }
         };
         let store = super::WalStoreLane::spawn_authenticated(
@@ -1565,7 +1568,8 @@ impl SingleArchiveWalPublisher {
             Arc::clone(&publisher.capture),
             super::LaneLiveness::new(),
         )
-        .await?;
+        .await
+        .map_err(|error| report_publisher_launch_refusal("open_store_lane", error))?;
         let control: Arc<dyn WalOwnerControl> = publisher.control.clone();
         Ok(super::SingleArchiveWalOwner::spawn_lane_with_fence(
             store,
@@ -1610,7 +1614,10 @@ impl SingleArchiveWalPublisher {
         // genesis owner reservation. Both — or neither — is a composition
         // defect, refused before any durable or provider work.
         if genesis_reservation.is_some() == parity.is_some() {
-            return Err(WalOwnerError::Conflict);
+            return Err(report_publisher_launch_refusal(
+                "select_launch_authority",
+                WalOwnerError::Conflict,
+            ));
         }
         if let Some(parity) = parity.as_ref() {
             let terminal_control = MaintenanceImportPersistence::load_exact(
@@ -1618,22 +1625,42 @@ impl SingleArchiveWalPublisher {
                 parity.operation_id_for_wal_owner(WalOwnerStoreContext(())),
             )
             .await
-            .map_err(|_| WalOwnerError::Conflict)?;
+            .map_err(|_| {
+                report_publisher_launch_refusal(
+                    "load_maintenance_terminal",
+                    WalOwnerError::Conflict,
+                )
+            })?;
             parity
                 .reauthenticate_for_wal_owner(
                     WalOwnerStoreContext(()),
                     &terminal_control,
                     &terminal_witness,
                 )
-                .map_err(|_| WalOwnerError::Conflict)?;
+                .map_err(|_| {
+                    report_publisher_launch_refusal(
+                        "authenticate_maintenance_terminal",
+                        WalOwnerError::Conflict,
+                    )
+                })?;
         }
         let runtime = runtime
             .into_wal_publisher(super::WalPublisherRuntimeContext(()))
-            .map_err(|_| WalOwnerError::Publication)?;
+            .map_err(|_| {
+                report_publisher_launch_refusal(
+                    "open_publisher_runtime",
+                    WalOwnerError::Publication,
+                )
+            })?;
         let objects = runtime.objects_owned(&super::WalPublisherRuntimeContext(()));
         let witness = &runtime;
         let reserved = match genesis_reservation {
-            None => control.reserve_owner(&terminal_witness).await?,
+            None => control
+                .reserve_owner(&terminal_witness)
+                .await
+                .map_err(|error| {
+                    report_publisher_launch_refusal("reserve_maintenance_owner", error)
+                })?,
             Some(carried) => {
                 // Genesis lane: re-adopt the durable reservation off the
                 // genesis control ledger. The reservation path revalidates
@@ -1644,47 +1671,79 @@ impl SingleArchiveWalPublisher {
                 // durably own.
                 let adopted = control
                     .reserve_owner_from_genesis(&terminal_witness)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        report_publisher_launch_refusal("reserve_genesis_owner", error)
+                    })?;
                 if adopted.owner_id.as_bytes() != carried.owner_id.as_bytes()
                     || adopted.expected != carried.expected
                     || adopted.revision != carried.revision
                     || adopted.stage != carried.stage
                     || adopted.commitment != carried.commitment
                 {
-                    return Err(WalOwnerError::Conflict);
+                    return Err(report_publisher_launch_refusal(
+                        "authenticate_genesis_reservation",
+                        WalOwnerError::Conflict,
+                    ));
                 }
                 adopted
             }
         };
         let (observed, _live) = if reserved.stage == OwnerLeaseStage::Bound {
-            let durable_binding = control.load_owner_binding(&terminal_witness).await?;
-            let previous = WitnessRecord::decode(durable_binding.witness_bytes())
-                .map_err(|_| WalOwnerError::Corrupt)?;
-            let retained = control.load_bound_owner(&previous).await?;
-            if control.has_pending_owner_work(&durable_binding).await? {
+            let durable_binding = control
+                .load_owner_binding(&terminal_witness)
+                .await
+                .map_err(|error| report_publisher_launch_refusal("load_owner_binding", error))?;
+            let previous =
+                WitnessRecord::decode(durable_binding.witness_bytes()).map_err(|_| {
+                    report_publisher_launch_refusal("decode_owner_binding", WalOwnerError::Corrupt)
+                })?;
+            let retained = control
+                .load_bound_owner(&previous)
+                .await
+                .map_err(|error| report_publisher_launch_refusal("load_bound_owner", error))?;
+            if control
+                .has_pending_owner_work(&durable_binding)
+                .await
+                .map_err(|error| report_publisher_launch_refusal("read_pending_work", error))?
+            {
                 (previous, retained)
             } else {
                 let current = witness
                     .read_current_exact(terminal_witness.archive_id())
                     .await
-                    .map_err(|_| WalOwnerError::Publication)?;
+                    .map_err(|_| {
+                        report_publisher_launch_refusal(
+                            "read_current_witness",
+                            WalOwnerError::Publication,
+                        )
+                    })?;
                 if let Ok(lease) =
                     current.exact_wal_owner_renewal_from(&previous, retained.owner_id.as_bytes())
                 {
                     let live = control
                         .persist_owner_renewal(&previous, &current, lease)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            report_publisher_launch_refusal("persist_owner_renewal", error)
+                        })?;
                     (current, live)
                 } else if let Ok(lease) =
                     current.exact_wal_owner_reacquire_from(&previous, retained.owner_id.as_bytes())
                 {
                     let live = control
                         .rebind_owner_after_expiry(&previous, &current, lease)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            report_publisher_launch_refusal("persist_owner_reacquire", error)
+                        })?;
                     (current, live)
                 } else {
                     if current != previous {
-                        return Err(WalOwnerError::Conflict);
+                        return Err(report_publisher_launch_refusal(
+                            "authenticate_owner_predecessor",
+                            WalOwnerError::Conflict,
+                        ));
                     }
                     let reacquired = witness
                         .reacquire_owner_lease(&previous, retained.owner_id, OWNER_LEASE_TICKS)
@@ -1695,29 +1754,57 @@ impl SingleArchiveWalPublisher {
                             let observed = witness
                                 .read_current_exact(previous.archive_id())
                                 .await
-                                .map_err(|_| WalOwnerError::Publication)?;
+                                .map_err(|_| {
+                                    report_publisher_launch_refusal(
+                                        "adopt_reacquire_readback",
+                                        WalOwnerError::Publication,
+                                    )
+                                })?;
                             let lease = observed
                                 .exact_wal_owner_reacquire_from(
                                     &previous,
                                     retained.owner_id.as_bytes(),
                                 )
-                                .map_err(|_| WalOwnerError::Publication)?;
+                                .map_err(|_| {
+                                    report_publisher_launch_refusal(
+                                        "adopt_reacquire_successor",
+                                        WalOwnerError::Publication,
+                                    )
+                                })?;
                             (observed, lease)
                         }
-                        Err(error) => return Err(map_commit_error(error)),
+                        Err(error) => {
+                            return Err(report_publisher_launch_refusal(
+                                "provider_owner_reacquire",
+                                map_commit_error(error),
+                            ))
+                        }
                     };
                     let live = control
                         .rebind_owner_after_expiry(&previous, &observed, lease)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            report_publisher_launch_refusal("bind_reacquired_owner", error)
+                        })?;
                     (observed, live)
                 }
             }
         } else {
-            let reserved = control.mark_owner_send_started(&reserved).await?;
+            let reserved = control
+                .mark_owner_send_started(&reserved)
+                .await
+                .map_err(|error| {
+                    report_publisher_launch_refusal("mark_owner_send_started", error)
+                })?;
             let current = witness
                 .read_current_exact(terminal_witness.archive_id())
                 .await
-                .map_err(|_| WalOwnerError::Publication)?;
+                .map_err(|_| {
+                    report_publisher_launch_refusal(
+                        "read_owner_acquire_witness",
+                        WalOwnerError::Publication,
+                    )
+                })?;
             let (observed, lease) = if let Ok(lease) = current
                 .exact_wal_owner_acquire_from(&terminal_witness, reserved.owner_id().as_bytes())
             {
@@ -1727,7 +1814,10 @@ impl SingleArchiveWalPublisher {
                 (current, lease)
             } else {
                 if current != terminal_witness {
-                    return Err(WalOwnerError::Conflict);
+                    return Err(report_publisher_launch_refusal(
+                        "authenticate_owner_acquire_predecessor",
+                        WalOwnerError::Conflict,
+                    ));
                 }
                 match witness
                     .acquire_owner_lease(&terminal_witness, reserved.owner_id(), OWNER_LEASE_TICKS)
@@ -1747,21 +1837,38 @@ impl SingleArchiveWalPublisher {
                             .map_err(|_| WalOwnerError::Publication)?;
                         (observed, lease)
                     }
-                    Err(error) => return Err(map_commit_error(error)),
+                    Err(error) => {
+                        return Err(report_publisher_launch_refusal(
+                            "provider_owner_acquire",
+                            map_commit_error(error),
+                        ))
+                    }
                 }
             };
-            let live = control.bind_owner(&reserved, &observed, lease).await?;
+            let live = control
+                .bind_owner(&reserved, &observed, lease)
+                .await
+                .map_err(|error| report_publisher_launch_refusal("bind_new_owner", error))?;
             (observed, live)
         };
-        let binding = WalOwnerStoreBinding::from_authenticated_witness(&observed)?;
+        let binding =
+            WalOwnerStoreBinding::from_authenticated_witness(&observed).map_err(|error| {
+                report_publisher_launch_refusal("authenticate_owner_binding", error)
+            })?;
         let cipher = Arc::new(
             runtime
                 .resolve_wal_owner_cipher(&super::WalPublisherRuntimeContext(()), &observed)
                 .await
-                .map_err(|_| WalOwnerError::Conflict)?,
+                .map_err(|_| {
+                    report_publisher_launch_refusal(
+                        "resolve_archive_cipher",
+                        WalOwnerError::Conflict,
+                    )
+                })?,
         );
-        let recovery = RecoveryRoot::from_exact_wal_owner_record(&observed)
-            .map_err(|_| WalOwnerError::Conflict)?;
+        let recovery = RecoveryRoot::from_exact_wal_owner_record(&observed).map_err(|_| {
+            report_publisher_launch_refusal("authenticate_recovery_root", WalOwnerError::Conflict)
+        })?;
         let staged = crate::archive_v3_shadow_wal::recover_owned_wal_owner_staging(
             recovery,
             Arc::clone(&objects),
@@ -1770,10 +1877,13 @@ impl SingleArchiveWalPublisher {
             &binding,
         )
         .await
-        .map_err(|_| WalOwnerError::Publication)?;
+        .map_err(|_| {
+            report_publisher_launch_refusal("recover_witnessed_staging", WalOwnerError::Publication)
+        })?;
         #[cfg(not(test))]
-        let capture = crate::store::StoreShadowCapture::shared_for_wal_owner()
-            .map_err(|_| WalOwnerError::Capture)?;
+        let capture = crate::store::StoreShadowCapture::shared_for_wal_owner().map_err(|_| {
+            report_publisher_launch_refusal("install_wal_capture", WalOwnerError::Capture)
+        })?;
         #[cfg(test)]
         let capture = crate::store::StoreShadowCapture::shared_for_test();
         let publisher = Self {
@@ -1794,6 +1904,27 @@ impl SingleArchiveWalPublisher {
             .map(Arc::new)
             .map_err(|_| WalOwnerError::Conflict)
     }
+}
+
+/// Emit only static launch structure. The stage and class are closed enums;
+/// no identity, archive coordinate, provider response, or error text crosses
+/// this boundary.
+fn report_publisher_launch_refusal(stage: &'static str, error: WalOwnerError) -> WalOwnerError {
+    let class = match error {
+        WalOwnerError::Malformed => "malformed",
+        WalOwnerError::Conflict => "conflict",
+        WalOwnerError::Corrupt => "corrupt",
+        WalOwnerError::Capture => "capture",
+        WalOwnerError::Persistence => "persistence",
+        WalOwnerError::Publication => "publication",
+        WalOwnerError::Poisoned => "poisoned",
+        WalOwnerError::Superseded => "superseded",
+    };
+    warn!(
+        metric = "archive_v3_wal_publisher_launch_refusal",
+        stage, class, "WAL publisher launch refused"
+    );
+    error
 }
 
 fn map_commit_error(error: PublisherCommitError) -> WalOwnerError {
