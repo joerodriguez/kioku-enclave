@@ -1393,6 +1393,10 @@ pub struct RecoveredWitnessWal {
 }
 
 impl RecoveredWitnessWal {
+    pub(super) const fn wal_generation(&self) -> u64 {
+        self.wal_generation
+    }
+
     pub(super) const fn logical_file_length(&self) -> u64 {
         self.logical_file_length
     }

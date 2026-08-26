@@ -347,6 +347,7 @@ pub(crate) struct AuthenticatedWalOwnerStaging {
     final_plaintext_hash: [u8; 32],
     checkpoint_len: u64,
     schema_version: u32,
+    recovered_wal_generation: u64,
 }
 
 impl AuthenticatedWalOwnerStaging {
@@ -355,6 +356,16 @@ impl AuthenticatedWalOwnerStaging {
         path: PathBuf,
         binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
         schema_version: u32,
+    ) -> Result<Self, ShadowParityError> {
+        Self::for_test_after_generation(path, binding, schema_version, 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_after_generation(
+        path: PathBuf,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+        schema_version: u32,
+        recovered_wal_generation: u64,
     ) -> Result<Self, ShadowParityError> {
         let owned = OwnedPrivateStagedSqliteCopy::for_wal_owner_test(path)?;
         let bytes =
@@ -370,6 +381,7 @@ impl AuthenticatedWalOwnerStaging {
             checkpoint_len: u64::try_from(bytes.len())
                 .map_err(|_| ShadowParityError::InvalidStagedCopy)?,
             schema_version,
+            recovered_wal_generation,
             owned,
         })
     }
@@ -407,7 +419,17 @@ impl AuthenticatedWalOwnerStaging {
             final_plaintext_hash,
             checkpoint_len: recovered.logical_file_length(),
             schema_version: recovered.user_schema_version(),
+            recovered_wal_generation: recovered.wal_generation(),
         })
+    }
+
+    pub(crate) fn recovered_wal_generation_for_store(
+        &self,
+        token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+    ) -> Result<u64, ShadowParityError> {
+        self.path_for_store(token, binding)?;
+        Ok(self.recovered_wal_generation)
     }
 
     pub(crate) fn path_for_store(

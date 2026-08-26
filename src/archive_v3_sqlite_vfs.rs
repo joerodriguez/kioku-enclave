@@ -111,6 +111,17 @@ impl RegisteredCaptureState {
         }
     }
 
+    fn new_after_generation(previous_generation: u64) -> Option<Self> {
+        Some(Self {
+            capture: WalCaptureState::new_after_generation(previous_generation)?,
+            advisory_detached: None,
+            retired: false,
+            next_drain_token: 0,
+            active_drain: None,
+            settled_drains: Vec::new(),
+        })
+    }
+
     fn retire_and_scrub(&mut self) {
         // Replacement drops the prior WalCaptureState while this mutex is
         // held. Its Drop implementation zeroizes raw image/header bytes and
@@ -279,6 +290,15 @@ impl CaptureRegistry {
         self.register_exact(stream_id, path)
     }
 
+    pub(crate) fn register_after_generation(
+        &self,
+        path: &CStr,
+        previous_generation: u64,
+    ) -> Result<CaptureRegistration, CaptureRegistryError> {
+        let stream_id = self.fresh_stream_id()?;
+        self.register_exact_after_generation(stream_id, path, previous_generation)
+    }
+
     fn fresh_stream_id(&self) -> Result<CaptureStreamId, CaptureRegistryError> {
         for _ in 0..MAX_CAPTURE_STREAM_ID_CANDIDATES {
             let mut bytes = [0u8; 16];
@@ -300,6 +320,26 @@ impl CaptureRegistry {
         &self,
         stream_id: CaptureStreamId,
         path: &CStr,
+    ) -> Result<CaptureRegistration, CaptureRegistryError> {
+        self.register_exact_with_state(stream_id, path, RegisteredCaptureState::new())
+    }
+
+    fn register_exact_after_generation(
+        &self,
+        stream_id: CaptureStreamId,
+        path: &CStr,
+        previous_generation: u64,
+    ) -> Result<CaptureRegistration, CaptureRegistryError> {
+        let state = RegisteredCaptureState::new_after_generation(previous_generation)
+            .ok_or(CaptureRegistryError::StateUnavailable)?;
+        self.register_exact_with_state(stream_id, path, state)
+    }
+
+    fn register_exact_with_state(
+        &self,
+        stream_id: CaptureStreamId,
+        path: &CStr,
+        state: RegisteredCaptureState,
     ) -> Result<CaptureRegistration, CaptureRegistryError> {
         if stream_id.0 == [0; 16] {
             return Err(CaptureRegistryError::StreamIdUnavailable);
@@ -325,7 +365,7 @@ impl CaptureRegistry {
             return Err(CaptureRegistryError::TooManyRegistrations);
         };
         inner.next_token = token;
-        let state = Arc::new(Mutex::new(RegisteredCaptureState::new()));
+        let state = Arc::new(Mutex::new(state));
         inner.slots.insert(
             path.clone(),
             RegistrySlot {
@@ -1859,6 +1899,69 @@ mod tests {
             21
         );
         drop(connection);
+    }
+
+    #[test]
+    fn sqlite_process_restart_after_recovered_checkpoint_advances_wal_generation() {
+        let (directory, c_path, registration, capture) = setup();
+        let connection = open(&c_path, capture.vfs_name_for_test());
+        wal_setup(&connection);
+        let _ = settle(&registration, 44, 1);
+        connection
+            .execute("INSERT INTO events VALUES (10)", [])
+            .unwrap();
+        let before_restart = settle(&registration, 44, 2);
+        let recovered_generation = before_restart
+            .commits()
+            .last()
+            .expect("the archived predecessor has a captured WAL commit")
+            .wal_generation();
+
+        // Recovery checkpoints the authenticated archived WAL into the main
+        // database and removes both sidecars before a fresh process opens it.
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        drop(registration);
+
+        let path = directory.path().join("capture.db");
+        let restarted = capture
+            .register_path_after_generation_for_test(&path, recovered_generation)
+            .unwrap();
+        let restarted_connection = open(&c_path, capture.vfs_name_for_test());
+        restarted_connection
+            .execute("INSERT INTO events VALUES (11)", [])
+            .unwrap();
+        let after_restart = settle(&restarted, 45, 1);
+        assert!(!after_restart.commits().is_empty());
+        assert!(after_restart.commits().iter().all(|commit| {
+            commit.wal_generation()
+                == recovered_generation
+                    .checked_add(1)
+                    .expect("test WAL generation remains in range")
+        }));
+        assert_eq!(
+            restarted_connection
+                .query_row("SELECT sum(value) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            21
+        );
+    }
+
+    #[test]
+    fn recovered_generation_overflow_refuses_registration_without_retaining_state() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("generation-overflow.db");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let registry = CaptureRegistry::new();
+
+        assert!(matches!(
+            registry.register_after_generation(&c_path, u64::MAX),
+            Err(CaptureRegistryError::StateUnavailable)
+        ));
+        assert!(registry.is_empty_for_test());
     }
 
     #[test]

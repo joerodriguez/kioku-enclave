@@ -296,8 +296,18 @@ impl Default for WalCaptureState {
 
 impl WalCaptureState {
     pub fn new() -> Self {
+        Self::new_at_generation(1)
+    }
+
+    pub(crate) fn new_after_generation(previous_generation: u64) -> Option<Self> {
+        previous_generation
+            .checked_add(1)
+            .map(Self::new_at_generation)
+    }
+
+    fn new_at_generation(wal_generation: u64) -> Self {
         Self {
-            wal_generation: 1,
+            wal_generation,
             image: Vec::new(),
             covered: Vec::new(),
             accepted_header_prefix: None,
