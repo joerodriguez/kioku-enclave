@@ -15,6 +15,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use rand::{rngs::OsRng, RngCore};
@@ -22,6 +23,7 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::info;
 use zeroize::Zeroizing;
 
@@ -96,6 +98,17 @@ use crate::{
 };
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
+// GCS replaces one immutable generation of this singleton object for every
+// durable Control transition.  Sustained sub-second replacements are provider
+// throttled even though short bursts can succeed, so WAL publication's
+// reserve/materialize ladder must share one process-wide dispatch interval
+// with every other Control writer.
+#[cfg(not(test))]
+const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::from_millis(1_100);
+// Keep the broad unit suite fast.  The focused pacing regression below installs
+// a non-zero interval and a fake provider that rejects an unpaced second PUT.
+#[cfg(test)]
+const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::ZERO;
 const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "usage_daily",
     "billing_accounts",
@@ -1921,6 +1934,8 @@ pub struct ControlStore {
     inner: Arc<Mutex<Option<Handle>>>,
     kms: Arc<dyn KmsClient>,
     gcs: Arc<dyn GcsClient>,
+    next_control_put: Arc<Mutex<Instant>>,
+    control_put_interval: Duration,
     /// Production authority for serializing legacy identity rebinding with
     /// account deletion. Tests which do not exercise rebinding may omit it;
     /// the rebind path itself always fails closed when it is absent.
@@ -19381,6 +19396,8 @@ impl ControlStore {
             inner: Arc::new(Mutex::new(None)),
             kms,
             gcs,
+            next_control_put: Arc::new(Mutex::new(Instant::now())),
+            control_put_interval: CONTROL_OBJECT_PUT_INTERVAL,
             lifecycle_store: None,
         }
     }
@@ -19789,6 +19806,8 @@ impl ControlStore {
             inner: Arc::new(Mutex::new(None)),
             kms,
             gcs,
+            next_control_put: Arc::new(Mutex::new(Instant::now())),
+            control_put_interval: CONTROL_OBJECT_PUT_INTERVAL,
             lifecycle_store: Some(lifecycle_store),
         }
     }
@@ -20318,6 +20337,14 @@ impl ControlStore {
         let db_bytes = tokio::fs::read(&handle.temp_path).await?;
         let dek = load_dek(self.kms.as_ref(), &handle.meta.wrapped_dek_b64).await?;
         let ciphertext = encrypt_bound_blob(&dek, &db_bytes, CONTROL_CONTEXT)?;
+        if !self.control_put_interval.is_zero() {
+            let mut next = self.next_control_put.lock().await;
+            let now = Instant::now();
+            if *next > now {
+                tokio::time::sleep_until(*next).await;
+            }
+            *next = Instant::now() + self.control_put_interval;
+        }
         let put_result = self
             .gcs
             .put_object(
@@ -26363,6 +26390,7 @@ mod tests {
         pause_after_get_target: std::sync::Mutex<Option<String>>,
         get_completed: Notify,
         resume_get: Notify,
+        minimum_control_put_interval: std::sync::Mutex<Option<(Duration, Option<Instant>)>>,
     }
 
     impl PausingGcs {
@@ -26381,6 +26409,7 @@ mod tests {
                 pause_after_get_target: std::sync::Mutex::new(None),
                 get_completed: Notify::new(),
                 resume_get: Notify::new(),
+                minimum_control_put_interval: std::sync::Mutex::new(None),
             }
         }
 
@@ -26398,6 +26427,10 @@ mod tests {
 
         fn pause_after_next_get(&self, object_name: &str) {
             *self.pause_after_get_target.lock().unwrap() = Some(object_name.to_string());
+        }
+
+        fn reject_rapid_control_puts(&self, minimum_interval: Duration) {
+            *self.minimum_control_put_interval.lock().unwrap() = Some((minimum_interval, None));
         }
     }
 
@@ -26448,6 +26481,18 @@ mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> Result<i64> {
+            if object_name == CONTROL_OBJECT {
+                let now = Instant::now();
+                let mut limiter = self.minimum_control_put_interval.lock().unwrap();
+                if let Some((minimum, previous)) = limiter.as_mut() {
+                    if previous.is_some_and(|previous| now.duration_since(previous) < *minimum) {
+                        return Err(EnclaveError::Gcs(
+                            "simulated same-object replacement throttle".into(),
+                        ));
+                    }
+                    *previous = Some(now);
+                }
+            }
             let should_pause_before = {
                 let mut target = self.pause_before_put_target.lock().unwrap();
                 if target.as_deref() == Some(object_name) {
@@ -30644,6 +30689,37 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first_generation, second_generation);
+    }
+
+    #[tokio::test]
+    async fn control_object_replacements_are_paced_before_the_provider_throttles() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        gcs.reject_rapid_control_puts(Duration::from_millis(20));
+        let mut control = ControlStore::new(Arc::new(FakeKms), gcs);
+        control.control_put_interval = Duration::from_millis(25);
+
+        control
+            .write_owned_if_changed(|connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO config (key,value) VALUES ('paced-test','one')",
+                    [],
+                )?;
+                Ok(((), true))
+            })
+            .await
+            .unwrap();
+        control
+            .write_owned_if_changed(|connection| {
+                connection.execute("UPDATE config SET value='two' WHERE key='paced-test'", [])?;
+                Ok(((), true))
+            })
+            .await
+            .unwrap();
+
+        assert!(inner.exact_generation_count(CONTROL_OBJECT) >= 3);
     }
 
     #[tokio::test]
