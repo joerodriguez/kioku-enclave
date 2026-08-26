@@ -1,13 +1,12 @@
 # ADR-0022 — fresh-generation proof for the sealed schema re-baseline
 
-**Status: THE FRESH-GENERATION PROOF HAS NOT BEEN RECORDED. This document is the
-obligation, not the discharge.**
+**Status: FRESH-GENERATION TAKE RECORDED 2026-08-25. FINAL activation remains
+under the public deny until its post-deploy checks pass.**
 
 `scripts/schema_baseline_seal.json` names this file as the proof for the
-`d5ff84db…2dfb` re-pin. The seal ships `"sealed": false` precisely because the
-proof below has not been taken. Nothing in this file may be read as evidence
-that the fresh provider generation exists or that its signed BOOTSTRAP and FINAL
-releases have run.
+`d5ff84db…2dfb` re-pin. The recorded take below establishes the fresh provider
+generation and signed BOOTSTRAP state required to flip the seal. It does not
+claim that FINAL has already been deployed or that public ingress has reopened.
 
 ## Primary launch proof — fresh production generation
 
@@ -45,8 +44,30 @@ The fresh proof must bind all of the following before the seal flips:
    and exact live image/provider identity. Failure at any point leaves the fresh generation
    denied and never falls back to the legacy namespace.
 
-The checked-in receipts, signed release coordinates, and live proof values will be appended to
-this section by the reviewed FINAL source change. Until then `sealed` remains false.
+### Recorded fresh-generation take — 2026-08-25
+
+- BOOTSTRAP source: `7542854e47c179f5b0f06a94b7bc952065015a6f`, signed tag
+  `v0.8.35-adr0022-fresh-bootstrap.1`.
+- BOOTSTRAP image: `us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave@sha256:9e89e8ef98bcdeacec264e6aeb082e127a027808a28efdfece4b7c157b6dbc64`.
+- Runtime identity: `kioku-enclave-adr0022-v1@kioku-joerodriguez.iam.gserviceaccount.com`.
+- Fresh buckets: `kioku-joerodriguez-adr0022-v1-indexes`,
+  `kioku-joerodriguez-adr0022-v1-media`,
+  `kioku-joerodriguez-adr0022-v1-archive`, and
+  `kioku-joerodriguez-adr0022-v1-witness-backups`; fresh witness database:
+  `adr0022-v1-witness`.
+- At the take, the Archive V3 runtime was source-baked `off`, schema coordinates
+  were `0/0/0`, the fresh Archive V3 bucket had no objects, the startup owner
+  aggregate reported no WAL serving or terminal failures, and the priority-800
+  public deny remained enabled.
+- The authenticated production owner read returned the one-way binding
+  commitment
+  `f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e`.
+- The FINAL source change binds that commitment, activates only the fresh
+  namespace, seals the unchanged epoch-0 baseline, and appends only
+  `0001_capture_events_stream_sequence` at schema coordinates `1/1/1`.
+
+The legacy physical-zero ceremony below is retained only as historical fallback
+documentation. It is not an input to the fresh-generation launch.
 
 ## Superseded fallback — physical zero of the legacy namespace
 
@@ -342,10 +363,12 @@ failed receipt.
 - The transcripts and selected voice-embedding lanes are merged and verified;
   running them is among the first work a new archive performs.
 
-## Take #1
+## Legacy fallback Take #1
 
-*Not taken.*
+Superseded by the recorded fresh-generation take above; it is not launch
+authority for this generation.
 
-## Take #2
+## Legacy fallback Take #2
 
-*Not taken.*
+Superseded by the recorded fresh-generation take above; it is not launch
+authority for this generation.

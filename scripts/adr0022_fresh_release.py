@@ -29,11 +29,12 @@ GENERATION_INTENT_SHA256 = (
 SCHEMA10_BOOTSTRAP_FIXTURE_SHA256 = (
     "40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9"
 )
-# This remains deliberately empty in the BOOTSTRAP source.  The separately
-# reviewed FINAL source commit must replace it with the exact SHA-256 of its
-# completed baseline-seal bytes.  Merely flipping ``sealed`` or activating the
-# runtime can therefore never make this precursor eligible for publication.
-FINAL_SCHEMA_BASELINE_SEAL_SHA256 = ""
+# BOOTSTRAP carried this as an empty string. FINAL pins the exact SHA-256 of
+# its completed baseline-seal bytes, so merely flipping ``sealed`` or
+# activating the runtime cannot make another tree eligible for publication.
+FINAL_SCHEMA_BASELINE_SEAL_SHA256 = (
+    "013f5f9698a20012a0e0833f3241e52395a6a26411627e5c07fe8f2833a386ed"
+)
 NAMESPACE_ID = "adr0022-v1"
 PROJECT_ID = "kioku-joerodriguez"
 PROJECT_NUMBER = "640329636251"

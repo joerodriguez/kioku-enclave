@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "mode": "off",
-  "archive_bucket": "",
-  "archive_gcs_project_number": "",
-  "registry_kms_version": "",
-  "witness_project_id": "",
-  "witness_project_number": "",
-  "witness_database_id": "",
-  "archive_binding_commitment": ""
+  "mode": "single-archive-wal-v1",
+  "archive_bucket": "kioku-joerodriguez-adr0022-v1-archive",
+  "archive_gcs_project_number": "640329636251",
+  "registry_kms_version": "1",
+  "witness_project_id": "kioku-joerodriguez",
+  "witness_project_number": "640329636251",
+  "witness_database_id": "adr0022-v1-witness",
+  "archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e"
 }

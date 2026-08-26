@@ -97,7 +97,14 @@ def bootstrap_manifest() -> dict[str, object]:
             "gcs_legacy_media_bucket": fresh.EXPECTED_INTENT["legacy_media_bucket"],
         }
     )
-    data.update(fresh.bootstrap_release_binding(CANARY_SHA, CANARY_UUID))
+    data.update(
+        fresh._release_binding(
+            CANARY_SHA,
+            CANARY_UUID,
+            genesis="off",
+            epoch=0,
+        )
+    )
     return data
 
 
@@ -106,6 +113,20 @@ def final_manifest_shape() -> dict[str, object]:
     data["source_ref"] = fresh.FINAL_TAG
     data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.FINAL_TAG}"
     data["release_url"] = fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.FINAL_TAG
+    data.update(
+        {
+            "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+            "archive_v3_archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
+            "archive_v3_archive_gcs_project_number": fresh.PROJECT_NUMBER,
+            "archive_v3_registry_kms_version": "1",
+            "archive_v3_witness_project_id": fresh.PROJECT_ID,
+            "archive_v3_witness_project_number": fresh.PROJECT_NUMBER,
+            "archive_v3_witness_database_id": fresh.EXPECTED_INTENT[
+                "witness_database_id"
+            ],
+            "archive_v3_archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+        }
+    )
     data.update(
         fresh._release_binding(
             CANARY_SHA,
@@ -198,7 +219,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), manifest())
 
-    def test_exact_schema_ten_fresh_bootstrap_is_eligible(self) -> None:
+    def test_exact_schema_ten_bootstrap_is_retired_by_final_source(self) -> None:
         data = bootstrap_manifest()
         self.assertEqual(len(data), 50)
         self.assertEqual(tuple(data), metadata_verifier.SCHEMA_TEN_FIELDS)
@@ -214,10 +235,10 @@ class ReleaseMetadataTests(unittest.TestCase):
             expected_canary_sha=CANARY_SHA,
             expected_canary_uuid=CANARY_UUID,
         )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(json.loads(completed.stdout), data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("fresh BOOTSTRAP schema phase is not exact 0/0/0", completed.stderr)
 
-    def test_schema_ten_final_is_reserved_but_current_bootstrap_tree_refuses_it(self) -> None:
+    def test_schema_ten_final_is_eligible_with_the_checked_live_commitment(self) -> None:
         data = final_manifest_shape()
         completed = self.verify(
             data,
@@ -241,11 +262,11 @@ class ReleaseMetadataTests(unittest.TestCase):
                 "witness_database_id": fresh.EXPECTED_INTENT[
                     "witness_database_id"
                 ],
-                "archive_binding_commitment": "d" * 64,
+                "archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
             },
         )
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("fresh FINAL schema phase is not exact 1/1/1", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), data)
 
     def test_schema_ten_refuses_every_generation_role_wif_kms_and_phase_drift(self) -> None:
         exact = bootstrap_manifest()

@@ -78,6 +78,17 @@ APNS_CONFIGURATION = {
 
 CANARY_IDENTITY_PREPARATION_SHA256 = "a" * 64
 CANARY_ADMIN_UUID = "12345678-1234-5678-9234-123456789abc"
+OFF_RUNTIME = {
+    "schema_version": 2,
+    "mode": "off",
+    "archive_bucket": "",
+    "archive_gcs_project_number": "",
+    "registry_kms_version": "",
+    "witness_project_id": "",
+    "witness_project_number": "",
+    "witness_database_id": "",
+    "archive_binding_commitment": "",
+}
 
 
 def environment() -> dict[str, str]:
@@ -139,16 +150,15 @@ class SelectorTests(unittest.TestCase):
                 probe_config_path = ROOT / "config" / "archive-witness-probe.json"
             else:
                 probe_config_path.write_text(json.dumps(probe_config), encoding="utf-8")
-            shadow_runtime_config_path = (
-                ROOT / "config" / "archive-v3-shadow-runtime.json"
+            shadow_runtime_config_path = Path(directory) / "archive-v3-shadow-runtime.json"
+            shadow_runtime_config_path.write_text(
+                json.dumps(
+                    OFF_RUNTIME
+                    if shadow_runtime_config is None
+                    else shadow_runtime_config
+                ),
+                encoding="utf-8",
             )
-            if shadow_runtime_config is not None:
-                shadow_runtime_config_path = (
-                    Path(directory) / "archive-v3-shadow-runtime.json"
-                )
-                shadow_runtime_config_path.write_text(
-                    json.dumps(shadow_runtime_config), encoding="utf-8"
-                )
             completed = subprocess.run(
                 [
                     "python3",
@@ -704,23 +714,13 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("GENESIS_WAL_NATIVE=on\n", content)
         self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", content)
 
-    def test_fresh_bootstrap_selects_only_the_exact_full_tuple(self) -> None:
+    def test_final_source_cannot_rebuild_the_retired_bootstrap_role(self) -> None:
         completed, content = self.run_selector(
             "production", fresh_bootstrap_environment(), source_ref=BOOTSTRAP_TAG
         )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        for line in (
-            "ENCLAVE_KMS_KEY_RING=kioku-adr0022-v1\n",
-            "ENCLAVE_KMS_KEY=kioku-kek-adr0022-v1\n",
-            "ENCLAVE_GCS_BUCKET=kioku-joerodriguez-adr0022-v1-indexes\n",
-            "ENCLAVE_GCS_MEDIA_BUCKET=kioku-joerodriguez-adr0022-v1-media\n",
-            "ENCLAVE_RUN_SA_EMAIL=kioku-enclave-adr0022-v1@kioku-joerodriguez.iam.gserviceaccount.com\n",
-            f"ADMIN_USER_IDS={CANARY_ADMIN_UUID}\n",
-            f"ADR0022_CANARY_IDENTITY_PREPARATION_SHA256={CANARY_IDENTITY_PREPARATION_SHA256}\n",
-            "GENESIS_WAL_NATIVE=off\n",
-            "ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n",
-        ):
-            self.assertIn(line, content)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("fresh BOOTSTRAP schema phase is not exact 0/0/0", completed.stderr)
 
     def test_fresh_bootstrap_refuses_wrong_tag_profile_and_image_tuple(self) -> None:
         exact = fresh_bootstrap_environment()
@@ -789,7 +789,7 @@ class SelectorTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
 
-    def test_fresh_final_aliases_and_current_bootstrap_source_are_ineligible(self) -> None:
+    def test_fresh_final_accepts_only_the_exact_tag_and_checked_commitment(self) -> None:
         exact = fresh_bootstrap_environment()
         exact["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
         active_runtime = {
@@ -801,7 +801,7 @@ class SelectorTests(unittest.TestCase):
             "witness_project_id": "kioku-joerodriguez",
             "witness_project_number": "640329636251",
             "witness_database_id": "adr0022-v1-witness",
-            "archive_binding_commitment": "d" * 64,
+            "archive_binding_commitment": "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
         }
         for tag in (
             "v0.8.35-archive-v3-wal.2",
@@ -825,9 +825,13 @@ class SelectorTests(unittest.TestCase):
             source_ref=FINAL_TAG,
             shadow_runtime_config=active_runtime,
         )
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(content, "")
-        self.assertIn("fresh FINAL schema phase is not exact 1/1/1", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("GENESIS_WAL_NATIVE=on\n", content)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", content)
+        self.assertIn(
+            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT=f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e\n",
+            content,
+        )
 
 
 if __name__ == "__main__":

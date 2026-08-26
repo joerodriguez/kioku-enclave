@@ -302,7 +302,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3",
+                    "refs/tags/v1.2.3-archive-v3-wal.1",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",
@@ -493,12 +493,14 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
         self.assertLess(source.index("verify_source_unchanged(arguments.source_ref, commit)"), source.index('if arguments.stage == "push":'))
 
-    def test_fresh_bootstrap_emits_exact_ordered_schema_ten_metadata(self) -> None:
+    def test_fresh_final_emits_exact_ordered_schema_ten_metadata(self) -> None:
         pipeline = load_pipeline()
+        final_environment = fresh_bootstrap_environment()
+        final_environment["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
         configuration = pipeline.selected_configuration(
             "production",
-            fresh_bootstrap_environment(),
-            source_ref=fresh.BOOTSTRAP_TAG,
+            final_environment,
+            source_ref=fresh.FINAL_TAG,
             probe_config_path=ROOT / "config/archive-witness-probe.json",
             shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
         )
@@ -564,9 +566,9 @@ class LocalImagePipelineTests(unittest.TestCase):
                     configuration=configuration,
                     config_sha256="d" * 64,
                     source_archive_sha256="e" * 64,
-                    source_ref=fresh.BOOTSTRAP_TAG,
+                    source_ref=fresh.FINAL_TAG,
                     source_commit="f" * 40,
-                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.BOOTSTRAP_TAG}",
+                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.FINAL_TAG}",
                     image_digest="sha256:" + "1" * 64,
                     created_at="2026-08-24T12:00:00Z",
                     expected_sbom_sha256="2" * 64,
@@ -580,16 +582,20 @@ class LocalImagePipelineTests(unittest.TestCase):
 
         self.assertEqual(
             raw,
-            (ROOT / "config/adr0022-fresh-schema10-bootstrap-fixture.json").read_bytes(),
+            (json.dumps(metadata, separators=(",", ":")) + "\n").encode(),
         )
         self.assertEqual(len(metadata), 50)
         self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
         self.assertEqual(metadata["schema_version"], 10)
-        self.assertEqual(metadata["source_ref"], fresh.BOOTSTRAP_TAG)
-        self.assertEqual(metadata["schema_epoch_head"], 0)
-        self.assertEqual(metadata["schema_epoch_target"], 0)
-        self.assertEqual(metadata["schema_epoch_minimum_servable"], 0)
-        self.assertEqual(metadata["production_genesis_wal_native"], "off")
+        self.assertEqual(metadata["source_ref"], fresh.FINAL_TAG)
+        self.assertEqual(metadata["schema_epoch_head"], 1)
+        self.assertEqual(metadata["schema_epoch_target"], 1)
+        self.assertEqual(metadata["schema_epoch_minimum_servable"], 1)
+        self.assertEqual(metadata["production_genesis_wal_native"], "on")
+        self.assertEqual(
+            metadata["archive_v3_archive_binding_commitment"],
+            "f3a5a22df443fe3ed35177df55a8ebddb220de6bb46bc533d22f50becaf7477e",
+        )
         self.assertEqual(metadata["signup_mode"], "positive")
         self.assertEqual(
             metadata["adr0022_canary_identity_preparation_sha256"],

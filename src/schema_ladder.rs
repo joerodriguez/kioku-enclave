@@ -278,13 +278,18 @@ pub(crate) struct SchemaStep {
 /// product code, which makes it the cheapest possible first rung of the
 /// runbook above.
 // ADR0022_SCHEMA_PHASE_DECLARATION_BEGIN
-pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[];
+pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[SchemaStep {
+    epoch: 1,
+    id: "0001_capture_events_stream_sequence",
+    class: StepClass::Index,
+    sql: "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence);",
+}];
 
-pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 0;
+pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 1;
 
-pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 0;
+pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 1;
 
-pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 0;
+pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 1;
 // ADR0022_SCHEMA_PHASE_DECLARATION_END
 
 // Enforced at compile time rather than in a test: a binary must never be asked

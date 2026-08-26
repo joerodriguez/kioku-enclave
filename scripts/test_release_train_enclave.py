@@ -486,7 +486,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                     directory,
                     directory / "local.env",
                     bundle_fixtures.COMMIT,
-                    fresh.BOOTSTRAP_TAG,
+                    fresh.FINAL_TAG,
                     bundle_fixtures.DIGEST,
                     image_repository=fresh.IMAGE_REPOSITORY,
                 )
