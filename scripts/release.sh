@@ -25,6 +25,7 @@ COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 PUSH_DEPLOYMENT_SOURCE_SEAL=""
 ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
 ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.14"
+ADR0022_FRESH_SUCCESSOR_TAG="v0.8.36-archive-v3-wal.15"
 RELEASE_CONFIG_SNAPSHOT=""
 SOURCE_ARCHIVE=""
 NOTES=""
@@ -116,6 +117,9 @@ fi
 if [[ "$TAG" =~ ^v0\.8\.35-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_FINAL_TAG" ]]; then
   die "ADR-0022 fresh FINAL tag must be exactly $ADR0022_FRESH_FINAL_TAG"
 fi
+if [[ "$TAG" =~ ^v0\.8\.36-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_SUCCESSOR_TAG" ]]; then
+  die "ADR-0022 fresh successor tag must be exactly $ADR0022_FRESH_SUCCESSOR_TAG"
+fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
 [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || die "--config must name the local build configuration used for this image"
@@ -196,8 +200,8 @@ PY
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
 IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" ) ]]; then
-  die "ADR-0022 fresh releases roll only through the sealed deployment adr0022-fresh-launch owner"
+if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" || "$TAG" == "$ADR0022_FRESH_SUCCESSOR_TAG" ) ]]; then
+  die "ADR-0022 fresh releases roll only through the sealed deployment direct-provider operation"
 elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/
   # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed

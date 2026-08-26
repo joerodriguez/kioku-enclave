@@ -81,7 +81,7 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        tag = fresh.FINAL_TAG if fresh_bootstrap else TAG
+        tag = fresh.SUCCESSOR_TAG if fresh_bootstrap else TAG
         source_repository = (
             fresh.SOURCE_REPOSITORY
             if fresh_bootstrap
@@ -271,7 +271,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--public-key", str(public),
                 "--expected-public-key-sha256", fingerprint,
                 "--repository", "joerodriguez/kioku-enclave",
-                "--tag", fresh.FINAL_TAG,
+                "--tag", fresh.SUCCESSOR_TAG,
                 "--commit", COMMIT,
                 "--image-repository", fresh.IMAGE_REPOSITORY,
                 "--config", str(directory / "local.env"),

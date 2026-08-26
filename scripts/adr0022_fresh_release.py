@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact source/configuration contracts for the two ADR-0022 fresh releases.
+"""Exact source/configuration contracts for ADR-0022 fresh releases.
 
 This module is deliberately provider-free.  It binds signed release metadata to
 the reviewed checked-in namespace intent and to two opaque values supplied by
@@ -22,6 +22,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_TAG = "v0.8.35-adr0022-fresh-bootstrap.1"
 FINAL_TAG = "v0.8.35-archive-v3-wal.14"
+SUCCESSOR_TAG = "v0.8.36-archive-v3-wal.15"
+FINAL_TAG_VERSIONS = {
+    FINAL_TAG: "0.8.35",
+    SUCCESSOR_TAG: "0.8.36",
+}
 SOURCE_REPOSITORY = "https://github.com/joerodriguez/kioku-enclave"
 GENERATION_INTENT_SHA256 = (
     "7ece5ba914f76d2f56af178d5891230d3e1ba7df33a6b54dd3d2a7870cce3727"
@@ -221,10 +226,15 @@ def claims_bootstrap_role(source_ref: str) -> bool:
 
 
 def claims_final_role(source_ref: str) -> bool:
-    """Return true for every 0.8.35 WAL ref attempting the fixed FINAL role."""
+    """Return true for every ref attempting one of the fixed active roles."""
 
-    return normalize_tag(source_ref).lower().startswith(
-        "v0.8.35-archive-v3-wal"
+    normalized = normalize_tag(source_ref).lower()
+    return any(
+        normalized.startswith(prefix)
+        for prefix in (
+            "v0.8.35-archive-v3-wal",
+            "v0.8.36-archive-v3-wal",
+        )
     )
 
 
@@ -244,14 +254,19 @@ def require_exact_bootstrap_tag(source_ref: str) -> None:
 
 
 def is_final_tag(source_ref: str) -> bool:
-    return normalize_tag(source_ref) == FINAL_TAG
+    return normalize_tag(source_ref) in FINAL_TAG_VERSIONS
 
 
 def require_exact_final_tag(source_ref: str) -> None:
     if not is_final_tag(source_ref):
         raise FreshReleaseError(
-            f"fresh FINAL source_ref must be exactly {FINAL_TAG}"
+            "fresh active source_ref must be exactly one reviewed tag"
         )
+
+
+def final_version(source_ref: str) -> str:
+    require_exact_final_tag(source_ref)
+    return FINAL_TAG_VERSIONS[normalize_tag(source_ref)]
 
 
 def require_exact_fresh_tag(source_ref: str) -> None:
@@ -341,7 +356,9 @@ def validate_checked_bootstrap_source(root: Path | None = None) -> None:
         raise FreshReleaseError("fresh BOOTSTRAP archive runtime is not exact off")
 
 
-def validate_checked_final_source(root: Path | None = None) -> str:
+def validate_checked_final_source(
+    root: Path | None = None, *, source_ref: str = SUCCESSOR_TAG
+) -> str:
     """Validate the exact active FINAL source and return its live commitment."""
 
     root = root or ROOT
@@ -373,15 +390,20 @@ def validate_checked_final_source(root: Path | None = None) -> str:
         DuplicateName,
     ) as error:
         raise FreshReleaseError("fresh FINAL checked source is unreadable") from error
-    if manifest.get("package", {}).get("version") != "0.8.35":
-        raise FreshReleaseError("fresh FINAL Cargo version must be 0.8.35")
+    expected_version = final_version(source_ref)
+    if manifest.get("package", {}).get("version") != expected_version:
+        raise FreshReleaseError(
+            f"fresh active Cargo version must be {expected_version}"
+        )
     package_versions = [
         package.get("version")
         for package in lock.get("package", [])
         if package.get("name") == "kioku-enclave"
     ]
-    if package_versions != ["0.8.35"]:
-        raise FreshReleaseError("fresh FINAL lockfile version must be 0.8.35")
+    if package_versions != [expected_version]:
+        raise FreshReleaseError(
+            f"fresh active lockfile version must be {expected_version}"
+        )
     begin = "// ADR0022_SCHEMA_PHASE_DECLARATION_BEGIN"
     end = "// ADR0022_SCHEMA_PHASE_DECLARATION_END"
     if schema.count(begin) != 1 or schema.count(end) != 1:
@@ -475,8 +497,10 @@ def validate_bootstrap_configuration(configuration: dict[str, str]) -> None:
     validate_canary_binding(receipt_sha256, admin_uuid)
 
 
-def validate_final_configuration(configuration: dict[str, str]) -> None:
-    commitment = validate_checked_final_source()
+def validate_final_configuration(
+    configuration: dict[str, str], *, source_ref: str = SUCCESSOR_TAG
+) -> None:
+    commitment = validate_checked_final_source(source_ref=source_ref)
     for name, expected in _EXPECTED_FINAL_CONFIGURATION.items():
         if configuration.get(name) != expected:
             raise FreshReleaseError(
@@ -562,10 +586,12 @@ def bootstrap_release_binding(
 def final_release_binding(
     canary_identity_preparation_sha256: str,
     canary_admin_uuid: str,
+    *,
+    source_ref: str = SUCCESSOR_TAG,
 ) -> dict[str, Any]:
     """Return the exact ordered schema-10-only FINAL binding fields."""
 
-    validate_checked_final_source()
+    validate_checked_final_source(source_ref=source_ref)
     validate_canary_binding(canary_identity_preparation_sha256, canary_admin_uuid)
     binding = _release_binding(
         canary_identity_preparation_sha256,
@@ -589,10 +615,14 @@ def bootstrap_release_binding_from_configuration(
 
 def final_release_binding_from_configuration(
     configuration: dict[str, str],
+    *,
+    source_ref: str = SUCCESSOR_TAG,
 ) -> dict[str, Any]:
-    validate_final_configuration(configuration)
+    validate_final_configuration(configuration, source_ref=source_ref)
     return final_release_binding(
-        configuration[CANARY_CONFIG_KEY], configuration["ADMIN_USER_IDS"]
+        configuration[CANARY_CONFIG_KEY],
+        configuration["ADMIN_USER_IDS"],
+        source_ref=source_ref,
     )
 
 
@@ -602,4 +632,6 @@ def fresh_release_binding_from_configuration(
     require_exact_fresh_tag(source_ref)
     if is_bootstrap_tag(source_ref):
         return bootstrap_release_binding_from_configuration(configuration)
-    return final_release_binding_from_configuration(configuration)
+    return final_release_binding_from_configuration(
+        configuration, source_ref=source_ref
+    )

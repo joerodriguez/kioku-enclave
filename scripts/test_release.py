@@ -82,20 +82,24 @@ class LocalReleaseContracts(unittest.TestCase):
     def test_fresh_roles_have_fixed_tags_and_never_enter_the_legacy_roll(self) -> None:
         fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
         final_tag = 'ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.14"'
+        successor_tag = 'ADR0022_FRESH_SUCCESSOR_TAG="v0.8.36-archive-v3-wal.15"'
         self.assertIn(fixed_tag, RELEASE)
         self.assertIn(final_tag, RELEASE)
+        self.assertIn(successor_tag, RELEASE)
         self.assertIn(
             '"$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp]',
             RELEASE,
         )
         role_gate = RELEASE.index("ADR-0022 fresh BOOTSTRAP tag must be exactly")
         final_gate = RELEASE.index("ADR-0022 fresh FINAL tag must be exactly")
+        successor_gate = RELEASE.index("ADR-0022 fresh successor tag must be exactly")
         roll_refusal = RELEASE.index(
             "ADR-0022 fresh releases roll only through the sealed deployment"
         )
         fetch = RELEASE.index("git --no-replace-objects fetch origin main")
         self.assertLess(role_gate, fetch)
         self.assertLess(final_gate, fetch)
+        self.assertLess(successor_gate, fetch)
         self.assertLess(roll_refusal, fetch)
         self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE"', RELEASE)
 

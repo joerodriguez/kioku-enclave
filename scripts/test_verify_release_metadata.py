@@ -110,9 +110,9 @@ def bootstrap_manifest() -> dict[str, object]:
 
 def final_manifest_shape() -> dict[str, object]:
     data = bootstrap_manifest()
-    data["source_ref"] = fresh.FINAL_TAG
-    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.FINAL_TAG}"
-    data["release_url"] = fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.FINAL_TAG
+    data["source_ref"] = fresh.SUCCESSOR_TAG
+    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.SUCCESSOR_TAG}"
+    data["release_url"] = fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.SUCCESSOR_TAG
     data.update(
         {
             "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
@@ -236,13 +236,13 @@ class ReleaseMetadataTests(unittest.TestCase):
             expected_canary_uuid=CANARY_UUID,
         )
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("fresh BOOTSTRAP schema phase is not exact 0/0/0", completed.stderr)
+        self.assertIn("fresh BOOTSTRAP Cargo version must be 0.8.35", completed.stderr)
 
     def test_schema_ten_final_is_eligible_with_the_checked_live_commitment(self) -> None:
         data = final_manifest_shape()
         completed = self.verify(
             data,
-            tag=fresh.FINAL_TAG,
+            tag=fresh.SUCCESSOR_TAG,
             repository="joerodriguez/kioku-enclave",
             expected_buckets=(
                 fresh.EXPECTED_INTENT["index_bucket"],
@@ -342,7 +342,7 @@ class ReleaseMetadataTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0)
 
-        for tag in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG):
+        for tag in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG, fresh.SUCCESSOR_TAG):
             schema_nine = manifest()
             schema_nine["source_ref"] = tag
             schema_nine["release_url"] = (
