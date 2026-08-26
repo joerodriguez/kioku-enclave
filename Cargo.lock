@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-enclave"
-version = "0.8.36"
+version = "0.8.37"
 dependencies = [
  "aes",
  "aes-gcm",

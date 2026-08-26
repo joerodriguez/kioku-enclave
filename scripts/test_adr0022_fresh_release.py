@@ -32,6 +32,7 @@ class FreshReleaseTests(unittest.TestCase):
             "config/adr0022-fresh-generation-intent.json",
             "config/archive-witness-probe.json",
             "config/archive-v3-shadow-runtime.json",
+            "config/archive-v3-current-release.json",
             "scripts/schema_baseline_seal.json",
         )
         for relative in paths:
@@ -165,22 +166,14 @@ class FreshReleaseTests(unittest.TestCase):
                     fresh.require_exact_bootstrap_tag(tag)
 
     def test_final_tag_role_has_no_version_attempt_case_or_cross_role_alias(self) -> None:
-        self.assertTrue(fresh.is_final_tag(fresh.FINAL_TAG))
-        self.assertTrue(fresh.is_final_tag(fresh.SUCCESSOR_TAG))
-        self.assertTrue(fresh.is_final_tag(fresh.FLEET_CONVERGENCE_TAG))
-        self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.FINAL_TAG))
-        self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.SUCCESSOR_TAG))
-        self.assertTrue(
-            fresh.is_final_tag("refs/tags/" + fresh.FLEET_CONVERGENCE_TAG)
-        )
-        self.assertFalse(fresh.is_bootstrap_tag(fresh.FINAL_TAG))
+        self.assertTrue(fresh.is_final_tag(fresh.CURRENT_TAG))
+        self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.CURRENT_TAG))
+        self.assertFalse(fresh.is_bootstrap_tag(fresh.CURRENT_TAG))
         for tag in (
-            "v0.8.35-archive-v3-wal.2",
-            "v0.8.35-archive-v3-wal.14-extra",
-            "v0.8.35-ARCHIVE-V3-WAL.1",
-            "v0.8.35-archive-v3-walish.1",
-            "v0.8.36-archive-v3-wal.14",
-            "v0.8.36-archive-v3-wal.15-extra",
+            "v0.8.37-archive-v3-wal.17",
+            "v0.8.37-archive-v3-wal.18-extra",
+            "v0.8.37-ARCHIVE-V3-WAL.18",
+            "v0.8.37-archive-v3-walish.18",
         ):
             with self.subTest(tag=tag):
                 self.assertTrue(fresh.claims_final_role(tag))
@@ -189,9 +182,7 @@ class FreshReleaseTests(unittest.TestCase):
                     fresh.require_exact_final_tag(tag)
         for exact in (
             fresh.BOOTSTRAP_TAG,
-            fresh.FINAL_TAG,
-            fresh.SUCCESSOR_TAG,
-            fresh.FLEET_CONVERGENCE_TAG,
+            fresh.CURRENT_TAG,
         ):
             fresh.require_exact_fresh_tag(exact)
 
@@ -206,9 +197,7 @@ class FreshReleaseTests(unittest.TestCase):
             "",
         )
         self.assertEqual(
-            fresh.validate_checked_final_source(
-                source_ref=fresh.FLEET_CONVERGENCE_TAG
-            ),
+            fresh.validate_checked_final_source(source_ref=fresh.CURRENT_TAG),
             "",
         )
 
@@ -232,13 +221,7 @@ class FreshReleaseTests(unittest.TestCase):
                 }
                 fresh.validate_final_configuration(configuration)
                 binding = fresh.fresh_release_binding_from_configuration(
-                    configuration, fresh.SUCCESSOR_TAG
-                )
-                self.assertEqual(
-                    fresh.fresh_release_binding_from_configuration(
-                        configuration, fresh.FLEET_CONVERGENCE_TAG
-                    ),
-                    binding,
+                    configuration, fresh.CURRENT_TAG
                 )
                 self.assertEqual(tuple(binding), fresh.RELEASE_BINDING_FIELD_ORDER)
                 self.assertEqual(binding["production_genesis_wal_native"], "on")
@@ -319,14 +302,14 @@ class FreshReleaseTests(unittest.TestCase):
             cargo_path = directory / "Cargo.toml"
             cargo_path.write_text(
                 cargo_path.read_text(encoding="utf-8").replace(
-                    'version = "0.8.36"', 'version = "0.8.35"', 1
+                    'version = "0.8.37"', 'version = "0.8.35"', 1
                 ),
                 encoding="utf-8",
             )
             lock_path = directory / "Cargo.lock"
             lock_path.write_text(
                 lock_path.read_text(encoding="utf-8").replace(
-                    'name = "kioku-enclave"\nversion = "0.8.36"',
+                    'name = "kioku-enclave"\nversion = "0.8.37"',
                     'name = "kioku-enclave"\nversion = "0.8.35"',
                     1,
                 ),

@@ -110,10 +110,10 @@ def bootstrap_manifest() -> dict[str, object]:
 
 def final_manifest_shape() -> dict[str, object]:
     data = bootstrap_manifest()
-    data["source_ref"] = fresh.FLEET_CONVERGENCE_TAG
-    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.FLEET_CONVERGENCE_TAG}"
+    data["source_ref"] = fresh.CURRENT_TAG
+    data["image_uri"] = f"{fresh.IMAGE_REPOSITORY}:{fresh.CURRENT_TAG}"
     data["release_url"] = (
-        fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.FLEET_CONVERGENCE_TAG
+        fresh.SOURCE_REPOSITORY + "/releases/tag/" + fresh.CURRENT_TAG
     )
     data.update(
         {
@@ -244,7 +244,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         data = final_manifest_shape()
         completed = self.verify(
             data,
-            tag=fresh.FLEET_CONVERGENCE_TAG,
+            tag=fresh.CURRENT_TAG,
             repository="joerodriguez/kioku-enclave",
             expected_buckets=(
                 fresh.EXPECTED_INTENT["index_bucket"],
@@ -346,9 +346,7 @@ class ReleaseMetadataTests(unittest.TestCase):
 
         for tag in (
             fresh.BOOTSTRAP_TAG,
-            fresh.FINAL_TAG,
-            fresh.SUCCESSOR_TAG,
-            fresh.FLEET_CONVERGENCE_TAG,
+            fresh.CURRENT_TAG,
         ):
             schema_nine = manifest()
             schema_nine["source_ref"] = tag

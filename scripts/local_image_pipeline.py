@@ -38,6 +38,12 @@ from adr0022_fresh_release import (
     is_bootstrap_tag,
     is_final_tag,
 )
+from archive_v3_release_tag import (
+    ReleaseTagError,
+    cargo_version,
+    read_remote_refs,
+    require_next_tag,
+)
 from select_build_configuration import (
     FRESH_RELEASE_PROFILE_KEYS,
     OPTIONAL_PROFILE_GROUPS,
@@ -2661,6 +2667,18 @@ def main() -> None:
             "source_archive": "immutable-git-archive",
         }
         if arguments.stage == "push":
+            if is_final_tag(arguments.source_ref):
+                try:
+                    require_next_tag(
+                        arguments.source_ref,
+                        cargo_version(ROOT),
+                        read_remote_refs("origin"),
+                        allow_existing=True,
+                    )
+                except ReleaseTagError as error:
+                    raise PipelineError(
+                        "Archive V3 image push is not the exact next published WAL release"
+                    ) from error
             push_inputs = {
                 "build_inputs": build_inputs,
                 "image_uri": image_uri,

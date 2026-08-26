@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 from adr0022_fresh_release import (  # noqa: E402
     BOOTSTRAP_TAG,
-    FLEET_CONVERGENCE_TAG,
+    CURRENT_TAG,
 )
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
@@ -732,7 +732,7 @@ class SelectorTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(content, "")
-        self.assertIn("only for an exact fixed tag", completed.stderr)
+        self.assertIn("generated current-release tag", completed.stderr)
         for tag in (
             "v0.8.34-adr0022-fresh-bootstrap.1",
             "v0.8.35-adr0022-fresh-bootstrap.2",
@@ -820,12 +820,12 @@ class SelectorTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
-                self.assertIn("must be exactly", completed.stderr)
+                self.assertIn("generated current-release tag", completed.stderr)
 
         completed, content = self.run_selector(
             "production",
             exact,
-            source_ref=FLEET_CONVERGENCE_TAG,
+            source_ref=CURRENT_TAG,
             shadow_runtime_config=active_runtime,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
