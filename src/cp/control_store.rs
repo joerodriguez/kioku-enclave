@@ -36648,7 +36648,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captured-publication-restart.sqlite");
         let conn = lifecycle_file_conn(&path);
-        let (_terminal, _acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
+        let (_terminal, acquired, _lease, binding) = bound_wal_publisher_fixture(&conn);
 
         let held_identity = WalOperationIdentity::for_test(
             crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
@@ -36717,6 +36717,25 @@ mod tests {
             .unwrap(),
             "superseded"
         );
+
+        // The real actor refreshes the live owner lease after replay lookup
+        // and before it admits the next operation. Restart recovery must
+        // survive that exact intervening heartbeat, not merely a direct
+        // prepare against the startup binding.
+        let owner = load_bound_wal_owner_conn(&conn, &acquired)
+            .unwrap()
+            .control_view(WalOwnerPersistenceContext::for_test())
+            .0;
+        let heartbeated = acquired.heartbeated_wal_owner_lease_for_test();
+        let lease = heartbeated
+            .exact_wal_owner_heartbeat_from(&acquired, owner.as_bytes())
+            .unwrap();
+        assert!(
+            persist_wal_owner_lease_successor_conn(&conn, &acquired, &heartbeated, lease, false,)
+                .unwrap()
+                .1
+        );
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&heartbeated).unwrap();
 
         let next_identity = WalOperationIdentity::for_test(
             crate::archive_v3_wal_idempotency::WalOperationKind::CaptureSessionFinish,

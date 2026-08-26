@@ -114,6 +114,34 @@ pub(crate) enum WalOwnerError {
     Superseded,
 }
 
+/// Content-free runtime refusal telemetry. The stage and class are closed
+/// enums chosen by this module; no archive, user, request, provider response,
+/// or error text crosses the boundary.
+fn report_wal_owner_runtime_refusal(
+    operation: &'static str,
+    stage: &'static str,
+    error: WalOwnerError,
+) -> WalOwnerError {
+    let class = match error {
+        WalOwnerError::Malformed => "malformed",
+        WalOwnerError::Conflict => "conflict",
+        WalOwnerError::Corrupt => "corrupt",
+        WalOwnerError::Capture => "capture",
+        WalOwnerError::Persistence => "persistence",
+        WalOwnerError::Publication => "publication",
+        WalOwnerError::Poisoned => "poisoned",
+        WalOwnerError::Superseded => "superseded",
+    };
+    tracing::warn!(
+        metric = "archive_v3_wal_owner_runtime_refusal",
+        operation,
+        stage,
+        class,
+        "WAL owner runtime operation refused"
+    );
+    error
+}
+
 pub(crate) type Result<T> = std::result::Result<T, WalOwnerError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2711,8 +2739,14 @@ where
                     // without poisoning.
                     WalOwnerMessage::Read { read, response } => {
                         let result = match owner.require_fresh_head().await {
-                            Ok(()) => owner.store.read(read).await,
-                            Err(error) => Err(error),
+                            Ok(()) => owner.store.read(read).await.map_err(|error| {
+                                report_wal_owner_runtime_refusal("read", "serve_store_read", error)
+                            }),
+                            Err(error) => Err(report_wal_owner_runtime_refusal(
+                                "read",
+                                "authenticate_fresh_head",
+                                error,
+                            )),
                         };
                         let _ = response.send(result);
                     }
@@ -2771,6 +2805,16 @@ where
         &mut self,
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
     ) -> Result<Box<dyn Any + Send>> {
+        let mut stage = "checkpoint_pending";
+        let result = self.apply_one_inner(prepared, &mut stage).await;
+        result.map_err(|error| report_wal_owner_runtime_refusal("apply", stage, error))
+    }
+
+    async fn apply_one_inner(
+        &mut self,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
+        stage: &mut &'static str,
+    ) -> Result<Box<dyn Any + Send>> {
         if self
             .publication
             .checkpoint_pending(self.store.binding())
@@ -2786,6 +2830,7 @@ where
             self.require_fresh_head().await?;
         }
         let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
+        *stage = "inspect_operation";
         let admission = self
             .control
             .inspect_operation(self.store.binding(), identity)
@@ -2808,7 +2853,9 @@ where
                 return self.resume_candidate(identity, attempt.clone()).await;
             }
         }
+        *stage = "authenticate_fresh_head_before_lookup";
         self.require_fresh_head().await?;
+        *stage = "lookup_settled_replay";
         let prepared = match self.store.lookup(prepared).await? {
             crate::store::WalStoreReplay::Present(result) => {
                 if retained.is_some() {
@@ -2830,11 +2877,14 @@ where
         // may renew the live owner lease. Control atomically rebases any
         // pre-candidate retained attempt to this successor before the actor
         // can enter another SQLite transaction.
+        *stage = "refresh_live_binding";
         let refreshed = self
             .publication
             .refresh_live_binding(self.store.binding())
             .await?;
+        *stage = "refresh_store_binding";
         self.store.refresh(refreshed).await?;
+        *stage = "inspect_operation_after_refresh";
         match self
             .control
             .inspect_operation(self.store.binding(), identity)
@@ -2851,6 +2901,7 @@ where
                 return Err(WalOwnerError::Conflict);
             }
         }
+        *stage = "checkpoint_required";
         if self
             .publication
             .checkpoint_required(self.store.binding())
@@ -2865,6 +2916,7 @@ where
             self.store = settlement.into_lane(self.store.liveness()).await?;
             self.require_fresh_head().await?;
         }
+        *stage = "prepare_operation";
         let attempt = self
             .control
             .prepare_operation(self.store.binding(), self.store.instance_id(), identity)
@@ -2879,7 +2931,9 @@ where
         // The read-only replay preflight cannot authorize a new mutation.
         // Reauthenticate the exact current head after durable admission and
         // immediately before entering the local transaction.
+        *stage = "authenticate_fresh_head_before_apply";
         self.require_fresh_head().await?;
+        *stage = "apply_local_mutation";
         let applied = self.store.apply(prepared, attempt.clone()).await?;
         match applied {
             crate::store::WalStoreApply::Replayed(result) => {
@@ -2891,7 +2945,10 @@ where
                 context,
                 drain,
                 result,
-            } => self.publish_applied(*context, drain, attempt, result).await,
+            } => {
+                *stage = "publish_applied_mutation";
+                self.publish_applied(*context, drain, attempt, result).await
+            }
         }
     }
 
