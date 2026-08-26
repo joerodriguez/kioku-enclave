@@ -85,6 +85,27 @@ pub enum ShadowWalError {
 
 pub type Result<T> = std::result::Result<T, ShadowWalError>;
 
+/// Emit only the closed publication substage and broad static error class.
+/// No object identity, archive coordinate, provider response, or error text
+/// crosses this boundary.
+fn report_wal_publication_refusal(stage: &'static str, error: ShadowWalError) -> ShadowWalError {
+    let class = match &error {
+        ShadowWalError::Archive(_) => "archive",
+        ShadowWalError::MissingObject => "missing_object",
+        ShadowWalError::MissingCheckpointOrWal => "missing_checkpoint_or_wal",
+        ShadowWalError::Sink => "sink",
+        ShadowWalError::CheckpointRequired => "checkpoint_required",
+        ShadowWalError::CompositeRecovery => "composite_recovery",
+    };
+    tracing::warn!(
+        metric = "archive_v3_wal_publication_refusal",
+        stage,
+        class,
+        "WAL publication substage refused"
+    );
+    error
+}
+
 const ADVISORY_CAPTURE_PARITY_DOMAIN: &[u8] =
     b"kioku/archive-v3/advisory-captured-prefix-parity/v1\0";
 
@@ -317,11 +338,18 @@ async fn upload_captured_wal_segments(
         )?;
         // The encoded WAL object is plaintext until `seal` returns. Keep that
         // bounded transient zeroized on success, error, and cancellation.
-        let encoded = Zeroizing::new(segment.encode()?);
-        let envelope = cipher.seal(&context, encoded.as_slice())?;
+        let encoded = Zeroizing::new(
+            segment
+                .encode()
+                .map_err(|error| report_wal_publication_refusal("encode_segment", error.into()))?,
+        );
+        let envelope = cipher
+            .seal(&context, encoded.as_slice())
+            .map_err(|error| report_wal_publication_refusal("seal_segment", error.into()))?;
         let exact = staging
             .create_and_readback(backend, &context, envelope.clone())
-            .await?;
+            .await
+            .map_err(|error| report_wal_publication_refusal("stage_segment", error))?;
         let reference = ImmutableReference {
             object_id,
             envelope_hash: envelope.hash(),
@@ -331,9 +359,14 @@ async fn upload_captured_wal_segments(
         if exact.hash() != reference.envelope_hash {
             return Err(ArchiveV3Error::Authentication.into());
         }
-        let resolved = load_exact_wal_segment(backend, cipher, &context, &reference).await?;
+        let resolved = load_exact_wal_segment(backend, cipher, &context, &reference)
+            .await
+            .map_err(|error| report_wal_publication_refusal("reload_segment", error))?;
         if resolved.reference() != &reference || resolved.segment() != &segment {
-            return Err(ArchiveV3Error::Authentication.into());
+            return Err(report_wal_publication_refusal(
+                "authenticate_segment",
+                ArchiveV3Error::Authentication.into(),
+            ));
         }
         previous_segment = Some(reference);
     }
@@ -506,7 +539,8 @@ async fn upload_captured_wal_commit_from_base(
     capture: &CapturedWalCommit,
     staging: &dyn WalObjectStaging,
 ) -> Result<UploadedWalCommit> {
-    base.validate()?;
+    base.validate()
+        .map_err(|error| report_wal_publication_refusal("validate_base_root", error.into()))?;
     if base.checkpoint_root.is_none()
         || base.extent_tree_root.is_some()
         || owner_fencing_epoch == 0
@@ -528,7 +562,8 @@ async fn upload_captured_wal_commit_from_base(
     // Derive every per-commit and cumulative cap before continuity readback or
     // immutable creation. A base just below a lineage cap must not leave
     // orphaned segments when this commit would cross that cap.
-    let preflight = preflight_captured_wal_commit(root_seq, capture)?;
+    let preflight = preflight_captured_wal_commit(root_seq, capture)
+        .map_err(|error| report_wal_publication_refusal("preflight_capture", error))?;
     let cumulative_commit_count = base
         .wal_commit_count
         .checked_add(1)
@@ -547,7 +582,9 @@ async fn upload_captured_wal_commit_from_base(
     {
         return Err(ShadowWalError::CheckpointRequired);
     }
-    validate_capture_continuity(backend, cipher, archive_id, base, capture).await?;
+    validate_capture_continuity(backend, cipher, archive_id, base, capture)
+        .await
+        .map_err(|error| report_wal_publication_refusal("validate_capture_continuity", error))?;
     let uploaded = upload_captured_wal_segments(
         WalSegmentUploadContext {
             backend,
@@ -560,7 +597,8 @@ async fn upload_captured_wal_commit_from_base(
         capture,
         &preflight,
     )
-    .await?;
+    .await
+    .map_err(|error| report_wal_publication_refusal("upload_segments", error))?;
     let parent = ParentReference {
         object_id: base_reference.object_id(),
         envelope_hash: base_reference.ciphertext_hash(),
@@ -597,7 +635,9 @@ async fn upload_captured_wal_commit_from_base(
         cumulative_wal_bytes,
         final_segment: uploaded.final_segment.clone(),
     };
-    descriptor.validate()?;
+    descriptor
+        .validate()
+        .map_err(|error| report_wal_publication_refusal("validate_descriptor", error.into()))?;
     let descriptor_object_id = ObjectId::random();
     let descriptor_context = wal_commit_context(
         archive_id,
@@ -606,14 +646,21 @@ async fn upload_captured_wal_commit_from_base(
         root_seq,
         descriptor_object_id,
     )?;
-    let encoded = Zeroizing::new(descriptor.encode()?);
+    let encoded = Zeroizing::new(
+        descriptor
+            .encode()
+            .map_err(|error| report_wal_publication_refusal("encode_descriptor", error.into()))?,
+    );
     if encoded.len() > MAX_WAL_COMMIT_DESCRIPTOR_BYTES {
         return Err(ArchiveV3Error::TooLarge("WAL commit descriptor").into());
     }
-    let envelope = cipher.seal(&descriptor_context, encoded.as_slice())?;
+    let envelope = cipher
+        .seal(&descriptor_context, encoded.as_slice())
+        .map_err(|error| report_wal_publication_refusal("seal_descriptor", error.into()))?;
     let exact_descriptor = staging
         .create_and_readback(backend, &descriptor_context, envelope.clone())
-        .await?;
+        .await
+        .map_err(|error| report_wal_publication_refusal("stage_descriptor", error))?;
     let descriptor_reference = ImmutableReference {
         object_id: descriptor_object_id,
         envelope_hash: envelope.hash(),
@@ -627,7 +674,8 @@ async fn upload_captured_wal_commit_from_base(
         &descriptor_context,
         &descriptor_reference,
     )
-    .await?;
+    .await
+    .map_err(|error| report_wal_publication_refusal("reload_descriptor", error))?;
     if readback.reference() != &descriptor_reference || readback.descriptor() != &descriptor {
         return Err(ArchiveV3Error::Authentication.into());
     }
@@ -651,7 +699,8 @@ async fn upload_captured_wal_commit_from_base(
         extent_tree_root: None,
         wal_commit_tail: Some(descriptor_reference),
     };
-    root.validate()?;
+    root.validate()
+        .map_err(|error| report_wal_publication_refusal("validate_candidate_root", error.into()))?;
     Ok(UploadedWalCommit {
         root_seq,
         wal_generation: uploaded.wal_generation,

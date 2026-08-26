@@ -65,6 +65,17 @@ const CHECKPOINT_OBJECTS_PER_HEARTBEAT: u32 = 32;
 pub(crate) const MAX_CHECKPOINT_ATTEMPTS: u32 = 16;
 pub(crate) const MAX_CHECKPOINT_ARTIFACTS: u32 = 32_898;
 
+/// Emit only a closed publication substage and broad static class. Provider
+/// responses, archive coordinates, object identities, and error text remain
+/// below this boundary.
+fn report_wal_candidate_refusal<E>(stage: &'static str, class: &'static str, error: E) -> E {
+    warn!(
+        metric = "archive_v3_wal_candidate_refusal",
+        stage, class, "WAL candidate publication substage refused"
+    );
+    error
+}
+
 fn checkpoint_source_binding_commitment(binding: &WalOwnerStoreBinding) -> Result<[u8; 32]> {
     let witness =
         WitnessRecord::decode(binding.witness_bytes()).map_err(|_| WalOwnerError::Corrupt)?;
@@ -2335,12 +2346,28 @@ impl WalPublicationAuthority for SingleArchiveWalPublisher {
         captured: &crate::archive_v3_shadow::CapturedWalCommit,
         control: &dyn WalOwnerControl,
     ) -> Result<WalPublicationCandidate> {
-        let expected = WitnessRecord::decode(context.binding().witness_bytes())
-            .map_err(|_| WalOwnerError::Corrupt)?;
-        let live = self.control.load_bound_owner(&expected).await?;
-        let cipher = self.exact_cipher(&expected).await?;
-        let recovery = RecoveryRoot::from_exact_wal_owner_record(&expected)
-            .map_err(|_| WalOwnerError::Conflict)?;
+        let expected = WitnessRecord::decode(context.binding().witness_bytes()).map_err(|_| {
+            report_wal_candidate_refusal(
+                "decode_expected_witness",
+                "corrupt",
+                WalOwnerError::Corrupt,
+            )
+        })?;
+        let live = self
+            .control
+            .load_bound_owner(&expected)
+            .await
+            .map_err(|error| report_wal_candidate_refusal("load_bound_owner", "control", error))?;
+        let cipher = self.exact_cipher(&expected).await.map_err(|error| {
+            report_wal_candidate_refusal("load_exact_cipher", "provider", error)
+        })?;
+        let recovery = RecoveryRoot::from_exact_wal_owner_record(&expected).map_err(|_| {
+            report_wal_candidate_refusal(
+                "recover_expected_root",
+                "conflict",
+                WalOwnerError::Conflict,
+            )
+        })?;
         let staging = ControlledWalStaging {
             context,
             control,
@@ -2358,7 +2385,13 @@ impl WalPublicationAuthority for SingleArchiveWalPublisher {
             &staging,
         )
         .await
-        .map_err(|_| WalOwnerError::Publication)?;
+        .map_err(|_| {
+            report_wal_candidate_refusal(
+                "upload_controlled_commit",
+                "publication",
+                WalOwnerError::Publication,
+            )
+        })?;
         let artifacts = control
             .authenticate_artifact_set(
                 context,
@@ -2366,8 +2399,12 @@ impl WalPublicationAuthority for SingleArchiveWalPublisher {
                 captured.first_frame_no(),
                 captured.frame_count(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                report_wal_candidate_refusal("authenticate_artifact_set", "control", error)
+            })?;
         WalPublicationCandidate::from_authority(context, captured, root, artifacts)
+            .map_err(|error| report_wal_candidate_refusal("compose_candidate", "candidate", error))
     }
 
     async fn send_candidate(
@@ -2441,25 +2478,57 @@ impl crate::archive_v3_shadow_wal::WalObjectStaging for ControlledWalStaging<'_>
             object_context,
             envelope.hash(),
         )
-        .map_err(|_| crate::archive_v3::ArchiveV3Error::InvalidContext)?;
+        .map_err(|_| {
+            report_wal_candidate_refusal(
+                "construct_artifact",
+                "invalid_context",
+                crate::archive_v3::ArchiveV3Error::InvalidContext,
+            )
+        })?;
         self.control
             .reserve_artifact(self.context, &artifact)
             .await
-            .map_err(|_| crate::archive_v3::ArchiveV3Error::Authentication)?;
+            .map_err(|_| {
+                report_wal_candidate_refusal(
+                    "reserve_artifact",
+                    "control",
+                    crate::archive_v3::ArchiveV3Error::Authentication,
+                )
+            })?;
         backend
             .create_if_absent(object_context.object_key(), envelope.clone())
-            .await?;
+            .await
+            .map_err(|error| {
+                report_wal_candidate_refusal("create_archive_object", "archive", error)
+            })?;
         let readback = backend
             .get(&object_context.object_key())
-            .await?
-            .ok_or(crate::archive_v3_shadow_wal::ShadowWalError::MissingObject)?;
+            .await
+            .map_err(|error| report_wal_candidate_refusal("read_archive_object", "archive", error))?
+            .ok_or_else(|| {
+                report_wal_candidate_refusal(
+                    "read_archive_object",
+                    "missing_object",
+                    crate::archive_v3_shadow_wal::ShadowWalError::MissingObject,
+                )
+            })?;
         if readback != envelope {
-            return Err(crate::archive_v3::ArchiveV3Error::Authentication.into());
+            return Err(report_wal_candidate_refusal(
+                "authenticate_archive_object",
+                "authentication",
+                crate::archive_v3::ArchiveV3Error::Authentication.into(),
+            ));
         }
         self.control
             .mark_artifact_materialized(self.context, &artifact)
             .await
-            .map_err(|_| crate::archive_v3::ArchiveV3Error::Authentication)?;
+            .map_err(|_| {
+                report_wal_candidate_refusal(
+                    "mark_artifact_materialized",
+                    "control",
+                    crate::archive_v3::ArchiveV3Error::Authentication,
+                )
+            })?;
         Ok(readback)
     }
 }
