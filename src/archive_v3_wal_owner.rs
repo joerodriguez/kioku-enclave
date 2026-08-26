@@ -5377,6 +5377,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovered_staging_seeds_the_next_process_wal_generation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("wal-owner-recovered-generation.sqlite");
+        let schema_version = crate::store::initialize_wal_owner_store_for_test(&path).unwrap();
+        let setup = rusqlite::Connection::open(&path).unwrap();
+        setup
+            .execute_batch(
+                "CREATE TABLE wal_owner_test_values(value BLOB NOT NULL);
+                 CREATE TABLE wal_owner_test_operations(
+                    operation_kind INTEGER NOT NULL,
+                    operation_id BLOB NOT NULL,
+                    request_fingerprint BLOB NOT NULL,
+                    result BLOB NOT NULL,
+                    PRIMARY KEY(operation_kind,operation_id),
+                    CHECK(operation_kind BETWEEN 1 AND 12),
+                    CHECK(length(operation_id)=16 AND operation_id<>zeroblob(16)),
+                    CHECK(length(request_fingerprint)=32 AND request_fingerprint<>zeroblob(32)),
+                    CHECK(length(result)>0 AND length(result)<=4096)
+                 ) WITHOUT ROWID;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        drop(setup);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let staged =
+            crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::for_test_after_generation(
+                path,
+                &binding,
+                schema_version,
+                7,
+            )
+            .unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::from_authenticated_staging(
+            WalOwnerStoreContext::for_test(),
+            staged,
+            binding,
+            crate::store::StoreShadowCapture::shared_for_test(),
+        )
+        .unwrap();
+        let control = Arc::new(FakeControl::new());
+        let handle = SingleArchiveWalOwner::spawn(
+            store,
+            control.clone(),
+            Arc::new(FakePublication::new(next)),
+        );
+
+        let result = handle.submit(plan(67, b"recovered-generation")).await;
+        assert_eq!(
+            result,
+            Ok(b"recovered-generation".to_vec()),
+            "{:?}",
+            control.snapshot()
+        );
+        assert_eq!(control.state.lock().unwrap().generation, Some(8));
+    }
+
     #[test]
     fn checkpoint_source_consumes_store_owner_closes_sidecars_and_scrubs_on_drop() {
         use std::os::unix::fs::PermissionsExt;

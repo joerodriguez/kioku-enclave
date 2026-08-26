@@ -598,6 +598,18 @@ impl StoreShadowCapture {
             .map_err(|_| EnclaveError::Store("shadow capture registration failed".into()))
     }
 
+    fn register_after_generation(
+        &self,
+        path: &Path,
+        previous_generation: u64,
+    ) -> Result<CaptureRegistration> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| EnclaveError::Store("shadow capture path contains NUL".into()))?;
+        self.registry
+            .register_after_generation(&path, previous_generation)
+            .map_err(|_| EnclaveError::Store("shadow capture registration failed".into()))
+    }
+
     fn vfs_name(&self) -> &CStr {
         &self.vfs_name
     }
@@ -652,6 +664,15 @@ impl StoreShadowCapture {
     #[cfg(test)]
     pub(crate) fn register_path_for_test(&self, path: &Path) -> Result<CaptureRegistration> {
         self.register(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_path_after_generation_for_test(
+        &self,
+        path: &Path,
+        previous_generation: u64,
+    ) -> Result<CaptureRegistration> {
+        self.register_after_generation(path, previous_generation)
     }
 
     #[cfg(test)]
@@ -1436,11 +1457,15 @@ impl SingleArchiveWalStoreOwner {
         let path = staged
             .path_for_store(token, &binding)
             .map_err(|_| WalOwnerError::Corrupt)?;
+        let recovered_wal_generation = staged
+            .recovered_wal_generation_for_store(token, &binding)
+            .map_err(|_| WalOwnerError::Corrupt)?;
         let owned_path = path.to_path_buf();
-        let (connection, registration, migration_dirty) = open_db(
+        let (connection, registration, migration_dirty) = open_db_after_wal_generation(
             &owned_path,
-            Some(capture.as_ref()),
+            capture.as_ref(),
             StorePersistencePolicy::WalOwnerAuthoritative,
+            recovered_wal_generation,
         )
         .map_err(|_| WalOwnerError::Corrupt)?;
         let registration = registration.ok_or(WalOwnerError::Capture)?;
@@ -7786,6 +7811,29 @@ fn open_db(
     shadow_capture: Option<&StoreShadowCapture>,
     persistence_policy: StorePersistencePolicy,
 ) -> Result<(Connection, Option<CaptureRegistration>, bool)> {
+    open_db_inner(path, shadow_capture, persistence_policy, None)
+}
+
+fn open_db_after_wal_generation(
+    path: &PathBuf,
+    shadow_capture: &StoreShadowCapture,
+    persistence_policy: StorePersistencePolicy,
+    previous_generation: u64,
+) -> Result<(Connection, Option<CaptureRegistration>, bool)> {
+    open_db_inner(
+        path,
+        Some(shadow_capture),
+        persistence_policy,
+        Some(previous_generation),
+    )
+}
+
+fn open_db_inner(
+    path: &PathBuf,
+    shadow_capture: Option<&StoreShadowCapture>,
+    persistence_policy: StorePersistencePolicy,
+    previous_generation: Option<u64>,
+) -> Result<(Connection, Option<CaptureRegistration>, bool)> {
     // Register the sqlite-vec extension globally before any connection opens.
     // This is idempotent (Once guard) and thread-safe.
     init_vec_extension();
@@ -7815,7 +7863,12 @@ fn open_db(
     // attachment resolve the same connection-scoped capture state. Failure to
     // open drops/retire the registration before the caller removes the file.
     let captured = shadow_capture.and_then(|shadow_capture| {
-        let registration = shadow_capture.register(path).ok()?;
+        let registration = match previous_generation {
+            Some(previous_generation) => shadow_capture
+                .register_after_generation(path, previous_generation)
+                .ok()?,
+            None => shadow_capture.register(path).ok()?,
+        };
         Connection::open_with_flags_and_vfs(path, OpenFlags::default(), shadow_capture.vfs_name())
             .ok()
             .map(|connection| (connection, registration))
