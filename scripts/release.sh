@@ -26,6 +26,7 @@ PUSH_DEPLOYMENT_SOURCE_SEAL=""
 ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
 ADR0022_FRESH_FINAL_TAG="v0.8.35-archive-v3-wal.14"
 ADR0022_FRESH_SUCCESSOR_TAG="v0.8.36-archive-v3-wal.15"
+ADR0022_FRESH_FLEET_CONVERGENCE_TAG="v0.8.36-archive-v3-wal.16"
 RELEASE_CONFIG_SNAPSHOT=""
 SOURCE_ARCHIVE=""
 NOTES=""
@@ -117,8 +118,8 @@ fi
 if [[ "$TAG" =~ ^v0\.8\.35-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_FINAL_TAG" ]]; then
   die "ADR-0022 fresh FINAL tag must be exactly $ADR0022_FRESH_FINAL_TAG"
 fi
-if [[ "$TAG" =~ ^v0\.8\.36-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_SUCCESSOR_TAG" ]]; then
-  die "ADR-0022 fresh successor tag must be exactly $ADR0022_FRESH_SUCCESSOR_TAG"
+if [[ "$TAG" =~ ^v0\.8\.36-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_FRESH_SUCCESSOR_TAG" && "$TAG" != "$ADR0022_FRESH_FLEET_CONVERGENCE_TAG" ]]; then
+  die "ADR-0022 fresh successor tag must be an exact reviewed tag"
 fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
@@ -200,7 +201,7 @@ PY
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
 IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" || "$TAG" == "$ADR0022_FRESH_SUCCESSOR_TAG" ) ]]; then
+if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_FRESH_FINAL_TAG" || "$TAG" == "$ADR0022_FRESH_SUCCESSOR_TAG" || "$TAG" == "$ADR0022_FRESH_FLEET_CONVERGENCE_TAG" ) ]]; then
   die "ADR-0022 fresh releases roll only through the sealed deployment direct-provider operation"
 elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/

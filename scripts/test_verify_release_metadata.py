@@ -342,7 +342,12 @@ class ReleaseMetadataTests(unittest.TestCase):
                 )
                 self.assertNotEqual(completed.returncode, 0)
 
-        for tag in (fresh.BOOTSTRAP_TAG, fresh.FINAL_TAG, fresh.SUCCESSOR_TAG):
+        for tag in (
+            fresh.BOOTSTRAP_TAG,
+            fresh.FINAL_TAG,
+            fresh.SUCCESSOR_TAG,
+            fresh.FLEET_CONVERGENCE_TAG,
+        ):
             schema_nine = manifest()
             schema_nine["source_ref"] = tag
             schema_nine["release_url"] = (
