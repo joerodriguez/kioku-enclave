@@ -1046,7 +1046,7 @@ mod tests {
     };
     use crate::schema_ladder::{
         chain_digest, read_archive_epoch, seed_epoch_marker, SchemaStep, StepClass,
-        SCHEMA_EPOCH_HEAD, SCHEMA_EPOCH_TARGET,
+        SCHEMA_EPOCH_HEAD, SCHEMA_EPOCH_MIN_SERVABLE, SCHEMA_EPOCH_TARGET,
     };
 
     const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
@@ -1501,7 +1501,16 @@ mod tests {
         let conn = archive_at_epoch_zero();
         let marker = read_archive_epoch(&conn).unwrap();
         assert_eq!(marker.chain, chain_digest(0));
-        if SCHEMA_EPOCH_TARGET == 0 {
+        if SCHEMA_EPOCH_MIN_SERVABLE > 0 {
+            assert_eq!(
+                decide_from_marker(marker, LadderView::PRODUCTION),
+                Some(AdvanceOutcome::RefusedNotServable(0))
+            );
+            let plan = SchemaEpochAdvancePlan::new(ACCOUNT.into(), 0).expect(
+                "the sealed step remains constructible even after the servable floor rises",
+            );
+            assert_eq!((plan.advances_from(), plan.advances_to()), (0, 1));
+        } else if SCHEMA_EPOCH_TARGET == 0 {
             assert_eq!(
                 decide_from_marker(marker, LadderView::PRODUCTION),
                 Some(AdvanceOutcome::AlreadyAtTarget(0))
@@ -1952,14 +1961,14 @@ mod tests {
             "step_digest moved: re-pin scripts/test_schema_ladder_gate.py with \
              --print-ladder-pins and re-derive every SEALED_STEP_DIGESTS entry"
         );
-        // The chain head the gate pins, over the shipped (empty) ladder.
+        // The chain head the gate pins, over the shipped ladder.
         let head: String = LadderView::PRODUCTION
             .chain_digest(SCHEMA_EPOCH_HEAD)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            head, "44c94f297c002b76892e96f1449398610eaf981dc1f6c123cfa69630d8c72c98",
+            head, "74336a506af544588f1572e592cb2e238090247fba8aea25187836a4d8c35701",
             "SEALED_LADDER_CHAIN_HEAD in the gate script must move with this"
         );
     }
