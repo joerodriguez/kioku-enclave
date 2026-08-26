@@ -170,7 +170,7 @@ class FreshReleaseTests(unittest.TestCase):
         self.assertFalse(fresh.is_bootstrap_tag(fresh.FINAL_TAG))
         for tag in (
             "v0.8.35-archive-v3-wal.2",
-            "v0.8.35-archive-v3-wal.10-extra",
+            "v0.8.35-archive-v3-wal.11-extra",
             "v0.8.35-ARCHIVE-V3-WAL.1",
             "v0.8.35-archive-v3-walish.1",
         ):
