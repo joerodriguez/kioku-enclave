@@ -102,9 +102,11 @@ const CONTROL_OBJECT: &str = "control/control.db.enc";
 // durable Control transition.  Sustained sub-second replacements are provider
 // throttled even though short bursts can succeed, so WAL publication's
 // reserve/materialize ladder must share one process-wide dispatch interval
-// with every other Control writer.
+// with every other Control writer.  Keep a full extra second of provider
+// headroom: production sustained seventeen 1.1-second replacements before
+// GCS refused the eighteenth.
 #[cfg(not(test))]
-const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::from_millis(1_100);
+const CONTROL_OBJECT_PUT_INTERVAL: Duration = Duration::from_millis(2_100);
 // Keep the broad unit suite fast.  The focused pacing regression below installs
 // a non-zero interval and a fake provider that rejects an unpaced second PUT.
 #[cfg(test)]
