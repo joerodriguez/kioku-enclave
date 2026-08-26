@@ -264,11 +264,6 @@ pub struct Store {
     /// connection, while deletion can still atomically close admission and
     /// wait for every admitted writer to settle.
     content_write_barrier: Arc<ContentWriteBarrier>,
-    /// Inactive exact-user local-only selection. Every production constructor
-    /// stores `None`; only the consuming advisory release transition may
-    /// install one selection while both local admission gates are still
-    /// closed. No startup/config/provider path can select a user.
-    shadow_capture: StdRwLock<Option<StoreShadowCaptureSelection>>,
     persistence_policy: StorePersistencePolicy,
     /// Inactive per-user WAL-authority persistence selections. Every
     /// production constructor starts empty; the only installer consumes the
@@ -541,36 +536,6 @@ pub(crate) trait WalServingRelaunch: Send + Sync {
 pub(crate) struct StoreShadowCapture {
     registry: CaptureRegistry,
     vfs_name: CString,
-}
-
-/// Exact one-user capture selection. Store construction can inject it only in
-/// tests; the sole production mutation is the consuming advisory-owner resume
-/// transition while both exact-user gates are closed. The Store applies it
-/// only when the validated user identity matches byte-for-byte.
-pub(crate) struct StoreShadowCaptureSelection {
-    user_id: UserId,
-    capture: Arc<StoreShadowCapture>,
-}
-
-impl StoreShadowCaptureSelection {
-    fn capture_for_user(&self, user_id: &str) -> Option<Arc<StoreShadowCapture>> {
-        (self.user_id == user_id).then(|| Arc::clone(&self.capture))
-    }
-
-    #[cfg(test)]
-    fn for_test(user_id: &str, capture: Arc<StoreShadowCapture>) -> Self {
-        validate_user_id(user_id).expect("test capture user identity");
-        Self {
-            user_id: user_id.to_owned(),
-            capture,
-        }
-    }
-}
-
-impl std::fmt::Debug for StoreShadowCaptureSelection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("StoreShadowCaptureSelection(<exact-user-inactive>)")
-    }
 }
 
 impl StoreShadowCapture {
@@ -2748,46 +2713,22 @@ impl Store {
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
     ) -> Self {
-        Self::new_internal_with_max_open_and_shadow_capture(
+        Self::new_internal_with_max_open_and_policy(
             kms,
             gcs,
             media_gcs,
             legacy_media_gcs,
             max_open,
-            None,
-        )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "reserved for separately reviewed default-off shadow runtime composition"
-    )]
-    pub(crate) fn new_internal_with_max_open_and_shadow_capture(
-        kms: Arc<dyn KmsClient>,
-        gcs: Arc<dyn GcsClient>,
-        media_gcs: Arc<dyn GcsClient>,
-        legacy_media_gcs: Arc<dyn GcsClient>,
-        max_open: usize,
-        shadow_capture: Option<StoreShadowCaptureSelection>,
-    ) -> Self {
-        Self::new_internal_with_max_open_shadow_capture_and_policy(
-            kms,
-            gcs,
-            media_gcs,
-            legacy_media_gcs,
-            max_open,
-            shadow_capture,
             StorePersistencePolicy::LegacySnapshot,
         )
     }
 
-    fn new_internal_with_max_open_shadow_capture_and_policy(
+    fn new_internal_with_max_open_and_policy(
         kms: Arc<dyn KmsClient>,
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
-        shadow_capture: Option<StoreShadowCaptureSelection>,
         persistence_policy: StorePersistencePolicy,
     ) -> Self {
         Store {
@@ -2801,7 +2742,6 @@ impl Store {
             registry_changed: Arc::new(Notify::new()),
             lifecycle_gates: Mutex::new(HashMap::new()),
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
-            shadow_capture: StdRwLock::new(shadow_capture),
             persistence_policy,
             wal_authority_persistence: StdRwLock::new(HashMap::new()),
             wal_serving_authorities: StdRwLock::new(HashMap::new()),
@@ -2829,13 +2769,12 @@ impl Store {
         max_open: usize,
     ) -> Self {
         let media = Arc::clone(&gcs);
-        Self::new_internal_with_max_open_shadow_capture_and_policy(
+        Self::new_internal_with_max_open_and_policy(
             kms,
             gcs,
             Arc::clone(&media),
             media,
             max_open,
-            None,
             StorePersistencePolicy::WalLogicalOnly,
         )
     }
@@ -3348,50 +3287,6 @@ impl Store {
     /// currently live legacy archive discovered through GCS listing.
     pub async fn legacy_checkpoint_reconciliation(&self) -> LegacyCheckpointReconciliation {
         self.legacy_checkpoint_reconciliation.lock().await.clone()
-    }
-
-    /// Enumerate the exact live legacy index owners for the one-time
-    /// Archive-v3 startup convergence pass. Names remain process-private and
-    /// callers may report only aggregate counts. The provider listing is
-    /// bounded and every object name is validated with the same strict parser
-    /// as checkpoint reconciliation; an incomplete or ambiguous scan fails
-    /// startup closed.
-    pub(crate) async fn live_legacy_index_users(&self) -> Result<Vec<String>> {
-        let mut users = Vec::new();
-        let mut page_token = None;
-        let mut seen_cursor_fingerprints = [0_u64; GCS_CURSOR_FINGERPRINT_WORDS];
-        for _ in 0..MAX_GCS_LIST_PAGES {
-            let page = self
-                .gcs
-                .list_live_objects("indexes/", page_token.as_deref())
-                .await?;
-            for listed in page.versions {
-                let user_id = legacy_index_user_id(&listed.name).ok_or_else(|| {
-                    EnclaveError::Store("legacy index inventory contains an invalid name".into())
-                })?;
-                users.push(user_id);
-            }
-            match page.next_page_token {
-                Some(next) => {
-                    let mut hasher = DefaultHasher::new();
-                    next.hash(&mut hasher);
-                    let fingerprint = (hasher.finish() as usize) % GCS_CURSOR_FINGERPRINT_BITS;
-                    let word = fingerprint / u64::BITS as usize;
-                    let mask = 1_u64 << (fingerprint % u64::BITS as usize);
-                    if seen_cursor_fingerprints[word] & mask != 0 {
-                        return Err(EnclaveError::Store(
-                            "legacy index inventory repeated a page cursor".into(),
-                        ));
-                    }
-                    seen_cursor_fingerprints[word] |= mask;
-                    page_token = Some(next);
-                }
-                None => return Ok(users),
-            }
-        }
-        Err(EnclaveError::Store(
-            "legacy index inventory exceeded the bounded page limit".into(),
-        ))
     }
 
     /// Reconcile legacy archives already present before the first new save.
@@ -5886,22 +5781,14 @@ impl Store {
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
-        let selected_capture = self.shadow_capture.read().ok().and_then(|selection| {
-            selection
-                .as_ref()
-                .and_then(|selection| selection.capture_for_user(user_id))
-        });
-        let (conn, shadow_capture_registration, migration_dirty) = match open_db(
-            &temp_path,
-            selected_capture.as_deref(),
-            self.persistence_policy_for(user_id),
-        ) {
-            Ok(opened) => opened,
-            Err(e) => {
-                remove_temp_db_files(&temp_path);
-                return Err(e);
-            }
-        };
+        let (conn, shadow_capture_registration, migration_dirty) =
+            match open_db(&temp_path, None, self.persistence_policy_for(user_id)) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    remove_temp_db_files(&temp_path);
+                    return Err(e);
+                }
+            };
 
         Ok(UserHandle {
             user_id: user_id.to_string(),
@@ -12172,30 +12059,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn startup_genesis_inventory_is_complete_strict_and_cursor_bounded() {
-        let gcs = Arc::new(FakeGcs::new());
-        for user in ["archive-a", "archive-b", "archive-c"] {
-            gcs.put_object(&gcs_object_name(user), b"current", "wrapped", 0)
-                .await
-                .unwrap();
-        }
-        let store = store_with_checkpoint_time(Arc::clone(&gcs), 1_767_268_800);
-        assert_eq!(
-            store.live_legacy_index_users().await.unwrap(),
-            vec!["archive-a", "archive-b", "archive-c"]
-        );
-
-        gcs.put_object("indexes/not/a.db.enc", b"bad", "wrapped", 0)
-            .await
-            .unwrap();
-        assert!(store.live_legacy_index_users().await.is_err());
-
-        gcs.delete_object("indexes/not/a.db.enc").await.unwrap();
-        gcs.set_repeat_version_cursor(true);
-        assert!(store.live_legacy_index_users().await.is_err());
-    }
-
-    #[tokio::test]
     async fn startup_reconciliation_rejects_repeated_live_listing_cursor() {
         let gcs = Arc::new(FakeGcs::new());
         for user in ["cursor-a", "cursor-b", "cursor-c"] {
@@ -14638,223 +14501,6 @@ pub(crate) mod tests {
         max_open: usize,
     ) -> Store {
         Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
-    }
-
-    #[tokio::test]
-    async fn exact_user_shadow_capture_excludes_others_and_retires_on_eviction_and_deletion() {
-        let ordinary = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
-        assert!(ordinary.shadow_capture.read().unwrap().is_none());
-
-        let capture = StoreShadowCapture::shared_for_test();
-        let gcs = Arc::new(FakeGcs::new());
-        let store = Store::new_internal_with_max_open_and_shadow_capture(
-            Arc::new(FakeKms),
-            gcs.clone(),
-            gcs.clone(),
-            gcs,
-            1,
-            Some(StoreShadowCaptureSelection::for_test(
-                "capture-lifetime",
-                Arc::clone(&capture),
-            )),
-        );
-        store
-            .with_user("capture-lifetime", |connection| {
-                connection.execute(
-                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
-                    ["2026-08-13T12:00:00Z", "first"],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let actor = match store.actor_for_existing("capture-lifetime").await.unwrap() {
-            SaveTarget::Actor(actor) => actor,
-            SaveTarget::AlreadyFlushed => panic!("capture handle unexpectedly evicted"),
-        };
-        let first_stream = {
-            let state = actor.state.lock().await;
-            let registration = state
-                .handle
-                .as_ref()
-                .unwrap()
-                ._shadow_capture_registration
-                .as_ref()
-                .unwrap();
-            let stream = registration.stream_id();
-            let first = registration
-                .begin_drain(
-                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
-                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([32; 16]),
-                )
-                .unwrap()
-                .commit()
-                .unwrap();
-            assert_eq!(first.stream_id(), stream);
-            assert!(!first.commits().is_empty());
-            stream
-        };
-
-        store
-            .with_user("capture-lifetime", |connection| {
-                connection.execute(
-                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
-                    ["2026-08-13T12:01:00Z", "second"],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        {
-            let state = actor.state.lock().await;
-            let registration = state
-                .handle
-                .as_ref()
-                .unwrap()
-                ._shadow_capture_registration
-                .as_ref()
-                .unwrap();
-            assert_eq!(registration.stream_id(), first_stream);
-            let second = registration
-                .begin_drain(
-                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
-                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([33; 16]),
-                )
-                .unwrap()
-                .commit()
-                .unwrap();
-            assert!(!second.commits().is_empty());
-        }
-
-        store
-            .with_user("capture-lifetime", |connection| {
-                connection.execute(
-                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
-                    ["2026-08-13T12:02:00Z", "pending eviction"],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let eviction_lease = {
-            let state = actor.state.lock().await;
-            state
-                .handle
-                .as_ref()
-                .unwrap()
-                ._shadow_capture_registration
-                .as_ref()
-                .unwrap()
-                .begin_drain(
-                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
-                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([34; 16]),
-                )
-                .unwrap()
-        };
-        drop(actor);
-        // With a one-handle bound this access flushes, closes, and retires the
-        // first connection while its capture lease remains outstanding.
-        store
-            .with_user("capture-evictor", |connection| {
-                connection.execute(
-                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
-                    ["2026-08-13T12:03:00Z", "pending deletion"],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            eviction_lease.commit(),
-            Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
-        ));
-        assert!(!capture.registry.contains_stream_for_test(first_stream));
-
-        let unselected_actor = match store.actor_for_existing("capture-evictor").await.unwrap() {
-            SaveTarget::Actor(actor) => actor,
-            SaveTarget::AlreadyFlushed => panic!("unselected handle unexpectedly evicted"),
-        };
-        {
-            let state = unselected_actor.state.lock().await;
-            assert!(
-                state
-                    .handle
-                    .as_ref()
-                    .unwrap()
-                    ._shadow_capture_registration
-                    .is_none(),
-                "an unrelated user must never enter the selected capture VFS"
-            );
-        }
-        drop(unselected_actor);
-
-        store
-            .with_user("capture-lifetime", |connection| {
-                connection.execute(
-                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
-                    ["2026-08-13T12:04:00Z", "pending deletion"],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let deletion_actor = match store.actor_for_existing("capture-lifetime").await.unwrap() {
-            SaveTarget::Actor(actor) => actor,
-            SaveTarget::AlreadyFlushed => panic!("deletion capture handle unexpectedly evicted"),
-        };
-        let (deletion_lease, deletion_stream) = {
-            let state = deletion_actor.state.lock().await;
-            let registration = state
-                .handle
-                .as_ref()
-                .unwrap()
-                ._shadow_capture_registration
-                .as_ref()
-                .unwrap();
-            let stream = registration.stream_id();
-            let lease = registration
-                .begin_drain(
-                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([41; 16]),
-                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([42; 16]),
-                )
-                .unwrap();
-            (lease, stream)
-        };
-        drop(deletion_actor);
-        store.delete_user("capture-lifetime").await.unwrap();
-        assert!(matches!(
-            deletion_lease.commit(),
-            Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
-        ));
-        assert!(!capture.registry.contains_stream_for_test(deletion_stream));
-
-        let directory = tempfile::TempDir::new().unwrap();
-        let directory_path = directory.path().to_path_buf();
-        assert!(open_db(
-            &directory_path,
-            Some(capture.as_ref()),
-            StorePersistencePolicy::LegacySnapshot,
-        )
-        .is_err());
-        assert!(!capture.registry.contains_path_for_test(&directory_path));
-
-        let unavailable_capture = StoreShadowCapture {
-            registry: CaptureRegistry::new(),
-            vfs_name: CString::new("kioku-unregistered-capture-vfs").unwrap(),
-        };
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let database_path = database.path().to_path_buf();
-        let (connection, registration, _) = open_db(
-            &database_path,
-            Some(&unavailable_capture),
-            StorePersistencePolicy::LegacySnapshot,
-        )
-        .unwrap();
-        assert!(registration.is_none());
-        assert!(unavailable_capture.registry.is_empty_for_test());
-        drop(connection);
-        drop(store);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
