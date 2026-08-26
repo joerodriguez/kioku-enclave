@@ -1129,6 +1129,16 @@ async fn async_main() {
         .unwrap_or_else(|error| panic!("Failed to validate the genesis sign-in gate: {error}"));
     if genesis_native_signin {
         info!("new-user archive-v3 genesis is armed for sign-in");
+        let converged =
+            archive_v3_genesis_trigger::converge_all_live_legacy_users(&control_store, &store)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("Failed to converge every live legacy archive to Archive v3: {error}")
+                });
+        info!(
+            converged,
+            "converged every live legacy archive to Archive v3 before request admission"
+        );
     }
 
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {

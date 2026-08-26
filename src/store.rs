@@ -3350,6 +3350,50 @@ impl Store {
         self.legacy_checkpoint_reconciliation.lock().await.clone()
     }
 
+    /// Enumerate the exact live legacy index owners for the one-time
+    /// Archive-v3 startup convergence pass. Names remain process-private and
+    /// callers may report only aggregate counts. The provider listing is
+    /// bounded and every object name is validated with the same strict parser
+    /// as checkpoint reconciliation; an incomplete or ambiguous scan fails
+    /// startup closed.
+    pub(crate) async fn live_legacy_index_users(&self) -> Result<Vec<String>> {
+        let mut users = Vec::new();
+        let mut page_token = None;
+        let mut seen_cursor_fingerprints = [0_u64; GCS_CURSOR_FINGERPRINT_WORDS];
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self
+                .gcs
+                .list_live_objects("indexes/", page_token.as_deref())
+                .await?;
+            for listed in page.versions {
+                let user_id = legacy_index_user_id(&listed.name).ok_or_else(|| {
+                    EnclaveError::Store("legacy index inventory contains an invalid name".into())
+                })?;
+                users.push(user_id);
+            }
+            match page.next_page_token {
+                Some(next) => {
+                    let mut hasher = DefaultHasher::new();
+                    next.hash(&mut hasher);
+                    let fingerprint = (hasher.finish() as usize) % GCS_CURSOR_FINGERPRINT_BITS;
+                    let word = fingerprint / u64::BITS as usize;
+                    let mask = 1_u64 << (fingerprint % u64::BITS as usize);
+                    if seen_cursor_fingerprints[word] & mask != 0 {
+                        return Err(EnclaveError::Store(
+                            "legacy index inventory repeated a page cursor".into(),
+                        ));
+                    }
+                    seen_cursor_fingerprints[word] |= mask;
+                    page_token = Some(next);
+                }
+                None => return Ok(users),
+            }
+        }
+        Err(EnclaveError::Store(
+            "legacy index inventory exceeded the bounded page limit".into(),
+        ))
+    }
+
     /// Reconcile legacy archives already present before the first new save.
     /// This runs serially (one GCS operation chain at a time), retains only one
     /// listing page, and retries later after failures. It never changes bucket
@@ -12125,6 +12169,30 @@ pub(crate) mod tests {
             .await
             .is_err());
         assert!(!store.legacy_checkpoint_reconciliation().await.ready);
+    }
+
+    #[tokio::test]
+    async fn startup_genesis_inventory_is_complete_strict_and_cursor_bounded() {
+        let gcs = Arc::new(FakeGcs::new());
+        for user in ["archive-a", "archive-b", "archive-c"] {
+            gcs.put_object(&gcs_object_name(user), b"current", "wrapped", 0)
+                .await
+                .unwrap();
+        }
+        let store = store_with_checkpoint_time(Arc::clone(&gcs), 1_767_268_800);
+        assert_eq!(
+            store.live_legacy_index_users().await.unwrap(),
+            vec!["archive-a", "archive-b", "archive-c"]
+        );
+
+        gcs.put_object("indexes/not/a.db.enc", b"bad", "wrapped", 0)
+            .await
+            .unwrap();
+        assert!(store.live_legacy_index_users().await.is_err());
+
+        gcs.delete_object("indexes/not/a.db.enc").await.unwrap();
+        gcs.set_repeat_version_cursor(true);
+        assert!(store.live_legacy_index_users().await.is_err());
     }
 
     #[tokio::test]
