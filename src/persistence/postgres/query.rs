@@ -1113,4 +1113,193 @@ impl MemoryQueryRepository for PostgresPersistence {
             "episodes": episodes,
         })))
     }
+
+    async fn browser_snapshot(&self, account_id: &str, source_key: &str) -> Result<Option<Value>> {
+        const CAPTURE_V2_BROWSER_SOURCE_PREFIX: &str = "capture-v2-browser:";
+        if let Some(event_id) = source_key.strip_prefix(CAPTURE_V2_BROWSER_SOURCE_PREFIX) {
+            if event_id.is_empty() || event_id.len() > 512 || event_id.contains('\0') {
+                return Ok(None);
+            }
+            let screenshots = sqlx::query(
+                "SELECT c.source_key, \
+                        floor(extract(epoch FROM c.captured_at)*1000)::bigint AS captured_at_ms \
+                   FROM screenshots c WHERE c.account_id=$1 AND c.browser_snapshot_source_key=$2 \
+                    AND EXISTS (SELECT 1 FROM episode_members m JOIN episodes e \
+                         ON e.account_id=m.account_id AND e.id=m.episode_id \
+                         WHERE m.account_id=c.account_id AND m.record_type='screenshot' \
+                           AND m.record_id=c.id)",
+            )
+            .bind(account_id)
+            .bind(source_key)
+            .fetch_all(self.pool())
+            .await?;
+            if screenshots.is_empty() {
+                return Ok(None);
+            }
+            if screenshots.len() != 1 {
+                return Err(EnclaveError::Store(
+                    "browser-v2 screenshot association is ambiguous".into(),
+                ));
+            }
+            let screenshot = &screenshots[0];
+            let expected_screenshot_source_key = format!("cloud-v2:{event_id}");
+            if screenshot
+                .try_get::<Option<String>, _>("source_key")?
+                .as_deref()
+                != Some(expected_screenshot_source_key.as_str())
+            {
+                return Err(EnclaveError::Store(
+                    "browser-v2 screenshot source is inconsistent".into(),
+                ));
+            }
+            let event = sqlx::query(
+                "SELECT device_id,context_json::text AS context_json, \
+                        floor(extract(epoch FROM started_at)*1000)::bigint AS started_at_ms, \
+                        floor(extract(epoch FROM source_wall_at)*1000)::bigint AS source_wall_at_ms \
+                   FROM capture_events WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(account_id)
+            .bind(event_id)
+            .fetch_optional(self.pool())
+            .await?
+            .ok_or_else(|| EnclaveError::Store("browser-v2 capture event is missing".into()))?;
+            let observation = sqlx::query(
+                "SELECT observation_id,state_key,context_status,active_url,active_title, \
+                        floor(extract(epoch FROM observed_at)*1000)::bigint AS observed_at_ms \
+                   FROM browser_observations_v2 WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(account_id)
+            .bind(event_id)
+            .fetch_optional(self.pool())
+            .await?
+            .ok_or_else(|| EnclaveError::Store("browser-v2 observation is missing".into()))?;
+            let state_key = observation
+                .try_get::<Option<String>, _>("state_key")?
+                .ok_or_else(|| {
+                    EnclaveError::Store("browser-v2 observation is missing state".into())
+                })?;
+            let state = sqlx::query(
+                "SELECT browser_bundle_id,browser_name,permission_status,content_hash, \
+                        tabs_json::text AS tabs_json FROM browser_states_v2 \
+                  WHERE account_id=$1 AND state_key=$2",
+            )
+            .bind(account_id)
+            .bind(&state_key)
+            .fetch_optional(self.pool())
+            .await?
+            .ok_or_else(|| EnclaveError::Store("browser-v2 state is missing".into()))?;
+            let context: crate::cp::media::CaptureContext = serde_json::from_str(
+                event
+                    .try_get::<Option<String>, _>("context_json")?
+                    .as_deref()
+                    .ok_or_else(|| EnclaveError::Store("browser-v2 context is missing".into()))?,
+            )
+            .map_err(|_| EnclaveError::Store("browser-v2 context is corrupt".into()))?;
+            let observed_at = required_timestamp(&observation, "observed_at_ms")?;
+            let source_wall_at = required_timestamp(&event, "source_wall_at_ms")?;
+            let tabs_json: String = state.try_get("tabs_json")?;
+            let browser_bundle_id: String = state.try_get("browser_bundle_id")?;
+            let browser_name: String = state.try_get("browser_name")?;
+            let permission_status: String = state.try_get("permission_status")?;
+            let content_hash: String = state.try_get("content_hash")?;
+            let observation_id: String = observation.try_get("observation_id")?;
+            let context_status: String = observation.try_get("context_status")?;
+            let active_url: Option<String> = observation.try_get("active_url")?;
+            let active_title: Option<String> = observation.try_get("active_title")?;
+            let device_id: String = event.try_get("device_id")?;
+            let snapshot = crate::cp::media::validate_browser_v2_persisted_evidence(
+                &context,
+                crate::cp::media::BrowserV2PersistedEvidence {
+                    event_id,
+                    device_id: &device_id,
+                    source_wall_at: &source_wall_at,
+                    observation_id: &observation_id,
+                    observed_at: &observed_at,
+                    state_key: Some(&state_key),
+                    context_status: &context_status,
+                    active_url: active_url.as_deref(),
+                    active_title: active_title.as_deref(),
+                    browser_bundle_id: &browser_bundle_id,
+                    browser_name: &browser_name,
+                    permission_status: &permission_status,
+                    content_hash: &content_hash,
+                    tabs_json: &tabs_json,
+                },
+            )?;
+            let captured_at_ms: i64 = screenshot.try_get("captured_at_ms")?;
+            if captured_at_ms != event.try_get::<i64, _>("started_at_ms")? {
+                return Err(EnclaveError::Store(
+                    "browser-v2 evidence is inconsistent".into(),
+                ));
+            }
+            return Ok(Some(json!({
+                "source_key": source_key,
+                "captured_at": isotime::format_epoch_millis(captured_at_ms),
+                "observed_at": observed_at,
+                "browser_bundle_id": snapshot.browser_bundle_id,
+                "browser_name": snapshot.browser_name,
+                "permission_status": snapshot.permission_status,
+                "active_window_index": snapshot.active_window_index,
+                "active_tab_index": snapshot.active_tab_index,
+                "reported_tab_count": snapshot.reported_tab_count,
+                "truncated": snapshot.truncated,
+                "ambient_tab_collection_enabled": snapshot.ambient_tab_collection_enabled,
+                "tabs": snapshot.tabs,
+            })));
+        }
+
+        let snapshot = sqlx::query(
+            "SELECT b.id,b.browser_bundle_id,b.browser_name,b.permission_status, \
+                    b.active_window_index,b.active_tab_index,b.reported_tab_count,b.truncated, \
+                    floor(extract(epoch FROM b.captured_at)*1000)::bigint AS captured_at_ms \
+               FROM browser_snapshots b WHERE b.account_id=$1 AND b.source_key=$2 \
+                AND EXISTS (SELECT 1 FROM screenshots c JOIN episode_members m \
+                     ON m.account_id=c.account_id AND m.record_type='screenshot' AND m.record_id=c.id \
+                     JOIN episodes e ON e.account_id=m.account_id AND e.id=m.episode_id \
+                     WHERE c.account_id=b.account_id AND c.browser_snapshot_source_key=b.source_key)",
+        )
+        .bind(account_id)
+        .bind(source_key)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let snapshot_id: i64 = snapshot.try_get("id")?;
+        let tab_rows = sqlx::query(
+            "SELECT window_index,tab_index,title,url,url_scheme,is_active,is_loading \
+               FROM browser_tabs WHERE account_id=$1 AND browser_snapshot_id=$2 \
+              ORDER BY window_index,tab_index LIMIT 500",
+        )
+        .bind(account_id)
+        .bind(snapshot_id)
+        .fetch_all(self.pool())
+        .await?;
+        let tabs = tab_rows
+            .iter()
+            .map(|row| {
+                Ok(json!({
+                    "window_index": row.try_get::<i64, _>("window_index")?,
+                    "tab_index": row.try_get::<i64, _>("tab_index")?,
+                    "title": row.try_get::<Option<String>, _>("title")?,
+                    "url": row.try_get::<Option<String>, _>("url")?,
+                    "url_scheme": row.try_get::<Option<String>, _>("url_scheme")?,
+                    "is_active": row.try_get::<bool, _>("is_active")?,
+                    "is_loading": row.try_get::<Option<bool>, _>("is_loading")?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(json!({
+            "source_key": source_key,
+            "captured_at": required_timestamp(&snapshot, "captured_at_ms")?,
+            "browser_bundle_id": snapshot.try_get::<String, _>("browser_bundle_id")?,
+            "browser_name": snapshot.try_get::<String, _>("browser_name")?,
+            "permission_status": snapshot.try_get::<String, _>("permission_status")?,
+            "active_window_index": snapshot.try_get::<Option<i64>, _>("active_window_index")?,
+            "active_tab_index": snapshot.try_get::<Option<i64>, _>("active_tab_index")?,
+            "reported_tab_count": snapshot.try_get::<i64, _>("reported_tab_count")?,
+            "truncated": snapshot.try_get::<bool, _>("truncated")?,
+            "tabs": tabs,
+        })))
+    }
 }
