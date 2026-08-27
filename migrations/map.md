@@ -33,3 +33,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   billing delivery claims, and coverage reconciliation.
 - `0014_media_processing.sql` adds fleet-wide media work-unit claims and
   tenant-qualified transcript, screen, speaker, and voice-job projections.
+- `0015_memory_formation.sql` adds fleet-wide summarizer window claims and
+  atomic episode/cursor settlement.
