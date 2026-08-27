@@ -39,8 +39,9 @@ pub(crate) use oauth::{
 };
 pub(crate) use postgres::PostgresPersistence;
 pub(crate) use query::{
-    CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryFeedPage, MemoryFeedRecord,
-    MemoryFeedRequest, MemoryQueryRepository,
+    CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
+    McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
+    MemoryQueryRepository,
 };
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,

@@ -7,8 +7,9 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::persistence::{
-    CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryFeedPage, MemoryFeedRecord,
-    MemoryFeedRequest, MemoryQueryRepository,
+    CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
+    McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
+    MemoryQueryRepository,
 };
 use crate::search::{search_all, SearchHit, SearchRequest};
 use crate::store::Store;
@@ -186,6 +187,57 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
         self.store
             .wal_authoritative_read(account_id, move |connection| {
                 legacy_feed(connection, &request)
+            })
+            .await
+    }
+
+    async fn mcp_search_transcripts(
+        &self,
+        account_id: &str,
+        request: &McpTranscriptSearchRequest,
+    ) -> Result<Value> {
+        let request = request.clone();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                Ok(crate::cp::mcp_query::search_safe_transcripts(
+                    connection,
+                    &request.query,
+                    request.from.as_deref(),
+                    request.to.as_deref(),
+                    request.limit,
+                )?)
+            })
+            .await
+    }
+
+    async fn mcp_context(&self, account_id: &str, request: &McpContextRequest) -> Result<Value> {
+        let request = request.clone();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                Ok(crate::cp::mcp_query::fetch_safe_context(
+                    connection,
+                    &request.at,
+                    request.window_seconds,
+                    request.limit,
+                )?)
+            })
+            .await
+    }
+
+    async fn mcp_time_range(
+        &self,
+        account_id: &str,
+        request: &McpTimeRangeRequest,
+    ) -> Result<Value> {
+        let request = request.clone();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                Ok(crate::cp::mcp_query::summarize_safe_time_range(
+                    connection,
+                    &request.from,
+                    &request.to,
+                    request.limit,
+                )?)
             })
             .await
     }
