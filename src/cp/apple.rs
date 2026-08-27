@@ -25,6 +25,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::error::{EnclaveError, Result};
+use crate::persistence::AppleAccountGrant;
 
 use super::auth::AuthUser;
 use super::{oauth, tokens, CpState};
@@ -73,12 +74,21 @@ enum AppleFlowError {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedAppleGrant {
     pub subject: String,
     pub email: String,
     pub refresh_token: String,
     pub client_id: String,
+}
+
+fn persistence_grant(grant: &VerifiedAppleGrant) -> AppleAccountGrant {
+    AppleAccountGrant {
+        subject: grant.subject.clone(),
+        email: grant.email.clone(),
+        refresh_token: grant.refresh_token.clone(),
+        client_id: grant.client_id.clone(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,14 +640,9 @@ async fn web_callback(State(state): State<Arc<CpState>>, body: String) -> Respon
         return finish_web_link(&state, &downstream.apple_link_user_id, grant).await;
     }
     let user = match state
-        .control
-        .upsert_apple_user(
-            &grant.subject,
-            &grant.email,
-            &grant.client_id,
-            &grant.refresh_token,
-            state.config.signup_limit_per_day,
-        )
+        .repositories
+        .identity_sessions()
+        .upsert_apple_account(persistence_grant(&grant), state.config.signup_limit_per_day)
         .await
     {
         Ok(user) => user,
@@ -665,14 +670,9 @@ async fn finish_web_link(
     grant: VerifiedAppleGrant,
 ) -> Response {
     let status = match state
-        .control
-        .link_apple_identity(
-            user_id,
-            &grant.subject,
-            &grant.email,
-            &grant.client_id,
-            &grant.refresh_token,
-        )
+        .repositories
+        .identity_sessions()
+        .link_apple_identity(user_id, persistence_grant(&grant))
         .await
     {
         Ok(()) => "linked",
@@ -693,14 +693,9 @@ fn web_link_redirect(state: &CpState, status: &str) -> Response {
 
 async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) -> Response {
     let user = match state
-        .control
-        .upsert_apple_user(
-            &grant.subject,
-            &grant.email,
-            &grant.client_id,
-            &grant.refresh_token,
-            state.config.signup_limit_per_day,
-        )
+        .repositories
+        .identity_sessions()
+        .upsert_apple_account(persistence_grant(&grant), state.config.signup_limit_per_day)
         .await
     {
         Ok(user) => user,
@@ -728,8 +723,14 @@ async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) ->
         Ok(tokens) => tokens,
         Err(_) => return server_error(),
     };
-    let providers = match state.control.linked_providers(&user.id).await {
-        Ok(providers) => providers,
+    let providers = match state
+        .repositories
+        .identity_sessions()
+        .account_session(&user.id)
+        .await
+    {
+        Ok(Some(session)) => session.providers,
+        Ok(None) => return server_error(),
         Err(_) => return server_error(),
     };
     no_store_json(json!({
@@ -750,8 +751,13 @@ async fn session(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let email = match state.control.user_email(&user.0).await {
-        Ok(Some(email)) => email,
+    let session = match state
+        .repositories
+        .identity_sessions()
+        .account_session(&user.0)
+        .await
+    {
+        Ok(Some(session)) => session,
         Ok(None) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -759,10 +765,6 @@ async fn session(
             )
                 .into_response()
         }
-        Err(_) => return server_error(),
-    };
-    let providers = match state.control.linked_providers(&user.0).await {
-        Ok(providers) => providers,
         Err(_) => return server_error(),
     };
     // Native Google clients authenticate this route with their Google ID
@@ -779,9 +781,9 @@ async fn session(
     );
     no_store_json(json!({
         "account_id": user.0,
-        "email": email,
+        "email": session.account.email,
         "issuer": state.config.base_url,
-        "providers": providers,
+        "providers": session.providers,
     }))
 }
 
@@ -823,22 +825,21 @@ async fn link(
         }
     };
     match state
-        .control
-        .link_apple_identity(
-            &user.0,
-            &grant.subject,
-            &grant.email,
-            &grant.client_id,
-            &grant.refresh_token,
-        )
+        .repositories
+        .identity_sessions()
+        .link_apple_identity(&user.0, persistence_grant(&grant))
         .await
     {
         Ok(()) => {
             let providers = state
-                .control
-                .linked_providers(&user.0)
+                .repositories
+                .identity_sessions()
+                .account_session(&user.0)
                 .await
-                .unwrap_or_else(|_| vec!["apple".into()]);
+                .ok()
+                .flatten()
+                .map(|session| session.providers)
+                .unwrap_or_else(|| vec!["apple".into()]);
             no_store_json(json!({"linked": true, "providers": providers}))
         }
         Err(EnclaveError::Conflict(_)) => (

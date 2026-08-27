@@ -5,12 +5,19 @@
 //! SQLite/GCS stores while the PostgreSQL implementation is built vertically.
 
 mod identity;
+mod legacy;
+mod oauth;
 
 use std::sync::Arc;
 
-pub(crate) use identity::{AccountStatus, IdentitySessionRepository};
+pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
+pub(crate) use oauth::{
+    AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
+    OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
+    OAuthRepository, PendingConsent, RefreshTokenRotation,
+};
 
-use self::identity::LegacyIdentitySessionRepository;
+use self::legacy::{LegacyIdentitySessionRepository, LegacyOAuthRepository};
 use crate::cp::control_store::ControlStore;
 
 /// The persistence dependencies injected into application code.
@@ -20,17 +27,23 @@ use crate::cp::control_store::ControlStore;
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
+    oauth: Arc<dyn OAuthRepository>,
 }
 
 impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>) -> Self {
         Self {
-            identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(control)),
+            identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
+            oauth: Arc::new(LegacyOAuthRepository::new(control)),
         }
     }
 
     pub(crate) fn identity_sessions(&self) -> &dyn IdentitySessionRepository {
         self.identity_sessions.as_ref()
+    }
+
+    pub(crate) fn oauth(&self) -> &dyn OAuthRepository {
+        self.oauth.as_ref()
     }
 }
 
