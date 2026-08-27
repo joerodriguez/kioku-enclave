@@ -405,16 +405,28 @@ mod tests {
         .unwrap();
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
+        // Reset every business table so this contract proves a database can be
+        // reused across repeated local/full-suite runs. A hand-maintained list
+        // silently missed newly added content and delivery tables and made the
+        // second run observe stale terminal receipts. Keep only SQLx's migration
+        // ledger and the release schema-version receipt.
         sqlx::raw_sql(
-            "TRUNCATE fleet_concurrency_leases, fleet_rate_limits, \
-             vertex_usage_events, vertex_usage_coverage, account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
-             recording_delivery_balances, recording_lease_denials, recording_lease_requests, \
-             recording_leases, vertex_coverage_anchors, billing_detach_outbox, billing_accounts, \
-             push_send_fences, push_installations, email_send_fences, \
-             episode_email_preferences, webhook_send_fences, webhook_subscriptions, \
-             usage_daily, refresh_tokens, oauth_authorization_codes, oauth_consents, \
-             oauth_clients, apple_credentials, auth_identities, deleted_identities, \
-             deleted_accounts, signup_daily, accounts CASCADE",
+            "DO $$
+             DECLARE tables_to_reset text;
+             BEGIN
+               SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
+                 INTO tables_to_reset
+                 FROM pg_tables
+                WHERE schemaname = 'public'
+                  AND tablename NOT IN ('_sqlx_migrations', 'persistence_schema');
+               IF tables_to_reset IS NOT NULL THEN
+                 EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
+               END IF;
+             END
+             $$;
+             ALTER SEQUENCE push_token_generation_seq RESTART WITH 1;
+             INSERT INTO provider_send_lanes(provider)
+             VALUES ('email'), ('webhook'), ('push');",
         )
         .execute(persistence.pool())
         .await
