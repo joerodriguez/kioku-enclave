@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use sqlx::Row;
 
@@ -13,6 +15,36 @@ const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
 const RECORDING_DELIVERY_EVENTS_PER_MINUTE: i64 = 120;
 const RECORDING_DELIVERY_BYTES_PER_MINUTE: i64 = 256 * 1024 * 1024;
 const MAX_RECORDING_LEASE_DENIALS_PER_ACCOUNT: i64 = 100;
+const MAX_PENDING_REFERENCE_BATCHES_PER_ACCOUNT: i64 = 256;
+
+fn valid_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn settle_reference_batches(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE capture_reference_batch_receipts r SET state='completed',updated_at=now() \
+          WHERE r.account_id=$1 AND r.state='reserved' AND NOT EXISTS ( \
+            SELECT 1 FROM capture_reference_batch_events e \
+            JOIN recording_delivery_reservations d ON d.account_id=e.account_id AND d.event_id=e.event_id \
+            WHERE e.account_id=r.account_id AND e.batch_id=r.batch_id)",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM capture_reference_batch_receipts r WHERE r.account_id=$1 AND r.state='completed' \
+          AND r.batch_id NOT IN (SELECT batch_id FROM capture_reference_batch_receipts \
+            WHERE account_id=$1 AND state='completed' ORDER BY updated_at DESC,batch_id DESC LIMIT 256)",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
 
 fn valid_utc_month(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -487,6 +519,246 @@ impl BillingRepository for PostgresPersistence {
         }
         transaction.commit().await?;
         Ok(true)
+    }
+
+    async fn reserve_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        stream_id: &str,
+        first_sequence: i64,
+        last_sequence: i64,
+        event_ids: &[String],
+        new_event_ids: &[String],
+    ) -> Result<bool> {
+        let event_set = event_ids.iter().collect::<HashSet<_>>();
+        let new_set = new_event_ids.iter().collect::<HashSet<_>>();
+        if !valid_hex_digest(batch_id)
+            || !valid_hex_digest(manifest_digest)
+            || stream_id.is_empty()
+            || event_ids.is_empty()
+            || event_ids.len() > 64
+            || event_set.len() != event_ids.len()
+            || new_set.len() != new_event_ids.len()
+            || new_event_ids.iter().any(|event| !event_set.contains(event))
+            || first_sequence < 0
+            || last_sequence < first_sequence
+            || last_sequence
+                .checked_sub(first_sequence)
+                .and_then(|span| span.checked_add(1))
+                != i64::try_from(event_ids.len()).ok()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch reservation is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "recording-accounting", account_id).await?;
+        let existing = sqlx::query(
+            "SELECT manifest_digest,stream_id,first_sequence,last_sequence,event_count,state \
+               FROM capture_reference_batch_receipts WHERE account_id=$1 AND batch_id=$2 FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(batch_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let state = if let Some(row) = existing {
+            let stored_events = sqlx::query_scalar::<_, String>(
+                "SELECT event_id FROM capture_reference_batch_events \
+                  WHERE account_id=$1 AND batch_id=$2 ORDER BY ordinal",
+            )
+            .bind(account_id)
+            .bind(batch_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            if row.try_get::<String, _>("manifest_digest")? != manifest_digest
+                || row.try_get::<String, _>("stream_id")? != stream_id
+                || row.try_get::<i64, _>("first_sequence")? != first_sequence
+                || row.try_get::<i64, _>("last_sequence")? != last_sequence
+                || row.try_get::<i64, _>("event_count")?
+                    != i64::try_from(event_ids.len()).unwrap_or(i64::MAX)
+                || stored_events != event_ids
+            {
+                return Err(EnclaveError::Conflict(
+                    "idempotency conflict for reference batch".into(),
+                ));
+            }
+            row.try_get::<String, _>("state")?
+        } else {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM capture_reference_batch_receipts \
+                  WHERE account_id=$1 AND state<>'completed'",
+            )
+            .bind(account_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if pending >= MAX_PENDING_REFERENCE_BATCHES_PER_ACCOUNT {
+                return Err(EnclaveError::Conflict(
+                    "too many pending reference batches".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO capture_reference_batch_receipts \
+                 (account_id,batch_id,manifest_digest,stream_id,first_sequence,last_sequence,event_count,state) \
+                 VALUES($1,$2,$3,$4,$5,$6,$7,'awaiting_credit')",
+            )
+            .bind(account_id)
+            .bind(batch_id)
+            .bind(manifest_digest)
+            .bind(stream_id)
+            .bind(first_sequence)
+            .bind(last_sequence)
+            .bind(i64::try_from(event_ids.len()).unwrap_or(i64::MAX))
+            .execute(&mut *transaction)
+            .await?;
+            for (ordinal, event_id) in event_ids.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO capture_reference_batch_events(account_id,batch_id,ordinal,event_id) \
+                     VALUES($1,$2,$3,$4)",
+                )
+                .bind(account_id)
+                .bind(batch_id)
+                .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+                .bind(event_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            "awaiting_credit".into()
+        };
+        if state == "completed" {
+            if !new_event_ids.is_empty() {
+                return Err(EnclaveError::Store(
+                    "completed reference batch is absent from structured capture state".into(),
+                ));
+            }
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        let mut unreserved = Vec::new();
+        for event_id in new_event_ids {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM recording_delivery_reservations \
+                  WHERE account_id=$1 AND event_id=$2)",
+            )
+            .bind(account_id)
+            .bind(event_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !exists {
+                unreserved.push(event_id);
+            }
+        }
+        if !unreserved.is_empty() {
+            let available = sqlx::query_scalar::<_, i64>(
+                "SELECT event_credits FROM recording_delivery_balances WHERE account_id=$1 FOR UPDATE",
+            )
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if available
+                .is_none_or(|credits| credits < i64::try_from(unreserved.len()).unwrap_or(i64::MAX))
+            {
+                transaction.commit().await?;
+                return Ok(false);
+            }
+            sqlx::query(
+                "UPDATE recording_delivery_balances SET event_credits=event_credits-$2,updated_at=now() \
+                  WHERE account_id=$1",
+            )
+            .bind(account_id)
+            .bind(i64::try_from(unreserved.len()).unwrap_or(i64::MAX))
+            .execute(&mut *transaction)
+            .await?;
+            for event_id in unreserved {
+                sqlx::query(
+                    "INSERT INTO recording_delivery_reservations(account_id,event_id,reserved_bytes) \
+                     VALUES($1,$2,0) ON CONFLICT(account_id,event_id) DO NOTHING",
+                )
+                .bind(account_id)
+                .bind(event_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "UPDATE capture_reference_batch_receipts SET state='reserved',updated_at=now() \
+              WHERE account_id=$1 AND batch_id=$2 AND state<>'reserved'",
+        )
+        .bind(account_id)
+        .bind(batch_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    async fn complete_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        event_ids: &[String],
+    ) -> Result<()> {
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "recording-accounting", account_id).await?;
+        let receipt = sqlx::query(
+            "SELECT manifest_digest FROM capture_reference_batch_receipts \
+              WHERE account_id=$1 AND batch_id=$2 FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(batch_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| EnclaveError::Store("reference batch receipt is missing".into()))?;
+        let stored_events = sqlx::query_scalar::<_, String>(
+            "SELECT event_id FROM capture_reference_batch_events \
+              WHERE account_id=$1 AND batch_id=$2 ORDER BY ordinal",
+        )
+        .bind(account_id)
+        .bind(batch_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if receipt.try_get::<String, _>("manifest_digest")? != manifest_digest
+            || stored_events != event_ids
+        {
+            return Err(EnclaveError::Conflict(
+                "idempotency conflict for reference batch completion".into(),
+            ));
+        }
+        sqlx::query(
+            "DELETE FROM recording_delivery_reservations WHERE account_id=$1 AND event_id=ANY($2)",
+        )
+        .bind(account_id)
+        .bind(event_ids)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE capture_reference_batch_receipts SET state='completed',updated_at=now() \
+              WHERE account_id=$1 AND batch_id=$2",
+        )
+        .bind(account_id)
+        .bind(batch_id)
+        .execute(&mut *transaction)
+        .await?;
+        settle_reference_batches(&mut transaction, account_id).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn complete_recording_delivery(&self, account_id: &str, event_id: &str) -> Result<()> {
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "recording-accounting", account_id).await?;
+        sqlx::query(
+            "DELETE FROM recording_delivery_reservations WHERE account_id=$1 AND event_id=$2",
+        )
+        .bind(account_id)
+        .bind(event_id)
+        .execute(&mut *transaction)
+        .await?;
+        settle_reference_batches(&mut transaction, account_id).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn recording_lease_receipt(

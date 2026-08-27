@@ -1305,7 +1305,8 @@ pub async fn reserve_recording_delivery_batch(
     new_event_ids: &[String],
 ) -> Result<(), Response> {
     match state
-        .control
+        .repositories
+        .billing()
         .reserve_recording_delivery_batch(
             user_id,
             batch_id,
@@ -1341,7 +1342,8 @@ pub async fn complete_recording_delivery_batch(
     event_ids: &[String],
 ) {
     if let Err(error) = state
-        .control
+        .repositories
+        .billing()
         .complete_recording_delivery_batch(user_id, batch_id, manifest_digest, event_ids)
         .await
     {
@@ -1351,7 +1353,8 @@ pub async fn complete_recording_delivery_batch(
 
 pub async fn complete_recording_delivery(state: &CpState, user_id: &str, event_id: &str) {
     if let Err(error) = state
-        .control
+        .repositories
+        .billing()
         .complete_recording_delivery(user_id, event_id)
         .await
     {

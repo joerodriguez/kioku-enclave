@@ -76,6 +76,26 @@ pub(crate) trait BillingRepository: Send + Sync {
         event_id: &str,
         media_bytes: i64,
     ) -> Result<bool>;
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        stream_id: &str,
+        first_sequence: i64,
+        last_sequence: i64,
+        event_ids: &[String],
+        new_event_ids: &[String],
+    ) -> Result<bool>;
+    async fn complete_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        event_ids: &[String],
+    ) -> Result<()>;
+    async fn complete_recording_delivery(&self, account_id: &str, event_id: &str) -> Result<()>;
 
     async fn recording_lease_receipt(
         &self,
