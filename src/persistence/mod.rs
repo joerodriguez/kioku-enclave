@@ -20,6 +20,7 @@ mod memory_formation;
 mod model_usage;
 mod notification;
 mod oauth;
+mod playback;
 mod query;
 mod recording_retention;
 mod work;
@@ -77,6 +78,7 @@ pub(crate) use oauth::{
     OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
+pub(crate) use playback::PlaybackRepository;
 pub(crate) use postgres::PostgresPersistence;
 pub(crate) use query::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
@@ -100,7 +102,8 @@ use self::legacy::{
     LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
     LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMediaObjectStore,
     LegacyMemoryQueryRepository, LegacyModelUsageRepository, LegacyNotificationRepository,
-    LegacyOAuthRepository, LegacyRecordingRetentionRepository, LegacyWorkRepository,
+    LegacyOAuthRepository, LegacyPlaybackRepository, LegacyRecordingRetentionRepository,
+    LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 use crate::store::Store;
@@ -117,6 +120,7 @@ pub(crate) struct RepositorySet {
     billing: Arc<dyn BillingRepository>,
     captures: Arc<dyn CaptureRepository>,
     oauth: Arc<dyn OAuthRepository>,
+    playback: Arc<dyn PlaybackRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
     episode_deletions: Option<Arc<dyn EpisodeDeletionRepository>>,
     deliveries: Option<Arc<dyn DeliveryRepository>>,
@@ -140,6 +144,7 @@ impl RepositorySet {
             billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
             captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
+            playback: Arc::new(LegacyPlaybackRepository::new(Arc::clone(&store))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             episode_deletions: None,
             deliveries: None,
@@ -170,6 +175,7 @@ impl RepositorySet {
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
             captures: Arc::clone(&persistence) as Arc<dyn CaptureRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
+            playback: Arc::clone(&persistence) as Arc<dyn PlaybackRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             episode_deletions: Some(Arc::clone(&persistence) as Arc<dyn EpisodeDeletionRepository>),
             deliveries: Some(Arc::clone(&persistence) as Arc<dyn DeliveryRepository>),
@@ -207,6 +213,10 @@ impl RepositorySet {
 
     pub(crate) fn oauth(&self) -> &dyn OAuthRepository {
         self.oauth.as_ref()
+    }
+
+    pub(crate) fn playback(&self) -> &dyn PlaybackRepository {
+        self.playback.as_ref()
     }
 
     pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {

@@ -17,6 +17,7 @@ mod memory_formation;
 mod model_usage;
 mod notification;
 mod oauth;
+mod playback;
 mod query;
 mod recording_retention;
 mod work;
@@ -2050,6 +2051,15 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO speaker_observation_sources \
+             (account_id,speaker_observation_id,event_id,window_start_ms,window_end_ms,event_start_ms,event_end_ms) \
+             VALUES($1,1,'capture-contract-0',0,5000,0,5000)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "UPDATE utterances SET source_key='cloud-v2:capture-contract-0:turn-contract', \
                     speaker_observation_id=1 WHERE account_id=$1 AND id=1",
         )
@@ -2236,6 +2246,13 @@ mod tests {
             statement_page.statements[0].episode_title.as_deref(),
             Some("PostgreSQL rollout")
         );
+        let person_memories = repositories
+            .playback()
+            .person_memories(&account_id, 1, None, 25, None)
+            .await
+            .unwrap();
+        assert_eq!(person_memories.memories.len(), 1);
+        assert_eq!(person_memories.memories[0].memory_id, 1);
         sqlx::query(
             "UPDATE capture_sessions SET last_event_at=now() WHERE account_id=$1 AND id=$2",
         )
@@ -2454,6 +2471,14 @@ mod tests {
             .export(&account_id)
             .await
             .unwrap();
+        let playback = repositories
+            .playback()
+            .dataset(&account_id, episode_ids[0], None)
+            .await
+            .unwrap()
+            .expect("PostgreSQL playback dataset");
+        assert_eq!(playback.memory_id, episode_ids[0]);
+        assert!(playback.projection_revision > 0);
         assert_eq!(
             export
                 .get("capture_events")

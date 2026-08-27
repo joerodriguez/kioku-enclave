@@ -35,12 +35,11 @@ const PLAYBACK_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const MAX_SEGMENTS_PER_WINDOW: usize = 128;
 const MAX_UTTERANCES_PER_WINDOW: usize = 1_000;
 const MAX_SOURCE_SPANS_PER_WINDOW: usize = 4_000;
-const MAX_AUDIO_SEGMENT_BYTES: i64 = 20 * 1024 * 1024;
+pub(crate) const MAX_AUDIO_SEGMENT_BYTES: i64 = 20 * 1024 * 1024;
 const SOURCE_CLOCK_TOLERANCE_MS: i64 = 2_000;
 const PLAYBACK_CURSOR_TTL_SECONDS: i64 = 5 * 60;
 const PEOPLE_MEMORIES_DEFAULT_LIMIT: usize = 25;
 const PEOPLE_MEMORIES_MAX_LIMIT: usize = 100;
-const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -175,33 +174,33 @@ struct PlaybackManifest {
 }
 
 #[derive(Debug, Clone)]
-struct SegmentAuthority {
-    recording_id: String,
-    segment_id: String,
-    track_id: String,
-    kind: String,
-    capture_session_id: String,
-    stream_id: String,
-    event_id: String,
-    asset_id: Option<String>,
-    object_key: Option<String>,
-    generation: Option<i64>,
-    object_backend: Option<String>,
-    stored_mime_type: Option<String>,
-    codec: Option<String>,
-    byte_length: Option<i64>,
-    sha256: Option<String>,
-    processing_state: Option<String>,
-    deleted_at: Option<String>,
-    retention_decision: String,
-    storage_backend: String,
-    retention_policy_revision: Option<i64>,
-    retention_policy_epoch: Option<String>,
-    recording_key_epoch: Option<i64>,
-    recording_state: String,
-    durable_read_authorized: bool,
-    timeline_start_ms: i64,
-    timeline_end_ms: i64,
+pub(crate) struct SegmentAuthority {
+    pub(crate) recording_id: String,
+    pub(crate) segment_id: String,
+    pub(crate) track_id: String,
+    pub(crate) kind: String,
+    pub(crate) capture_session_id: String,
+    pub(crate) stream_id: String,
+    pub(crate) event_id: String,
+    pub(crate) asset_id: Option<String>,
+    pub(crate) object_key: Option<String>,
+    pub(crate) generation: Option<i64>,
+    pub(crate) object_backend: Option<String>,
+    pub(crate) stored_mime_type: Option<String>,
+    pub(crate) codec: Option<String>,
+    pub(crate) byte_length: Option<i64>,
+    pub(crate) sha256: Option<String>,
+    pub(crate) processing_state: Option<String>,
+    pub(crate) deleted_at: Option<String>,
+    pub(crate) retention_decision: String,
+    pub(crate) storage_backend: String,
+    pub(crate) retention_policy_revision: Option<i64>,
+    pub(crate) retention_policy_epoch: Option<String>,
+    pub(crate) recording_key_epoch: Option<i64>,
+    pub(crate) recording_state: String,
+    pub(crate) durable_read_authorized: bool,
+    pub(crate) timeline_start_ms: i64,
+    pub(crate) timeline_end_ms: i64,
 }
 
 impl SegmentAuthority {
@@ -270,24 +269,27 @@ impl SegmentAuthority {
 }
 
 #[derive(Debug, Clone)]
-struct UtteranceAuthority {
-    utterance_id: i64,
-    observation_id: Option<i64>,
-    timeline_start_ms: i64,
-    timeline_end_ms: i64,
-    text: String,
-    fallback_label: String,
-    overlap: bool,
+pub(crate) struct UtteranceAuthority {
+    pub(crate) utterance_id: i64,
+    pub(crate) observation_id: Option<i64>,
+    pub(crate) timeline_start_ms: i64,
+    pub(crate) timeline_end_ms: i64,
+    pub(crate) text: String,
+    pub(crate) fallback_label: String,
+    pub(crate) overlap: bool,
+    pub(crate) person_id: Option<i64>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) attribution_state: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct SourceAuthority {
-    observation_id: i64,
-    event_id: String,
-    window_start_ms: i64,
-    window_end_ms: i64,
-    event_start_ms: i64,
-    event_end_ms: i64,
+pub(crate) struct SourceAuthority {
+    pub(crate) observation_id: i64,
+    pub(crate) event_id: String,
+    pub(crate) window_start_ms: i64,
+    pub(crate) window_end_ms: i64,
+    pub(crate) event_start_ms: i64,
+    pub(crate) event_end_ms: i64,
 }
 
 impl SourceAuthority {
@@ -309,42 +311,42 @@ impl SourceAuthority {
 }
 
 #[derive(Debug, Clone)]
-struct PlaybackDataset {
-    owner_id: String,
-    memory_id: i64,
-    started_at: String,
-    ended_at: String,
-    duration_ms: i64,
-    projection_revision: i64,
-    segments: Vec<SegmentAuthority>,
-    utterances: Vec<UtteranceAuthority>,
-    sources: Vec<SourceAuthority>,
+pub(crate) struct PlaybackDataset {
+    pub(crate) owner_id: String,
+    pub(crate) memory_id: i64,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) duration_ms: i64,
+    pub(crate) projection_revision: i64,
+    pub(crate) segments: Vec<SegmentAuthority>,
+    pub(crate) utterances: Vec<UtteranceAuthority>,
+    pub(crate) sources: Vec<SourceAuthority>,
 }
 
 #[derive(Debug, Serialize)]
-struct PersonMemorySummary {
-    memory_id: i64,
-    title: Option<String>,
-    summary: Option<String>,
-    started_at: String,
-    ended_at: String,
-    attributed_utterance_count: i64,
-    contributing_recording_count: i64,
-    audio_availability: String,
-    playback_start_ms: Option<i64>,
-    playback_utterance_id: Option<i64>,
+pub(crate) struct PersonMemorySummary {
+    pub(crate) memory_id: i64,
+    pub(crate) title: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) attributed_utterance_count: i64,
+    pub(crate) contributing_recording_count: i64,
+    pub(crate) audio_availability: String,
+    pub(crate) playback_start_ms: Option<i64>,
+    pub(crate) playback_utterance_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
-struct PersonMemoriesPage {
-    memories: Vec<PersonMemorySummary>,
-    next_cursor: Option<i64>,
+pub(crate) struct PersonMemoriesPage {
+    pub(crate) memories: Vec<PersonMemorySummary>,
+    pub(crate) next_cursor: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-struct DurableReadFence {
-    policy_revision: i64,
-    policy_epoch: String,
+pub(crate) struct DurableReadFence {
+    pub(crate) policy_revision: i64,
+    pub(crate) policy_epoch: String,
 }
 
 async fn current_durable_read_fence(
@@ -395,27 +397,30 @@ async fn memory_playback_manifest(
     if !manifest_limiter().consume(&user_id).await {
         return too_many_requests();
     }
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
+        }
+    } else {
+        None
     };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
     };
-    let read_user = user_id.clone();
-    let result = state
-        .store
-        .wal_authoritative_read(&read_user, move |conn| {
-            let Some(dataset) =
-                load_playback_dataset(conn, &user_id, memory_id, durable_read.as_ref())?
-            else {
-                return Ok(None);
-            };
-            let window_start = playback_window_start(&dataset, &query)?;
-            Ok(Some(project_manifest(conn, &dataset, window_start)?))
-        })
-        .await;
+    let result = match state
+        .repositories
+        .playback()
+        .dataset(&user_id, memory_id, durable_read.as_ref())
+        .await
+    {
+        Ok(Some(dataset)) => playback_window_start(&dataset, &query)
+            .and_then(|window_start| project_manifest(&dataset, window_start))
+            .map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
     match result {
         Ok(Some(manifest)) => no_store_json(manifest),
         Ok(None) => not_found(),
@@ -445,9 +450,15 @@ async fn memory_playback_segment(
     if !segment_limiter().consume(&user_id).await {
         return too_many_requests();
     }
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => return super::routed_read_unavailable("api.playback_segment.lookup", &error),
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                return super::routed_read_unavailable("api.playback_segment.lookup", &error)
+            }
+        }
+    } else {
+        None
     };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
@@ -456,43 +467,53 @@ async fn memory_playback_segment(
     let lookup_user = user_id.clone();
     let requested_recording = recording_id.clone();
     let requested_segment = segment_id.clone();
-    let lookup = state
-        .store
-        .wal_authoritative_read(&lookup_user, move |conn| {
-            let Some(dataset) =
-                load_playback_dataset(conn, &user_id, memory_id, durable_read.as_ref())?
-            else {
-                return Ok(None);
-            };
+    let lookup = match state
+        .repositories
+        .playback()
+        .dataset(&user_id, memory_id, durable_read.as_ref())
+        .await
+    {
+        Ok(Some(dataset)) => {
             if dataset.projection_revision != query.projection_revision {
-                return Err(EnclaveError::Conflict(
+                Err(EnclaveError::Conflict(
                     "playback projection revision changed".into(),
-                ));
-            }
-            let segment = dataset
-                .segments
-                .into_iter()
-                .find(|candidate| {
-                    candidate.recording_id == requested_recording
-                        && candidate.segment_id == requested_segment
-                })
-                .filter(SegmentAuthority::readable);
-            let wrapped_dek = if segment
-                .as_ref()
-                .is_some_and(|segment| segment.retention_decision == "processing_window_30d")
-            {
-                conn.query_row(
-                    "SELECT value FROM app_metadata WHERE key=?1",
-                    [MEDIA_DEK_METADATA_KEY],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
+                ))
             } else {
-                None
-            };
-            Ok(segment.map(|segment| (segment, wrapped_dek)))
-        })
-        .await;
+                let segment = dataset
+                    .segments
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.recording_id == requested_recording
+                            && candidate.segment_id == requested_segment
+                    })
+                    .filter(SegmentAuthority::readable);
+                let wrapped_dek = if segment
+                    .as_ref()
+                    .is_some_and(|segment| segment.retention_decision == "processing_window_30d")
+                {
+                    match state
+                        .repositories
+                        .captures()
+                        .media_dek_wrapped(&user_id)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return super::routed_read_unavailable(
+                                "api.playback_segment.lookup",
+                                &error,
+                            )
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(segment.map(|segment| (segment, wrapped_dek)))
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
 
     let (authority, wrapped_dek) = match lookup {
         Ok(Some(value)) => value,
@@ -672,7 +693,9 @@ async fn memory_playback_segment(
 }
 
 fn playback_capability_available(state: &CpState) -> bool {
-    state.durable_recording_storage_bound && crate::schema_ladder::durable_recording_schema_active()
+    state.durable_recording_storage_bound
+        && (!state.repositories.uses_legacy_state()
+            || crate::schema_ladder::durable_recording_schema_active())
 }
 
 async fn person_memories(
@@ -693,28 +716,22 @@ async fn person_memories(
         .clamp(1, PEOPLE_MEMORIES_MAX_LIMIT);
     let before_id = query.before_id;
     let user_id = user.0;
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => return super::routed_read_unavailable("api.person_memories", &error),
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return super::routed_read_unavailable("api.person_memories", &error),
+        }
+    } else {
+        None
     };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.person_memories", &error),
     };
-    let read_user = user_id.clone();
     let result = state
-        .store
-        .wal_authoritative_read(&read_user, move |conn| {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM people WHERE id=?1 AND status='identified')",
-                [person_id],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(EnclaveError::NotFound);
-            }
-            load_person_memories(conn, person_id, before_id, limit, durable_read.as_ref())
-        })
+        .repositories
+        .playback()
+        .person_memories(&user_id, person_id, before_id, limit, durable_read.as_ref())
         .await;
     match result {
         Ok(page) => no_store_json(page),
@@ -723,7 +740,7 @@ async fn person_memories(
     }
 }
 
-fn load_playback_dataset(
+pub(crate) fn load_playback_dataset(
     conn: &Connection,
     user_id: &str,
     memory_id: i64,
@@ -846,7 +863,7 @@ fn load_playback_dataset(
          LEFT JOIN speaker_observations o ON o.id=u.speaker_observation_id
          WHERE em.episode_id=?1 ORDER BY COALESCE(o.started_at,s.started_at),u.id",
     )?;
-    let utterances = utterance_statement
+    let mut utterances = utterance_statement
         .query_map([memory_id], |row| {
             let observation_start: Option<String> = row.get(2)?;
             let observation_end: Option<String> = row.get(3)?;
@@ -869,9 +886,29 @@ fn load_playback_dataset(
                 text: row.get(7)?,
                 fallback_label: row.get(8)?,
                 overlap: row.get::<_, i64>(9)? != 0,
+                person_id: None,
+                display_name: None,
+                attribution_state: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    for utterance in &mut utterances {
+        let Some(observation_id) = utterance.observation_id else {
+            continue;
+        };
+        if let Ok(attribution) =
+            super::identity::resolve_speaker_attribution(conn, observation_id, Some(memory_id))
+        {
+            utterance.person_id = attribution.person_id;
+            utterance.display_name = Some(attribution.display_label);
+            utterance.attribution_state = Some(
+                attribution
+                    .attribution_kind
+                    .to_participant_attribution_kind(attribution.has_direct_evidence)
+                    .to_string(),
+            );
+        }
+    }
 
     let mut source_statement = conn.prepare(
         "SELECT src.speaker_observation_id,src.event_id,
@@ -917,7 +954,7 @@ fn load_playback_dataset(
     }))
 }
 
-fn resolve_utterance_interval(
+pub(crate) fn resolve_utterance_interval(
     observation_start: Option<&str>,
     observation_end: Option<&str>,
     segment_start: &str,
@@ -951,11 +988,7 @@ fn resolve_utterance_interval(
     (interval.1 > interval.0).then_some(interval)
 }
 
-fn project_manifest(
-    conn: &Connection,
-    dataset: &PlaybackDataset,
-    window_start_ms: i64,
-) -> Result<PlaybackManifest> {
+fn project_manifest(dataset: &PlaybackDataset, window_start_ms: i64) -> Result<PlaybackManifest> {
     let window_end_ms = window_start_ms
         .saturating_add(PLAYBACK_WINDOW_MS)
         .min(dataset.duration_ms);
@@ -1006,14 +1039,6 @@ fn project_manifest(
         if utterance_end <= window_start_ms || utterance_start >= window_end_ms {
             continue;
         }
-        let attribution = utterance.observation_id.and_then(|observation_id| {
-            super::identity::resolve_speaker_attribution(
-                conn,
-                observation_id,
-                Some(dataset.memory_id),
-            )
-            .ok()
-        });
         let mut spans = Vec::new();
         if let Some(observation_id) = utterance.observation_id {
             for source in sources_by_observation
@@ -1058,19 +1083,14 @@ fn project_manifest(
         utterances.push(PlaybackUtterance {
             utterance_id: utterance.utterance_id,
             speaker_observation_id: utterance.observation_id,
-            person_id: attribution.as_ref().and_then(|value| value.person_id),
-            display_name: attribution
-                .as_ref()
-                .map(|value| value.display_label.clone())
+            person_id: utterance.person_id,
+            display_name: utterance
+                .display_name
+                .clone()
                 .unwrap_or_else(|| utterance.fallback_label.clone()),
-            attribution_state: attribution
-                .as_ref()
-                .map(|value| {
-                    value
-                        .attribution_kind
-                        .to_participant_attribution_kind(value.has_direct_evidence)
-                        .to_string()
-                })
+            attribution_state: utterance
+                .attribution_state
+                .clone()
                 .unwrap_or_else(|| "unavailable".into()),
             timeline_start_ms: utterance_start,
             timeline_end_ms: utterance_end,
@@ -1177,7 +1197,7 @@ fn playback_window_start(dataset: &PlaybackDataset, query: &PlaybackQuery) -> Re
     Ok((at / PLAYBACK_WINDOW_MS) * PLAYBACK_WINDOW_MS)
 }
 
-fn load_person_memories(
+pub(crate) fn load_person_memories(
     conn: &Connection,
     person_id: i64,
     before_id: Option<i64>,
@@ -1358,7 +1378,7 @@ fn load_person_memories(
     })
 }
 
-fn projection_revision(
+pub(crate) fn projection_revision(
     memory_id: i64,
     started_at: &str,
     ended_at: &str,
@@ -1410,7 +1430,7 @@ fn projection_revision(
     (i64::from_be_bytes(bytes) & i64::MAX).max(1)
 }
 
-fn opaque_id(prefix: &str, components: &[&str]) -> String {
+pub(crate) fn opaque_id(prefix: &str, components: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"kioku.playback-public-id.v1\0");
     digest.update(prefix.as_bytes());
@@ -1598,7 +1618,7 @@ fn combine_availability(left: &str, right: &str) -> String {
     aggregate_availability([left, right].into_iter())
 }
 
-fn availability_from_counts(
+pub(crate) fn availability_from_counts(
     total: i64,
     ready: i64,
     pending: i64,
@@ -1972,7 +1992,7 @@ mod tests {
         let dataset = load_playback_dataset(&connection, "user-a", 42, None)
             .unwrap()
             .unwrap();
-        let manifest = project_manifest(&connection, &dataset, 0).unwrap();
+        let manifest = project_manifest(&dataset, 0).unwrap();
         assert_eq!(manifest.timeline.duration_ms, 120_000);
         assert_eq!(manifest.availability, "ready");
         assert_eq!(manifest.segments.len(), 1);
