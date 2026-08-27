@@ -1,13 +1,21 @@
 # kioku-enclave
 
-**The attested Kioku backend—the only Kioku-operated server process that handles user
-plaintext.**
+**The open-source, attested Kioku application backend.**
 
 Kioku (記憶, “memory” in Japanese) is a personal memory capture and recall system.
 This repository contains the Rust service that runs inside a
 [GCP Confidential Space](https://cloud.google.com/confidential-computing/confidential-space/docs/overview)
-VM (AMD SEV). It terminates TLS and implements OAuth, sync, MCP and REST queries,
-account operations, summarisation, and encrypted storage in one attested binary.
+VMs (AMD SEV). It terminates TLS and implements OAuth, sync, MCP and REST queries,
+account operations, summarisation, and media encryption in one attested binary. Private
+Cloud SQL PostgreSQL is the production structured-state/search/work authority; its
+database engine and authorized GCP/database administrators are explicitly inside the
+plaintext trust boundary. Large audio and image objects remain per-user encrypted in GCS.
+
+> **ADR-0040 storage change (2026-08-27):** Production builds select PostgreSQL and
+> fail closed rather than falling back to SQLite/GCS. The extensive SQLite, WAL,
+> witness, and archive-v3 material retained in this repository documents the reference
+> implementation and historical safety work; it is not constructed in PostgreSQL
+> serving mode.
 
 See [`SECURITY.md`](SECURITY.md) for the threat model and [`RELEASING.md`](RELEASING.md)
 for the signed source-tag, provenance, SBOM, image-digest, and deployment procedure.
@@ -23,8 +31,10 @@ Kioku's privacy claim is:
 > The current/default policy retains them for a bounded retry/voice-learning window and
 > then deletes them. ADR-0036 stages an opt-in durable original-audio path and owner-only
 > playback, but it remains inactive until its schema, privacy, export, deletion, and
-> rollout gates are complete. Derived records, evidence, and voice profiles remain in the
-> encrypted user archive. The server code handling that plaintext is open source.
+> rollout gates are complete. Derived records, evidence, and voice profiles remain in
+> private Cloud SQL PostgreSQL. Cloud SQL is conventional managed-cloud trust, not
+> operator-independent encryption. The application code handling that plaintext is open
+> source; large raw-media objects remain per-user encrypted in GCS.
 
 The exact deployed image digest is public. A Confidential Space attestation token reports
 the running container digest; a detached Ed25519 signature from the separately pinned
@@ -89,7 +99,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   the enclave knows only the provider-neutral allowance snapshot and
   reservation decision. Catalog, pricing, payment, and subscription implementations live
   behind the external control-plane port and are not part of this repository.
-- Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
+- Stores structured user/control/search/job data in private Cloud SQL PostgreSQL and
+  stores large audio/image media as KMS-wrapped, context-bound AES-256-GCM GCS objects.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service. Synced OCR, app/window/URL and browser-tab metadata,
   deterministic visual statistics, transcript context, and derived text are sent together
@@ -102,9 +113,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   waiting. Automatic workers never regenerate already-completed historical episodes.
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
-Within Kioku-operated compute and storage, plaintext exists only in this process and in
-the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Audio,
-screenshots, and selected text leave the TEE through the documented Vertex boundary.
+Public TLS and application processing plaintext runs in this process and SEV-protected
+memory. Queryable structured plaintext also exists in private Cloud SQL and its bounded
+backup/PITR copies. Audio, screenshots, and selected text leave the TEE through the
+documented Vertex boundary.
 After the separately gated ADR-0036 activation, one bounded verified audio segment may
 also leave to its authenticated owner's active browser as a private/no-store response;
 storage credentials and media keys never do.
@@ -145,14 +157,14 @@ guarantee still requires user-held keys or an independently controlled authoriza
 boundary. See
 [`SECURITY.md`](SECURITY.md#t1--malicious-operator-or-cloud-project-insider).
 
-### Context-bound blob encryption
+### Context-bound large-media encryption
 
 Version 2 blobs are prefixed with `KIOKU-BLOB\x02` and encrypted with AES-256-GCM. Their
 authenticated data binds each ciphertext to its logical purpose and location:
 
-- user databases bind to `indexes/{user_id}.db.enc`;
 - raw capture and screenshot evidence bind to both the authenticated user and opaque media object key; new selected screenshot evidence is under the validated owner prefix `raw/{user_id}/evidence/{opaque_key}.enc` (legacy keys remain compatible);
-- the control database and ACME state use separate fixed contexts.
+- legacy/reference SQLite databases and historical ACME state retain their existing
+  fixed contexts but are not PostgreSQL serving authorities.
 
 Copying ciphertext and its wrapped DEK to another user or object therefore fails
 authentication. All production images enforce context-bound v2 encryption unconditionally.
@@ -187,12 +199,12 @@ separate public, active endpoint.
 
 ### Production TLS is fail-closed
 
-The production container build requires `ENCLAVE_ACME=1` and HTTPS origins. At boot the
-service loads or obtains a usable certificate before serving; ACME issuance retries rather
-than falling back to the application over HTTP. A non-debug binary without TLS refuses to
-start. Plain HTTP application serving exists only in a debug build with
-`ENCLAVE_TEST_MODE=1`; port 80 in production is only the isolated ACME HTTP-01 challenge
-listener.
+The production fleet build requires `ENCLAVE_TLS=1`, `ENCLAVE_ACME=0`, and HTTPS origins.
+Each replica loads the same certificate and private-key generation from Secret Manager
+before serving; a missing, malformed, or mismatched secret fails closed. Certificate
+renewal publishes new versions and rolls the fleet. A non-debug binary without TLS refuses
+to start. Plain HTTP application serving exists only in a debug build with
+`ENCLAVE_TEST_MODE=1`.
 
 The Confidential Space launch policy permits only `PORT` to be changed through VM
 metadata. `RUST_LOG` and every security-relevant setting are not production launch-time
@@ -486,7 +498,7 @@ docker build --platform linux/amd64 \
   --build-arg VERTEX_PROJECT=my-project \
   --build-arg VERTEX_LOCATION=us-central1 \
   --build-arg VERTEX_MODEL=gemini-3.5-flash \
-  --build-arg ENCLAVE_ACME=1 \
+  --build-arg ENCLAVE_ACME=0 \
   --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
   --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
   --build-arg ENCLAVE_ALLOW_LEGACY_BLOBS=0 \
@@ -505,7 +517,7 @@ binding.
 | Variable | Purpose |
 |---|---|
 | `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY` | KMS KEK coordinates |
-| `GCS_BUCKET` | Encrypted database bucket |
+| `GCS_BUCKET` | Legacy/reference encrypted database bucket; not a PostgreSQL serving authority |
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
 | `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, operator configuration/commands cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
@@ -526,7 +538,10 @@ binding.
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
 | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration; the model is a 1–128 byte billing-safe name using only ASCII letters, digits, `.`, `_`, `:`, or `-` |
 | `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | Optional per-user UTC-day maximum-output reservation ceiling; defaults to `524288`. Each request reserves its full configured output maximum before Vertex is called and fails closed when exhausted |
-| `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
+| `PERSISTENCE_BACKEND` | Production is exactly `postgres`; unknown or legacy values fail the release configuration gate |
+| `POSTGRES_SCHEMA_MODE`, `POSTGRES_MAX_CONNECTIONS` | Serving images verify schema version and use the bounded per-process pool; only the explicit one-shot migrator applies DDL |
+| `HEALTH_PORT`, `DRAIN_TIMEOUT_SECONDS` | Content-free wildcard-bound fleet probe port and bounded SIGTERM drain window |
+| `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Fleet production disables process-local ACME and loads one shared Secret Manager certificate/key generation; the directory/contact remain fixed inert configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
@@ -549,17 +564,18 @@ password nor signing secret is a Docker build argument or launch metadata value.
 `ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are neither accepted
 production build arguments nor launch-policy overrides.
 
-APNs pacing and circuit state are process-local. A production roll therefore
-requires `scripts/release.sh --roll` to match a reviewed deployment commit and
-the canonical inventory/digest of every Terraform root source. The pinned source
-defines the single Confidential Space VM/container and reserved addresses; the
+Provider pacing, claims, circuit state, quotas, and request admission are durable and
+fleet-wide in PostgreSQL. A production roll requires `scripts/release.sh --roll` to match
+a reviewed deployment commit and the canonical inventory/digest of every Terraform root
+source. The pinned source defines the staged scale-to-zero regional MIG and reserved
+public address; the
 checkout must be clean, and the exact seal is bound before network access and
 rechecked at the roll boundary. Release invokes only the pinned tracked
 `scripts/local-operations.sh` and passes that seal through; the deployment owner
 recomputes it after acquiring the production-infrastructure lock and before GCP
 credentials, planning, or apply. Any deployment-source change requires a reviewed
-pin update. Horizontal or overlapping enclave runtimes are forbidden until a
-separately reviewed external provider fence exists.
+pin update. Release stages must prove zero old instances before changing the one
+KMS-authorized digest; ordinary serving then keeps at least two PostgreSQL-backed members.
 
 ## Local verification and release evidence
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-`kioku-enclave` is the production Kioku backend, not only a storage data plane. The
+`kioku-enclave` is the production Kioku application backend, not only a storage data plane. The
 same attested Rust process terminates TLS and implements Google/Apple authentication, token issuance,
 device sync, MCP and REST queries, account export/deletion, quotas, summarisation, and
 encrypted persistence. This threat model therefore includes those control-plane
@@ -22,13 +22,22 @@ surfaces.
 - The repository's local verification, dependency audit, image scanning, signed local
   build evidence, and release process.
 
-The encrypted Control database is a complete context-bound SQLite snapshot rotated over
+**ADR-0040 trust boundary:** production structured account, OAuth, user-content,
+search/vector, job, outbox, quota, and operation state is queryable in private Cloud SQL
+PostgreSQL. The database service and authorized GCP/database administration are trusted
+for that plaintext. Encrypted transport, private networking, least privilege, audit,
+regional HA, backups, and PITR reduce risk but are not end-to-end encryption. Large media
+continues to use the attestation-gated per-user GCS key hierarchy described below.
+
+The legacy encrypted Control database is a complete context-bound SQLite snapshot rotated over
 a fixed 32-name GCS ring. The sequence header is authenticated by each slot's distinct
 object-name AEAD context; restart accepts only the contiguous newest sequence, every
 replacement is generation-CASed, and a lost response is adopted only after exact
 ciphertext readback. This changes write distribution, not authority or durability:
 every WAL transition remains remotely durable at the same boundary, and account deletion
 rewrites every live slot with the sanitized snapshot before purging older generations.
+It remains a reference/backend contract implementation and is not constructed in
+PostgreSQL production serving mode.
 
 ### Out of scope or accepted external trust
 
@@ -47,6 +56,11 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   content from this process to Vertex under Google's applicable enterprise terms. The
   privacy claim is “attested enclave + Google Vertex inference,” not enclave-only
   inference.
+- **Cloud SQL structured-state confidentiality.** The PostgreSQL engine processes
+  transcripts, OCR, browser context, memories, people/voice data, credentials, search
+  projections, and work state in plaintext. Authorized provider/project/database
+  administration could access those values and retained backups. This is an accepted
+  managed-cloud trust boundary, not an enclave-only or “not even us” claim.
 - **User-configured webhooks.** A finalized-episode event leaves the TEE only after a
   user adds an HTTPS destination. Events are content-free by default; full brief content
   is a separate opt-in and is then processed by that destination outside Kioku's trust
@@ -59,9 +73,9 @@ rewrites every live slot with the sanitized snapshot before purging older genera
 
 ## Security invariants
 
-- Production never serves the application over plaintext HTTP. The production image
-  requires `ENCLAVE_ACME=1`; boot waits for a usable certificate, and a non-debug build
-  without TLS refuses to start. Plain HTTP is available only in a debug binary with
+- Production never serves the application over plaintext HTTP. The fleet production
+  image requires TLS, disables process-local ACME, and fails closed unless it loads the
+  shared Secret Manager certificate/key generation. Plain HTTP is available only in a debug binary with
   `ENCLAVE_TEST_MODE=1`.
 - The Confidential Space launch policy permits only `PORT` to be changed at launch.
   KMS, GCS, caller identity, OAuth, TLS, attestation, and migration settings are baked
@@ -324,8 +338,10 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   `${BASE_URL}/v1/attestation` as its audience. It never uses
   `ATTEST_STS_AUDIENCE`: a WIF-audience token is an STS bearer credential and must not
   leave the enclave.
-- Decrypted databases exist only in the `/tmp` Confidential Space tmpfs and in process
-  memory. User content and key material must never be logged.
+- Legacy SQLite plaintext exists only in `/tmp` Confidential Space tmpfs and process
+  memory when the reference backend is explicitly selected outside production.
+  PostgreSQL structured plaintext exists in the accepted private Cloud SQL boundary.
+  User content, query bind values, and key material must never be logged.
 - The ADR-0022 SQLite shadow-parity checker is inactive and advisory-only. If future
   rollout code invokes it, a separately reviewed recovery factory must mint two distinct
   owner-private disposable staging copies; this release has no non-test constructor for
@@ -356,7 +372,7 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   request must not load an image object, image bytes, a signed image URL, or a local image
   path. Cloud Screenshot Evidence consent controls pixel sync, not text inference.
 - Voice embeddings, sample diagnostics, robust profile representatives, biometric
-  match scores, and the identity graph remain inside the encrypted per-user database.
+  match scores, and the identity graph remain account-qualified in private PostgreSQL.
   They are never sent to Gemini, returned by a public API, emitted in logs/metrics, or
   compared across users. Candidate names supplied to Gemini are bounded spelling
   vocabulary only and are never accepted as identity evidence by themselves.
@@ -393,7 +409,7 @@ rewrites every live slot with the sanitized snapshot before purging older genera
   restricted media, opaque labels, receipt, and authorization documents remain outside
   Git; only the later content-free cases/report may be committed.
 
-## Key hierarchy and encrypted objects
+## Large-media key hierarchy and encrypted objects
 
 ```text
 Cloud KMS KEK
@@ -411,8 +427,8 @@ Cloud KMS KEK
 ```
 
 Version 2 uses AES-GCM Additional Authenticated Data containing a domain separator and
-the object's logical identity. User databases are bound to their exact
-`indexes/{user_id}.db.enc` name, raw capture and screenshot evidence objects are bound to
+the object's logical identity. Legacy/reference user databases retain their exact
+`indexes/{user_id}.db.enc` binding; production raw capture and screenshot evidence objects are bound to
 both the authenticated user and exact media object key. Historical device-sync screenshot
 evidence uses `raw/{user_id}/evidence/{opaque_key}.enc` only on the guarded legacy lane;
 the Genesis-selected plan and multipart routes are provider-free `410 Gone` tombstones.
@@ -2124,9 +2140,11 @@ local production WAL is truncated or mutated.
 
 **Threat:** A co-tenant or hypervisor reads plaintext guest memory or persistent disk.
 
-**Mitigation:** Confidential Space uses AMD SEV memory encryption, and decrypted SQLite
-files are created only on the required `/tmp` tmpfs. No plaintext is intentionally
-written to persistent disk.
+**Mitigation:** Confidential Space uses AMD SEV memory encryption for application memory;
+legacy/reference SQLite files are created only on the required `/tmp` tmpfs. PostgreSQL
+structured plaintext is intentionally processed by the private Cloud SQL service and its
+documented backup/PITR boundary. Large-media plaintext and unwrapped media keys are not
+written to VM persistent disk.
 
 **Residual risk:** CPU-level microarchitectural side channels are not fully mitigated by
 AMD SEV.
@@ -2194,13 +2212,9 @@ contain historical bare-installation rows, but those rows are cancellation-only 
 reach APNs; only `p1` current-generation rows can spend, and every row is cancelled before provider
 I/O after 24 hours. A complete archive claim plus a short durable Control outcome-or-cancellation
 receipt linearize the exact installation generation without holding a database lock across the
-network. Ambiguous outcomes are never resent. Bounded FIFO process-wide pacing, per-account work
-caps, and a process-local provider circuit are production-service-wide only because rollout
-preflight enforces the reviewed, clean, exact-source-sealed single VM/container/static-IP
-deployment, rechecks that seal at the roll boundary, and passes it only to the exact tracked roll
-owner for another recomputation inside the production-infrastructure lock before credentials or
-mutation. Horizontal or overlapping senders are unsupported and forbidden until a true external
-provider fence exists. Apple may correlate the
+network. Ambiguous outcomes are never resent. PostgreSQL owns fleet-wide claims, operation/effect
+receipts, pacing admission, and shared circuits; no process-local lock or cache is a production
+correctness authority. Apple may correlate the
 device token, topic, generic alert, and delivery timing; Focus/device settings determine
 display and an already accepted generic alert cannot be recalled after offline sign-out.
 
@@ -2209,8 +2223,8 @@ display and an already accepted generic alert cannot be recalled after offline s
 The external control plane receives a random account pseudonym and content-free usage
 events over HTTPS authenticated with an exact-audience Google OIDC token. It does not
 receive email, Google subject, stable enclave user UUID, capture/episode identifiers, or
-model content. The random mapping, lease receipts, and deletion-detach outbox remain
-encrypted inside the enclave. This boundary reveals subscription usage and inference-cost
+model content. The random mapping, lease receipts, and deletion-detach outbox remain in
+private PostgreSQL. This boundary reveals subscription usage and inference-cost
 shape; compromise of both databases could link those records.
 
 Cloud persistence of new capture depends on the entitlement port in enforce mode: a
