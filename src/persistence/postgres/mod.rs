@@ -3,6 +3,7 @@
 //! Serving startup selects this complete implementation as one authority. It
 //! never constructs a readable or writable legacy SQLite/GCS authority.
 
+mod admission;
 mod billing;
 mod capture;
 mod delivery_outbox;
@@ -29,7 +30,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 23;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 24;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -277,6 +278,12 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 23;
+        }
+        if version == 23 {
+            sqlx::raw_sql(include_str!("../../../migrations/0024_fleet_admission.sql"))
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -399,7 +406,8 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE vertex_usage_events, vertex_usage_coverage, account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
+            "TRUNCATE fleet_concurrency_leases, fleet_rate_limits, \
+             vertex_usage_events, vertex_usage_coverage, account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
              recording_delivery_balances, recording_lease_denials, recording_lease_requests, \
              recording_leases, vertex_coverage_anchors, billing_detach_outbox, billing_accounts, \
              push_send_fences, push_installations, email_send_fences, \
@@ -460,6 +468,60 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        let admission = repositories.admission().unwrap();
+        assert!(admission
+            .consume_rate("contract-rate", &account_id, 2.0, 0.000_001)
+            .await
+            .unwrap());
+        assert!(admission
+            .consume_rate("contract-rate", &account_id, 2.0, 0.000_001)
+            .await
+            .unwrap());
+        assert!(!admission
+            .consume_rate("contract-rate", &account_id, 2.0, 0.000_001)
+            .await
+            .unwrap());
+        assert!(admission
+            .acquire_concurrency(
+                "contract-concurrency",
+                "holder-a",
+                2,
+                Duration::from_secs(60)
+            )
+            .await
+            .unwrap());
+        assert!(admission
+            .acquire_concurrency(
+                "contract-concurrency",
+                "holder-b",
+                2,
+                Duration::from_secs(60)
+            )
+            .await
+            .unwrap());
+        assert!(!admission
+            .acquire_concurrency(
+                "contract-concurrency",
+                "holder-c",
+                2,
+                Duration::from_secs(60)
+            )
+            .await
+            .unwrap());
+        admission
+            .release_concurrency("contract-concurrency", "holder-a")
+            .await
+            .unwrap();
+        assert!(admission
+            .acquire_concurrency(
+                "contract-concurrency",
+                "holder-c",
+                2,
+                Duration::from_secs(60)
+            )
+            .await
+            .unwrap());
 
         let initial_retention = repositories
             .recording_retention()

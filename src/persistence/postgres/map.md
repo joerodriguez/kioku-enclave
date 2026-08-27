@@ -2,12 +2,12 @@
 
 The production-target implementations of the backend-neutral persistence
 ports. They share one bounded SQLx pool and PostgreSQL transaction authority.
-The module is compiled and contract-tested during extraction, but startup must
-not select it until every active domain has moved off the legacy stores.
+Startup selects the complete set once and refuses any fallback to legacy state.
 
 | File | Role |
 |---|---|
 | `mod.rs` | Pool construction, UTC/timeout policy, explicit migrator, schema verification, and shared transaction helpers. |
+| `admission.rs` | Database-clocked fleet token buckets and crash-recoverable concurrency leases. |
 | `billing.rs` | Fleet-wide billing pseudonyms, recording lease/credit receipts, coverage anchors, and detach outbox. |
 | `entitlement.rs` | Fleet-wide active-account checks and atomic daily quota/Vertex reservations. |
 | `episode_deletion.rs` | Durable freeze, exact media inventory, structured purge, and replay receipt for episode deletion. |

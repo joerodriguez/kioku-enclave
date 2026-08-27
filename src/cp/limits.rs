@@ -1,15 +1,15 @@
-//! Per-user quotas and rate limits. Rate limiters are in-memory token buckets,
-//! which is correct for the single-instance enclave. Daily counters live in
-//! the control DB (`usage_daily`).
+//! Per-user quotas and rate limits. Legacy mode uses in-memory token buckets;
+//! PostgreSQL mode routes the same policy through fleet-wide durable buckets.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::Result;
 
-use crate::persistence::RepositorySet;
+use crate::persistence::{FleetAdmissionLease, RepositorySet};
 
 pub(crate) use crate::persistence::VertexWorkClass;
 
@@ -45,6 +45,60 @@ impl RateLimiter {
         }
         entry.0 -= 1.0;
         true
+    }
+
+    /// Apply this limiter across the whole PostgreSQL fleet, falling back to
+    /// the behavior-preserving process-local bucket in legacy mode.
+    pub async fn consume_scoped(
+        &self,
+        repositories: &RepositorySet,
+        scope: &'static str,
+        key: &str,
+    ) -> bool {
+        let Some(admission) = repositories.admission() else {
+            return self.consume(key).await;
+        };
+        match admission
+            .consume_rate(scope, key, self.capacity, self.refill_per_sec)
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::error!(scope, error = %error, "fleet rate admission failed closed");
+                false
+            }
+        }
+    }
+}
+
+pub(crate) enum ConcurrencyPermit {
+    Local(#[allow(dead_code)] OwnedSemaphorePermit),
+    Fleet(#[allow(dead_code)] FleetAdmissionLease),
+}
+
+/// Acquire a process-local semaphore in legacy mode or a durable fleet lease
+/// in PostgreSQL mode. Storage errors are returned so callers can distinguish
+/// service unavailability from ordinary saturation.
+pub(crate) async fn try_acquire_concurrency(
+    repositories: &RepositorySet,
+    local: Arc<Semaphore>,
+    scope: &'static str,
+    holder: &str,
+    limit: u32,
+    ttl: Duration,
+) -> Result<Option<ConcurrencyPermit>> {
+    let Some(admission) = repositories.admission_arc() else {
+        return Ok(local.try_acquire_owned().ok().map(ConcurrencyPermit::Local));
+    };
+    if admission
+        .acquire_concurrency(scope, holder, limit, ttl)
+        .await?
+    {
+        Ok(Some(ConcurrencyPermit::Fleet(FleetAdmissionLease::new(
+            admission, scope, holder,
+        ))))
+    } else {
+        Ok(None)
     }
 }
 

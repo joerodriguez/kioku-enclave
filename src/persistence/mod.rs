@@ -4,6 +4,7 @@
 //! connection or SQL callback. The legacy adapter delegates to the existing
 //! SQLite/GCS stores or the PostgreSQL implementation selected once at startup.
 
+mod admission;
 mod billing;
 mod capture;
 mod delivery_outbox;
@@ -29,6 +30,7 @@ mod work;
 
 use std::sync::Arc;
 
+pub(crate) use admission::{AdmissionRepository, FleetAdmissionLease};
 pub(crate) use billing::BillingRepository;
 pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor};
 pub(crate) use capture::{
@@ -112,6 +114,7 @@ use crate::store::Store;
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
     legacy_state_authoritative: bool,
+    admission: Option<Arc<dyn AdmissionRepository>>,
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     lifecycle: Arc<dyn AccountLifecycleRepository>,
     billing: Arc<dyn BillingRepository>,
@@ -136,6 +139,7 @@ impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>, store: Arc<Store>) -> Self {
         Self {
             legacy_state_authoritative: true,
+            admission: None,
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
             billing: Arc::new(LegacyBillingRepository::new(
@@ -169,6 +173,7 @@ impl RepositorySet {
     ) -> Self {
         Self {
             legacy_state_authoritative: false,
+            admission: Some(Arc::clone(&persistence) as Arc<dyn AdmissionRepository>),
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
@@ -196,6 +201,14 @@ impl RepositorySet {
 
     pub(crate) fn uses_legacy_state(&self) -> bool {
         self.legacy_state_authoritative
+    }
+
+    pub(crate) fn admission(&self) -> Option<&dyn AdmissionRepository> {
+        self.admission.as_deref()
+    }
+
+    pub(crate) fn admission_arc(&self) -> Option<Arc<dyn AdmissionRepository>> {
+        self.admission.clone()
     }
 
     pub(crate) fn lifecycle(&self) -> &dyn AccountLifecycleRepository {

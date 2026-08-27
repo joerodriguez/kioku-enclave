@@ -394,7 +394,10 @@ async fn memory_playback_manifest(
         return bad_request("invalid playback window");
     }
     let user_id = user.0;
-    if !manifest_limiter().consume(&user_id).await {
+    if !manifest_limiter()
+        .consume_scoped(&state.repositories, "playback-manifest", &user_id)
+        .await
+    {
         return too_many_requests();
     }
     let _lifecycle_guard = if state.repositories.uses_legacy_state() {
@@ -447,7 +450,10 @@ async fn memory_playback_segment(
     }
 
     let user_id = user.0;
-    if !segment_limiter().consume(&user_id).await {
+    if !segment_limiter()
+        .consume_scoped(&state.repositories, "playback-segment", &user_id)
+        .await
+    {
         return too_many_requests();
     }
     let _lifecycle_guard = if state.repositories.uses_legacy_state() {
@@ -707,7 +713,10 @@ async fn person_memories(
     if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
         return bad_request("person_id and before_id must be positive");
     }
-    if !manifest_limiter().consume(&user.0).await {
+    if !manifest_limiter()
+        .consume_scoped(&state.repositories, "playback-person-memories", &user.0)
+        .await
+    {
         return too_many_requests();
     }
     let limit = query

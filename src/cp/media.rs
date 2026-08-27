@@ -1346,7 +1346,11 @@ async fn upload_screen_reference_batch(
             );
         }
     }
-    if !state.reference_batch_limiter.consume(&user_id).await {
+    if !state
+        .reference_batch_limiter
+        .consume_scoped(&state.repositories, "capture-reference-batch", &user_id)
+        .await
+    {
         return capture_failure_response_for_route(
             "screen_reference_batch",
             started_at,
@@ -1366,9 +1370,19 @@ async fn upload_screen_reference_batch(
             )
         }
     };
-    let _batch_permit = match Arc::clone(&state.reference_batch_concurrency).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
+    let concurrency_holder = format!("{}:{:032x}", request.batch_id, rand::random::<u128>());
+    let _batch_permit = match limits::try_acquire_concurrency(
+        &state.repositories,
+        Arc::clone(&state.reference_batch_concurrency),
+        "capture-reference-batch",
+        &concurrency_holder,
+        32,
+        std::time::Duration::from_secs(600),
+    )
+    .await
+    {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
             return capture_failure_response_for_route(
                 "screen_reference_batch",
                 started_at,
@@ -1376,6 +1390,16 @@ async fn upload_screen_reference_batch(
                 CaptureIngestFailureReason::RateLimited,
                 rate_limited_response(),
             )
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "capture reference batch concurrency admission failed");
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::LifecycleUnavailable,
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response(),
+            );
         }
     };
     let _lifecycle_guard = if state.repositories.uses_legacy_state() {
@@ -1569,7 +1593,11 @@ async fn upload_capture_event(
     // `advance_contiguous_ack` walks only while the next sequence exists, so
     // routing the canonical arm alone would have stalled every such stream
     // permanently at its first refused reference event.
-    if !state.sync_limiter.consume(&user_id).await {
+    if !state
+        .sync_limiter
+        .consume_scoped(&state.repositories, "capture-event", &user_id)
+        .await
+    {
         return capture_failure_response(
             started_at,
             None,
