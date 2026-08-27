@@ -102,7 +102,7 @@ def bootstrap_manifest() -> dict[str, object]:
             CANARY_SHA,
             CANARY_UUID,
             genesis="off",
-            epoch=0,
+            schema_epochs=(0, 0, 0),
         )
     )
     return data
@@ -134,7 +134,7 @@ def final_manifest_shape() -> dict[str, object]:
             CANARY_SHA,
             CANARY_UUID,
             genesis="on",
-            epoch=1,
+            schema_epochs=(2, 1, 1),
         )
     )
     return data
