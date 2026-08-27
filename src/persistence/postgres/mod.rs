@@ -6,6 +6,7 @@
 
 mod entitlement;
 mod identity;
+mod notification;
 mod oauth;
 
 use std::str::FromStr;
@@ -16,7 +17,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 2;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -86,7 +87,7 @@ impl PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
         }
-        let version = sqlx::query_scalar::<_, i64>(
+        let mut version = sqlx::query_scalar::<_, i64>(
             "SELECT version FROM persistence_schema WHERE singleton = true",
         )
         .fetch_one(&mut *transaction)
@@ -95,6 +96,14 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0002_entitlements.sql"))
                 .execute(&mut *transaction)
                 .await?;
+            version = 2;
+        }
+        if version == 2 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0003_notification_configuration.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -153,6 +162,7 @@ mod tests {
         RefreshTokenRotation,
     };
     use crate::persistence::RepositorySet;
+    use crate::persistence::{PushInstallation, WebhookSubscription};
 
     async fn test_persistence() -> Option<PostgresPersistence> {
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -173,7 +183,9 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE usage_daily, refresh_tokens, oauth_authorization_codes, oauth_consents, \
+            "TRUNCATE push_send_fences, push_installations, email_send_fences, \
+             episode_email_preferences, webhook_send_fences, webhook_subscriptions, \
+             usage_daily, refresh_tokens, oauth_authorization_codes, oauth_consents, \
              oauth_clients, apple_credentials, auth_identities, deleted_identities, \
              deleted_accounts, signup_daily, accounts CASCADE",
         )
@@ -184,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_identity_and_oauth_contract() {
+    async fn postgres_control_plane_contract() {
         let Some(persistence) = test_persistence().await else {
             return;
         };
@@ -270,6 +282,88 @@ mod tests {
             allowed += usize::from(reservation.await.unwrap());
         }
         assert_eq!(allowed, 2, "the protected audio budget is fleet-wide");
+
+        let webhook = WebhookSubscription {
+            id: "22222222-2222-4222-8222-222222222222".into(),
+            user_id: account_id.clone(),
+            name: "Contract hook".into(),
+            endpoint_url: "https://hooks.example/kioku".into(),
+            signing_secret: "private-signing-secret".into(),
+            include_content: true,
+            enabled: true,
+            created_at: "2026-08-27T12:00:00.000Z".into(),
+        };
+        repositories
+            .notifications()
+            .create_webhook_subscription(webhook.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .notifications()
+                .list_webhook_subscriptions(&account_id)
+                .await
+                .unwrap(),
+            vec![webhook.clone()]
+        );
+        repositories
+            .notifications()
+            .disable_webhook_subscription(&account_id, &webhook.id)
+            .await
+            .unwrap();
+        assert!(
+            !repositories
+                .notifications()
+                .get_webhook_subscription(&account_id, &webhook.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+
+        let default_email = repositories
+            .notifications()
+            .get_email_preference(&account_id)
+            .await
+            .unwrap();
+        assert!(!default_email.enabled);
+        let opted_in = repositories
+            .notifications()
+            .set_email_preference(&account_id, true, true)
+            .await
+            .unwrap();
+        assert!(opted_in.enabled && opted_in.include_content);
+        assert!(opted_in.consented_at.is_some());
+
+        let installation = PushInstallation {
+            id: "33333333-3333-4333-8333-333333333333".into(),
+            user_id: account_id.clone(),
+            platform: "ios".into(),
+            topic: "com.kioku.ios".into(),
+            environment: "sandbox".into(),
+            device_token: "a".repeat(64),
+            token_generation: 1,
+            enabled: true,
+        };
+        let installed = repositories
+            .notifications()
+            .upsert_push_installation(installation.clone())
+            .await
+            .unwrap();
+        let repeated = repositories
+            .notifications()
+            .upsert_push_installation(installation)
+            .await
+            .unwrap();
+        assert_eq!(installed.token_generation, repeated.token_generation);
+        assert_eq!(
+            repositories
+                .notifications()
+                .list_push_installations(&account_id)
+                .await
+                .unwrap(),
+            vec![repeated]
+        );
 
         let client_id = "11111111-1111-4111-8111-111111111111";
         repositories

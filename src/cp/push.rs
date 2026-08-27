@@ -156,7 +156,12 @@ async fn upsert_installation(
         token_generation: 1,
         enabled: true,
     };
-    match state.control.upsert_push_installation(installation).await {
+    match state
+        .repositories
+        .notifications()
+        .upsert_push_installation(installation)
+        .await
+    {
         Ok(installed) => Json(InstallationResponse {
             id: installed.id,
             platform: installed.platform,
@@ -177,7 +182,8 @@ async fn delete_installation(
         return bad_request("installation_id must be a UUID");
     }
     match state
-        .control
+        .repositories
+        .notifications()
         .delete_push_installation(&user.0, &installation_id)
         .await
     {

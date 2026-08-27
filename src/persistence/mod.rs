@@ -7,6 +7,7 @@
 mod entitlement;
 mod identity;
 mod legacy;
+mod notification;
 mod oauth;
 // PostgreSQL is compiled and contract-tested now, but production construction
 // stays disabled until the interface freeze makes one whole repository set
@@ -18,6 +19,8 @@ use std::sync::Arc;
 
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
+pub(crate) use notification::NotificationRepository;
+pub use notification::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
 pub(crate) use oauth::{
     AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
     OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
@@ -26,7 +29,8 @@ pub(crate) use oauth::{
 pub(crate) use postgres::PostgresPersistence;
 
 use self::legacy::{
-    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyOAuthRepository,
+    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyNotificationRepository,
+    LegacyOAuthRepository,
 };
 use crate::cp::control_store::ControlStore;
 
@@ -39,6 +43,7 @@ pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
+    notifications: Arc<dyn NotificationRepository>,
 }
 
 impl RepositorySet {
@@ -46,7 +51,8 @@ impl RepositorySet {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
-            entitlements: Arc::new(LegacyEntitlementRepository::new(control)),
+            entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
+            notifications: Arc::new(LegacyNotificationRepository::new(control)),
         }
     }
 
@@ -55,7 +61,8 @@ impl RepositorySet {
         Self {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
-            entitlements: persistence,
+            entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
+            notifications: persistence,
         }
     }
 
@@ -70,13 +77,17 @@ impl RepositorySet {
     pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {
         self.entitlements.as_ref()
     }
+
+    pub(crate) fn notifications(&self) -> &dyn NotificationRepository {
+        self.notifications.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{AccountStatus, RepositorySet};
+    use super::{AccountStatus, PushInstallation, RepositorySet, WebhookSubscription};
     use crate::cp::control_store::{ControlStore, TEST_SIGNUP_LIMIT};
     use crate::store::tests::{FakeGcs, FakeKms};
 
@@ -107,5 +118,46 @@ mod tests {
                 .unwrap(),
             Some(AccountStatus::Active)
         );
+
+        let webhook = WebhookSubscription {
+            id: "11111111-1111-4111-8111-111111111111".into(),
+            user_id: account.id.clone(),
+            name: "Legacy contract".into(),
+            endpoint_url: "https://hooks.example/legacy".into(),
+            signing_secret: "secret".into(),
+            include_content: false,
+            enabled: true,
+            created_at: "2026-08-27T12:00:00.000Z".into(),
+        };
+        repositories
+            .notifications()
+            .create_webhook_subscription(webhook.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .notifications()
+                .list_webhook_subscriptions(&account.id)
+                .await
+                .unwrap(),
+            vec![webhook]
+        );
+
+        let installation = PushInstallation {
+            id: "22222222-2222-4222-8222-222222222222".into(),
+            user_id: account.id.clone(),
+            platform: "ios".into(),
+            topic: "com.kioku.ios".into(),
+            environment: "sandbox".into(),
+            device_token: "a".repeat(64),
+            token_generation: 1,
+            enabled: true,
+        };
+        let installed = repositories
+            .notifications()
+            .upsert_push_installation(installation)
+            .await
+            .unwrap();
+        assert!(installed.token_generation > 0);
     }
 }

@@ -8,3 +8,6 @@ migration lock; serving instances only verify `persistence_schema.version`.
   signup-budget, OAuth client/consent/code, and refresh-token foundation.
 - `0002_entitlements.sql` adds tenant-scoped, fleet-wide daily quota and Vertex
   reservation counters.
+- `0003_notification_configuration.sql` adds webhook destinations, email
+  consent, the bounded push registry, and provider-send fence tables that
+  serialize configuration changes with in-flight disclosures.

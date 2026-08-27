@@ -10,6 +10,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
 | `oauth.rs` | Backend-neutral OAuth client, consent, authorization-code, and refresh-token transaction contract. |
 | `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
+| `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
 | [`legacy/`](legacy/map.md) | Private behavior-preserving adapters over the current encrypted SQLite/GCS stores. |
 | [`postgres/`](postgres/map.md) | Bounded SQLx pool plus PostgreSQL implementations of the extracted ports. |
 

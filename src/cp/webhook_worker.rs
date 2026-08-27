@@ -557,7 +557,8 @@ async fn handle_failure(
             || error_code == "invalid_endpoint"
         {
             let _ = state
-                .control
+                .repositories
+                .notifications()
                 .disable_webhook_subscription(user_id, &outbox.subscription_id)
                 .await;
         }
@@ -880,7 +881,8 @@ async fn deliver_selected_user_webhooks(
             Some(request) => request,
             None => {
                 let subscription = state
-                    .control
+                    .repositories
+                    .notifications()
                     .get_webhook_subscription(user_id, &snapshot.subscription_id)
                     .await?;
                 let Some(subscription) = subscription else {
@@ -1124,7 +1126,8 @@ async fn deliver_legacy_user_webhooks(
             continue;
         }
         let subscription = state
-            .control
+            .repositories
+            .notifications()
             .get_webhook_subscription(user_id, &outbox.subscription_id)
             .await?;
         let Some(subscription) = subscription.filter(|subscription| subscription.enabled) else {

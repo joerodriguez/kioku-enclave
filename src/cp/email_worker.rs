@@ -396,7 +396,11 @@ async fn deliver_selected_user_emails(
             match load_frozen_email_request(state, user_id, &snapshot.delivery_id).await? {
                 Some(request) => request,
                 None => {
-                    let preference = state.control.get_email_preference(user_id).await?;
+                    let preference = state
+                        .repositories
+                        .notifications()
+                        .get_email_preference(user_id)
+                        .await?;
                     let effective_include_content =
                         snapshot.include_content && preference.include_content;
                     let loaded =
@@ -643,7 +647,12 @@ async fn deliver_legacy_user_emails(
     user_id: &str,
 ) -> Result<()> {
     for _ in 0..MAX_DELIVERIES_PER_SWEEP {
-        let pref = match state.control.get_email_preference(user_id).await {
+        let pref = match state
+            .repositories
+            .notifications()
+            .get_email_preference(user_id)
+            .await
+        {
             Ok(p) => p,
             Err(EnclaveError::Auth(_)) => {
                 // User unknown, inactive, or deleting — cancel all pending/retry email outbox rows
