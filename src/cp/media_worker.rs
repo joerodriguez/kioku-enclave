@@ -21,6 +21,10 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::error::{EnclaveError, Result};
+use crate::persistence::{
+    AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
+    MediaProcessingJob, MediaScreenProjection, MediaUsageSettlement, ScreenMediaSettlement,
+};
 use crate::store::Store;
 
 use super::media::{parse_audio_result, AudioTurn};
@@ -198,6 +202,39 @@ struct MediaWorkUnit {
     id: String,
     class: WorkClass,
     jobs: Vec<MediaJob>,
+}
+
+impl From<&MediaProcessingJob> for MediaJob {
+    fn from(job: &MediaProcessingJob) -> Self {
+        Self {
+            id: job.id,
+            event_id: job.event_id.clone(),
+            job_kind: job.job_kind.clone(),
+            object_key: job.object_key.clone(),
+            mime_type: job.mime_type.clone(),
+            codec: job.codec.clone(),
+            byte_length: job.byte_length,
+            sample_rate: job.sample_rate,
+            channels: job.channels,
+            width: job.width,
+            height: job.height,
+            sha256: job.sha256.clone(),
+            started_at: job.started_at.clone(),
+            ended_at: job.ended_at.clone(),
+            stream_kind: job.stream_kind.clone(),
+            capture_session_id: job.capture_session_id.clone(),
+            stream_id: job.stream_id.clone(),
+            sequence: job.sequence,
+            context_json: job
+                .context
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok()),
+            usage_json: None,
+            audio_role: job.audio_role.clone(),
+            audio_route: job.audio_route.clone(),
+            route_epoch: job.route_epoch,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2267,6 +2304,237 @@ async fn load_job_media(state: &CpState, user_id: &str, job: &MediaJob) -> Resul
     Ok(media)
 }
 
+async fn load_postgres_job_media(
+    state: &CpState,
+    user_id: &str,
+    job: &MediaProcessingJob,
+) -> Result<Vec<u8>> {
+    let stored = state
+        .repositories
+        .media_objects()
+        .get_current_generation(&job.object_key, job.object_generation)
+        .await?;
+    if stored.generation != job.object_generation {
+        return Err(EnclaveError::Crypto(
+            "raw media generation changed after admission".into(),
+        ));
+    }
+    let dek = crate::crypto::load_dek(state.kms.as_ref(), &stored.wrapped_dek_b64).await?;
+    let context = crate::store::media_blob_context(user_id, &job.object_key);
+    let media = crate::crypto::decrypt_bound_blob(&dek, &stored.ciphertext, &context)?.plaintext;
+    if i64::try_from(media.len()).ok() != Some(job.byte_length)
+        || !format!("{:x}", Sha256::digest(&media)).eq_ignore_ascii_case(&job.sha256)
+    {
+        return Err(EnclaveError::Crypto("raw media commitment mismatch".into()));
+    }
+    Ok(media)
+}
+
+fn postgres_media_attempt_id(claim: &MediaProcessingClaim) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.postgres.media-attempt.v1\0");
+    digest.update(claim.account_id.as_bytes());
+    digest.update([0]);
+    digest.update(claim.work_unit_id.as_bytes());
+    digest.update([0]);
+    digest.update(claim.claim_token.as_bytes());
+    format!("vtx_{:x}", digest.finalize())
+}
+
+fn postgres_media_usage(
+    claim: &MediaProcessingClaim,
+    generation: &vertex::MediaGeneration,
+) -> Value {
+    let reserved = match claim.class {
+        MediaProcessingClass::Audio => vertex::MAX_MEDIA_OUTPUT_TOKENS,
+        MediaProcessingClass::Screen => vertex::MAX_SCREEN_OUTPUT_TOKENS,
+    };
+    json!({
+        "work_unit_id": claim.work_unit_id,
+        "work_class": claim.class.as_str(),
+        "member_count": claim.jobs.len(),
+        "reservation_state": "reserved",
+        "reserved_output_tokens": reserved,
+        "actual_prompt_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+        "actual_input_text_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_text_tokens),
+        "actual_input_audio_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_audio_tokens),
+        "actual_input_image_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_image_tokens),
+        "actual_cached_input_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+        "actual_output_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.output_tokens),
+        "actual_thought_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.thought_tokens),
+        "actual_total_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.total_tokens),
+        "returned_model": generation.metadata.model_version.as_deref(),
+        "traffic_type": generation.metadata.traffic_type.as_deref(),
+        "latency_ms": generation.latency_ms,
+        "processor_version": PROCESSOR_VERSION,
+        "outcome": "model_returned",
+    })
+}
+
+async fn reserve_postgres_media_output(
+    state: &CpState,
+    user_id: &str,
+    claim: &MediaProcessingClaim,
+) -> Result<()> {
+    let (class, requested) = match claim.class {
+        MediaProcessingClass::Audio => (
+            super::limits::VertexWorkClass::Audio,
+            i64::from(vertex::MAX_MEDIA_OUTPUT_TOKENS),
+        ),
+        MediaProcessingClass::Screen => (
+            super::limits::VertexWorkClass::Screen,
+            i64::from(vertex::MAX_SCREEN_OUTPUT_TOKENS),
+        ),
+    };
+    let reserved = super::limits::reserve_vertex_output_tokens_for_class(
+        &state.repositories,
+        user_id,
+        class,
+        requested,
+        state.config.quota_vertex_output_tokens_per_day,
+    )
+    .await?;
+    if !reserved.allowed {
+        return Err(EnclaveError::Config("vertex_daily_budget".into()));
+    }
+    state
+        .repositories
+        .media_processing()
+        .ok_or_else(|| EnclaveError::Config("PostgreSQL media repository is absent".into()))?
+        .record_reservation(claim, requested, &now_iso())
+        .await
+}
+
+async fn process_postgres_work_unit(
+    state: &CpState,
+    user_id: &str,
+    claim: &MediaProcessingClaim,
+) -> Result<()> {
+    let work = MediaWorkUnit {
+        id: claim.work_unit_id.clone(),
+        class: match claim.class {
+            MediaProcessingClass::Audio => WorkClass::Audio,
+            MediaProcessingClass::Screen => WorkClass::Screen,
+        },
+        jobs: claim.jobs.iter().map(MediaJob::from).collect(),
+    };
+    let mut media = Vec::with_capacity(claim.jobs.len());
+    for job in &claim.jobs {
+        media.push(load_postgres_job_media(state, user_id, job).await?);
+    }
+    reserve_postgres_media_output(state, user_id, claim).await?;
+    let attempt_id = postgres_media_attempt_id(claim);
+    let repository = state
+        .repositories
+        .media_processing()
+        .ok_or_else(|| EnclaveError::Config("PostgreSQL media repository is absent".into()))?;
+    if claim.class == MediaProcessingClass::Audio {
+        let (window, _sources, duration_ms) = assemble_audio_window(&work.jobs, &media)?;
+        let candidate_names = repository.candidate_name_vocabulary(user_id).await?;
+        let prompt = format!(
+            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            work.jobs[0].stream_kind,
+            serde_json::to_string(&candidate_names)?
+        );
+        let generation = vertex::generate_media_custom(
+            state,
+            user_id,
+            vertex::VertexOperation::AudioWindow,
+            &prompt,
+            "audio/wav",
+            &window,
+            audio_schema(),
+            true,
+            Some(attempt_id),
+        )
+        .await?;
+        super::model_usage::settle_response_required(
+            state,
+            user_id,
+            &postgres_media_attempt_id(claim),
+            &generation.metadata,
+        )
+        .await?;
+        repository
+            .settle_usage(MediaUsageSettlement {
+                claim: claim.clone(),
+                usage: postgres_media_usage(claim, &generation),
+            })
+            .await?;
+        let turns = parse_audio_result(&generation.text, duration_ms)?;
+        repository
+            .settle_audio(AudioMediaSettlement {
+                claim: claim.clone(),
+                turns,
+            })
+            .await
+    } else {
+        let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. List a person only when a visible name label supports it, preferring the complete first and last name. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
+        let inputs = work
+            .jobs
+            .iter()
+            .zip(&media)
+            .map(|(job, bytes)| vertex::MediaInput::new(&job.event_id, &job.mime_type, bytes))
+            .collect::<Vec<_>>();
+        let generation = vertex::generate_media_parts_custom(
+            state,
+            user_id,
+            vertex::VertexOperation::ScreenStoryboard,
+            prompt,
+            &inputs,
+            storyboard_schema(),
+            vertex::MAX_SCREEN_OUTPUT_TOKENS,
+            Some(attempt_id),
+        )
+        .await?;
+        super::model_usage::settle_response_required(
+            state,
+            user_id,
+            &postgres_media_attempt_id(claim),
+            &generation.metadata,
+        )
+        .await?;
+        repository
+            .settle_usage(MediaUsageSettlement {
+                claim: claim.clone(),
+                usage: postgres_media_usage(claim, &generation),
+            })
+            .await?;
+        let expected = claim
+            .jobs
+            .iter()
+            .map(|job| job.event_id.clone())
+            .collect::<Vec<_>>();
+        let results = validate_storyboard_result(&generation.text, &expected)?
+            .into_iter()
+            .map(|(event_id, result)| MediaScreenProjection {
+                event_id,
+                literal_description: result.literal_description,
+                screen_state: result.screen_state,
+                content_type: result.content_type,
+                visible_text: result.visible_text,
+                salient_text: result.salient_text,
+                people: result
+                    .people
+                    .into_iter()
+                    .map(|person| MediaPersonEvidence {
+                        name: person.name,
+                        evidence: person.evidence,
+                        confidence: person.confidence,
+                        is_active_speaker: person.is_active_speaker,
+                    })
+                    .collect(),
+            })
+            .collect();
+        repository
+            .settle_screens(ScreenMediaSettlement {
+                claim: claim.clone(),
+                results,
+            })
+            .await
+    }
+}
+
 async fn candidate_name_vocabulary(state: &CpState, user_id: &str) -> Result<Vec<String>> {
     state
         .store
@@ -3641,7 +3909,113 @@ async fn settle_media_work_failure(
         .await
 }
 
+async fn process_postgres_user(state: &CpState, user_id: &str) {
+    let Some(repository) = state.repositories.media_processing() else {
+        return;
+    };
+    let now = now_iso();
+    if let Err(error) = repository
+        .resurrect_recent_failures(
+            user_id,
+            &now,
+            RESURRECTION_DELAY_SECONDS as i64,
+            RESURRECTION_TOTAL_ATTEMPT_CAP,
+            RESURRECTION_WINDOW_SECONDS_INTEGRAL,
+            RESURRECTION_MAX_PER_SWEEP,
+        )
+        .await
+    {
+        warn!(user_id, error = %error, "PostgreSQL media resurrection failed");
+    }
+    let (audio_pending, screen_pending) = match repository.pending_classes(user_id, &now).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            warn!(user_id, error = %error, "PostgreSQL media class scan failed");
+            return;
+        }
+    };
+    let mut completed_work = false;
+    for class in
+        media_planner::schedule_classes(audio_pending, screen_pending, MAX_JOBS_PER_USER_PER_SWEEP)
+    {
+        let class = match class {
+            WorkClass::Audio => MediaProcessingClass::Audio,
+            WorkClass::Screen => MediaProcessingClass::Screen,
+        };
+        let claim = match repository
+            .claim(
+                user_id,
+                class,
+                &now_iso(),
+                CLAIM_LEASE_SECONDS,
+                CLAIM_SCAN_LIMIT,
+            )
+            .await
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                warn!(user_id, class = class.as_str(), error = %error, "PostgreSQL media claim failed");
+                continue;
+            }
+        };
+        let Some(claim) = claim else {
+            continue;
+        };
+        if let Err(error) = process_postgres_work_unit(state, user_id, &claim).await {
+            let error_code = match error {
+                EnclaveError::Config(ref message) if message == "quota" => "vertex_quota",
+                EnclaveError::Config(ref message) if message == "vertex_daily_budget" => {
+                    "vertex_daily_budget"
+                }
+                EnclaveError::Json(_) | EnclaveError::InvalidRequest(_) => "invalid_model_output",
+                EnclaveError::Crypto(_) => "media_integrity",
+                EnclaveError::Conflict(ref message) if message == TRANSCRIPT_TARGET_CONFLICT => {
+                    TRANSCRIPT_TARGET_CONFLICT
+                }
+                _ => "processing_error",
+            };
+            warn!(
+                user_id,
+                work_unit_id = claim.work_unit_id,
+                error_code,
+                error = %error,
+                "PostgreSQL media work unit failed"
+            );
+            if let Err(settle_error) = repository
+                .settle_failure(
+                    &claim,
+                    error_code,
+                    &now_iso(),
+                    MAX_ATTEMPTS,
+                    BUDGET_RETRY_SECONDS,
+                    RESURRECTION_WINDOW_SECONDS_INTEGRAL,
+                )
+                .await
+            {
+                warn!(
+                    user_id,
+                    work_unit_id = claim.work_unit_id,
+                    error = %settle_error,
+                    "PostgreSQL media failure settlement failed"
+                );
+                return;
+            }
+            if matches!(error_code, "vertex_quota" | "vertex_daily_budget") {
+                return;
+            }
+        }
+        completed_work = true;
+    }
+    if completed_work {
+        super::summarizer::kick_session_settled(user_id);
+    }
+}
+
 async fn process_user(state: &CpState, user_id: &str) {
+    if state.repositories.media_processing().is_some() {
+        process_postgres_user(state, user_id).await;
+        return;
+    }
     let now = now_iso();
     // The class scan is read-only, so the routed branch reads it through the
     // serving authority and the legacy branch keeps its exact call. Both see
@@ -4655,11 +5029,15 @@ async fn sweep(state: &Arc<CpState>) {
         }
         let state = Arc::clone(state);
         tasks.spawn(async move {
-            resurrect_user_failed_jobs(&state, &user_id).await;
+            if state.repositories.media_processing().is_none() {
+                resurrect_user_failed_jobs(&state, &user_id).await;
+            }
             process_user(&state, &user_id).await;
-            process_user_voice_embedding_jobs(&state, &user_id).await;
-            process_user_voice_profiles(&state, &user_id).await;
-            prune_user_media(&state, &user_id).await;
+            if state.repositories.media_processing().is_none() {
+                process_user_voice_embedding_jobs(&state, &user_id).await;
+                process_user_voice_profiles(&state, &user_id).await;
+                prune_user_media(&state, &user_id).await;
+            }
         });
     }
     while let Some(result) = tasks.join_next().await {
