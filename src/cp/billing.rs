@@ -569,7 +569,12 @@ async fn get_billing(
     State(state): State<std::sync::Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let account_id = match state.control.billing_account_id(&user.0).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
         Ok(value) => value,
         Err(_) => return service_unavailable(),
     };
@@ -771,7 +776,12 @@ async fn current_recording_summary(
     state: &CpState,
     user_id: &str,
 ) -> Result<Value, RecordingAuthorizationFailure> {
-    let account_id = match state.control.billing_account_id(user_id).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(user_id)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "recording billing account mapping unavailable");
@@ -797,7 +807,12 @@ async fn authorize_recording_seconds(
     user_id: &str,
     request_id: &str,
 ) -> Result<(Value, bool), RecordingAuthorizationFailure> {
-    let account_id = match state.control.billing_account_id(user_id).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(user_id)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "recording billing account mapping unavailable");
@@ -852,7 +867,12 @@ async fn authorize_offline_recording_seconds(
     user_id: &str,
     request_id: &str,
 ) -> Result<(Value, bool), RecordingAuthorizationFailure> {
-    let account_id = match state.control.billing_account_id(user_id).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(user_id)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "offline recording billing account mapping unavailable");
@@ -927,7 +947,8 @@ async fn create_recording_lease(
     }
     let _gate = state.recording_lease_gate.lock(&user.0).await;
     let existing = match state
-        .control
+        .repositories
+        .billing()
         .recording_lease_receipt(&user.0, &request.request_id)
         .await
     {
@@ -978,7 +999,12 @@ async fn create_recording_lease(
     let mut effective_request_id = request.request_id.clone();
     let mut existing_pending = existing.is_some();
     if !existing_pending {
-        let abandoned = match state.control.pending_recording_lease_request(&user.0).await {
+        let abandoned = match state
+            .repositories
+            .billing()
+            .pending_recording_lease_request(&user.0)
+            .await
+        {
             Ok(value) => value,
             Err(_) => return service_unavailable(),
         };
@@ -993,7 +1019,12 @@ async fn create_recording_lease(
         }
     }
     if existing.is_none() && !existing_pending {
-        let active = match state.control.active_recording_lease(&user.0).await {
+        let active = match state
+            .repositories
+            .billing()
+            .active_recording_lease(&user.0)
+            .await
+        {
             Ok(value) => value,
             Err(_) => return service_unavailable(),
         };
@@ -1057,7 +1088,8 @@ async fn create_recording_lease(
             base_ms.saturating_add(RECORDING_LEASE_SECONDS * 1_000),
         );
         if state
-            .control
+            .repositories
+            .billing()
             .begin_recording_lease_request(
                 &user.0,
                 &request.request_id,
@@ -1076,7 +1108,8 @@ async fn create_recording_lease(
             Ok(result) => result,
             Err(RecordingAuthorizationFailure::Denied { code, summary }) => {
                 if state
-                    .control
+                    .repositories
+                    .billing()
                     .deny_recording_lease_request(&user.0, &effective_request_id, &code, &summary)
                     .await
                     .is_err()
@@ -1089,12 +1122,18 @@ async fn create_recording_lease(
         };
     if duplicate_is_conflict(existing_pending, upstream_duplicate) {
         let _ = state
-            .control
+            .repositories
+            .billing()
             .conflict_recording_lease_request(&user.0, &effective_request_id)
             .await;
         return idempotency_conflict();
     }
-    let pending = match state.control.pending_recording_lease_request(&user.0).await {
+    let pending = match state
+        .repositories
+        .billing()
+        .pending_recording_lease_request(&user.0)
+        .await
+    {
         Ok(Some((_request_id, pending))) => pending,
         _ => return service_unavailable(),
     };
@@ -1112,7 +1151,8 @@ async fn create_recording_lease(
     };
     let retry_now_ms = existing_pending.then(epoch_millis);
     let (lease_id, expires_at) = match state
-        .control
+        .repositories
+        .billing()
         .complete_recording_lease(&user.0, &effective_request_id, retry_now_ms, &summary)
         .await
     {
@@ -1142,7 +1182,8 @@ async fn record_offline_recording_usage(
     // idempotent without persisting client or capture metadata in the enclave.
     let _gate = state.recording_lease_gate.lock(&user.0).await;
     let already_completed = match state
-        .control
+        .repositories
+        .billing()
         .offline_recording_usage_receipt(&user.0, &request.request_id)
         .await
     {
@@ -1160,7 +1201,8 @@ async fn record_offline_recording_usage(
     match authorize_offline_recording_seconds(&state, &user.0, &request.request_id).await {
         Ok((summary, upstream_duplicate)) => {
             let inserted = match state
-                .control
+                .repositories
+                .billing()
                 .complete_offline_recording_usage(&user.0, &request.request_id)
                 .await
             {
@@ -1210,7 +1252,12 @@ fn idempotency_conflict() -> Response {
 /// in bounded idempotent ticks. A new audio object still checks the current
 /// entitlement before persistence so a client cannot bypass a stopped lease.
 pub async fn check_recording_entitlement(state: &CpState, user_id: &str) -> Result<(), Response> {
-    match state.control.active_recording_lease(user_id).await {
+    match state
+        .repositories
+        .billing()
+        .active_recording_lease(user_id)
+        .await
+    {
         Ok(Some((_lease_id, expires_at)))
             if super::isotime::parse_epoch_millis(&expires_at)
                 .is_some_and(|expires| expires > epoch_millis()) =>
@@ -1231,7 +1278,8 @@ pub async fn reserve_recording_delivery(
     media_bytes: i64,
 ) -> Result<(), Response> {
     match state
-        .control
+        .repositories
+        .billing()
         .reserve_recording_delivery(user_id, event_id, media_bytes)
         .await
     {
@@ -1363,7 +1411,12 @@ async fn create_checkout(
                 .into_response(),
         );
     }
-    let account_id = match state.control.billing_account_id(&user.0).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
         Ok(value) => value,
         Err(_) => return service_unavailable(),
     };
@@ -1374,7 +1427,12 @@ async fn create_portal(
     State(state): State<std::sync::Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let account_id = match state.control.billing_account_id(&user.0).await {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
         Ok(value) => value,
         Err(_) => return service_unavailable(),
     };
@@ -1868,7 +1926,8 @@ async fn current_account_drivers(
         .ok()?;
 
     let anchor = state
-        .control
+        .repositories
+        .billing()
         .vertex_coverage_anchor(&user_id, &period)
         .await
         .ok()
@@ -1948,24 +2007,34 @@ async fn admin_margin(
         Some(account_ids) => account_ids,
         None => return service_unavailable(),
     };
-    let account_metrics = match state.control.retained_active_account_metrics(&period).await {
+    let account_metrics = match state
+        .repositories
+        .billing()
+        .retained_active_account_metrics(&period)
+        .await
+    {
         Ok(metrics) => metrics,
         Err(_) => return service_unavailable(),
     };
     let account_metrics_as_of = super::isotime::format_epoch_millis(epoch_millis());
     let users = match state
-        .control
+        .repositories
+        .billing()
         .active_identities_for_billing_accounts(account_ids)
         .await
     {
         Ok(users) => users,
         Err(_) => return service_unavailable(),
     };
-    let anchored_global_coverage_complete =
-        match state.control.active_vertex_coverage_complete(&period).await {
-            Ok(complete) => complete,
-            Err(_) => return service_unavailable(),
-        };
+    let anchored_global_coverage_complete = match state
+        .repositories
+        .billing()
+        .active_vertex_coverage_complete(&period)
+        .await
+    {
+        Ok(complete) => complete,
+        Err(_) => return service_unavailable(),
+    };
     let mut identities = Vec::with_capacity(users.len());
     for (user_id, email, account_id) in users {
         let drivers = current_account_drivers(&state, &user_id, &period).await;
@@ -2004,7 +2073,12 @@ pub fn spawn_detach_worker(state: std::sync::Arc<CpState>) {
 }
 
 pub async fn drain_detach_outbox(state: &CpState) {
-    let account_ids = match state.control.pending_billing_detach_ids(50).await {
+    let account_ids = match state
+        .repositories
+        .billing()
+        .pending_billing_detach_ids(50)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "billing detach scan deferred");
@@ -2014,13 +2088,19 @@ pub async fn drain_detach_outbox(state: &CpState) {
     for account_id in account_ids {
         match state.billing.detach(&account_id).await {
             Ok(response) if response.detached => {
-                if let Err(error) = state.control.complete_billing_detach(&account_id).await {
+                if let Err(error) = state
+                    .repositories
+                    .billing()
+                    .complete_billing_detach(&account_id)
+                    .await
+                {
                     warn!(error = %error, "billing detach acknowledgement deferred");
                 }
             }
             _ => {
                 let _ = state
-                    .control
+                    .repositories
+                    .billing()
                     .record_billing_detach_failure(&account_id)
                     .await;
                 warn!("billing detach deferred");

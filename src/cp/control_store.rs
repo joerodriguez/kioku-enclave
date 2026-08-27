@@ -98,6 +98,9 @@ use crate::{
 };
 
 pub use crate::persistence::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
+pub use crate::persistence::{
+    RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor,
+};
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
 const CONTROL_OBJECT_SLOT_COUNT: usize = 32;
@@ -3525,34 +3528,6 @@ fn refuse_push_fenced_identity_rebind_conn(
         ));
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecordingLeaseRequestRow {
-    pub requested_lease_id: Option<String>,
-    pub issued_lease_id: String,
-    pub expires_at: String,
-    pub state: String,
-    pub summary: Option<serde_json::Value>,
-    pub denial_code: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VertexCoverageAnchor {
-    pub period: String,
-    pub sequence: u64,
-    pub pending_events: u64,
-    pub lost_events: u64,
-    pub observed_at: String,
-}
-
-/// Aggregate owner-reporting counts derived inside the encrypted control
-/// store. The shape deliberately cannot carry account identifiers or signup
-/// timestamps across the owner API boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetainedAccountMetrics {
-    pub retained_active_accounts: u64,
-    pub new_retained_active_accounts_mtd: u64,
 }
 
 fn valid_utc_month(value: &str) -> bool {

@@ -11,3 +11,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
 - `0003_notification_configuration.sql` adds webhook destinations, email
   consent, the bounded push registry, and provider-send fence tables that
   serialize configuration changes with in-flight disclosures.
+- `0004_billing_recording.sql` adds billing pseudonyms, coverage anchors,
+  recording lease/idempotency receipts, and fleet-wide delivery credits.

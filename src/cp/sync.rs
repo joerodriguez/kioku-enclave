@@ -689,7 +689,12 @@ async fn delete_account(
     // retry, content may already be gone, so reopening an empty index to settle
     // again would violate deletion. Finalized tombstone retries likewise skip.
     if account_status == "active" {
-        let account_id = match s.control.billing_account_id_for_deletion(&user_id).await {
+        let account_id = match s
+            .repositories
+            .billing()
+            .billing_account_id_for_deletion(&user_id)
+            .await
+        {
             Ok(account_id) => account_id,
             Err(e) => {
                 warn!(error = %e, "failed to load deletion accounting identity");
@@ -954,7 +959,8 @@ async fn begin_adr0022_cutover_account_deletion(
     }
 
     let account_id = state
-        .control
+        .repositories
+        .billing()
         .billing_account_id_for_deletion(user_id)
         .await?;
     super::model_usage::settle_for_account_deletion(state, user_id, &account_id).await?;

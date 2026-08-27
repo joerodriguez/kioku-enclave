@@ -4,6 +4,7 @@
 //! not select it until every application domain has a PostgreSQL port. That
 //! keeps the intermediate releases single-authority.
 
+mod billing;
 mod entitlement;
 mod identity;
 mod notification;
@@ -17,7 +18,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 3;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -104,6 +105,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 3;
+        }
+        if version == 3 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0004_billing_recording.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -183,7 +192,10 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE push_send_fences, push_installations, email_send_fences, \
+            "TRUNCATE offline_recording_usage_receipts, recording_delivery_reservations, \
+             recording_delivery_balances, recording_lease_denials, recording_lease_requests, \
+             recording_leases, vertex_coverage_anchors, billing_detach_outbox, billing_accounts, \
+             push_send_fences, push_installations, email_send_fences, \
              episode_email_preferences, webhook_send_fences, webhook_subscriptions, \
              usage_daily, refresh_tokens, oauth_authorization_codes, oauth_consents, \
              oauth_clients, apple_credentials, auth_identities, deleted_identities, \
@@ -282,6 +294,129 @@ mod tests {
             allowed += usize::from(reservation.await.unwrap());
         }
         assert_eq!(allowed, 2, "the protected audio budget is fleet-wide");
+
+        let mut billing_lookups = Vec::new();
+        for _ in 0..8 {
+            let repositories = Arc::clone(&repositories);
+            let account_id = account_id.clone();
+            billing_lookups.push(tokio::spawn(async move {
+                repositories
+                    .billing()
+                    .billing_account_id(&account_id)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut billing_account_id = None;
+        for lookup in billing_lookups {
+            let observed = lookup.await.unwrap();
+            match &billing_account_id {
+                Some(expected) => assert_eq!(&observed, expected),
+                None => billing_account_id = Some(observed),
+            }
+        }
+        assert!(billing_account_id.unwrap().starts_with("acct_"));
+
+        let coverage = repositories
+            .billing()
+            .reconcile_vertex_coverage(&account_id, "2026-08", 1, 0, 0, "2026-08-27T12:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(coverage.sequence, 1);
+        assert!(repositories
+            .billing()
+            .active_vertex_coverage_complete("2026-08")
+            .await
+            .unwrap());
+
+        repositories
+            .billing()
+            .begin_recording_lease_request(
+                &account_id,
+                "lease-request-one",
+                None,
+                "lease_contract_one",
+                "2026-08-27T12:01:00.000Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .billing()
+                .pending_recording_lease_request(&account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            "lease-request-one"
+        );
+        let lease = repositories
+            .billing()
+            .complete_recording_lease(
+                &account_id,
+                "lease-request-one",
+                None,
+                &serde_json::json!({"recording":{"allowed":true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease.0, "lease_contract_one");
+        assert_eq!(
+            repositories
+                .billing()
+                .active_recording_lease(&account_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            lease
+        );
+        assert!(repositories
+            .billing()
+            .reserve_recording_delivery(&account_id, "event-one", 1024)
+            .await
+            .unwrap());
+        assert!(repositories
+            .billing()
+            .complete_offline_recording_usage(&account_id, "offline-one")
+            .await
+            .unwrap());
+        assert!(!repositories
+            .billing()
+            .complete_offline_recording_usage(&account_id, "offline-one")
+            .await
+            .unwrap());
+
+        repositories
+            .billing()
+            .begin_recording_lease_request(
+                &account_id,
+                "lease-request-denied",
+                None,
+                "lease_contract_denied",
+                "2026-08-27T12:02:00.000Z",
+            )
+            .await
+            .unwrap();
+        repositories
+            .billing()
+            .deny_recording_lease_request(
+                &account_id,
+                "lease-request-denied",
+                "allowance_exhausted",
+                &serde_json::json!({"recording":{"allowed":false}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .billing()
+                .recording_lease_receipt(&account_id, "lease-request-denied")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "denied"
+        );
 
         let webhook = WebhookSubscription {
             id: "22222222-2222-4222-8222-222222222222".into(),
