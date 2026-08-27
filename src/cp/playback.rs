@@ -531,8 +531,9 @@ async fn memory_playback_segment(
 
     let generation = authority.generation.unwrap_or_default();
     let object = match state
-        .store
-        .get_current_media_generation(object_key, generation)
+        .repositories
+        .media_objects()
+        .get_current_generation(object_key, generation)
         .await
     {
         Ok(value) => value,

@@ -7,9 +7,11 @@
 mod billing;
 mod capture;
 mod entitlement;
+mod gcs_media;
 mod identity;
 mod legacy;
 mod lifecycle;
+mod media_object;
 mod model_usage;
 mod notification;
 mod oauth;
@@ -29,9 +31,11 @@ pub(crate) use capture::{
     CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
+pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
 pub(crate) use lifecycle::AccountLifecycleRepository;
+pub(crate) use media_object::MediaObjectStore;
 pub(crate) use model_usage::{
     ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
 };
@@ -60,9 +64,9 @@ pub(crate) use work::{
 
 use self::legacy::{
     LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
-    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMemoryQueryRepository,
-    LegacyModelUsageRepository, LegacyNotificationRepository, LegacyOAuthRepository,
-    LegacyWorkRepository,
+    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMediaObjectStore,
+    LegacyMemoryQueryRepository, LegacyModelUsageRepository, LegacyNotificationRepository,
+    LegacyOAuthRepository, LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 use crate::store::Store;
@@ -81,6 +85,7 @@ pub(crate) struct RepositorySet {
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
+    media_objects: Arc<dyn MediaObjectStore>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
 }
@@ -96,13 +101,17 @@ impl RepositorySet {
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
             memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
+            media_objects: Arc::new(LegacyMediaObjectStore::new(Arc::clone(&store))),
             model_usage: Arc::new(LegacyModelUsageRepository::new(store)),
             work: Arc::new(LegacyWorkRepository::new(control)),
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn postgres(persistence: Arc<PostgresPersistence>) -> Self {
+    pub(crate) fn postgres(
+        persistence: Arc<PostgresPersistence>,
+        media_objects: Arc<dyn MediaObjectStore>,
+    ) -> Self {
         Self {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
@@ -112,6 +121,7 @@ impl RepositorySet {
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
+            media_objects,
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
             work: persistence,
         }
@@ -147,6 +157,14 @@ impl RepositorySet {
 
     pub(crate) fn memory_queries(&self) -> &dyn MemoryQueryRepository {
         self.memory_queries.as_ref()
+    }
+
+    pub(crate) fn media_objects(&self) -> &dyn MediaObjectStore {
+        self.media_objects.as_ref()
+    }
+
+    pub(crate) fn media_objects_arc(&self) -> Arc<dyn MediaObjectStore> {
+        Arc::clone(&self.media_objects)
     }
 
     pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {

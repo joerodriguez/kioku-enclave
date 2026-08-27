@@ -1856,14 +1856,14 @@ async fn upload_capture_event(
         // cancelled. Deletion waits for that child lease and therefore scans
         // only after the provider has definitively accepted or rejected it.
         let put_lease = _content_write.child();
-        let put_store = Arc::clone(&state.store);
+        let put_store = state.repositories.media_objects_arc();
         let put_user_id = user_id.clone();
         let put_object_key = write.object_key.clone();
         let put_key_reference = write.provider_key_reference.clone();
         let put = tokio::spawn(async move {
             let _put_lease = put_lease;
             put_store
-                .put_user_media(
+                .put_current(
                     &put_user_id,
                     &put_object_key,
                     &encrypted,
@@ -3192,7 +3192,11 @@ async fn verify_existing_media(
     // live response. It must be encrypted under the account's already chosen
     // DEK and strict v2 AAD; the generation returned here is the same response
     // whose bytes were authenticated, so no verify-N/record-N+1 race exists.
-    let existing = state.store.get_current_media(object_key).await?;
+    let existing = state
+        .repositories
+        .media_objects()
+        .get_current(object_key)
+        .await?;
     if existing.generation <= 0 || existing.wrapped_dek_b64 != installed_wrapped_dek {
         return Err(EnclaveError::Conflict(
             "existing canonical media does not match the installed account key".into(),
@@ -3236,8 +3240,9 @@ pub(crate) async fn submit_selected_screen_capture_fixture(
     let context = crate::store::media_blob_context(user_id, &object_key);
     let encrypted = crate::crypto::encrypt_bound_blob(&dek, media_bytes, &context)?;
     let generation = state
-        .store
-        .put_user_media(user_id, &object_key, &encrypted, &wrapped_dek)
+        .repositories
+        .media_objects()
+        .put_current(user_id, &object_key, &encrypted, &wrapped_dek)
         .await?;
     let asset_id = media.asset_id.clone();
     let commit_stamp = enclave_commit_stamp();

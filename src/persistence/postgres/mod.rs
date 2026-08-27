@@ -255,7 +255,6 @@ mod tests {
         AuthorizationCodeExchange, ConsentApproval, OAuthClientDefinition, PendingConsent,
         RefreshTokenRotation,
     };
-    use crate::persistence::RepositorySet;
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
@@ -264,7 +263,9 @@ mod tests {
         PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
+    use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::search::{SearchHit, SearchRequest};
+    use crate::store::tests::FakeGcs;
 
     async fn test_persistence() -> Option<PostgresPersistence> {
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -308,7 +309,10 @@ mod tests {
         };
         let persistence = Arc::new(persistence);
         let pool = persistence.pool().clone();
-        let repositories = Arc::new(RepositorySet::postgres(persistence));
+        let media_gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let media_objects: Arc<dyn MediaObjectStore> =
+            Arc::new(GcsMediaObjectStore::new(Arc::clone(&media_gcs), media_gcs));
+        let repositories = Arc::new(RepositorySet::postgres(persistence, media_objects));
 
         let mut signups = Vec::new();
         for _ in 0..16 {
