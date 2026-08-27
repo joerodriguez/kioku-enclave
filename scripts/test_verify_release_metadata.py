@@ -591,8 +591,26 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertIn("shadow-runtime claim does not match", completed.stderr)
 
         completed = self.verify(manifest(), shadow_runtime_config=active_config)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        active_on_stable_tag = manifest()
+        active_on_stable_tag.update(
+            {
+                "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+                "archive_v3_archive_bucket": "archive-bucket-1",
+                "archive_v3_archive_gcs_project_number": "123456789",
+                "archive_v3_registry_kms_version": "7",
+                "archive_v3_witness_project_id": "project-1",
+                "archive_v3_witness_project_number": "987654321",
+                "archive_v3_witness_database_id": "witness-db",
+                "archive_v3_archive_binding_commitment": "1" * 64,
+            }
+        )
+        completed = self.verify(
+            active_on_stable_tag, shadow_runtime_config=active_config
+        )
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("exact vX.Y.Z-archive-v3-wal.N", completed.stderr)
+        self.assertIn("shadow-runtime claim does not match", completed.stderr)
 
     def test_schema_v7_manifest_is_ineligible_for_promotion(self) -> None:
         data = manifest()
