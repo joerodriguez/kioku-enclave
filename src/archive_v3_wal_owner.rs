@@ -2730,15 +2730,27 @@ where
                     // expired and was reacquired by another process kept
                     // answering from its frozen SQLite as though it were the
                     // settled authority — unboundedly stale, with no error.
-                    // `require_fresh_head` re-reads the live witness and
-                    // requires the rebuilt binding to equal this owner's
-                    // binding; that commitment covers the whole record, so any
-                    // fence takeover or root advance fails it and poisons the
-                    // lane, and a superseded owner can never serve again.
+                    // `require_fresh_head_or_reconcile_checkpoint` first
+                    // re-reads the live witness. A matching commitment serves
+                    // without consulting mutable Control lifecycle state. If
+                    // the provider instead reports a successor, the actor gets
+                    // one exact chance to prove and adopt a retained checkpoint
+                    // before treating the owner as terminally superseded.
                     // Transient provider failures surface as Publication
                     // without poisoning.
                     WalOwnerMessage::Read { read, response } => {
-                        let result = match owner.require_fresh_head().await {
+                        // A checkpoint can have advanced the external witness
+                        // before its Control settlement survives a response or
+                        // process exit. Startup deliberately reopens that
+                        // send-sensitive state on the predecessor binding so
+                        // the checkpoint reconciler can authenticate and adopt
+                        // the exact successor. A read that observes that
+                        // successor must run the reconciler before terminally
+                        // accepting supersession: otherwise the first startup
+                        // epoch-marker read poisons the only recovery-capable
+                        // owner, and every relaunch repeats the same dead end.
+                        let result = match owner.require_fresh_head_or_reconcile_checkpoint().await
+                        {
                             Ok(()) => owner.store.read(read).await.map_err(|error| {
                                 report_wal_owner_runtime_refusal("read", "serve_store_read", error)
                             }),
@@ -2815,20 +2827,7 @@ where
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
         stage: &mut &'static str,
     ) -> Result<Box<dyn Any + Send>> {
-        if self
-            .publication
-            .checkpoint_pending(self.store.binding())
-            .await?
-        {
-            let owner_instance_id = self.store.instance_id();
-            let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
-            let settlement = self
-                .publication
-                .checkpoint_and_recover(&binding, owner_instance_id, source)
-                .await?;
-            self.store = settlement.into_lane(self.store.liveness()).await?;
-            self.require_fresh_head().await?;
-        }
+        self.reconcile_pending_checkpoint().await?;
         let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
         *stage = "inspect_operation";
         let admission = self
@@ -2950,6 +2949,58 @@ where
                 self.publish_applied(*context, drain, attempt, result).await
             }
         }
+    }
+
+    /// Settle an exact retained checkpoint before any operation authenticates
+    /// the current head.
+    ///
+    /// The provider successor may already be live while Control still retains
+    /// CandidateReady/SendStarted. The predecessor binding is intentional in
+    /// that state: it is the authority needed to authenticate the candidate
+    /// and recover the successor. This helper is shared by reads and applies
+    /// so neither operation can destroy that recovery authority merely by
+    /// observing the already-advanced witness first.
+    async fn reconcile_pending_checkpoint(&mut self) -> Result<()> {
+        if !self
+            .publication
+            .checkpoint_pending(self.store.binding())
+            .await?
+        {
+            return Ok(());
+        }
+        let owner_instance_id = self.store.instance_id();
+        let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
+        let settlement = self
+            .publication
+            .checkpoint_and_recover(&binding, owner_instance_id, source)
+            .await?;
+        self.store = settlement.into_lane(self.store.liveness()).await?;
+        self.require_fresh_head().await
+    }
+
+    /// Authenticate an ordinary read without coupling it to Control lifecycle
+    /// availability. Only a provider-confirmed successor can justify looking
+    /// for the one retained checkpoint that may legitimately replace this
+    /// owner's binding.
+    async fn require_fresh_head_or_reconcile_checkpoint(&mut self) -> Result<()> {
+        let fresh = self
+            .publication
+            .read_fresh_head(self.store.binding())
+            .await?;
+        if let FreshHead::Authenticated(fresh) = fresh {
+            if fresh.authenticates(self.store.binding()) {
+                return Ok(());
+            }
+        }
+        if self
+            .publication
+            .checkpoint_pending(self.store.binding())
+            .await?
+        {
+            return self.reconcile_pending_checkpoint().await;
+        }
+        self.store.poison();
+        Err(WalOwnerError::Superseded)
     }
 
     async fn require_fresh_head(&mut self) -> Result<()> {
@@ -4153,6 +4204,153 @@ mod tests {
             self.candidate_sends.fetch_add(1, Ordering::SeqCst);
             WitnessedWalCandidate::from_authority(candidate.clone(), self.next.clone())
         }
+    }
+
+    /// Restart shape for a checkpoint whose provider root advance succeeded
+    /// before the retained Control attempt was settled. The owner is rebuilt
+    /// on the predecessor binding; only checkpoint reconciliation may adopt
+    /// `successor`.
+    struct PendingCheckpointPublication {
+        successor: WitnessRecord,
+        pending: AtomicBool,
+        recoveries: AtomicUsize,
+        directories: Mutex<Vec<tempfile::TempDir>>,
+    }
+
+    impl PendingCheckpointPublication {
+        fn new(successor: WitnessRecord) -> Self {
+            Self {
+                successor,
+                pending: AtomicBool::new(true),
+                recoveries: AtomicUsize::new(0),
+                directories: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl sealed::PublicationAuthority for PendingCheckpointPublication {}
+
+    #[async_trait]
+    impl WalPublicationAuthority for PendingCheckpointPublication {
+        async fn read_fresh_head(&self, binding: &WalOwnerStoreBinding) -> Result<FreshHead> {
+            AuthenticatedWalOwnerHead::from_authority(binding, self.successor.clone())
+        }
+
+        async fn checkpoint_required(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn checkpoint_pending(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(self.pending.load(Ordering::SeqCst))
+        }
+
+        async fn refresh_live_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn refresh_checkpoint_source_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn checkpoint_and_recover(
+            &self,
+            binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+            mut source: crate::store::WalOwnerCheckpointSource,
+        ) -> Result<WalCheckpointSettlement> {
+            use std::os::unix::fs::PermissionsExt;
+
+            if !self.pending.swap(false, Ordering::SeqCst) {
+                return Err(WalOwnerError::Conflict);
+            }
+            let (length, _, schema_version) =
+                source.authenticated_facts(WalCheckpointSourceContext::for_test(), binding)?;
+            let mut bytes =
+                vec![0; usize::try_from(length).map_err(|_| WalOwnerError::Persistence)?];
+            source.read_checkpoint_exact(
+                WalCheckpointSourceContext::for_test(),
+                0,
+                bytes.as_mut_slice(),
+            )?;
+            let directory = tempfile::tempdir().map_err(|_| WalOwnerError::Persistence)?;
+            let path = directory.path().join("pending-checkpoint-successor.sqlite");
+            std::fs::write(&path, bytes).map_err(|_| WalOwnerError::Persistence)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| WalOwnerError::Persistence)?;
+            let next_binding = WalOwnerStoreBinding::from_authenticated_witness(&self.successor)?;
+            let staged = crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::for_test(
+                path,
+                &next_binding,
+                schema_version,
+            )
+            .map_err(|_| WalOwnerError::Corrupt)?;
+            self.directories.lock().unwrap().push(directory);
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(WalCheckpointSettlement {
+                staged,
+                binding: next_binding,
+                capture: crate::store::StoreShadowCapture::shared_for_test(),
+            })
+        }
+
+        async fn create_candidate(
+            &self,
+            _context: &WalOwnerContext,
+            _captured: &CapturedWalCommit,
+            _control: &dyn WalOwnerControl,
+        ) -> Result<WalPublicationCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+
+        async fn send_candidate(
+            &self,
+            _context: &WalOwnerContext,
+            _candidate: &WalPublicationCandidate,
+        ) -> Result<WitnessedWalCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+
+        async fn resume_candidate(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _identity: WalOperationIdentity,
+            _attempt: &WalOwnerAttempt,
+            _candidate: &WalPublicationCandidate,
+        ) -> Result<WitnessedWalCandidate> {
+            Err(WalOwnerError::Conflict)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_reconciles_a_pending_checkpoint_before_authenticating_the_fresh_head() {
+        let (predecessor, successor) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&predecessor).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let publication = Arc::new(PendingCheckpointPublication::new(successor));
+        let handle = SingleArchiveWalOwner::spawn(
+            store,
+            Arc::new(FakeControl::new()),
+            Arc::clone(&publication),
+        );
+
+        // Without the pre-read checkpoint reconciliation this exact restart
+        // shape returns Superseded here, poisons the actor, and makes every
+        // startup/relaunch repeat the same terminal predecessor.
+        assert_eq!(handle.read(|_| Ok(7_u8)).await.unwrap().unwrap(), 7);
+        assert_eq!(publication.recoveries.load(Ordering::SeqCst), 1);
+        assert!(!handle.is_terminal());
+
+        // The retained checkpoint is consumed exactly once. Later reads use
+        // the authenticated successor directly and do not rebuild again.
+        assert_eq!(handle.read(|_| Ok(8_u8)).await.unwrap().unwrap(), 8);
+        assert_eq!(publication.recoveries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
