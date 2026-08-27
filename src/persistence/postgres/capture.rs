@@ -12,8 +12,10 @@ use crate::{
     },
     error::{CaptureReferenceFailureReason, EnclaveError, Result},
     persistence::{
-        CaptureCommit, CaptureCommitResult, CapturePreflight, CaptureRepository,
-        ReferenceBatchCommit, ReferenceBatchCommitResult,
+        CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight,
+        CaptureRepository, CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing,
+        CaptureSessionStage, CaptureSessionStatus, ReferenceBatchCommit,
+        ReferenceBatchCommitResult,
     },
 };
 
@@ -685,6 +687,170 @@ async fn insert_event(
     })
 }
 
+async fn postgres_session_status(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    capture_session_id: &str,
+    summarized_until_ms: Option<i64>,
+) -> Result<Option<CaptureSessionStatus>> {
+    let session = sqlx::query(
+        "SELECT id,device_id, \
+                floor(extract(epoch FROM started_at)*1000)::bigint AS started_at_ms, \
+                floor(extract(epoch FROM last_event_at)*1000)::bigint AS last_event_at_ms, \
+                floor(extract(epoch FROM ended_at)*1000)::bigint AS ended_at_ms \
+           FROM capture_sessions WHERE account_id=$1 AND id=$2",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_optional(persistence.pool())
+    .await?;
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let started_at = isotime::format_epoch_millis(session.try_get("started_at_ms")?);
+    let last_event_at = isotime::format_epoch_millis(session.try_get("last_event_at_ms")?);
+    let ended_at_ms: Option<i64> = session.try_get("ended_at_ms")?;
+    let ended_at = ended_at_ms.map(isotime::format_epoch_millis);
+
+    let processing = sqlx::query(
+        "SELECT count(*)::bigint AS event_count, \
+                count(*) FILTER (WHERE coalesce(m.processing_state,'ready')='queued')::bigint AS queued, \
+                count(*) FILTER (WHERE coalesce(m.processing_state,'ready')='processing')::bigint AS processing, \
+                count(*) FILTER (WHERE coalesce(m.processing_state,'ready')='retry_wait')::bigint AS retry_wait, \
+                count(*) FILTER (WHERE coalesce(m.processing_state,'ready') IN ('ready','pruned'))::bigint AS ready, \
+                count(*) FILTER (WHERE coalesce(m.processing_state,'ready')='failed')::bigint AS failed \
+           FROM capture_events e LEFT JOIN media_objects m \
+             ON m.account_id=e.account_id AND m.event_id=e.event_id \
+          WHERE e.account_id=$1 AND e.capture_session_id=$2",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_one(persistence.pool())
+    .await?;
+    let event_count: i64 = processing.try_get("event_count")?;
+    let queued: i64 = processing.try_get("queued")?;
+    let processing_count: i64 = processing.try_get("processing")?;
+    let retry_wait: i64 = processing.try_get("retry_wait")?;
+    let ready: i64 = processing.try_get("ready")?;
+    let failed: i64 = processing.try_get("failed")?;
+
+    let memory_rows = sqlx::query(
+        "SELECT DISTINCT e.id,e.title,e.finalization_status, \
+                floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
+                floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
+                floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms \
+           FROM episodes e JOIN episode_members m \
+             ON m.account_id=e.account_id AND m.episode_id=e.id \
+           LEFT JOIN utterances u ON u.account_id=m.account_id \
+             AND m.record_type='utterance' AND u.id=m.record_id \
+           LEFT JOIN screenshots s ON s.account_id=m.account_id \
+             AND m.record_type='screenshot' AND s.id=m.record_id \
+           JOIN capture_events ce ON ce.account_id=e.account_id AND ce.capture_session_id=$2 \
+             AND ((u.source_key LIKE 'cloud-v2:'||ce.event_id||':%') \
+               OR s.source_key='cloud-v2:'||ce.event_id) \
+          WHERE e.account_id=$1 AND e.substance!='none' \
+          ORDER BY started_at_ms DESC,e.id DESC",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_all(persistence.pool())
+    .await?;
+    let memories = memory_rows
+        .iter()
+        .map(|row| {
+            Ok(CaptureSessionMemory {
+                id: row.try_get("id")?,
+                title: row.try_get("title")?,
+                started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
+                ended_at: isotime::format_epoch_millis(row.try_get("ended_at_ms")?),
+                finalization_status: row.try_get("finalization_status")?,
+                finalized_at: row
+                    .try_get::<Option<i64>, _>("finalized_at_ms")?
+                    .map(isotime::format_epoch_millis),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let audio_minutes = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT round(max(kind_seconds)/60.0)::bigint FROM ( \
+           SELECT sum(extract(epoch FROM (ended_at-started_at))) AS kind_seconds \
+             FROM capture_events WHERE account_id=$1 AND capture_session_id=$2 \
+              AND stream_kind IN ('mic','system_audio','ios_mic') GROUP BY stream_kind) kinds",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_one(persistence.pool())
+    .await?;
+    let voice_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(DISTINCT u.speaker_label)::bigint FROM capture_events ce JOIN utterances u \
+           ON u.account_id=ce.account_id AND u.source_key LIKE 'cloud-v2:'||ce.event_id||':%' \
+          WHERE ce.account_id=$1 AND ce.capture_session_id=$2 AND u.speaker_label!=''",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_one(persistence.pool())
+    .await?;
+    let top_contexts = sqlx::query_scalar::<_, String>(
+        "SELECT s.active_app FROM capture_events ce JOIN screenshots s \
+           ON s.account_id=ce.account_id AND s.source_key='cloud-v2:'||ce.event_id \
+          WHERE ce.account_id=$1 AND ce.capture_session_id=$2 \
+            AND s.active_app IS NOT NULL AND s.active_app!='' \
+          GROUP BY s.active_app ORDER BY count(*) DESC,s.active_app LIMIT 3",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_all(persistence.pool())
+    .await?;
+
+    let has_ready_memory = memories
+        .iter()
+        .any(|memory| memory.finalization_status == "complete" && memory.finalized_at.is_some());
+    let summarized_past_end = ended_at_ms
+        .zip(summarized_until_ms)
+        .is_some_and(|(ended, cursor)| cursor > ended);
+    let stage = if queued + processing_count > 0 {
+        CaptureSessionStage::Processing
+    } else if has_ready_memory {
+        CaptureSessionStage::Ready
+    } else if retry_wait > 0 {
+        CaptureSessionStage::Processing
+    } else if !memories.is_empty() {
+        CaptureSessionStage::PreparingRecap
+    } else if failed > 0 {
+        CaptureSessionStage::NeedsAttention
+    } else if ended_at.is_some() {
+        if summarized_past_end {
+            CaptureSessionStage::NoMemory
+        } else {
+            CaptureSessionStage::Organizing
+        }
+    } else {
+        CaptureSessionStage::Received
+    };
+    Ok(Some(CaptureSessionStatus {
+        capture_session_id: session.try_get("id")?,
+        device_id: session.try_get("device_id")?,
+        started_at,
+        last_event_at,
+        ended_at,
+        event_count,
+        stage,
+        processing: CaptureSessionProcessing {
+            queued,
+            processing: processing_count,
+            retry_wait,
+            ready,
+            failed,
+        },
+        evidence: CaptureSessionEvidence {
+            audio_minutes,
+            voice_count: (voice_count > 0).then_some(voice_count),
+            top_contexts,
+        },
+        memories,
+    }))
+}
+
 #[async_trait]
 impl CaptureRepository for PostgresPersistence {
     async fn preflight_event(
@@ -754,5 +920,103 @@ impl CaptureRepository for PostgresPersistence {
             duplicate_count,
             committed_through_sequence,
         })
+    }
+
+    async fn stream_ack(&self, account_id: &str, stream_id: &str) -> Result<i64> {
+        stream_ack(self.pool(), account_id, stream_id).await
+    }
+
+    async fn event_status(
+        &self,
+        account_id: &str,
+        event_id: &str,
+    ) -> Result<Option<CaptureEventStatus>> {
+        let row = sqlx::query(
+            "SELECT e.event_id,coalesce(m.processing_state,'ready') AS processing_state, \
+                    j.error_code,coalesce(j.attempt_count,0)::bigint AS attempt_count \
+               FROM capture_events e LEFT JOIN media_objects m \
+                 ON m.account_id=e.account_id AND m.event_id=e.event_id \
+               LEFT JOIN media_processing_jobs j \
+                 ON j.account_id=e.account_id AND j.event_id=e.event_id \
+              WHERE e.account_id=$1 AND e.event_id=$2",
+        )
+        .bind(account_id)
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            Ok(CaptureEventStatus {
+                event_id: row.try_get("event_id")?,
+                processing_state: row.try_get("processing_state")?,
+                error_code: row.try_get("error_code")?,
+                attempt_count: row.try_get("attempt_count")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn session_status(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+        summarized_until_ms: Option<i64>,
+    ) -> Result<Option<CaptureSessionStatus>> {
+        postgres_session_status(self, account_id, capture_session_id, summarized_until_ms).await
+    }
+
+    async fn recent_sessions(
+        &self,
+        account_id: &str,
+        window_hours: i64,
+        max_sessions: i64,
+        summarized_until_ms: Option<i64>,
+    ) -> Result<Vec<CaptureSessionStatus>> {
+        if !(1..=24).contains(&window_hours) || !(1..=10).contains(&max_sessions) {
+            return Err(EnclaveError::InvalidRequest(
+                "capture session list bounds are invalid".into(),
+            ));
+        }
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM capture_sessions WHERE account_id=$1 AND ( \
+                 started_at>=now()-make_interval(hours=>$2::int) OR \
+                 (ended_at IS NULL AND last_event_at>=now()-make_interval(hours=>$2::int))) \
+             ORDER BY started_at DESC,id LIMIT $3",
+        )
+        .bind(account_id)
+        .bind(window_hours)
+        .bind(max_sessions)
+        .fetch_all(self.pool())
+        .await?;
+        let mut sessions = Vec::with_capacity(ids.len());
+        for id in ids {
+            sessions.push(
+                postgres_session_status(self, account_id, &id, summarized_until_ms)
+                    .await?
+                    .ok_or_else(|| {
+                        EnclaveError::Store("capture session disappeared during listing".into())
+                    })?,
+            );
+        }
+        Ok(sessions)
+    }
+
+    async fn finish_session(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+    ) -> Result<Option<CaptureSessionStatus>> {
+        let changed = sqlx::query(
+            "UPDATE capture_sessions SET ended_at=coalesce(ended_at,now()) \
+             WHERE account_id=$1 AND id=$2",
+        )
+        .bind(account_id)
+        .bind(capture_session_id)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(None);
+        }
+        postgres_session_status(self, account_id, capture_session_id, None).await
     }
 }

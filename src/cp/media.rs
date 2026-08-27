@@ -19,7 +19,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
-use crate::persistence::{CaptureCommit, CapturePreflight, ReferenceBatchCommit};
+use crate::persistence::{
+    CaptureCommit, CaptureEventStatus, CapturePreflight, CaptureSessionEvidence,
+    CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage, CaptureSessionStatus,
+    ReferenceBatchCommit,
+};
 
 use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
@@ -1223,74 +1227,6 @@ struct StreamAck {
 }
 
 #[derive(Debug, Serialize)]
-struct CaptureStatus {
-    event_id: String,
-    processing_state: String,
-    error_code: Option<String>,
-    attempt_count: i64,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum CaptureSessionStage {
-    Received,
-    Processing,
-    Organizing,
-    PreparingRecap,
-    Ready,
-    NeedsAttention,
-    /// Terminal honest zero-result (ADR-0034): all linked media processed and
-    /// a segmentation pass covering past the session's end linked nothing.
-    NoMemory,
-}
-
-/// Evidence echo (ADR-0034): facts derived mechanically from accepted
-/// evidence, never model output. Absent fields mean unknown — clients render
-/// nothing rather than a placeholder.
-#[derive(Debug, Serialize)]
-struct CaptureSessionEvidence {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    audio_minutes: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    voice_count: Option<i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    top_contexts: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CaptureSessionProcessing {
-    queued: i64,
-    processing: i64,
-    retry_wait: i64,
-    ready: i64,
-    failed: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct CaptureSessionMemory {
-    id: i64,
-    title: Option<String>,
-    started_at: String,
-    ended_at: String,
-    finalization_status: String,
-    finalized_at: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CaptureSessionStatus {
-    capture_session_id: String,
-    device_id: String,
-    started_at: String,
-    last_event_at: String,
-    ended_at: Option<String>,
-    event_count: i64,
-    stage: CaptureSessionStage,
-    processing: CaptureSessionProcessing,
-    evidence: CaptureSessionEvidence,
-    memories: Vec<CaptureSessionMemory>,
-}
-
-#[derive(Debug, Serialize)]
 struct CaptureSessionList {
     sessions: Vec<CaptureSessionStatus>,
 }
@@ -2129,11 +2065,9 @@ async fn stream_ack(
     // replaced, so the legacy fallthrough also runs under SQLite's
     // `query_only` guard.)
     match state
-        .store
-        .wal_authoritative_read(&user.0, {
-            let stream_id = stream_id.clone();
-            move |conn| committed_through_sequence(conn, &stream_id)
-        })
+        .repositories
+        .captures()
+        .stream_ack(&user.0, &stream_id)
         .await
     {
         Ok(committed) => Json(StreamAck {
@@ -2177,8 +2111,9 @@ async fn capture_status(
     // the settled-only lane and a user with no registered serving authority
     // refuses as unavailable — never the stale legacy snapshot.
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| load_capture_status(conn, &event_id))
+        .repositories
+        .captures()
+        .event_status(&user.0, &event_id)
         .await
     {
         Ok(Some(status)) => Json(status).into_response(),
@@ -2220,10 +2155,9 @@ async fn capture_session_status(
     // read.
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            load_capture_session_status(conn, &capture_session_id, cursor_ms)
-        })
+        .repositories
+        .captures()
+        .session_status(&user.0, &capture_session_id, cursor_ms)
         .await
     {
         Ok(Some(status)) => Json(status).into_response(),
@@ -2254,20 +2188,12 @@ async fn list_capture_sessions(
     // Per-domain routing, live for every unselected user today: same per-user
     // facts as the single-session endpoint, so it routes the same way.
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            let ids = load_recent_capture_session_ids(conn, window_hours, max_sessions)?;
-            let mut sessions = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(status) = load_capture_session_status(conn, &id, cursor_ms)? {
-                    sessions.push(status);
-                }
-            }
-            Ok(CaptureSessionList { sessions })
-        })
+        .repositories
+        .captures()
+        .recent_sessions(&user.0, window_hours, max_sessions, cursor_ms)
         .await
     {
-        Ok(list) => Json(list).into_response(),
+        Ok(sessions) => Json(CaptureSessionList { sessions }).into_response(),
         // A COLLECTION endpoint, so this arm matters most: 503 with the named
         // reason under `super::routed_read_unavailable`'s rule. Never the
         // generic 500, and never a 200 carrying an empty `sessions` array --
@@ -2280,7 +2206,7 @@ async fn list_capture_sessions(
 /// recent events (so an in-flight recording is discoverable even when it
 /// started before the window). Stale open sessions age out with their last
 /// event rather than pinning the list forever.
-fn load_recent_capture_session_ids(
+pub(crate) fn load_recent_capture_session_ids(
     conn: &Connection,
     window_hours: i64,
     max_sessions: i64,
@@ -2309,101 +2235,16 @@ async fn finish_capture_session(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
-    // ADR-0022 per-domain routing: a WAL-authoritative user's finish flows
-    // through the sealed capture-session-finish plan — probe, settle-submit,
-    // then read the settled status — and is acknowledged only after witness
-    // settlement. The probe mirrors the legacy updated==0 branch (an unknown
-    // session is already in the goal state), and a submit-time conflict
-    // surfaces as an error so the client's durably queued finish marker
-    // retries instead of being silently dropped.
-    if state.store.is_wal_authoritative(&user.0) {
-        let probe_session_id = capture_session_id.clone();
-        match state
-            .store
-            .wal_authoritative_read(&user.0, move |conn| {
-                Ok(conn
-                    .query_row(
-                        "SELECT 1 FROM capture_sessions WHERE id=?1",
-                        [&probe_session_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some())
-            })
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => return StatusCode::NO_CONTENT.into_response(),
-            Err(error) => return error.into_response(),
-        }
-        let plan = match wal::CaptureSessionFinishPlan::new(capture_session_id.clone()) {
-            Ok(plan) => plan,
-            Err(_) => {
-                return crate::error::EnclaveError::Store(
-                    "capture-session finish plan construction failed".into(),
-                )
-                .into_response()
-            }
-        };
-        let prepared =
-            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
-                Ok(prepared) => prepared,
-                Err(_) => {
-                    return crate::error::EnclaveError::Store(
-                        "capture-session finish plan construction failed".into(),
-                    )
-                    .into_response()
-                }
-            };
-        if let Err(error) = state
-            .store
-            .wal_authoritative_submit(&user.0, prepared)
-            .await
-        {
-            return error.into_response();
-        }
-        let status_session_id = capture_session_id.clone();
-        return match state
-            .store
-            .wal_authoritative_read(&user.0, move |conn| {
-                load_capture_session_status(conn, &status_session_id, None)
-            })
-            .await
-        {
-            Ok(Some(status)) => {
-                super::summarizer::kick_session_settled(&user.0);
-                Json(status).into_response()
-            }
-            Ok(None) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => error.into_response(),
-        };
-    }
     match state
-        .store
-        .with_user(&user.0, |conn| {
-            let updated = conn.execute(
-                "UPDATE capture_sessions SET ended_at=COALESCE(ended_at, \
-                 strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",
-                [&capture_session_id],
-            )?;
-            if updated == 0 {
-                return Ok(None);
-            }
-            load_capture_session_status(conn, &capture_session_id, None)
-        })
+        .repositories
+        .captures()
+        .finish_session(&user.0, &capture_session_id)
         .await
     {
-        Ok(Some(status)) => match state.store.save_user(&user.0).await {
-            Ok(()) => {
-                // ADR-0034: the finished session may already be fully
-                // processed — let the summarizer form the memory now instead
-                // of waiting for the next 10-minute sweep. Only a hint; the
-                // settled gate re-checks before any LLM call.
-                super::summarizer::kick_session_settled(&user.0);
-                Json(status).into_response()
-            }
-            Err(error) => error.into_response(),
-        },
+        Ok(Some(status)) => {
+            super::summarizer::kick_session_settled(&user.0);
+            Json(status).into_response()
+        }
         // Finishing is idempotent: an unknown session is already in the goal
         // state ("not active"), and clients queue finish markers durably, so a
         // 404 here wedges their outbox forever after server-side session loss.
@@ -2412,7 +2253,10 @@ async fn finish_capture_session(
     }
 }
 
-fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<CaptureStatus>> {
+pub(crate) fn load_capture_status(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<CaptureEventStatus>> {
     conn.query_row(
         "SELECT e.event_id,COALESCE(m.processing_state,'ready'),j.error_code,\
                 COALESCE(j.attempt_count,0) \
@@ -2420,7 +2264,7 @@ fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<Captu
          LEFT JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
         [event_id],
         |row| {
-            Ok(CaptureStatus {
+            Ok(CaptureEventStatus {
                 event_id: row.get(0)?,
                 processing_state: row.get(1)?,
                 error_code: row.get(2)?,
@@ -2432,7 +2276,7 @@ fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<Captu
     .map_err(Into::into)
 }
 
-fn load_capture_session_status(
+pub(crate) fn load_capture_session_status(
     conn: &Connection,
     capture_session_id: &str,
     summarized_until_ms: Option<i64>,

@@ -239,11 +239,11 @@ mod tests {
     };
     use crate::persistence::RepositorySet;
     use crate::persistence::{
-        CaptureCommit, CapturePreflight, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
-        EmailSendFenceDisposition, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
-        McpTranscriptSearchRequest, MemoryFeedRequest, PushInstallation, PushProviderOutcome,
-        PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
-        WebhookSendFenceDisposition, WebhookSubscription,
+        CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
+        EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
+        McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedRequest,
+        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
+        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
 
@@ -483,6 +483,32 @@ mod tests {
             .unwrap();
         assert!(!referenced.duplicate);
         assert_eq!(referenced.committed_through_sequence, 1);
+        assert_eq!(
+            repositories
+                .captures()
+                .stream_ack(&account_id, "screen-contract")
+                .await
+                .unwrap(),
+            1
+        );
+        let event_status = repositories
+            .captures()
+            .event_status(&account_id, "capture-contract-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event_status.processing_state, "queued");
+        assert_eq!(event_status.attempt_count, 0);
+        let session_status = repositories
+            .captures()
+            .session_status(&account_id, "session-contract", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session_status.event_count, 2);
+        assert_eq!(session_status.processing.queued, 1);
+        assert_eq!(session_status.processing.ready, 1);
+        assert_eq!(session_status.stage, CaptureSessionStage::Processing);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM media_processing_jobs WHERE account_id=$1",
@@ -1260,6 +1286,29 @@ mod tests {
             evidence["members"][1]["activity_summary"],
             "Reviewing the schema"
         );
+        sqlx::query(
+            "UPDATE capture_sessions SET last_event_at=now() WHERE account_id=$1 AND id=$2",
+        )
+        .bind(&account_id)
+        .bind("session-contract")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recent_sessions = repositories
+            .captures()
+            .recent_sessions(&account_id, 8, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(recent_sessions.len(), 1);
+        assert_eq!(recent_sessions[0].memories.len(), 1);
+        let finished = repositories
+            .captures()
+            .finish_session(&account_id, "session-contract")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(finished.ended_at.is_some());
+        assert_eq!(finished.memories.len(), 1);
         let capture_status = repositories
             .memory_queries()
             .capture_status(&account_id)

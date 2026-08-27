@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 
 use crate::{
     archive_v3_wal_idempotency::PreparedLogicalMutation,
     cp::media::{self, wal, MediaDisposition, PreflightOutcome, RecordOutcome},
     error::{EnclaveError, Result},
     persistence::{
-        CaptureCommit, CaptureCommitResult, CapturePreflight, CaptureRepository,
-        ReferenceBatchCommit, ReferenceBatchCommitResult,
+        CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight,
+        CaptureRepository, CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
     },
     store::Store,
 };
@@ -233,5 +234,128 @@ impl CaptureRepository for LegacyCaptureRepository {
             duplicate_count: recorded.duplicate_count,
             committed_through_sequence: recorded.committed_through_sequence,
         })
+    }
+
+    async fn stream_ack(&self, account_id: &str, stream_id: &str) -> Result<i64> {
+        let stream_id = stream_id.to_owned();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                media::committed_through_sequence(connection, &stream_id)
+            })
+            .await
+    }
+
+    async fn event_status(
+        &self,
+        account_id: &str,
+        event_id: &str,
+    ) -> Result<Option<CaptureEventStatus>> {
+        let event_id = event_id.to_owned();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                media::load_capture_status(connection, &event_id)
+            })
+            .await
+    }
+
+    async fn session_status(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+        summarized_until_ms: Option<i64>,
+    ) -> Result<Option<CaptureSessionStatus>> {
+        let capture_session_id = capture_session_id.to_owned();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                media::load_capture_session_status(
+                    connection,
+                    &capture_session_id,
+                    summarized_until_ms,
+                )
+            })
+            .await
+    }
+
+    async fn recent_sessions(
+        &self,
+        account_id: &str,
+        window_hours: i64,
+        max_sessions: i64,
+        summarized_until_ms: Option<i64>,
+    ) -> Result<Vec<CaptureSessionStatus>> {
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                let ids =
+                    media::load_recent_capture_session_ids(connection, window_hours, max_sessions)?;
+                ids.into_iter()
+                    .map(|id| {
+                        media::load_capture_session_status(connection, &id, summarized_until_ms)?
+                            .ok_or_else(|| {
+                                EnclaveError::Store(
+                                    "capture session disappeared during listing".into(),
+                                )
+                            })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    async fn finish_session(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+    ) -> Result<Option<CaptureSessionStatus>> {
+        if self.store.is_wal_authoritative(account_id) {
+            let probe_id = capture_session_id.to_owned();
+            let exists = self
+                .store
+                .wal_authoritative_read(account_id, move |connection| {
+                    Ok(connection
+                        .query_row(
+                            "SELECT 1 FROM capture_sessions WHERE id=?1",
+                            [&probe_id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some())
+                })
+                .await?;
+            if !exists {
+                return Ok(None);
+            }
+            let plan = wal::CaptureSessionFinishPlan::new(capture_session_id.to_owned()).map_err(
+                |_| EnclaveError::Store("capture-session finish plan construction failed".into()),
+            )?;
+            let prepared = PreparedLogicalMutation::prepare(plan).map_err(|_| {
+                EnclaveError::Store("capture-session finish plan construction failed".into())
+            })?;
+            self.store
+                .wal_authoritative_submit(account_id, prepared)
+                .await?;
+            return self
+                .session_status(account_id, capture_session_id, None)
+                .await;
+        }
+
+        let capture_session_id = capture_session_id.to_owned();
+        let status = self
+            .store
+            .with_user(account_id, move |connection| {
+                let updated = connection.execute(
+                    "UPDATE capture_sessions SET ended_at=COALESCE(ended_at, \
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",
+                    [&capture_session_id],
+                )?;
+                if updated == 0 {
+                    return Ok(None);
+                }
+                media::load_capture_session_status(connection, &capture_session_id, None)
+            })
+            .await?;
+        if status.is_some() {
+            self.store.save_user(account_id).await?;
+        }
+        Ok(status)
     }
 }
