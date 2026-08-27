@@ -21,8 +21,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use rusqlite::OptionalExtension;
-
 use crate::{
     error::{EnclaveError, Result as EnclaveResult},
     persistence::{AccountDeletionOperation, AccountLifecycleRepository, AccountStatus},
@@ -77,44 +75,37 @@ async fn sync_status(
     // `screenshots` from `media_worker/wal/result.rs::write_frame`, `episodes`
     // from `summarizer/wal/window.rs::apply` — so a zero count is now a
     // truthful zero rather than a deferral wearing the face of one.
-    let email = s.control.user_email(&user_id).await.ok().flatten();
+    let email = s
+        .repositories
+        .identity_sessions()
+        .account_session(&user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|session| session.account.email);
 
     // ADR-0022: the counts route through the settled-only serving lane for a
     // WAL-authoritative user and fall through to the guarded legacy read for
     // everyone else. A failure still answers 503 — never zeroed counts, which
     // would read as an emptied archive.
     let stats = s
-        .store
-        .wal_authoritative_read(&user_id, |conn| {
-            let utt: i64 = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
-            let scr: i64 = conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?;
-            let eps: i64 = conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?;
-            // `.optional()`, never `.ok()` — see the identical pair in
-            // `query.rs::tool_get_capture_status`. `.ok()` made a failed
-            // statement indistinguishable from an archive that has never
-            // captured anything, and this route's whole job is to report
-            // freshness truthfully.
-            let last_u: Option<String> = conn
-                .query_row(
-                    "SELECT s.started_at FROM utterances u JOIN audio_segments s ON s.id = u.audio_segment_id ORDER BY s.started_at DESC LIMIT 1",
-                    [],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            let last_s: Option<String> = conn
-                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
-                .optional()?
-                .flatten();
-            Ok((utt, scr, eps, last_u, last_s))
-        })
+        .repositories
+        .memory_queries()
+        .capture_status(&user_id)
         .await;
 
     match stats {
-        Ok((utt, scr, eps, last_u, last_s)) => Json(json!({
+        Ok(stats) => Json(json!({
             "email": email,
-            "counts": { "utterances": utt, "screenshots": scr, "episodes": eps },
-            "latest": { "utterance_at": last_u, "screenshot_at": last_s },
+            "counts": {
+                "utterances": stats.total_utterances,
+                "screenshots": stats.total_screenshots,
+                "episodes": stats.episode_count
+            },
+            "latest": {
+                "utterance_at": stats.last_utterance_at,
+                "screenshot_at": stats.last_screenshot_at
+            },
         }))
         .into_response(),
         Err(e) => super::routed_read_unavailable("api.sync_status", &e),
