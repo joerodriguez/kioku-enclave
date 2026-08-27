@@ -1934,6 +1934,157 @@ impl SingleArchiveWalPublisher {
             .map(Arc::new)
             .map_err(|_| WalOwnerError::Conflict)
     }
+
+    /// Reconcile a checkpoint whose immutable candidate is already complete.
+    ///
+    /// CandidateReady and SendStarted bind the complete checkpoint artifact
+    /// inventory and exact root advance in encrypted Control. Re-checkpointing
+    /// the recovered predecessor SQLite file after a process restart is both
+    /// unnecessary and incorrect: SQLite may reproduce a byte-distinct but
+    /// logically equivalent main file, while the retained candidate remains
+    /// the sole exact recovery authority. This path authenticates and settles
+    /// only that candidate, then rebuilds the Store lane from its witnessed
+    /// successor.
+    async fn recover_pending_checkpoint_candidate_inner(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<Option<super::WalCheckpointSettlement>> {
+        let mut current_binding = binding.clone();
+        let (next_binding, exact) = loop {
+            let expected = WitnessRecord::decode(current_binding.witness_bytes())
+                .map_err(|_| WalOwnerError::Corrupt)?;
+            self.control.load_bound_owner(&expected).await?;
+            let mut attempt = self
+                .control
+                .prepare_checkpoint(&current_binding, owner_instance_id)
+                .await?;
+            if matches!(
+                attempt.stage,
+                CheckpointStage::Prepared
+                    | CheckpointStage::SourceReady
+                    | CheckpointStage::Uploading
+            ) {
+                return Ok(None);
+            }
+            if !matches!(
+                attempt.stage,
+                CheckpointStage::CandidateReady | CheckpointStage::SendStarted
+            ) {
+                return Err(WalOwnerError::Conflict);
+            }
+
+            let candidate = attempt.candidate.ok_or(WalOwnerError::Corrupt)?;
+            let advance = AuthenticatedWalRootAdvance::from_expected_witness(
+                super::WalWitnessAdvanceContext::for_publisher(),
+                &expected,
+                candidate,
+            )
+            .map_err(|_| WalOwnerError::Conflict)?;
+            let mut observed = self
+                .runtime
+                .read_current_exact(expected.archive_id())
+                .await
+                .map_err(|_| WalOwnerError::Publication)?;
+            if advance.validate_observed(&observed).is_err() {
+                if observed != expected {
+                    let _ = self
+                        .control
+                        .checkpoint_manual(&current_binding, &attempt)
+                        .await;
+                    return Err(WalOwnerError::Conflict);
+                }
+                if attempt.stage == CheckpointStage::CandidateReady {
+                    let refreshed = self.maintain_live_owner_binding(&current_binding).await?;
+                    if refreshed != current_binding {
+                        current_binding = refreshed;
+                        continue;
+                    }
+                    attempt = self
+                        .control
+                        .mark_checkpoint_send_started(&current_binding, &attempt)
+                        .await?;
+                }
+                if attempt.stage != CheckpointStage::SendStarted {
+                    return Err(WalOwnerError::Conflict);
+                }
+                match self
+                    .runtime
+                    .advance_root_unresolved(
+                        &expected,
+                        advance.provider_advance(super::WalWitnessAdvanceContext::for_publisher()),
+                    )
+                    .await
+                {
+                    Ok(()) | Err(PublisherCommitError::OutcomeUnknown) => {}
+                    Err(PublisherCommitError::Rejected) => {
+                        self.control
+                            .checkpoint_manual(&current_binding, &attempt)
+                            .await?;
+                        return Err(WalOwnerError::Conflict);
+                    }
+                    Err(PublisherCommitError::DefinitelyFailed) => {
+                        return Err(WalOwnerError::Publication);
+                    }
+                }
+                observed = self
+                    .runtime
+                    .read_current_exact(expected.archive_id())
+                    .await
+                    .map_err(|_| WalOwnerError::Publication)?;
+                if advance.validate_observed(&observed).is_err() {
+                    if observed != expected {
+                        let _ = self
+                            .control
+                            .checkpoint_manual(&current_binding, &attempt)
+                            .await;
+                        return Err(WalOwnerError::Conflict);
+                    }
+                    return Err(WalOwnerError::Publication);
+                }
+            }
+            if attempt.stage == CheckpointStage::CandidateReady {
+                // A lost local acknowledgement after the exact provider
+                // successor still needs the durable send marker, but never a
+                // replacement provider write or replacement source image.
+                attempt = self
+                    .control
+                    .mark_checkpoint_send_started(&current_binding, &attempt)
+                    .await?;
+            }
+            let next_binding = self
+                .control
+                .settle_checkpoint(&current_binding, &attempt, &observed)
+                .await?;
+            break (next_binding, observed);
+        };
+
+        let fresh = self
+            .runtime
+            .read_current_exact(next_binding.archive_id())
+            .await
+            .map_err(|_| WalOwnerError::Publication)?;
+        if fresh != exact || fresh.encode() != *next_binding.witness_bytes() {
+            return Err(WalOwnerError::Conflict);
+        }
+        let cipher = self.exact_cipher(&fresh).await?;
+        let recovery = RecoveryRoot::from_exact_wal_owner_record(&fresh)
+            .map_err(|_| WalOwnerError::Conflict)?;
+        let staged = crate::archive_v3_shadow_wal::recover_owned_wal_owner_staging(
+            recovery,
+            Arc::clone(&self.objects),
+            cipher,
+            fresh.archive_id(),
+            &next_binding,
+        )
+        .await
+        .map_err(|_| WalOwnerError::Publication)?;
+        Ok(Some(super::WalCheckpointSettlement {
+            staged,
+            binding: next_binding,
+            capture: Arc::clone(&self.capture),
+        }))
+    }
 }
 
 /// Emit only static launch structure. The stage and class are closed enums;
@@ -2012,6 +2163,15 @@ impl WalPublicationAuthority for SingleArchiveWalPublisher {
 
     async fn checkpoint_pending(&self, binding: &WalOwnerStoreBinding) -> Result<bool> {
         self.control.has_pending_checkpoint(binding).await
+    }
+
+    async fn recover_pending_checkpoint_candidate(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<Option<super::WalCheckpointSettlement>> {
+        self.recover_pending_checkpoint_candidate_inner(binding, owner_instance_id)
+            .await
     }
 
     async fn refresh_live_binding(

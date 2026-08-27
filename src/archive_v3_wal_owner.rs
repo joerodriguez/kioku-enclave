@@ -1691,6 +1691,23 @@ pub(crate) trait WalPublicationAuthority:
 
     async fn checkpoint_pending(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
 
+    /// Resume an already-materialized checkpoint candidate without requiring
+    /// the predecessor SQLite file to be checkpointed a second time.
+    ///
+    /// A restart can retain CandidateReady/SendStarted after every immutable
+    /// checkpoint artifact is durable and the provider may already expose the
+    /// exact successor. In that state the retained Control candidate, not a
+    /// newly regenerated local SQLite byte image, is the recovery authority.
+    /// Implementations return `None` only while source production is still
+    /// required (Prepared/SourceReady/Uploading).
+    async fn recover_pending_checkpoint_candidate(
+        &self,
+        _binding: &WalOwnerStoreBinding,
+        _owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<Option<WalCheckpointSettlement>> {
+        Ok(None)
+    }
+
     async fn refresh_live_binding(
         &self,
         binding: &WalOwnerStoreBinding,
@@ -2749,16 +2766,17 @@ where
                         // accepting supersession: otherwise the first startup
                         // epoch-marker read poisons the only recovery-capable
                         // owner, and every relaunch repeats the same dead end.
-                        let result = match owner.require_fresh_head_or_reconcile_checkpoint().await
+                        let mut stage = "read_fresh_head";
+                        let result = match owner
+                            .require_fresh_head_or_reconcile_checkpoint(&mut stage)
+                            .await
                         {
                             Ok(()) => owner.store.read(read).await.map_err(|error| {
                                 report_wal_owner_runtime_refusal("read", "serve_store_read", error)
                             }),
-                            Err(error) => Err(report_wal_owner_runtime_refusal(
-                                "read",
-                                "authenticate_fresh_head",
-                                error,
-                            )),
+                            Err(error) => {
+                                Err(report_wal_owner_runtime_refusal("read", stage, error))
+                            }
                         };
                         let _ = response.send(result);
                     }
@@ -2827,7 +2845,7 @@ where
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
         stage: &mut &'static str,
     ) -> Result<Box<dyn Any + Send>> {
-        self.reconcile_pending_checkpoint().await?;
+        self.reconcile_pending_checkpoint(stage).await?;
         let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
         *stage = "inspect_operation";
         let admission = self
@@ -2960,7 +2978,8 @@ where
     /// and recover the successor. This helper is shared by reads and applies
     /// so neither operation can destroy that recovery authority merely by
     /// observing the already-advanced witness first.
-    async fn reconcile_pending_checkpoint(&mut self) -> Result<()> {
+    async fn reconcile_pending_checkpoint(&mut self, stage: &mut &'static str) -> Result<()> {
+        *stage = "checkpoint_pending";
         if !self
             .publication
             .checkpoint_pending(self.store.binding())
@@ -2969,12 +2988,24 @@ where
             return Ok(());
         }
         let owner_instance_id = self.store.instance_id();
-        let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
-        let settlement = self
+        *stage = "checkpoint_candidate_recovery";
+        let settlement = if let Some(settlement) = self
             .publication
-            .checkpoint_and_recover(&binding, owner_instance_id, source)
-            .await?;
+            .recover_pending_checkpoint_candidate(self.store.binding(), owner_instance_id)
+            .await?
+        {
+            settlement
+        } else {
+            *stage = "produce_checkpoint_source";
+            let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
+            *stage = "publish_checkpoint";
+            self.publication
+                .checkpoint_and_recover(&binding, owner_instance_id, source)
+                .await?
+        };
+        *stage = "install_recovered_checkpoint";
         self.store = settlement.into_lane(self.store.liveness()).await?;
+        *stage = "authenticate_recovered_checkpoint";
         self.require_fresh_head().await
     }
 
@@ -2982,7 +3013,11 @@ where
     /// availability. Only a provider-confirmed successor can justify looking
     /// for the one retained checkpoint that may legitimately replace this
     /// owner's binding.
-    async fn require_fresh_head_or_reconcile_checkpoint(&mut self) -> Result<()> {
+    async fn require_fresh_head_or_reconcile_checkpoint(
+        &mut self,
+        stage: &mut &'static str,
+    ) -> Result<()> {
+        *stage = "read_fresh_head";
         let fresh = self
             .publication
             .read_fresh_head(self.store.binding())
@@ -2992,13 +3027,15 @@ where
                 return Ok(());
             }
         }
+        *stage = "checkpoint_after_fresh_head";
         if self
             .publication
             .checkpoint_pending(self.store.binding())
             .await?
         {
-            return self.reconcile_pending_checkpoint().await;
+            return self.reconcile_pending_checkpoint(stage).await;
         }
+        *stage = "reject_superseded_head";
         self.store.poison();
         Err(WalOwnerError::Superseded)
     }
@@ -4212,19 +4249,48 @@ mod tests {
     /// `successor`.
     struct PendingCheckpointPublication {
         successor: WitnessRecord,
+        checkpoint_bytes: Vec<u8>,
         pending: AtomicBool,
         recoveries: AtomicUsize,
+        source_recovery_attempts: AtomicUsize,
         directories: Mutex<Vec<tempfile::TempDir>>,
     }
 
     impl PendingCheckpointPublication {
-        fn new(successor: WitnessRecord) -> Self {
+        fn new(successor: WitnessRecord, checkpoint_bytes: Vec<u8>) -> Self {
             Self {
                 successor,
+                checkpoint_bytes,
                 pending: AtomicBool::new(true),
                 recoveries: AtomicUsize::new(0),
+                source_recovery_attempts: AtomicUsize::new(0),
                 directories: Mutex::new(Vec::new()),
             }
+        }
+
+        fn settlement(&self) -> Result<WalCheckpointSettlement> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().map_err(|_| WalOwnerError::Persistence)?;
+            let path = directory.path().join("pending-checkpoint-successor.sqlite");
+            std::fs::write(&path, &self.checkpoint_bytes)
+                .map_err(|_| WalOwnerError::Persistence)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| WalOwnerError::Persistence)?;
+            let next_binding = WalOwnerStoreBinding::from_authenticated_witness(&self.successor)?;
+            let staged = crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::for_test(
+                path,
+                &next_binding,
+                0,
+            )
+            .map_err(|_| WalOwnerError::Corrupt)?;
+            self.directories.lock().unwrap().push(directory);
+            self.recoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(WalCheckpointSettlement {
+                staged,
+                binding: next_binding,
+                capture: crate::store::StoreShadowCapture::shared_for_test(),
+            })
         }
     }
 
@@ -4244,6 +4310,17 @@ mod tests {
             Ok(self.pending.load(Ordering::SeqCst))
         }
 
+        async fn recover_pending_checkpoint_candidate(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+        ) -> Result<Option<WalCheckpointSettlement>> {
+            if !self.pending.swap(false, Ordering::SeqCst) {
+                return Err(WalOwnerError::Conflict);
+            }
+            self.settlement().map(Some)
+        }
+
         async fn refresh_live_binding(
             &self,
             binding: &WalOwnerStoreBinding,
@@ -4261,43 +4338,12 @@ mod tests {
 
         async fn checkpoint_and_recover(
             &self,
-            binding: &WalOwnerStoreBinding,
+            _binding: &WalOwnerStoreBinding,
             _owner_instance_id: WalOwnerInstanceId,
-            mut source: crate::store::WalOwnerCheckpointSource,
+            _source: crate::store::WalOwnerCheckpointSource,
         ) -> Result<WalCheckpointSettlement> {
-            use std::os::unix::fs::PermissionsExt;
-
-            if !self.pending.swap(false, Ordering::SeqCst) {
-                return Err(WalOwnerError::Conflict);
-            }
-            let (length, _, schema_version) =
-                source.authenticated_facts(WalCheckpointSourceContext::for_test(), binding)?;
-            let mut bytes =
-                vec![0; usize::try_from(length).map_err(|_| WalOwnerError::Persistence)?];
-            source.read_checkpoint_exact(
-                WalCheckpointSourceContext::for_test(),
-                0,
-                bytes.as_mut_slice(),
-            )?;
-            let directory = tempfile::tempdir().map_err(|_| WalOwnerError::Persistence)?;
-            let path = directory.path().join("pending-checkpoint-successor.sqlite");
-            std::fs::write(&path, bytes).map_err(|_| WalOwnerError::Persistence)?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|_| WalOwnerError::Persistence)?;
-            let next_binding = WalOwnerStoreBinding::from_authenticated_witness(&self.successor)?;
-            let staged = crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::for_test(
-                path,
-                &next_binding,
-                schema_version,
-            )
-            .map_err(|_| WalOwnerError::Corrupt)?;
-            self.directories.lock().unwrap().push(directory);
-            self.recoveries.fetch_add(1, Ordering::SeqCst);
-            Ok(WalCheckpointSettlement {
-                staged,
-                binding: next_binding,
-                capture: crate::store::StoreShadowCapture::shared_for_test(),
-            })
+            self.source_recovery_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(WalOwnerError::Conflict)
         }
 
         async fn create_candidate(
@@ -4329,11 +4375,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_read_reconciles_a_pending_checkpoint_before_authenticating_the_fresh_head() {
+    async fn a_read_recovers_a_materialized_checkpoint_without_regenerating_its_source() {
         let (predecessor, successor) = authoritative_records();
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&predecessor).unwrap();
         let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
-        let publication = Arc::new(PendingCheckpointPublication::new(successor));
+        let checkpoint_bytes = std::fs::read(store.scratch_path_for_wal_owner_test()).unwrap();
+        let publication = Arc::new(PendingCheckpointPublication::new(
+            successor,
+            checkpoint_bytes,
+        ));
         let handle = SingleArchiveWalOwner::spawn(
             store,
             Arc::new(FakeControl::new()),
@@ -4345,12 +4395,21 @@ mod tests {
         // startup/relaunch repeat the same terminal predecessor.
         assert_eq!(handle.read(|_| Ok(7_u8)).await.unwrap().unwrap(), 7);
         assert_eq!(publication.recoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            publication.source_recovery_attempts.load(Ordering::SeqCst),
+            0,
+            "a durable candidate must not depend on regenerated SQLite bytes"
+        );
         assert!(!handle.is_terminal());
 
         // The retained checkpoint is consumed exactly once. Later reads use
         // the authenticated successor directly and do not rebuild again.
         assert_eq!(handle.read(|_| Ok(8_u8)).await.unwrap().unwrap(), 8);
         assert_eq!(publication.recoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            publication.source_recovery_attempts.load(Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]
