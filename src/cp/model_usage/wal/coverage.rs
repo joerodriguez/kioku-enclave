@@ -761,6 +761,25 @@ mod tests {
         CoveragePredecessor::new(period.into(), sequence, pending, lost).unwrap()
     }
 
+    fn coverage_row(connection: &Connection, period: &str) -> (i64, i64, i64, String, String) {
+        connection
+            .query_row(
+                "SELECT sequence,pending_events,lost_events,delivery_state,updated_at
+                 FROM vertex_usage_coverage WHERE period=?1",
+                [period],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
     fn settle(
         connection: &mut Connection,
         plan: VertexCoverageLedgerPlan,
@@ -893,6 +912,151 @@ mod tests {
             .unwrap();
         assert_eq!(sequence, 5);
         assert_eq!(lost, 1);
+    }
+
+    #[test]
+    fn captured_completion_reapplies_after_recovery_without_creating_loss() {
+        const RECOVERED_AT: &str = "2026-08-20T16:31:00.000Z";
+        const REPLAYED_AT: &str = "2026-08-20T16:32:00.000Z";
+
+        let mut first_process = Connection::open_in_memory().unwrap();
+        install_schema(&first_process);
+        seed_period(&first_process, "2026-08", 7, 0, 0);
+        let first_plan = VertexCoverageLedgerPlan::new(
+            ACCOUNT.into(),
+            CoverageTransition::CompleteDelivered {
+                predecessor: predecessor(&first_process, "2026-08"),
+            },
+            COMMITTED_AT.into(),
+        )
+        .unwrap();
+        let operation_id = first_plan.operation_id;
+        assert!(matches!(
+            settle(&mut first_process, first_plan).unwrap(),
+            LogicalMutationDisposition::Applied
+        ));
+        assert_eq!(
+            coverage_row(&first_process, "2026-08"),
+            (7, 0, 0, "delivered".into(), COMMITTED_AT.into())
+        );
+
+        // Model a process loss after the SQLite WAL was captured but before
+        // its candidate was witnessed: recovery opens the last witnessed
+        // predecessor, not the first process's locally committed bytes. The
+        // restart may carry a later clock value, but it must derive the same
+        // operation and settle without inventing a coverage loss.
+        let mut recovered_process = Connection::open_in_memory().unwrap();
+        install_schema(&recovered_process);
+        seed_period(&recovered_process, "2026-08", 7, 0, 0);
+        let recovered_plan = VertexCoverageLedgerPlan::new(
+            ACCOUNT.into(),
+            CoverageTransition::CompleteDelivered {
+                predecessor: predecessor(&recovered_process, "2026-08"),
+            },
+            RECOVERED_AT.into(),
+        )
+        .unwrap();
+        assert_eq!(recovered_plan.operation_id, operation_id);
+        assert!(matches!(
+            settle(&mut recovered_process, recovered_plan).unwrap(),
+            LogicalMutationDisposition::Applied
+        ));
+        assert_eq!(
+            coverage_row(&recovered_process, "2026-08"),
+            (7, 0, 0, "delivered".into(), RECOVERED_AT.into())
+        );
+
+        let replay = VertexCoverageLedgerPlan::new(
+            ACCOUNT.into(),
+            CoverageTransition::CompleteDelivered {
+                predecessor: CoveragePredecessor::new("2026-08".into(), 7, 0, 0).unwrap(),
+            },
+            REPLAYED_AT.into(),
+        )
+        .unwrap();
+        assert_eq!(replay.operation_id, operation_id);
+        assert!(matches!(
+            settle(&mut recovered_process, replay).unwrap(),
+            LogicalMutationDisposition::Replayed
+        ));
+        assert_eq!(
+            coverage_row(&recovered_process, "2026-08"),
+            (7, 0, 0, "delivered".into(), RECOVERED_AT.into())
+        );
+    }
+
+    #[test]
+    fn captured_rollback_marker_recovery_records_one_fail_closed_loss() {
+        const ANCHORED_AT: &str = "2026-08-20T16:29:00.000Z";
+        const RECOVERED_AT: &str = "2026-08-20T16:31:00.000Z";
+
+        fn rollback_plan(connection: &Connection, committed_at: &str) -> VertexCoverageLedgerPlan {
+            VertexCoverageLedgerPlan::new(
+                ACCOUNT.into(),
+                CoverageTransition::PersistSnapshot {
+                    predecessor: predecessor(connection, "2026-08"),
+                    sequence: 8,
+                    pending_events: 0,
+                    lost_events: 1,
+                    observed_at: ANCHORED_AT.into(),
+                },
+                committed_at.into(),
+            )
+            .unwrap()
+        }
+
+        let mut first_process = Connection::open_in_memory().unwrap();
+        install_schema(&first_process);
+        seed_period(&first_process, "2026-08", 7, 0, 0);
+        let first_plan = rollback_plan(&first_process, COMMITTED_AT);
+        let operation_id = first_plan.operation_id;
+        assert!(matches!(
+            settle(&mut first_process, first_plan).unwrap(),
+            LogicalMutationDisposition::Applied
+        ));
+        assert_eq!(
+            coverage_row(&first_process, "2026-08"),
+            (8, 0, 1, "pending".into(), ANCHORED_AT.into())
+        );
+
+        // The captured attempt is absent from the last witnessed predecessor.
+        // Re-preparing that exact marker after restart must reproduce one
+        // conservative loss, never increment it again or clear it.
+        let mut recovered_process = Connection::open_in_memory().unwrap();
+        install_schema(&recovered_process);
+        seed_period(&recovered_process, "2026-08", 7, 0, 0);
+        let recovered_plan = rollback_plan(&recovered_process, RECOVERED_AT);
+        assert_eq!(recovered_plan.operation_id, operation_id);
+        assert!(matches!(
+            settle(&mut recovered_process, recovered_plan).unwrap(),
+            LogicalMutationDisposition::Applied
+        ));
+        assert_eq!(
+            coverage_row(&recovered_process, "2026-08"),
+            (8, 0, 1, "pending".into(), ANCHORED_AT.into())
+        );
+
+        let replay = VertexCoverageLedgerPlan::new(
+            ACCOUNT.into(),
+            CoverageTransition::PersistSnapshot {
+                predecessor: CoveragePredecessor::new("2026-08".into(), 7, 0, 0).unwrap(),
+                sequence: 8,
+                pending_events: 0,
+                lost_events: 1,
+                observed_at: ANCHORED_AT.into(),
+            },
+            RECOVERED_AT.into(),
+        )
+        .unwrap();
+        assert_eq!(replay.operation_id, operation_id);
+        assert!(matches!(
+            settle(&mut recovered_process, replay).unwrap(),
+            LogicalMutationDisposition::Replayed
+        ));
+        assert_eq!(
+            coverage_row(&recovered_process, "2026-08"),
+            (8, 0, 1, "pending".into(), ANCHORED_AT.into())
+        );
     }
 
     #[test]
