@@ -2517,7 +2517,7 @@ def main() -> None:
             "dockerfile_sha256": sha256(ROOT / "Dockerfile"),
             "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
             "cargo_inputs_sha256": immutable_source_subset_digest(commit, "Cargo.toml", "Cargo.lock"),
-            "source_inputs_sha256": immutable_source_subset_digest(commit, "src"),
+            "source_inputs_sha256": immutable_source_subset_digest(commit, "src", "migrations"),
             "builder_mode": "native-linux-amd64" if native else "emulated-fallback",
             # A resumable receipt binds the immutable worker identity, not a
             # point-in-time disk measurement. Free-space is rechecked on every

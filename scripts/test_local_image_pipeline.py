@@ -278,9 +278,13 @@ class LocalImagePipelineTests(unittest.TestCase):
         pipeline.verify = lambda: calls.append(["verify"])
         pipeline.source_snapshot = lambda commit, **kwargs: nullcontext(ROOT)
         pipeline.immutable_source_archive_digest = lambda commit: "d" * 64
-        pipeline.immutable_source_subset_digest = lambda commit, *paths: (
-            "e" * 64 if paths == ("Cargo.toml", "Cargo.lock") else "f" * 64
-        )
+        subset_digest_calls: list[tuple[str, ...]] = []
+
+        def fake_subset_digest(commit: str, *paths: str) -> str:
+            subset_digest_calls.append(paths)
+            return "e" * 64 if paths == ("Cargo.toml", "Cargo.lock") else "f" * 64
+
+        pipeline.immutable_source_subset_digest = fake_subset_digest
         pipeline.temporary_docker_login = (
             lambda registry, docker_config, access_token: (
                 calls.append(["temporary-docker-login", registry, str(docker_config), "token-redacted"]),
@@ -341,6 +345,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertTrue(any(argument.startswith("CONFIG_SHA256=") for argument in build))
         self.assertIn("CARGO_INPUTS_SHA256=" + "e" * 64, build)
         self.assertIn("SOURCE_INPUTS_SHA256=" + "f" * 64, build)
+        self.assertIn(("src", "migrations"), subset_digest_calls)
         self.assertFalse(any(argument.startswith("SOURCE_DATE_EPOCH=") for argument in build))
         self.assertIn("--secret", build)
         self.assertIn("id=kioku-config,src=", " ".join(build))
@@ -367,6 +372,9 @@ class LocalImagePipelineTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertLess(dockerfile.index("ARG CARGO_INPUTS_SHA256"), dockerfile.index("COPY Cargo.toml Cargo.lock"))
         self.assertLess(dockerfile.index("ARG SOURCE_INPUTS_SHA256"), dockerfile.index("COPY src ./src"))
+        self.assertLess(dockerfile.index("ARG SOURCE_INPUTS_SHA256"), dockerfile.index("COPY migrations ./migrations"))
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("!migrations/**", dockerignore)
 
     def test_preflight_rejects_builder_without_linux_amd64(self) -> None:
         pipeline = load_pipeline()
