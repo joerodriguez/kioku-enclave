@@ -319,7 +319,7 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
+        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, FrozenPushDelivery,
         FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest,
         MediaProcessingClass, MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest,
         PeopleListRequest, PushInstallation, PushProviderOutcome, PushProviderReceipt,
@@ -909,7 +909,7 @@ mod tests {
             )],
             email_preference_include_content: Some(true),
             push_destinations: vec![(
-                "p1:contract-installation:1".into(),
+                "p1:33333333-3333-4333-8333-333333333333:1".into(),
                 "contract-push-delivery".into(),
                 "contract-handoff".into(),
                 "contract-collapse".into(),
@@ -1314,6 +1314,54 @@ mod tests {
                 .await
                 .unwrap(),
             vec![repeated]
+        );
+        let push_candidate = repositories
+            .deliveries()
+            .unwrap()
+            .next_push_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("finalization push candidate");
+        assert_eq!(push_candidate.token_generation, installed.token_generation);
+        let push_claim = repositories
+            .deliveries()
+            .unwrap()
+            .claim_push(
+                &push_candidate,
+                FrozenPushDelivery {
+                    topic: push_candidate.topic.clone(),
+                    environment: push_candidate.environment.clone(),
+                    device_token: push_candidate.device_token.clone(),
+                    token_generation: push_candidate.token_generation,
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("push claim");
+        let accepted_push = PushProviderOutcome::Accepted { status: 200 };
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_push(&push_claim, accepted_push.clone(), None)
+            .await
+            .unwrap();
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_push(&push_claim, accepted_push, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM push_deliveries WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&push_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "delivered"
         );
 
         let fence_webhook = WebhookSubscription {

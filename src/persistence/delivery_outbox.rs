@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use crate::{cp::delivery::FinalizedEpisode, error::Result};
 
 use super::EmailProviderOutcome;
+use super::PushProviderOutcome;
 use super::WebhookProviderOutcome;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +98,61 @@ impl std::fmt::Debug for WebhookDeliveryClaim {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PushDeliveryCandidate {
+    pub(crate) account_id: String,
+    pub(crate) episode_id: i64,
+    pub(crate) installation_binding: String,
+    pub(crate) installation_id: String,
+    pub(crate) delivery_version: i64,
+    pub(crate) delivery_id: String,
+    pub(crate) handoff_handle: String,
+    pub(crate) collapse_id: String,
+    pub(crate) attempt_count: i64,
+    pub(crate) created_at: String,
+    pub(crate) topic: String,
+    pub(crate) environment: String,
+    pub(crate) device_token: String,
+    pub(crate) token_generation: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FrozenPushDelivery {
+    pub(crate) topic: String,
+    pub(crate) environment: String,
+    pub(crate) device_token: String,
+    pub(crate) token_generation: i64,
+}
+
+impl std::fmt::Debug for FrozenPushDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FrozenPushDelivery(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PushDeliveryClaim {
+    pub(crate) account_id: String,
+    pub(crate) episode_id: i64,
+    pub(crate) installation_binding: String,
+    pub(crate) installation_id: String,
+    pub(crate) delivery_version: i64,
+    pub(crate) delivery_id: String,
+    pub(crate) handoff_handle: String,
+    pub(crate) collapse_id: String,
+    pub(crate) claim_token: String,
+    pub(crate) lease_expires_at: String,
+    pub(crate) attempt_count: i64,
+    pub(crate) created_at: String,
+    pub(crate) request: FrozenPushDelivery,
+}
+
+impl std::fmt::Debug for PushDeliveryClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PushDeliveryClaim(<redacted>)")
+    }
+}
+
 /// Fleet-safe access to outbound delivery rows.
 ///
 /// Candidate reads perform no external effects. `claim_email` atomically
@@ -140,6 +196,22 @@ pub(crate) trait DeliveryRepository: Send + Sync {
         &self,
         claim: &WebhookDeliveryClaim,
         outcome: WebhookProviderOutcome,
+        circuit_seconds: Option<i64>,
+    ) -> Result<()>;
+
+    async fn next_push_candidate(&self, account_id: &str) -> Result<Option<PushDeliveryCandidate>>;
+
+    async fn claim_push(
+        &self,
+        candidate: &PushDeliveryCandidate,
+        request: FrozenPushDelivery,
+        lease_seconds: i64,
+    ) -> Result<Option<PushDeliveryClaim>>;
+
+    async fn settle_push(
+        &self,
+        claim: &PushDeliveryClaim,
+        outcome: PushProviderOutcome,
         circuit_seconds: Option<i64>,
     ) -> Result<()>;
 }
