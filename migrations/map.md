@@ -23,3 +23,9 @@ migration lock; serving instances only verify `persistence_schema.version`.
   browser evidence, processing jobs, and the transactional work outbox.
 - `0009_episode_query_contract.sql` adds tenant-scoped final briefs consumed by
   the episode list/detail and delivery surfaces.
+- `0010_browser_snapshot_query.sql` preserves the legacy and Cloud Capture v2
+  browser-evidence query contract.
+- `0011_episode_evidence_query.sql` adds tenant-qualified screenshot images,
+  screen interpretations, people, speaker slots, and participants.
+- `0012_people_voice_queries.sql` adds the people, identity-evidence,
+  speaker-observation, and voice-lineage records used by public memory queries.

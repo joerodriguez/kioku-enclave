@@ -42,7 +42,9 @@ pub(crate) use postgres::PostgresPersistence;
 pub(crate) use query::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
     McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
-    MemoryQueryRepository,
+    MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
+    PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
+    PersonStatementView, PersonSummary,
 };
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,

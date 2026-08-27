@@ -9,7 +9,8 @@ use crate::error::Result;
 use crate::persistence::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
     McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
-    MemoryQueryRepository,
+    MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage, PersonProfile,
+    PersonStatementPage, PersonSummary,
 };
 use crate::search::{search_all, SearchHit, SearchRequest};
 use crate::store::Store;
@@ -255,6 +256,108 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
         self.store
             .wal_authoritative_read(account_id, move |connection| {
                 crate::cp::query::load_episode_members(connection, episode_id)
+            })
+            .await
+    }
+
+    async fn list_people(
+        &self,
+        account_id: &str,
+        request: &PeopleListRequest,
+    ) -> Result<PeopleListPage> {
+        let request = request.clone();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                let search = request
+                    .query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty())
+                    .map(|query| format!("%{}%", query.to_lowercase()));
+                let mut statement = connection.prepare(
+                    "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
+                     FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
+                       AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                         WHERE r.profile_id=v.id AND r.active=1 \
+                           AND r.status IN ('quarantined','superseded','split')) \
+                     LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
+                     WHERE p.status='identified' AND p.display_name IS NOT NULL AND p.id>?1 \
+                     AND (?2 IS NULL OR lower(p.display_name) LIKE ?2 OR EXISTS (\
+                       SELECT 1 FROM person_name_claims n WHERE n.person_id=p.id \
+                       AND n.status IN ('accepted','probationary') AND lower(n.name) LIKE ?2)) \
+                     GROUP BY p.id ORDER BY p.id LIMIT ?3",
+                )?;
+                let mut people = statement
+                    .query_map(
+                        params![request.after_id, search, request.limit as i64 + 1],
+                        |row| {
+                            Ok(PersonSummary {
+                                id: row.get(0)?,
+                                display_name: row.get(1)?,
+                                voice_profile_count: row.get(2)?,
+                                fact_count: row.get(3)?,
+                                updated_at: row.get(4)?,
+                            })
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let next_cursor =
+                    (people.len() > request.limit).then(|| people[request.limit - 1].id);
+                people.truncate(request.limit);
+                Ok(PeopleListPage {
+                    people,
+                    next_cursor,
+                })
+            })
+            .await
+    }
+
+    async fn person_profile(&self, account_id: &str, person_id: i64) -> Result<PersonProfile> {
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::media::load_person_profile(connection, person_id)
+            })
+            .await
+    }
+
+    async fn person_evidence(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonEvidencePage> {
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::media::ensure_identified_person(connection, person_id)?;
+                let (evidence, next_cursor) = crate::cp::media::load_person_evidence(
+                    connection, person_id, before_id, limit,
+                )?;
+                Ok(PersonEvidencePage {
+                    evidence,
+                    next_cursor,
+                })
+            })
+            .await
+    }
+
+    async fn person_statements(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonStatementPage> {
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::media::ensure_identified_person(connection, person_id)?;
+                let (statements, next_cursor) = crate::cp::media::load_person_statements(
+                    connection, person_id, before_id, limit,
+                )?;
+                Ok(PersonStatementPage {
+                    statements,
+                    next_cursor,
+                })
             })
             .await
     }
