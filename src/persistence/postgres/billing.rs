@@ -7,7 +7,8 @@ use crate::cp::isotime;
 use crate::error::{EnclaveError, Result};
 
 use super::super::billing::{
-    BillingRepository, RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor,
+    AccountDriverMetrics, BillingRepository, RecordingLeaseRequestRow, RetainedAccountMetrics,
+    VertexCoverageAnchor,
 };
 use super::{advisory_transaction_lock, PostgresPersistence};
 
@@ -389,6 +390,68 @@ impl BillingRepository for PostgresPersistence {
             })
         })
         .transpose()
+    }
+
+    async fn account_driver_metrics(
+        &self,
+        account_id: &str,
+        period: &str,
+    ) -> Result<AccountDriverMetrics> {
+        if !valid_utc_month(period) {
+            return Err(EnclaveError::InvalidRequest(
+                "account metrics period must be YYYY-MM".into(),
+            ));
+        }
+        let row = sqlx::query(
+            "WITH tenant_rows(bytes) AS ( \
+               SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM capture_events r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM utterances r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM screenshots r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM episodes r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM episode_final_briefs r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM people r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(pg_column_size(r)),0)::bigint FROM voice_samples r WHERE account_id=$1 \
+               UNION ALL SELECT COALESCE(sum(byte_length),0)::bigint FROM media_objects WHERE account_id=$1 AND deleted_at IS NULL \
+             ), coverage AS ( \
+               SELECT sequence,pending_events,lost_events, \
+                      floor(extract(epoch FROM updated_at)*1000)::bigint AS observed_at_ms \
+               FROM vertex_usage_coverage WHERE account_id=$1 AND period=$2 \
+             ) \
+             SELECT (SELECT COALESCE(sum(bytes),0)::bigint FROM tenant_rows) AS storage_bytes, \
+                    (SELECT count(*)::bigint FROM email_deliveries WHERE account_id=$1 \
+                       AND state='delivered' \
+                       AND updated_at >= to_date($2,'YYYY-MM') \
+                       AND updated_at < to_date($2,'YYYY-MM') + interval '1 month') AS accepted_email_count, \
+                    sequence,pending_events,lost_events,observed_at_ms \
+             FROM (SELECT 1) one LEFT JOIN coverage ON true",
+        )
+        .bind(account_id)
+        .bind(period)
+        .fetch_one(self.pool())
+        .await?;
+        let vertex_coverage = row
+            .try_get::<Option<i64>, _>("sequence")?
+            .map(|sequence| {
+                Ok::<VertexCoverageAnchor, EnclaveError>(VertexCoverageAnchor {
+                    period: period.to_string(),
+                    sequence: checked_u64(sequence, "coverage sequence")?,
+                    pending_events: checked_u64(
+                        row.try_get("pending_events")?,
+                        "coverage pending count",
+                    )?,
+                    lost_events: checked_u64(row.try_get("lost_events")?, "coverage lost count")?,
+                    observed_at: isotime::format_epoch_millis(row.try_get("observed_at_ms")?),
+                })
+            })
+            .transpose()?;
+        Ok(AccountDriverMetrics {
+            storage_bytes: checked_u64(row.try_get("storage_bytes")?, "storage byte count")?,
+            accepted_email_count: checked_u64(
+                row.try_get("accepted_email_count")?,
+                "email delivery count",
+            )?,
+            vertex_coverage,
+        })
     }
 
     async fn pending_billing_detach_ids(&self, limit: i64) -> Result<Vec<String>> {

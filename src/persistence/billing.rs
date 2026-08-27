@@ -21,6 +21,15 @@ pub struct VertexCoverageAnchor {
     pub observed_at: String,
 }
 
+/// Tenant-scoped inputs used to allocate shared service cost. Storage is a
+/// backend-defined logical byte count, not a physical provider billing value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDriverMetrics {
+    pub storage_bytes: u64,
+    pub accepted_email_count: u64,
+    pub vertex_coverage: Option<VertexCoverageAnchor>,
+}
+
 /// Content-free owner reporting totals. This shape deliberately cannot carry
 /// account identifiers or signup timestamps across the admin API boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +64,11 @@ pub(crate) trait BillingRepository: Send + Sync {
         account_id: &str,
         period: &str,
     ) -> Result<Option<VertexCoverageAnchor>>;
+    async fn account_driver_metrics(
+        &self,
+        account_id: &str,
+        period: &str,
+    ) -> Result<AccountDriverMetrics>;
 
     async fn pending_billing_detach_ids(&self, limit: i64) -> Result<Vec<String>>;
     async fn complete_billing_detach(&self, billing_account_id: &str) -> Result<()>;

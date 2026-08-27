@@ -1284,6 +1284,14 @@ mod tests {
             .active_vertex_coverage_complete("2026-08")
             .await
             .unwrap());
+        let account_drivers = repositories
+            .billing()
+            .account_driver_metrics(&account_id, "2026-08")
+            .await
+            .unwrap();
+        assert!(account_drivers.storage_bytes > 0);
+        assert_eq!(account_drivers.accepted_email_count, 0);
+        assert!(account_drivers.vertex_coverage.unwrap().sequence >= coverage.sequence);
 
         repositories
             .billing()

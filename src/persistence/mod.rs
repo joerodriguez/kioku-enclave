@@ -141,7 +141,10 @@ impl RepositorySet {
             legacy_state_authoritative: true,
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
-            billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
+            billing: Arc::new(LegacyBillingRepository::new(
+                Arc::clone(&control),
+                Arc::clone(&store),
+            )),
             captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             playback: Arc::new(LegacyPlaybackRepository::new(Arc::clone(&store))),
