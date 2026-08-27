@@ -102,6 +102,7 @@ use crate::store::Store;
 /// Additional ports join this set as their handlers and workers are extracted.
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
+    legacy_state_authoritative: bool,
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     lifecycle: Arc<dyn AccountLifecycleRepository>,
     billing: Arc<dyn BillingRepository>,
@@ -122,6 +123,7 @@ pub(crate) struct RepositorySet {
 impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>, store: Arc<Store>) -> Self {
         Self {
+            legacy_state_authoritative: true,
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
             billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
@@ -146,6 +148,7 @@ impl RepositorySet {
         media_objects: Arc<dyn MediaObjectStore>,
     ) -> Self {
         Self {
+            legacy_state_authoritative: false,
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
@@ -166,6 +169,10 @@ impl RepositorySet {
 
     pub(crate) fn identity_sessions(&self) -> &dyn IdentitySessionRepository {
         self.identity_sessions.as_ref()
+    }
+
+    pub(crate) fn uses_legacy_state(&self) -> bool {
+        self.legacy_state_authoritative
     }
 
     pub(crate) fn lifecycle(&self) -> &dyn AccountLifecycleRepository {

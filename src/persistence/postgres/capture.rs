@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-use super::PostgresPersistence;
+use super::{advisory_transaction_lock, PostgresPersistence};
 
 fn timestamp(value: &str, field: &str) -> Result<i64> {
     isotime::parse_epoch_millis(value).ok_or_else(|| {
@@ -363,6 +363,43 @@ async fn insert_event(
             committed_through_sequence,
         });
     }
+    match manifest.media_disposition {
+        MediaDisposition::Canonical => {
+            let media = manifest.media.as_ref().ok_or_else(|| {
+                EnclaveError::InvalidRequest("canonical media is required".into())
+            })?;
+            let object_key = command.object_key.as_deref().ok_or_else(|| {
+                EnclaveError::InvalidRequest("canonical capture object key is required".into())
+            })?;
+            let upload_token = command.upload_token.as_deref().ok_or_else(|| {
+                EnclaveError::Conflict("canonical media upload admission is missing".into())
+            })?;
+            let admitted = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM capture_upload_intents \
+                  WHERE account_id=$1 AND event_id=$2 AND token=$3 AND asset_id=$4 \
+                    AND object_key=$5 AND manifest_digest=$6 AND expires_at>now())",
+            )
+            .bind(&command.account_id)
+            .bind(&manifest.event_id)
+            .bind(upload_token)
+            .bind(&media.asset_id)
+            .bind(object_key)
+            .bind(command.manifest_digest.to_ascii_lowercase())
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !admitted {
+                return Err(EnclaveError::Conflict(
+                    "canonical media upload admission is unavailable".into(),
+                ));
+            }
+        }
+        MediaDisposition::Reference if command.upload_token.is_some() => {
+            return Err(EnclaveError::InvalidRequest(
+                "reference capture cannot carry media upload admission".into(),
+            ));
+        }
+        MediaDisposition::Reference => {}
+    }
     let committed_at_ms = timestamp(&command.committed_at, "committed_at")?;
     upsert_session_and_stream(transaction, &command.account_id, manifest, committed_at_ms).await?;
     let sequence_used = sqlx::query_scalar::<_, bool>(
@@ -676,6 +713,24 @@ async fn insert_event(
             .await?;
     }
 
+    if let Some(upload_token) = command.upload_token.as_deref() {
+        let deleted = sqlx::query(
+            "DELETE FROM capture_upload_intents \
+              WHERE account_id=$1 AND event_id=$2 AND token=$3",
+        )
+        .bind(&command.account_id)
+        .bind(&manifest.event_id)
+        .bind(upload_token)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
+        if deleted != 1 {
+            return Err(EnclaveError::Conflict(
+                "canonical media upload admission disappeared".into(),
+            ));
+        }
+    }
+
     Ok(CaptureCommitResult {
         duplicate: false,
         committed_through_sequence: advance_ack(
@@ -871,10 +926,114 @@ impl CaptureRepository for PostgresPersistence {
         .await
     }
 
+    async fn reserve_media_upload(
+        &self,
+        account_id: &str,
+        event_id: &str,
+        asset_id: &str,
+        object_key: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<String>> {
+        if event_id.is_empty()
+            || asset_id.is_empty()
+            || object_key.is_empty()
+            || manifest_digest.len() != 64
+            || !manifest_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "canonical media upload admission is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "capture-upload", event_id).await?;
+        require_active_account(&mut transaction, account_id).await?;
+        let candidate = format!("upl_{}", crate::cp::tokens::random_token_hex());
+        let token = sqlx::query_scalar::<_, String>(
+            "INSERT INTO capture_upload_intents \
+                (account_id,event_id,token,asset_id,object_key,manifest_digest,expires_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,now()+interval '10 minutes') \
+             ON CONFLICT (account_id,event_id) DO UPDATE SET \
+                token=CASE WHEN capture_upload_intents.expires_at<=now() \
+                           THEN EXCLUDED.token ELSE capture_upload_intents.token END, \
+                expires_at=now()+interval '10 minutes' \
+             WHERE capture_upload_intents.asset_id=EXCLUDED.asset_id \
+               AND capture_upload_intents.object_key=EXCLUDED.object_key \
+               AND capture_upload_intents.manifest_digest=EXCLUDED.manifest_digest \
+             RETURNING token",
+        )
+        .bind(account_id)
+        .bind(event_id)
+        .bind(candidate)
+        .bind(asset_id)
+        .bind(object_key)
+        .bind(manifest_digest.to_ascii_lowercase())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            EnclaveError::Conflict("idempotency conflict for media upload admission".into())
+        })?;
+        transaction.commit().await?;
+        Ok(Some(token))
+    }
+
+    async fn media_dek_wrapped(&self, account_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT k.wrapped_dek FROM account_media_keys k JOIN accounts a ON a.id=k.account_id \
+              WHERE k.account_id=$1 AND a.status='active'",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    async fn install_media_dek(
+        &self,
+        account_id: &str,
+        candidate_wrapped: &str,
+        _candidate_dek: &crate::crypto::Dek,
+    ) -> Result<String> {
+        if candidate_wrapped.is_empty() {
+            return Err(EnclaveError::InvalidRequest(
+                "wrapped media DEK must not be empty".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        require_active_account(&mut transaction, account_id).await?;
+        sqlx::query(
+            "INSERT INTO account_media_keys(account_id,wrapped_dek) VALUES($1,$2) \
+             ON CONFLICT(account_id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(candidate_wrapped)
+        .execute(&mut *transaction)
+        .await?;
+        let winner = sqlx::query_scalar::<_, String>(
+            "SELECT wrapped_dek FROM account_media_keys WHERE account_id=$1 FOR UPDATE",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(winner)
+    }
+
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult> {
         let mut transaction = self.pool().begin().await?;
         require_active_account(&mut transaction, &command.account_id).await?;
         let result = insert_event(&mut transaction, &command).await?;
+        if result.duplicate {
+            if let Some(upload_token) = command.upload_token.as_deref() {
+                sqlx::query(
+                    "DELETE FROM capture_upload_intents \
+                      WHERE account_id=$1 AND event_id=$2 AND token=$3",
+                )
+                .bind(&command.account_id)
+                .bind(&command.manifest.event_id)
+                .bind(upload_token)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
         transaction.commit().await?;
         Ok(result)
     }
@@ -902,6 +1061,7 @@ impl CaptureRepository for PostgresPersistence {
                     manifest_digest: digest.clone(),
                     object_key: None,
                     object_generation: None,
+                    upload_token: None,
                     media_authority: None,
                     committed_at: command.committed_at.clone(),
                 },

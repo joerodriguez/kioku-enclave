@@ -101,7 +101,7 @@ pub(crate) struct MediaDekInstallPlan {
 impl MediaDekInstallPlan {
     /// Visible to the owning route module only: `load_or_create_media_dek`
     /// is the single production constructor site.
-    pub(in crate::cp::media) fn new(
+    pub(crate) fn new(
         account_id: String,
         wrapped_dek_b64: String,
         plaintext_dek: &Dek,

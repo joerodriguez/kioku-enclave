@@ -64,6 +64,83 @@ impl CaptureRepository for LegacyCaptureRepository {
         })
     }
 
+    async fn reserve_media_upload(
+        &self,
+        _account_id: &str,
+        _event_id: &str,
+        _asset_id: &str,
+        _object_key: &str,
+        _manifest_digest: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn media_dek_wrapped(&self, account_id: &str) -> Result<Option<String>> {
+        self.store
+            .wal_authoritative_read(account_id, |connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT value FROM app_metadata WHERE key='wrapped_media_dek'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })
+            .await
+    }
+
+    async fn install_media_dek(
+        &self,
+        account_id: &str,
+        candidate_wrapped: &str,
+        candidate_dek: &crate::crypto::Dek,
+    ) -> Result<String> {
+        if self.store.is_wal_authoritative(account_id) {
+            let plan = wal::MediaDekInstallPlan::new(
+                account_id.to_owned(),
+                candidate_wrapped.to_owned(),
+                candidate_dek,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("media DEK install plan construction failed".into())
+            })?;
+            let prepared = PreparedLogicalMutation::prepare(plan).map_err(|_| {
+                EnclaveError::Store("media DEK install plan construction failed".into())
+            })?;
+            match self
+                .store
+                .wal_authoritative_submit(account_id, prepared)
+                .await
+            {
+                Ok(_) => return Ok(candidate_wrapped.to_owned()),
+                Err(EnclaveError::Conflict(_)) => {
+                    return self.media_dek_wrapped(account_id).await?.ok_or_else(|| {
+                        EnclaveError::Store("media DEK install lost a race to no winner".into())
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let candidate = candidate_wrapped.to_owned();
+        let winner = self
+            .store
+            .with_user(account_id, move |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata (key,value) VALUES ('wrapped_media_dek',?1) \
+                     ON CONFLICT(key) DO NOTHING",
+                    [&candidate],
+                )?;
+                Ok(connection.query_row(
+                    "SELECT value FROM app_metadata WHERE key='wrapped_media_dek'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        self.store.save_user(account_id).await?;
+        Ok(winner)
+    }
+
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult> {
         let CaptureCommit {
             account_id,
@@ -71,6 +148,7 @@ impl CaptureRepository for LegacyCaptureRepository {
             manifest_digest,
             object_key,
             object_generation,
+            upload_token: _,
             media_authority,
             committed_at,
         } = command;

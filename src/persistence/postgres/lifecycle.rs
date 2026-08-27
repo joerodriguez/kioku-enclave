@@ -89,6 +89,28 @@ async fn refuse_open_provider_fences(
     Ok(())
 }
 
+async fn refuse_active_media_uploads(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    sqlx::query("DELETE FROM capture_upload_intents WHERE account_id=$1 AND expires_at<=now()")
+        .bind(account_id)
+        .execute(&mut **transaction)
+        .await?;
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM capture_upload_intents WHERE account_id=$1)",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if active {
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight media upload".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn deletion_status_for_reason(reason: &str) -> &'static str {
     match reason {
         "legacy_generation_unavailable"
@@ -131,6 +153,7 @@ impl AccountLifecycleRepository for PostgresPersistence {
             .as_ref()
             .map(|row| row.try_get::<String, _>("status"))
             .transpose()?;
+        refuse_active_media_uploads(&mut transaction, account_id).await?;
         if !tombstoned && !matches!(status.as_deref(), Some("active" | "deleting")) {
             transaction.commit().await?;
             return Ok(None);
@@ -257,6 +280,7 @@ impl AccountLifecycleRepository for PostgresPersistence {
             .bind(account_id)
             .fetch_optional(&mut *transaction)
             .await?;
+        refuse_active_media_uploads(&mut transaction, account_id).await?;
         if account.is_none() {
             let tombstoned = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM deleted_accounts WHERE account_id=$1)",

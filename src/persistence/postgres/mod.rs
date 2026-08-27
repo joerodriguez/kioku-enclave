@@ -27,7 +27,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 17;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 18;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -231,6 +231,14 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0017_delivery_claims.sql"))
                 .execute(&mut *transaction)
                 .await?;
+            version = 17;
+        }
+        if version == 17 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0018_capture_upload_admission.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -405,6 +413,32 @@ mod tests {
                 .unwrap(),
             Some(AccountStatus::Active)
         );
+        assert!(repositories
+            .captures()
+            .media_dek_wrapped(&account_id)
+            .await
+            .unwrap()
+            .is_none());
+        let first_media_key = repositories
+            .captures()
+            .install_media_dek(
+                &account_id,
+                "wrapped-media-key-1",
+                &crate::crypto::Dek([7; 32]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_media_key, "wrapped-media-key-1");
+        let raced_media_key = repositories
+            .captures()
+            .install_media_dek(
+                &account_id,
+                "wrapped-media-key-2",
+                &crate::crypto::Dek([8; 32]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raced_media_key, first_media_key);
         assert_eq!(
             repositories.work().active_account_ids().await.unwrap(),
             vec![account_id.clone()]
@@ -490,12 +524,24 @@ mod tests {
             &canonical.media.as_ref().unwrap().asset_id,
         )
         .unwrap();
+        let upload_token = repositories
+            .captures()
+            .reserve_media_upload(
+                &account_id,
+                &canonical.event_id,
+                &canonical.media.as_ref().unwrap().asset_id,
+                &object_key,
+                &canonical_digest,
+            )
+            .await
+            .unwrap();
         let canonical_command = CaptureCommit {
             account_id: account_id.clone(),
             manifest: canonical.clone(),
             manifest_digest: canonical_digest.clone(),
             object_key: Some(object_key.clone()),
             object_generation: Some(1),
+            upload_token,
             media_authority: Some(
                 crate::cp::media::RecordingMediaAuthorityDecision::ProcessingWindow30d {
                     capture_policy_revision: 0,
@@ -562,6 +608,7 @@ mod tests {
                 manifest_digest: reference_digest,
                 object_key: None,
                 object_generation: None,
+                upload_token: None,
                 media_authority: None,
                 committed_at: "2026-08-27T12:00:04.000Z".into(),
             })
@@ -2211,6 +2258,37 @@ mod tests {
             .billing_account_id_for_deletion(&account_id)
             .await
             .unwrap();
+        let deletion_upload = repositories
+            .captures()
+            .reserve_media_upload(
+                &account_id,
+                "deletion-race-event",
+                "deletion-race-asset",
+                &crate::store::canonical_capture_media_object_key(
+                    &account_id,
+                    "deletion-race-asset",
+                )
+                .unwrap(),
+                &"d".repeat(64),
+            )
+            .await
+            .unwrap();
+        assert!(deletion_upload.is_some());
+        assert!(matches!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&account_id)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
+        sqlx::query(
+            "UPDATE capture_upload_intents SET expires_at=now()-interval '1 second' \
+              WHERE account_id=$1 AND event_id='deletion-race-event'",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let deletion = repositories
             .lifecycle()
             .begin_account_deletion(&account_id)
