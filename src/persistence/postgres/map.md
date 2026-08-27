@@ -13,3 +13,4 @@ not select it until every active domain has moved off the legacy stores.
 | `identity.rs` | PostgreSQL accounts, identities, signup budget, Apple credentials, and coherent session reads. |
 | `notification.rs` | PostgreSQL webhook destinations, email consent, and bounded push installation registry serialized against send fences. |
 | `oauth.rs` | PostgreSQL OAuth client registration, consent/code consumption, and refresh-token rotation. |
+| `work.rs` | PostgreSQL-authoritative email, webhook, and push send capabilities, outcome receipts, cancellation, and exact reconciliation. |

@@ -333,7 +333,12 @@ async fn deliver_selected_user_emails(
             break;
         };
         let snapshot = delivery_snapshot(row);
-        if state.control.email_outbox_deletion_owned(user_id).await? {
+        if state
+            .repositories
+            .work()
+            .email_outbox_deletion_owned(user_id)
+            .await?
+        {
             emit_email_metric("deletion_owned");
             break;
         }
@@ -527,7 +532,8 @@ async fn deliver_selected_user_emails(
             Ok(None) => break,
             Err(error) => {
                 if let Ok(None) = state
-                    .control
+                    .repositories
+                    .work()
                     .get_email_send_fence(user_id, &snapshot.delivery_id)
                     .await
                 {
@@ -560,7 +566,8 @@ async fn deliver_selected_user_emails(
             .checked_add(wal::MIN_SEND_LEASE_MILLIS)
             .ok_or_else(|| EnclaveError::Store("email lease horizon overflow".into()))?;
         if !state
-            .control
+            .repositories
+            .work()
             .validate_email_send_fence(&fence, minimum_valid_at)
             .await?
         {
@@ -996,7 +1003,8 @@ async fn begin_or_reload_email_fence(
 ) -> Result<Option<EmailSendFence>> {
     let requested = fence_for_email_claim(user_id, claim, None, None);
     match state
-        .control
+        .repositories
+        .work()
         .begin_email_send_fence(
             &requested,
             &now_for_email_snapshot(claim.predecessor(), Some(claim)),
@@ -1123,7 +1131,11 @@ async fn replay_email_fence_receipt(
             .await?;
         }
     }
-    state.control.finish_email_send_fence(&fence, outcome).await
+    state
+        .repositories
+        .work()
+        .finish_email_send_fence(&fence, outcome)
+        .await
 }
 
 async fn persist_email_provider_outcome(
@@ -1136,7 +1148,8 @@ async fn persist_email_provider_outcome(
     outcome_at: String,
 ) -> Result<()> {
     let control_result = state
-        .control
+        .repositories
+        .work()
         .record_email_send_outcome(&fence, outcome.clone(), &outcome_at)
         .await;
     let archive_result = settle_exact_email(
@@ -1157,7 +1170,8 @@ async fn persist_email_provider_outcome(
         Some(outcome_at),
     );
     state
-        .control
+        .repositories
+        .work()
         .finish_email_send_fence(&completed, EmailFenceOutcome::Provider(outcome))
         .await
 }
@@ -1169,7 +1183,8 @@ async fn recover_existing_email_claim(
     claim: wal::EmailSendClaim,
 ) -> Result<bool> {
     let fence = state
-        .control
+        .repositories
+        .work()
         .get_email_send_fence(user_id, &predecessor.delivery_id)
         .await?;
     if let Some(fence) = fence {
@@ -1225,10 +1240,20 @@ async fn recover_existing_email_claim(
 }
 
 async fn reconcile_email_send_fences(state: &CpState, user_id: &str) -> Result<()> {
-    for fence in state.control.list_email_send_fences(user_id).await? {
+    for fence in state
+        .repositories
+        .work()
+        .list_email_send_fences(user_id)
+        .await?
+    {
         let Some(recovery) = load_email_claim_recovery(state, user_id, &fence.claim_id).await?
         else {
-            if state.control.email_outbox_deletion_owned(user_id).await? {
+            if state
+                .repositories
+                .work()
+                .email_outbox_deletion_owned(user_id)
+                .await?
+            {
                 return Ok(());
             }
             return Err(EnclaveError::Store(
@@ -1267,7 +1292,8 @@ async fn reconcile_email_send_fences(state: &CpState, user_id: &str) -> Result<(
                         .ok_or_else(|| EnclaveError::Store("email outcome lacks claim".into()))?;
                     if fence.outcome.is_none() {
                         state
-                            .control
+                            .repositories
+                            .work()
                             .record_email_send_outcome(&fence, provider.clone(), settled_at)
                             .await?;
                     }
@@ -1278,7 +1304,8 @@ async fn reconcile_email_send_fences(state: &CpState, user_id: &str) -> Result<(
                         Some(settled_at.into()),
                     );
                     state
-                        .control
+                        .repositories
+                        .work()
                         .finish_email_send_fence(&completed, EmailFenceOutcome::Provider(provider))
                         .await?;
                 } else if let wal::EmailClaimRecovery::Cancelled {
@@ -1297,7 +1324,8 @@ async fn reconcile_email_send_fences(state: &CpState, user_id: &str) -> Result<(
                         Some(settled_at),
                     );
                     state
-                        .control
+                        .repositories
+                        .work()
                         .finish_email_send_fence(
                             &completed,
                             EmailFenceOutcome::Cancellation(cancellation),
@@ -2203,7 +2231,8 @@ mod tests {
         .unwrap();
         let first_fence = archive
             .state
-            .control
+            .repositories
+            .work()
             .get_email_send_fence(&archive.user_id, &first_row.as_ref().unwrap().delivery_id)
             .await;
         assert!(first_claim.is_none());

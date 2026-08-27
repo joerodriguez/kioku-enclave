@@ -9,6 +9,7 @@ mod entitlement;
 mod identity;
 mod notification;
 mod oauth;
+mod work;
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -171,7 +172,11 @@ mod tests {
         RefreshTokenRotation,
     };
     use crate::persistence::RepositorySet;
-    use crate::persistence::{PushInstallation, WebhookSubscription};
+    use crate::persistence::{
+        EmailFenceOutcome, EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition,
+        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
+        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+    };
 
     async fn test_persistence() -> Option<PostgresPersistence> {
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -499,6 +504,182 @@ mod tests {
                 .unwrap(),
             vec![repeated]
         );
+
+        let fence_webhook = WebhookSubscription {
+            id: "44444444-4444-4444-8444-444444444444".into(),
+            user_id: account_id.clone(),
+            name: "Fence contract hook".into(),
+            endpoint_url: "https://hooks.example/fence".into(),
+            signing_secret: "fence-signing-secret".into(),
+            include_content: false,
+            enabled: true,
+            created_at: "2026-08-27T12:03:00.000Z".into(),
+        };
+        repositories
+            .notifications()
+            .create_webhook_subscription(fence_webhook.clone())
+            .await
+            .unwrap();
+        let webhook_fence = WebhookSendFence {
+            user_id: account_id.clone(),
+            event_id: "event-contract".into(),
+            subscription_id: fence_webhook.id.clone(),
+            claim_id: "55555555-5555-4555-8555-555555555555".into(),
+            lease_expires_at: "2026-08-27T12:10:00.000Z".into(),
+            endpoint_url: fence_webhook.endpoint_url.clone(),
+            signing_secret: fence_webhook.signing_secret.clone(),
+            include_content: false,
+            outcome: None,
+            outcome_at: None,
+        };
+        let mut webhook_begins = Vec::new();
+        for _ in 0..8 {
+            let repositories = Arc::clone(&repositories);
+            let webhook_fence = webhook_fence.clone();
+            webhook_begins.push(tokio::spawn(async move {
+                repositories
+                    .work()
+                    .begin_webhook_send_fence(&webhook_fence, "2026-08-27T12:04:00.000Z")
+                    .await
+            }));
+        }
+        for begin in webhook_begins {
+            assert!(matches!(
+                begin.await.unwrap().unwrap(),
+                WebhookSendFenceDisposition::Authorized(_)
+            ));
+        }
+        let mut conflicting_webhook = webhook_fence.clone();
+        conflicting_webhook.claim_id = "88888888-8888-4888-8888-888888888888".into();
+        assert!(matches!(
+            repositories
+                .work()
+                .begin_webhook_send_fence(&conflicting_webhook, "2026-08-27T12:04:00.000Z",)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
+        assert!(repositories
+            .work()
+            .validate_webhook_send_fence(
+                &webhook_fence,
+                crate::cp::isotime::parse_epoch_millis("2026-08-27T12:09:00.000Z").unwrap(),
+            )
+            .await
+            .unwrap());
+        let webhook_outcome = WebhookProviderOutcome::Sent { status: 204 };
+        repositories
+            .work()
+            .record_webhook_send_outcome(
+                &webhook_fence,
+                webhook_outcome.clone(),
+                "2026-08-27T12:05:00.000Z",
+            )
+            .await
+            .unwrap();
+        let completed_webhook = repositories
+            .work()
+            .get_webhook_send_fence(&account_id, &webhook_fence.event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        repositories
+            .work()
+            .record_webhook_send_outcome(
+                &webhook_fence,
+                webhook_outcome,
+                "2026-08-27T12:05:00.000Z",
+            )
+            .await
+            .unwrap();
+        repositories
+            .work()
+            .close_webhook_send_fence(&completed_webhook)
+            .await
+            .unwrap();
+
+        let email_fence = EmailSendFence {
+            user_id: account_id.clone(),
+            delivery_id: "delivery-contract".into(),
+            claim_id: "66666666-6666-4666-8666-666666666666".into(),
+            lease_expires_at: "2026-08-27T12:10:00.000Z".into(),
+            recipient_email: "owner@example.com".into(),
+            include_content: true,
+            outcome: None,
+            outcome_at: None,
+        };
+        assert!(matches!(
+            repositories
+                .work()
+                .begin_email_send_fence(&email_fence, "2026-08-27T12:04:00.000Z")
+                .await
+                .unwrap(),
+            EmailSendFenceDisposition::Authorized(_)
+        ));
+        let email_outcome = EmailProviderOutcome::Accepted {
+            status: 202,
+            provider_message_id: "provider-message-contract".into(),
+        };
+        repositories
+            .work()
+            .record_email_send_outcome(
+                &email_fence,
+                email_outcome.clone(),
+                "2026-08-27T12:05:00.000Z",
+            )
+            .await
+            .unwrap();
+        let completed_email = repositories
+            .work()
+            .get_email_send_fence(&account_id, &email_fence.delivery_id)
+            .await
+            .unwrap()
+            .unwrap();
+        repositories
+            .work()
+            .finish_email_send_fence(&completed_email, EmailFenceOutcome::Provider(email_outcome))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repositories
+                .work()
+                .begin_push_send_fence(
+                    &account_id,
+                    &installed.id,
+                    installed.token_generation,
+                    "77777777-7777-4777-8777-777777777777",
+                    "2026-08-27T12:10:00.000Z",
+                    "2026-08-27T12:04:00.000Z",
+                )
+                .await
+                .unwrap(),
+            PushSendFenceDisposition::Authorized(_)
+        ));
+        let push_outcome = PushProviderOutcome::Accepted { status: 200 };
+        repositories
+            .work()
+            .record_push_send_outcome(
+                &account_id,
+                &installed.id,
+                installed.token_generation,
+                "77777777-7777-4777-8777-777777777777",
+                "2026-08-27T12:10:00.000Z",
+                PushProviderReceipt::new(push_outcome.clone(), "2026-08-27T12:05:00.000Z".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let completed_push = repositories
+            .work()
+            .get_push_send_fence(&account_id, &installed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        repositories
+            .work()
+            .finish_push_send_fence(&completed_push, push_outcome)
+            .await
+            .unwrap();
 
         let client_id = "11111111-1111-4111-8111-111111111111";
         repositories
