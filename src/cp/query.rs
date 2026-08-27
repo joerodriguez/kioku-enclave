@@ -323,6 +323,7 @@ fn string_is_truthy(value: &str) -> bool {
 
 /// Parse a stored JSON-array column (participants/languages/action_items)
 /// into a Value, defaulting to an empty array.
+#[cfg(any())]
 fn json_array_column(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .filter(Value::is_array)
@@ -330,6 +331,7 @@ fn json_array_column(raw: Option<String>) -> Value {
 }
 
 /// Registrable host of a URL for the "top domains" chips (strips `www.`).
+#[cfg(any())]
 fn url_domain(url: &str) -> Option<String> {
     let host = reqwest::Url::parse(url).ok()?.host_str()?.to_lowercase();
     Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
@@ -492,6 +494,63 @@ async fn query_episodes_page_value(
 }
 
 async fn query_episodes_rows_value(
+    s: &CpState,
+    user_id: &str,
+    query: EpisodeRowsQuery,
+    mode: EpisodeQueryMode,
+) -> crate::error::Result<Value> {
+    let EpisodeRowsQuery {
+        from,
+        to,
+        max,
+        include_low,
+        episode_id,
+    } = query;
+    let (before, probe_for_more) = match mode {
+        EpisodeQueryMode::Legacy => (None, false),
+        EpisodeQueryMode::RestPage { before } => (before, true),
+    };
+    let request = crate::persistence::EpisodeListRequest {
+        from: from.map(|value| super::isotime::normalize_to_utc(&value)),
+        to: to.map(|value| super::isotime::normalize_to_utc(&value)),
+        // REST callers clamp before this boundary; the legacy MCP helper's
+        // historical zero-limit behavior remains observable and is preserved.
+        limit: max,
+        include_low,
+        episode_id,
+        before_started_at: before.as_ref().map(|cursor| cursor.started_at.clone()),
+        before_id: before.map(|cursor| cursor.id),
+        probe_for_more,
+    };
+    let page = s
+        .repositories
+        .memory_queries()
+        .list_episodes(user_id, &request)
+        .await?;
+    let next_before = page.has_more.then(|| {
+        page.episodes.last().and_then(|episode| {
+            Some(encode_episode_before_cursor(
+                episode.get("started_at")?.as_str()?,
+                episode.get("id")?.as_i64()?,
+            ))
+        })
+    });
+    let mut value = json!({
+        "episode_count": page.episodes.len(),
+        "hidden_count": page.hidden_count,
+        "episodes": page.episodes,
+    });
+    if probe_for_more {
+        value["next_before"] = json!(next_before.flatten());
+    }
+    Ok(value)
+}
+
+// Kept temporarily as non-compiled extraction evidence while the remaining
+// query surfaces move into persistence adapters. It is deleted at the
+// interface-freeze gate.
+#[cfg(any())]
+async fn legacy_query_episodes_rows_value(
     s: &CpState,
     user_id: &str,
     query: EpisodeRowsQuery,
@@ -731,34 +790,11 @@ async fn query_episodes_rows_value(
 }
 
 async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {
-    s.store
-        .wal_authoritative_read(user_id, |conn| {
-            let utt: i64 = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
-            let scr: i64 = conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?;
-            let eps: i64 = conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?;
-            // `.optional()`, never `.ok()`. `.ok()` collapses EVERY error into
-            // `None`, so a corrupt index or a failed statement reported the
-            // same "no captures yet" as a genuinely empty archive — the exact
-            // absence-for-a-refusal this whole surface exists to prevent. Only
-            // "no rows" and a NULL timestamp are absences; anything else is a
-            // read failure and must reach the caller's failure arm.
-            let last_u: Option<String> = conn
-                .query_row("SELECT s.started_at FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id ORDER BY s.started_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
-                .optional()?
-                .flatten();
-            let last_s: Option<String> = conn
-                .query_row("SELECT captured_at FROM screenshots ORDER BY captured_at DESC LIMIT 1", [], |r| r.get::<_, Option<String>>(0))
-                .optional()?
-                .flatten();
-            Ok(json!({
-                "total_utterances": utt,
-                "total_screenshots": scr,
-                "episode_count": eps,
-                "last_utterance_at": last_u,
-                "last_screenshot_at": last_s,
-            }))
-        })
+    s.repositories
+        .memory_queries()
+        .capture_status(user_id)
         .await
+        .and_then(|status| serde_json::to_value(status).map_err(Into::into))
         .unwrap_or_else(|_| json!({ "error": "stats failed" }))
 }
 

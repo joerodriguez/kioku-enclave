@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::{
     cp::isotime,
     error::{EnclaveError, Result},
-    persistence::MemoryQueryRepository,
+    persistence::{CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryQueryRepository},
     search::{extract_speaker_filter, rrf_merge, SearchHit, SearchRequest},
 };
 
@@ -503,6 +504,29 @@ impl PostgresPersistence {
     }
 }
 
+fn postgres_json_array(row: &sqlx::postgres::PgRow, name: &str) -> Result<Value> {
+    let raw: String = row.try_get(name)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    Ok(if value.is_array() { value } else { json!([]) })
+}
+
+fn postgres_url_domain(value: &str) -> Option<String> {
+    let host = reqwest::Url::parse(value).ok()?.host_str()?.to_lowercase();
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_owned())
+}
+
+fn top_three(counts: Option<&HashMap<String, i64>>) -> Vec<String> {
+    let mut values = counts
+        .map(|counts| counts.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    values.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    values
+        .into_iter()
+        .take(3)
+        .map(|(value, _)| value.clone())
+        .collect()
+}
+
 #[async_trait]
 impl MemoryQueryRepository for PostgresPersistence {
     async fn search(&self, account_id: &str, request: &SearchRequest) -> Result<Vec<SearchHit>> {
@@ -532,5 +556,216 @@ impl MemoryQueryRepository for PostgresPersistence {
         hits.sort_by(|left, right| timestamp(right).cmp(timestamp(left)));
         hits.truncate(request.limit);
         Ok(hits)
+    }
+
+    async fn list_episodes(
+        &self,
+        account_id: &str,
+        request: &EpisodeListRequest,
+    ) -> Result<EpisodeListPage> {
+        if request.limit < 0 || request.limit > 50 {
+            return Err(EnclaveError::InvalidRequest(
+                "episode limit must be between 0 and 50".into(),
+            ));
+        }
+        let from = bound(&request.from)?;
+        let to = bound(&request.to)?;
+        let before = bound(&request.before_started_at)?;
+        if before.is_some() != request.before_id.is_some() {
+            return Err(EnclaveError::InvalidRequest(
+                "episode continuation is incomplete".into(),
+            ));
+        }
+        let fetch_limit = request.limit + i64::from(request.probe_for_more);
+        let rows = sqlx::query(
+            "SELECT e.id,e.title,e.summary,e.type,e.participants::text AS participants, \
+                    e.languages::text AS languages,e.action_items::text AS action_items, \
+                    e.minute_summaries::text AS minute_summaries,e.substance,e.visual_evidence,e.finalization_version, \
+                    e.finalization_status,e.speaker_processing_status, \
+                    floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
+                    floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
+                    floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms, \
+                    floor(extract(epoch FROM e.finalization_attempted_at)*1000)::bigint AS finalization_attempted_at_ms, \
+                    (SELECT count(*) FROM episode_members m WHERE m.account_id=e.account_id \
+                       AND m.episode_id=e.id AND m.record_type='utterance') AS utterance_count, \
+                    (SELECT count(*) FROM episode_members m WHERE m.account_id=e.account_id \
+                       AND m.episode_id=e.id AND m.record_type='screenshot') AS screenshot_count, \
+                    fb.overview,fb.decisions::text AS decisions, \
+                    fb.action_items::text AS brief_action_items, \
+                    fb.important_links::text AS important_links,fb.open_questions::text AS open_questions \
+               FROM episodes e LEFT JOIN episode_final_briefs fb \
+                 ON fb.account_id=e.account_id AND fb.episode_id=e.id \
+              WHERE e.account_id=$1 \
+                AND ($2::bigint IS NULL OR e.ended_at>=to_timestamp($2::double precision/1000.0)) \
+                AND ($3::bigint IS NULL OR e.started_at<=to_timestamp($3::double precision/1000.0)) \
+                AND ($4 OR e.substance!='none') AND ($5::bigint IS NULL OR e.id=$5) \
+                AND ($6::bigint IS NULL OR e.started_at<to_timestamp($6::double precision/1000.0) \
+                     OR (e.started_at=to_timestamp($6::double precision/1000.0) AND e.id<$7)) \
+              ORDER BY e.started_at DESC,e.id DESC LIMIT $8",
+        )
+        .bind(account_id)
+        .bind(from)
+        .bind(to)
+        .bind(request.include_low)
+        .bind(request.episode_id)
+        .bind(before)
+        .bind(request.before_id)
+        .bind(fetch_limit)
+        .fetch_all(self.pool())
+        .await?;
+
+        let mut episodes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let utterance_count: i64 = row.try_get("utterance_count")?;
+            let screenshot_count: i64 = row.try_get("screenshot_count")?;
+            let finalization_status: String = row.try_get("finalization_status")?;
+            let final_brief = row
+                .try_get::<Option<String>, _>("overview")?
+                .map(|overview| {
+                    Ok::<_, EnclaveError>(json!({
+                        "overview": overview,
+                        "decisions": postgres_json_array(row, "decisions")?,
+                        "action_items": postgres_json_array(row, "brief_action_items")?,
+                        "important_links": postgres_json_array(row, "important_links")?,
+                        "open_questions": postgres_json_array(row, "open_questions")?,
+                    }))
+                })
+                .transpose()?;
+            let timestamp = |name: &str| -> Result<Option<String>> {
+                Ok(row
+                    .try_get::<Option<i64>, _>(name)?
+                    .map(isotime::format_epoch_millis))
+            };
+            episodes.push(json!({
+                "id": row.try_get::<i64, _>("id")?,
+                "started_at": required_timestamp(row, "started_at_ms")?,
+                "ended_at": required_timestamp(row, "ended_at_ms")?,
+                "title": row.try_get::<Option<String>, _>("title")?,
+                "summary": row.try_get::<Option<String>, _>("summary")?,
+                "type": row.try_get::<Option<String>, _>("type")?,
+                "participants": postgres_json_array(row, "participants")?,
+                "languages": postgres_json_array(row, "languages")?,
+                "action_items": postgres_json_array(row, "action_items")?,
+                "minute_summaries": postgres_json_array(row, "minute_summaries")?,
+                "substance": row.try_get::<String, _>("substance")?,
+                "visual_evidence": row.try_get::<String, _>("visual_evidence")?,
+                "utterance_count": utterance_count,
+                "screenshot_count": screenshot_count,
+                "member_count": utterance_count + screenshot_count,
+                "source": "summarized",
+                "finalized_at": timestamp("finalized_at_ms")?,
+                "finalization_version": row.try_get::<Option<i64>, _>("finalization_version")?,
+                "finalization_status": finalization_status,
+                "finalization_attempted_at": timestamp("finalization_attempted_at_ms")?,
+                "finalization_retryable": matches!(finalization_status.as_str(), "retry_wait" | "budget_wait" | "failed_terminal"),
+                "final_brief": final_brief,
+                "speaker_processing_status": row.try_get::<String, _>("speaker_processing_status")?,
+            }));
+        }
+        let has_more = request.probe_for_more
+            && episodes.len() > usize::try_from(request.limit).unwrap_or(usize::MAX);
+        if request.probe_for_more {
+            episodes.truncate(usize::try_from(request.limit).unwrap_or(usize::MAX));
+        }
+
+        let ids = episodes
+            .iter()
+            .filter_map(|episode| episode.get("id").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+        let facet_rows = if ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query(
+                "SELECT m.episode_id,s.active_app,s.url,count(*)::bigint AS count \
+                   FROM episode_members m JOIN screenshots s \
+                     ON s.account_id=m.account_id AND s.id=m.record_id \
+                  WHERE m.account_id=$1 AND m.record_type='screenshot' AND m.episode_id=ANY($2) \
+                  GROUP BY m.episode_id,s.active_app,s.url",
+            )
+            .bind(account_id)
+            .bind(&ids)
+            .fetch_all(self.pool())
+            .await?
+        };
+        let mut app_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+        let mut domain_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+        for row in facet_rows {
+            let episode_id: i64 = row.try_get("episode_id")?;
+            let count: i64 = row.try_get("count")?;
+            if let Some(app) = row
+                .try_get::<Option<String>, _>("active_app")?
+                .filter(|value| !value.is_empty())
+            {
+                *app_counts
+                    .entry(episode_id)
+                    .or_default()
+                    .entry(app)
+                    .or_default() += count;
+            }
+            if let Some(domain) = row
+                .try_get::<Option<String>, _>("url")?
+                .as_deref()
+                .and_then(postgres_url_domain)
+            {
+                *domain_counts
+                    .entry(episode_id)
+                    .or_default()
+                    .entry(domain)
+                    .or_default() += count;
+            }
+        }
+        for episode in &mut episodes {
+            let id = episode.get("id").and_then(Value::as_i64).unwrap_or(-1);
+            episode["top_apps"] = json!(top_three(app_counts.get(&id)));
+            episode["top_domains"] = json!(top_three(domain_counts.get(&id)));
+        }
+
+        let hidden_count = if request.include_low {
+            0
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM episodes WHERE account_id=$1 AND substance='none' \
+                 AND ($2::bigint IS NULL OR ended_at>=to_timestamp($2::double precision/1000.0)) \
+                 AND ($3::bigint IS NULL OR started_at<=to_timestamp($3::double precision/1000.0))",
+            )
+            .bind(account_id)
+            .bind(from)
+            .bind(to)
+            .fetch_one(self.pool())
+            .await?
+        };
+        Ok(EpisodeListPage {
+            episodes,
+            hidden_count,
+            has_more,
+        })
+    }
+
+    async fn capture_status(&self, account_id: &str) -> Result<CaptureStatus> {
+        let row = sqlx::query(
+            "SELECT (SELECT count(*) FROM utterances WHERE account_id=$1)::bigint AS utterances, \
+                    (SELECT count(*) FROM screenshots WHERE account_id=$1)::bigint AS screenshots, \
+                    (SELECT count(*) FROM episodes WHERE account_id=$1)::bigint AS episodes, \
+                    (SELECT floor(extract(epoch FROM s.started_at)*1000)::bigint \
+                       FROM utterances u JOIN audio_segments s \
+                         ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+                      WHERE u.account_id=$1 ORDER BY s.started_at DESC LIMIT 1) AS last_utterance_ms, \
+                    (SELECT floor(extract(epoch FROM captured_at)*1000)::bigint \
+                       FROM screenshots WHERE account_id=$1 ORDER BY captured_at DESC LIMIT 1) AS last_screenshot_ms",
+        )
+        .bind(account_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(CaptureStatus {
+            total_utterances: row.try_get("utterances")?,
+            total_screenshots: row.try_get("screenshots")?,
+            episode_count: row.try_get("episodes")?,
+            last_utterance_at: row
+                .try_get::<Option<i64>, _>("last_utterance_ms")?
+                .map(isotime::format_epoch_millis),
+            last_screenshot_at: row
+                .try_get::<Option<i64>, _>("last_screenshot_ms")?
+                .map(isotime::format_epoch_millis),
+        })
     }
 }

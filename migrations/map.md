@@ -21,3 +21,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   PostgreSQL full-text and pgvector indexes.
 - `0008_capture_ingestion.sql` adds atomic capture receipts, media metadata,
   browser evidence, processing jobs, and the transactional work outbox.
+- `0009_episode_query_contract.sql` adds tenant-scoped final briefs consumed by
+  the episode list/detail and delivery surfaces.
