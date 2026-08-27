@@ -983,7 +983,17 @@ impl CheckpointAttempt {
         token: crate::cp::control_store::WalOwnerPersistenceContext,
         binding: &WalOwnerStoreBinding,
     ) -> Result<Self> {
-        if self.stage != CheckpointStage::SendStarted {
+        // ManualRequired is ordinarily terminal. The one exception is a
+        // retained, fully materialized candidate whose exact successor is
+        // independently reauthenticated from the provider. Control owns that
+        // proof-bound settlement and calls this transition only after the
+        // candidate, artifact inventory, and observed witness all agree.
+        if !matches!(
+            self.stage,
+            CheckpointStage::SendStarted | CheckpointStage::ManualRequired
+        ) || self.candidate.is_none()
+            || self.artifact_commitment.is_none()
+        {
             return Err(WalOwnerError::Conflict);
         }
         self.transition_for_control(
@@ -1969,7 +1979,9 @@ impl SingleArchiveWalPublisher {
             }
             if !matches!(
                 attempt.stage,
-                CheckpointStage::CandidateReady | CheckpointStage::SendStarted
+                CheckpointStage::CandidateReady
+                    | CheckpointStage::SendStarted
+                    | CheckpointStage::ManualRequired
             ) {
                 return Err(WalOwnerError::Conflict);
             }
@@ -1992,6 +2004,12 @@ impl SingleArchiveWalPublisher {
                         .control
                         .checkpoint_manual(&current_binding, &attempt)
                         .await;
+                    return Err(WalOwnerError::Conflict);
+                }
+                if attempt.stage == CheckpointStage::ManualRequired {
+                    // A manual fence may be settled only by exact adoption of
+                    // its retained candidate. Never renew, resend, or replace
+                    // provider state from this branch.
                     return Err(WalOwnerError::Conflict);
                 }
                 if attempt.stage == CheckpointStage::CandidateReady {

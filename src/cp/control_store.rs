@@ -15139,7 +15139,12 @@ fn load_wal_checkpoint_conn(
     if matches!(
         stage,
         CheckpointStage::CandidateReady | CheckpointStage::SendStarted | CheckpointStage::Witnessed
-    ) {
+    ) || (stage == CheckpointStage::ManualRequired
+        && attempt
+            .control_view(WalOwnerPersistenceContext(()))
+            .7
+            .is_some())
+    {
         let (artifact_commitment, _, root_id, root_hash) =
             checkpoint_artifact_commitment_for_binding_conn(
                 conn,
@@ -15237,8 +15242,8 @@ fn prepare_wal_checkpoint_conn(
             old_revision,
             old_stage,
             _,
-            _,
-            _,
+            retained_candidate,
+            retained_artifact_commitment,
             retained_instance,
             old_commitment,
         ) = value.control_view(WalOwnerPersistenceContext(()));
@@ -15326,9 +15331,17 @@ fn prepare_wal_checkpoint_conn(
             return Ok((value, false));
         }
         if old_stage == CheckpointStage::ManualRequired {
-            return Err(EnclaveError::Conflict(
-                "checkpoint requires manual recovery".into(),
-            ));
+            if retained_candidate.is_none() || retained_artifact_commitment.is_none() {
+                return Err(EnclaveError::Conflict(
+                    "checkpoint requires manual recovery".into(),
+                ));
+            }
+            // Preserve the manual fence. Returning its authenticated row does
+            // not authorize a resend or regenerated source; the publisher may
+            // only compare the retained candidate with the exact current
+            // provider witness and request atomic settlement below.
+            tx.commit()?;
+            return Ok((value, false));
         }
         if retained_instance != owner_instance_id {
             let next_attempt_id = ShadowAttemptId::random();
@@ -16139,6 +16152,7 @@ fn checkpoint_artifact_commitment_for_binding_conn(
             | CheckpointStage::CandidateReady
             | CheckpointStage::SendStarted
             | CheckpointStage::Witnessed
+            | CheckpointStage::ManualRequired
     ) {
         return Err(EnclaveError::Conflict(
             "checkpoint has no complete artifact set".into(),
@@ -16506,9 +16520,13 @@ fn settle_wal_checkpoint_conn(
 
     let tx = conn.unchecked_transaction()?;
     let current = load_wal_checkpoint_conn(&tx, binding)?;
+    let current_stage = current.control_view(WalOwnerPersistenceContext(())).5;
     if current.control_view(WalOwnerPersistenceContext(()))
         != retained.control_view(WalOwnerPersistenceContext(()))
-        || current.control_view(WalOwnerPersistenceContext(())).5 != CheckpointStage::SendStarted
+        || !matches!(
+            current_stage,
+            CheckpointStage::SendStarted | CheckpointStage::ManualRequired
+        )
     {
         return Err(EnclaveError::Conflict("checkpoint send changed".into()));
     }
@@ -16534,13 +16552,19 @@ fn settle_wal_checkpoint_conn(
     update_wal_checkpoint_stage_conn(&tx, binding, &current, &next, Some(observed))?;
     let (operation, _, _, attempt, _, _, _, _, _, _, _) =
         current.control_view(WalOwnerPersistenceContext(()));
+    let expected_attempt_state = if current_stage == CheckpointStage::ManualRequired {
+        "manual_required"
+    } else {
+        "active"
+    };
     if tx.execute(
         "UPDATE archive_v3_wal_checkpoint_attempts SET state='witnessed'
-         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state='active'",
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state=?4",
         rusqlite::params![
             archive_id.as_bytes().as_slice(),
             operation.as_bytes().as_slice(),
             i64::from(attempt),
+            expected_attempt_state,
         ],
     )? != 1
     {
@@ -37492,6 +37516,96 @@ mod tests {
             identity,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn wal_manual_checkpoint_candidate_recovers_only_the_exact_retained_successor() {
+        {
+            let conn = account_conn();
+            maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+            let (_terminal, _expected, _lease, binding) = bound_wal_publisher_fixture(&conn);
+            let instance = wal_owner_instance(0xda);
+            let prepared = prepare_wal_checkpoint_conn(&conn, &binding, instance)
+                .unwrap()
+                .0;
+            require_wal_checkpoint_manual_conn(&conn, &binding, &prepared).unwrap();
+            assert!(prepare_wal_checkpoint_conn(&conn, &binding, instance).is_err());
+        }
+
+        for tamper_artifact in [false, true] {
+            let conn = account_conn();
+            maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+            let (_terminal, expected, lease, binding) = bound_wal_publisher_fixture(&conn);
+            let (candidate, observed) = candidate_wal_checkpoint_fixture(
+                &conn,
+                &expected,
+                lease,
+                &binding,
+                wal_owner_instance(0xdb),
+            );
+            require_wal_checkpoint_manual_conn(&conn, &binding, &candidate).unwrap();
+            let manual = load_wal_checkpoint_conn(&conn, &binding).unwrap();
+            assert_eq!(
+                manual
+                    .control_view(WalOwnerPersistenceContext::for_test())
+                    .5,
+                CheckpointStage::ManualRequired
+            );
+
+            if tamper_artifact {
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                    .unwrap();
+                conn.execute(
+                    "UPDATE archive_v3_wal_checkpoint_artifacts
+                     SET state='reserved' WHERE ordinal=1",
+                    [],
+                )
+                .unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+                    .unwrap();
+                assert!(settle_wal_checkpoint_conn(&conn, &binding, &manual, &observed).is_err());
+                continue;
+            }
+
+            // A different same-root lease is not the retained candidate and
+            // cannot clear the manual fence.
+            let wrong = expected.renewed_maintenance_lease_for_test();
+            assert!(settle_wal_checkpoint_conn(&conn, &binding, &manual, &wrong).is_err());
+            assert_eq!(
+                load_wal_checkpoint_conn(&conn, &binding)
+                    .unwrap()
+                    .control_view(WalOwnerPersistenceContext::for_test())
+                    .5,
+                CheckpointStage::ManualRequired
+            );
+
+            let (settled, changed) =
+                settle_wal_checkpoint_conn(&conn, &binding, &manual, &observed).unwrap();
+            assert!(changed);
+            assert_eq!(settled.witness_bytes(), &observed.encode());
+            assert_eq!(
+                load_wal_checkpoint_conn(&conn, &settled)
+                    .unwrap()
+                    .control_view(WalOwnerPersistenceContext::for_test())
+                    .5,
+                CheckpointStage::Witnessed
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_wal_checkpoint_attempts
+                     WHERE state='witnessed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                !settle_wal_checkpoint_conn(&conn, &binding, &manual, &observed)
+                    .unwrap()
+                    .1
+            );
+        }
     }
 
     #[test]
