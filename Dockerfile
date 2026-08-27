@@ -141,6 +141,7 @@ RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,
 ARG SOURCE_INPUTS_SHA256
 RUN printf '%s\n' "${SOURCE_INPUTS_SHA256}" > /build/.source-inputs-sha256
 COPY src ./src
+COPY migrations ./migrations
 # Touch main.rs so cargo detects the change
 RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=kioku-cargo-git,target=/usr/local/cargo/git,sharing=locked \

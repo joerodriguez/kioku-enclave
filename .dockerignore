@@ -6,6 +6,8 @@
 !.dockerignore
 !Cargo.toml
 !Cargo.lock
+!migrations/
+!migrations/**
 !src/
 !src/**
 !scripts/
