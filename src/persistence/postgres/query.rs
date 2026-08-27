@@ -1302,4 +1302,196 @@ impl MemoryQueryRepository for PostgresPersistence {
             "tabs": tabs,
         })))
     }
+
+    async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value> {
+        let utterance_rows = sqlx::query(
+            "SELECT u.id,u.speaker_label,u.language,u.text,u.source_key, \
+                    floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms \
+               FROM episode_members m JOIN utterances u \
+                 ON u.account_id=m.account_id AND u.id=m.record_id \
+               JOIN audio_segments s \
+                 ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+              WHERE m.account_id=$1 AND m.episode_id=$2 AND m.record_type='utterance'",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .fetch_all(self.pool())
+        .await?;
+        let mut members = utterance_rows
+            .iter()
+            .map(|row| {
+                let timestamp = required_timestamp(row, "started_at_ms")?;
+                Ok((
+                    timestamp.clone(),
+                    json!({
+                        "record_type": "utterance",
+                        "record_id": row.try_get::<i64, _>("id")?,
+                        "started_at": timestamp,
+                        "speaker_label": row.try_get::<String, _>("speaker_label")?,
+                        "attribution_kind": Value::Null,
+                        "language": row.try_get::<Option<String>, _>("language")?,
+                        "text": row.try_get::<String, _>("text")?,
+                        "source_key": row.try_get::<Option<String>, _>("source_key")?,
+                    }),
+                ))
+            })
+            .collect::<Result<Vec<(String, Value)>>>()?;
+
+        let screenshot_rows = sqlx::query(
+            "SELECT c.id,c.active_app,c.window_title,c.url,left(c.ocr_text,4000) AS ocr_excerpt, \
+                    left(c.salient_ocr_text,4000) AS salient_ocr_excerpt, \
+                    coalesce(char_length(c.ocr_text)>4000,false) AS ocr_truncated,c.source_key, \
+                    coalesce(img.id,CASE WHEN capture_img.asset_id IS NOT NULL \
+                         THEN 'capture-v2:'||capture_img.asset_id END) AS cloud_image_id, \
+                    o.status AS observation_status,o.generation_method AS observation_method, \
+                    o.literal_description,o.screen_state,o.content_type,o.visible_text_summary, \
+                    o.notable_items::text AS notable_items, \
+                    i.activity_summary,i.relevance_level,i.relevance_reason,i.key_rank, \
+                    i.is_key_screen,i.semantic_group,c.capture_status,c.primary_bundle_id, \
+                    floor(extract(epoch FROM c.captured_at)*1000)::bigint AS captured_at_ms, \
+                    floor(extract(epoch FROM c.visible_until)*1000)::bigint AS visible_until_ms, \
+                    c.browser_snapshot_source_key,i.status AS interpretation_status, \
+                    i.milestone_type,i.base_score AS key_score \
+               FROM episode_members m JOIN screenshots c \
+                 ON c.account_id=m.account_id AND c.id=m.record_id \
+               LEFT JOIN screenshot_images img \
+                 ON img.account_id=c.account_id AND img.source_key=c.source_key \
+               LEFT JOIN media_objects capture_img \
+                 ON capture_img.account_id=c.account_id \
+                AND c.source_key LIKE 'cloud-v2:%' \
+                AND capture_img.event_id=substring(c.source_key from length('cloud-v2:')+1) \
+                AND capture_img.mime_type='image/jpeg' \
+                AND capture_img.processing_state='ready' AND capture_img.deleted_at IS NULL \
+               LEFT JOIN screen_observations o \
+                 ON o.account_id=c.account_id AND o.screenshot_id=c.id \
+               LEFT JOIN episode_screen_interpretations i \
+                 ON i.account_id=m.account_id AND i.episode_id=m.episode_id \
+                AND i.screenshot_id=c.id \
+              WHERE m.account_id=$1 AND m.episode_id=$2 \
+                AND m.record_type='screenshot' AND NOT c.is_duplicate",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .fetch_all(self.pool())
+        .await?;
+        for row in &screenshot_rows {
+            let timestamp = required_timestamp(row, "captured_at_ms")?;
+            let raw_ocr: Option<String> = row.try_get("ocr_excerpt")?;
+            let supplied_salient: Option<String> = row.try_get("salient_ocr_excerpt")?;
+            let salient =
+                crate::ocr::select_salient_ocr(raw_ocr.as_deref(), supplied_salient.as_deref());
+            let screen_facts = salient
+                .as_deref()
+                .map(crate::ocr::extract_screen_facts)
+                .unwrap_or_default();
+            let notable_items = row
+                .try_get::<Option<String>, _>("notable_items")?
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_else(|| json!([]));
+            let visible_until = row
+                .try_get::<Option<i64>, _>("visible_until_ms")?
+                .map(isotime::format_epoch_millis);
+            members.push((
+                timestamp.clone(),
+                json!({
+                    "record_type": "screenshot",
+                    "record_id": row.try_get::<i64, _>("id")?,
+                    "captured_at": timestamp,
+                    "active_app": row.try_get::<Option<String>, _>("active_app")?,
+                    "window_title": row.try_get::<Option<String>, _>("window_title")?,
+                    "url": row.try_get::<Option<String>, _>("url")?,
+                    "ocr_excerpt": raw_ocr,
+                    "ocr_truncated": row.try_get::<bool, _>("ocr_truncated")?,
+                    "salient_ocr_excerpt": salient,
+                    "screen_facts": screen_facts,
+                    "source_key": row.try_get::<Option<String>, _>("source_key")?,
+                    "cloud_image_id": row.try_get::<Option<String>, _>("cloud_image_id")?,
+                    "observation_status": row.try_get::<Option<String>, _>("observation_status")?,
+                    "observation_method": row.try_get::<Option<String>, _>("observation_method")?,
+                    "literal_description": row.try_get::<Option<String>, _>("literal_description")?,
+                    "screen_state": row.try_get::<Option<String>, _>("screen_state")?,
+                    "content_type": row.try_get::<Option<String>, _>("content_type")?,
+                    "visible_text_summary": row.try_get::<Option<String>, _>("visible_text_summary")?,
+                    "notable_items": notable_items,
+                    "activity_summary": row.try_get::<Option<String>, _>("activity_summary")?,
+                    "relevance_level": row.try_get::<Option<i64>, _>("relevance_level")?,
+                    "relevance_reason": row.try_get::<Option<String>, _>("relevance_reason")?,
+                    "key_rank": row.try_get::<Option<i64>, _>("key_rank")?,
+                    "is_key_screen": row.try_get::<Option<bool>, _>("is_key_screen")?.unwrap_or(false),
+                    "semantic_group": row.try_get::<Option<String>, _>("semantic_group")?,
+                    "capture_status": row.try_get::<Option<String>, _>("capture_status")?,
+                    "primary_bundle_id": row.try_get::<Option<String>, _>("primary_bundle_id")?,
+                    "visible_until": visible_until,
+                    "browser_snapshot_source_key": row.try_get::<Option<String>, _>("browser_snapshot_source_key")?,
+                    "interpretation_status": row.try_get::<Option<String>, _>("interpretation_status")?,
+                    "milestone_type": row.try_get::<Option<String>, _>("milestone_type")?,
+                    "key_score": row.try_get::<Option<i64>, _>("key_score")?,
+                }),
+            ));
+        }
+        members.sort_by(|left, right| left.0.cmp(&right.0));
+        let members = members
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        let participant_rows = sqlx::query(
+            "SELECT p.participant_key,p.person_id,p.attribution_kind,p.state,pe.display_name, \
+                    p.source_claimed_name,s.slot_ordinal \
+               FROM episode_participants p LEFT JOIN people pe \
+                 ON pe.account_id=p.account_id AND pe.id=p.person_id \
+               LEFT JOIN episode_speaker_slots s \
+                 ON s.account_id=p.account_id AND s.id=p.speaker_slot_id \
+              WHERE p.account_id=$1 AND p.episode_id=$2 AND p.state='active' ORDER BY p.id",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .fetch_all(self.pool())
+        .await?;
+        let participant_details = participant_rows
+            .iter()
+            .map(|row| {
+                let participant_key: String = row.try_get("participant_key")?;
+                let attribution_kind: String = row.try_get("attribution_kind")?;
+                let person_name: Option<String> = row.try_get("display_name")?;
+                let claimed_name: Option<String> = row.try_get("source_claimed_name")?;
+                let slot = row.try_get::<Option<i64>, _>("slot_ordinal")?;
+                let display_name = if participant_key == "owner"
+                    || matches!(
+                        attribution_kind.as_str(),
+                        "owner" | "owner_presentation" | "owner_source_role"
+                    ) {
+                    "Me".to_owned()
+                } else if let Some(name) = person_name {
+                    name
+                } else if let Some(name) = claimed_name {
+                    name
+                } else if let Some(slot) = slot {
+                    let slot = i32::try_from(slot).map_err(|_| {
+                        EnclaveError::Store("episode speaker slot is out of range".into())
+                    })?;
+                    format!(
+                        "Unknown speaker {}",
+                        crate::cp::identity::format_slot_ordinal(slot)
+                    )
+                } else {
+                    "Unknown speaker".to_owned()
+                };
+                Ok(json!({
+                    "participant_key": participant_key,
+                    "display_name": display_name,
+                    "person_id": row.try_get::<Option<i64>, _>("person_id")?,
+                    "attribution_kind": attribution_kind,
+                    "state": row.try_get::<String, _>("state")?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(json!({
+            "episode_id": episode_id,
+            "member_count": members.len(),
+            "participant_details": participant_details,
+            "members": members,
+        }))
+    }
 }
