@@ -166,14 +166,15 @@ class FreshReleaseTests(unittest.TestCase):
                     fresh.require_exact_bootstrap_tag(tag)
 
     def test_final_tag_role_has_no_version_attempt_case_or_cross_role_alias(self) -> None:
+        _, current = fresh.load_current_release_receipt(ROOT)
         self.assertTrue(fresh.is_final_tag(fresh.CURRENT_TAG))
         self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.CURRENT_TAG))
         self.assertFalse(fresh.is_bootstrap_tag(fresh.CURRENT_TAG))
         for tag in (
-            "v0.8.38-archive-v3-wal.18",
-            "v0.8.38-archive-v3-wal.19-extra",
-            "v0.8.38-ARCHIVE-V3-WAL.19",
-            "v0.8.38-archive-v3-walish.19",
+            f"v{current.version}-archive-v3-wal.{current.sequence - 1}",
+            current.name + "-extra",
+            current.name.replace("-archive-v3-wal.", "-ARCHIVE-V3-WAL."),
+            current.name.replace("-archive-v3-wal.", "-archive-v3-walish."),
         ):
             with self.subTest(tag=tag):
                 self.assertTrue(fresh.claims_final_role(tag))
@@ -295,6 +296,7 @@ class FreshReleaseTests(unittest.TestCase):
         )
 
         def fixture(directory: Path) -> None:
+            _, current = fresh.load_current_release_receipt(ROOT)
             for relative in source_paths:
                 target = directory / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -302,14 +304,14 @@ class FreshReleaseTests(unittest.TestCase):
             cargo_path = directory / "Cargo.toml"
             cargo_path.write_text(
                 cargo_path.read_text(encoding="utf-8").replace(
-                    'version = "0.8.38"', 'version = "0.8.35"', 1
+                    f'version = "{current.version}"', 'version = "0.8.35"', 1
                 ),
                 encoding="utf-8",
             )
             lock_path = directory / "Cargo.lock"
             lock_path.write_text(
                 lock_path.read_text(encoding="utf-8").replace(
-                    'name = "kioku-enclave"\nversion = "0.8.38"',
+                    f'name = "kioku-enclave"\nversion = "{current.version}"',
                     'name = "kioku-enclave"\nversion = "0.8.35"',
                     1,
                 ),
