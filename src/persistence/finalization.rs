@@ -112,8 +112,27 @@ pub(crate) struct FinalizationSettlement {
     pub(crate) interpretation_prompt_version: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinalizationRequest {
+    NotFound,
+    LowSignal,
+    AlreadyComplete { status: String },
+    AlreadyQueued { status: String },
+    Queued,
+}
+
 #[async_trait]
 pub(crate) trait FinalizationRepository: Send + Sync {
+    /// Atomically inspect and queue a user-requested episode finalization.
+    /// This prevents two application replicas from deriving competing queue
+    /// transitions from a stale process-local snapshot.
+    async fn request_finalization(
+        &self,
+        account_id: &str,
+        episode_id: i64,
+        finalization_version: i64,
+    ) -> Result<FinalizationRequest>;
+
     async fn claim_finalization(
         &self,
         account_id: &str,

@@ -43,8 +43,9 @@ pub(crate) use delivery_outbox::{
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use finalization::{
-    FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationScreenResult,
-    FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
+    FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationRequest,
+    FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
+    FinalizationUtterance,
 };
 #[allow(unused_imports)]
 pub(crate) use gcs_media::GcsMediaObjectStore;
@@ -77,7 +78,7 @@ pub(crate) use query::{
     McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
     MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
     PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
-    PersonStatementView, PersonSummary,
+    PersonStatementView, PersonSummary, ScreenshotMediaLocator,
 };
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,

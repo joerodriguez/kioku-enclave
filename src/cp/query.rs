@@ -2527,6 +2527,69 @@ async fn rest_episode_finalize(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if let Some(repository) = s.repositories.finalization() {
+        let outcome = repository
+            .request_finalization(
+                &user.0,
+                id,
+                i64::from(super::finalizer::FINALIZATION_VERSION),
+            )
+            .await;
+        match outcome {
+            Ok(crate::persistence::FinalizationRequest::NotFound) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "episode_not_found"})),
+                )
+                    .into_response();
+            }
+            Ok(crate::persistence::FinalizationRequest::LowSignal) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "low_signal_episode"})),
+                )
+                    .into_response();
+            }
+            Ok(crate::persistence::FinalizationRequest::AlreadyComplete { status }) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "already_complete", "status": status})),
+                )
+                    .into_response();
+            }
+            Ok(crate::persistence::FinalizationRequest::AlreadyQueued { status }) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"queued": true, "episode_id": id, "status": status})),
+                )
+                    .into_response();
+            }
+            Ok(crate::persistence::FinalizationRequest::Queued) => {}
+            Err(error) => {
+                tracing::warn!(%error, episode_id = id, "failed to queue PostgreSQL episode finalization");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "enclave_unavailable"})),
+                )
+                    .into_response();
+            }
+        }
+        let state = s.clone();
+        let worker_user = user.0;
+        tokio::spawn(async move {
+            if let Err(error) =
+                super::finalizer::finalize_user_episode(&state, &worker_user, id).await
+            {
+                tracing::warn!(%error, episode_id = id, "scoped PostgreSQL episode finalization failed");
+            }
+        });
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"queued": true, "episode_id": id, "status": "queued"})),
+        )
+            .into_response();
+    }
+
     // ADR-0022: the routed read serves both branches (it falls through to
     // the legacy read lane for unselected users) and fetches the full
     // predecessor row the sealed queue plan pins.
@@ -3453,6 +3516,12 @@ async fn rest_screenshot_upload_plan(
             .into_response();
     }
 
+    // A fresh PostgreSQL deployment has only the canonical capture-v2 media
+    // path. Do not port the retired device-prefix compatibility protocol.
+    if !s.repositories.uses_legacy_state() {
+        return selected_screenshot_upload_retired();
+    }
+
     // Genesis capture already uploads canonical image bytes before the screen
     // result is planned, and the native client no longer owns a local source
     // for those cloud-v2 rows. Reusing this retired device-prefix plan would
@@ -3497,6 +3566,12 @@ async fn rest_screenshot_image_upload(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+
+    // A fresh PostgreSQL deployment has only the canonical capture-v2 media
+    // path. Do not port the retired multipart compatibility protocol.
+    if !s.repositories.uses_legacy_state() {
+        return selected_screenshot_upload_retired();
     }
 
     // Canonical Cloud Capture v2 already owns the selected archive's image
@@ -3915,14 +3990,10 @@ async fn rest_screenshot_image_content(
     // Capture v2 asset ID inside this authenticated user's database. The v2
     // arm returns the complete immutable media identity; object_key alone is
     // not authority to read a current provider generation.
-    let user_id_cloned = user_id.clone();
     let query_res = s
-        .store
-        .wal_authoritative_read(&user_id_cloned, {
-            let id_clone = id.clone();
-            let lookup_user = user_id_cloned.clone();
-            move |conn| screenshot_image_object_key(conn, &lookup_user, &id_clone)
-        })
+        .repositories
+        .memory_queries()
+        .screenshot_media(&user_id, &id)
         .await;
 
     let locator = match query_res {
@@ -3943,11 +4014,15 @@ async fn rest_screenshot_image_content(
     // 2. Fetch the encrypted object. Capture-v2 is exact-current only; legacy
     // screenshot evidence preserves its compatibility fallback.
     let gcs_resp = match &locator {
-        ScreenshotImageLocator::CaptureV2(identity) => {
+        crate::persistence::ScreenshotMediaLocator::Canonical {
+            object_key,
+            generation,
+            ..
+        } => {
             match s
                 .repositories
                 .media_objects()
-                .get_current_generation(&identity.object_key, identity.generation)
+                .get_current_generation(object_key, *generation)
                 .await
             {
                 Ok(response) => response,
@@ -3956,14 +4031,10 @@ async fn rest_screenshot_image_content(
                     // settles the row. Re-read authority: a now-ineligible row
                     // is a truthful 404; an unchanged ready tuple means storage
                     // is unavailable and must not masquerade as absence.
-                    let reread_user = user_id.clone();
-                    let lookup_user = reread_user.clone();
-                    let reread_id = id.clone();
                     return match s
-                        .store
-                        .wal_authoritative_read(&reread_user, move |conn| {
-                            screenshot_image_object_key(conn, &lookup_user, &reread_id)
-                        })
+                        .repositories
+                        .memory_queries()
+                        .screenshot_media(&user_id, &id)
                         .await
                     {
                         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -3983,7 +4054,7 @@ async fn rest_screenshot_image_content(
                 }
             }
         }
-        ScreenshotImageLocator::Legacy { object_key } => {
+        crate::persistence::ScreenshotMediaLocator::LegacyCompatible { object_key } => {
             match s
                 .repositories
                 .media_objects()
@@ -4005,24 +4076,7 @@ async fn rest_screenshot_image_content(
     };
 
     // 3. Load user's media DEK
-    let user_id_cloned = user_id.clone();
-    let wrapped_opt_res = s
-        .store
-        .wal_authoritative_read(&user_id_cloned, |conn| {
-            let mut stmt =
-                conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
-            // `.optional()`, never `.ok()`. This is not a timestamp whose
-            // absence is cosmetic: `None` becomes a 404 four lines below, so
-            // `.ok()` turned every read error into "that screenshot does not
-            // exist". Only a missing row (or a NULL value) is an absence; a
-            // read failure falls through to the failure arm.
-            let val: Option<String> = stmt
-                .query_row([], |r| r.get::<_, Option<String>>(0))
-                .optional()?
-                .flatten();
-            Ok(val)
-        })
-        .await;
+    let wrapped_opt_res = s.repositories.captures().media_dek_wrapped(&user_id).await;
 
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
@@ -4050,12 +4104,11 @@ async fn rest_screenshot_image_content(
     };
 
     // 4. Bind media to both the authenticated user and exact object key.
-    let object_key = locator.object_key();
+    let object_key = locator.object_key().to_owned();
     let media_context = crate::store::media_blob_context(&user_id, &object_key);
     let opened = match &locator {
-        ScreenshotImageLocator::CaptureV2(identity) => {
-            if gcs_resp.generation != identity.generation || gcs_resp.wrapped_dek_b64 != wrapped_b64
-            {
+        crate::persistence::ScreenshotMediaLocator::Canonical { generation, .. } => {
+            if gcs_resp.generation != *generation || gcs_resp.wrapped_dek_b64 != wrapped_b64 {
                 tracing::error!("canonical screenshot provider identity mismatch");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -4071,7 +4124,7 @@ async fn rest_screenshot_image_content(
                 }
             }
         }
-        ScreenshotImageLocator::Legacy { .. } => {
+        crate::persistence::ScreenshotMediaLocator::LegacyCompatible { .. } => {
             match crate::crypto::decrypt_bound_blob(
                 &media_dek,
                 &gcs_resp.ciphertext,
@@ -4086,10 +4139,15 @@ async fn rest_screenshot_image_content(
         }
     };
 
-    if let ScreenshotImageLocator::CaptureV2(identity) = &locator {
+    if let crate::persistence::ScreenshotMediaLocator::Canonical {
+        byte_length,
+        sha256,
+        ..
+    } = &locator
+    {
         let actual_sha256 = format!("{:x}", Sha256::digest(&opened.plaintext));
-        if opened.plaintext.len() as i64 != identity.byte_length
-            || !actual_sha256.eq_ignore_ascii_case(&identity.sha256)
+        if opened.plaintext.len() as i64 != *byte_length
+            || !actual_sha256.eq_ignore_ascii_case(sha256)
         {
             tracing::error!("canonical screenshot plaintext commitment mismatch");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4104,34 +4162,11 @@ async fn rest_screenshot_image_content(
         .into_response()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CaptureV2ScreenshotIdentity {
-    object_key: String,
-    generation: i64,
-    byte_length: i64,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ScreenshotImageLocator {
-    CaptureV2(CaptureV2ScreenshotIdentity),
-    Legacy { object_key: String },
-}
-
-impl ScreenshotImageLocator {
-    fn object_key(&self) -> String {
-        match self {
-            Self::CaptureV2(identity) => identity.object_key.clone(),
-            Self::Legacy { object_key } => object_key.clone(),
-        }
-    }
-}
-
-fn screenshot_image_object_key(
+pub(crate) fn legacy_screenshot_media_locator(
     conn: &Connection,
     user_id: &str,
     id: &str,
-) -> crate::error::Result<Option<ScreenshotImageLocator>> {
+) -> crate::error::Result<Option<crate::persistence::ScreenshotMediaLocator>> {
     if let Some(asset_id) = id.strip_prefix(CLOUD_CAPTURE_IMAGE_ID_PREFIX) {
         let expected_object_key =
             match crate::store::canonical_capture_media_object_key(user_id, asset_id) {
@@ -4175,14 +4210,14 @@ fn screenshot_image_object_key(
                 "canonical screenshot identity is malformed".into(),
             ));
         }
-        return Ok(Some(ScreenshotImageLocator::CaptureV2(
-            CaptureV2ScreenshotIdentity {
+        return Ok(Some(
+            crate::persistence::ScreenshotMediaLocator::Canonical {
                 object_key,
                 generation,
                 byte_length,
                 sha256,
             },
-        )));
+        ));
     }
 
     Ok(conn
@@ -4190,9 +4225,11 @@ fn screenshot_image_object_key(
             "SELECT object_key FROM screenshot_images WHERE id = ?1",
             [id],
             |row| {
-                Ok(ScreenshotImageLocator::Legacy {
-                    object_key: row.get(0)?,
-                })
+                Ok(
+                    crate::persistence::ScreenshotMediaLocator::LegacyCompatible {
+                        object_key: row.get(0)?,
+                    },
+                )
             },
         )
         .optional()?)
@@ -4325,9 +4362,13 @@ async fn rest_delete_webhook(
     // disable + exact archive drain + Control deletion here. Never replace
     // this with a final unprotected scan: a paused finalizer could enqueue
     // after the route returned 204.
-    let _webhook_lifecycle_guard = match s.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => return error.into_response(),
+    let _webhook_lifecycle_guard = if s.repositories.uses_legacy_state() {
+        match s.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
     };
     match s
         .repositories
