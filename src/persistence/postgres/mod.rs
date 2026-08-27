@@ -30,7 +30,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 21;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 22;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -263,6 +263,14 @@ impl PostgresPersistence {
         if version == 20 {
             sqlx::raw_sql(include_str!(
                 "../../../migrations/0021_recording_retention.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
+            version = 21;
+        }
+        if version == 21 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0022_reference_batch_billing.sql"
             ))
             .execute(&mut *transaction)
             .await?;
@@ -1323,6 +1331,59 @@ mod tests {
             .reserve_recording_delivery(&account_id, "event-one", 1024)
             .await
             .unwrap());
+        let batch_id = "b".repeat(64);
+        let batch_digest = "c".repeat(64);
+        let batch_events = vec!["batch-event-one".into(), "batch-event-two".into()];
+        assert!(repositories
+            .billing()
+            .reserve_recording_delivery_batch(
+                &account_id,
+                &batch_id,
+                &batch_digest,
+                "screen-contract",
+                10,
+                11,
+                &batch_events,
+                &batch_events,
+            )
+            .await
+            .unwrap());
+        assert!(repositories
+            .billing()
+            .reserve_recording_delivery_batch(
+                &account_id,
+                &batch_id,
+                &batch_digest,
+                "screen-contract",
+                10,
+                11,
+                &batch_events,
+                &batch_events,
+            )
+            .await
+            .unwrap());
+        repositories
+            .billing()
+            .complete_recording_delivery_batch(&account_id, &batch_id, &batch_digest, &batch_events)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM capture_reference_batch_receipts \
+                  WHERE account_id=$1 AND batch_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "completed"
+        );
+        repositories
+            .billing()
+            .complete_recording_delivery(&account_id, "event-one")
+            .await
+            .unwrap();
         assert!(repositories
             .billing()
             .complete_offline_recording_usage(&account_id, "offline-one")

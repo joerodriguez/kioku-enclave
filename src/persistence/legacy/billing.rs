@@ -129,6 +129,49 @@ impl BillingRepository for LegacyBillingRepository {
             .await
     }
 
+    async fn reserve_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        stream_id: &str,
+        first_sequence: i64,
+        last_sequence: i64,
+        event_ids: &[String],
+        new_event_ids: &[String],
+    ) -> Result<bool> {
+        self.control
+            .reserve_recording_delivery_batch(
+                account_id,
+                batch_id,
+                manifest_digest,
+                stream_id,
+                first_sequence,
+                last_sequence,
+                event_ids,
+                new_event_ids,
+            )
+            .await
+    }
+
+    async fn complete_recording_delivery_batch(
+        &self,
+        account_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        event_ids: &[String],
+    ) -> Result<()> {
+        self.control
+            .complete_recording_delivery_batch(account_id, batch_id, manifest_digest, event_ids)
+            .await
+    }
+
+    async fn complete_recording_delivery(&self, account_id: &str, event_id: &str) -> Result<()> {
+        self.control
+            .complete_recording_delivery(account_id, event_id)
+            .await
+    }
+
     async fn recording_lease_receipt(
         &self,
         account_id: &str,

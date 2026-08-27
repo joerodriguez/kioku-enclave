@@ -47,3 +47,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   purge state machine and replayable receipt for user-requested episode deletion.
 - `0021_recording_retention.sql` adds fleet-wide recording-retention policy,
   preview/CAS receipts, durable key epochs, and downgrade reconciliation state.
+- `0022_reference_batch_billing.sql` adds durable reference-batch credit
+  reservations, ordered event fingerprints, replay, and completion receipts.
