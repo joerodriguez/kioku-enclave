@@ -7,6 +7,7 @@
 mod billing;
 mod capture;
 mod entitlement;
+mod finalization;
 mod identity;
 mod lifecycle;
 mod media_processing;
@@ -25,7 +26,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 15;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 16;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -215,6 +216,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 15;
+        }
+        if version == 15 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0016_finalization_delivery.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -303,10 +312,11 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
-        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
-        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        ScreenMediaSettlement, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
+        FinalizationScreenResult, FinalizationSettlement, McpContextRequest, McpTimeRangeRequest,
+        McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
+        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
+        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, ScreenMediaSettlement,
+        SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
@@ -796,6 +806,135 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("2026-08-27T12:34:56.789Z")
+        );
+        repositories
+            .work()
+            .set_summarized_until(&account_id, "2026-08-27T17:00:00.000Z")
+            .await
+            .unwrap();
+        let finalization = repositories
+            .finalization()
+            .expect("PostgreSQL finalization repository");
+        let finalization_claim = finalization
+            .claim_finalization(
+                &account_id,
+                Some(episode_ids[0]),
+                "2026-08-27T20:00:00.000Z",
+                "2026-08-27T16:00:00.000Z",
+                5,
+                900,
+            )
+            .await
+            .unwrap()
+            .expect("finalization claim");
+        assert!(finalization
+            .claim_finalization(
+                &account_id,
+                Some(episode_ids[0]),
+                "2026-08-27T20:00:01.000Z",
+                "2026-08-27T16:00:00.000Z",
+                5,
+                900,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(finalization_claim.screenshots.len(), 1);
+        let finalization_event = repositories
+            .model_usage()
+            .begin_invocation(
+                &account_id,
+                VertexOperation::FinalEpisodeAnalysis,
+                "contract-model",
+                "us-central1",
+                &[0x66; 32],
+            )
+            .await
+            .unwrap();
+        repositories
+            .model_usage()
+            .settle_response(
+                &account_id,
+                &finalization_event,
+                &VertexMetadata {
+                    usage: None,
+                    model_version: Some("contract-model".into()),
+                    traffic_type: None,
+                },
+            )
+            .await
+            .unwrap();
+        let finalization_settlement = FinalizationSettlement {
+            claim: finalization_claim,
+            vertex_event_id: finalization_event.clone(),
+            model_name: "contract-model".into(),
+            analysis_revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+            title: "Final PostgreSQL architecture".into(),
+            summary: "Completed the database architecture review.".into(),
+            minute_summaries_json: "[]".into(),
+            minutes_text: "Reviewed PostgreSQL".into(),
+            action_items_json: "[]".into(),
+            overview: "The persistence boundary is complete.".into(),
+            decisions_json: "[]".into(),
+            important_links_json: "[]".into(),
+            open_questions_json: "[]".into(),
+            ranked_screens: vec![FinalizationScreenResult {
+                screenshot_id: summary_screenshots[0].id,
+                observation_revision: "contract-observation".into(),
+                literal_description: "A PostgreSQL architecture diagram".into(),
+                screen_state: "content".into(),
+                content_type: "document".into(),
+                visible_text_summary: Some("PostgreSQL".into()),
+                notable_items_json: "[]".into(),
+                activity_summary: Some("Reviewed the data model".into()),
+                relevance_level: 3,
+                relevance_reason: "Primary design artifact".into(),
+                milestone_type: "decision".into(),
+                base_score: 100,
+                key_rank: Some(1),
+                is_key_screen: true,
+                semantic_group: "contract-group".into(),
+            }],
+            webhook_destinations: vec![("contract-webhook".into(), "contract-event".into())],
+            email_preference_include_content: Some(true),
+            push_destinations: vec![(
+                "p1:contract-installation:1".into(),
+                "contract-push-delivery".into(),
+                "contract-handoff".into(),
+                "contract-collapse".into(),
+            )],
+            finalization_version: 5,
+            observation_version: 2,
+            observation_prompt_version: 2,
+            interpretation_version: 1,
+            interpretation_prompt_version: 1,
+        };
+        assert_eq!(
+            finalization
+                .settle_finalization(finalization_settlement.clone())
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            finalization
+                .settle_finalization(finalization_settlement)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT count(*) FROM webhook_deliveries WHERE account_id=$1)+\
+                        (SELECT count(*) FROM email_deliveries WHERE account_id=$1)+\
+                        (SELECT count(*) FROM push_deliveries WHERE account_id=$1)",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            3
         );
         assert!(matches!(
             repositories
@@ -1448,10 +1587,18 @@ mod tests {
         sqlx::query(
             "INSERT INTO episode_screen_interpretations \
              (account_id,episode_id,screenshot_id,episode_revision,interpretation_version,status, \
-              activity_summary,relevance_level,relevance_reason,milestone_type,base_score,key_rank, \
+             activity_summary,relevance_level,relevance_reason,milestone_type,base_score,key_rank, \
               is_key_screen,semantic_group,prompt_version) \
              VALUES($1,1,1,'episode-1',1,'ready','Reviewing the schema',3,'central evidence', \
-                    'decision',95,1,true,'database',1)",
+                    'decision',95,1,true,'database',1) \
+             ON CONFLICT(account_id,episode_id,screenshot_id) DO UPDATE SET \
+                    episode_revision=excluded.episode_revision,\
+                    interpretation_version=excluded.interpretation_version,\
+                    status=excluded.status,activity_summary=excluded.activity_summary,\
+                    relevance_level=excluded.relevance_level,relevance_reason=excluded.relevance_reason,\
+                    milestone_type=excluded.milestone_type,base_score=excluded.base_score,\
+                    key_rank=excluded.key_rank,is_key_screen=excluded.is_key_screen,\
+                    semantic_group=excluded.semantic_group,prompt_version=excluded.prompt_version",
         )
         .bind(&account_id)
         .execute(&pool)
@@ -1587,7 +1734,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
-             VALUES($1,1,'Ready','[]'::jsonb,'[\"Ship\"]'::jsonb,'[]'::jsonb,'[]'::jsonb)",
+             VALUES($1,1,'Ready','[]'::jsonb,'[\"Ship\"]'::jsonb,'[]'::jsonb,'[]'::jsonb) \
+             ON CONFLICT(account_id,episode_id) DO UPDATE SET \
+               overview=excluded.overview,decisions=excluded.decisions, \
+               action_items=excluded.action_items,important_links=excluded.important_links, \
+               open_questions=excluded.open_questions",
         )
         .bind(&account_id)
         .execute(&pool)
@@ -1839,8 +1990,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(usage_claim.events.len(), 1);
-        assert_eq!(usage_claim.events[0].event_id, invocation);
+        assert_eq!(usage_claim.events.len(), 2);
+        assert!(usage_claim
+            .events
+            .iter()
+            .any(|event| event.event_id == invocation));
+        assert!(usage_claim
+            .events
+            .iter()
+            .any(|event| event.event_id == finalization_event));
         assert!(repositories
             .model_usage()
             .pending_events(&account_id, &billing_account, false)
@@ -1849,7 +2007,15 @@ mod tests {
             .is_none());
         repositories
             .model_usage()
-            .complete_delivery(&account_id, &usage_claim.claim_id, &[invocation.clone()])
+            .complete_delivery(
+                &account_id,
+                &usage_claim.claim_id,
+                &usage_claim
+                    .events
+                    .iter()
+                    .map(|event| event.event_id.clone())
+                    .collect::<Vec<_>>(),
+            )
             .await
             .unwrap();
         let coverage = repositories

@@ -7,6 +7,7 @@
 mod billing;
 mod capture;
 mod entitlement;
+mod finalization;
 mod gcs_media;
 mod identity;
 mod legacy;
@@ -33,6 +34,10 @@ pub(crate) use capture::{
     CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
+pub(crate) use finalization::{
+    FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationScreenResult,
+    FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
+};
 pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
@@ -94,6 +99,7 @@ pub(crate) struct RepositorySet {
     captures: Arc<dyn CaptureRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
+    finalization: Option<Arc<dyn FinalizationRepository>>,
     notifications: Arc<dyn NotificationRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
     media_objects: Arc<dyn MediaObjectStore>,
@@ -112,6 +118,7 @@ impl RepositorySet {
             captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
+            finalization: None,
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
             memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
             media_objects: Arc::new(LegacyMediaObjectStore::new(Arc::clone(&store))),
@@ -134,6 +141,7 @@ impl RepositorySet {
             captures: Arc::clone(&persistence) as Arc<dyn CaptureRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
+            finalization: Some(Arc::clone(&persistence) as Arc<dyn FinalizationRepository>),
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
             media_objects,
@@ -166,6 +174,10 @@ impl RepositorySet {
 
     pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {
         self.entitlements.as_ref()
+    }
+
+    pub(crate) fn finalization(&self) -> Option<&dyn FinalizationRepository> {
+        self.finalization.as_deref()
     }
 
     pub(crate) fn notifications(&self) -> &dyn NotificationRepository {
