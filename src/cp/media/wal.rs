@@ -191,7 +191,7 @@ pub(crate) struct CaptureSessionFinishPlan {
 }
 
 impl CaptureSessionFinishPlan {
-    pub(super) fn new(capture_session_id: String) -> Result<Self> {
+    pub(crate) fn new(capture_session_id: String) -> Result<Self> {
         super::validate_id("capture_session_id", &capture_session_id)
             .map_err(|_| WalIdempotencyError::Malformed)?;
         let operation_id = WalLogicalOperationId::from_stable_source(

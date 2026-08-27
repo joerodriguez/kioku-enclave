@@ -23,8 +23,9 @@ mod postgres;
 use std::sync::Arc;
 
 pub(crate) use capture::{
-    CaptureCommit, CaptureCommitResult, CapturePreflight, CaptureRepository, ReferenceBatchCommit,
-    ReferenceBatchCommitResult,
+    CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight, CaptureRepository,
+    CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage,
+    CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
