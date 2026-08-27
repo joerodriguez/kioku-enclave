@@ -2071,52 +2071,66 @@ async fn rest_episode_members(
     // and image tables do not decide it: they widen a member row, they cannot
     // create or suppress one.
     let result = s
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            // Legacy source keys let the Mac-selected evidence flow join a
-            // member to screenshot_images. Cloud Capture v2 source keys bind
-            // canonical screenshots to their retained encrypted media object.
-            let mut us = conn.prepare(
+        .repositories
+        .memory_queries()
+        .episode_members(&user.0, id)
+        .await;
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => super::routed_read_unavailable("api.episode_members", &e),
+    }
+}
+
+pub(crate) fn load_episode_members(conn: &Connection, id: i64) -> crate::error::Result<Value> {
+    // Legacy source keys let the Mac-selected evidence flow join a member to
+    // screenshot_images. Cloud Capture v2 source keys bind canonical
+    // screenshots to their retained encrypted media object.
+    let mut us = conn.prepare(
                 "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key, u.speaker_observation_id \
                  FROM episode_members m \
                  JOIN utterances u ON u.id = m.record_id \
                  JOIN audio_segments s ON s.id = u.audio_segment_id \
                  WHERE m.episode_id = ?1 AND m.record_type = 'utterance'",
-            )?;
-            let mut members: Vec<(String, Value)> = us
-                .query_map([id], |r| {
-                    let ts: String = r.get(1)?;
-                    let obs_id: Option<i64> = r.get(6)?;
-                    let raw_label: String = r.get(2)?;
-                    let (resolved_label, attribution_kind) = if let Some(oid) = obs_id {
-                        if let Ok(attr) = crate::cp::identity::resolve_speaker_attribution(conn, oid, Some(id)) {
-                            (attr.display_label, Some(serde_json::to_value(attr.attribution_kind).unwrap_or(Value::Null)))
-                        } else {
-                            (raw_label, None)
-                        }
-                    } else {
-                        (raw_label, None)
-                    };
+    )?;
+    let mut members: Vec<(String, Value)> = us
+        .query_map([id], |r| {
+            let ts: String = r.get(1)?;
+            let obs_id: Option<i64> = r.get(6)?;
+            let raw_label: String = r.get(2)?;
+            let (resolved_label, attribution_kind) = if let Some(oid) = obs_id {
+                if let Ok(attr) =
+                    crate::cp::identity::resolve_speaker_attribution(conn, oid, Some(id))
+                {
+                    (
+                        attr.display_label,
+                        Some(serde_json::to_value(attr.attribution_kind).unwrap_or(Value::Null)),
+                    )
+                } else {
+                    (raw_label, None)
+                }
+            } else {
+                (raw_label, None)
+            };
 
-                    Ok((
-                        ts.clone(),
-                        json!({
-                            "record_type": "utterance",
-                            "record_id": r.get::<_, i64>(0)?,
-                            "started_at": ts,
-                            "speaker_label": resolved_label,
-                            "attribution_kind": attribution_kind,
-                            "language": r.get::<_, Option<String>>(3)?,
-                            "text": r.get::<_, String>(4)?,
-                            "source_key": r.get::<_, Option<String>>(5)?,
-                        }),
-                    ))
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
+            Ok((
+                ts.clone(),
+                json!({
+                    "record_type": "utterance",
+                    "record_id": r.get::<_, i64>(0)?,
+                    "started_at": ts,
+                    "speaker_label": resolved_label,
+                    "attribution_kind": attribution_kind,
+                    "language": r.get::<_, Option<String>>(3)?,
+                    "text": r.get::<_, String>(4)?,
+                    "source_key": r.get::<_, Option<String>>(5)?,
+                }),
+            ))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
 
-            let mut ss = conn.prepare(
-                "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
+    let mut ss = conn.prepare(
+        "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
                         substr(c.ocr_text,1,4000), substr(c.salient_ocr_text,1,4000), \
                         CASE WHEN length(c.ocr_text) > 4000 THEN 1 ELSE 0 END, \
                         c.source_key, COALESCE(img.id, \
@@ -2142,126 +2156,118 @@ async fn rest_episode_members(
                  LEFT JOIN episode_screen_interpretations i \
                    ON i.episode_id = m.episode_id AND i.screenshot_id = c.id \
                  WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' AND c.is_duplicate = 0",
-            )?;
-            members.extend(
-                ss.query_map([id], |r| {
-                    let ts: String = r.get(1)?;
-                    let raw_ocr: Option<String> = r.get(5)?;
-                    let supplied_salient: Option<String> = r.get(6)?;
-                    let salient = crate::ocr::select_salient_ocr(
-                        raw_ocr.as_deref(),
-                        supplied_salient.as_deref(),
-                    );
-                    let screen_facts = salient
-                        .as_deref()
-                        .map(crate::ocr::extract_screen_facts)
-                        .unwrap_or_default();
-                    let notable_items: Value = r
-                        .get::<_, Option<String>>(16)?
-                        .and_then(|raw| serde_json::from_str(&raw).ok())
-                        .unwrap_or_else(|| json!([]));
-                    Ok((
-                        ts.clone(),
-                        json!({
-                            "record_type": "screenshot",
-                            "record_id": r.get::<_, i64>(0)?,
-                            "captured_at": ts,
-                            "active_app": r.get::<_, Option<String>>(2)?,
-                            "window_title": r.get::<_, Option<String>>(3)?,
-                            "url": r.get::<_, Option<String>>(4)?,
-                            "ocr_excerpt": raw_ocr,
-                            "ocr_truncated": r.get::<_, i64>(7)? != 0,
-                            "salient_ocr_excerpt": salient,
-                            "screen_facts": screen_facts,
-                            "source_key": r.get::<_, Option<String>>(8)?,
-                            "cloud_image_id": r.get::<_, Option<String>>(9)?,
-                            "observation_status": r.get::<_, Option<String>>(10)?,
-                            "observation_method": r.get::<_, Option<String>>(11)?,
-                            "literal_description": r.get::<_, Option<String>>(12)?,
-                            "screen_state": r.get::<_, Option<String>>(13)?,
-                            "content_type": r.get::<_, Option<String>>(14)?,
-                            "visible_text_summary": r.get::<_, Option<String>>(15)?,
-                            "notable_items": notable_items,
-                            "activity_summary": r.get::<_, Option<String>>(17)?,
-                            "relevance_level": r.get::<_, Option<i64>>(18)?,
-                            "relevance_reason": r.get::<_, Option<String>>(19)?,
-                            "key_rank": r.get::<_, Option<i64>>(20)?,
-                            "is_key_screen": r.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
-                            "semantic_group": r.get::<_, Option<String>>(22)?,
-                            "capture_status": r.get::<_, Option<String>>(23)?,
-                            "primary_bundle_id": r.get::<_, Option<String>>(24)?,
-                            "visible_until": r.get::<_, Option<String>>(25)?,
-                            "browser_snapshot_source_key": r.get::<_, Option<String>>(26)?,
-                            "interpretation_status": r.get::<_, Option<String>>(27)?,
-                            "milestone_type": r.get::<_, Option<String>>(28)?,
-                            "key_score": r.get::<_, Option<i64>>(29)?,
-                        }),
-                    ))
-                })?
-                .filter_map(|x| x.ok()),
-            );
+    )?;
+    members.extend(
+        ss.query_map([id], |r| {
+            let ts: String = r.get(1)?;
+            let raw_ocr: Option<String> = r.get(5)?;
+            let supplied_salient: Option<String> = r.get(6)?;
+            let salient =
+                crate::ocr::select_salient_ocr(raw_ocr.as_deref(), supplied_salient.as_deref());
+            let screen_facts = salient
+                .as_deref()
+                .map(crate::ocr::extract_screen_facts)
+                .unwrap_or_default();
+            let notable_items: Value = r
+                .get::<_, Option<String>>(16)?
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_else(|| json!([]));
+            Ok((
+                ts.clone(),
+                json!({
+                    "record_type": "screenshot",
+                    "record_id": r.get::<_, i64>(0)?,
+                    "captured_at": ts,
+                    "active_app": r.get::<_, Option<String>>(2)?,
+                    "window_title": r.get::<_, Option<String>>(3)?,
+                    "url": r.get::<_, Option<String>>(4)?,
+                    "ocr_excerpt": raw_ocr,
+                    "ocr_truncated": r.get::<_, i64>(7)? != 0,
+                    "salient_ocr_excerpt": salient,
+                    "screen_facts": screen_facts,
+                    "source_key": r.get::<_, Option<String>>(8)?,
+                    "cloud_image_id": r.get::<_, Option<String>>(9)?,
+                    "observation_status": r.get::<_, Option<String>>(10)?,
+                    "observation_method": r.get::<_, Option<String>>(11)?,
+                    "literal_description": r.get::<_, Option<String>>(12)?,
+                    "screen_state": r.get::<_, Option<String>>(13)?,
+                    "content_type": r.get::<_, Option<String>>(14)?,
+                    "visible_text_summary": r.get::<_, Option<String>>(15)?,
+                    "notable_items": notable_items,
+                    "activity_summary": r.get::<_, Option<String>>(17)?,
+                    "relevance_level": r.get::<_, Option<i64>>(18)?,
+                    "relevance_reason": r.get::<_, Option<String>>(19)?,
+                    "key_rank": r.get::<_, Option<i64>>(20)?,
+                    "is_key_screen": r.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+                    "semantic_group": r.get::<_, Option<String>>(22)?,
+                    "capture_status": r.get::<_, Option<String>>(23)?,
+                    "primary_bundle_id": r.get::<_, Option<String>>(24)?,
+                    "visible_until": r.get::<_, Option<String>>(25)?,
+                    "browser_snapshot_source_key": r.get::<_, Option<String>>(26)?,
+                    "interpretation_status": r.get::<_, Option<String>>(27)?,
+                    "milestone_type": r.get::<_, Option<String>>(28)?,
+                    "key_score": r.get::<_, Option<i64>>(29)?,
+                }),
+            ))
+        })?
+        .filter_map(|x| x.ok()),
+    );
 
-            members.sort_by(|a, b| a.0.cmp(&b.0));
-            let members: Vec<Value> = members.into_iter().map(|(_, v)| v).collect();
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+    let members: Vec<Value> = members.into_iter().map(|(_, v)| v).collect();
 
-            let mut part_stmt = conn.prepare(
-                "SELECT p.participant_key, p.person_id, p.attribution_kind, p.state, \
+    let mut part_stmt = conn.prepare(
+        "SELECT p.participant_key, p.person_id, p.attribution_kind, p.state, \
                         pe.display_name, p.source_claimed_name, s.slot_ordinal \
                  FROM episode_participants p \
                  LEFT JOIN people pe ON pe.id = p.person_id \
                  LEFT JOIN episode_speaker_slots s ON s.id = p.speaker_slot_id \
                  WHERE p.episode_id = ?1 AND p.state = 'active' \
                  ORDER BY p.id ASC",
-            )?;
-            let participant_details: Vec<Value> = part_stmt
-                .query_map([id], |r| {
-                    let participant_key: String = r.get(0)?;
-                    let person_id: Option<i64> = r.get(1)?;
-                    let attribution_kind: String = r.get(2)?;
-                    let state: String = r.get(3)?;
-                    let pe_display_name: Option<String> = r.get(4)?;
-                    let source_claimed_name: Option<String> = r.get(5)?;
-                    let slot_ordinal: Option<i32> = r.get(6)?;
+    )?;
+    let participant_details: Vec<Value> = part_stmt
+        .query_map([id], |r| {
+            let participant_key: String = r.get(0)?;
+            let person_id: Option<i64> = r.get(1)?;
+            let attribution_kind: String = r.get(2)?;
+            let state: String = r.get(3)?;
+            let pe_display_name: Option<String> = r.get(4)?;
+            let source_claimed_name: Option<String> = r.get(5)?;
+            let slot_ordinal: Option<i32> = r.get(6)?;
 
-                    let display_name = if participant_key == "owner"
-                        || attribution_kind == "owner_presentation"
-                        || attribution_kind == "owner_source_role"
-                    {
-                        "Me".to_string()
-                    } else if let Some(dn) = pe_display_name {
-                        dn
-                    } else if let Some(claimed) = source_claimed_name {
-                        claimed
-                    } else if let Some(ord) = slot_ordinal {
-                        let letter = crate::cp::identity::format_slot_ordinal(ord);
-                        format!("Unknown speaker {letter}")
-                    } else {
-                        "Unknown speaker".to_string()
-                    };
-
-                    Ok(json!({
-                        "participant_key": participant_key,
-                        "display_name": display_name,
-                        "person_id": person_id,
-                        "attribution_kind": attribution_kind,
-                        "state": state,
-                    }))
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
+            let display_name = if participant_key == "owner"
+                || attribution_kind == "owner_presentation"
+                || attribution_kind == "owner_source_role"
+            {
+                "Me".to_string()
+            } else if let Some(dn) = pe_display_name {
+                dn
+            } else if let Some(claimed) = source_claimed_name {
+                claimed
+            } else if let Some(ord) = slot_ordinal {
+                let letter = crate::cp::identity::format_slot_ordinal(ord);
+                format!("Unknown speaker {letter}")
+            } else {
+                "Unknown speaker".to_string()
+            };
 
             Ok(json!({
-                "episode_id": id,
-                "member_count": members.len(),
-                "participant_details": participant_details,
-                "members": members,
+                "participant_key": participant_key,
+                "display_name": display_name,
+                "person_id": person_id,
+                "attribution_kind": attribution_kind,
+                "state": state,
             }))
-        })
-        .await;
-    match result {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => super::routed_read_unavailable("api.episode_members", &e),
-    }
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    Ok(json!({
+        "episode_id": id,
+        "member_count": members.len(),
+        "participant_details": participant_details,
+        "members": members,
+    }))
 }
 
 async fn rest_browser_snapshot(

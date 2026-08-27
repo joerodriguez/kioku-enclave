@@ -22,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 10;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -169,6 +169,14 @@ impl PostgresPersistence {
         if version == 9 {
             sqlx::raw_sql(include_str!(
                 "../../../migrations/0010_browser_snapshot_query.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
+            version = 10;
+        }
+        if version == 10 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0011_episode_evidence_query.sql"
             ))
             .execute(&mut *transaction)
             .await?;
@@ -1151,6 +1159,66 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO screen_observations \
+             (account_id,screenshot_id,input_revision,observation_version,status,generation_method, \
+              literal_description,screen_state,content_type,visible_text_summary,notable_items,prompt_version) \
+             VALUES($1,1,'screen-1',1,'ready','model','Database diagram','focused', \
+                    'document','PostgreSQL architecture','[\"schema\"]'::jsonb,1)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_screen_interpretations \
+             (account_id,episode_id,screenshot_id,episode_revision,interpretation_version,status, \
+              activity_summary,relevance_level,relevance_reason,milestone_type,base_score,key_rank, \
+              is_key_screen,semantic_group,prompt_version) \
+             VALUES($1,1,1,'episode-1',1,'ready','Reviewing the schema',3,'central evidence', \
+                    'decision',95,1,true,'database',1)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO screenshot_images \
+             (account_id,id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type, \
+              width,height,byte_length,sha256) \
+             VALUES($1,'img_contract',1,1,'cloud-v2:capture-contract-0','2026-08-27T12:00:00Z', \
+                    'screenshots/contract.jpg','image/jpeg',1280,720,12, \
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO people(account_id,id,display_name,normalized_name,status) \
+             VALUES($1,1,'Lynn','lynn','identified')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_speaker_slots \
+             (account_id,id,episode_id,voice_profile_id,slot_ordinal) VALUES($1,1,1,1,0)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_participants \
+             (account_id,id,episode_id,participant_key,person_id,speaker_slot_id,attribution_kind) \
+             VALUES($1,1,1,'person:1',1,1,'verified_voice')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
              VALUES($1,1,'Ready','[]'::jsonb,'[\"Ship\"]'::jsonb,'[]'::jsonb,'[]'::jsonb)",
         )
@@ -1180,6 +1248,18 @@ mod tests {
         assert_eq!(episode_page.episodes[0]["member_count"], 2);
         assert_eq!(episode_page.episodes[0]["top_domains"][0], "example.com");
         assert_eq!(episode_page.episodes[0]["final_brief"]["overview"], "Ready");
+        let evidence = repositories
+            .memory_queries()
+            .episode_members(&account_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(evidence["member_count"], 2);
+        assert_eq!(evidence["participant_details"][0]["display_name"], "Lynn");
+        assert_eq!(evidence["members"][1]["cloud_image_id"], "img_contract");
+        assert_eq!(
+            evidence["members"][1]["activity_summary"],
+            "Reviewing the schema"
+        );
         let capture_status = repositories
             .memory_queries()
             .capture_status(&account_id)

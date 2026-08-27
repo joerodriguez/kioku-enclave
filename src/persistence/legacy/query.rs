@@ -250,6 +250,14 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
             })
             .await
     }
+
+    async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value> {
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::query::load_episode_members(connection, episode_id)
+            })
+            .await
+    }
 }
 
 fn legacy_feed(
