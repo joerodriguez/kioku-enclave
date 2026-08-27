@@ -2214,7 +2214,11 @@ async fn reserve_media_output(state: &CpState, user_id: &str, work: &MediaWorkUn
 }
 
 async fn load_raw_media_bytes(state: &CpState, user_id: &str, object_key: &str) -> Result<Vec<u8>> {
-    let stored = state.store.get_media(object_key).await?;
+    let stored = state
+        .repositories
+        .media_objects()
+        .get_compatible(object_key)
+        .await?;
     let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &stored.wrapped_dek_b64).await?;
     let context = crate::store::media_blob_context(user_id, object_key);
     let media = crate::crypto::decrypt_bound_blob(&dek, &stored.ciphertext, &context)?.plaintext;
@@ -2232,8 +2236,9 @@ async fn load_selected_voice_source(
         .generation()
         .ok_or_else(|| EnclaveError::Store("voice source generation is absent".into()))?;
     let stored = state
-        .store
-        .get_current_media_generation(source.object_key(), generation)
+        .repositories
+        .media_objects()
+        .get_current_generation(source.object_key(), generation)
         .await?;
     if stored.generation != generation || stored.wrapped_dek_b64 != wrapped_media_dek {
         return Err(EnclaveError::Crypto(

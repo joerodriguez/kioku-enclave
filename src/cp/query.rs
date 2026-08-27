@@ -1525,7 +1525,12 @@ async fn rest_episode_delete(
         }
     };
     for object_key in &media_keys {
-        if let Err(e) = s.store.delete_media(object_key).await {
+        if let Err(e) = s
+            .repositories
+            .media_objects()
+            .delete_compatible(object_key)
+            .await
+        {
             tracing::error!(error = %e, episode_id = id, "episode purge media deletion failed");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1752,7 +1757,12 @@ async fn rest_selected_episode_delete(s: &CpState, user_id: &str, id: i64) -> Re
                             .await
                     }
                     wal::EpisodeDeleteCleanupTarget::Legacy(object_key) => {
-                        match s.store.delete_media(object_key).await {
+                        match s
+                            .repositories
+                            .media_objects()
+                            .delete_compatible(object_key)
+                            .await
+                        {
                             Ok(()) | Err(crate::error::EnclaveError::NotFound) => Ok(()),
                             Err(error) => Err(error),
                         }
@@ -3770,14 +3780,14 @@ async fn rest_screenshot_image_upload(
 
     // 3. Upload to GCS
     let put_lease = _content_write.child();
-    let put_store = Arc::clone(&s.store);
+    let put_store = s.repositories.media_objects_arc();
     let put_user_id = user_id.clone();
     let put_object_key = object_key.clone();
     let put_wrapped_b64 = wrapped_b64.clone();
     let put = tokio::spawn(async move {
         let _put_lease = put_lease;
         put_store
-            .put_user_media(
+            .put_current(
                 &put_user_id,
                 &put_object_key,
                 &encrypted_data,
@@ -3825,13 +3835,23 @@ async fn rest_screenshot_image_upload(
     let stored = match insert_res {
         Ok(ScreenshotRecordOutcome::Created(stored)) => stored,
         Ok(ScreenshotRecordOutcome::Existing(existing)) => {
-            if let Err(e) = s.store.delete_media(&object_key).await {
+            if let Err(e) = s
+                .repositories
+                .media_objects()
+                .delete_compatible(&object_key)
+                .await
+            {
                 tracing::error!(error = %e, "failed to clean up redundant selected evidence media");
             }
             return (StatusCode::OK, Json(existing.response_json())).into_response();
         }
         Err(e) => {
-            if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
+            if let Err(cleanup_error) = s
+                .repositories
+                .media_objects()
+                .delete_compatible(&object_key)
+                .await
+            {
                 tracing::error!(error = %cleanup_error, "failed to clean up rejected selected evidence media");
             }
             tracing::warn!(error = %e, "media upload database insert failed");
@@ -3863,7 +3883,12 @@ async fn rest_screenshot_image_upload(
                 tracing::error!(error = %rollback_error, "failed to roll back screenshot image row");
             }
         }
-        if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
+        if let Err(cleanup_error) = s
+            .repositories
+            .media_objects()
+            .delete_compatible(&object_key)
+            .await
+        {
             tracing::error!(error = %cleanup_error, "failed to clean up selected evidence media after database save failure");
         }
         return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
@@ -3920,8 +3945,9 @@ async fn rest_screenshot_image_content(
     let gcs_resp = match &locator {
         ScreenshotImageLocator::CaptureV2(identity) => {
             match s
-                .store
-                .get_current_media_generation(&identity.object_key, identity.generation)
+                .repositories
+                .media_objects()
+                .get_current_generation(&identity.object_key, identity.generation)
                 .await
             {
                 Ok(response) => response,
@@ -3958,7 +3984,12 @@ async fn rest_screenshot_image_content(
             }
         }
         ScreenshotImageLocator::Legacy { object_key } => {
-            match s.store.get_media(object_key).await {
+            match s
+                .repositories
+                .media_objects()
+                .get_compatible(object_key)
+                .await
+            {
                 Ok(response) => response,
                 Err(crate::error::EnclaveError::NotFound) => {
                     return StatusCode::NOT_FOUND.into_response()
@@ -7584,7 +7615,7 @@ mod tests {
         let upload_selection = upload.find(concat!("is_wal_", "authoritative(")).unwrap();
         let multipart_read = upload.find("multipart.next_field()").unwrap();
         let content_lease = upload.find(concat!("acquire_content_", "write(")).unwrap();
-        let provider_put = upload.find(concat!("put_user_", "media(")).unwrap();
+        let provider_put = upload.find(concat!("put_", "current(")).unwrap();
         assert!(upload_selection < multipart_read);
         assert!(upload_selection < content_lease);
         assert!(upload_selection < provider_put);
@@ -7596,7 +7627,7 @@ mod tests {
         // shape after the early Genesis tombstone.
         assert_eq!(upload.matches(concat!(".with_", "user(")).count(), 5);
         assert_eq!(upload.matches(concat!(".save_", "user(")).count(), 2);
-        assert_eq!(upload.matches(concat!("put_user_", "media(")).count(), 1);
+        assert_eq!(upload.matches(concat!("put_", "current(")).count(), 1);
     }
 
     #[tokio::test]
