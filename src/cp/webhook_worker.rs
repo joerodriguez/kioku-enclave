@@ -631,11 +631,152 @@ async fn next_delivery(state: &CpState, user_id: &str) -> Result<Option<OutboxRo
 
 /// Deliver a bounded number of due events for one user.
 pub async fn deliver_user_webhooks(state: &CpState, user_id: &str) -> Result<()> {
+    if state.repositories.deliveries().is_some() {
+        return deliver_postgres_user_webhooks(state, &ProductionWebhookTransport, user_id).await;
+    }
     if state.store.is_wal_authoritative(user_id) {
         deliver_selected_user_webhooks(state, &ProductionWebhookTransport, user_id).await
     } else {
         deliver_legacy_user_webhooks(state, &ProductionWebhookTransport, user_id).await
     }
+}
+
+async fn deliver_postgres_user_webhooks(
+    state: &CpState,
+    transport: &dyn WebhookTransport,
+    user_id: &str,
+) -> Result<()> {
+    let repository = state
+        .repositories
+        .deliveries()
+        .ok_or_else(|| EnclaveError::Store("PostgreSQL delivery repository is missing".into()))?;
+    for _ in 0..MAX_PROVIDER_CALLS_PER_ACCOUNT {
+        let Some(candidate) = repository.next_webhook_candidate(user_id).await? else {
+            break;
+        };
+        let details = &candidate.episode;
+        let mut data = json!({
+            "episode_id": candidate.episode_id,
+            "finalized_at": details.finalized_at,
+            "kioku_url": format!("{}/app#memory/{}", state.config.web_origin, candidate.episode_id),
+            "content_included": candidate.include_content,
+        });
+        if candidate.include_content {
+            data["title"] = json!(details.title);
+            data["started_at"] = json!(details.started_at);
+            data["ended_at"] = json!(details.ended_at);
+            data["episode_type"] = json!(details.episode_type);
+            data["participants"] = json!(details.participants);
+            data["final_brief"] = json!({
+                "overview": details.overview,
+                "decisions": details.decisions,
+                "action_items": details.action_items,
+                "important_links": details.important_links,
+                "open_questions": details.open_questions,
+            });
+        }
+        let event = cloud_event(
+            &candidate.event_id,
+            "com.kiokuu.episode.finalized.v1",
+            &format!("episode/{}", candidate.episode_id),
+            &details.finalized_at,
+            data,
+        );
+        let frozen = crate::persistence::FrozenWebhookDelivery {
+            endpoint_url: candidate.endpoint_url.clone(),
+            signing_secret: candidate.signing_secret.clone(),
+            include_content: candidate.include_content,
+            event_body: serde_json::to_string(&event)?,
+        };
+        let mut claim = repository
+            .claim_webhook(&candidate, frozen.clone(), 60)
+            .await?;
+        if claim.is_none() {
+            tokio::time::sleep(Duration::from_millis(SEND_PACE_MILLIS.saturating_add(25))).await;
+            claim = repository.claim_webhook(&candidate, frozen, 60).await?;
+        }
+        let Some(claim) = claim else {
+            break;
+        };
+        let result = transport
+            .send(WebhookRequest {
+                endpoint_url: claim.request.endpoint_url.clone(),
+                signing_secret: claim.request.signing_secret.clone(),
+                event_id: claim.event_id.clone(),
+                body: claim.request.event_body.as_bytes().to_vec(),
+            })
+            .await;
+        let outcome_at = isotime::format_epoch_millis(epoch_millis());
+        let (outcome, circuit_seconds) = match result {
+            Ok(response) if (200..300).contains(&response.status) => (
+                WebhookProviderOutcome::Sent {
+                    status: i64::from(response.status),
+                },
+                None,
+            ),
+            Ok(response) if retryable_status(response.status) => {
+                if claim.attempt_count >= MAX_ATTEMPTS {
+                    (
+                        WebhookProviderOutcome::Failed {
+                            status: Some(i64::from(response.status)),
+                            code: "attempt_cap".into(),
+                        },
+                        None,
+                    )
+                } else {
+                    let delay = response
+                        .retry_after_seconds
+                        .and_then(|seconds| i64::try_from(seconds).ok())
+                        .unwrap_or_else(|| retry_delay(claim.attempt_count));
+                    (
+                        WebhookProviderOutcome::Retry {
+                            status: Some(i64::from(response.status)),
+                            code: format!("http_{}", response.status),
+                            retry_at: add_seconds(&outcome_at, delay)?,
+                        },
+                        (response.status == 429 || response.status >= 500)
+                            .then_some(delay.clamp(1, 6 * 60 * 60)),
+                    )
+                }
+            }
+            Ok(response) => (
+                WebhookProviderOutcome::Failed {
+                    status: Some(i64::from(response.status)),
+                    code: format!("http_{}", response.status),
+                },
+                None,
+            ),
+            Err(SendFailure::InvalidEndpoint) => (
+                WebhookProviderOutcome::Failed {
+                    status: None,
+                    code: "invalid_endpoint".into(),
+                },
+                None,
+            ),
+            Err(SendFailure::Preflight) if claim.attempt_count < MAX_ATTEMPTS => (
+                WebhookProviderOutcome::Retry {
+                    status: None,
+                    code: "destination_preflight_unavailable".into(),
+                    retry_at: add_seconds(&outcome_at, 60)?,
+                },
+                None,
+            ),
+            Err(SendFailure::Preflight) => (
+                WebhookProviderOutcome::Failed {
+                    status: None,
+                    code: "attempt_cap".into(),
+                },
+                None,
+            ),
+            Err(SendFailure::Ambiguous) => (WebhookProviderOutcome::Ambiguous, None),
+        };
+        let metric = webhook_provider_metric(&outcome);
+        repository
+            .settle_webhook(&claim, outcome, circuit_seconds)
+            .await?;
+        emit_webhook_metric(metric);
+    }
+    Ok(())
 }
 
 /// Cancel and physically purge every delivery for one already-disabled

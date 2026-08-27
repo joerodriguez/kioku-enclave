@@ -319,12 +319,12 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, McpContextRequest,
-        McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
-        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
-        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        ScreenMediaSettlement, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
-        WebhookSendFenceDisposition, WebhookSubscription,
+        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
+        FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest,
+        MediaProcessingClass, MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest,
+        PeopleListRequest, PushInstallation, PushProviderOutcome, PushProviderReceipt,
+        PushSendFenceDisposition, ScreenMediaSettlement, SummaryWindowSettlement,
+        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::search::{SearchHit, SearchRequest};
@@ -903,7 +903,10 @@ mod tests {
                 is_key_screen: true,
                 semantic_group: "contract-group".into(),
             }],
-            webhook_destinations: vec![("contract-webhook".into(), "contract-event".into())],
+            webhook_destinations: vec![(
+                "22222222-2222-4222-8222-222222222222".into(),
+                "contract-event".into(),
+            )],
             email_preference_include_content: Some(true),
             push_destinations: vec![(
                 "p1:contract-installation:1".into(),
@@ -1223,6 +1226,59 @@ mod tests {
             )
             .bind(&account_id)
             .bind(&email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "delivered"
+        );
+        sqlx::query("UPDATE webhook_subscriptions SET enabled=true WHERE account_id=$1 AND id=$2")
+            .bind(&account_id)
+            .bind(&webhook.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let webhook_candidate = repositories
+            .deliveries()
+            .unwrap()
+            .next_webhook_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("finalization webhook candidate");
+        let webhook_claim = repositories
+            .deliveries()
+            .unwrap()
+            .claim_webhook(
+                &webhook_candidate,
+                FrozenWebhookDelivery {
+                    endpoint_url: webhook_candidate.endpoint_url.clone(),
+                    signing_secret: webhook_candidate.signing_secret.clone(),
+                    include_content: webhook_candidate.include_content,
+                    event_body: "{\"contract\":true}".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("webhook claim");
+        let sent_webhook = WebhookProviderOutcome::Sent { status: 204 };
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_webhook(&webhook_claim, sent_webhook.clone(), None)
+            .await
+            .unwrap();
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_webhook(&webhook_claim, sent_webhook, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM webhook_deliveries WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&webhook_claim.event_id)
             .fetch_one(&pool)
             .await
             .unwrap(),

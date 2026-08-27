@@ -38,6 +38,7 @@ pub(crate) use capture::{
 };
 pub(crate) use delivery_outbox::{
     DeliveryRepository, EmailDeliveryCandidate, EmailDeliveryClaim, FrozenEmailDelivery,
+    FrozenWebhookDelivery, WebhookDeliveryCandidate, WebhookDeliveryClaim,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use finalization::{
