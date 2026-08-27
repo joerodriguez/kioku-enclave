@@ -3061,7 +3061,7 @@ async fn recording_media_authority_decision(
             decision_at.to_owned(),
         ));
     }
-    if !state.store.durable_recording_storage_bound()
+    if !state.durable_recording_storage_bound
         || !super::retention::recording_authority_schema_present(state, user_id).await?
     {
         return Err(EnclaveError::Store(
@@ -7289,6 +7289,7 @@ mod tests {
         ));
         Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),

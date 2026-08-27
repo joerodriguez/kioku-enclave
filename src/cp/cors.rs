@@ -104,6 +104,7 @@ mod tests {
 
         let cp_state = Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),

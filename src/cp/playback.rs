@@ -658,8 +658,7 @@ async fn memory_playback_segment(
 }
 
 fn playback_capability_available(state: &CpState) -> bool {
-    state.store.durable_recording_storage_bound()
-        && crate::schema_ladder::durable_recording_schema_active()
+    state.durable_recording_storage_bound && crate::schema_ladder::durable_recording_schema_active()
 }
 
 async fn person_memories(

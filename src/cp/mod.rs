@@ -441,6 +441,7 @@ pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
 #[allow(dead_code)]
 pub struct CpState {
     pub(crate) kms: Arc<dyn crate::crypto::KmsClient>,
+    pub(crate) durable_recording_storage_bound: bool,
     pub store: Arc<Store>,
     pub control: Arc<control_store::ControlStore>,
     pub(crate) repositories: crate::persistence::RepositorySet,
@@ -606,6 +607,7 @@ pub(crate) mod wal_gate_test_support {
             crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
         Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store,
             control,
             repositories,

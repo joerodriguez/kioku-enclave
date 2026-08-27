@@ -731,7 +731,7 @@ async fn attach_recording_retention_authority(
             .ok_or(RecordingAuthorizationFailure::Unavailable)?;
         let expires_ms = super::isotime::parse_epoch_millis(expires_at)
             .ok_or(RecordingAuthorizationFailure::Unavailable)?;
-        if !state.store.durable_recording_storage_bound() || !schema_present {
+        if !state.durable_recording_storage_bound || !schema_present {
             authority["status"] = Value::String("temporarily_unavailable".into());
         } else {
             let claims = super::tokens::RecordingRetentionLeaseClaims {
@@ -2267,6 +2267,7 @@ mod tests {
         let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
         Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),
