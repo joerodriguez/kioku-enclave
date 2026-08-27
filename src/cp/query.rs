@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::search::{search_all, SearchRequest};
+use crate::search::SearchRequest;
 
 use super::auth::AuthUser;
 use super::CpState;
@@ -108,17 +108,15 @@ async fn query_transcripts_value(
     // authority is unavailable). Propagating the error is what lets each
     // caller answer loudly in its own idiom.
     //
-    // ADR-0022: the routed read serves both branches — a WAL-authoritative
-    // user reads through their serving authority's settled-only lane, and an
-    // unselected user falls through to the ordinary guarded legacy read.
-    let (episodes, utterances) = s
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            Ok((
-                crate::search::search_episodes(conn, &ep_req)?,
-                search_all(conn, &utt_req)?,
-            ))
-        })
+    let episodes = s
+        .repositories
+        .memory_queries()
+        .search(user_id, &ep_req)
+        .await?;
+    let utterances = s
+        .repositories
+        .memory_queries()
+        .search(user_id, &utt_req)
         .await?;
     Ok(json!({
         "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
@@ -286,11 +284,7 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
     // See the note in the combined search above: an unreadable archive must
     // not be answered with an authoritative-looking empty result set. The
     // routed read serves the WAL-authoritative and legacy branches alike.
-    let hits = match s
-        .store
-        .wal_authoritative_read(user_id, move |conn| search_all(conn, &req))
-        .await
-    {
+    let hits = match s.repositories.memory_queries().search(user_id, &req).await {
         Ok(hits) => hits,
         Err(_) => return json!({ "error": "screenshot search is unavailable" }),
     };
@@ -4993,9 +4987,9 @@ mod tests {
         ));
         let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs));
         Arc::new(CpState {
-            store,
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
@@ -7341,7 +7335,7 @@ mod tests {
         let s = Arc::new(CpState {
             store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
@@ -7426,7 +7420,7 @@ mod tests {
         let s = Arc::new(CpState {
             store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
@@ -7486,9 +7480,9 @@ mod tests {
             .unwrap();
 
         let s = Arc::new(CpState {
-            store,
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: query_test_state().config.clone(),

@@ -2264,10 +2264,11 @@ mod tests {
             kms.clone(),
             gcs.clone(),
         ));
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
         Arc::new(CpState {
-            store: Arc::new(Store::new(kms.clone(), gcs.clone())),
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(ProbeGateway { admin_calls }),
             recording_lease_gate: Arc::new(RecordingLeaseGates::default()),
             config: Arc::new(super::super::CpConfig {

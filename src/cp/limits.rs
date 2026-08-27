@@ -145,10 +145,10 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_output_reservations_are_persistent_and_atomic() {
-        let control = Arc::new(ControlStore::new(
-            Arc::new(FakeKms),
-            Arc::new(FakeGcs::new()),
-        ));
+        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(FakeKms);
+        let gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::clone(&kms), Arc::clone(&gcs)));
+        let store = Arc::new(crate::store::Store::new(kms, gcs));
         let user = control
             .upsert_user(
                 "vertex-budget-user",
@@ -158,7 +158,7 @@ mod tests {
             .await
             .unwrap();
 
-        let repositories = RepositorySet::legacy(Arc::clone(&control));
+        let repositories = RepositorySet::legacy(Arc::clone(&control), store);
         let first = reserve_vertex_output_tokens(&repositories, &user.id, 8_192, 8_192)
             .await
             .unwrap();
@@ -190,10 +190,10 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_work_classes_have_persistent_protected_budgets() {
-        let control = Arc::new(ControlStore::new(
-            Arc::new(FakeKms),
-            Arc::new(FakeGcs::new()),
-        ));
+        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(FakeKms);
+        let gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::clone(&kms), Arc::clone(&gcs)));
+        let store = Arc::new(crate::store::Store::new(kms, gcs));
         let user = control
             .upsert_user(
                 "class-budget-user",
@@ -203,7 +203,7 @@ mod tests {
             .await
             .unwrap();
         let daily_limit = 16_384;
-        let repositories = RepositorySet::legacy(Arc::clone(&control));
+        let repositories = RepositorySet::legacy(Arc::clone(&control), store);
 
         assert!(
             reserve_vertex_output_tokens_for_class(
@@ -276,10 +276,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_billable_media_retry_consumes_a_distinct_output_ceiling() {
-        let control = Arc::new(ControlStore::new(
-            Arc::new(FakeKms),
-            Arc::new(FakeGcs::new()),
-        ));
+        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(FakeKms);
+        let gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::clone(&kms), Arc::clone(&gcs)));
+        let store = Arc::new(crate::store::Store::new(kms, gcs));
         let user = control
             .upsert_user(
                 "media-retry-budget-user",
@@ -288,7 +288,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let repositories = RepositorySet::legacy(Arc::clone(&control));
+        let repositories = RepositorySet::legacy(Arc::clone(&control), store);
 
         // Audio owns half of the 600-token daily ceiling. Three ambiguous or
         // invalid-output attempts may each have been billed and therefore

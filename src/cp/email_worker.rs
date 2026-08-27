@@ -1664,7 +1664,7 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
-            repositories: crate::persistence::RepositorySet::legacy(control.clone()),
+            repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),
@@ -1747,7 +1747,7 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
-            repositories: crate::persistence::RepositorySet::legacy(control.clone()),
+            repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),
@@ -1818,7 +1818,7 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
-            repositories: crate::persistence::RepositorySet::legacy(control.clone()),
+            repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),

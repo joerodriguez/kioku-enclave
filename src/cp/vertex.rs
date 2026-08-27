@@ -687,7 +687,8 @@ mod tests {
         let terminal_usage_persisted = Arc::new(AtomicBool::new(false));
         let egresses = Arc::new(AtomicUsize::new(0));
         let call_store = Arc::clone(&store);
-        let call_repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
+        let call_repositories =
+            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
         let call_user = user.id.clone();
         let call_started = Arc::clone(&started);
         let call_release = Arc::clone(&release);
@@ -717,7 +718,8 @@ mod tests {
         assert!(!deletion.is_finished());
 
         let queued_store = Arc::clone(&store);
-        let queued_repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
+        let queued_repositories =
+            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
         let queued_user = user.id.clone();
         let queued_egresses = Arc::clone(&egresses);
         let queued = tokio::spawn(async move {
@@ -755,9 +757,9 @@ mod tests {
             .await
             .unwrap();
         let state = CpState {
-            store,
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(super::super::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(super::super::billing::RecordingLeaseGates::default()),
             config: Arc::new(super::super::CpConfig {

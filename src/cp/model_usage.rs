@@ -1590,10 +1590,11 @@ mod tests {
             kms.clone(),
             gcs.clone(),
         ));
+        let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
         Arc::new(CpState {
-            store: Arc::new(crate::store::Store::new(kms.clone(), gcs.clone())),
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(SettlementGateway { batch_sizes }),
             recording_lease_gate: Arc::new(RecordingLeaseGates::default()),
             config: Arc::new(super::super::CpConfig {

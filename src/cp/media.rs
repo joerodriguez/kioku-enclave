@@ -7875,15 +7875,16 @@ mod tests {
             kms.clone(),
             index_gcs.clone(),
         ));
+        let store = Arc::new(crate::store::Store::new_with_media_and_legacy(
+            kms.clone(),
+            index_gcs.clone(),
+            current_media_gcs,
+            legacy_media_gcs,
+        ));
         Arc::new(CpState {
-            store: Arc::new(crate::store::Store::new_with_media_and_legacy(
-                kms.clone(),
-                index_gcs.clone(),
-                current_media_gcs,
-                legacy_media_gcs,
-            )),
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
