@@ -14,8 +14,10 @@ plaintext trust boundary. Large audio and image objects remain per-user encrypte
 > **ADR-0040 storage change (2026-08-27):** Production builds select PostgreSQL and
 > fail closed rather than falling back to SQLite/GCS. The extensive SQLite, WAL,
 > witness, and archive-v3 material retained in this repository documents the reference
-> implementation and historical safety work; it is not constructed in PostgreSQL
-> serving mode.
+> implementation and historical safety work. PostgreSQL serving mode constructs only
+> fail-closed `Store`/`ControlStore` compatibility shells backed by a provider that
+> rejects every legacy object operation; it does not start legacy archive/WAL authority
+> or use SQLite/GCS as serving state.
 
 See [`SECURITY.md`](SECURITY.md) for the threat model and [`RELEASING.md`](RELEASING.md)
 for the signed source-tag, provenance, SBOM, image-digest, and deployment procedure.

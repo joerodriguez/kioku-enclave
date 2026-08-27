@@ -36,8 +36,10 @@ replacement is generation-CASed, and a lost response is adopted only after exact
 ciphertext readback. This changes write distribution, not authority or durability:
 every WAL transition remains remotely durable at the same boundary, and account deletion
 rewrites every live slot with the sanitized snapshot before purging older generations.
-It remains a reference/backend contract implementation and is not constructed in
-PostgreSQL production serving mode.
+It remains a reference/backend contract implementation. PostgreSQL production serving
+mode constructs only fail-closed `Store`/`ControlStore` compatibility shells backed by
+a provider that rejects every legacy object operation; it does not start legacy
+archive/WAL authority or use SQLite/GCS as serving state.
 
 ### Out of scope or accepted external trust
 
