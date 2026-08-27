@@ -96,6 +96,102 @@ pub(crate) struct McpTimeRangeRequest {
     pub(crate) limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeopleListRequest {
+    pub(crate) after_id: i64,
+    pub(crate) limit: usize,
+    pub(crate) query: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PeopleListPage {
+    pub(crate) people: Vec<PersonSummary>,
+    pub(crate) next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonSummary {
+    pub(crate) id: i64,
+    pub(crate) display_name: String,
+    pub(crate) voice_profile_count: i64,
+    pub(crate) fact_count: i64,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonProfile {
+    pub(crate) person: PersonSummary,
+    pub(crate) voice_labels: Vec<String>,
+    pub(crate) voice_coverage: String,
+    pub(crate) aliases: Vec<PersonNameView>,
+    pub(crate) facts: Vec<PersonFactView>,
+    pub(crate) evidence: Vec<PersonEvidenceView>,
+    pub(crate) recent_statements: Vec<PersonStatementView>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonFactView {
+    pub(crate) id: i64,
+    pub(crate) predicate: String,
+    pub(crate) value: String,
+    pub(crate) status: String,
+    pub(crate) evidence: Value,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) speaker_observation_id: Option<i64>,
+    pub(crate) observed_at: Option<String>,
+    pub(crate) literal_evidence: Option<String>,
+    pub(crate) confidence: f64,
+    pub(crate) supersedes_id: Option<i64>,
+    pub(crate) created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonNameView {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) evidence_kind: String,
+    pub(crate) confidence: f64,
+    pub(crate) observed_at: String,
+    pub(crate) source_event_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonEvidenceView {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) claimed_name: Option<String>,
+    pub(crate) score: Option<f64>,
+    pub(crate) status: String,
+    pub(crate) observed_at: Option<String>,
+    pub(crate) source_event_id: Option<String>,
+    pub(crate) speaker_observation_id: Option<i64>,
+    pub(crate) evidence: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonStatementView {
+    pub(crate) speaker_observation_id: i64,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: String,
+    pub(crate) text: String,
+    pub(crate) source_event_id: String,
+    pub(crate) episode_id: Option<i64>,
+    pub(crate) episode_title: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonEvidencePage {
+    pub(crate) evidence: Vec<PersonEvidenceView>,
+    pub(crate) next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonStatementPage {
+    pub(crate) statements: Vec<PersonStatementView>,
+    pub(crate) next_cursor: Option<i64>,
+}
+
 /// Backend-neutral structured-memory query boundary.
 ///
 /// Query embedding and response fusion remain application behavior; candidate
@@ -124,4 +220,24 @@ pub(crate) trait MemoryQueryRepository: Send + Sync {
     ) -> Result<Value>;
     async fn browser_snapshot(&self, account_id: &str, source_key: &str) -> Result<Option<Value>>;
     async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value>;
+    async fn list_people(
+        &self,
+        account_id: &str,
+        request: &PeopleListRequest,
+    ) -> Result<PeopleListPage>;
+    async fn person_profile(&self, account_id: &str, person_id: i64) -> Result<PersonProfile>;
+    async fn person_evidence(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonEvidencePage>;
+    async fn person_statements(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonStatementPage>;
 }

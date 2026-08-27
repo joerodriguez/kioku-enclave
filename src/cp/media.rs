@@ -22,7 +22,8 @@ use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
 use crate::persistence::{
     CaptureCommit, CaptureEventStatus, CapturePreflight, CaptureSessionEvidence,
     CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage, CaptureSessionStatus,
-    ReferenceBatchCommit,
+    PeopleListRequest, PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile,
+    PersonStatementView, PersonSummary, ReferenceBatchCommit,
 };
 
 use super::isotime::parse_epoch_millis;
@@ -1237,89 +1238,6 @@ struct CaptureSessionListQuery {
     max_sessions: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
-struct PersonSummary {
-    id: i64,
-    display_name: String,
-    voice_profile_count: i64,
-    fact_count: i64,
-    updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonProfile {
-    person: PersonSummary,
-    voice_labels: Vec<String>,
-    voice_coverage: String,
-    aliases: Vec<PersonNameView>,
-    facts: Vec<PersonFactView>,
-    evidence: Vec<PersonEvidenceView>,
-    recent_statements: Vec<PersonStatementView>,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonFactView {
-    id: i64,
-    predicate: String,
-    value: String,
-    status: String,
-    evidence: Value,
-    source_event_id: Option<String>,
-    speaker_observation_id: Option<i64>,
-    observed_at: Option<String>,
-    literal_evidence: Option<String>,
-    confidence: f64,
-    supersedes_id: Option<i64>,
-    created_at: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonNameView {
-    id: i64,
-    name: String,
-    status: String,
-    evidence_kind: String,
-    confidence: f64,
-    observed_at: String,
-    source_event_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonEvidenceView {
-    id: i64,
-    kind: String,
-    claimed_name: Option<String>,
-    score: Option<f64>,
-    status: String,
-    observed_at: Option<String>,
-    source_event_id: Option<String>,
-    speaker_observation_id: Option<i64>,
-    evidence: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonStatementView {
-    speaker_observation_id: i64,
-    started_at: String,
-    ended_at: String,
-    text: String,
-    source_event_id: String,
-    episode_id: Option<i64>,
-    episode_title: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonEvidencePage {
-    evidence: Vec<PersonEvidenceView>,
-    next_cursor: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct PersonStatementPage {
-    statements: Vec<PersonStatementView>,
-    next_cursor: Option<i64>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeopleListQuery {
@@ -2464,45 +2382,23 @@ async fn list_people(
         .as_deref()
         .map(str::trim)
         .filter(|query| !query.is_empty())
-        .map(|query| format!("%{}%", query.to_lowercase()));
+        .map(str::to_owned);
     // Per-domain routing, live for every unselected user today; the gate above
     // is the one line that lifts when the people writers migrate.
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
-                 FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
-                   AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
-                     WHERE r.profile_id=v.id AND r.active=1 \
-                       AND r.status IN ('quarantined','superseded','split')) \
-                 LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
-                 WHERE p.status='identified' AND p.display_name IS NOT NULL AND p.id>?1 \
-                 AND (?2 IS NULL OR lower(p.display_name) LIKE ?2 OR EXISTS (\
-                   SELECT 1 FROM person_name_claims n WHERE n.person_id=p.id \
-                   AND n.status IN ('accepted','probationary') AND lower(n.name) LIKE ?2)) \
-                 GROUP BY p.id ORDER BY p.id LIMIT ?3",
-            )?;
-            let mut people = statement
-                .query_map(params![after_id, search, limit as i64 + 1], |row| {
-                    Ok(PersonSummary {
-                        id: row.get(0)?,
-                        display_name: row.get(1)?,
-                        voice_profile_count: row.get(2)?,
-                        fact_count: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let next_cursor = (people.len() > limit).then(|| people[limit - 1].id);
-            people.truncate(limit);
-            Ok((people, next_cursor))
-        })
+        .repositories
+        .memory_queries()
+        .list_people(
+            &user.0,
+            &PeopleListRequest {
+                after_id,
+                limit,
+                query: search,
+            },
+        )
         .await
     {
-        Ok((people, next_cursor)) => {
-            Json(json!({"people": people, "next_cursor": next_cursor})).into_response()
-        }
+        Ok(page) => Json(page).into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -2516,8 +2412,9 @@ async fn person_profile(
         return bad_request("person_id must be positive");
     }
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| load_person_profile(conn, person_id))
+        .repositories
+        .memory_queries()
+        .person_profile(&user.0, person_id)
         .await
     {
         Ok(profile) => Json(profile).into_response(),
@@ -2537,15 +2434,9 @@ async fn person_evidence(
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let before_id = query.before_id;
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            ensure_identified_person(conn, person_id)?;
-            let (evidence, next_cursor) = load_person_evidence(conn, person_id, before_id, limit)?;
-            Ok(PersonEvidencePage {
-                evidence,
-                next_cursor,
-            })
-        })
+        .repositories
+        .memory_queries()
+        .person_evidence(&user.0, person_id, before_id, limit)
         .await
     {
         Ok(page) => Json(page).into_response(),
@@ -2565,16 +2456,9 @@ async fn person_statements(
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let before_id = query.before_id;
     match state
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            ensure_identified_person(conn, person_id)?;
-            let (statements, next_cursor) =
-                load_person_statements(conn, person_id, before_id, limit)?;
-            Ok(PersonStatementPage {
-                statements,
-                next_cursor,
-            })
-        })
+        .repositories
+        .memory_queries()
+        .person_statements(&user.0, person_id, before_id, limit)
         .await
     {
         Ok(page) => Json(page).into_response(),
@@ -2582,7 +2466,7 @@ async fn person_statements(
     }
 }
 
-fn ensure_identified_person(conn: &Connection, person_id: i64) -> Result<()> {
+pub(crate) fn ensure_identified_person(conn: &Connection, person_id: i64) -> Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM people WHERE id=?1 AND status='identified')",
         [person_id],
@@ -2595,7 +2479,7 @@ fn ensure_identified_person(conn: &Connection, person_id: i64) -> Result<()> {
     }
 }
 
-fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfile> {
+pub(crate) fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfile> {
     let person = conn
         .query_row(
             "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
@@ -2708,7 +2592,7 @@ fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfil
     })
 }
 
-fn load_person_evidence(
+pub(crate) fn load_person_evidence(
     conn: &Connection,
     person_id: i64,
     before_id: Option<i64>,
@@ -2740,7 +2624,7 @@ fn load_person_evidence(
     Ok((evidence, next_cursor))
 }
 
-fn load_person_statements(
+pub(crate) fn load_person_statements(
     conn: &Connection,
     person_id: i64,
     before_id: Option<i64>,

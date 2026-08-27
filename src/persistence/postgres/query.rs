@@ -10,7 +10,9 @@ use crate::{
     persistence::{
         CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
         McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
-        MemoryQueryRepository,
+        MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
+        PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
+        PersonStatementView, PersonSummary,
     },
     search::{extract_speaker_filter, rrf_merge, SearchHit, SearchRequest},
 };
@@ -529,6 +531,128 @@ fn top_three(counts: Option<&HashMap<String, i64>>) -> Vec<String> {
         .take(3)
         .map(|(value, _)| value.clone())
         .collect()
+}
+
+async fn require_identified_person(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    person_id: i64,
+) -> Result<()> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM people \
+          WHERE account_id=$1 AND id=$2 AND status='identified')",
+    )
+    .bind(account_id)
+    .bind(person_id)
+    .fetch_one(persistence.pool())
+    .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(EnclaveError::NotFound)
+    }
+}
+
+async fn postgres_person_evidence(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    person_id: i64,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<PersonEvidencePage> {
+    let row_limit = i64::try_from(limit.saturating_add(1))
+        .map_err(|_| EnclaveError::InvalidRequest("people page limit is too large".into()))?;
+    let rows = sqlx::query(
+        "SELECT id,kind,claimed_name,score,status, \
+                floor(extract(epoch FROM observed_at)*1000)::bigint AS observed_at_ms, \
+                source_event_id,speaker_observation_id,evidence::text AS evidence_json \
+           FROM identity_evidence WHERE account_id=$1 AND person_id=$2 \
+            AND ($3::bigint IS NULL OR id<$3) ORDER BY id DESC LIMIT $4",
+    )
+    .bind(account_id)
+    .bind(person_id)
+    .bind(before_id)
+    .bind(row_limit)
+    .fetch_all(persistence.pool())
+    .await?;
+    let mut evidence = rows
+        .iter()
+        .map(|row| {
+            let raw: String = row.try_get("evidence_json")?;
+            Ok(PersonEvidenceView {
+                id: row.try_get("id")?,
+                kind: row.try_get("kind")?,
+                claimed_name: row.try_get("claimed_name")?,
+                score: row.try_get("score")?,
+                status: row.try_get("status")?,
+                observed_at: row
+                    .try_get::<Option<i64>, _>("observed_at_ms")?
+                    .map(isotime::format_epoch_millis),
+                source_event_id: row.try_get("source_event_id")?,
+                speaker_observation_id: row.try_get("speaker_observation_id")?,
+                evidence: serde_json::from_str(&raw).unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let next_cursor = (evidence.len() > limit).then(|| evidence[limit - 1].id);
+    evidence.truncate(limit);
+    Ok(PersonEvidencePage {
+        evidence,
+        next_cursor,
+    })
+}
+
+async fn postgres_person_statements(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    person_id: i64,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<PersonStatementPage> {
+    let row_limit = i64::try_from(limit.saturating_add(1))
+        .map_err(|_| EnclaveError::InvalidRequest("people page limit is too large".into()))?;
+    let rows = sqlx::query(
+        "SELECT s.id,s.transcript_text,s.event_id, \
+                floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms, \
+                floor(extract(epoch FROM s.ended_at)*1000)::bigint AS ended_at_ms, \
+                linked.id AS episode_id,linked.title AS episode_title \
+           FROM speaker_observations s LEFT JOIN LATERAL ( \
+                SELECT e.id,e.title FROM utterances u JOIN episode_members m \
+                  ON m.account_id=u.account_id AND m.record_type='utterance' AND m.record_id=u.id \
+                 JOIN episodes e ON e.account_id=m.account_id AND e.id=m.episode_id \
+                 WHERE u.account_id=s.account_id \
+                   AND u.source_key='cloud-v2:'||s.event_id||':'||s.turn_id \
+                 ORDER BY e.id DESC LIMIT 1) linked ON true \
+          WHERE s.account_id=$1 AND s.person_id=$2 \
+            AND ($3::bigint IS NULL OR s.id<$3) ORDER BY s.id DESC LIMIT $4",
+    )
+    .bind(account_id)
+    .bind(person_id)
+    .bind(before_id)
+    .bind(row_limit)
+    .fetch_all(persistence.pool())
+    .await?;
+    let mut statements = rows
+        .iter()
+        .map(|row| {
+            Ok(PersonStatementView {
+                speaker_observation_id: row.try_get("id")?,
+                started_at: required_timestamp(row, "started_at_ms")?,
+                ended_at: required_timestamp(row, "ended_at_ms")?,
+                text: row.try_get("transcript_text")?,
+                source_event_id: row.try_get("event_id")?,
+                episode_id: row.try_get("episode_id")?,
+                episode_title: row.try_get("episode_title")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let next_cursor =
+        (statements.len() > limit).then(|| statements[limit - 1].speaker_observation_id);
+    statements.truncate(limit);
+    Ok(PersonStatementPage {
+        statements,
+        next_cursor,
+    })
 }
 
 #[async_trait]
@@ -1493,5 +1617,253 @@ impl MemoryQueryRepository for PostgresPersistence {
             "participant_details": participant_details,
             "members": members,
         }))
+    }
+
+    async fn list_people(
+        &self,
+        account_id: &str,
+        request: &PeopleListRequest,
+    ) -> Result<PeopleListPage> {
+        if request.limit == 0 || request.limit > 100 || request.after_id < 0 {
+            return Err(EnclaveError::InvalidRequest(
+                "people page bounds are invalid".into(),
+            ));
+        }
+        let row_limit = i64::try_from(request.limit + 1)
+            .map_err(|_| EnclaveError::InvalidRequest("people page limit is too large".into()))?;
+        let query = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let rows = sqlx::query(
+            "SELECT p.id,p.display_name, \
+                    count(DISTINCT v.id)::bigint AS voice_profile_count, \
+                    count(DISTINCT f.id)::bigint AS fact_count, \
+                    floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
+               FROM people p LEFT JOIN voice_profiles v \
+                 ON v.account_id=p.account_id AND v.person_id=p.id \
+                AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                     WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
+                       AND r.status IN ('quarantined','superseded','split')) \
+               LEFT JOIN person_facts f ON f.account_id=p.account_id \
+                 AND f.person_id=p.id AND f.status='active' \
+              WHERE p.account_id=$1 AND p.status='identified' \
+                AND p.display_name IS NOT NULL AND p.id>$2 \
+                AND ($3::text IS NULL OR lower(p.display_name) LIKE '%'||lower($3)||'%' \
+                  OR EXISTS (SELECT 1 FROM person_name_claims n \
+                       WHERE n.account_id=p.account_id AND n.person_id=p.id \
+                         AND n.status IN ('accepted','probationary') \
+                         AND lower(n.name) LIKE '%'||lower($3)||'%')) \
+              GROUP BY p.account_id,p.id ORDER BY p.id LIMIT $4",
+        )
+        .bind(account_id)
+        .bind(request.after_id)
+        .bind(query)
+        .bind(row_limit)
+        .fetch_all(self.pool())
+        .await?;
+        let mut people = rows
+            .iter()
+            .map(|row| {
+                Ok(PersonSummary {
+                    id: row.try_get("id")?,
+                    display_name: row.try_get("display_name")?,
+                    voice_profile_count: row.try_get("voice_profile_count")?,
+                    fact_count: row.try_get("fact_count")?,
+                    updated_at: required_timestamp(row, "updated_at_ms")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor = (people.len() > request.limit).then(|| people[request.limit - 1].id);
+        people.truncate(request.limit);
+        Ok(PeopleListPage {
+            people,
+            next_cursor,
+        })
+    }
+
+    async fn person_profile(&self, account_id: &str, person_id: i64) -> Result<PersonProfile> {
+        let row = sqlx::query(
+            "SELECT p.id,p.display_name, \
+                    count(DISTINCT v.id)::bigint AS voice_profile_count, \
+                    count(DISTINCT f.id)::bigint AS fact_count, \
+                    floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
+               FROM people p LEFT JOIN voice_profiles v \
+                 ON v.account_id=p.account_id AND v.person_id=p.id \
+                AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                     WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
+                       AND r.status IN ('quarantined','superseded','split')) \
+               LEFT JOIN person_facts f ON f.account_id=p.account_id \
+                 AND f.person_id=p.id AND f.status='active' \
+              WHERE p.account_id=$1 AND p.id=$2 AND p.status='identified' \
+              GROUP BY p.account_id,p.id",
+        )
+        .bind(account_id)
+        .bind(person_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Err(EnclaveError::NotFound);
+        };
+        let person = PersonSummary {
+            id: row.try_get("id")?,
+            display_name: row.try_get("display_name")?,
+            voice_profile_count: row.try_get("voice_profile_count")?,
+            fact_count: row.try_get("fact_count")?,
+            updated_at: required_timestamp(&row, "updated_at_ms")?,
+        };
+
+        let voice_labels = sqlx::query_scalar::<_, String>(
+            "SELECT v.label FROM voice_profiles v \
+              WHERE v.account_id=$1 AND v.person_id=$2 AND v.status<>'quarantined' \
+                AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                     WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
+                       AND r.status IN ('quarantined','superseded','split')) ORDER BY v.id",
+        )
+        .bind(account_id)
+        .bind(person_id)
+        .fetch_all(self.pool())
+        .await?;
+        let coverage = sqlx::query(
+            "SELECT (SELECT count(*)::bigint FROM voice_profiles v \
+                       WHERE v.account_id=$1 AND v.person_id=$2 AND v.status='stable' \
+                         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                              WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
+                                AND r.status IN ('quarantined','superseded','split'))) AS stable_profiles, \
+                    (SELECT count(*)::bigint FROM voice_samples s \
+                       JOIN voice_sample_profile_assignments a \
+                         ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active \
+                       JOIN voice_profiles v \
+                         ON v.account_id=a.account_id AND v.id=a.profile_id \
+                      WHERE v.account_id=$1 AND v.person_id=$2 AND s.accepted \
+                        AND s.eligibility='enroll' AND NOT s.outlier \
+                        AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                             WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
+                               AND r.status IN ('quarantined','superseded','split'))) AS accepted_samples",
+        )
+        .bind(account_id)
+        .bind(person_id)
+        .fetch_one(self.pool())
+        .await?;
+        let stable_profiles: i64 = coverage.try_get("stable_profiles")?;
+        let accepted_samples: i64 = coverage.try_get("accepted_samples")?;
+        let voice_coverage = if stable_profiles > 0 {
+            format!(
+                "Recognized from {accepted_samples} high-quality samples across {stable_profiles} stable acoustic profiles"
+            )
+        } else if accepted_samples > 0 {
+            format!("Learning from {accepted_samples} high-quality voice samples")
+        } else {
+            "No stable voice recognition profile yet".into()
+        };
+
+        let alias_rows = sqlx::query(
+            "SELECT id,name,status,evidence_kind,confidence,source_event_id, \
+                    floor(extract(epoch FROM observed_at)*1000)::bigint AS observed_at_ms \
+               FROM person_name_claims WHERE account_id=$1 AND person_id=$2 \
+                AND status<>'rejected' ORDER BY observed_at DESC,id DESC LIMIT 100",
+        )
+        .bind(account_id)
+        .bind(person_id)
+        .fetch_all(self.pool())
+        .await?;
+        let aliases = alias_rows
+            .iter()
+            .map(|row| {
+                Ok(PersonNameView {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    status: row.try_get("status")?,
+                    evidence_kind: row.try_get("evidence_kind")?,
+                    confidence: row.try_get("confidence")?,
+                    observed_at: required_timestamp(row, "observed_at_ms")?,
+                    source_event_id: row.try_get("source_event_id")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let fact_rows = sqlx::query(
+            "SELECT id,predicate,value,status,evidence::text AS evidence_json,source_event_id, \
+                    speaker_observation_id, \
+                    floor(extract(epoch FROM observed_at)*1000)::bigint AS observed_at_ms, \
+                    literal_evidence,confidence,supersedes_id, \
+                    floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms \
+               FROM person_facts WHERE account_id=$1 AND person_id=$2 \
+              ORDER BY coalesce(observed_at,created_at) DESC,id DESC LIMIT 200",
+        )
+        .bind(account_id)
+        .bind(person_id)
+        .fetch_all(self.pool())
+        .await?;
+        let facts = fact_rows
+            .iter()
+            .map(|row| {
+                let raw: String = row.try_get("evidence_json")?;
+                Ok(PersonFactView {
+                    id: row.try_get("id")?,
+                    predicate: row.try_get("predicate")?,
+                    value: row.try_get("value")?,
+                    status: row.try_get("status")?,
+                    evidence: serde_json::from_str(&raw).unwrap_or(Value::Null),
+                    source_event_id: row.try_get("source_event_id")?,
+                    speaker_observation_id: row.try_get("speaker_observation_id")?,
+                    observed_at: row
+                        .try_get::<Option<i64>, _>("observed_at_ms")?
+                        .map(isotime::format_epoch_millis),
+                    literal_evidence: row.try_get("literal_evidence")?,
+                    confidence: row.try_get("confidence")?,
+                    supersedes_id: row.try_get("supersedes_id")?,
+                    created_at: required_timestamp(row, "created_at_ms")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let evidence = postgres_person_evidence(self, account_id, person_id, None, 100)
+            .await?
+            .evidence;
+        let recent_statements = postgres_person_statements(self, account_id, person_id, None, 100)
+            .await?
+            .statements;
+        Ok(PersonProfile {
+            person,
+            voice_labels,
+            voice_coverage,
+            aliases,
+            facts,
+            evidence,
+            recent_statements,
+        })
+    }
+
+    async fn person_evidence(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonEvidencePage> {
+        if limit == 0 || limit > 100 {
+            return Err(EnclaveError::InvalidRequest(
+                "people page bounds are invalid".into(),
+            ));
+        }
+        require_identified_person(self, account_id, person_id).await?;
+        postgres_person_evidence(self, account_id, person_id, before_id, limit).await
+    }
+
+    async fn person_statements(
+        &self,
+        account_id: &str,
+        person_id: i64,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<PersonStatementPage> {
+        if limit == 0 || limit > 100 {
+            return Err(EnclaveError::InvalidRequest(
+                "people page bounds are invalid".into(),
+            ));
+        }
+        require_identified_person(self, account_id, person_id).await?;
+        postgres_person_statements(self, account_id, person_id, before_id, limit).await
     }
 }

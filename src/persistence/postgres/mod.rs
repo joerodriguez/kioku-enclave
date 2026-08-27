@@ -22,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 11;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -180,6 +180,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 11;
+        }
+        if version == 11 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0012_people_voice_queries.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -242,8 +250,9 @@ mod tests {
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
         McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedRequest,
-        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+        PeopleListRequest, PushInstallation, PushProviderOutcome, PushProviderReceipt,
+        PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
+        WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
 
@@ -1228,6 +1237,97 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO speaker_observations \
+             (account_id,id,person_id,event_id,turn_id,speaker_local_id,started_at,ended_at, \
+              transcript_text,language,voice_eligibility) \
+             VALUES($1,1,1,'capture-contract-0','turn-contract','speaker-1', \
+                    '2026-08-27T12:00:00Z','2026-08-27T12:00:05Z', \
+                    'PostgreSQL private memory alpha','en','enroll')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE utterances SET source_key='cloud-v2:capture-contract-0:turn-contract', \
+                    speaker_observation_id=1 WHERE account_id=$1 AND id=1",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO voice_profiles \
+             (account_id,id,person_id,label,embedding_space,channel_domain,centroid,sample_count,status) \
+             VALUES($1,1,1,'Lynn','voice-v1','mic',decode('00','hex'),1,'stable')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO voice_samples \
+             (account_id,id,speaker_observation_id,voice_profile_id,embedding_space,channel_domain, \
+              embedding,quality_score,eligibility,outlier,accepted) \
+             VALUES($1,1,1,1,'voice-v1','mic',decode('00','hex'),0.99,'enroll',false,true)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO voice_profile_revisions \
+             (account_id,id,profile_id,status,derivation_version,scorer_version,representative_kind, \
+              centroid,sample_count,medoid_sample_id,person_id,reason_code,active) \
+             VALUES($1,1,1,'stable',1,2,'medoid_trimmed_centroid',decode('00','hex'),1,1,1, \
+                    'contract',true)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO voice_sample_profile_assignments \
+             (account_id,id,sample_id,profile_id,active) VALUES($1,1,1,1,true)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO person_name_claims \
+             (account_id,id,person_id,name,normalized_name,source_event_id,speaker_observation_id, \
+              observed_at,evidence_kind,evidence,confidence,status) \
+             VALUES($1,1,1,'Lynn','lynn','capture-contract-0',1,'2026-08-27T12:00:01Z', \
+                    'self_identification','{\"literal\":true}'::jsonb,0.99,'accepted')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO identity_evidence \
+             (account_id,id,person_id,voice_profile_id,source_event_id,observed_at, \
+              speaker_observation_id,kind,claimed_name,evidence,score,status) \
+             VALUES($1,1,1,1,'capture-contract-0','2026-08-27T12:00:01Z',1, \
+                    'self_identification','Lynn','{\"literal\":true}'::jsonb,0.99,'accepted')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO person_facts \
+             (account_id,id,person_id,predicate,value,evidence,derivation_version,status, \
+              source_event_id,speaker_observation_id,observed_at,literal_evidence,confidence) \
+             VALUES($1,1,1,'role','staff engineer','{\"literal\":true}'::jsonb,1,'active', \
+                    'capture-contract-0',1,'2026-08-27T12:00:02Z','I am a staff engineer',0.98)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO episode_speaker_slots \
              (account_id,id,episode_id,voice_profile_id,slot_ordinal) VALUES($1,1,1,1,0)",
         )
@@ -1285,6 +1385,51 @@ mod tests {
         assert_eq!(
             evidence["members"][1]["activity_summary"],
             "Reviewing the schema"
+        );
+        let people = repositories
+            .memory_queries()
+            .list_people(
+                &account_id,
+                &PeopleListRequest {
+                    after_id: 0,
+                    limit: 50,
+                    query: Some("lynn".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(people.people.len(), 1);
+        assert_eq!(people.people[0].voice_profile_count, 1);
+        assert_eq!(people.people[0].fact_count, 1);
+        let person = repositories
+            .memory_queries()
+            .person_profile(&account_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(person.voice_labels, vec!["Lynn"]);
+        assert_eq!(
+            person.voice_coverage,
+            "Recognized from 1 high-quality samples across 1 stable acoustic profiles"
+        );
+        assert_eq!(person.aliases[0].name, "Lynn");
+        assert_eq!(person.facts[0].value, "staff engineer");
+        assert_eq!(person.evidence[0].claimed_name.as_deref(), Some("Lynn"));
+        assert_eq!(person.recent_statements[0].episode_id, Some(1));
+        let evidence_page = repositories
+            .memory_queries()
+            .person_evidence(&account_id, 1, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(evidence_page.evidence.len(), 1);
+        let statement_page = repositories
+            .memory_queries()
+            .person_statements(&account_id, 1, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(statement_page.statements.len(), 1);
+        assert_eq!(
+            statement_page.statements[0].episode_title.as_deref(),
+            Some("PostgreSQL rollout")
         );
         sqlx::query(
             "UPDATE capture_sessions SET last_event_at=now() WHERE account_id=$1 AND id=$2",
