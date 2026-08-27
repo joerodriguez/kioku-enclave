@@ -1571,11 +1571,13 @@ pub(super) async fn begin_authorization_consent(
     // sign-in never blocks on genesis and a wedged, unavailable, or refused
     // genesis costs the user nothing they already had. It is also the
     // resumption point: a half-genesis user converges on their next sign-in.
-    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-        Arc::clone(&s.control),
-        Arc::clone(&s.store),
-        user_id,
-    );
+    if s.repositories.uses_legacy_state() {
+        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+            Arc::clone(&s.control),
+            Arc::clone(&s.store),
+            user_id,
+        );
+    }
     let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
     let registered = s.repositories.oauth().client(&client_id).await;
     let RegisteredClient { name } = match registered {
@@ -2008,11 +2010,13 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
     // (or whose process-local serving authority was lost to a restart)
     // converges here on the user's next request rather than waiting for a new
     // interactive sign-in. Detached and swallowed for the same reason.
-    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-        Arc::clone(&s.control),
-        Arc::clone(&s.store),
-        &user_id,
-    );
+    if s.repositories.uses_legacy_state() {
+        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+            Arc::clone(&s.control),
+            Arc::clone(&s.store),
+            &user_id,
+        );
+    }
     token_response(&access, &raw_refresh)
 }
 
@@ -2046,11 +2050,13 @@ pub async fn issue_native_session(
     // the pre-Genesis archive for up to one access-token lifetime. Resume only
     // after the session write is durable, matching the existing code-exchange
     // and refresh-token boundaries.
-    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-        Arc::clone(&s.control),
-        Arc::clone(&s.store),
-        &genesis_user_id,
-    );
+    if s.repositories.uses_legacy_state() {
+        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+            Arc::clone(&s.control),
+            Arc::clone(&s.store),
+            &genesis_user_id,
+        );
+    }
     Ok((access, raw_refresh))
 }
 

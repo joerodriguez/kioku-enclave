@@ -774,11 +774,13 @@ async fn session(
     // Browser OAuth already reaches the same idempotent trigger, while Apple
     // native sessions also call it at issuance; duplicate calls are contained
     // by the per-user single-flight and exact durable state machine.
-    crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-        Arc::clone(&state.control),
-        Arc::clone(&state.store),
-        &user.0,
-    );
+    if state.repositories.uses_legacy_state() {
+        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
+            Arc::clone(&state.control),
+            Arc::clone(&state.store),
+            &user.0,
+        );
+    }
     no_store_json(json!({
         "account_id": user.0,
         "email": session.account.email,

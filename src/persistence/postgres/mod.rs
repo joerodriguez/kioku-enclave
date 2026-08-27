@@ -2630,6 +2630,29 @@ mod tests {
             .billing_account_id_for_deletion(&account_id)
             .await
             .unwrap();
+        let deletion_race_invocation = repositories
+            .model_usage()
+            .begin_invocation(
+                &account_id,
+                VertexOperation::EpisodeSummary,
+                "gemini-contract",
+                "us-central1",
+                &[0x91; 32],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&account_id)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
+        repositories
+            .model_usage()
+            .settle_ambiguous(&account_id, &deletion_race_invocation, None)
+            .await
+            .unwrap();
         let deletion_upload = repositories
             .captures()
             .reserve_media_upload(
