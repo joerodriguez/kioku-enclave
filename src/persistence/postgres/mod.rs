@@ -9,6 +9,7 @@ mod capture;
 mod entitlement;
 mod identity;
 mod lifecycle;
+mod model_usage;
 mod notification;
 mod oauth;
 mod query;
@@ -22,7 +23,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 12;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 13;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -188,6 +189,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 12;
+        }
+        if version == 12 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0013_vertex_usage_ledger.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -240,6 +249,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{PostgresPersistence, PostgresPoolConfig};
+    use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
         AuthorizationCodeExchange, ConsentApproval, OAuthClientDefinition, PendingConsent,
@@ -276,7 +286,7 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
+            "TRUNCATE vertex_usage_events, vertex_usage_coverage, account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
              recording_delivery_balances, recording_lease_denials, recording_lease_requests, \
              recording_leases, vertex_coverage_anchors, billing_detach_outbox, billing_accounts, \
              push_send_fences, push_installations, email_send_fences, \
@@ -1533,6 +1543,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mcp_range["episodes"].as_array().unwrap().len(), 1);
+
+        let billing_account = repositories
+            .billing()
+            .billing_account_id(&account_id)
+            .await
+            .unwrap();
+        let invocation = repositories
+            .model_usage()
+            .begin_invocation(
+                &account_id,
+                VertexOperation::EpisodeSummary,
+                "gemini-contract",
+                "us-central1",
+                &[7; 32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .model_usage()
+                .begin_invocation(
+                    &account_id,
+                    VertexOperation::EpisodeSummary,
+                    "gemini-contract",
+                    "us-central1",
+                    &[7; 32],
+                )
+                .await
+                .unwrap(),
+            invocation
+        );
+        repositories
+            .model_usage()
+            .settle_response(
+                &account_id,
+                &invocation,
+                &VertexMetadata {
+                    model_version: Some("gemini-contract".into()),
+                    traffic_type: Some("ON_DEMAND".into()),
+                    usage: Some(VertexUsage {
+                        prompt_details_present: true,
+                        cache_details_present: true,
+                        prompt_tokens: Some(10),
+                        input_text_tokens: Some(10),
+                        input_audio_tokens: Some(0),
+                        input_image_tokens: Some(0),
+                        cached_input_tokens: Some(0),
+                        cached_input_text_tokens: Some(0),
+                        cached_input_audio_tokens: Some(0),
+                        cached_input_image_tokens: Some(0),
+                        output_tokens: Some(4),
+                        tool_use_prompt_tokens: Some(0),
+                        thought_tokens: Some(0),
+                        total_tokens: Some(14),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let usage_claim = repositories
+            .model_usage()
+            .pending_events(&account_id, &billing_account, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage_claim.events.len(), 1);
+        assert_eq!(usage_claim.events[0].event_id, invocation);
+        assert!(repositories
+            .model_usage()
+            .pending_events(&account_id, &billing_account, false)
+            .await
+            .unwrap()
+            .is_none());
+        repositories
+            .model_usage()
+            .complete_delivery(&account_id, &usage_claim.claim_id, &[invocation.clone()])
+            .await
+            .unwrap();
+        let coverage = repositories
+            .model_usage()
+            .pending_coverage(&account_id, &billing_account)
+            .await
+            .unwrap();
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].snapshot.pending_events, 0);
+        repositories
+            .model_usage()
+            .complete_coverage(
+                &account_id,
+                &coverage[0].claim_id,
+                &coverage[0].snapshot.period,
+                coverage[0].snapshot.sequence,
+            )
+            .await
+            .unwrap();
 
         let billing_detach_id = repositories
             .billing()

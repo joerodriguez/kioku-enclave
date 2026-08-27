@@ -29,3 +29,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   screen interpretations, people, speaker slots, and participants.
 - `0012_people_voice_queries.sql` adds the people, identity-evidence,
   speaker-observation, and voice-lineage records used by public memory queries.
+- `0013_vertex_usage_ledger.sql` adds fleet-wide paid-model invocation intents,
+  billing delivery claims, and coverage reconciliation.
