@@ -1042,8 +1042,9 @@ async fn reviewer_login(
     // consumer Google `sub` stored in the same legacy identity column.
     let identity_subject = format!("reviewer:identity-platform:{reviewer_uid}");
     let user = match s
-        .control
-        .upsert_user(
+        .repositories
+        .identity_sessions()
+        .upsert_subject_account(
             &identity_subject,
             &reviewer_email,
             super::control_store::REVIEWER_SIGNUP_EXEMPT,
@@ -1568,8 +1569,9 @@ async fn google_callback(
     };
 
     let user = match s
-        .control
-        .upsert_user(&google_sub, &email, s.config.signup_limit_per_day)
+        .repositories
+        .identity_sessions()
+        .upsert_subject_account(&google_sub, &email, s.config.signup_limit_per_day)
         .await
     {
         Ok(u) => u,

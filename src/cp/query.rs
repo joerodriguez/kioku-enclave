@@ -4970,9 +4970,11 @@ mod tests {
             current_media_gcs,
             legacy_media_gcs,
         ));
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs));
         Arc::new(CpState {
             store,
-            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs)),
+            control: Arc::clone(&control),
+            repositories: crate::persistence::RepositorySet::legacy(control),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
@@ -7311,12 +7313,14 @@ mod tests {
             .await
             .unwrap();
 
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
         let s = Arc::new(CpState {
             store: Arc::clone(&store),
-            control: Arc::new(crate::cp::control_store::ControlStore::new(
-                Arc::new(FakeKms),
-                Arc::new(FakeGcs::new()),
-            )),
+            control: Arc::clone(&control),
+            repositories: crate::persistence::RepositorySet::legacy(control),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
@@ -7394,12 +7398,14 @@ mod tests {
             .await
             .unwrap();
 
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
         let s = Arc::new(CpState {
             store: Arc::clone(&store),
-            control: Arc::new(crate::cp::control_store::ControlStore::new(
-                Arc::new(FakeKms),
-                Arc::new(FakeGcs::new()),
-            )),
+            control: Arc::clone(&control),
+            repositories: crate::persistence::RepositorySet::legacy(control),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
@@ -7460,7 +7466,8 @@ mod tests {
 
         let s = Arc::new(CpState {
             store,
-            control,
+            control: Arc::clone(&control),
+            repositories: crate::persistence::RepositorySet::legacy(control),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: query_test_state().config.clone(),
