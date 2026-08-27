@@ -601,7 +601,8 @@ pub(crate) mod wal_gate_test_support {
         store: Arc<Store>,
         control: Arc<super::control_store::ControlStore>,
     ) -> Arc<CpState> {
-        let repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
+        let repositories =
+            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
         Arc::new(CpState {
             store,
             control,

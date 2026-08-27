@@ -1382,7 +1382,8 @@ async fn async_main() {
             .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
     );
 
-    let repositories = persistence::RepositorySet::legacy(Arc::clone(&control_store));
+    let repositories =
+        persistence::RepositorySet::legacy(Arc::clone(&control_store), Arc::clone(&store));
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,

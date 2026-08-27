@@ -13,3 +13,9 @@ migration lock; serving instances only verify `persistence_schema.version`.
   serialize configuration changes with in-flight disclosures.
 - `0004_billing_recording.sql` adds billing pseudonyms, coverage anchors,
   recording lease/idempotency receipts, and fleet-wide delivery credits.
+- `0005_account_lifecycle.sql` adds durable account-deletion operations and
+  no-resurrection tombstones.
+- `0006_worker_cursors.sql` adds fleet-wide scheduler enumeration and the
+  durable summarizer cursor.
+- `0007_content_search.sql` adds tenant-qualified structured memories plus
+  PostgreSQL full-text and pgvector indexes.

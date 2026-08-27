@@ -103,9 +103,9 @@ mod tests {
         let control = Arc::new(ControlStore::new(kms, gcs));
 
         let cp_state = Arc::new(CpState {
-            store,
+            store: Arc::clone(&store),
             control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control),
+            repositories: crate::persistence::RepositorySet::legacy(control, store),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config,

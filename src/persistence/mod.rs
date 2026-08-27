@@ -11,6 +11,7 @@ mod legacy;
 mod lifecycle;
 mod notification;
 mod oauth;
+mod query;
 mod work;
 // PostgreSQL is compiled and contract-tested now, but production construction
 // stays disabled until the interface freeze makes one whole repository set
@@ -32,6 +33,7 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use postgres::PostgresPersistence;
+pub(crate) use query::MemoryQueryRepository;
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
     EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,
@@ -42,10 +44,11 @@ pub(crate) use work::{
 
 use self::legacy::{
     LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyEntitlementRepository,
-    LegacyIdentitySessionRepository, LegacyNotificationRepository, LegacyOAuthRepository,
-    LegacyWorkRepository,
+    LegacyIdentitySessionRepository, LegacyMemoryQueryRepository, LegacyNotificationRepository,
+    LegacyOAuthRepository, LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
+use crate::store::Store;
 
 /// The persistence dependencies injected into application code.
 ///
@@ -59,11 +62,12 @@ pub(crate) struct RepositorySet {
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
+    memory_queries: Arc<dyn MemoryQueryRepository>,
     work: Arc<dyn WorkRepository>,
 }
 
 impl RepositorySet {
-    pub(crate) fn legacy(control: Arc<ControlStore>) -> Self {
+    pub(crate) fn legacy(control: Arc<ControlStore>, store: Arc<Store>) -> Self {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
@@ -71,6 +75,7 @@ impl RepositorySet {
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
+            memory_queries: Arc::new(LegacyMemoryQueryRepository::new(store)),
             work: Arc::new(LegacyWorkRepository::new(control)),
         }
     }
@@ -84,6 +89,7 @@ impl RepositorySet {
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
+            memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
             work: persistence,
         }
     }
@@ -112,6 +118,10 @@ impl RepositorySet {
         self.notifications.as_ref()
     }
 
+    pub(crate) fn memory_queries(&self) -> &dyn MemoryQueryRepository {
+        self.memory_queries.as_ref()
+    }
+
     pub(crate) fn work(&self) -> &dyn WorkRepository {
         self.work.as_ref()
     }
@@ -127,11 +137,11 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_identity_port_preserves_signup_and_status_behavior() {
-        let control = Arc::new(ControlStore::new(
-            Arc::new(FakeKms),
-            Arc::new(FakeGcs::new()),
-        ));
-        let repositories = RepositorySet::legacy(control);
+        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(FakeKms);
+        let gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::clone(&kms), Arc::clone(&gcs)));
+        let store = Arc::new(crate::store::Store::new(kms, gcs));
+        let repositories = RepositorySet::legacy(control, store);
 
         let account = repositories
             .identity_sessions()

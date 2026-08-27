@@ -220,7 +220,7 @@ fn hit_timestamp(h: &SearchHit) -> &str {
 /// Merge two ranked candidate lists with Reciprocal Rank Fusion:
 /// `RRF(d) = Σ 1/(k + rank_i(d))`, k=60. Input lists are already in rank
 /// order (best first); output is (rowid, rrf_score) sorted descending.
-fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, f64)> {
+pub(crate) fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, f64)> {
     const RRF_K: f64 = 60.0;
     use std::collections::HashMap;
     let mut scores: HashMap<i64, f64> = HashMap::new();

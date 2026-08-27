@@ -10,6 +10,7 @@ mod identity;
 mod lifecycle;
 mod notification;
 mod oauth;
+mod query;
 mod work;
 
 use std::str::FromStr;
@@ -20,7 +21,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 6;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -129,6 +130,12 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0006_worker_cursors.sql"))
                 .execute(&mut *transaction)
                 .await?;
+            version = 6;
+        }
+        if version == 6 {
+            sqlx::raw_sql(include_str!("../../../migrations/0007_content_search.sql"))
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -192,6 +199,7 @@ mod tests {
         PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
         WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
     };
+    use crate::search::{SearchHit, SearchRequest};
 
     async fn test_persistence() -> Option<PostgresPersistence> {
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -232,7 +240,9 @@ mod tests {
         let Some(persistence) = test_persistence().await else {
             return;
         };
-        let repositories = Arc::new(RepositorySet::postgres(Arc::new(persistence)));
+        let persistence = Arc::new(persistence);
+        let pool = persistence.pool().clone();
+        let repositories = Arc::new(RepositorySet::postgres(persistence));
 
         let mut signups = Vec::new();
         for _ in 0..16 {
@@ -806,6 +816,114 @@ mod tests {
             None
         );
 
+        // The same tenant-local ids may exist for different accounts. Search
+        // must bind the authenticated account at every candidate and row
+        // retrieval step, including vector-only matches.
+        let other_account = repositories
+            .identity_sessions()
+            .upsert_subject_account("other-tenant-subject", "other@example.com", 2)
+            .await
+            .unwrap();
+        let embedding = format!(
+            "[{}]",
+            std::iter::repeat_n((1.0_f32 / 384.0_f32.sqrt()).to_string(), 384)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (tenant, text) in [
+            (&account_id, "PostgreSQL private memory alpha"),
+            (&other_account.id, "other tenant private memory"),
+        ] {
+            sqlx::query(
+                "INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) \
+                 VALUES($1,1,'2026-08-27T12:00:00Z','2026-08-27T12:01:00Z',60,'mic')",
+            )
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds, \
+                                        end_offset_seconds,text,speaker_label,embedding) \
+                 VALUES($1,1,1,0,5,$2,'Lynn',$3::vector)",
+            )
+            .bind(tenant)
+            .bind(text)
+            .bind(&embedding)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO screenshots(account_id,id,captured_at,ocr_text,url,embedding) \
+             VALUES($1,1,'2026-08-27T12:02:00Z','PostgreSQL diagram','https://example.com/db',$2::vector)",
+        )
+        .bind(&account_id)
+        .bind(&embedding)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episodes(account_id,id,started_at,ended_at,title,summary,participants, \
+                                  minute_summaries,minutes_text,embedding) \
+             VALUES($1,1,'2026-08-27T12:00:00Z','2026-08-27T12:03:00Z', \
+                    'PostgreSQL rollout','Shipped the database boundary','[\"Lynn\"]'::jsonb, \
+                    '[]'::jsonb,'database boundary',$2::vector)",
+        )
+        .bind(&account_id)
+        .bind(&embedding)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let search = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    user_id: account_id.clone(),
+                    query: "PostgreSQL".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 20,
+                    offset: 0,
+                    kinds: Vec::new(),
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.len(), 3);
+        assert!(!serde_json::to_string(&search)
+            .unwrap()
+            .contains("other tenant"));
+        let hybrid = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    user_id: account_id.clone(),
+                    query: "not-in-the-document".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 5,
+                    offset: 0,
+                    kinds: vec!["utterance".into()],
+                    query_embedding: Some(vec![1.0_f32 / 384.0_f32.sqrt(); 384]),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            hybrid.as_slice(),
+            [SearchHit::Utterance {
+                id: 1,
+                score: Some(_),
+                ..
+            }]
+        ));
+
         let billing_detach_id = repositories
             .billing()
             .billing_account_id_for_deletion(&account_id)
@@ -836,12 +954,9 @@ mod tests {
                 .unwrap(),
             Some(AccountStatus::Deleting)
         );
-        assert!(repositories
-            .work()
-            .active_account_ids()
-            .await
-            .unwrap()
-            .is_empty());
+        let active = repositories.work().active_account_ids().await.unwrap();
+        assert!(!active.contains(&account_id));
+        assert!(active.contains(&other_account.id));
         let credentials = repositories
             .lifecycle()
             .apple_refresh_credentials(&account_id)

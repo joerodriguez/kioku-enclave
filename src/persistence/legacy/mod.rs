@@ -9,6 +9,7 @@ mod identity;
 mod lifecycle;
 mod notification;
 mod oauth;
+mod query;
 mod work;
 
 pub(super) use billing::LegacyBillingRepository;
@@ -17,4 +18,5 @@ pub(super) use identity::LegacyIdentitySessionRepository;
 pub(super) use lifecycle::LegacyAccountLifecycleRepository;
 pub(super) use notification::LegacyNotificationRepository;
 pub(super) use oauth::LegacyOAuthRepository;
+pub(super) use query::LegacyMemoryQueryRepository;
 pub(super) use work::LegacyWorkRepository;
