@@ -43,3 +43,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   the single installed processing-media key for each account.
 - `0019_voice_lineage_export.sql` adds the remaining voice representative and
   identity-binding records exposed by the user export contract.
+- `0020_episode_deletion.sql` adds a durable freeze/provider-purge/database-
+  purge state machine and replayable receipt for user-requested episode deletion.

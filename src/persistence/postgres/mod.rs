@@ -8,6 +8,7 @@ mod billing;
 mod capture;
 mod delivery_outbox;
 mod entitlement;
+mod episode_deletion;
 mod finalization;
 mod identity;
 mod lifecycle;
@@ -27,7 +28,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 19;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 20;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -247,6 +248,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 19;
+        }
+        if version == 19 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0020_episode_deletion.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -334,14 +343,14 @@ mod tests {
     };
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
-        EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        FinalizationRequest, FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
-        FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
-        McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
-        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
-        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, ScreenMediaSettlement,
-        ScreenshotMediaLocator, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
-        WebhookSendFenceDisposition, WebhookSubscription,
+        EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeDeletionStart,
+        EpisodeListRequest, FinalizationRequest, FinalizationScreenResult, FinalizationSettlement,
+        FrozenEmailDelivery, FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest,
+        McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
+        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
+        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
+        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
+        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::search::{SearchHit, SearchRequest};
@@ -2325,6 +2334,62 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(0)
+        );
+
+        let episode_deletions = repositories
+            .episode_deletions()
+            .expect("PostgreSQL episode deletion repository");
+        let plan = match episode_deletions
+            .begin_episode_deletion(&account_id, episode_ids[0])
+            .await
+            .unwrap()
+        {
+            EpisodeDeletionStart::Pending(plan) => plan,
+            other => panic!("expected pending episode deletion, got {other:?}"),
+        };
+        assert_eq!(plan.purge.deleted_utterances, 1);
+        assert_eq!(plan.purge.deleted_screenshots, 1);
+        assert_eq!(plan.purge.deleted_segments, 1);
+        assert_eq!(
+            plan.media_object_keys,
+            vec![object_key.clone(), "screenshots/contract.jpg".into()]
+        );
+        assert!(matches!(
+            episode_deletions
+                .begin_episode_deletion(&account_id, episode_ids[0])
+                .await
+                .unwrap(),
+            EpisodeDeletionStart::Pending(replayed) if replayed == plan
+        ));
+        let purge = episode_deletions
+            .complete_episode_deletion(&account_id, &plan)
+            .await
+            .unwrap();
+        assert_eq!(purge, plan.purge);
+        assert!(matches!(
+            episode_deletions
+                .begin_episode_deletion(&account_id, episode_ids[0])
+                .await
+                .unwrap(),
+            EpisodeDeletionStart::Complete(replayed) if replayed == purge
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episodes WHERE account_id=$1",)
+                .bind(&account_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM capture_events WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
         );
 
         let billing_detach_id = repositories

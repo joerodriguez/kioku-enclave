@@ -351,7 +351,7 @@ pub(crate) fn upsert_episodes(
 /// Result of purging one episode: counts plus the `source_key`s of the
 /// deleted records, so the Mac debugger can purge the matching LOCAL rows and
 /// media files (a cloud-only delete would resurrect on a forced resync).
-#[derive(Clone, Debug, Serialize, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct EpisodePurge {
     pub deleted_utterances: usize,
     pub deleted_screenshots: usize,

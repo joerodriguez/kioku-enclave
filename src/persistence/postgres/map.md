@@ -10,6 +10,7 @@ not select it until every active domain has moved off the legacy stores.
 | `mod.rs` | Pool construction, UTC/timeout policy, explicit migrator, schema verification, and shared transaction helpers. |
 | `billing.rs` | Fleet-wide billing pseudonyms, recording lease/credit receipts, coverage anchors, and detach outbox. |
 | `entitlement.rs` | Fleet-wide active-account checks and atomic daily quota/Vertex reservations. |
+| `episode_deletion.rs` | Durable freeze, exact media inventory, structured purge, and replay receipt for episode deletion. |
 | `identity.rs` | PostgreSQL accounts, identities, signup budget, Apple credentials, and coherent session reads. |
 | `lifecycle.rs` | PostgreSQL account tombstones, deletion progress, Apple-revocation settlement, cascading purge, and billing-detach creation. |
 | `notification.rs` | PostgreSQL webhook destinations, email consent, and bounded push installation registry serialized against send fences. |

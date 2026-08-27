@@ -8,6 +8,7 @@ mod billing;
 mod capture;
 mod delivery_outbox;
 mod entitlement;
+mod episode_deletion;
 mod finalization;
 mod gcs_media;
 mod identity;
@@ -42,6 +43,9 @@ pub(crate) use delivery_outbox::{
     WebhookDeliveryCandidate, WebhookDeliveryClaim,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
+pub(crate) use episode_deletion::{
+    EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart,
+};
 pub(crate) use finalization::{
     FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationRequest,
     FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
@@ -110,6 +114,7 @@ pub(crate) struct RepositorySet {
     captures: Arc<dyn CaptureRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
+    episode_deletions: Option<Arc<dyn EpisodeDeletionRepository>>,
     deliveries: Option<Arc<dyn DeliveryRepository>>,
     finalization: Option<Arc<dyn FinalizationRepository>>,
     notifications: Arc<dyn NotificationRepository>,
@@ -131,6 +136,7 @@ impl RepositorySet {
             captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
+            episode_deletions: None,
             deliveries: None,
             finalization: None,
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
@@ -156,6 +162,7 @@ impl RepositorySet {
             captures: Arc::clone(&persistence) as Arc<dyn CaptureRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
+            episode_deletions: Some(Arc::clone(&persistence) as Arc<dyn EpisodeDeletionRepository>),
             deliveries: Some(Arc::clone(&persistence) as Arc<dyn DeliveryRepository>),
             finalization: Some(Arc::clone(&persistence) as Arc<dyn FinalizationRepository>),
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
@@ -194,6 +201,10 @@ impl RepositorySet {
 
     pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {
         self.entitlements.as_ref()
+    }
+
+    pub(crate) fn episode_deletions(&self) -> Option<&dyn EpisodeDeletionRepository> {
+        self.episode_deletions.as_deref()
     }
 
     pub(crate) fn deliveries(&self) -> Option<&dyn DeliveryRepository> {
