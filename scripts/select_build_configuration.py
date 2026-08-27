@@ -228,8 +228,18 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         require_https_origin(configuration, name)
     require_https_url(configuration, "ENCLAVE_ACME_DIRECTORY")
 
-    if configuration["ENCLAVE_ACME"] != "1":
-        raise SystemExit("ENCLAVE_ACME must be 1 for an enclave image")
+    if configuration["PERSISTENCE_BACKEND"] != "postgres":
+        raise SystemExit("PERSISTENCE_BACKEND must be postgres for ADR-0040")
+    if configuration["POSTGRES_SCHEMA_MODE"] != "verify":
+        raise SystemExit("serving images must verify, never migrate, PostgreSQL schema")
+    if configuration["POSTGRES_MAX_CONNECTIONS"] != "12":
+        raise SystemExit("POSTGRES_MAX_CONNECTIONS must match the reviewed fleet pool budget")
+    if configuration["HEALTH_PORT"] != "8081":
+        raise SystemExit("HEALTH_PORT must be the reviewed health-only port")
+    if configuration["DRAIN_TIMEOUT_SECONDS"] != "105":
+        raise SystemExit("DRAIN_TIMEOUT_SECONDS must fit the Confidential Space SIGTERM window")
+    if configuration["ENCLAVE_TLS"] != "1" or configuration["ENCLAVE_ACME"] != "0":
+        raise SystemExit("PostgreSQL fleet images require shared TLS and per-process ACME off")
     if not re.fullmatch(rf"mailto:{EMAIL_PATTERN}", configuration["ENCLAVE_ACME_CONTACT"]):
         raise SystemExit("invalid format for build configuration: ENCLAVE_ACME_CONTACT")
 
@@ -340,6 +350,21 @@ def selected_configuration(
                 "incomplete optional build configuration group; missing: " + missing
             )
         configuration.update(values)
+    # ADR-0040 is a one-way empty-production cutover. These values describe
+    # the reviewed runtime shape and are source-controlled rather than mutable
+    # operator inputs: PostgreSQL is the sole structured authority, serving
+    # instances never run DDL, and every replica loads the same TLS secret.
+    configuration.update(
+        {
+            "PERSISTENCE_BACKEND": "postgres",
+            "POSTGRES_SCHEMA_MODE": "verify",
+            "POSTGRES_MAX_CONNECTIONS": "12",
+            "HEALTH_PORT": "8081",
+            "DRAIN_TIMEOUT_SECONDS": "105",
+            "ENCLAVE_TLS": "1",
+            "ENCLAVE_ACME": "0",
+        }
+    )
     if profile == "production" and not configuration.get("APNS_TEAM_ID"):
         raise SystemExit(
             "missing required production build configuration: "
