@@ -138,8 +138,7 @@ fn retention_response(
 }
 
 fn durable_recording_retention_available(state: &CpState) -> bool {
-    state.store.durable_recording_storage_bound()
-        && crate::schema_ladder::durable_recording_schema_active()
+    state.durable_recording_storage_bound && crate::schema_ladder::durable_recording_schema_active()
 }
 
 async fn get_recording_retention(

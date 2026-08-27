@@ -1386,6 +1386,7 @@ async fn async_main() {
         persistence::RepositorySet::legacy(Arc::clone(&control_store), Arc::clone(&store));
     let cp_state = Arc::new(cp::CpState {
         kms: Arc::clone(&store.kms),
+        durable_recording_storage_bound: store.durable_recording_storage_bound(),
         store: Arc::clone(&store),
         control: control_store,
         repositories,

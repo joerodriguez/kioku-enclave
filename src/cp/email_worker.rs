@@ -1663,6 +1663,7 @@ mod tests {
 
         let state = Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
@@ -1747,6 +1748,7 @@ mod tests {
 
         let state = Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
@@ -1819,6 +1821,7 @@ mod tests {
 
         let state = Arc::new(CpState {
             kms: Arc::clone(&store.kms),
+            durable_recording_storage_bound: store.durable_recording_storage_bound(),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
