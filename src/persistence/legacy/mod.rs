@@ -5,8 +5,10 @@
 
 mod entitlement;
 mod identity;
+mod notification;
 mod oauth;
 
 pub(super) use entitlement::LegacyEntitlementRepository;
 pub(super) use identity::LegacyIdentitySessionRepository;
+pub(super) use notification::LegacyNotificationRepository;
 pub(super) use oauth::LegacyOAuthRepository;

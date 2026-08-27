@@ -4178,7 +4178,12 @@ async fn rest_list_webhooks(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    match s.control.list_webhook_subscriptions(&user.0).await {
+    match s
+        .repositories
+        .notifications()
+        .list_webhook_subscriptions(&user.0)
+        .await
+    {
         Ok(subscriptions) => {
             let mut webhooks = Vec::with_capacity(subscriptions.len());
             for subscription in &subscriptions {
@@ -4240,7 +4245,8 @@ async fn rest_create_webhook(
         created_at: now,
     };
     match s
-        .control
+        .repositories
+        .notifications()
         .create_webhook_subscription(subscription.clone())
         .await
     {
@@ -4272,7 +4278,8 @@ async fn rest_delete_webhook(
         Err(error) => return error.into_response(),
     };
     match s
-        .control
+        .repositories
+        .notifications()
         .get_webhook_subscription(&user_id, &subscription_id)
         .await
     {
@@ -4281,7 +4288,8 @@ async fn rest_delete_webhook(
         Err(error) => return error.into_response(),
     }
     if let Err(error) = s
-        .control
+        .repositories
+        .notifications()
         .disable_webhook_subscription(&user_id, &subscription_id)
         .await
     {
@@ -4293,7 +4301,8 @@ async fn rest_delete_webhook(
         return error.into_response();
     }
     match s
-        .control
+        .repositories
+        .notifications()
         .delete_webhook_subscription(&user_id, &subscription_id)
         .await
     {
@@ -4309,7 +4318,8 @@ async fn rest_test_webhook(
     Path(subscription_id): Path<String>,
 ) -> Response {
     let subscription = match s
-        .control
+        .repositories
+        .notifications()
         .get_webhook_subscription(&user.0, &subscription_id)
         .await
     {
@@ -4366,7 +4376,12 @@ async fn rest_get_episode_email_preference(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let available = s.email_transport.is_some();
-    match s.control.get_email_preference(&user.0).await {
+    match s
+        .repositories
+        .notifications()
+        .get_email_preference(&user.0)
+        .await
+    {
         Ok(pref) => (
             StatusCode::OK,
             [("cache-control", "no-store")],
@@ -4389,7 +4404,8 @@ async fn rest_put_episode_email_preference(
 ) -> Response {
     let available = s.email_transport.is_some();
     match s
-        .control
+        .repositories
+        .notifications()
         .set_email_preference(&user.0, req.enabled, req.include_content)
         .await
     {
@@ -4436,7 +4452,12 @@ async fn rest_test_episode_email(
             .into_response();
     }
 
-    let pref = match s.control.get_email_preference(&user.0).await {
+    let pref = match s
+        .repositories
+        .notifications()
+        .get_email_preference(&user.0)
+        .await
+    {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };

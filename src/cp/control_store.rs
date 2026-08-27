@@ -97,6 +97,8 @@ use crate::{
     store::{validate_user_id, GcsClient, IdentityRebindSource, MaintenanceTentativeSource, Store},
 };
 
+pub use crate::persistence::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
+
 const CONTROL_OBJECT: &str = "control/control.db.enc";
 const CONTROL_OBJECT_SLOT_COUNT: usize = 32;
 const CONTROL_SNAPSHOT_MAGIC: &[u8] = b"KIOKU-CONTROL-SNAPSHOT\x01";
@@ -2348,24 +2350,6 @@ impl std::fmt::Debug for IdentityRebindOperation {
     }
 }
 
-#[derive(Clone, serde::Deserialize, PartialEq, Eq)]
-pub struct WebhookSubscription {
-    pub id: String,
-    pub user_id: String,
-    pub name: String,
-    pub endpoint_url: String,
-    pub signing_secret: String,
-    pub include_content: bool,
-    pub enabled: bool,
-    pub created_at: String,
-}
-
-impl std::fmt::Debug for WebhookSubscription {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("WebhookSubscription(<redacted>)")
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WebhookControlCancellation {
     AccountInactive,
@@ -2476,15 +2460,6 @@ pub(crate) enum WebhookSendFenceDisposition {
     Authorized(WebhookSubscription),
     DeletionOwned,
     Recorded(WebhookSendFence),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct EpisodeEmailPreference {
-    pub enabled: bool,
-    pub include_content: bool,
-    pub recipient_email: String,
-    pub consented_at: Option<String>,
-    pub updated_at: String,
 }
 
 pub const RECORDING_RETENTION_CONSENT_VERSION: i64 = 1;
@@ -2753,18 +2728,6 @@ pub(crate) enum EmailSendFenceDisposition {
     Recorded(EmailSendFence),
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct PushInstallation {
-    pub id: String,
-    pub user_id: String,
-    pub platform: String,
-    pub topic: String,
-    pub environment: String,
-    pub device_token: String,
-    pub token_generation: i64,
-    pub enabled: bool,
-}
-
 pub(crate) enum PushSendFenceDisposition {
     Authorized(PushInstallation),
     DeletionOwned,
@@ -2912,20 +2875,6 @@ pub(crate) struct PushSendFence {
     pub(crate) lease_expires_at: String,
     pub(crate) outcome: Option<PushFenceOutcome>,
     pub(crate) outcome_at: Option<String>,
-}
-
-impl std::fmt::Debug for PushInstallation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PushInstallation")
-            .field("id", &"<opaque>")
-            .field("platform", &self.platform)
-            .field("topic", &self.topic)
-            .field("environment", &self.environment)
-            .field("token_generation", &self.token_generation)
-            .field("enabled", &self.enabled)
-            .finish()
-    }
 }
 
 fn push_installation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PushInstallation> {
@@ -24187,8 +24136,9 @@ impl ControlStore {
             }
             conn.execute(
                 "INSERT INTO webhook_subscriptions
-                    (id, user_id, name, endpoint_url, signing_secret, include_content, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (id, user_id, name, endpoint_url, signing_secret, include_content, enabled,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 rusqlite::params![
                     subscription.id,
                     subscription.user_id,
@@ -24197,6 +24147,7 @@ impl ControlStore {
                     subscription.signing_secret,
                     if subscription.include_content { 1 } else { 0 },
                     if subscription.enabled { 1 } else { 0 },
+                    subscription.created_at,
                 ],
             )?;
             Ok(())

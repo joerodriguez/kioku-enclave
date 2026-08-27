@@ -2930,7 +2930,8 @@ async fn finalize_user_episodes_scoped(
         // the complete production owner boundary.
         let webhook_lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?;
         let webhook_destinations: Vec<(String, String)> = state
-            .control
+            .repositories
+            .notifications()
             .list_webhook_subscriptions(user_id)
             .await?
             .into_iter()
@@ -2938,7 +2939,11 @@ async fn finalize_user_episodes_scoped(
             .map(|subscription| (subscription.id, super::webhook_worker::new_event_id()))
             .collect();
 
-        let email_preference = state.control.get_email_preference(user_id).await?;
+        let email_preference = state
+            .repositories
+            .notifications()
+            .get_email_preference(user_id)
+            .await?;
         let email_preference = email_preference.enabled.then_some(email_preference);
 
         // Snapshot active installations before the user-content transaction.
@@ -2950,7 +2955,8 @@ async fn finalize_user_episodes_scoped(
         // before provider I/O. Every row created here uses the distinct p1
         // shape and binds the exact enabled Control token generation.
         let push_destinations: Vec<(String, String, String, String)> = state
-            .control
+            .repositories
+            .notifications()
             .list_push_installations(user_id)
             .await?
             .into_iter()
