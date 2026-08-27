@@ -1,5 +1,11 @@
 use crate::cp::{isotime, vertex, CpState};
 use crate::error::{EnclaveError, Result};
+use crate::persistence::{
+    FinalizationClaim, FinalizationEpisode as EpisodeRow,
+    FinalizationScreenResult as PersistedFinalizationScreen,
+    FinalizationScreenshot as ScreenshotEvidenceRow, FinalizationSettlement,
+    FinalizationUtterance as UtteranceEvidenceRow,
+};
 use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -129,64 +135,6 @@ struct ModelUrlCandidate {
     record_type: String,
     record_id: i64,
     context_kind: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct EpisodeRow {
-    id: i64,
-    started_at: String,
-    ended_at: String,
-    episode_type: Option<String>,
-    title: String,
-    summary: Option<String>,
-    participants: Option<String>,
-    languages: Option<String>,
-    action_items: Option<String>,
-    model: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct UtteranceEvidenceRow {
-    id: i64,
-    at: String,
-    at_ms: i64,
-    speaker: String,
-    source_type: String,
-    text: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct ScreenshotEvidenceRow {
-    id: i64,
-    captured_at: String,
-    captured_at_ms: i64,
-    active_app: Option<String>,
-    window_title: Option<String>,
-    url: Option<String>,
-    ocr_text: Option<String>,
-    salient_ocr_text: Option<String>,
-    is_duplicate: bool,
-    // True when representative-screen selection excluded this canonical row
-    // from the model input; it keeps its ingest-time observation and gets no
-    // episode interpretation. Recomputed on every finalization attempt.
-    elided: bool,
-    source_key: String,
-    capture_status: String,
-    visible_until: Option<String>,
-    display_id: Option<i64>,
-    primary_bundle_id: Option<String>,
-    visible_windows: Value,
-    browser_context: Value,
-    visual_signals: Value,
-    // Retained only for backwards-compatible deterministic log tests. The
-    // unified model input never consumes prior semantic outputs.
-    literal_description: Option<String>,
-    activity_summary: Option<String>,
-    relevance_reason: Option<String>,
-    milestone_type: Option<String>,
-    key_rank: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2486,11 +2434,355 @@ fn read_finalization_evidence(
     Ok((utterances, screenshots, input_identity_revision))
 }
 
+const POSTGRES_FINALIZATION_LEASE_SECONDS: i64 = 15 * 60;
+
+async fn defer_postgres_finalization(
+    state: &CpState,
+    claim: &FinalizationClaim,
+    error: &str,
+    budget: bool,
+) {
+    let Some(repository) = state.repositories.finalization() else {
+        return;
+    };
+    let now = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let (status, retry_at, count_attempt) = if budget {
+        (
+            "budget_wait",
+            Some(isotime::add_seconds(&now, 3_600.0)),
+            false,
+        )
+    } else {
+        let disposition = retry_disposition(claim.attempt_count.saturating_add(1));
+        (
+            disposition.status,
+            disposition
+                .delay_seconds
+                .map(|seconds| isotime::add_seconds(&now, seconds as f64)),
+            true,
+        )
+    };
+    if let Err(defer_error) = repository
+        .defer_finalization(
+            claim,
+            status,
+            Some(error),
+            retry_at.as_deref(),
+            &now,
+            count_attempt,
+        )
+        .await
+    {
+        warn!(episode_id = claim.episode.id, error = %defer_error, "failed to defer PostgreSQL finalization");
+    }
+}
+
+async fn finalize_user_episodes_postgres(
+    state: &CpState,
+    user_id: &str,
+    target_episode_id: Option<i64>,
+) -> Result<()> {
+    let repository = state
+        .repositories
+        .finalization()
+        .ok_or_else(|| EnclaveError::Store("PostgreSQL finalization repository missing".into()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let now = isotime::format_epoch_millis(now_ms);
+    let horizon = isotime::format_epoch_millis(now_ms - 4 * 60 * 60 * 1_000);
+    let Some(claim) = repository
+        .claim_finalization(
+            user_id,
+            target_episode_id,
+            &now,
+            &horizon,
+            i64::from(FINALIZATION_VERSION),
+            POSTGRES_FINALIZATION_LEASE_SECONDS,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let ep = claim.episode.clone();
+    let utterance_rows = claim.utterances.clone();
+    let mut screenshot_rows = claim.screenshots.clone();
+    let utts = utterance_rows
+        .iter()
+        .map(|row| (row.id, row.text.clone()))
+        .collect::<Vec<_>>();
+    let scrs = screenshot_rows
+        .iter()
+        .filter(|row| !row.is_duplicate)
+        .map(|row| (row.id, row.url.clone(), row.ocr_text.clone()))
+        .collect::<Vec<_>>();
+    let mut candidates = extract_candidates(&utts, &scrs);
+    for candidate in browser_tab_candidates(&screenshot_rows) {
+        if !candidates
+            .iter()
+            .any(|existing| existing.url == candidate.url)
+        {
+            candidates.push(candidate);
+        }
+    }
+    let model_candidates = model_url_candidates(&candidates, &screenshot_rows);
+    let (model_input, grounding) = match render_bounded_episode_analysis(
+        &ep,
+        &utterance_rows,
+        &mut screenshot_rows,
+        &model_candidates,
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            defer_postgres_finalization(state, &claim, &error.to_string(), false).await;
+            return Ok(());
+        }
+    };
+    let analysis_revision = episode_analysis_revision(&model_input);
+    if reserve_finalizer_output(state, user_id).await.is_err() {
+        defer_postgres_finalization(
+            state,
+            &claim,
+            "daily Vertex output-token budget exhausted",
+            true,
+        )
+        .await;
+        return Ok(());
+    }
+    let generation = match vertex::generate_custom(
+        state,
+        user_id,
+        vertex::VertexOperation::FinalEpisodeAnalysis,
+        FINALIZER_SYSTEM_PROMPT,
+        &model_input,
+        brief_response_schema(),
+        FINALIZER_MAX_OUTPUT_TOKENS,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            defer_postgres_finalization(state, &claim, &error.to_string(), false).await;
+            return Ok(());
+        }
+    };
+    let parsed: GeminiEpisodeAnalysisResponse = match serde_json::from_str(&generation.text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(episode_id = ep.id, error = %error, "Gemini episode analysis response unparseable");
+            defer_postgres_finalization(
+                state,
+                &claim,
+                "episode analysis response was not valid JSON",
+                false,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if !missing_grounded_entities(&parsed, &grounding).is_empty() {
+        defer_postgres_finalization(
+            state,
+            &claim,
+            "episode analysis omitted required grounded entities",
+            false,
+        )
+        .await;
+        return Ok(());
+    }
+    let ranked_screens = match validate_and_rank_screens(&parsed, &screenshot_rows) {
+        Ok(screens) => screens,
+        Err(error) => {
+            defer_postgres_finalization(state, &claim, error, false).await;
+            return Ok(());
+        }
+    };
+
+    let utterance_ids: HashSet<i64> = utts.iter().map(|row| row.0).collect();
+    let screenshot_ids: HashSet<i64> = scrs.iter().map(|row| row.0).collect();
+    let is_valid_evidence = |evidence: &EvidenceRef| match evidence.record_type.as_str() {
+        "utterance" => utterance_ids.contains(&evidence.record_id),
+        "screenshot" => screenshot_ids.contains(&evidence.record_id),
+        _ => false,
+    };
+    let decisions = parsed
+        .decisions
+        .iter()
+        .map(|decision| {
+            json!({
+                "text": decision.text,
+                "evidence": decision.evidence.iter().filter(|e| is_valid_evidence(e)).map(|e| {
+                    json!({"record_type": e.record_type, "record_id": e.record_id})
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let action_items = parsed
+        .action_items
+        .iter()
+        .map(|action| {
+            json!({
+                "text": action.text,
+                "owner": action.owner,
+                "due_at": action.due_at,
+                "evidence": action.evidence.iter().filter(|e| is_valid_evidence(e)).map(|e| {
+                    json!({"record_type": e.record_type, "record_id": e.record_id})
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    if !valid_link_candidate_selection(&parsed.important_links, &model_candidates) {
+        defer_postgres_finalization(
+            state,
+            &claim,
+            "episode analysis returned an unknown or duplicate URL candidate id",
+            false,
+        )
+        .await;
+        return Ok(());
+    }
+    let candidate_by_id = model_candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let important_links = parsed
+        .important_links
+        .iter()
+        .map(|link| {
+            let candidate = candidate_by_id[link.candidate_id.as_str()];
+            json!({
+                "url": candidate.url,
+                "label": link.label,
+                "why_it_matters": link.why_it_matters,
+                "evidence": link.evidence.iter().filter(|e| is_valid_evidence(e)).map(|e| {
+                    json!({"record_type": e.record_type, "record_id": e.record_id})
+                }).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let webhook_destinations = state
+        .repositories
+        .notifications()
+        .list_webhook_subscriptions(user_id)
+        .await?
+        .into_iter()
+        .filter(|subscription| subscription.enabled)
+        .map(|subscription| (subscription.id, super::webhook_worker::new_event_id()))
+        .collect::<Vec<_>>();
+    let email_preference = state
+        .repositories
+        .notifications()
+        .get_email_preference(user_id)
+        .await?;
+    let email_preference_include_content = email_preference
+        .enabled
+        .then_some(email_preference.include_content);
+    let push_destinations = state
+        .repositories
+        .notifications()
+        .list_push_installations(user_id)
+        .await?
+        .into_iter()
+        .map(|installation| {
+            let random = super::tokens::random_token_hex();
+            Ok((
+                super::push::PushInstallationBinding::new(
+                    &installation.id,
+                    installation.token_generation,
+                )?
+                .encode(),
+                super::tokens::new_uuid(),
+                super::tokens::pkce_s256(&random),
+                super::tokens::new_uuid(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let minute_summaries_json = serde_json::to_string(&parsed.minute_summaries)?;
+    let minutes_text = parsed
+        .minute_summaries
+        .iter()
+        .map(|minute| minute.gist.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let screen_results = ranked_screens
+        .into_iter()
+        .map(|screen| PersistedFinalizationScreen {
+            screenshot_id: screen.screenshot_id,
+            observation_revision: screen.observation_revision,
+            literal_description: screen.literal_description,
+            screen_state: screen.screen_state,
+            content_type: screen.content_type,
+            visible_text_summary: screen.visible_text_summary,
+            notable_items_json: screen.notable_items_json,
+            activity_summary: screen.activity_summary,
+            relevance_level: screen.relevance_level,
+            relevance_reason: screen.relevance_reason,
+            milestone_type: screen.milestone_type,
+            base_score: screen.base_score,
+            key_rank: screen.key_rank,
+            is_key_screen: screen.is_key_screen,
+            semantic_group: screen.semantic_group,
+        })
+        .collect();
+    let settlement = FinalizationSettlement {
+        claim: claim.clone(),
+        vertex_event_id: generation.event_id,
+        model_name: state.config.vertex_model.clone(),
+        analysis_revision,
+        title: parsed.title,
+        summary: parsed.summary,
+        minute_summaries_json,
+        minutes_text,
+        action_items_json: serde_json::to_string(&action_items)?,
+        overview: parsed.overview,
+        decisions_json: serde_json::to_string(&decisions)?,
+        important_links_json: serde_json::to_string(&important_links)?,
+        open_questions_json: serde_json::to_string(&parsed.open_questions)?,
+        ranked_screens: screen_results,
+        webhook_destinations,
+        email_preference_include_content,
+        push_destinations,
+        finalization_version: i64::from(FINALIZATION_VERSION),
+        observation_version: i64::from(super::screen_understanding::OBSERVATION_VERSION),
+        observation_prompt_version: i64::from(
+            super::screen_understanding::OBSERVATION_PROMPT_VERSION,
+        ),
+        interpretation_version: i64::from(super::screen_understanding::INTERPRETATION_VERSION),
+        interpretation_prompt_version: i64::from(
+            super::screen_understanding::INTERPRETATION_PROMPT_VERSION,
+        ),
+    };
+    match repository.settle_finalization(settlement).await {
+        Ok(delivery_count) => {
+            info!(
+                episode_id = ep.id,
+                delivery_count, "episode successfully finalized"
+            );
+            super::summarizer::embed_episodes(state, user_id, &[ep.id]).await;
+        }
+        Err(error) => {
+            warn!(episode_id = ep.id, error = %error, "failed to commit PostgreSQL finalization");
+            defer_postgres_finalization(state, &claim, &error.to_string(), false).await;
+        }
+    }
+    Ok(())
+}
+
 async fn finalize_user_episodes_scoped(
     state: &CpState,
     user_id: &str,
     target_episode_id: Option<i64>,
 ) -> Result<()> {
+    if state.repositories.finalization().is_some() {
+        return finalize_user_episodes_postgres(state, user_id, target_episode_id).await;
+    }
     // Scheduler sweeps and user-triggered scoped retries can overlap. Serialize
     // per user so only one model call can target a given episode history at a
     // time, without making one account wait behind another account's sweep.

@@ -35,3 +35,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   tenant-qualified transcript, screen, speaker, and voice-job projections.
 - `0015_memory_formation.sql` adds fleet-wide summarizer window claims and
   atomic episode/cursor settlement.
+- `0016_finalization_delivery.sql` adds fleet-owned finalization claims and
+  tenant-qualified webhook, email, and push delivery outboxes.
