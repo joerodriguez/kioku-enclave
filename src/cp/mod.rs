@@ -442,6 +442,7 @@ pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
 pub struct CpState {
     pub store: Arc<Store>,
     pub control: Arc<control_store::ControlStore>,
+    pub(crate) repositories: crate::persistence::RepositorySet,
     pub billing: Arc<dyn billing::BillingGateway>,
     pub recording_lease_gate: Arc<billing::RecordingLeaseGates>,
     pub config: Arc<CpConfig>,
@@ -600,9 +601,11 @@ pub(crate) mod wal_gate_test_support {
         store: Arc<Store>,
         control: Arc<super::control_store::ControlStore>,
     ) -> Arc<CpState> {
+        let repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
         Arc::new(CpState {
             store,
             control,
+            repositories,
             billing: Arc::new(super::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(super::billing::RecordingLeaseGates::default()),
             config: Arc::new(CpConfig {

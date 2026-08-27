@@ -229,6 +229,7 @@ mod error;
 // Store, GCS provider, route, flag, or authority wiring.
 mod legacy_gcm;
 mod ocr;
+mod persistence;
 mod schema_ladder;
 mod search;
 mod storage_observability;
@@ -1381,9 +1382,11 @@ async fn async_main() {
             .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
     );
 
+    let repositories = persistence::RepositorySet::legacy(Arc::clone(&control_store));
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,
+        repositories,
         billing: billing_gateway,
         recording_lease_gate: Arc::new(cp::billing::RecordingLeaseGates::default()),
         user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(

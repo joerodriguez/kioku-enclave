@@ -7871,6 +7871,10 @@ mod tests {
     ) -> Arc<CpState> {
         use crate::store::tests::FakeKms;
         let kms = Arc::new(FakeKms);
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(
+            kms.clone(),
+            index_gcs.clone(),
+        ));
         Arc::new(CpState {
             store: Arc::new(crate::store::Store::new_with_media_and_legacy(
                 kms.clone(),
@@ -7878,7 +7882,8 @@ mod tests {
                 current_media_gcs,
                 legacy_media_gcs,
             )),
-            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs)),
+            control: Arc::clone(&control),
+            repositories: crate::persistence::RepositorySet::legacy(control),
             billing: Arc::new(crate::cp::billing::FakeBillingGateway),
             recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {

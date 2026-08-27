@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::error::{EnclaveError, Result};
+use crate::persistence::AccountStatus;
 
 use super::{tokens, CpState, ReviewerAuthConfig};
 
@@ -423,11 +424,16 @@ pub async fn require_auth(
         &state.config.base_url,
         &token,
     ) {
-        match state.control.user_status(&user_id).await {
+        match state
+            .repositories
+            .identity_sessions()
+            .account_status(&user_id)
+            .await
+        {
             Ok(Some(status))
-                if status == "active"
+                if status == AccountStatus::Active
                     || (deletion_status_access
-                        && matches!(status.as_str(), "deleting" | "deleted")) =>
+                        && matches!(status, AccountStatus::Deleting | AccountStatus::Deleted)) =>
             {
                 req.extensions_mut().insert(AuthUser(user_id));
                 req.extensions_mut().insert(AuthEvidence {
@@ -455,13 +461,18 @@ pub async fn require_auth(
             };
             if deletion_status_access {
                 let user_id = tokens::derive_stable_uuid(&google_sub);
-                match state.control.user_status(&user_id).await {
-                    Ok(Some(status)) if matches!(status.as_str(), "deleting" | "deleted") => {
+                match state
+                    .repositories
+                    .identity_sessions()
+                    .account_status(&user_id)
+                    .await
+                {
+                    Ok(Some(AccountStatus::Deleting | AccountStatus::Deleted)) => {
                         req.extensions_mut().insert(AuthUser(user_id));
                         req.extensions_mut().insert(evidence);
                         return next.run(req).await;
                     }
-                    Ok(Some(status)) if status == "active" => {}
+                    Ok(Some(AccountStatus::Active)) => {}
                     Ok(_) => return unavailable_account(),
                     Err(e) => {
                         warn!(error = %e, "account-status lookup failed");
@@ -470,8 +481,9 @@ pub async fn require_auth(
                 }
             }
             match state
-                .control
-                .upsert_user(&google_sub, &email, state.config.signup_limit_per_day)
+                .repositories
+                .identity_sessions()
+                .upsert_subject_account(&google_sub, &email, state.config.signup_limit_per_day)
                 .await
             {
                 Ok(user) => {
