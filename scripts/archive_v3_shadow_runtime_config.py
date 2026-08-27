@@ -26,6 +26,9 @@ WAL_TAG_PATTERN = re.compile(
     r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"-archive-v3-wal\.[1-9][0-9]*\Z"
 )
+GENERIC_RELEASE_TAG_PATTERN = re.compile(
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
 U64_MAX = 18_446_744_073_709_551_615
 
 
@@ -240,6 +243,12 @@ def select_shadow_runtime_config(
     if source_ref == "main":
         return OFF
     if not is_wal_tag:
+        # ADR-0040's stable release coordinate explicitly retires Archive V3
+        # serving authority. Keep the checked active profile available only
+        # to the historical WAL-tag lane; a plain stable semver tag always
+        # bakes the complete OFF tuple into the image.
+        if GENERIC_RELEASE_TAG_PATTERN.fullmatch(source_ref) is not None:
+            return OFF
         raise ShadowRuntimeConfigError(
             "an active archive-v3 runtime requires an exact vX.Y.Z-archive-v3-wal.N tag"
         )
