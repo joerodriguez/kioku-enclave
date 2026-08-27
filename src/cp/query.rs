@@ -2270,10 +2270,9 @@ async fn rest_browser_snapshot(
     Path(source_key): Path<String>,
 ) -> Response {
     let result = s
-        .store
-        .wal_authoritative_read(&user.0, move |conn| {
-            load_browser_snapshot(conn, &source_key)
-        })
+        .repositories
+        .memory_queries()
+        .browser_snapshot(&user.0, &source_key)
         .await;
     match result {
         Ok(Some(snapshot)) => Json(snapshot).into_response(),
@@ -2284,7 +2283,7 @@ async fn rest_browser_snapshot(
 
 const CAPTURE_V2_BROWSER_SOURCE_PREFIX: &str = "capture-v2-browser:";
 
-fn load_browser_snapshot(
+pub(crate) fn load_browser_snapshot(
     conn: &Connection,
     source_key: &str,
 ) -> crate::error::Result<Option<Value>> {

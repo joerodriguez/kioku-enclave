@@ -241,6 +241,15 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
             })
             .await
     }
+
+    async fn browser_snapshot(&self, account_id: &str, source_key: &str) -> Result<Option<Value>> {
+        let source_key = source_key.to_owned();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::query::load_browser_snapshot(connection, &source_key)
+            })
+            .await
+    }
 }
 
 fn legacy_feed(

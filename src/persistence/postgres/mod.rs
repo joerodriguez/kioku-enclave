@@ -22,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 9;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -161,6 +161,14 @@ impl PostgresPersistence {
         if version == 8 {
             sqlx::raw_sql(include_str!(
                 "../../../migrations/0009_episode_query_contract.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
+            version = 9;
+        }
+        if version == 9 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0010_browser_snapshot_query.sql"
             ))
             .execute(&mut *transaction)
             .await?;
@@ -308,7 +316,7 @@ mod tests {
             vec![account_id.clone()]
         );
 
-        let canonical: crate::cp::media::CaptureEventManifest =
+        let mut canonical: crate::cp::media::CaptureEventManifest =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 2,
                 "event_id": "capture-contract-0",
@@ -341,12 +349,47 @@ mod tests {
                     "primary_window_id": 7,
                     "window_title": "Contract",
                     "display_id": 1,
-                    "active_url": "https://example.com/contract",
-                    "active_url_title": "Contract",
+                    "active_url": "https://meet.google.com/abc?authuser=0#frag",
+                    "active_url_title": "Meeting",
                     "browser_permission_status": "granted"
                 }
             }))
             .unwrap();
+        let browser_state_key = "device-contract:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
+        let context = canonical.context.as_mut().unwrap();
+        context.browser_state_key = Some(browser_state_key.into());
+        context.browser_snapshot = Some(crate::cp::media::BrowserSnapshot {
+            state_key: browser_state_key.into(),
+            browser_bundle_id: "com.apple.Safari".into(),
+            browser_name: "Safari".into(),
+            permission_status: "granted".into(),
+            active_window_index: Some(1),
+            active_tab_index: Some(1),
+            reported_tab_count: 2,
+            truncated: false,
+            ambient_tab_collection_enabled: Some(true),
+            content_hash: "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3".into(),
+            tabs: vec![
+                crate::cp::media::BrowserTab {
+                    window_index: 1,
+                    tab_index: 1,
+                    title: Some("Meeting".into()),
+                    url: Some("https://meet.google.com/abc?authuser=0#frag".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: true,
+                    is_loading: None,
+                },
+                crate::cp::media::BrowserTab {
+                    window_index: 1,
+                    tab_index: 2,
+                    title: Some("Document".into()),
+                    url: Some("https://docs.google.com/document/d/exact/edit?tab=t.0".into()),
+                    url_scheme: Some("https".into()),
+                    is_active: false,
+                    is_loading: None,
+                },
+            ],
+        });
         let canonical_digest = crate::cp::media::manifest_digest(&canonical).unwrap();
         let object_key = crate::store::canonical_capture_media_object_key(
             &account_id,
@@ -1010,7 +1053,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) \
-                 VALUES($1,1,'2026-08-27T12:00:00Z','2026-08-27T12:01:00Z',60,'mic')",
+                 VALUES($1,1,'2026-08-27T11:59:00Z','2026-08-27T11:59:59Z',59,'mic')",
             )
             .bind(tenant)
             .execute(&pool)
@@ -1029,8 +1072,10 @@ mod tests {
             .unwrap();
         }
         sqlx::query(
-            "INSERT INTO screenshots(account_id,id,captured_at,ocr_text,url,embedding) \
-             VALUES($1,1,'2026-08-27T12:02:00Z','PostgreSQL diagram','https://example.com/db',$2::vector)",
+            "INSERT INTO screenshots(account_id,id,captured_at,ocr_text,url,source_key, \
+                                      browser_snapshot_source_key,embedding) \
+             VALUES($1,1,'2026-08-27T12:00:00Z','PostgreSQL diagram','https://example.com/db', \
+                    'cloud-v2:capture-contract-0','capture-v2-browser:capture-contract-0',$2::vector)",
         )
         .bind(&account_id)
         .bind(&embedding)
@@ -1161,6 +1206,15 @@ mod tests {
         assert_eq!(feed.records[0].episode_id, Some(1));
         assert_eq!(feed.records[1].kind, "utterance");
         assert_eq!(feed.records[1].episode_id, Some(1));
+        let browser = repositories
+            .memory_queries()
+            .browser_snapshot(&account_id, "capture-v2-browser:capture-contract-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(browser["browser_name"], "Safari");
+        assert_eq!(browser["tabs"].as_array().unwrap().len(), 2);
+        assert_eq!(browser["tabs"][0]["is_active"], true);
         let mcp_search = repositories
             .memory_queries()
             .mcp_search_transcripts(

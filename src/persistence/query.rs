@@ -122,4 +122,5 @@ pub(crate) trait MemoryQueryRepository: Send + Sync {
         account_id: &str,
         request: &McpTimeRangeRequest,
     ) -> Result<Value>;
+    async fn browser_snapshot(&self, account_id: &str, source_key: &str) -> Result<Option<Value>>;
 }

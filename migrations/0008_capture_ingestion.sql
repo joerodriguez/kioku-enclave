@@ -158,7 +158,7 @@ CREATE TABLE browser_observations_v2 (
     FOREIGN KEY (account_id, event_id)
         REFERENCES capture_events(account_id, event_id) ON DELETE CASCADE,
     FOREIGN KEY (account_id, state_key)
-        REFERENCES browser_states_v2(account_id, state_key)
+        REFERENCES browser_states_v2(account_id, state_key) ON DELETE CASCADE
 );
 
 CREATE TABLE media_processing_jobs (
