@@ -62,15 +62,15 @@ impl MediaReferenceBatchOutcome {
         self.last_sequence
     }
 
-    pub(in crate::cp::media) const fn new_count(&self) -> u16 {
+    pub(crate) const fn new_count(&self) -> u16 {
         self.new_count
     }
 
-    pub(in crate::cp::media) const fn duplicate_count(&self) -> u16 {
+    pub(crate) const fn duplicate_count(&self) -> u16 {
         self.duplicate_count
     }
 
-    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
+    pub(crate) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -89,7 +89,7 @@ pub(crate) struct MediaReferenceBatchPlan {
 }
 
 impl MediaReferenceBatchPlan {
-    pub(in crate::cp::media) fn new(
+    pub(crate) fn new(
         account_id: String,
         batch_id: String,
         events: Vec<CaptureEventManifest>,
@@ -101,7 +101,7 @@ impl MediaReferenceBatchPlan {
     /// Handle on the rebase-required reason `apply()` refused with, taken by
     /// the route before `prepare` consumes the plan. See
     /// [`RebaseRefusalSink`].
-    pub(in crate::cp::media) fn refusal_sink(&self) -> RebaseRefusalSink {
+    pub(crate) fn refusal_sink(&self) -> RebaseRefusalSink {
         self.refusal.clone()
     }
 

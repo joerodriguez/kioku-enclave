@@ -5,6 +5,7 @@
 //! SQLite/GCS stores while the PostgreSQL implementation is built vertically.
 
 mod billing;
+mod capture;
 mod entitlement;
 mod identity;
 mod legacy;
@@ -21,6 +22,10 @@ mod postgres;
 
 use std::sync::Arc;
 
+pub(crate) use capture::{
+    CaptureCommit, CaptureCommitResult, CapturePreflight, CaptureRepository, ReferenceBatchCommit,
+    ReferenceBatchCommitResult,
+};
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
@@ -43,9 +48,9 @@ pub(crate) use work::{
 };
 
 use self::legacy::{
-    LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyEntitlementRepository,
-    LegacyIdentitySessionRepository, LegacyMemoryQueryRepository, LegacyNotificationRepository,
-    LegacyOAuthRepository, LegacyWorkRepository,
+    LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
+    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMemoryQueryRepository,
+    LegacyNotificationRepository, LegacyOAuthRepository, LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 use crate::store::Store;
@@ -59,6 +64,7 @@ pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     lifecycle: Arc<dyn AccountLifecycleRepository>,
     billing: Arc<dyn BillingRepository>,
+    captures: Arc<dyn CaptureRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
@@ -72,6 +78,7 @@ impl RepositorySet {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
             billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
+            captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
@@ -86,6 +93,7 @@ impl RepositorySet {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
+            captures: Arc::clone(&persistence) as Arc<dyn CaptureRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
@@ -104,6 +112,10 @@ impl RepositorySet {
 
     pub(crate) fn billing(&self) -> &dyn BillingRepository {
         self.billing.as_ref()
+    }
+
+    pub(crate) fn captures(&self) -> &dyn CaptureRepository {
+        self.captures.as_ref()
     }
 
     pub(crate) fn oauth(&self) -> &dyn OAuthRepository {

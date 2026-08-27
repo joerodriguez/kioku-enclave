@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
+use crate::persistence::{CaptureCommit, CapturePreflight, ReferenceBatchCommit};
 
 use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
@@ -999,7 +1000,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn manifest_digest(manifest: &CaptureEventManifest) -> Result<String> {
+pub(crate) fn manifest_digest(manifest: &CaptureEventManifest) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(manifest)?))
 }
 
@@ -1399,7 +1400,7 @@ struct DescendingPageQuery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreflightOutcome {
+pub(crate) enum PreflightOutcome {
     New,
     Duplicate { committed_through_sequence: i64 },
 }
@@ -1548,54 +1549,29 @@ async fn upload_screen_reference_batch(
             )
         }
     };
-    // ADR-0022 per-domain routing: a WAL-authoritative user's preflight and
-    // batch write route through the settled lane — the sealed plan covers the
-    // complete manifest vector and every reference write, and the settle-
-    // submit replaces the legacy write+save pair with acknowledgement only
-    // after witness settlement. Billing reserve/complete, limits, leases, and
-    // telemetry are identical on both branches.
-    let wal_authoritative = state.store.is_wal_authoritative(&user_id);
-    let preflight = if wal_authoritative {
-        let events = request.events.clone();
-        let digests = validated.manifest_digests.clone();
-        state
-            .store
-            .wal_authoritative_read(&user_id, move |conn| {
-                events
-                    .iter()
-                    .zip(&digests)
-                    .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
-                    .collect::<Result<Vec<_>>>()
-            })
+    let mut preflight = Vec::with_capacity(request.events.len());
+    for (event, digest) in request.events.iter().zip(&validated.manifest_digests) {
+        match state
+            .repositories
+            .captures()
+            .preflight_event(&user_id, event, digest, None)
             .await
-    } else {
-        state
-            .store
-            .with_user_read(&user_id, |conn| {
-                request
-                    .events
-                    .iter()
-                    .zip(&validated.manifest_digests)
-                    .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .await
-    };
-    let preflight = match preflight {
-        Ok(value) => value,
-        Err(error) => {
-            return capture_error_response_for_route(
-                "screen_reference_batch",
-                started_at,
-                manifest,
-                error,
-            )
+        {
+            Ok(outcome) => preflight.push(outcome),
+            Err(error) => {
+                return capture_error_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    error,
+                )
+            }
         }
-    };
+    }
     let new_event_ids = preflight
         .iter()
         .zip(&validated.event_ids)
-        .filter(|(outcome, _)| matches!(outcome, PreflightOutcome::New))
+        .filter(|(outcome, _)| matches!(outcome, CapturePreflight::New))
         .map(|(_, event_id)| event_id.clone())
         .collect::<Vec<_>>();
     if let Err(response) = super::billing::reserve_recording_delivery_batch(
@@ -1621,96 +1597,27 @@ async fn upload_screen_reference_batch(
         );
     }
 
-    let recorded = if wal_authoritative {
-        let plan = match wal::MediaReferenceBatchPlan::new(
-            user_id.clone(),
-            request.batch_id.clone(),
-            request.events.clone(),
-            enclave_commit_stamp(),
-        ) {
-            Ok(plan) => plan,
-            Err(_) => {
-                return capture_error_response_for_route(
-                    "screen_reference_batch",
-                    started_at,
-                    manifest,
-                    crate::error::EnclaveError::Store(
-                        "reference batch plan construction failed".into(),
-                    ),
-                )
-            }
-        };
-        // Taken BEFORE `prepare` consumes the plan: the submit narrows every
-        // owner refusal to a content-free conflict, so the rebase-required
-        // reason has to travel out of band or the route answers 409 and the
-        // client's durable outbox re-posts an event only a rebase can fix.
-        let refusal = plan.refusal_sink();
-        let prepared =
-            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
-                Ok(prepared) => prepared,
-                Err(_) => {
-                    return capture_error_response_for_route(
-                        "screen_reference_batch",
-                        started_at,
-                        manifest,
-                        crate::error::EnclaveError::Store(
-                            "reference batch plan construction failed".into(),
-                        ),
-                    )
-                }
-            };
-        match state
-            .store
-            .wal_authoritative_submit(&user_id, prepared)
-            .await
-        {
-            Ok(outcome) => RecordedReferenceBatch {
-                new_count: usize::from(outcome.new_count()),
-                duplicate_count: usize::from(outcome.duplicate_count()),
-                committed_through_sequence: outcome.committed_through_sequence(),
-            },
-            Err(error) => {
-                return capture_error_response_for_route(
-                    "screen_reference_batch",
-                    started_at,
-                    manifest,
-                    refusal.observed().unwrap_or(error),
-                )
-            }
-        }
-    } else {
-        let recorded = state
-            .store
-            .with_user(&user_id, |conn| {
-                record_reference_batch(conn, &user_id, &request.events, &validated.manifest_digests)
-            })
-            .await;
-        let recorded = match recorded {
-            Ok(value) => value,
-            Err(error) => {
-                return capture_error_response_for_route(
-                    "screen_reference_batch",
-                    started_at,
-                    manifest,
-                    error,
-                )
-            }
-        };
-        if let Err(error) = state.store.save_user(&user_id).await {
-            tracing::error!(error = %error, "capture reference batch persistence failed");
-            return capture_failure_response_for_route(
+    let recorded = match state
+        .repositories
+        .captures()
+        .commit_reference_batch(ReferenceBatchCommit {
+            account_id: user_id.clone(),
+            batch_id: request.batch_id.clone(),
+            events: request.events.clone(),
+            manifest_digests: validated.manifest_digests.clone(),
+            committed_at: enclave_commit_stamp(),
+        })
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return capture_error_response_for_route(
                 "screen_reference_batch",
                 started_at,
                 manifest,
-                CaptureIngestFailureReason::PersistenceUnavailable,
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "capture persistence failed",
-                )
-                    .into_response(),
-            );
+                error,
+            )
         }
-        recorded
     };
     super::billing::complete_recording_delivery_batch(
         &state,
@@ -1998,70 +1905,20 @@ async fn upload_capture_event(
             )
         }
     };
-    // ADR-0022 per-domain routing. This preflight is the canonical arm's whole
-    // residual and it is load-bearing on BOTH branches:
-    //
-    //   * A WAL-authoritative user reads the SETTLED lane. Without that, a
-    //     selected user's preflight would run through `with_user`, which
-    //     refuses outright for a WAL-authoritative archive, and every capture
-    //     would fail before it reached a plan.
-    //   * `CanonicalCaptureEventPlan` treats an already-present event as a
-    //     hard `Precondition` failure (`ensure_domain_targets_absent`), and
-    //     the legacy route answers 200 for it. Catching the duplicate HERE,
-    //     before the submit, is what keeps a re-posted event answering 200
-    //     instead of 409. The reference arm's plan handles a duplicate as a
-    //     first-class outcome, so this read is a fast path for it, not a
-    //     correctness precondition.
-    //
-    // Same shape as `upload_screen_reference_batch` above.
-    let wal_authoritative = state.store.is_wal_authoritative(&user_id);
-    let preflight = if wal_authoritative {
-        let preflight_manifest = manifest.clone();
-        let preflight_digest = digest.clone();
-        let preflight_object_keys = object_key_candidates.clone();
-        state
-            .store
-            .wal_authoritative_read(&user_id, move |conn| {
-                preflight_source_event(
-                    conn,
-                    &preflight_manifest,
-                    &preflight_digest,
-                    preflight_object_keys.as_deref(),
-                )
-            })
-            .await
-    } else {
-        state
-            .store
-            .with_user(&user_id, |conn| {
-                preflight_source_event(conn, &manifest, &digest, object_key_candidates.as_deref())
-            })
-            .await
-    };
+    let preflight = state
+        .repositories
+        .captures()
+        .preflight_event(
+            &user_id,
+            &manifest,
+            &digest,
+            object_key_candidates.as_deref(),
+        )
+        .await;
     match preflight {
-        Ok(PreflightOutcome::Duplicate {
+        Ok(CapturePreflight::Duplicate {
             committed_through_sequence,
         }) => {
-            // A prior attempt may have committed only to the in-memory archive
-            // before its durable save failed. Flush even duplicate preflight
-            // state before acknowledging or clearing delayed-delivery authority.
-            // The WAL lane has no such half-state: it acknowledges only after
-            // witness settlement and never persists through `save_user`.
-            if !wal_authoritative {
-                if let Err(error) = state.store.save_user(&user_id).await {
-                    tracing::error!(error = %error, "duplicate capture persistence failed");
-                    return capture_failure_response(
-                        started_at,
-                        Some(&manifest),
-                        CaptureIngestFailureReason::PersistenceUnavailable,
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "capture persistence failed",
-                        )
-                            .into_response(),
-                    );
-                }
-            }
             if encrypted_outbox_delivery {
                 super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id)
                     .await;
@@ -2082,7 +1939,7 @@ async fn upload_capture_event(
             )
                 .into_response();
         }
-        Ok(PreflightOutcome::New) => {}
+        Ok(CapturePreflight::New) => {}
         Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     }
 
@@ -2200,153 +2057,25 @@ async fn upload_capture_event(
         media_authority = Some(write.authority);
     }
 
-    // The settle-submit replaces the legacy write+save pair: acknowledgement
-    // comes only after immutable publication and witness settlement, so there
-    // is no `save_user` on this branch and nothing to flush. Billing, limits,
-    // leases, the media upload above and the telemetry below are identical on
-    // both branches.
-    let (committed, duplicate) = if wal_authoritative {
-        match manifest.media_disposition {
-            MediaDisposition::Canonical => {
-                let object_key = object_key
-                    .as_deref()
-                    .expect("validated canonical object key");
-                // The plan requires the immutable upload handoff: an exact
-                // account-bound object key and a POSITIVE provider generation.
-                // A missing or non-positive generation means the upload above
-                // did not actually fix the object, so refuse rather than mint
-                // a receipt for media nothing can be replayed against.
-                let Some(generation) = media_generation.filter(|value| *value > 0) else {
-                    tracing::error!("canonical capture reached the WAL lane without a generation");
-                    return capture_failure_response(
-                        started_at,
-                        Some(&manifest),
-                        CaptureIngestFailureReason::MediaStorageUnavailable,
-                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
-                    );
-                };
-                let prepared = match prepare_canonical_capture_event(
-                    user_id.clone(),
-                    manifest.clone(),
-                    object_key.to_string(),
-                    generation,
-                    media_authority
-                        .clone()
-                        .expect("canonical media has a retention decision"),
-                    commit_stamp.clone(),
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => {
-                        return capture_error_response(
-                            started_at,
-                            Some(&manifest),
-                            EnclaveError::Store(
-                                "canonical capture plan construction failed".into(),
-                            ),
-                        )
-                    }
-                };
-                match state
-                    .store
-                    .wal_authoritative_submit(&user_id, prepared)
-                    .await
-                {
-                    Ok(outcome) => (outcome.committed_through_sequence(), false),
-                    Err(error) => {
-                        return capture_error_response(started_at, Some(&manifest), error)
-                    }
-                }
-            }
-            MediaDisposition::Reference => {
-                let plan = match wal::MediaReferenceEventPlan::new(
-                    user_id.clone(),
-                    manifest.clone(),
-                    enclave_commit_stamp(),
-                ) {
-                    Ok(plan) => plan,
-                    Err(_) => {
-                        return capture_error_response(
-                            started_at,
-                            Some(&manifest),
-                            EnclaveError::Store(
-                                "reference capture plan construction failed".into(),
-                            ),
-                        )
-                    }
-                };
-                // Taken BEFORE `prepare` consumes the plan: the submit narrows
-                // every owner refusal to a content-free conflict, and a
-                // rebase-required refusal that arrives content-free is a wedge
-                // -- the client re-posts an event only a rebase can fix.
-                let refusal = plan.refusal_sink();
-                let prepared =
-                    match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-                    {
-                        Ok(prepared) => prepared,
-                        Err(_) => {
-                            return capture_error_response(
-                                started_at,
-                                Some(&manifest),
-                                EnclaveError::Store(
-                                    "reference capture plan construction failed".into(),
-                                ),
-                            )
-                        }
-                    };
-                match state
-                    .store
-                    .wal_authoritative_submit(&user_id, prepared)
-                    .await
-                {
-                    Ok(outcome) => (outcome.committed_through_sequence(), outcome.duplicate()),
-                    Err(error) => {
-                        return capture_error_response(
-                            started_at,
-                            Some(&manifest),
-                            refusal.observed().unwrap_or(error),
-                        )
-                    }
-                }
-            }
-        }
-    } else {
-        let outcome = state
-            .store
-            .with_user(&user_id, |conn| {
-                match manifest.media_disposition {
-                    MediaDisposition::Canonical => record_source_event_with_generation(
-                        conn,
-                        &user_id,
-                        &manifest,
-                        &digest,
-                        object_key
-                            .as_deref()
-                            .expect("validated canonical object key"),
-                        media_generation,
-                        media_authority.as_ref(),
-                    )?,
-                    MediaDisposition::Reference => {
-                        record_reference_event(conn, &user_id, &manifest, &digest)?
-                    }
-                };
-                committed_through_sequence(conn, &manifest.stream_id)
-            })
-            .await;
-        let committed = match outcome {
-            Ok(value) => value,
-            Err(error) => return capture_error_response(started_at, Some(&manifest), error),
-        };
-        if let Err(error) = state.store.save_user(&user_id).await {
-            tracing::error!(error = %error, "capture database persistence failed");
-            return capture_failure_response(
-                started_at,
-                Some(&manifest),
-                CaptureIngestFailureReason::PersistenceUnavailable,
-                (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
-            );
-        }
-        (committed, false)
+    let result = match state
+        .repositories
+        .captures()
+        .commit_event(CaptureCommit {
+            account_id: user_id.clone(),
+            manifest: manifest.clone(),
+            manifest_digest: digest.clone(),
+            object_key,
+            object_generation: media_generation,
+            media_authority,
+            committed_at: commit_stamp,
+        })
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
+    let committed = result.committed_through_sequence;
+    let duplicate = result.duplicate;
     if encrypted_outbox_delivery {
         super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id).await;
     }
@@ -3220,7 +2949,6 @@ enum CaptureIngestFailureReason {
     RecordingLeaseConflict,
     RecordingLeaseUnavailable,
     MediaStorageUnavailable,
-    PersistenceUnavailable,
     CanonicalUnavailable,
     ContextFingerprintMismatch,
     ReferenceTargetMismatch,
@@ -3253,7 +2981,6 @@ impl CaptureIngestFailureReason {
             Self::RecordingLeaseConflict => "recording_lease_conflict",
             Self::RecordingLeaseUnavailable => "recording_lease_unavailable",
             Self::MediaStorageUnavailable => "media_storage_unavailable",
-            Self::PersistenceUnavailable => "persistence_unavailable",
             Self::CanonicalUnavailable => "canonical_unavailable",
             Self::ContextFingerprintMismatch => "context_fingerprint_mismatch",
             Self::ReferenceTargetMismatch => "target_mismatch",
@@ -3390,7 +3117,7 @@ fn rate_limited_response() -> Response {
     response
 }
 
-fn preflight_source_event(
+pub(crate) fn preflight_source_event(
     conn: &Connection,
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
@@ -3430,7 +3157,7 @@ fn preflight_source_event(
     })
 }
 
-fn committed_through_sequence(conn: &Connection, stream_id: &str) -> Result<i64> {
+pub(crate) fn committed_through_sequence(conn: &Connection, stream_id: &str) -> Result<i64> {
     conn.query_row(
         "SELECT committed_through_sequence FROM capture_streams WHERE id=?1",
         [stream_id],
@@ -3702,7 +3429,7 @@ async fn prepare_canonical_media_write(
     }
 }
 
-fn prepare_canonical_capture_event(
+pub(crate) fn prepare_canonical_capture_event(
     user_id: String,
     manifest: CaptureEventManifest,
     object_key: String,
@@ -5244,7 +4971,7 @@ fn record_media_authority(
     Ok(())
 }
 
-fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Value {
+pub(crate) fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Value {
     let mut value = json!({
         "active_app": context.active_app,
         "active_url": context.active_url,
@@ -5273,7 +5000,10 @@ fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Valu
     value
 }
 
-fn semantic_context_fingerprint(context: &CaptureContext, dedupe_version: u32) -> Result<String> {
+pub(crate) fn semantic_context_fingerprint(
+    context: &CaptureContext,
+    dedupe_version: u32,
+) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(&semantic_context_value(
         context,
         dedupe_version,
@@ -5343,7 +5073,7 @@ fn enclave_commit_stamp() -> String {
     )
 }
 
-fn record_reference_event(
+pub(crate) fn record_reference_event(
     conn: &Connection,
     account_id: &str,
     manifest: &CaptureEventManifest,
@@ -5356,13 +5086,13 @@ fn record_reference_event(
     Ok(outcome)
 }
 
-struct RecordedReferenceBatch {
-    new_count: usize,
-    duplicate_count: usize,
-    committed_through_sequence: i64,
+pub(crate) struct RecordedReferenceBatch {
+    pub(crate) new_count: usize,
+    pub(crate) duplicate_count: usize,
+    pub(crate) committed_through_sequence: i64,
 }
 
-fn record_reference_batch(
+pub(crate) fn record_reference_batch(
     conn: &Connection,
     account_id: &str,
     events: &[CaptureEventManifest],
@@ -6246,22 +5976,12 @@ mod tests {
         );
     }
 
-    /// ADR-0022: the ingest route is dual-path, and structurally so.
+    /// ADR-0040: the route has exactly one typed persistence authority.
     ///
-    /// The preflight read is the canonical arm's whole residual, and it has to
-    /// route: a selected user's `with_user` preflight would refuse before any
-    /// plan was reached. Both dispositions must submit, because a mac_screen
-    /// stream interleaves canonical screenshots and reference pointers by
-    /// sequence and `advance_contiguous_ack` walks only while the next
-    /// sequence exists — one migrated arm would stall the stream at the first
-    /// refused event of the other.
-    ///
-    /// Falsifiability, checked by sabotage: deleting either
-    /// `wal_authoritative_submit` call drops that count to 1; routing the
-    /// preflight back to `with_user` drops the `wal_authoritative_read` count
-    /// to 0 and raises the `with_user` count to 2.
+    /// Legacy SQLite/WAL selection is private to `LegacyCaptureRepository`;
+    /// the same route therefore runs unchanged against PostgreSQL.
     #[test]
-    fn capture_event_route_is_exactly_dual_path_on_both_dispositions() {
+    fn capture_event_route_uses_only_the_capture_repository() {
         let source = include_str!("media.rs");
         let start = source
             .find(concat!("async fn upload_capture_", "event"))
@@ -6270,56 +5990,23 @@ mod tests {
             .find(concat!("fn capture_requires_recording_", "lease"))
             .unwrap();
         let route = &source[start..end];
-        assert_eq!(
-            route.matches(concat!("is_wal_", "authoritative(")).count(),
-            1
-        );
-        // One routed preflight read for the selected branch.
+        assert_eq!(route.matches(".preflight_event(").count(), 1);
+        assert_eq!(route.matches(".commit_event(").count(), 1);
+        assert_eq!(route.matches(".captures()").count(), 2);
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "read("))
                 .count(),
-            1
+            0
         );
-        // BOTH dispositions submit: canonical and reference.
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "submit("))
                 .count(),
-            2
+            0
         );
-        assert_eq!(
-            route
-                .matches(concat!("prepare_canonical_capture_", "event("))
-                .count(),
-            1
-        );
-        assert_eq!(
-            source
-                .matches(concat!(
-                    "CanonicalCaptureEventPlan::",
-                    "new_with_authority("
-                ))
-                .count(),
-            1,
-            "production and selected E2E fixtures share the one sealed constructor"
-        );
-        assert_eq!(
-            route
-                .matches(concat!("MediaReferenceEventPlan::", "new("))
-                .count(),
-            1
-        );
-        // The legacy branch keeps its exact preflight + write + save trio and
-        // nothing more.
-        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 2);
-        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 2);
-        // The D4 gate is gone: ingest is migrated, so nothing here may refuse
-        // a selected user on the grounds that the domain is deferred.
-        assert!(!route.contains(concat!("wal_domain_", "refusal")));
-        // Both submits carry the rebase reason out of band or the client's
-        // durable outbox retries an unrebasable event forever.
-        assert_eq!(route.matches("refusal.observed()").count(), 1);
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 0);
+        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 0);
     }
 
     /// The LEGACY path stays byte-intact: `commit_stamp: None` leaves every
@@ -6380,11 +6067,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_batch_route_is_exactly_dual_path() {
-        // ADR-0022: the WAL-authoritative branch settles through the routed
-        // surfaces only, and the legacy branch keeps its exact write+save
-        // pair; the plan's apply shares record_reference_event_in_transaction
-        // with the legacy path, so the branches cannot drift semantically.
+    fn reference_batch_route_uses_only_the_capture_repository() {
         let source = include_str!("media.rs");
         let start = source
             .find(concat!("async fn upload_screen_", "reference_batch"))
@@ -6393,32 +6076,22 @@ mod tests {
             .find(concat!("async fn upload_capture_", "event"))
             .unwrap();
         let route = &source[start..end];
-        assert_eq!(
-            route.matches(concat!("is_wal_", "authoritative(")).count(),
-            1
-        );
+        assert_eq!(route.matches(".preflight_event(").count(), 1);
+        assert_eq!(route.matches(".commit_reference_batch(").count(), 1);
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "read("))
                 .count(),
-            1
+            0
         );
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "submit("))
                 .count(),
-            1
+            0
         );
-        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 1);
-        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 1);
-        let submit_at = route
-            .find(concat!("wal_authoritative_", "submit("))
-            .unwrap();
-        let legacy_write_at = route.find(concat!(".with_", "user(")).unwrap();
-        assert!(
-            submit_at < legacy_write_at,
-            "the settled branch must precede the legacy write"
-        );
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 0);
+        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 0);
     }
 
     #[test]

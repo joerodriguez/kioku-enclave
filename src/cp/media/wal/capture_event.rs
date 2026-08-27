@@ -64,7 +64,7 @@ impl CanonicalCaptureEventOutcome {
         &self.stream_id
     }
 
-    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
+    pub(crate) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -110,7 +110,7 @@ impl CanonicalCaptureEventPlan {
         )
     }
 
-    pub(in crate::cp::media) fn new_with_authority(
+    pub(crate) fn new_with_authority(
         account_id: String,
         manifest: CaptureEventManifest,
         object_key: String,

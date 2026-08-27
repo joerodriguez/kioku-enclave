@@ -4,6 +4,7 @@
 //! legacy stores while application callers move to typed persistence ports.
 
 mod billing;
+mod capture;
 mod entitlement;
 mod identity;
 mod lifecycle;
@@ -13,6 +14,7 @@ mod query;
 mod work;
 
 pub(super) use billing::LegacyBillingRepository;
+pub(super) use capture::LegacyCaptureRepository;
 pub(super) use entitlement::LegacyEntitlementRepository;
 pub(super) use identity::LegacyIdentitySessionRepository;
 pub(super) use lifecycle::LegacyAccountLifecycleRepository;
