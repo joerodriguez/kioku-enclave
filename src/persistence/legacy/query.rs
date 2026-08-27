@@ -27,6 +27,10 @@ impl LegacyMemoryQueryRepository {
 
 #[async_trait]
 impl MemoryQueryRepository for LegacyMemoryQueryRepository {
+    async fn export(&self, account_id: &str) -> Result<Value> {
+        crate::cp::sync::dump_user_export(&self.store, account_id).await
+    }
+
     async fn search(&self, account_id: &str, request: &SearchRequest) -> Result<Vec<SearchHit>> {
         let request = request.clone();
         self.store

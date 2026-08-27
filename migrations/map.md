@@ -41,3 +41,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   outbound request evidence for crash-safe multi-process delivery.
 - `0018_capture_upload_admission.sql` adds fleet-wide GCS upload admission and
   the single installed processing-media key for each account.
+- `0019_voice_lineage_export.sql` adds the remaining voice representative and
+  identity-binding records exposed by the user export contract.

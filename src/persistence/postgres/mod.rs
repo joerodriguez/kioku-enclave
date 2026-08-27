@@ -27,7 +27,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 18;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 19;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -236,6 +236,14 @@ impl PostgresPersistence {
         if version == 17 {
             sqlx::raw_sql(include_str!(
                 "../../../migrations/0018_capture_upload_admission.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
+            version = 18;
+        }
+        if version == 18 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0019_voice_lineage_export.sql"
             ))
             .execute(&mut *transaction)
             .await?;
@@ -2252,6 +2260,32 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let export = repositories
+            .memory_queries()
+            .export(&account_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            export
+                .get("capture_events")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(export
+            .get("capture_events")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|events| events.first())
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|event| !event.contains_key("account_id")));
+        assert_eq!(
+            export
+                .get("voice_profile_representatives")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
 
         let billing_detach_id = repositories
             .billing()

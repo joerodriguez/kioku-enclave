@@ -53,4 +53,8 @@ impl MediaObjectStore for LegacyMediaObjectStore {
     async fn delete_compatible(&self, object_name: &str) -> Result<()> {
         self.store.delete_media(object_name).await
     }
+
+    async fn purge_account(&self, account_id: &str) -> Result<()> {
+        self.store.delete_user(account_id).await
+    }
 }

@@ -19,6 +19,125 @@ use crate::{
 
 use super::PostgresPersistence;
 
+const EXPORT_TABLES: &[(&str, &str, &str)] = &[
+    ("utterances", "utterances", "id"),
+    ("screenshots", "screenshots", "id"),
+    ("screenshot_images", "screenshot_images", "id"),
+    ("episodes", "episodes", "id"),
+    ("episode_final_briefs", "episode_final_briefs", "episode_id"),
+    ("capture_sessions", "capture_sessions", "created_at,id"),
+    ("capture_streams", "capture_streams", "created_at,id"),
+    ("capture_events", "capture_events", "started_at,event_id"),
+    (
+        "browser_states_v2",
+        "browser_states_v2",
+        "created_at,state_key",
+    ),
+    (
+        "browser_observations_v2",
+        "browser_observations_v2",
+        "observed_at,event_id",
+    ),
+    (
+        "media_objects",
+        "media_objects",
+        "created_at,event_id,asset_id",
+    ),
+    (
+        "speaker_observations",
+        "speaker_observations",
+        "started_at,event_id,id",
+    ),
+    ("people", "people", "display_name,id"),
+    ("voice_profiles", "voice_profiles", "person_id,id"),
+    (
+        "voice_samples",
+        "voice_samples",
+        "speaker_observation_id,id",
+    ),
+    (
+        "speaker_clusters",
+        "speaker_clusters",
+        "work_unit_id,speaker_local_id,id",
+    ),
+    (
+        "episode_speaker_slots",
+        "episode_speaker_slots",
+        "episode_id,slot_ordinal,id",
+    ),
+    (
+        "voice_profile_representatives",
+        "voice_profile_representatives",
+        "profile_id,channel_domain,id",
+    ),
+    (
+        "voice_embedding_jobs",
+        "voice_embedding_jobs",
+        "speaker_observation_id,embedding_space,processor_version,id",
+    ),
+    (
+        "episode_participants",
+        "episode_participants",
+        "episode_id,participant_key,id",
+    ),
+    (
+        "visual_speaker_observations",
+        "visual_speaker_observations",
+        "observed_at,event_id,id",
+    ),
+    (
+        "profile_identity_bindings",
+        "profile_identity_bindings",
+        "voice_profile_id,id",
+    ),
+    ("person_name_claims", "person_name_claims", "observed_at,id"),
+    ("identity_evidence", "identity_evidence", "observed_at,id"),
+    (
+        "voice_profile_revisions",
+        "voice_profile_revisions",
+        "profile_id,id",
+    ),
+    (
+        "voice_sample_profile_assignments",
+        "voice_sample_profile_assignments",
+        "sample_id,profile_id,id",
+    ),
+    (
+        "speaker_observation_sources",
+        "speaker_observation_sources",
+        "speaker_observation_id,event_id,window_start_ms",
+    ),
+    ("person_facts", "person_facts", "person_id,id"),
+];
+
+async fn postgres_export(persistence: &PostgresPersistence, account_id: &str) -> Result<Value> {
+    let mut export = serde_json::Map::new();
+    let mut transaction = persistence.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await?;
+    for (response_field, table, order) in EXPORT_TABLES {
+        // Identifiers come only from the reviewed static table above. Product
+        // rows lose the shared-database tenant key and backend-only generated
+        // search projection before they cross the public export boundary.
+        let statement = format!(
+            "SELECT (to_jsonb(export_row)-'account_id'-'search_document')::text AS row_json \
+               FROM (SELECT * FROM {table} WHERE account_id=$1 ORDER BY {order}) export_row"
+        );
+        let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(statement))
+            .bind(account_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let values = rows
+            .into_iter()
+            .map(|row| serde_json::from_str(&row).map_err(Into::into))
+            .collect::<Result<Vec<Value>>>()?;
+        export.insert((*response_field).to_owned(), Value::Array(values));
+    }
+    transaction.commit().await?;
+    Ok(Value::Object(export))
+}
+
 fn bound(value: &Option<String>) -> Result<Option<i64>> {
     value
         .as_deref()
@@ -657,6 +776,10 @@ async fn postgres_person_statements(
 
 #[async_trait]
 impl MemoryQueryRepository for PostgresPersistence {
+    async fn export(&self, account_id: &str) -> Result<Value> {
+        postgres_export(self, account_id).await
+    }
+
     async fn search(&self, account_id: &str, request: &SearchRequest) -> Result<Vec<SearchHit>> {
         let (query, inline_speaker) = extract_speaker_filter(&request.query);
         let mut request = request.clone();
