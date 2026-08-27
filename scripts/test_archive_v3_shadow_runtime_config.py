@@ -318,8 +318,13 @@ class ArchiveV3ShadowRuntimeConfigTests(unittest.TestCase):
             ),
             active,
         )
+        self.assertEqual(
+            select_shadow_runtime_config(
+                active, profile="production", source_ref="refs/tags/v1.2.3"
+            ),
+            OFF,
+        )
         for ref in (
-            "v1.2.3",
             "v1.2.3-rc.1",
             "feature/runtime",
             "v01.2.3-archive-v3-wal.1",

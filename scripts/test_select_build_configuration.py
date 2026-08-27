@@ -552,7 +552,14 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
         self.assertNotIn("archive-bucket-1", selected)
 
-        for ref in ("v1.2.3", "v1.2.3-rc.1", "feature/runtime"):
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref="v1.2.3", shadow_runtime_config=active
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("archive-bucket-1", selected)
+
+        for ref in ("v1.2.3-rc.1", "feature/runtime"):
             with self.subTest(ref=ref):
                 completed, selected = self.run_selector(
                     "production", environment(), source_ref=ref, shadow_runtime_config=active
