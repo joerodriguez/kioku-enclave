@@ -1211,7 +1211,8 @@ async fn drain_coverage(state: &CpState, user_id: &str, account_id: &str) {
     }
     for snapshot in snapshots {
         let anchor = match state
-            .control
+            .repositories
+            .billing()
             .reconcile_vertex_coverage(
                 user_id,
                 &snapshot.period,
@@ -1350,7 +1351,8 @@ pub async fn settle_for_account_deletion(
     }
     for snapshot in snapshots {
         let anchor = state
-            .control
+            .repositories
+            .billing()
             .reconcile_vertex_coverage(
                 &user,
                 &snapshot.period,
@@ -1449,7 +1451,12 @@ pub async fn drain_outbox(state: &CpState) {
         }
     };
     for user_id in users {
-        let account_id = match state.control.billing_account_id(&user_id).await {
+        let account_id = match state
+            .repositories
+            .billing()
+            .billing_account_id(&user_id)
+            .await
+        {
             Ok(account_id) => account_id,
             Err(error) => {
                 warn!(error = %error, "Vertex usage account mapping deferred");

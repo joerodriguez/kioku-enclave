@@ -4,6 +4,7 @@
 //! connection or SQL callback. The legacy adapter delegates to the existing
 //! SQLite/GCS stores while the PostgreSQL implementation is built vertically.
 
+mod billing;
 mod entitlement;
 mod identity;
 mod legacy;
@@ -29,8 +30,8 @@ pub(crate) use oauth::{
 pub(crate) use postgres::PostgresPersistence;
 
 use self::legacy::{
-    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyNotificationRepository,
-    LegacyOAuthRepository,
+    LegacyBillingRepository, LegacyEntitlementRepository, LegacyIdentitySessionRepository,
+    LegacyNotificationRepository, LegacyOAuthRepository,
 };
 use crate::cp::control_store::ControlStore;
 
@@ -41,6 +42,7 @@ use crate::cp::control_store::ControlStore;
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
+    billing: Arc<dyn BillingRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
@@ -50,6 +52,7 @@ impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>) -> Self {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
+            billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             notifications: Arc::new(LegacyNotificationRepository::new(control)),
@@ -60,6 +63,7 @@ impl RepositorySet {
     pub(crate) fn postgres(persistence: Arc<PostgresPersistence>) -> Self {
         Self {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
+            billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             notifications: persistence,
@@ -68,6 +72,10 @@ impl RepositorySet {
 
     pub(crate) fn identity_sessions(&self) -> &dyn IdentitySessionRepository {
         self.identity_sessions.as_ref()
+    }
+
+    pub(crate) fn billing(&self) -> &dyn BillingRepository {
+        self.billing.as_ref()
     }
 
     pub(crate) fn oauth(&self) -> &dyn OAuthRepository {
@@ -161,3 +169,5 @@ mod tests {
         assert!(installed.token_generation > 0);
     }
 }
+pub(crate) use billing::BillingRepository;
+pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor};
