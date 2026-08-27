@@ -97,6 +97,10 @@ use crate::{
     store::{validate_user_id, GcsClient, IdentityRebindSource, MaintenanceTentativeSource, Store},
 };
 
+pub use crate::persistence::{
+    AccountDeletionOperation, RecordingLeaseRequestRow, RetainedAccountMetrics,
+    VertexCoverageAnchor,
+};
 pub(crate) use crate::persistence::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
     EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,
@@ -104,9 +108,6 @@ pub(crate) use crate::persistence::{
     WebhookFenceOutcome, WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition,
 };
 pub use crate::persistence::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
-pub use crate::persistence::{
-    RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor,
-};
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
 const CONTROL_OBJECT_SLOT_COUNT: usize = 32;
@@ -2134,16 +2135,6 @@ pub struct User {
     pub id: String,
     #[allow(dead_code)] // surfaced for callers that log/display the account
     pub email: String,
-}
-
-/// Content-free, durable status for an account-deletion operation.
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub struct AccountDeletionOperation {
-    pub operation_id: String,
-    pub status: String,
-    pub reason: String,
-    pub retry_after_seconds: Option<u64>,
-    pub hard_delete_time: Option<String>,
 }
 
 /// One-transaction, content-free ADR-0022 zero-state measurement.

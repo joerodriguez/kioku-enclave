@@ -6,6 +6,7 @@
 | `billing.rs` | Behavior-preserving billing pseudonym, recording lease/credit, coverage, and detach operations backed by `ControlStore`. |
 | `entitlement.rs` | Behavior-preserving active-account checks and atomic daily quota/Vertex reservations backed by `ControlStore`. |
 | `identity.rs` | Behavior-preserving account, identity, Apple credential, and session operations backed by `ControlStore`. |
+| `lifecycle.rs` | Behavior-preserving deletion operation, credential-revocation, tombstone, and final identity cleanup operations. |
 | `notification.rs` | Behavior-preserving webhook, email preference, and push installation operations backed by `ControlStore`. |
 | `oauth.rs` | Behavior-preserving OAuth registry, grant, code, and refresh-token operations backed by `ControlStore`. |
 | `work.rs` | Behavior-preserving provider-send fence and deletion-ownership operations backed by `ControlStore`. |
