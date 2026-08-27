@@ -13,6 +13,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | `oauth.rs` | Backend-neutral OAuth client, consent, authorization-code, and refresh-token transaction contract. |
 | `query.rs` | Backend-neutral tenant-scoped structured-memory search, episode pagination/detail projection, merged feed, and capture-freshness contract. |
 | `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
+| `episode_deletion.rs` | Backend-neutral two-step episode freeze, provider cleanup inventory, and durable purge receipt. |
 | `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
 | `work.rs` | Backend-neutral fleet account enumeration, summarizer cursor, and durable email, webhook, and push disclosure-fence contracts; provider I/O occurs outside the repository transaction. |
 | [`legacy/`](legacy/map.md) | Private behavior-preserving adapters over the current encrypted SQLite/GCS stores. |

@@ -132,6 +132,7 @@ impl FinalizationRepository for PostgresPersistence {
             "WITH candidate AS (\
                 SELECT e.id FROM episodes e JOIN accounts a ON a.id=e.account_id \
                  WHERE e.account_id=$1 AND a.status='active' AND e.substance!='none' \
+                   AND e.finalization_status!='deleting' \
                    AND ($2::bigint IS NULL OR e.id=$2) \
                    AND e.ended_at<to_timestamp($3::double precision/1000.0) \
                    AND a.summarized_until>=e.ended_at+interval '4 hours' \

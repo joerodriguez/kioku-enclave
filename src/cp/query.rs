@@ -1486,6 +1486,56 @@ async fn rest_episode_delete(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if let Some(repository) = s.repositories.episode_deletions() {
+        let plan = match repository.begin_episode_deletion(&user.0, id).await {
+            Ok(crate::persistence::EpisodeDeletionStart::NotFound) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "episode_not_found"})),
+                )
+                    .into_response();
+            }
+            Ok(crate::persistence::EpisodeDeletionStart::Complete(purge)) => {
+                return episode_purge_response(id, purge);
+            }
+            Ok(crate::persistence::EpisodeDeletionStart::Pending(plan)) => plan,
+            Err(error) => {
+                tracing::error!(%error, episode_id = id, "PostgreSQL episode deletion preparation failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "enclave_unavailable"})),
+                )
+                    .into_response();
+            }
+        };
+        for object_key in &plan.media_object_keys {
+            if let Err(error) = s
+                .repositories
+                .media_objects()
+                .delete_compatible(object_key)
+                .await
+            {
+                tracing::error!(%error, episode_id = id, "PostgreSQL episode media deletion failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "media_delete_failed", "deletion_pending": true})),
+                )
+                    .into_response();
+            }
+        }
+        return match repository.complete_episode_deletion(&user.0, &plan).await {
+            Ok(purge) => episode_purge_response(id, purge),
+            Err(error) => {
+                tracing::error!(%error, episode_id = id, "PostgreSQL episode deletion settlement failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "enclave_unavailable", "deletion_pending": true})),
+                )
+                    .into_response()
+            }
+        };
+    }
+
     // ADR-0022 D4: selected archives use the exact sealed deletion family;
     // unselected archives retain the existing snapshot transaction below.
     if s.store.is_wal_authoritative(&user.0) {
@@ -1818,10 +1868,13 @@ async fn rest_selected_episode_delete(s: &CpState, user_id: &str, id: i64) -> Re
 }
 
 fn episode_delete_response(receipt: wal::EpisodeDeleteReceipt) -> Response {
-    let purge = receipt.purge;
+    episode_purge_response(receipt.episode_id, receipt.purge)
+}
+
+fn episode_purge_response(episode_id: i64, purge: crate::episodes::EpisodePurge) -> Response {
     Json(json!({
         "deleted": true,
-        "episode_id": receipt.episode_id,
+        "episode_id": episode_id,
         "deleted_utterances": purge.deleted_utterances,
         "deleted_screenshots": purge.deleted_screenshots,
         "deleted_segments": purge.deleted_segments,
