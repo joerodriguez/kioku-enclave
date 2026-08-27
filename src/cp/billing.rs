@@ -17,7 +17,6 @@ use axum::{
     Extension, Router,
 };
 use base64::Engine as _;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1840,99 +1839,27 @@ async fn current_account_drivers(
     user_id: &str,
     period: &str,
 ) -> Option<AccountDrivers> {
-    let user_id = user_id.to_string();
-    let period = period.to_string();
-    // Routed, not legacy: for a WAL-authoritative account the archive IS the
-    // authoritative database, so its page count and media bytes are the
-    // correct drivers. `wal_authoritative_read` falls through to exactly the
-    // `with_user_read` this used to call for every unselected account, so the
-    // legacy answer is unchanged.
-    //
-    // This was the last ungated legacy read outside the D4 sweep. It mattered
-    // quietly: the refusal for a selected account was swallowed by this
-    // function's `Option` return, so the margin dashboard showed an account
-    // with no drivers rather than an error.
-    let mut drivers = state
-        .store
-        .wal_authoritative_read(&user_id, {
-            let period = period.clone();
-            move |conn| {
-                let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-                let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-                let media_bytes: i64 = conn.query_row(
-                    "SELECT COALESCE(SUM(byte_length),0) FROM media_objects",
-                    [],
-                    |row| row.get(0),
-                )?;
-                let accepted_email_count: i64 = conn.query_row(
-                    "SELECT count(*) FROM email_deliveries
-                 WHERE state='accepted'
-                   AND substr(updated_at,1,7)=?1",
-                    [&period],
-                    |row| row.get(0),
-                )?;
-                let bytes = page_count
-                    .checked_mul(page_size)
-                    .and_then(|value| value.checked_add(media_bytes))
-                    .and_then(|value| u64::try_from(value).ok())
-                    .ok_or_else(|| {
-                        crate::error::EnclaveError::Config("storage size overflow".into())
-                    })?;
-                let accepted_email_count = u64::try_from(accepted_email_count).map_err(|_| {
-                    crate::error::EnclaveError::Config("email delivery count overflow".into())
-                })?;
-                let coverage = conn
-                    .query_row(
-                        "SELECT sequence,pending_events,lost_events,updated_at
-                     FROM vertex_usage_coverage
-                     WHERE period=?1",
-                        [&period],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, String>(3)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let vertex_coverage = coverage
-                    .map(|(sequence, pending_events, lost_events, observed_at)| {
-                        Ok::<LocalVertexCoverage, crate::error::EnclaveError>(LocalVertexCoverage {
-                            sequence: u64::try_from(sequence).map_err(|_| {
-                                crate::error::EnclaveError::Config(
-                                    "coverage sequence overflow".into(),
-                                )
-                            })?,
-                            pending_events: u64::try_from(pending_events).map_err(|_| {
-                                crate::error::EnclaveError::Config(
-                                    "coverage pending count overflow".into(),
-                                )
-                            })?,
-                            lost_events: u64::try_from(lost_events).map_err(|_| {
-                                crate::error::EnclaveError::Config(
-                                    "coverage lost count overflow".into(),
-                                )
-                            })?,
-                            observed_at,
-                        })
-                    })
-                    .transpose()?;
-                Ok(AccountDrivers {
-                    storage_bytes: bytes,
-                    accepted_email_count,
-                    vertex_coverage,
-                })
-            }
-        })
+    let metrics = state
+        .repositories
+        .billing()
+        .account_driver_metrics(user_id, period)
         .await
         .ok()?;
+    let mut drivers = AccountDrivers {
+        storage_bytes: metrics.storage_bytes,
+        accepted_email_count: metrics.accepted_email_count,
+        vertex_coverage: metrics.vertex_coverage.map(|coverage| LocalVertexCoverage {
+            sequence: coverage.sequence,
+            pending_events: coverage.pending_events,
+            lost_events: coverage.lost_events,
+            observed_at: coverage.observed_at,
+        }),
+    };
 
     let anchor = state
         .repositories
         .billing()
-        .vertex_coverage_anchor(&user_id, &period)
+        .vertex_coverage_anchor(user_id, period)
         .await
         .ok()
         .flatten();
