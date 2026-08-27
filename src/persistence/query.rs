@@ -74,6 +74,28 @@ pub(crate) struct MemoryFeedPage {
     pub(crate) next_before: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpTranscriptSearchRequest {
+    pub(crate) query: String,
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+    pub(crate) limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpContextRequest {
+    pub(crate) at: String,
+    pub(crate) window_seconds: u64,
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpTimeRangeRequest {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) limit: Option<usize>,
+}
+
 /// Backend-neutral structured-memory query boundary.
 ///
 /// Query embedding and response fusion remain application behavior; candidate
@@ -89,4 +111,15 @@ pub(crate) trait MemoryQueryRepository: Send + Sync {
     ) -> Result<EpisodeListPage>;
     async fn capture_status(&self, account_id: &str) -> Result<CaptureStatus>;
     async fn feed(&self, account_id: &str, request: &MemoryFeedRequest) -> Result<MemoryFeedPage>;
+    async fn mcp_search_transcripts(
+        &self,
+        account_id: &str,
+        request: &McpTranscriptSearchRequest,
+    ) -> Result<Value>;
+    async fn mcp_context(&self, account_id: &str, request: &McpContextRequest) -> Result<Value>;
+    async fn mcp_time_range(
+        &self,
+        account_id: &str,
+        request: &McpTimeRangeRequest,
+    ) -> Result<Value>;
 }

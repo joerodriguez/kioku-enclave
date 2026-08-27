@@ -1148,11 +1148,9 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
     if let Some(refusal) = super::mcp_safety::refusal_for_args(name, args) {
         return Some(refusal);
     }
-    // ADR-0022: every one of the six tools now reads through the routed
-    // `wal_authoritative_read`, which serves a WAL-authoritative user from
-    // their serving authority's settled-only lane and falls through to the
-    // ordinary guarded legacy read for everyone else. The D4 `mcp.tools` gate
-    // that stood here is retired with the migration.
+    // All six tools read through the backend-neutral memory-query repository.
+    // Its legacy adapter retains ADR-0022's routed, settled-only WAL lane;
+    // PostgreSQL mode binds every query to the authenticated account.
     //
     // Whichever lane answers, a failure must surface an `error` key: that is
     // what sets `isError` on the tool result, and it is the only thing that
@@ -1167,16 +1165,17 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
             let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
             let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            s.store
-                .wal_authoritative_read(user_id, move |conn| {
-                    Ok(super::mcp_query::search_safe_transcripts(
-                        conn,
-                        &query,
-                        from.as_deref(),
-                        to.as_deref(),
+            s.repositories
+                .memory_queries()
+                .mcp_search_transcripts(
+                    user_id,
+                    &crate::persistence::McpTranscriptSearchRequest {
+                        query,
+                        from,
+                        to,
                         limit,
-                    )?)
-                })
+                    },
+                )
                 .await
                 .unwrap_or_else(|_| json!({ "error": "transcript search is unavailable" }))
         }
@@ -1194,12 +1193,16 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            s.store
-                .wal_authoritative_read(user_id, move |conn| {
-                    Ok(super::mcp_query::fetch_safe_context(
-                        conn, &at, window, limit,
-                    )?)
-                })
+            s.repositories
+                .memory_queries()
+                .mcp_context(
+                    user_id,
+                    &crate::persistence::McpContextRequest {
+                        at,
+                        window_seconds: window,
+                        limit,
+                    },
+                )
                 .await
                 .unwrap_or_else(|_| json!({ "error": "context lookup is unavailable" }))
         }
@@ -1218,12 +1221,12 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            s.store
-                .wal_authoritative_read(user_id, move |conn| {
-                    Ok(super::mcp_query::summarize_safe_time_range(
-                        conn, &from, &to, limit,
-                    )?)
-                })
+            s.repositories
+                .memory_queries()
+                .mcp_time_range(
+                    user_id,
+                    &crate::persistence::McpTimeRangeRequest { from, to, limit },
+                )
                 .await
                 .unwrap_or_else(|_| json!({ "error": "time-range summary is unavailable" }))
         }

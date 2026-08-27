@@ -224,9 +224,10 @@ mod tests {
     use crate::persistence::RepositorySet;
     use crate::persistence::{
         CaptureCommit, CapturePreflight, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
-        EmailSendFenceDisposition, EpisodeListRequest, MemoryFeedRequest, PushInstallation,
-        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome,
-        WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+        EmailSendFenceDisposition, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
+        McpTranscriptSearchRequest, MemoryFeedRequest, PushInstallation, PushProviderOutcome,
+        PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
+        WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
 
@@ -1160,6 +1161,50 @@ mod tests {
         assert_eq!(feed.records[0].episode_id, Some(1));
         assert_eq!(feed.records[1].kind, "utterance");
         assert_eq!(feed.records[1].episode_id, Some(1));
+        let mcp_search = repositories
+            .memory_queries()
+            .mcp_search_transcripts(
+                &account_id,
+                &McpTranscriptSearchRequest {
+                    query: "PostgreSQL".into(),
+                    from: Some("2026-08-27T07:00:00-04:00".into()),
+                    to: Some("2026-08-27T09:00:00-04:00".into()),
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_search["count"], 1);
+        assert_eq!(mcp_search["results"][0]["speaker"], "Lynn");
+        assert!(!serde_json::to_string(&mcp_search)
+            .unwrap()
+            .contains("other tenant"));
+        let mcp_context = repositories
+            .memory_queries()
+            .mcp_context(
+                &account_id,
+                &McpContextRequest {
+                    at: "2026-08-27T08:00:00-04:00".into(),
+                    window_seconds: 300,
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_context["utterances"].as_array().unwrap().len(), 1);
+        let mcp_range = repositories
+            .memory_queries()
+            .mcp_time_range(
+                &account_id,
+                &McpTimeRangeRequest {
+                    from: "2026-08-27T07:00:00-04:00".into(),
+                    to: "2026-08-27T09:00:00-04:00".into(),
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_range["episodes"].as_array().unwrap().len(), 1);
 
         let billing_detach_id = repositories
             .billing()
