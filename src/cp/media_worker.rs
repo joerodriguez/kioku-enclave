@@ -2219,7 +2219,7 @@ async fn load_raw_media_bytes(state: &CpState, user_id: &str, object_key: &str) 
         .media_objects()
         .get_compatible(object_key)
         .await?;
-    let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &stored.wrapped_dek_b64).await?;
+    let dek = crate::crypto::load_dek(state.kms.as_ref(), &stored.wrapped_dek_b64).await?;
     let context = crate::store::media_blob_context(user_id, object_key);
     let media = crate::crypto::decrypt_bound_blob(&dek, &stored.ciphertext, &context)?.plaintext;
     Ok(media)
@@ -4533,7 +4533,7 @@ async fn selected_voice_embedding_outcome(
     let wrapped = evidence
         .wrapped_media_dek()
         .ok_or(("ERR_MEDIA_DEK_MISSING", true))?;
-    let media_dek = crate::crypto::load_dek(state.store.kms.as_ref(), wrapped)
+    let media_dek = crate::crypto::load_dek(state.kms.as_ref(), wrapped)
         .await
         .map_err(|error| match error {
             EnclaveError::Http(_) | EnclaveError::Attestation(_) => ("ERR_KMS_UNAVAILABLE", false),

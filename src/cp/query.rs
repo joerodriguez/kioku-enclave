@@ -3707,7 +3707,7 @@ async fn rest_screenshot_image_upload(
     };
 
     let (media_dek, wrapped_b64) = match wrapped_opt {
-        Some(wrapped) => match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped).await {
+        Some(wrapped) => match crate::crypto::load_dek(s.kms.as_ref(), &wrapped).await {
             Ok(dek) => (dek, wrapped),
             Err(e) => {
                 tracing::error!(error = %e, "media upload DEK load failed");
@@ -3716,7 +3716,7 @@ async fn rest_screenshot_image_upload(
         },
         None => {
             let (candidate_dek, candidate_wrapped) =
-                match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
+                match crate::crypto::generate_and_wrap_dek(s.kms.as_ref()).await {
                     Ok(candidate) => candidate,
                     Err(e) => {
                         tracing::error!(error = %e, "media upload DEK generation failed");
@@ -3744,7 +3744,7 @@ async fn rest_screenshot_image_upload(
             if winner == candidate_wrapped {
                 (candidate_dek, winner)
             } else {
-                match crate::crypto::load_dek(s.store.kms.as_ref(), &winner).await {
+                match crate::crypto::load_dek(s.kms.as_ref(), &winner).await {
                     Ok(dek) => (dek, winner),
                     Err(e) => {
                         tracing::error!(error = %e, "media upload winning DEK load failed");
@@ -4037,7 +4037,7 @@ async fn rest_screenshot_image_content(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_b64).await {
+    let media_dek = match crate::crypto::load_dek(s.kms.as_ref(), &wrapped_b64).await {
         Ok(dek) => dek,
         Err(
             error @ (crate::error::EnclaveError::Http(_)
@@ -5045,6 +5045,7 @@ mod tests {
         ));
         let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, index_gcs));
         Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
@@ -6211,7 +6212,7 @@ mod tests {
         let legacy_object_key = "media/legacy-image";
         let plaintext = b"test-jpeg-bytes";
         let legacy_plaintext = b"legacy-jpeg-bytes";
-        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
             .await
             .unwrap();
         let encrypted = crate::crypto::encrypt_bound_blob(
@@ -6518,7 +6519,7 @@ mod tests {
         let legacy = Arc::new(FakeGcs::new());
         let state = query_test_state_with_media(index, Arc::clone(&current), Arc::clone(&legacy));
         let user_id = "capture-content-integrity";
-        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
             .await
             .unwrap();
         let wrapped_for_db = wrapped_dek.clone();
@@ -6684,7 +6685,7 @@ mod tests {
             crate::store::canonical_capture_media_object_key(user_id, wrong_key_asset).unwrap();
         let wrong_key_plaintext = b"wrong wrapped key bytes";
         let (other_dek, other_wrapped_dek) =
-            crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+            crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
                 .await
                 .unwrap();
         let wrong_key_blob = crate::crypto::encrypt_bound_blob(
@@ -7391,6 +7392,7 @@ mod tests {
             Arc::new(FakeGcs::new()),
         ));
         let s = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
@@ -7476,6 +7478,7 @@ mod tests {
             Arc::new(FakeGcs::new()),
         ));
         let s = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, Arc::clone(&store)),
@@ -7538,6 +7541,7 @@ mod tests {
             .unwrap();
 
         let s = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),

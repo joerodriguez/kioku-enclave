@@ -440,6 +440,7 @@ pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
 // mcp_limiter is consumed by the MCP routes, wired in a later commit.
 #[allow(dead_code)]
 pub struct CpState {
+    pub(crate) kms: Arc<dyn crate::crypto::KmsClient>,
     pub store: Arc<Store>,
     pub control: Arc<control_store::ControlStore>,
     pub(crate) repositories: crate::persistence::RepositorySet,
@@ -604,6 +605,7 @@ pub(crate) mod wal_gate_test_support {
         let repositories =
             crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
         Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store,
             control,
             repositories,

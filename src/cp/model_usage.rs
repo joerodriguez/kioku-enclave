@@ -1649,6 +1649,7 @@ mod tests {
         ));
         let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
         Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),
