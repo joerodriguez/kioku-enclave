@@ -81,22 +81,44 @@ pub async fn begin_invocation(
     requested_model: &str,
     caller_anchor: &[u8; 32],
 ) -> Result<String> {
-    if state.store.is_wal_authoritative(user_id) {
-        return begin_invocation_settled(state, user_id, operation, requested_model, caller_anchor)
-            .await;
+    state
+        .repositories
+        .model_usage()
+        .begin_invocation(
+            user_id,
+            operation,
+            requested_model,
+            &state.config.vertex_location,
+            caller_anchor,
+        )
+        .await
+}
+
+pub(crate) async fn legacy_begin_invocation(
+    store: &crate::store::Store,
+    user_id: &str,
+    operation: VertexOperation,
+    requested_model: &str,
+    location: &str,
+    caller_anchor: &[u8; 32],
+) -> Result<String> {
+    if store.is_wal_authoritative(user_id) {
+        return begin_invocation_settled(
+            store,
+            user_id,
+            operation,
+            requested_model,
+            location,
+            caller_anchor,
+        )
+        .await;
     }
     let event_id = format!("vtx_{}", super::tokens::random_token_hex());
     let user = user_id.to_string();
     let id = event_id.clone();
     let model = requested_model.chars().take(256).collect::<String>();
-    let location = state
-        .config
-        .vertex_location
-        .chars()
-        .take(128)
-        .collect::<String>();
-    state
-        .store
+    let location = location.chars().take(128).collect::<String>();
+    store
         .with_user(&user, move |conn| {
             conn.execute(
                 "INSERT INTO vertex_usage_events
@@ -110,10 +132,9 @@ pub async fn begin_invocation(
         .await?;
     // Cost attribution is a financial-integrity boundary: a paid request must
     // never leave before its content-free intent is durable.
-    if let Err(error) = state.store.save_user(&user).await {
+    if let Err(error) = store.save_user(&user).await {
         let cleanup_id = event_id.clone();
-        let _ = state
-            .store
+        let _ = store
             .with_user(&user, move |conn| {
                 conn.execute(
                     "DELETE FROM vertex_usage_events WHERE event_id=?1 AND outcome='started'",
@@ -139,19 +160,15 @@ pub async fn begin_invocation(
 /// — and the legacy compensating DELETE has no analogue: a failed settle
 /// means no intent and no call.
 async fn begin_invocation_settled(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     operation: VertexOperation,
     requested_model: &str,
+    location: &str,
     caller_anchor: &[u8; 32],
 ) -> Result<String> {
     let model = requested_model.chars().take(256).collect::<String>();
-    let location = state
-        .config
-        .vertex_location
-        .chars()
-        .take(128)
-        .collect::<String>();
+    let location = location.chars().take(128).collect::<String>();
     let commitment = wal::request_commitment(operation, &model, &location, caller_anchor)
         .map_err(|_| EnclaveError::Store("vertex invocation identity derivation failed".into()))?;
     let lane = wal::VertexInvocationLane::for_operation(operation);
@@ -159,8 +176,7 @@ async fn begin_invocation_settled(
     // production, so a second conflict means something is genuinely wrong.
     for _ in 0..2 {
         let probe_user = user_id.to_owned();
-        let (sequence, dangling) = state
-            .store
+        let (sequence, dangling) = store
             .wal_authoritative_read(user_id, move |conn| {
                 let sequence = wal::read_lane_sequence(conn, lane)?;
                 let dangling = if sequence > 0 {
@@ -208,11 +224,7 @@ async fn begin_invocation_settled(
             .map_err(|_| {
                 EnclaveError::Store("vertex invocation plan construction failed".into())
             })?;
-        match state
-            .store
-            .wal_authoritative_submit(user_id, prepared)
-            .await
-        {
+        match store.wal_authoritative_submit(user_id, prepared).await {
             Ok(event_id) => return Ok(event_id),
             Err(EnclaveError::Conflict(_)) => continue,
             Err(error) => return Err(error),
@@ -235,16 +247,10 @@ pub(crate) async fn settle_response_required(
     event_id: &str,
     metadata: &VertexMetadata,
 ) -> Result<()> {
-    let prepared = wal::VertexUsageOutcomePlan::response(event_id.to_owned(), metadata)
-        .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
-        .map_err(|_| {
-            crate::error::EnclaveError::Store(
-                "vertex usage outcome plan construction failed".into(),
-            )
-        })?;
     state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
+        .repositories
+        .model_usage()
+        .settle_response(user_id, event_id, metadata)
         .await
 }
 
@@ -254,26 +260,35 @@ pub async fn record_response(
     event_id: &str,
     metadata: &VertexMetadata,
 ) {
+    if let Err(error) = state
+        .repositories
+        .model_usage()
+        .settle_response(user_id, event_id, metadata)
+        .await
+    {
+        warn!(error = %error, "Vertex usage response persistence deferred");
+    }
+}
+
+pub(crate) async fn legacy_settle_response(
+    store: &crate::store::Store,
+    user_id: &str,
+    event_id: &str,
+    metadata: &VertexMetadata,
+) -> Result<()> {
     let user = user_id.to_string();
     let event_id = event_id.to_string();
-    if state.store.is_wal_authoritative(&user) {
+    if store.is_wal_authoritative(&user) {
         // ADR-0022: the terminal outcome settles on the F2-minted event id's
         // coordinate; the plan derives the metered/usage-missing fields from
         // the same metadata and refreshes coverage inside apply(). Same
         // best-effort semantics as the legacy arm.
         let prepared = wal::VertexUsageOutcomePlan::response(event_id, metadata)
-            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
-        match prepared {
-            Ok(prepared) => {
-                if let Err(error) = state.store.wal_authoritative_submit(&user, prepared).await {
-                    warn!(error = %error, "Vertex usage response persistence deferred");
-                }
-            }
-            Err(error) => {
-                warn!(?error, "Vertex usage response plan construction failed");
-            }
-        }
-        return;
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            .map_err(|_| {
+                EnclaveError::Store("vertex usage outcome plan construction failed".into())
+            })?;
+        return store.wal_authoritative_submit(&user, prepared).await;
     }
     let (model, normalized) = normalized_billable_response(metadata);
     let outcome = if normalized.is_some() {
@@ -282,8 +297,7 @@ pub async fn record_response(
         "usage_missing"
     };
     let traffic = normalized_traffic_type(metadata.traffic_type.as_deref());
-    let result = state
-        .store
+    store
         .with_user(&user, move |conn| {
             let normalized = normalized.unwrap_or_default();
             conn.execute(
@@ -314,17 +328,11 @@ pub async fn record_response(
             refresh_coverage_conn(conn)?;
             Ok(())
         })
-        .await;
-    if let Err(error) = result {
-        warn!(error = %error, "Vertex usage response persistence deferred");
-        return;
-    }
-    if let Err(error) = state.store.save_user(&user).await {
-        warn!(error = %error, "Vertex usage response flush deferred");
-    }
+        .await?;
+    store.save_user(&user).await
 }
 
-fn normalized_billable_response(
+pub(crate) fn normalized_billable_response(
     metadata: &VertexMetadata,
 ) -> (Option<String>, Option<VertexUsage>) {
     let model = metadata
@@ -342,25 +350,33 @@ pub async fn record_ambiguous(
     event_id: &str,
     http_status: Option<u16>,
 ) {
+    if let Err(error) = state
+        .repositories
+        .model_usage()
+        .settle_ambiguous(user_id, event_id, http_status)
+        .await
+    {
+        warn!(error = %error, "ambiguous Vertex usage persistence deferred");
+    }
+}
+
+pub(crate) async fn legacy_settle_ambiguous(
+    store: &crate::store::Store,
+    user_id: &str,
+    event_id: &str,
+    http_status: Option<u16>,
+) -> Result<()> {
     let user = user_id.to_string();
     let id = event_id.to_string();
-    if state.store.is_wal_authoritative(&user) {
+    if store.is_wal_authoritative(&user) {
         let prepared = wal::VertexUsageOutcomePlan::ambiguous(id, http_status)
-            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
-        match prepared {
-            Ok(prepared) => {
-                if let Err(error) = state.store.wal_authoritative_submit(&user, prepared).await {
-                    warn!(error = %error, "ambiguous Vertex usage persistence deferred");
-                }
-            }
-            Err(error) => {
-                warn!(?error, "ambiguous Vertex usage plan construction failed");
-            }
-        }
-        return;
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            .map_err(|_| {
+                EnclaveError::Store("ambiguous Vertex usage plan construction failed".into())
+            })?;
+        return store.wal_authoritative_submit(&user, prepared).await;
     }
-    let result = state
-        .store
+    store
         .with_user(&user, move |conn| {
             conn.execute(
                 "UPDATE vertex_usage_events SET outcome='ambiguous',http_status=?1,
@@ -371,29 +387,38 @@ pub async fn record_ambiguous(
             refresh_coverage_conn(conn)?;
             Ok(())
         })
-        .await;
-    if let Err(error) = result {
-        warn!(error = %error, "ambiguous Vertex usage persistence deferred");
-        return;
-    }
-    if let Err(error) = state.store.save_user(&user).await {
-        warn!(error = %error, "ambiguous Vertex usage flush deferred");
-    }
+        .await?;
+    store.save_user(&user).await
 }
 
 pub async fn record_not_billed(state: &CpState, user_id: &str, event_id: &str, http_status: u16) {
+    if let Err(error) = state
+        .repositories
+        .model_usage()
+        .settle_not_billed(user_id, event_id, http_status)
+        .await
+    {
+        warn!(error = %error, "not-billed Vertex usage persistence deferred");
+    }
+}
+
+pub(crate) async fn legacy_settle_not_billed(
+    store: &crate::store::Store,
+    user_id: &str,
+    event_id: &str,
+    http_status: u16,
+) -> Result<()> {
     let user = user_id.to_string();
     let id = event_id.to_string();
-    if state.store.is_wal_authoritative(&user) {
+    if store.is_wal_authoritative(&user) {
         let prepared = wal::VertexUsageOutcomePlan::not_billed(id, http_status)
-            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
-        if let Ok(prepared) = prepared {
-            let _ = state.store.wal_authoritative_submit(&user, prepared).await;
-        }
-        return;
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+            .map_err(|_| {
+                EnclaveError::Store("not-billed Vertex usage plan construction failed".into())
+            })?;
+        return store.wal_authoritative_submit(&user, prepared).await;
     }
-    let result = state
-        .store
+    store
         .with_user(&user, move |conn| {
             conn.execute(
                 "UPDATE vertex_usage_events SET outcome='not_billed',delivery_state='delivered',http_status=?1,
@@ -404,13 +429,11 @@ pub async fn record_not_billed(state: &CpState, user_id: &str, event_id: &str, h
             refresh_coverage_conn(conn)?;
             Ok(())
         })
-        .await;
-    if result.is_ok() {
-        let _ = state.store.save_user(&user).await;
-    }
+        .await?;
+    store.save_user(&user).await
 }
 
-fn normalized_traffic_type(value: Option<&str>) -> String {
+pub(crate) fn normalized_traffic_type(value: Option<&str>) -> String {
     match value {
         Some("PROVISIONED_THROUGHPUT" | "provisioned_throughput") => {
             "provisioned_throughput".into()
@@ -475,7 +498,7 @@ fn normalized_usage(metadata: &VertexMetadata) -> Option<VertexUsage> {
     })
 }
 
-fn to_i64(value: Option<u64>) -> Option<i64> {
+pub(crate) fn to_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|value| i64::try_from(value).ok())
 }
 
@@ -507,7 +530,7 @@ const DELETION_STALE_INTENT_CUTOFF_MILLIS: i64 = 0;
 /// the plan is submitted only when the resolved sets are non-empty, exactly
 /// reproducing the clean-scan semantics.
 async fn pending_events_settled(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     account_id: &str,
     stale_cutoff_millis: i64,
@@ -524,8 +547,7 @@ async fn pending_events_settled(
     let account = account_id.to_string();
     let probe_period = period.clone();
     let probe_cutoff = cutoff.clone();
-    let (events, stale, predecessor_lost) = state
-        .store
+    let (events, stale, predecessor_lost) = store
         .wal_authoritative_read(user_id, move |conn| {
             let stale = {
                 let mut statement = conn.prepare(
@@ -589,10 +611,7 @@ async fn pending_events_settled(
     .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))?;
     let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
         .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))?;
-    state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
-        .await?;
+    store.wal_authoritative_submit(user_id, prepared).await?;
     Ok((deliverable, true))
 }
 
@@ -640,34 +659,51 @@ fn load_pending_usage_events(
     Ok(rows)
 }
 
-async fn pending_events(
-    state: &CpState,
+pub(crate) async fn legacy_pending_events(
+    store: &crate::store::Store,
     user_id: &str,
     account_id: &str,
-    stale_cutoff_millis: i64,
-) -> Result<(Vec<VertexUsageEvent>, bool)> {
-    if state.store.is_wal_authoritative(user_id) {
-        return pending_events_settled(state, user_id, account_id, stale_cutoff_millis).await;
+    force_started_ambiguous: bool,
+) -> Result<Vec<VertexUsageEvent>> {
+    let stale_cutoff_millis = if force_started_ambiguous {
+        DELETION_STALE_INTENT_CUTOFF_MILLIS
+    } else {
+        STALE_INTENT_CUTOFF_MILLIS
+    };
+    if store.is_wal_authoritative(user_id) {
+        loop {
+            let (events, dirty) =
+                pending_events_settled(store, user_id, account_id, stale_cutoff_millis).await?;
+            if !events.is_empty() || !dirty {
+                return Ok(events);
+            }
+        }
     }
-    // The legacy branch deliberately ignores `stale_cutoff_millis`: its
-    // deletion caller (`settle_for_account_deletion`) still performs the bare
-    // `with_user` sweep that marks *every* `started` row ambiguous before this
-    // scan runs, so the legacy contract is byte-unchanged.
     let user = user_id.to_string();
     let account = account_id.to_string();
-    state
-        .store
-        .with_user_if_changed(&user, move |conn| {
+    loop {
+        let account = account.clone();
+        let (events, dirty) = store
+            .with_user_if_changed(&user, move |conn| {
             // A process crash can leave a durable intent without an observed
             // response. After the longest generation timeout, report it as
             // ambiguous rather than silently dropping or pricing it at zero.
-            let stale_started = conn.execute(
-                "UPDATE vertex_usage_events SET outcome='ambiguous',
-                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE outcome='started'
-                   AND observed_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-3 minutes')",
-                [],
-            )?;
+            let stale_started = if force_started_ambiguous {
+                conn.execute(
+                    "UPDATE vertex_usage_events SET outcome='ambiguous',
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE outcome='started'",
+                    [],
+                )?
+            } else {
+                conn.execute(
+                    "UPDATE vertex_usage_events SET outcome='ambiguous',
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE outcome='started'
+                       AND observed_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-3 minutes')",
+                    [],
+                )?
+            };
             let events = {
                 let mut statement = conn.prepare(
                     "SELECT event_id,operation,requested_model,returned_model,location,
@@ -758,8 +794,15 @@ async fn pending_events(
                 }
             }
             Ok(((deliverable, dirty), dirty))
-        })
-        .await
+            })
+            .await?;
+        if dirty {
+            store.save_user(&user).await?;
+        }
+        if !events.is_empty() || !dirty {
+            return Ok(events);
+        }
+    }
 }
 
 fn usage_event_models_are_safe(event: &VertexUsageEvent) -> bool {
@@ -778,15 +821,14 @@ fn nonnegative_u64(value: i64) -> Option<u64> {
 /// Routed read of the delivery predecessors for one enumerated id set,
 /// ordered by event id as the plan requires.
 async fn read_delivery_predecessors(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     event_ids: &[String],
 ) -> Result<Vec<wal::DeliveryEventPredecessor>> {
     let mut ids = event_ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
-    state
-        .store
+    store
         .wal_authoritative_read(user_id, move |conn| {
             let mut predecessors = Vec::with_capacity(ids.len());
             for id in &ids {
@@ -812,7 +854,7 @@ async fn read_delivery_predecessors(
 }
 
 async fn settle_delivery(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     outcome: wal::DeliveryOutcome,
     event_ids: &[String],
@@ -820,7 +862,7 @@ async fn settle_delivery(
     if event_ids.is_empty() {
         return Ok(());
     }
-    let predecessors = read_delivery_predecessors(state, user_id, event_ids).await?;
+    let predecessors = read_delivery_predecessors(store, user_id, event_ids).await?;
     let plan = wal::VertexUsageDeliveryPlan::new(
         user_id.to_owned(),
         outcome,
@@ -830,20 +872,20 @@ async fn settle_delivery(
     .map_err(|_| EnclaveError::Store("vertex delivery plan construction failed".into()))?;
     let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
         .map_err(|_| EnclaveError::Store("vertex delivery plan construction failed".into()))?;
-    state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
-        .await
+    store.wal_authoritative_submit(user_id, prepared).await
 }
 
-async fn complete_delivery(state: &CpState, user_id: &str, event_ids: &[String]) -> Result<()> {
-    if state.store.is_wal_authoritative(user_id) {
-        return settle_delivery(state, user_id, wal::DeliveryOutcome::Delivered, event_ids).await;
+pub(crate) async fn legacy_complete_delivery(
+    store: &crate::store::Store,
+    user_id: &str,
+    event_ids: &[String],
+) -> Result<()> {
+    if store.is_wal_authoritative(user_id) {
+        return settle_delivery(store, user_id, wal::DeliveryOutcome::Delivered, event_ids).await;
     }
     let user = user_id.to_string();
     let ids = event_ids.to_vec();
-    state
-        .store
+    store
         .with_user(&user, move |conn| {
             let tx = conn.unchecked_transaction()?;
             for id in ids {
@@ -859,18 +901,17 @@ async fn complete_delivery(state: &CpState, user_id: &str, event_ids: &[String])
             Ok(())
         })
         .await?;
-    state.store.save_user(&user).await
+    store.save_user(&user).await
 }
 
 /// Routed read of one coverage row's predecessor tuple.
 async fn read_coverage_predecessor(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     period: &str,
 ) -> Result<Option<wal::CoveragePredecessor>> {
     let probe = period.to_string();
-    state
-        .store
+    store
         .wal_authoritative_read(user_id, move |conn| {
             conn.query_row(
                 "SELECT sequence,pending_events,lost_events
@@ -900,7 +941,7 @@ async fn read_coverage_predecessor(
 }
 
 async fn settle_coverage(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     transition: wal::CoverageTransition,
 ) -> Result<()> {
@@ -909,10 +950,7 @@ async fn settle_coverage(
             .map_err(|_| EnclaveError::Store("vertex coverage plan construction failed".into()))?;
     let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
         .map_err(|_| EnclaveError::Store("vertex coverage plan construction failed".into()))?;
-    state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
-        .await
+    store.wal_authoritative_submit(user_id, prepared).await
 }
 
 /// The WAL-authoritative half of `pending_coverage` (ADR-0022 F5 rollover):
@@ -920,7 +958,7 @@ async fn settle_coverage(
 /// rollover settles only when something is actually stale or missing, and
 /// the snapshot list is then re-read from settled state.
 async fn pending_coverage_settled(
-    state: &CpState,
+    store: &crate::store::Store,
     user_id: &str,
     account_id: &str,
 ) -> Result<(Vec<VertexCoverageSnapshot>, bool)> {
@@ -928,8 +966,7 @@ async fn pending_coverage_settled(
     let current_period = committed_at[..7].to_string();
     let account = account_id.to_string();
     let probe_period = current_period.clone();
-    let (prior_pending, current_exists) = state
-        .store
+    let (prior_pending, current_exists) = store
         .wal_authoritative_read(user_id, move |conn| {
             let mut statement = conn.prepare(
                 "SELECT period,sequence,pending_events,lost_events
@@ -966,7 +1003,7 @@ async fn pending_coverage_settled(
             })
             .collect::<Result<Vec<_>>>()?;
         settle_coverage(
-            state,
+            store,
             user_id,
             wal::CoverageTransition::Rollover {
                 current_period: current_period.clone(),
@@ -976,8 +1013,7 @@ async fn pending_coverage_settled(
         .await?;
     }
     let probe_period = current_period.clone();
-    let snapshots = state
-        .store
+    let snapshots = store
         .wal_authoritative_read(user_id, move |conn| {
             let mut statement = conn.prepare(
                 "SELECT period,sequence,pending_events,lost_events,updated_at
@@ -1006,18 +1042,19 @@ async fn pending_coverage_settled(
     Ok((snapshots, dirty))
 }
 
-async fn pending_coverage(
-    state: &CpState,
+pub(crate) async fn legacy_pending_coverage(
+    store: &crate::store::Store,
     user_id: &str,
     account_id: &str,
-) -> Result<(Vec<VertexCoverageSnapshot>, bool)> {
-    if state.store.is_wal_authoritative(user_id) {
-        return pending_coverage_settled(state, user_id, account_id).await;
+) -> Result<Vec<VertexCoverageSnapshot>> {
+    if store.is_wal_authoritative(user_id) {
+        return pending_coverage_settled(store, user_id, account_id)
+            .await
+            .map(|(snapshots, _dirty)| snapshots);
     }
     let user = user_id.to_string();
     let account = account_id.to_string();
-    state
-        .store
+    let (snapshots, dirty) = store
         .with_user_if_changed(&user, move |conn| {
             let current_period: String =
                 conn.query_row("SELECT strftime('%Y-%m','now')", [], |row| row.get(0))?;
@@ -1048,7 +1085,11 @@ async fn pending_coverage(
             let dirty = inserted || expired_terminalized;
             Ok(((snapshots, dirty), dirty))
         })
-        .await
+        .await?;
+    if dirty {
+        store.save_user(&user).await?;
+    }
+    Ok(snapshots)
 }
 
 fn checked_sql_u64(value: i64, index: usize) -> rusqlite::Result<u64> {
@@ -1061,14 +1102,14 @@ fn checked_sql_u64(value: i64, index: usize) -> rusqlite::Result<u64> {
     })
 }
 
-async fn complete_coverage(
-    state: &CpState,
+pub(crate) async fn legacy_complete_coverage(
+    store: &crate::store::Store,
     user_id: &str,
     period: &str,
     sequence: u64,
 ) -> Result<()> {
-    if state.store.is_wal_authoritative(user_id) {
-        let Some(predecessor) = read_coverage_predecessor(state, user_id, period).await? else {
+    if store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_coverage_predecessor(store, user_id, period).await? else {
             return Ok(());
         };
         if predecessor.sequence_for_caller() != i64::try_from(sequence).unwrap_or(-1) {
@@ -1076,7 +1117,7 @@ async fn complete_coverage(
             return Ok(());
         }
         return settle_coverage(
-            state,
+            store,
             user_id,
             wal::CoverageTransition::CompleteDelivered { predecessor },
         )
@@ -1086,8 +1127,7 @@ async fn complete_coverage(
     let period = period.to_string();
     let sequence = i64::try_from(sequence)
         .map_err(|_| crate::error::EnclaveError::Config("coverage sequence overflow".into()))?;
-    state
-        .store
+    store
         .with_user(&user, move |conn| {
             conn.execute(
                 "UPDATE vertex_usage_coverage SET delivery_state='delivered'
@@ -1097,19 +1137,30 @@ async fn complete_coverage(
             Ok(())
         })
         .await?;
-    state.store.save_user(&user).await
+    store.save_user(&user).await
 }
 
-async fn persist_coverage_snapshot(
-    state: &CpState,
+pub(crate) async fn legacy_persist_coverage_snapshot(
+    store: &crate::store::Store,
     user_id: &str,
+    predecessor: &VertexCoverageSnapshot,
     snapshot: &VertexCoverageSnapshot,
 ) -> Result<()> {
-    if state.store.is_wal_authoritative(user_id) {
-        let Some(predecessor) = read_coverage_predecessor(state, user_id, &snapshot.period).await?
+    if predecessor.period != snapshot.period {
+        return Err(EnclaveError::Conflict(
+            "coverage period changed during reconciliation".into(),
+        ));
+    }
+    if store.is_wal_authoritative(user_id) {
+        let Some(current) = read_coverage_predecessor(store, user_id, &snapshot.period).await?
         else {
             return Ok(());
         };
+        if current.sequence_for_caller() != i64::try_from(predecessor.sequence).unwrap_or(-1) {
+            return Err(EnclaveError::Conflict(
+                "coverage predecessor changed during reconciliation".into(),
+            ));
+        }
         let sequence = i64::try_from(snapshot.sequence)
             .map_err(|_| crate::error::EnclaveError::Config("coverage sequence overflow".into()))?;
         let pending_events = i64::try_from(snapshot.pending_events)
@@ -1117,10 +1168,10 @@ async fn persist_coverage_snapshot(
         let lost_events = i64::try_from(snapshot.lost_events)
             .map_err(|_| crate::error::EnclaveError::Config("coverage lost overflow".into()))?;
         return settle_coverage(
-            state,
+            store,
             user_id,
             wal::CoverageTransition::PersistSnapshot {
-                predecessor,
+                predecessor: current,
                 sequence,
                 pending_events,
                 lost_events,
@@ -1137,38 +1188,51 @@ async fn persist_coverage_snapshot(
         .map_err(|_| crate::error::EnclaveError::Config("coverage pending overflow".into()))?;
     let lost_events = i64::try_from(snapshot.lost_events)
         .map_err(|_| crate::error::EnclaveError::Config("coverage lost overflow".into()))?;
+    let predecessor_sequence = i64::try_from(predecessor.sequence)
+        .map_err(|_| crate::error::EnclaveError::Config("coverage sequence overflow".into()))?;
     let observed_at = snapshot.observed_at.clone();
-    state
-        .store
+    let changed = store
         .with_user(&user, move |conn| {
-            conn.execute(
+            let changed = conn.execute(
                 "UPDATE vertex_usage_coverage
                  SET sequence=?1,pending_events=?2,lost_events=?3,
                      delivery_state='pending',updated_at=?4
-                 WHERE period=?5",
-                rusqlite::params![sequence, pending_events, lost_events, observed_at, period],
+                 WHERE period=?5 AND sequence=?6",
+                rusqlite::params![
+                    sequence,
+                    pending_events,
+                    lost_events,
+                    observed_at,
+                    period,
+                    predecessor_sequence
+                ],
             )?;
-            Ok(())
+            Ok(changed)
         })
         .await?;
-    state.store.save_user(&user).await
+    if changed == 0 {
+        return Err(EnclaveError::Conflict(
+            "coverage predecessor changed during reconciliation".into(),
+        ));
+    }
+    store.save_user(&user).await
 }
 
-async fn invalidate_stale_coverage(
-    state: &CpState,
+pub(crate) async fn legacy_invalidate_stale_coverage(
+    store: &crate::store::Store,
     user_id: &str,
     period: &str,
     sequence: u64,
 ) -> Result<()> {
-    if state.store.is_wal_authoritative(user_id) {
-        let Some(predecessor) = read_coverage_predecessor(state, user_id, period).await? else {
+    if store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_coverage_predecessor(store, user_id, period).await? else {
             return Ok(());
         };
         if predecessor.sequence_for_caller() != i64::try_from(sequence).unwrap_or(-1) {
             return Ok(());
         }
         return settle_coverage(
-            state,
+            store,
             user_id,
             wal::CoverageTransition::InvalidateStale { predecessor },
         )
@@ -1178,8 +1242,7 @@ async fn invalidate_stale_coverage(
     let period = period.to_string();
     let sequence = i64::try_from(sequence)
         .map_err(|_| crate::error::EnclaveError::Config("coverage sequence overflow".into()))?;
-    state
-        .store
+    store
         .with_user(&user, move |conn| {
             conn.execute(
                 "UPDATE vertex_usage_coverage
@@ -1192,24 +1255,25 @@ async fn invalidate_stale_coverage(
             Ok(())
         })
         .await?;
-    state.store.save_user(&user).await
+    store.save_user(&user).await
 }
 
 async fn drain_coverage(state: &CpState, user_id: &str, account_id: &str) {
-    let (snapshots, coverage_inserted) = match pending_coverage(state, user_id, account_id).await {
+    let snapshots = match state
+        .repositories
+        .model_usage()
+        .pending_coverage(user_id, account_id)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "Vertex coverage snapshot read deferred");
             return;
         }
     };
-    if coverage_inserted {
-        if let Err(error) = state.store.save_user(user_id).await {
-            warn!(error = %error, "Vertex coverage snapshot durability deferred");
-            return;
-        }
-    }
-    for snapshot in snapshots {
+    for claimed in snapshots {
+        let claim_id = claimed.claim_id;
+        let snapshot = claimed.snapshot;
         let anchor = match state
             .repositories
             .billing()
@@ -1238,23 +1302,38 @@ async fn drain_coverage(state: &CpState, user_id: &str, account_id: &str) {
             observed_at: anchor.observed_at,
         };
         if anchored != snapshot {
-            if let Err(error) = persist_coverage_snapshot(state, user_id, &anchored).await {
+            if let Err(error) = state
+                .repositories
+                .model_usage()
+                .persist_coverage_snapshot(user_id, &claim_id, &snapshot, &anchored)
+                .await
+            {
                 warn!(error = %error, "Vertex coverage rollback marker durability deferred");
                 continue;
             }
         }
         match state.billing.report_vertex_coverage(&anchored).await {
             Ok(response) if response.acknowledged() => {
-                if let Err(error) =
-                    complete_coverage(state, user_id, &anchored.period, anchored.sequence).await
+                if let Err(error) = state
+                    .repositories
+                    .model_usage()
+                    .complete_coverage(user_id, &claim_id, &anchored.period, anchored.sequence)
+                    .await
                 {
                     warn!(error = %error, "Vertex coverage acknowledgement deferred");
                 }
             }
             Ok(response) if response.stale => {
-                if let Err(error) =
-                    invalidate_stale_coverage(state, user_id, &anchored.period, anchored.sequence)
-                        .await
+                if let Err(error) = state
+                    .repositories
+                    .model_usage()
+                    .invalidate_stale_coverage(
+                        user_id,
+                        &claim_id,
+                        &anchored.period,
+                        anchored.sequence,
+                    )
+                    .await
                 {
                     warn!(error = %error, "stale Vertex coverage invalidation deferred");
                 }
@@ -1273,57 +1352,16 @@ pub async fn settle_for_account_deletion(
     user_id: &str,
     account_id: &str,
 ) -> Result<()> {
-    let user = user_id.to_string();
-    // ADR-0022 F5: a WAL-authoritative user has no legacy blob to open, and
-    // `with_user` refuses outright for a selected user — running this sweep
-    // would 503 the deletion route forever, before deletion could even begin.
-    // The sweep is not rebuilt: everything after it is already routed
-    // (`pending_events` → `pending_events_settled`, `complete_delivery` →
-    // `settle_delivery`, the coverage family, `note_delivery_failure`), and
-    // `save_user` is a provider-silent no-op for a selected user. The one
-    // effect the sweep contributed — settling `started` rows that the ordinary
-    // 180s cutoff would still consider live — is reproduced exactly by the
-    // deletion cutoff below, through the same reviewed reconcile plan.
-    let wal_lane = state.store.is_wal_authoritative(&user);
-    let stale_cutoff = if wal_lane {
-        DELETION_STALE_INTENT_CUTOFF_MILLIS
-    } else {
-        STALE_INTENT_CUTOFF_MILLIS
-    };
-    if !wal_lane {
-        let changed = state
-            .store
-            .with_user(&user, |conn| {
-                let changed = conn.execute(
-                    "UPDATE vertex_usage_events SET outcome='ambiguous',
-                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                     WHERE outcome='started'",
-                    [],
-                )?;
-                if changed != 0 {
-                    refresh_coverage_conn(conn)?;
-                }
-                Ok(changed != 0)
-            })
-            .await?;
-        if changed {
-            state.store.save_user(&user).await?;
-        }
-    }
-
     loop {
-        let (events, ledger_dirty) = pending_events(state, &user, account_id, stale_cutoff).await?;
-        if ledger_dirty || !events.is_empty() {
-            state.store.save_user(&user).await?;
-        }
-        if events.is_empty() {
-            if ledger_dirty {
-                // A full batch may contain only locally quarantined poison
-                // rows. Continue so later valid rows are still settled.
-                continue;
-            }
+        let Some(batch) = state
+            .repositories
+            .model_usage()
+            .pending_events(user_id, account_id, true)
+            .await?
+        else {
             break;
-        }
+        };
+        let events = batch.events;
         let response = state
             .billing
             .report_vertex_usage(&events)
@@ -1342,19 +1380,26 @@ pub async fn settle_for_account_deletion(
             .iter()
             .map(|event| event.event_id.clone())
             .collect::<Vec<_>>();
-        complete_delivery(state, &user, &ids).await?;
+        state
+            .repositories
+            .model_usage()
+            .complete_delivery(user_id, &batch.claim_id, &ids)
+            .await?;
     }
 
-    let (snapshots, coverage_inserted) = pending_coverage(state, &user, account_id).await?;
-    if coverage_inserted {
-        state.store.save_user(&user).await?;
-    }
-    for snapshot in snapshots {
+    let snapshots = state
+        .repositories
+        .model_usage()
+        .pending_coverage(user_id, account_id)
+        .await?;
+    for claimed in snapshots {
+        let claim_id = claimed.claim_id;
+        let snapshot = claimed.snapshot;
         let anchor = state
             .repositories
             .billing()
             .reconcile_vertex_coverage(
-                &user,
+                user_id,
                 &snapshot.period,
                 snapshot.sequence,
                 snapshot.pending_events,
@@ -1371,7 +1416,11 @@ pub async fn settle_for_account_deletion(
             observed_at: anchor.observed_at,
         };
         if anchored != snapshot {
-            persist_coverage_snapshot(state, &user, &anchored).await?;
+            state
+                .repositories
+                .model_usage()
+                .persist_coverage_snapshot(user_id, &claim_id, &snapshot, &anchored)
+                .await?;
         }
         if anchored.pending_events != 0 {
             return Err(crate::error::EnclaveError::Config(
@@ -1392,28 +1441,34 @@ pub async fn settle_for_account_deletion(
                 "Vertex coverage settlement incomplete during deletion".into(),
             ));
         }
-        complete_coverage(state, &user, &anchored.period, anchored.sequence).await?;
+        state
+            .repositories
+            .model_usage()
+            .complete_coverage(user_id, &claim_id, &anchored.period, anchored.sequence)
+            .await?;
     }
     Ok(())
 }
 
-async fn note_delivery_failure(state: &CpState, user_id: &str, event_ids: &[String]) {
-    if state.store.is_wal_authoritative(user_id) {
+pub(crate) async fn legacy_note_delivery_failure(
+    store: &crate::store::Store,
+    user_id: &str,
+    event_ids: &[String],
+) -> Result<()> {
+    if store.is_wal_authoritative(user_id) {
         // Failure noting is best-effort in the legacy path too; a refused
         // settle leaves the attempt counter alone and the next drain retries.
-        let _ = settle_delivery(
-            state,
+        return settle_delivery(
+            store,
             user_id,
             wal::DeliveryOutcome::AttemptFailed,
             event_ids,
         )
         .await;
-        return;
     }
     let user = user_id.to_string();
     let ids = event_ids.to_vec();
-    if state
-        .store
+    store
         .with_user(&user, move |conn| {
             for id in ids {
                 conn.execute(
@@ -1426,11 +1481,8 @@ async fn note_delivery_failure(state: &CpState, user_id: &str, event_ids: &[Stri
             }
             Ok(())
         })
-        .await
-        .is_ok()
-    {
-        let _ = state.store.save_user(&user).await;
-    }
+        .await?;
+    store.save_user(&user).await
 }
 
 pub fn spawn_delivery_worker(state: Arc<CpState>) {
@@ -1463,36 +1515,41 @@ pub async fn drain_outbox(state: &CpState) {
                 continue;
             }
         };
-        let (events, ledger_dirty) =
-            match pending_events(state, &user_id, &account_id, STALE_INTENT_CUTOFF_MILLIS).await {
-                Ok(pending) => pending,
-                Err(error) => {
-                    warn!(error = %error, "Vertex usage outbox read deferred");
-                    continue;
-                }
-            };
-        if ledger_dirty || !events.is_empty() {
-            // `pending_events` may have converted an expired started intent to
-            // ambiguous or quarantined a malformed billing row. Persist that
-            // exact state before either external delivery or coverage.
-            if let Err(error) = state.store.save_user(&user_id).await {
-                warn!(error = %error, "Vertex usage batch durability deferred");
+        let batch = match state
+            .repositories
+            .model_usage()
+            .pending_events(&user_id, &account_id, false)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                warn!(error = %error, "Vertex usage outbox read deferred");
                 continue;
             }
-        }
-        if !events.is_empty() {
+        };
+        if let Some(batch) = batch {
+            let events = batch.events;
             let ids = events
                 .iter()
                 .map(|event| event.event_id.clone())
                 .collect::<Vec<_>>();
             match state.billing.report_vertex_usage(&events).await {
                 Ok(response) if response.accounts_for(events.len()) => {
-                    if let Err(error) = complete_delivery(state, &user_id, &ids).await {
+                    if let Err(error) = state
+                        .repositories
+                        .model_usage()
+                        .complete_delivery(&user_id, &batch.claim_id, &ids)
+                        .await
+                    {
                         warn!(error = %error, "Vertex usage acknowledgement persistence deferred");
                     }
                 }
                 Ok(_) | Err(_) => {
-                    note_delivery_failure(state, &user_id, &ids).await;
+                    let _ = state
+                        .repositories
+                        .model_usage()
+                        .note_delivery_failure(&user_id, &batch.claim_id, &ids)
+                        .await;
                     warn!(events = events.len(), "Vertex usage delivery deferred");
                 }
             }

@@ -10,6 +10,7 @@ mod entitlement;
 mod identity;
 mod legacy;
 mod lifecycle;
+mod model_usage;
 mod notification;
 mod oauth;
 mod query;
@@ -31,6 +32,9 @@ pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
 pub(crate) use lifecycle::AccountLifecycleRepository;
+pub(crate) use model_usage::{
+    ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
+};
 pub(crate) use notification::NotificationRepository;
 pub use notification::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
 pub(crate) use oauth::{
@@ -57,7 +61,8 @@ pub(crate) use work::{
 use self::legacy::{
     LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
     LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMemoryQueryRepository,
-    LegacyNotificationRepository, LegacyOAuthRepository, LegacyWorkRepository,
+    LegacyModelUsageRepository, LegacyNotificationRepository, LegacyOAuthRepository,
+    LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 use crate::store::Store;
@@ -76,6 +81,7 @@ pub(crate) struct RepositorySet {
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
+    model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
 }
 
@@ -89,7 +95,8 @@ impl RepositorySet {
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
-            memory_queries: Arc::new(LegacyMemoryQueryRepository::new(store)),
+            memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
+            model_usage: Arc::new(LegacyModelUsageRepository::new(store)),
             work: Arc::new(LegacyWorkRepository::new(control)),
         }
     }
@@ -105,6 +112,7 @@ impl RepositorySet {
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
+            model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
             work: persistence,
         }
     }
@@ -139,6 +147,10 @@ impl RepositorySet {
 
     pub(crate) fn memory_queries(&self) -> &dyn MemoryQueryRepository {
         self.memory_queries.as_ref()
+    }
+
+    pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {
+        self.model_usage.as_ref()
     }
 
     pub(crate) fn work(&self) -> &dyn WorkRepository {
