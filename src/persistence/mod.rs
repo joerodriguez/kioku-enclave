@@ -13,6 +13,7 @@ mod legacy;
 mod lifecycle;
 mod media_object;
 mod media_processing;
+mod memory_formation;
 mod model_usage;
 mod notification;
 mod oauth;
@@ -41,6 +42,10 @@ pub(crate) use media_processing::{
     AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
     MediaProcessingJob, MediaProcessingRepository, MediaScreenProjection, MediaUsageSettlement,
     ScreenMediaSettlement,
+};
+pub(crate) use memory_formation::{
+    EpisodeEmbeddingSource, EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode,
+    SummaryScreenshot, SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,
 };
 pub(crate) use model_usage::{
     ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
@@ -93,6 +98,7 @@ pub(crate) struct RepositorySet {
     memory_queries: Arc<dyn MemoryQueryRepository>,
     media_objects: Arc<dyn MediaObjectStore>,
     media_processing: Option<Arc<dyn MediaProcessingRepository>>,
+    memory_formation: Option<Arc<dyn MemoryFormationRepository>>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
 }
@@ -110,6 +116,7 @@ impl RepositorySet {
             memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
             media_objects: Arc::new(LegacyMediaObjectStore::new(Arc::clone(&store))),
             media_processing: None,
+            memory_formation: None,
             model_usage: Arc::new(LegacyModelUsageRepository::new(store)),
             work: Arc::new(LegacyWorkRepository::new(control)),
         }
@@ -131,6 +138,7 @@ impl RepositorySet {
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
             media_objects,
             media_processing: Some(Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>),
+            memory_formation: Some(Arc::clone(&persistence) as Arc<dyn MemoryFormationRepository>),
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
             work: persistence,
         }
@@ -178,6 +186,10 @@ impl RepositorySet {
 
     pub(crate) fn media_processing(&self) -> Option<&dyn MediaProcessingRepository> {
         self.media_processing.as_deref()
+    }
+
+    pub(crate) fn memory_formation(&self) -> Option<&dyn MemoryFormationRepository> {
+        self.memory_formation.as_deref()
     }
 
     pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {

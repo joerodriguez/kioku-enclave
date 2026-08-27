@@ -38,6 +38,10 @@ use tracing::{info, warn};
 
 use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
 use crate::error::{EnclaveError, Result};
+use crate::persistence::{
+    EpisodeEmbeddingWrite, OpenEpisode as OpenEp, SummaryScreenshot as ScrRow,
+    SummaryUtterance as UttRow, SummaryWindowClaim, SummaryWindowSettlement,
+};
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
 use super::CpState;
@@ -133,41 +137,6 @@ async fn reserve_vertex_output(state: &CpState, user_id: &str, output_tokens: u3
 
 fn ms(ts: &str) -> i64 {
     parse_epoch_millis(ts).unwrap_or(0)
-}
-
-#[derive(Clone)]
-struct UttRow {
-    id: i64,
-    started_at: String,
-    speaker_label: String,
-    language: Option<String>,
-    text: String,
-}
-
-#[derive(Clone)]
-struct ScrRow {
-    id: i64,
-    captured_at: String,
-    active_app: Option<String>,
-    window_title: Option<String>,
-    ocr_text: Option<String>,
-    salient_ocr_text: Option<String>,
-    url: Option<String>,
-    is_duplicate: i64,
-}
-
-struct OpenEp {
-    id: i64,
-    started_at: String,
-    ended_at: String,
-    episode_type: Option<String>,
-    title: String,
-    summary: Option<String>,
-    participants: Vec<String>,
-    action_items: Vec<String>,
-    recent_minutes: Option<String>,
-    utt_count: i64,
-    scr_count: i64,
 }
 
 fn fmt_time(ts: &str) -> String {
@@ -1010,6 +979,24 @@ async fn clear_settle_refusal(user_id: &str) {
     settle_refusals().lock().await.remove(user_id);
 }
 
+const SUMMARY_CLAIM_LEASE_SECONDS: i64 = 15 * 60;
+
+async fn release_summary_claim(
+    state: &CpState,
+    claim: Option<&SummaryWindowClaim>,
+    error_code: Option<&str>,
+) {
+    let (Some(repository), Some(claim)) = (state.repositories.memory_formation(), claim) else {
+        return;
+    };
+    if let Err(error) = repository
+        .release_summary_window(claim, &format_epoch_millis(now_ms()), error_code)
+        .await
+    {
+        warn!(error = %error, "failed to release summarizer window claim");
+    }
+}
+
 /// Summarize one user's recent capture into episodes. Returns a short status.
 pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     summarize_user_window(state, user_id, SummarizeMode::Scheduled).await
@@ -1180,11 +1167,42 @@ async fn summarize_user_window(
         }
     );
 
+    // PostgreSQL fleet mode admits one provider-backed summarizer for this
+    // user's window. The lease is durable and reclaimable after a crash; the
+    // later settlement verifies the opaque token before applying anything.
+    let summary_claim = if let Some(repository) = state.repositories.memory_formation() {
+        match repository
+            .claim_summary_window(
+                user_id,
+                &new_from_iso,
+                &new_to_iso,
+                &format_epoch_millis(now_ms()),
+                SUMMARY_CLAIM_LEASE_SECONDS,
+            )
+            .await?
+        {
+            Some(claim) => Some(claim),
+            None => {
+                return Ok(serde_json::json!({
+                    "skipped": true,
+                    "reason": "summary_window_claimed"
+                }));
+            }
+        }
+    } else {
+        None
+    };
+
     // Call Vertex. Failed windows return an `error` status carrying
     // `window_to` so the sweep can skip past a window that fails
     // deterministically (see summarize_all) instead of stalling forever.
     let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
-    reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
+    if let Err(error) =
+        reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
+    {
+        release_summary_claim(state, summary_claim.as_ref(), Some("quota_reservation")).await;
+        return Err(error);
+    }
     let response = match super::vertex::generate(
         state,
         user_id,
@@ -1196,10 +1214,12 @@ async fn summarize_user_window(
     {
         Ok(t) => t.text,
         Err(e) if e.to_string().contains("quota") => {
+            release_summary_claim(state, summary_claim.as_ref(), Some("quota")).await;
             return Ok(serde_json::json!({ "skipped": true, "reason": "quota" }));
         }
         Err(e) => {
             warn!(error = %e, "summarizer LLM call failed");
+            release_summary_claim(state, summary_claim.as_ref(), Some("model_call")).await;
             return Ok(serde_json::json!({ "error": e.to_string(), "window_to": new_to_iso }));
         }
     };
@@ -1209,6 +1229,7 @@ async fn summarize_user_window(
             response_len = response.len(),
             "summarizer LLM response unparseable"
         );
+        release_summary_claim(state, summary_claim.as_ref(), Some("unparseable")).await;
         return Ok(
             serde_json::json!({ "error": "unparseable LLM response", "window_to": new_to_iso }),
         );
@@ -1229,7 +1250,12 @@ async fn summarize_user_window(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
+        if let Err(error) =
+            reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
+        {
+            release_summary_claim(state, summary_claim.as_ref(), Some("repair_quota")).await;
+            return Err(error);
+        }
         match super::vertex::generate(
             state,
             user_id,
@@ -1387,6 +1413,33 @@ async fn summarize_user_window(
         });
     }
 
+    let cutoff_iso = format_epoch_millis(effective_cutoff);
+    if let Some(repository) = state.repositories.memory_formation() {
+        let claim = summary_claim
+            .ok_or_else(|| EnclaveError::Store("PostgreSQL summarizer claim disappeared".into()))?;
+        if to_upsert.is_empty() && tail_bounded {
+            release_summary_claim(state, Some(&claim), None).await;
+            info!(
+                user_id,
+                dropped, "summarized nothing; holding cursor for tail to grow"
+            );
+            return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
+        }
+        let ids = repository
+            .settle_summary_window(SummaryWindowSettlement {
+                claim,
+                episodes: to_upsert,
+                cursor: Some(cutoff_iso.clone()),
+            })
+            .await?;
+        let upserted = ids.len();
+        embed_episodes(state, user_id, &ids).await;
+        info!(user_id, upserted, dropped, "summarized");
+        return Ok(
+            serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }),
+        );
+    }
+
     let mut upserted = 0;
     if !to_upsert.is_empty() {
         let user = user_id.to_string();
@@ -1461,7 +1514,6 @@ async fn summarize_user_window(
         return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
     }
 
-    let cutoff_iso = format_epoch_millis(effective_cutoff);
     state
         .repositories
         .work()
@@ -1721,33 +1773,40 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
     };
 
     let id_list = ids.to_vec();
-    let rows: Vec<(i64, String)> = match state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            let mut out = Vec::new();
-            for id in id_list {
-                let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
-                    .query_row(
-                        "SELECT title, summary, minutes_text FROM episodes WHERE id = ?1",
-                        [id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .ok();
-                if let Some((title, summary, minutes)) = row {
-                    let text = [title, summary, minutes]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.trim().is_empty() {
-                        out.push((id, text));
+    let loaded = if let Some(repository) = state.repositories.memory_formation() {
+        repository
+            .episode_embedding_sources(user_id, &id_list)
+            .await
+            .map(|rows| rows.into_iter().map(|row| (row.id, row.text)).collect())
+    } else {
+        state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                let mut out = Vec::new();
+                for id in id_list {
+                    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+                        .query_row(
+                            "SELECT title, summary, minutes_text FROM episodes WHERE id = ?1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+                    if let Some((title, summary, minutes)) = row {
+                        let text = [title, summary, minutes]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.trim().is_empty() {
+                            out.push((id, text));
+                        }
                     }
                 }
-            }
-            Ok(out)
-        })
-        .await
-    {
+                Ok(out)
+            })
+            .await
+    };
+    let rows: Vec<(i64, String)> = match loaded {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "episode embed: read-back failed");
@@ -1772,6 +1831,16 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
         }
     }
     if vectors.is_empty() {
+        return;
+    }
+    if let Some(repository) = state.repositories.memory_formation() {
+        let writes = vectors
+            .into_iter()
+            .map(|(id, _, embedding)| EpisodeEmbeddingWrite { id, embedding })
+            .collect::<Vec<_>>();
+        if let Err(error) = repository.write_episode_embeddings(user_id, &writes).await {
+            warn!(error = %error, "episode embed: vector write failed");
+        }
         return;
     }
     if state.store.is_wal_authoritative(user_id) {
@@ -1913,6 +1982,17 @@ async fn span_holds_recoverable_media(
     let resurrection_window_start = format_epoch_millis(
         now_ms() - (super::media_worker::RESURRECTION_WINDOW_SECONDS * 1000.0) as i64,
     );
+    if let Some(repository) = state.repositories.media_processing() {
+        return repository
+            .span_has_recoverable_media(
+                user_id,
+                from,
+                to,
+                &resurrection_window_start,
+                super::media_worker::RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS,
+            )
+            .await;
+    }
     state
         .store
         .wal_authoritative_read(user_id, move |conn| {
@@ -1936,6 +2016,11 @@ async fn fetch_range(
     from: &str,
     to: &str,
 ) -> Result<(Vec<UttRow>, Vec<ScrRow>)> {
+    if let Some(repository) = state.repositories.memory_formation() {
+        return repository
+            .summary_evidence(user_id, from, to, UTT_CAP as i64, SCR_CAP as i64)
+            .await;
+    }
     let (f, t) = (from.to_string(), to.to_string());
     state
         .store
@@ -1995,6 +2080,17 @@ async fn fetch_open_episodes(
     list_end: &str,
     open_cutoff_ms: i64,
 ) -> Result<Vec<OpenEp>> {
+    if let Some(repository) = state.repositories.memory_formation() {
+        let mut episodes = repository
+            .open_episodes(user_id, list_start, list_end, 100)
+            .await?;
+        episodes.retain(|episode| ms(&episode.ended_at) >= open_cutoff_ms);
+        let excess = episodes.len().saturating_sub(30);
+        if excess > 0 {
+            episodes.drain(0..excess);
+        }
+        return Ok(episodes);
+    }
     let (ls, le) = (list_start.to_string(), list_end.to_string());
     let mut eps = state
         .store
@@ -2205,6 +2301,16 @@ pub fn kick_session_settled(user_id: &str) {
 /// "not settled" holds the kick, which is the conservative answer — claiming
 /// "settled" would summarize a transcript that is still forming.
 async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
+    if let Some(repository) = state.repositories.memory_formation() {
+        let cutoff = format_epoch_millis(now_ms() - 30 * 60 * 1000);
+        return match repository.session_tail_is_settled(user_id, &cutoff).await {
+            Ok(settled) => settled,
+            Err(error) => {
+                warn!(user_id, error = %error, "session-settled gate check failed");
+                false
+            }
+        };
+    }
     let result = state
         .store
         .wal_authoritative_read(user_id, |conn| {

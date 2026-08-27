@@ -10,6 +10,7 @@ mod entitlement;
 mod identity;
 mod lifecycle;
 mod media_processing;
+mod memory_formation;
 mod model_usage;
 mod notification;
 mod oauth;
@@ -24,7 +25,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 14;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 15;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -206,6 +207,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 14;
+        }
+        if version == 14 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0015_memory_formation.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -285,6 +294,7 @@ mod tests {
 
     use super::{PostgresPersistence, PostgresPoolConfig};
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
+    use crate::episodes::EpisodeInput;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
         AuthorizationCodeExchange, ConsentApproval, OAuthClientDefinition, PendingConsent,
@@ -296,7 +306,7 @@ mod tests {
         McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
         MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
         PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        ScreenMediaSettlement, WebhookProviderOutcome, WebhookSendFence,
+        ScreenMediaSettlement, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
@@ -669,13 +679,109 @@ mod tests {
                 .unwrap(),
             1
         );
+        let memory = repositories
+            .memory_formation()
+            .expect("PostgreSQL memory formation repository");
+        let claim = memory
+            .claim_summary_window(
+                &account_id,
+                "2026-08-27T11:59:00.000Z",
+                "2026-08-27T12:10:00.000Z",
+                "2026-08-27T12:10:01.000Z",
+                900,
+            )
+            .await
+            .unwrap()
+            .expect("summary window claim");
+        assert!(memory
+            .claim_summary_window(
+                &account_id,
+                "2026-08-27T11:59:00.000Z",
+                "2026-08-27T12:10:00.000Z",
+                "2026-08-27T12:10:02.000Z",
+                900,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let (summary_utterances, summary_screenshots) = memory
+            .summary_evidence(
+                &account_id,
+                "2026-08-27T11:59:00.000Z",
+                "2026-08-27T12:10:00.000Z",
+                100,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(summary_utterances.is_empty());
+        assert_eq!(summary_screenshots.len(), 1);
+        assert!(memory
+            .open_episodes(
+                &account_id,
+                "2026-08-27T11:00:00.000Z",
+                "2026-08-27T12:10:00.000Z",
+                100,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        let settlement = SummaryWindowSettlement {
+            claim: claim.clone(),
+            episodes: vec![EpisodeInput {
+                id: None,
+                started_at: "2026-08-27T12:00:00.000Z".into(),
+                ended_at: "2026-08-27T12:00:02.000Z".into(),
+                episode_type: Some("work".into()),
+                title: "PostgreSQL architecture".into(),
+                summary: Some("Reviewed the database design.".into()),
+                participants: Some(Vec::new()),
+                languages: Some(vec!["en".into()]),
+                action_items: Some(vec!["Implement the repository".into()]),
+                substance: Some("normal".into()),
+                visual_evidence: Some("useful".into()),
+                minute_summaries: Some(Vec::new()),
+                model: Some("contract-model".into()),
+                member_utterance_ids: Vec::new(),
+                member_screenshot_ids: vec![summary_screenshots[0].id],
+            }],
+            cursor: Some("2026-08-27T12:00:02.000Z".into()),
+        };
+        let episode_ids = memory
+            .settle_summary_window(settlement.clone())
+            .await
+            .unwrap();
+        assert_eq!(episode_ids.len(), 1);
+        assert_eq!(
+            memory.settle_summary_window(settlement).await.unwrap(),
+            episode_ids
+        );
+        assert!(memory
+            .claim_summary_window(
+                &account_id,
+                "2026-08-27T11:59:00.000Z",
+                "2026-08-27T12:10:00.000Z",
+                "2026-08-27T12:20:00.000Z",
+                900,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let embedding_sources = memory
+            .episode_embedding_sources(&account_id, &episode_ids)
+            .await
+            .unwrap();
+        assert_eq!(embedding_sources.len(), 1);
+        assert!(embedding_sources[0]
+            .text
+            .contains("PostgreSQL architecture"));
         assert_eq!(
             repositories
                 .work()
                 .summarized_until(&account_id)
                 .await
                 .unwrap(),
-            None
+            Some("2026-08-27T12:00:02.000Z".into())
         );
         repositories
             .work()
@@ -1262,7 +1368,12 @@ mod tests {
                                   minute_summaries,minutes_text,embedding) \
              VALUES($1,1,'2026-08-27T12:00:00Z','2026-08-27T12:03:00Z', \
                     'PostgreSQL rollout','Shipped the database boundary','[\"Lynn\"]'::jsonb, \
-                    '[]'::jsonb,'database boundary',$2::vector)",
+                    '[]'::jsonb,'database boundary',$2::vector) \
+             ON CONFLICT(account_id,id) DO UPDATE SET \
+                    started_at=excluded.started_at,ended_at=excluded.ended_at,\
+                    title=excluded.title,summary=excluded.summary,\
+                    participants=excluded.participants,minute_summaries=excluded.minute_summaries,\
+                    minutes_text=excluded.minutes_text,embedding=excluded.embedding",
         )
         .bind(&account_id)
         .bind(&embedding)
@@ -1319,7 +1430,8 @@ mod tests {
         ));
         sqlx::query(
             "INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
-             VALUES($1,1,'utterance',1),($1,1,'screenshot',1)",
+             VALUES($1,1,'utterance',1),($1,1,'screenshot',1) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&account_id)
         .execute(&pool)
