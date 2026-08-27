@@ -8,8 +8,8 @@ use crate::{
     cp::{isotime, tokens},
     error::{EnclaveError, Result},
     persistence::{
-        FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationScreenshot,
-        FinalizationSettlement, FinalizationUtterance,
+        FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationRequest,
+        FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
     },
 };
 
@@ -56,6 +56,60 @@ async fn replay_delivery_count(
 
 #[async_trait]
 impl FinalizationRepository for PostgresPersistence {
+    async fn request_finalization(
+        &self,
+        account_id: &str,
+        episode_id: i64,
+        finalization_version: i64,
+    ) -> Result<FinalizationRequest> {
+        if finalization_version <= 0 {
+            return Err(EnclaveError::InvalidRequest(
+                "finalization version is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT substance,finalized_at IS NOT NULL AS finalized,\
+                    coalesce(finalization_version,0) AS version,finalization_status \
+               FROM episodes WHERE account_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(row) = row else {
+            transaction.rollback().await?;
+            return Ok(FinalizationRequest::NotFound);
+        };
+        let status: String = row.try_get("finalization_status")?;
+        if row.try_get::<String, _>("substance")? == "none" {
+            transaction.rollback().await?;
+            return Ok(FinalizationRequest::LowSignal);
+        }
+        if row.try_get::<bool, _>("finalized")?
+            && row.try_get::<i64, _>("version")? >= finalization_version
+        {
+            transaction.rollback().await?;
+            return Ok(FinalizationRequest::AlreadyComplete { status });
+        }
+        if matches!(status.as_str(), "queued" | "processing") {
+            transaction.rollback().await?;
+            return Ok(FinalizationRequest::AlreadyQueued { status });
+        }
+        sqlx::query(
+            "UPDATE episodes SET finalization_status='queued',finalization_error=NULL,\
+                    finalization_attempt_count=0,finalization_next_attempt_at=NULL,\
+                    finalization_claim_token=NULL,finalization_claim_until=NULL,updated_at=now() \
+              WHERE account_id=$1 AND id=$2",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(FinalizationRequest::Queued)
+    }
+
     async fn claim_finalization(
         &self,
         account_id: &str,

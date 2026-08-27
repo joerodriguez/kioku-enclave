@@ -32,6 +32,35 @@ pub(crate) struct CaptureStatus {
     pub(crate) last_screenshot_at: Option<String>,
 }
 
+/// Authoritative encrypted screenshot object resolved from structured state.
+///
+/// Canonical capture objects require an exact current generation and the v2
+/// bound-blob envelope. `LegacyCompatible` exists only so the SQLite adapter
+/// can preserve the retired device-sync image endpoint while it remains a
+/// development/reference backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenshotMediaLocator {
+    Canonical {
+        object_key: String,
+        generation: i64,
+        byte_length: i64,
+        sha256: String,
+    },
+    LegacyCompatible {
+        object_key: String,
+    },
+}
+
+impl ScreenshotMediaLocator {
+    pub(crate) fn object_key(&self) -> &str {
+        match self {
+            Self::Canonical { object_key, .. } | Self::LegacyCompatible { object_key } => {
+                object_key
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryFeedRequest {
     pub(crate) from: Option<String>,
@@ -221,6 +250,11 @@ pub(crate) trait MemoryQueryRepository: Send + Sync {
     ) -> Result<Value>;
     async fn browser_snapshot(&self, account_id: &str, source_key: &str) -> Result<Option<Value>>;
     async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value>;
+    async fn screenshot_media(
+        &self,
+        account_id: &str,
+        public_id: &str,
+    ) -> Result<Option<ScreenshotMediaLocator>>;
     async fn list_people(
         &self,
         account_id: &str,

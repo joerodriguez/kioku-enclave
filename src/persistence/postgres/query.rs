@@ -12,7 +12,7 @@ use crate::{
         McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
         MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
         PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
-        PersonStatementView, PersonSummary,
+        PersonStatementView, PersonSummary, ScreenshotMediaLocator,
     },
     search::{extract_speaker_filter, rrf_merge, SearchHit, SearchRequest},
 };
@@ -1739,6 +1739,58 @@ impl MemoryQueryRepository for PostgresPersistence {
             "member_count": members.len(),
             "participant_details": participant_details,
             "members": members,
+        }))
+    }
+
+    async fn screenshot_media(
+        &self,
+        account_id: &str,
+        public_id: &str,
+    ) -> Result<Option<ScreenshotMediaLocator>> {
+        let Some(asset_id) = public_id.strip_prefix("capture-v2:") else {
+            // The legacy multipart image namespace is intentionally not part
+            // of a fresh PostgreSQL deployment.
+            return Ok(None);
+        };
+        let expected_object_key =
+            crate::store::canonical_capture_media_object_key(account_id, asset_id)?;
+        let row = sqlx::query(
+            "SELECT object_key,object_generation,object_backend,byte_length,sha256 \
+               FROM media_objects WHERE account_id=$1 AND asset_id=$2 \
+                AND mime_type='image/jpeg' AND processing_state='ready' AND deleted_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(asset_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let object_key: String = row.try_get("object_key")?;
+        let generation: Option<i64> = row.try_get("object_generation")?;
+        let backend: Option<String> = row.try_get("object_backend")?;
+        let byte_length: i64 = row.try_get("byte_length")?;
+        let sha256: String = row.try_get("sha256")?;
+        let generation = generation.ok_or_else(|| {
+            EnclaveError::InvalidRequest("canonical screenshot is missing its generation".into())
+        })?;
+        if generation <= 0
+            || backend.as_deref() != Some("current")
+            || object_key != expected_object_key
+            || byte_length <= 0
+            || byte_length > crate::cp::media::MAX_SCREENSHOT_BYTES
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "canonical screenshot identity is malformed".into(),
+            ));
+        }
+        Ok(Some(ScreenshotMediaLocator::Canonical {
+            object_key,
+            generation,
+            byte_length,
+            sha256,
         }))
     }
 

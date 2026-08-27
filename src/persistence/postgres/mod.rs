@@ -335,12 +335,13 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, FrozenPushDelivery,
-        FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest,
-        MediaProcessingClass, MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest,
-        PeopleListRequest, PushInstallation, PushProviderOutcome, PushProviderReceipt,
-        PushSendFenceDisposition, ScreenMediaSettlement, SummaryWindowSettlement,
-        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+        FinalizationRequest, FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
+        FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
+        McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
+        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
+        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, ScreenMediaSettlement,
+        ScreenshotMediaLocator, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
+        WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::search::{SearchHit, SearchRequest};
@@ -723,6 +724,29 @@ mod tests {
                 .processing_state,
             "ready"
         );
+        let screenshot_locator = repositories
+            .memory_queries()
+            .screenshot_media(
+                &account_id,
+                &format!("capture-v2:{}", canonical.media.as_ref().unwrap().asset_id),
+            )
+            .await
+            .unwrap()
+            .expect("canonical screenshot locator");
+        assert!(matches!(
+            screenshot_locator,
+            ScreenshotMediaLocator::Canonical {
+                generation: 1,
+                byte_length: 12,
+                ..
+            }
+        ));
+        assert!(repositories
+            .memory_queries()
+            .screenshot_media(&account_id, "legacy-evidence-id")
+            .await
+            .unwrap()
+            .is_none());
         let session_status = repositories
             .captures()
             .session_status(&account_id, "session-contract", None)
@@ -877,6 +901,22 @@ mod tests {
         let finalization = repositories
             .finalization()
             .expect("PostgreSQL finalization repository");
+        assert_eq!(
+            finalization
+                .request_finalization(&account_id, episode_ids[0], 5)
+                .await
+                .unwrap(),
+            FinalizationRequest::Queued
+        );
+        assert_eq!(
+            finalization
+                .request_finalization(&account_id, episode_ids[0], 5)
+                .await
+                .unwrap(),
+            FinalizationRequest::AlreadyQueued {
+                status: "queued".into()
+            }
+        );
         let finalization_claim = finalization
             .claim_finalization(
                 &account_id,

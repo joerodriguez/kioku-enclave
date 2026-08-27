@@ -10,7 +10,7 @@ use crate::persistence::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
     McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
     MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage, PersonProfile,
-    PersonStatementPage, PersonSummary,
+    PersonStatementPage, PersonSummary, ScreenshotMediaLocator,
 };
 use crate::search::{search_all, SearchHit, SearchRequest};
 use crate::store::Store;
@@ -260,6 +260,24 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
         self.store
             .wal_authoritative_read(account_id, move |connection| {
                 crate::cp::query::load_episode_members(connection, episode_id)
+            })
+            .await
+    }
+
+    async fn screenshot_media(
+        &self,
+        account_id: &str,
+        public_id: &str,
+    ) -> Result<Option<ScreenshotMediaLocator>> {
+        let public_id = public_id.to_owned();
+        let account_id_owned = account_id.to_owned();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                crate::cp::query::legacy_screenshot_media_locator(
+                    connection,
+                    &account_id_owned,
+                    &public_id,
+                )
             })
             .await
     }
