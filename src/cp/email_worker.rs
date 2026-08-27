@@ -1662,6 +1662,7 @@ mod tests {
             .unwrap();
 
         let state = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
@@ -1745,6 +1746,7 @@ mod tests {
             .unwrap();
 
         let state = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),
@@ -1816,6 +1818,7 @@ mod tests {
             .unwrap();
 
         let state = Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: store.clone(),
             control: control.clone(),
             repositories: crate::persistence::RepositorySet::legacy(control.clone(), store.clone()),

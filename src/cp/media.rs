@@ -2915,11 +2915,11 @@ pub(in crate::cp) async fn load_or_create_media_dek(
     // read path, a selected user reads the settled lane.
     let existing = read_media_dek_wrapped(state, user_id).await?;
     if let Some(wrapped) = existing {
-        let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &wrapped).await?;
+        let dek = crate::crypto::load_dek(state.kms.as_ref(), &wrapped).await?;
         return Ok((dek, wrapped));
     }
     let (candidate_dek, candidate_wrapped) =
-        crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref()).await?;
+        crate::crypto::generate_and_wrap_dek(state.kms.as_ref()).await?;
     if state.store.is_wal_authoritative(user_id) {
         let plan = wal::MediaDekInstallPlan::new(
             user_id.to_owned(),
@@ -2948,7 +2948,7 @@ pub(in crate::cp) async fn load_or_create_media_dek(
                     .ok_or_else(|| {
                         EnclaveError::Store("media DEK install lost a race to no winner".into())
                     })?;
-                let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &winner).await?;
+                let dek = crate::crypto::load_dek(state.kms.as_ref(), &winner).await?;
                 Ok((dek, winner))
             }
             Err(error) => Err(error),
@@ -2963,7 +2963,7 @@ pub(in crate::cp) async fn load_or_create_media_dek(
     if winner == candidate_wrapped {
         Ok((candidate_dek, winner))
     } else {
-        let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &winner).await?;
+        let dek = crate::crypto::load_dek(state.kms.as_ref(), &winner).await?;
         Ok((dek, winner))
     }
 }
@@ -7288,6 +7288,7 @@ mod tests {
             legacy_media_gcs,
         ));
         Arc::new(CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),
@@ -7344,7 +7345,7 @@ mod tests {
             crate::store::canonical_capture_media_object_key(user_id, "strict-asset").unwrap();
         let context = crate::store::media_blob_context(user_id, &object_key);
         let expected = b"strict current response";
-        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
             .await
             .unwrap();
         let blob = crate::crypto::encrypt_bound_blob(&dek, expected, &context).unwrap();
@@ -7415,10 +7416,9 @@ mod tests {
         let wrong_wrapped_context = crate::store::media_blob_context(user_id, &wrong_wrapped_key);
         let wrong_wrapped_blob =
             crate::crypto::encrypt_bound_blob(&dek, expected, &wrong_wrapped_context).unwrap();
-        let (_, different_wrapped_dek) =
-            crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
-                .await
-                .unwrap();
+        let (_, different_wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
+            .await
+            .unwrap();
         current
             .put_object(
                 &wrong_wrapped_key,

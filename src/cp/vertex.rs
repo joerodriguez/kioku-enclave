@@ -757,6 +757,7 @@ mod tests {
             .await
             .unwrap();
         let state = CpState {
+            kms: Arc::clone(&store.kms),
             store: Arc::clone(&store),
             control: Arc::clone(&control),
             repositories: crate::persistence::RepositorySet::legacy(control, store),

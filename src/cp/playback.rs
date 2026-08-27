@@ -551,17 +551,16 @@ async fn memory_playback_segment(
                 tracing::error!("playback segment has no media DEK authority");
                 return internal_error();
             };
-            let media_dek =
-                match crate::crypto::load_dek(state.store.kms.as_ref(), &wrapped_dek).await {
-                    Ok(value) => value,
-                    Err(error @ (EnclaveError::Http(_) | EnclaveError::Attestation(_))) => {
-                        return super::routed_read_unavailable("api.playback_segment.kms", &error)
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "playback media DEK load failed");
-                        return internal_error();
-                    }
-                };
+            let media_dek = match crate::crypto::load_dek(state.kms.as_ref(), &wrapped_dek).await {
+                Ok(value) => value,
+                Err(error @ (EnclaveError::Http(_) | EnclaveError::Attestation(_))) => {
+                    return super::routed_read_unavailable("api.playback_segment.kms", &error)
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "playback media DEK load failed");
+                    return internal_error();
+                }
+            };
             (
                 wrapped_dek,
                 media_dek,
