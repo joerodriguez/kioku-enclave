@@ -1039,6 +1039,7 @@ fn map_domain_error(error: EnclaveError) -> WalIdempotencyError {
         EnclaveError::Conflict(_) | EnclaveError::NotFound => WalIdempotencyError::Precondition,
         EnclaveError::InvalidRequest(_) | EnclaveError::Json(_) => WalIdempotencyError::Corrupt,
         EnclaveError::Db(_)
+        | EnclaveError::Postgres(_)
         | EnclaveError::Crypto(_)
         | EnclaveError::Store(_)
         | EnclaveError::Kms(_)

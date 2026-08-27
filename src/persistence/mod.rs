@@ -7,6 +7,11 @@
 mod identity;
 mod legacy;
 mod oauth;
+// PostgreSQL is compiled and contract-tested now, but production construction
+// stays disabled until the interface freeze makes one whole repository set
+// selectable without split authority.
+#[allow(dead_code)]
+mod postgres;
 
 use std::sync::Arc;
 
@@ -16,6 +21,7 @@ pub(crate) use oauth::{
     OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
+pub(crate) use postgres::PostgresPersistence;
 
 use self::legacy::{LegacyIdentitySessionRepository, LegacyOAuthRepository};
 use crate::cp::control_store::ControlStore;
@@ -35,6 +41,14 @@ impl RepositorySet {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
             oauth: Arc::new(LegacyOAuthRepository::new(control)),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn postgres(persistence: Arc<PostgresPersistence>) -> Self {
+        Self {
+            identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
+            oauth: persistence,
         }
     }
 

@@ -1509,6 +1509,7 @@ fn map_domain_error(error: EnclaveError) -> WalIdempotencyError {
         | EnclaveError::CaptureReference(_)
         | EnclaveError::CaptureReferenceBatch { .. } => WalIdempotencyError::Precondition,
         EnclaveError::Db(_)
+        | EnclaveError::Postgres(_)
         | EnclaveError::Crypto(_)
         | EnclaveError::Store(_)
         | EnclaveError::Kms(_)
