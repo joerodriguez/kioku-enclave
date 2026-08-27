@@ -26,6 +26,7 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine as _};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,6 +38,9 @@ use super::auth::AuthUser;
 use super::CpState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const EPISODE_CURSOR_VERSION: u8 = 1;
+const MAX_EPISODE_CURSOR_CHARS: usize = 256;
+const MAX_EPISODE_CURSOR_TIMESTAMP_BYTES: usize = 64;
 
 /// The combined episode + utterance search behind `GET /api/search`.
 ///
@@ -337,6 +341,98 @@ fn url_domain(url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
 }
 
+/// Opaque REST continuation key. Clients must round-trip the encoded value
+/// rather than inspecting it; the versioned payload lets the server reject an
+/// unknown representation instead of silently restarting at the first page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpisodeBeforeCursor {
+    started_at: String,
+    id: i64,
+}
+
+enum EpisodeQueryMode {
+    Legacy,
+    RestPage { before: Option<EpisodeBeforeCursor> },
+}
+
+fn encode_episode_before_cursor(started_at: &str, id: i64) -> String {
+    let mut payload = Vec::with_capacity(1 + std::mem::size_of::<i64>() + started_at.len());
+    payload.push(EPISODE_CURSOR_VERSION);
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(started_at.as_bytes());
+    BASE64_URL.encode(payload)
+}
+
+fn is_valid_episode_cursor_timestamp(timestamp: &str) -> bool {
+    if !timestamp.is_ascii()
+        || timestamp.len() < 20
+        || timestamp.len() > MAX_EPISODE_CURSOR_TIMESTAMP_BYTES
+    {
+        return false;
+    }
+    let bytes = timestamp.as_bytes();
+    const DIGIT_POSITIONS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last().expect("length checked above") != b'Z'
+        || !DIGIT_POSITIONS
+            .iter()
+            .all(|position| bytes[*position].is_ascii_digit())
+    {
+        return false;
+    }
+    if timestamp.len() > 20
+        && (bytes[19] != b'.'
+            || bytes[20..timestamp.len() - 1].is_empty()
+            || !bytes[20..timestamp.len() - 1]
+                .iter()
+                .all(u8::is_ascii_digit))
+    {
+        return false;
+    }
+
+    let parse = |range: std::ops::Range<usize>| timestamp[range].parse::<u8>().ok();
+    let (Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        parse(5..7),
+        parse(8..10),
+        parse(11..13),
+        parse(14..16),
+        parse(17..19),
+    ) else {
+        return false;
+    };
+    &timestamp[0..4] != "0000"
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60
+}
+
+fn decode_episode_before_cursor(encoded: &str) -> Result<EpisodeBeforeCursor, ()> {
+    if encoded.is_empty() || encoded.len() > MAX_EPISODE_CURSOR_CHARS {
+        return Err(());
+    }
+    let bytes = BASE64_URL.decode(encoded).map_err(|_| ())?;
+    if bytes.len() < 1 + std::mem::size_of::<i64>() + 20
+        || bytes.len() > 1 + std::mem::size_of::<i64>() + MAX_EPISODE_CURSOR_TIMESTAMP_BYTES
+        || bytes[0] != EPISODE_CURSOR_VERSION
+    {
+        return Err(());
+    }
+    let id = i64::from_be_bytes(bytes[1..9].try_into().map_err(|_| ())?);
+    let started_at = std::str::from_utf8(&bytes[9..])
+        .map_err(|_| ())?
+        .to_string();
+    if !is_valid_episode_cursor_timestamp(&started_at) {
+        return Err(());
+    }
+    Ok(EpisodeBeforeCursor { started_at, id })
+}
+
 /// Shared list/detail query. Keeping the optional id filter here ensures the
 /// direct detail endpoint cannot drift from the list row's fields, visibility
 /// rules, derived counts, or final-brief shape.
@@ -359,11 +455,69 @@ async fn query_episodes_value(
     include_low: bool,
     episode_id: Option<i64>,
 ) -> crate::error::Result<Value> {
+    query_episodes_rows_value(
+        s,
+        user_id,
+        from,
+        to,
+        max,
+        include_low,
+        episode_id,
+        EpisodeQueryMode::Legacy,
+    )
+    .await
+}
+
+/// REST-capable episode page. Ordering and the continuation predicate use the
+/// same `(started_at, id)` tuple, so equal timestamps neither duplicate nor
+/// skip rows between pages.
+async fn query_episodes_page_value(
+    s: &CpState,
+    user_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    max: i64,
+    include_low: bool,
+    episode_id: Option<i64>,
+    before: Option<EpisodeBeforeCursor>,
+) -> crate::error::Result<Value> {
+    query_episodes_rows_value(
+        s,
+        user_id,
+        from,
+        to,
+        max.clamp(1, 50),
+        include_low,
+        episode_id,
+        EpisodeQueryMode::RestPage { before },
+    )
+    .await
+}
+
+async fn query_episodes_rows_value(
+    s: &CpState,
+    user_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    max: i64,
+    include_low: bool,
+    episode_id: Option<i64>,
+    mode: EpisodeQueryMode,
+) -> crate::error::Result<Value> {
     // Normalize offset-bearing timestamps (e.g. -04:00) to UTC before SQL.
     // DB stores UTC Z-suffixed strings; after normalization both sides are UTC
     // and simple string comparison works correctly.
     let from = from.map(|s| super::isotime::normalize_to_utc(&s));
     let to = to.map(|s| super::isotime::normalize_to_utc(&s));
+    let (fetch_limit, before_started_at, before_id, rest_page_size) = match mode {
+        EpisodeQueryMode::Legacy => (max, None, None, None),
+        EpisodeQueryMode::RestPage { before } => {
+            let (before_started_at, before_id) = before
+                .map(|cursor| (Some(cursor.started_at), Some(cursor.id)))
+                .unwrap_or((None, None));
+            (max + 1, before_started_at, before_id, Some(max as usize))
+        }
+    };
 
     s.store
         .wal_authoritative_read(user_id, move |conn| {
@@ -404,11 +558,20 @@ async fn query_episodes_value(
                    (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
                    AND (?3 = 1 OR e.substance != 'none') \
                    AND (?5 IS NULL OR e.id = ?5) \
-                 ORDER BY e.started_at DESC LIMIT ?4",
+                   AND (?6 IS NULL OR e.started_at < ?6 OR (e.started_at = ?6 AND e.id < ?7)) \
+                 ORDER BY e.started_at DESC, e.id DESC LIMIT ?4",
             )?;
             let mut episodes: Vec<Value> = stmt
                 .query_map(
-                    rusqlite::params![from, to, include_low, max, episode_id],
+                    rusqlite::params![
+                        from,
+                        to,
+                        include_low,
+                        fetch_limit,
+                        episode_id,
+                        before_started_at,
+                        before_id
+                    ],
                     |r| {
 
                     let utt: i64 = r.get(9)?;
@@ -469,6 +632,23 @@ async fn query_episodes_value(
                 .filter_map(|x| x.ok())
                 .collect();
 
+            let next_before = if let Some(page_size) = rest_page_size {
+                let has_more = episodes.len() > page_size;
+                episodes.truncate(page_size);
+                if has_more {
+                    episodes.last().and_then(|episode| {
+                        Some(encode_episode_before_cursor(
+                            episode.get("started_at")?.as_str()?,
+                            episode.get("id")?.as_i64()?,
+                        ))
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let hidden_count: i64 = if include_low {
                 0
             } else {
@@ -527,11 +707,15 @@ async fn query_episodes_value(
 
             // episode_count is part of the debugger contract: the Episodes tab
             // header renders `${data.episode_count} episodes`.
-            Ok(json!({
+            let mut value = json!({
                 "episode_count": episodes.len(),
                 "hidden_count": hidden_count,
-                "episodes": episodes
-            }))
+                "episodes": episodes,
+            });
+            if rest_page_size.is_some() {
+                value["next_before"] = json!(next_before);
+            }
+            Ok(value)
         })
         .await
 }
@@ -1152,6 +1336,7 @@ struct EpisodesParams {
     to: Option<String>,
     max_episodes: Option<i64>,
     include_low: Option<String>,
+    before: Option<String>,
 }
 
 async fn rest_episodes(
@@ -1160,6 +1345,21 @@ async fn rest_episodes(
     Query(p): Query<EpisodesParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
+    let before = match p
+        .before
+        .as_deref()
+        .map(decode_episode_before_cursor)
+        .transpose()
+    {
+        Ok(before) => before,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_before"})),
+            )
+                .into_response();
+        }
+    };
     // ADR-0022 D4: the `query.episodes` gate is GONE. `episodes` and
     // `episode_members` are both written inside
     // `summarizer/wal/window.rs::apply` for a selected user, and
@@ -1171,14 +1371,15 @@ async fn rest_episodes(
     // above covers the deferred population; this arm covers the legacy lane,
     // where a transient database error produced the same false empty and no
     // gate was ever going to catch it.
-    match query_episodes_value(
+    match query_episodes_page_value(
         &s,
         &user.0,
         p.from,
         p.to,
-        p.max_episodes.unwrap_or(50),
+        p.max_episodes.unwrap_or(50).clamp(1, 50),
         include_low,
         None,
+        before,
     )
     .await
     {
@@ -5508,6 +5709,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_episode_pages_are_stable_across_equal_timestamps_and_newer_inserts() {
+        async fn page(state: &Arc<CpState>, user_id: &str, before: Option<String>) -> Value {
+            let response = rest_episodes(
+                State(Arc::clone(state)),
+                Extension(AuthUser(user_id.to_string())),
+                Query(EpisodesParams {
+                    from: None,
+                    to: None,
+                    max_episodes: Some(2),
+                    include_low: None,
+                    before,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        fn ids(value: &Value) -> Vec<i64> {
+            value["episodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|episode| episode["id"].as_i64().unwrap())
+                .collect()
+        }
+
+        let state = query_test_state();
+        let user_id = "episode-pagination-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                for (id, started_at) in [
+                    (10, "2026-08-20T12:00:00.000Z"),
+                    (20, "2026-08-20T12:00:00.000Z"),
+                    (30, "2026-08-20T12:00:00.000Z"),
+                    (40, "2026-08-20T11:00:00.000Z"),
+                    (50, "2026-08-20T10:00:00.000Z"),
+                ] {
+                    conn.execute(
+                        "INSERT INTO episodes (id, started_at, ended_at, title, substance) \
+                         VALUES (?1, ?2, ?2, ?3, 'normal')",
+                        rusqlite::params![id, started_at, format!("Episode {id}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let first = page(&state, user_id, None).await;
+        assert_eq!(ids(&first), vec![30, 20]);
+        let first_cursor = first["next_before"]
+            .as_str()
+            .expect("a full page with an older row has a continuation")
+            .to_string();
+        assert!(!first_cursor.contains("2026-08-20"));
+
+        // A row inserted above the first page must not shift the continuation
+        // window or cause a duplicate. Equal timestamps continue by id.
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, substance) \
+                     VALUES (99, '2026-08-20T13:00:00.000Z', '2026-08-20T13:01:00.000Z', \
+                             'Inserted later', 'normal')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let second = page(&state, user_id, Some(first_cursor)).await;
+        assert_eq!(ids(&second), vec![10, 40]);
+        let third = page(
+            &state,
+            user_id,
+            Some(
+                second["next_before"]
+                    .as_str()
+                    .expect("one older row remains")
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(ids(&third), vec![50]);
+        assert!(third["next_before"].is_null());
+
+        // Pagination is additive to REST only; the MCP contract remains the
+        // same finite newest-first list with no cursor field.
+        let mcp = dispatch_tool(
+            &state,
+            user_id,
+            "list_episodes",
+            &json!({"max_episodes": 2}),
+        )
+        .await
+        .expect("list_episodes dispatches");
+        assert_eq!(mcp["episode_count"], 2);
+        assert!(mcp.get("next_before").is_none());
+    }
+
+    #[tokio::test]
+    async fn rest_episode_limit_is_clamped_while_legacy_limit_is_preserved() {
+        async fn request(
+            state: &Arc<CpState>,
+            user_id: &str,
+            max_episodes: i64,
+            before: Option<String>,
+        ) -> Response {
+            rest_episodes(
+                State(Arc::clone(state)),
+                Extension(AuthUser(user_id.to_string())),
+                Query(EpisodesParams {
+                    from: None,
+                    to: None,
+                    max_episodes: Some(max_episodes),
+                    include_low: None,
+                    before,
+                }),
+            )
+            .await
+        }
+
+        async fn body(response: Response) -> Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let state = query_test_state();
+        let user_id = "episode-limit-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                for id in 1..=55_i64 {
+                    conn.execute(
+                        "INSERT INTO episodes (id, started_at, ended_at, title, substance) \
+                         VALUES (?1, '2026-08-20T12:00:00.000Z', \
+                                 '2026-08-20T12:01:00.000Z', ?2, 'normal')",
+                        rusqlite::params![id, format!("Episode {id}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let legacy_zero = query_episodes_value(&state, user_id, None, None, 0, false, None)
+            .await
+            .unwrap();
+        assert_eq!(legacy_zero["episode_count"], 0);
+        assert!(legacy_zero.get("next_before").is_none());
+
+        let legacy_above_rest_cap =
+            query_episodes_value(&state, user_id, None, None, 500, false, None)
+                .await
+                .unwrap();
+        assert_eq!(legacy_above_rest_cap["episode_count"], 55);
+        assert!(legacy_above_rest_cap.get("next_before").is_none());
+
+        let lower = request(&state, user_id, 0, None).await;
+        assert_eq!(lower.status(), StatusCode::OK);
+        let lower = body(lower).await;
+        assert_eq!(lower["episode_count"], 1);
+        assert!(lower["next_before"].is_string());
+
+        let upper = request(&state, user_id, 500, None).await;
+        assert_eq!(upper.status(), StatusCode::OK);
+        let upper = body(upper).await;
+        assert_eq!(upper["episode_count"], 50);
+        assert!(upper["next_before"].is_string());
+
+        let malformed = request(
+            &state,
+            user_id,
+            10,
+            Some("this-is-not-an-episode-cursor".to_string()),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(malformed).await["error"], "invalid_before");
+
+        let invalid_timestamp = encode_episode_before_cursor("2026-99-99T99:99:99.000Z", 55);
+        let malformed = request(&state, user_id, 10, Some(invalid_timestamp)).await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(malformed).await["error"], "invalid_before");
+    }
+
+    #[tokio::test]
     async fn episode_members_expose_ready_cloud_capture_images_without_regressing_legacy_ids() {
         let state = query_test_state();
         let user_id = "episode-cloud-images-user";
@@ -7207,6 +7604,7 @@ mod tests {
                             to: None,
                             max_episodes: None,
                             include_low: None,
+                            before: None,
                         }),
                     )
                     .await,
@@ -7549,6 +7947,7 @@ mod tests {
                 to: None,
                 max_episodes: None,
                 include_low: None,
+                before: None,
             }),
         )
         .await;
