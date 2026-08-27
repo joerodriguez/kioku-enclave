@@ -5934,6 +5934,7 @@ mod tests {
                     &"d".repeat(64),
                     &object_key,
                     Some(retained_generation),
+                    None,
                 )?;
                 conn.execute(
                     "UPDATE media_objects SET processing_state='ready',retain_until='2000-01-01T00:00:00.000Z' \

@@ -88,7 +88,7 @@ class FreshReleaseTests(unittest.TestCase):
                 binding["schema_epoch_target"],
                 binding["schema_epoch_minimum_servable"],
             ),
-            (1, 1, 1),
+            (2, 1, 1),
         )
 
     def test_cross_repository_schema_ten_fixture_bytes_are_exact(self) -> None:
@@ -111,7 +111,7 @@ class FreshReleaseTests(unittest.TestCase):
                 "c" * 64,
                 "12345678-1234-5678-9234-567812345678",
                 genesis="off",
-                epoch=0,
+                schema_epochs=(0, 0, 0),
             ),
         )
         self.assertEqual(
@@ -170,10 +170,10 @@ class FreshReleaseTests(unittest.TestCase):
         self.assertTrue(fresh.is_final_tag("refs/tags/" + fresh.CURRENT_TAG))
         self.assertFalse(fresh.is_bootstrap_tag(fresh.CURRENT_TAG))
         for tag in (
-            "v0.8.37-archive-v3-wal.17",
-            "v0.8.37-archive-v3-wal.18-extra",
-            "v0.8.37-ARCHIVE-V3-WAL.18",
-            "v0.8.37-archive-v3-walish.18",
+            "v0.8.38-archive-v3-wal.18",
+            "v0.8.38-archive-v3-wal.19-extra",
+            "v0.8.38-ARCHIVE-V3-WAL.19",
+            "v0.8.38-archive-v3-walish.19",
         ):
             with self.subTest(tag=tag):
                 self.assertTrue(fresh.claims_final_role(tag))
@@ -231,14 +231,14 @@ class FreshReleaseTests(unittest.TestCase):
                         binding["schema_epoch_target"],
                         binding["schema_epoch_minimum_servable"],
                     ),
-                    (1, 1, 1),
+                    (2, 1, 1),
                 )
                 with self.assertRaises(fresh.FreshReleaseError):
                     fresh.bootstrap_release_binding(CANARY_SHA, CANARY_UUID)
 
     def test_final_source_refuses_schema_runtime_seal_and_commitment_drift(self) -> None:
         cases = (
-            ("src/schema_ladder.rs", "SCHEMA_EPOCH_HEAD: u32 = 1", "SCHEMA_EPOCH_HEAD: u32 = 0"),
+            ("src/schema_ladder.rs", "SCHEMA_EPOCH_HEAD: u32 = 2", "SCHEMA_EPOCH_HEAD: u32 = 1"),
             (
                 "config/archive-v3-shadow-runtime.json",
                 '"mode": "durable-fleet-wal-v1"',
@@ -302,14 +302,14 @@ class FreshReleaseTests(unittest.TestCase):
             cargo_path = directory / "Cargo.toml"
             cargo_path.write_text(
                 cargo_path.read_text(encoding="utf-8").replace(
-                    'version = "0.8.37"', 'version = "0.8.35"', 1
+                    'version = "0.8.38"', 'version = "0.8.35"', 1
                 ),
                 encoding="utf-8",
             )
             lock_path = directory / "Cargo.lock"
             lock_path.write_text(
                 lock_path.read_text(encoding="utf-8").replace(
-                    'name = "kioku-enclave"\nversion = "0.8.37"',
+                    'name = "kioku-enclave"\nversion = "0.8.38"',
                     'name = "kioku-enclave"\nversion = "0.8.35"',
                     1,
                 ),

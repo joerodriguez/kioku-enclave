@@ -67,6 +67,7 @@ FORBIDDEN_STEP_SQL = (
 # Every step in FINAL is pinned here; appending a step means appending here too.
 SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = (
     (1, "0001_capture_events_stream_sequence", "00721b2e0796349ebb9200f0f2595b2537d9250212f0b0bf0dd77e5d21622887"),
+    (2, "0002_recording_media_authority", "74b5360ac6692e9000df0c44dff265ec9f58f611eca7200a6d17a9e9352a98a8"),
 )
 
 # `chain_digest(SCHEMA_EPOCH_HEAD)` over the declared ladder, anchored on
@@ -78,7 +79,7 @@ SEALED_STEP_DIGESTS: tuple[tuple[int, str, str], ...] = (
 # nothing about BASELINE_DIGEST, and the chain is built from it, so a baseline
 # re-pin moves this even when no step moved. Not vacuous with an empty ladder
 # either -- it is then exactly `SHA256(LADDER_DOMAIN || BASELINE_DIGEST)`.
-SEALED_LADDER_CHAIN_HEAD = "74336a506af544588f1572e592cb2e238090247fba8aea25187836a4d8c35701"
+SEALED_LADDER_CHAIN_HEAD = "cc396448ff879dc53ee7624271542109d353985390307f695b316bf8320deab3"
 
 # One fixture triple digested by BOTH implementations of `step_digest`: this
 # file's and `schema_ladder::step_digest`'s. The identical constant is asserted

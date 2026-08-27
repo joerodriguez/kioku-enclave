@@ -194,6 +194,29 @@ pub(crate) fn canonical_capture_media_object_key(user_id: &str, asset_id: &str) 
     Ok(format!("raw/{user_id}/{asset_id}.enc"))
 }
 
+/// Build the sole object key accepted for an ADR-0036 durable source segment.
+///
+/// The distinct top-level namespace is a provider-routing boundary, not a
+/// disclosure: both account and asset identifiers are already validated opaque
+/// application identifiers, and callers must still never log the resulting key.
+pub(crate) fn canonical_recording_media_object_key(
+    user_id: &str,
+    asset_id: &str,
+) -> Result<String> {
+    validate_user_id(user_id)?;
+    let valid_asset_id = !asset_id.is_empty()
+        && asset_id.len() <= 128
+        && asset_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !valid_asset_id {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid durable recording asset identifier".into(),
+        ));
+    }
+    Ok(format!("recordings/{user_id}/{asset_id}.enc"))
+}
+
 /// GCS blob metadata we need to track between load and save.
 struct BlobMeta {
     /// GCS object `generation` at load time.  Used for `ifGenerationMatch`.
@@ -292,6 +315,10 @@ pub struct Store {
     /// cleanup scans both providers because bucket identity is not inferable
     /// from a historical database key.
     pub legacy_media_gcs: Arc<dyn GcsClient>,
+    /// True only when startup supplied the separately release-bound durable
+    /// recordings provider. This is an immutable construction fact; request
+    /// input can never select or synthesize it.
+    durable_recording_storage_bound: bool,
     max_open: usize,
     checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     storage_metrics: StorageMetrics,
@@ -2303,7 +2330,10 @@ impl LegacyWriteIntent {
             }
             LegacyWriteKind::MediaPut => {
                 self.backend == LegacyWriteBackend::Media
-                    && self.object_name.starts_with(&media_prefix(&self.user_id))
+                    && (self.object_name.starts_with(&media_prefix(&self.user_id))
+                        || self
+                            .object_name
+                            .starts_with(&recording_media_prefix(&self.user_id)))
             }
             LegacyWriteKind::RecoveryCopy => {
                 let expected_source = gcs_object_name(&self.user_id);
@@ -2669,7 +2699,7 @@ impl std::fmt::Debug for PushDeliveryRow {
 impl Store {
     pub fn new(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>) -> Self {
         let media_gcs = Arc::clone(&gcs);
-        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs, false)
     }
 
     pub fn new_with_media(
@@ -2677,7 +2707,7 @@ impl Store {
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
-        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs, false)
     }
 
     /// Construct the Phase-0 split-media topology. The legacy client is
@@ -2689,7 +2719,24 @@ impl Store {
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
-        Self::new_internal(kms, gcs, media_gcs, legacy_media_gcs)
+        Self::new_internal(kms, gcs, media_gcs, legacy_media_gcs, false)
+    }
+
+    /// Construct the fixed four-provider ADR-0036 topology. Only the
+    /// `recordings/` namespace can reach `recording_media_gcs`; every other
+    /// key remains pinned to the processing provider.
+    pub fn new_with_recording_media(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        processing_media_gcs: Arc<dyn GcsClient>,
+        recording_media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+    ) -> Self {
+        let routed: Arc<dyn GcsClient> = Arc::new(RoutedMediaGcsClient::new(
+            processing_media_gcs,
+            Some(recording_media_gcs),
+        ));
+        Self::new_internal(kms, gcs, routed, legacy_media_gcs, true)
     }
 
     fn new_internal(
@@ -2697,13 +2744,21 @@ impl Store {
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
+        durable_recording_storage_bound: bool,
     ) -> Self {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(16usize)
             .max(1);
-        Self::new_internal_with_max_open(kms, gcs, media_gcs, legacy_media_gcs, max_open)
+        Self::new_internal_with_max_open(
+            kms,
+            gcs,
+            media_gcs,
+            legacy_media_gcs,
+            max_open,
+            durable_recording_storage_bound,
+        )
     }
 
     fn new_internal_with_max_open(
@@ -2712,6 +2767,7 @@ impl Store {
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
+        durable_recording_storage_bound: bool,
     ) -> Self {
         Self::new_internal_with_max_open_and_policy(
             kms,
@@ -2720,6 +2776,7 @@ impl Store {
             legacy_media_gcs,
             max_open,
             StorePersistencePolicy::LegacySnapshot,
+            durable_recording_storage_bound,
         )
     }
 
@@ -2730,6 +2787,7 @@ impl Store {
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
         persistence_policy: StorePersistencePolicy,
+        durable_recording_storage_bound: bool,
     ) -> Self {
         Store {
             registry: Mutex::new(StoreRegistry {
@@ -2750,6 +2808,7 @@ impl Store {
             gcs,
             media_gcs,
             legacy_media_gcs,
+            durable_recording_storage_bound,
             max_open: max_open.max(1),
             checkpoint_clock: Arc::new(SystemTime::now),
             storage_metrics: StorageMetrics::default(),
@@ -2776,7 +2835,12 @@ impl Store {
             media,
             max_open,
             StorePersistencePolicy::WalLogicalOnly,
+            false,
         )
+    }
+
+    pub(crate) const fn durable_recording_storage_bound(&self) -> bool {
+        self.durable_recording_storage_bound
     }
 
     /// Install the KMS-protected key that separates provider fence names from
@@ -4212,11 +4276,51 @@ impl Store {
         self.media_gcs.get_object_generation(name, generation).await
     }
 
+    /// Delete every live and noncurrent durable-recording generation owned by
+    /// one account, then prove that neither live/versioned nor soft-deleted
+    /// provider state remains. The caller must hold the account lifecycle
+    /// gate: unlike account deletion this operation deliberately does not
+    /// close the account's ordinary processing-media admission forever.
+    pub(crate) async fn delete_user_recordings_under_lifecycle(&self, user_id: &str) -> Result<()> {
+        validate_user_id(user_id)?;
+        let prefix = recording_media_prefix(user_id);
+        self.delete_all_versions_under(&self.media_gcs, &prefix)
+            .await?;
+        if !list_all_object_versions(self.media_gcs.as_ref(), &prefix)
+            .await?
+            .is_empty()
+        {
+            return Err(EnclaveError::Gcs(
+                "durable recording generations remain after deletion".into(),
+            ));
+        }
+        let live = self.media_gcs.list_live_objects(&prefix, None).await?;
+        if !live.versions.is_empty() || live.next_page_token.is_some() {
+            return Err(EnclaveError::Gcs(
+                "durable recording live objects remain after deletion".into(),
+            ));
+        }
+        let soft_deleted =
+            matching_soft_deleted_inventory(self.media_gcs.as_ref(), &prefix, false).await?;
+        if soft_deleted.found {
+            return Err(soft_deleted_account_objects_error(soft_deleted));
+        }
+        Ok(())
+    }
+
     fn unique_media_providers(&self) -> impl Iterator<Item = &Arc<dyn GcsClient>> {
         std::iter::once(&self.media_gcs).chain(
             (!Arc::ptr_eq(&self.media_gcs, &self.legacy_media_gcs))
                 .then_some(&self.legacy_media_gcs),
         )
+    }
+
+    fn account_media_prefixes(&self, user_id: &str) -> Vec<String> {
+        let mut prefixes = vec![media_prefix(user_id), legacy_media_prefix(user_id)];
+        if self.durable_recording_storage_bound {
+            prefixes.push(recording_media_prefix(user_id));
+        }
+        prefixes
     }
 
     pub async fn delete_media(&self, name: &str) -> Result<()> {
@@ -4824,11 +4928,11 @@ impl Store {
         // longer represented by the current SQLite blob. The prefix includes
         // its trailing slash, so another user's similarly named prefix cannot
         // be selected.
+        let account_media_prefixes = self.account_media_prefixes(user_id);
         for media_gcs in self.unique_media_providers() {
-            self.delete_all_versions_under(media_gcs, &media_prefix(user_id))
-                .await?;
-            self.delete_all_versions_under(media_gcs, &legacy_media_prefix(user_id))
-                .await?;
+            for prefix in &account_media_prefixes {
+                self.delete_all_versions_under(media_gcs, prefix).await?;
+            }
         }
         for key in keys_to_delete.iter() {
             for media_gcs in self.unique_media_providers() {
@@ -4948,7 +5052,7 @@ impl Store {
         frozen_keys: &[String],
     ) -> Result<()> {
         validate_user_id(user_id)?;
-        let owned = [media_prefix(user_id), legacy_media_prefix(user_id)];
+        let owned = self.account_media_prefixes(user_id);
         for key in frozen_keys {
             if !owned.iter().any(|prefix| key.starts_with(prefix.as_str())) {
                 return Err(EnclaveError::Store(
@@ -5019,10 +5123,11 @@ impl Store {
             inventory
                 .merge(matching_soft_deleted_inventory(gcs.as_ref(), &selector, exact_name).await?);
         }
+        let account_media_prefixes = self.account_media_prefixes(user_id);
         for media_gcs in self.unique_media_providers() {
-            for selector in [media_prefix(user_id), legacy_media_prefix(user_id)] {
+            for selector in &account_media_prefixes {
                 inventory.merge(
-                    matching_soft_deleted_inventory(media_gcs.as_ref(), &selector, false).await?,
+                    matching_soft_deleted_inventory(media_gcs.as_ref(), selector, false).await?,
                 );
             }
         }
@@ -8327,6 +8432,141 @@ pub trait GcsClient: Send + Sync {
     ) -> Result<GcsListVersionsResponse>;
 }
 
+/// Fixed prefix router separating bounded processing media from durable audio.
+///
+/// The router is installed once by startup. Requests cannot choose a provider:
+/// only the canonical `recordings/` namespace reaches the dedicated adapter.
+/// When the infrastructure binding is absent, every durable-key operation fails
+/// closed while established `raw/` and `media/` behavior remains unchanged.
+pub(crate) struct RoutedMediaGcsClient {
+    processing: Arc<dyn GcsClient>,
+    recordings: Option<Arc<dyn GcsClient>>,
+}
+
+impl RoutedMediaGcsClient {
+    pub(crate) fn new(
+        processing: Arc<dyn GcsClient>,
+        recordings: Option<Arc<dyn GcsClient>>,
+    ) -> Self {
+        Self {
+            processing,
+            recordings,
+        }
+    }
+
+    fn provider(&self, name_or_prefix: &str) -> Result<Arc<dyn GcsClient>> {
+        if name_or_prefix.starts_with("recordings/") {
+            self.recordings.clone().ok_or_else(|| {
+                EnclaveError::Store("durable recording storage is not release-bound".into())
+            })
+        } else {
+            Ok(Arc::clone(&self.processing))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GcsClient for RoutedMediaGcsClient {
+    async fn trusted_time_millis(
+        &self,
+        authority_object_name: &str,
+        authority_generation: i64,
+    ) -> Result<i64> {
+        self.provider(authority_object_name)?
+            .trusted_time_millis(authority_object_name, authority_generation)
+            .await
+    }
+
+    async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+        self.provider(object_name)?.get_object(object_name).await
+    }
+
+    async fn get_object_generation(
+        &self,
+        object_name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse> {
+        self.provider(object_name)?
+            .get_object_generation(object_name, generation)
+            .await
+    }
+
+    async fn put_object(
+        &self,
+        object_name: &str,
+        ciphertext: &[u8],
+        wrapped_dek_b64: &str,
+        if_generation_match: i64,
+    ) -> Result<i64> {
+        self.provider(object_name)?
+            .put_object(
+                object_name,
+                ciphertext,
+                wrapped_dek_b64,
+                if_generation_match,
+            )
+            .await
+    }
+
+    async fn copy_generation_if_absent(
+        &self,
+        source_name: &str,
+        source_generation: i64,
+        destination_name: &str,
+    ) -> Result<GcsGenerationCopy> {
+        let source = self.provider(source_name)?;
+        let destination = self.provider(destination_name)?;
+        if !Arc::ptr_eq(&source, &destination) {
+            return Err(EnclaveError::Store(
+                "cross-bucket media copy requires enclave re-encryption".into(),
+            ));
+        }
+        source
+            .copy_generation_if_absent(source_name, source_generation, destination_name)
+            .await
+    }
+
+    async fn delete_object(&self, object_name: &str) -> Result<()> {
+        self.provider(object_name)?.delete_object(object_name).await
+    }
+
+    async fn list_object_versions(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        self.provider(prefix)?
+            .list_object_versions(prefix, page_token)
+            .await
+    }
+
+    async fn list_live_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        self.provider(prefix)?
+            .list_live_objects(prefix, page_token)
+            .await
+    }
+
+    async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()> {
+        self.provider(object_name)?
+            .delete_object_generation(object_name, generation)
+            .await
+    }
+
+    async fn list_soft_deleted_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        self.provider(prefix)?
+            .list_soft_deleted_objects(prefix, page_token)
+            .await
+    }
+}
+
 async fn list_all_object_versions(
     gcs: &dyn GcsClient,
     prefix: &str,
@@ -9336,6 +9576,10 @@ fn legacy_media_prefix(user_id: &str) -> String {
     format!("media/{user_id}/")
 }
 
+fn recording_media_prefix(user_id: &str) -> String {
+    format!("recordings/{user_id}/")
+}
+
 fn legacy_recovery_prefix(user_id: &str) -> String {
     format!("legacy-recovery/{user_id}/")
 }
@@ -9497,6 +9741,108 @@ pub(crate) fn user_blob_context(user_id: &str) -> Vec<u8> {
 
 pub(crate) fn media_blob_context(user_id: &str, object_key: &str) -> Vec<u8> {
     format!("media\0{user_id}\0{object_key}").into_bytes()
+}
+
+/// Provider metadata for a durable recording points at the central key
+/// registry without repeating the wrapped DEK in the recordings bucket.
+/// The policy-epoch commitment prevents an object from being adopted under a
+/// same-numbered epoch belonging to a different retention interval.
+pub(crate) fn recording_media_key_reference(key_epoch: i64, policy_epoch: &str) -> Result<String> {
+    if key_epoch <= 0
+        || policy_epoch.len() != 68
+        || !policy_epoch.starts_with("rpe_")
+        || !policy_epoch[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid durable recording key reference".into(),
+        ));
+    }
+    Ok(format!(
+        "recording-key-v1:{key_epoch}:{}",
+        sha256_hex_bytes(policy_epoch.as_bytes())
+    ))
+}
+
+/// Strict v1 AAD for a durable canonical source segment. Length framing keeps
+/// the encoding injective even if a future opaque identifier grammar expands;
+/// binding the declared plaintext integrity facts makes a provider-side copy
+/// unusable under any other owner, event, asset, or source description.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the AEAD context constructor keeps every authenticated source fact explicit"
+)]
+pub(crate) fn recording_media_blob_context(
+    user_id: &str,
+    object_key: &str,
+    key_epoch: i64,
+    policy_epoch: &str,
+    event_id: &str,
+    asset_id: &str,
+    capture_session_id: &str,
+    stream_kind: &str,
+    codec: &str,
+    byte_length: i64,
+    plaintext_sha256: &str,
+) -> Result<Vec<u8>> {
+    validate_user_id(user_id)?;
+    if object_key != canonical_recording_media_object_key(user_id, asset_id)?
+        || key_epoch <= 0
+        || policy_epoch.len() != 68
+        || !policy_epoch.starts_with("rpe_")
+        || !policy_epoch[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || byte_length <= 0
+        || plaintext_sha256.len() != 64
+        || !plaintext_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || [event_id, capture_session_id, stream_kind, codec]
+            .into_iter()
+            .any(|value| {
+                value.is_empty()
+                    || value.len() > 128
+                    || value
+                        .bytes()
+                        .any(|byte| byte == 0 || byte.is_ascii_control())
+            })
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid durable recording encryption context".into(),
+        ));
+    }
+
+    fn append_field(target: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+        let length = u32::try_from(value.len()).map_err(|_| {
+            EnclaveError::InvalidRequest("durable recording context is too large".into())
+        })?;
+        target.extend_from_slice(&length.to_be_bytes());
+        target.extend_from_slice(value);
+        Ok(())
+    }
+
+    let mut context = Vec::with_capacity(512);
+    context.extend_from_slice(b"kioku.recording-media.v1\0");
+    let byte_length_text = byte_length.to_string();
+    let normalized_sha256 = plaintext_sha256.to_ascii_lowercase();
+    for value in [
+        user_id,
+        object_key,
+        policy_epoch,
+        event_id,
+        asset_id,
+        capture_session_id,
+        stream_kind,
+        codec,
+        byte_length_text.as_str(),
+        normalized_sha256.as_str(),
+    ] {
+        append_field(&mut context, value.as_bytes())?;
+    }
+    context.extend_from_slice(&key_epoch.to_be_bytes());
+    Ok(context)
 }
 
 /// Persist a decrypted database in an atomically-created, owner-only temp file.
@@ -14500,7 +14846,14 @@ pub(crate) mod tests {
         media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
     ) -> Store {
-        Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
+        Store::new_internal_with_max_open(
+            kms,
+            gcs,
+            Arc::clone(&media_gcs),
+            media_gcs,
+            max_open,
+            false,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15745,6 +16098,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn account_deletion_sweeps_uncommitted_durable_recording_prefix() {
+        let indexes = Arc::new(FakeGcs::new());
+        let processing = Arc::new(FakeGcs::new());
+        let recordings = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_recording_media(
+            Arc::new(FakeKms),
+            indexes,
+            processing,
+            recordings.clone(),
+            legacy,
+        );
+        write_and_save(&store, "alice", "init").await.unwrap();
+        recordings
+            .put_object(
+                "recordings/alice/uncommitted.enc",
+                b"ciphertext",
+                "key-reference",
+                0,
+            )
+            .await
+            .unwrap();
+        recordings
+            .put_object("recordings/bob/keep.enc", b"other", "key-reference", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+
+        assert!(recordings
+            .get_object("recordings/alice/uncommitted.enc")
+            .await
+            .is_err());
+        assert!(recordings
+            .get_object("recordings/bob/keep.enc")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn legacy_media_soft_delete_blocks_physical_account_completion() {
         let indexes = Arc::new(FakeGcs::new());
         let current = Arc::new(FakeGcs::new());
@@ -16658,6 +17051,115 @@ pub(crate) mod tests {
             );
         }
         assert!(selected_evidence_media_object_key("alice/../bob", opaque_key).is_err());
+    }
+
+    #[test]
+    fn durable_recording_media_key_is_validated_and_owner_scoped() {
+        let alice = canonical_recording_media_object_key("alice-1", "asset_01").unwrap();
+        let bob = canonical_recording_media_object_key("bob-2", "asset_01").unwrap();
+        assert_eq!(alice, "recordings/alice-1/asset_01.enc");
+        assert_eq!(bob, "recordings/bob-2/asset_01.enc");
+        assert_ne!(alice, bob);
+        for invalid in ["", "../asset", "asset/name", "asset.name"] {
+            assert!(canonical_recording_media_object_key("alice-1", invalid).is_err());
+        }
+        assert!(canonical_recording_media_object_key("alice/../bob", "asset_01").is_err());
+    }
+
+    #[test]
+    fn durable_recording_context_binds_owner_epoch_and_plaintext_facts() {
+        let epoch = format!("rpe_{}", "a".repeat(64));
+        let object = canonical_recording_media_object_key("alice-1", "asset_01").unwrap();
+        let context = recording_media_blob_context(
+            "alice-1",
+            &object,
+            7,
+            &epoch,
+            "event_01",
+            "asset_01",
+            "session_01",
+            "mic",
+            "aac",
+            321,
+            &"b".repeat(64),
+        )
+        .unwrap();
+        let key = crate::crypto::Dek([0x51; 32]);
+        let ciphertext = crate::crypto::encrypt_bound_blob(&key, b"m4a fixture", &context).unwrap();
+        assert_eq!(
+            crate::crypto::decrypt_bound_blob_v2(&key, &ciphertext, &context)
+                .unwrap()
+                .plaintext,
+            b"m4a fixture"
+        );
+        let other = recording_media_blob_context(
+            "alice-1",
+            &object,
+            8,
+            &epoch,
+            "event_01",
+            "asset_01",
+            "session_01",
+            "mic",
+            "aac",
+            321,
+            &"b".repeat(64),
+        )
+        .unwrap();
+        assert!(crate::crypto::decrypt_bound_blob_v2(&key, &ciphertext, &other).is_err());
+        assert_eq!(
+            recording_media_key_reference(7, &epoch).unwrap(),
+            format!("recording-key-v1:7:{}", sha256_hex_bytes(epoch.as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn media_router_is_prefix_fixed_and_fails_closed_without_recording_binding() {
+        let processing = Arc::new(FakeGcs::new());
+        let recordings = Arc::new(FakeGcs::new());
+        let router = RoutedMediaGcsClient::new(
+            processing.clone() as Arc<dyn GcsClient>,
+            Some(recordings.clone() as Arc<dyn GcsClient>),
+        );
+
+        router
+            .put_object("raw/alice/asset.enc", b"processing", "wrapped", 0)
+            .await
+            .unwrap();
+        router
+            .put_object("recordings/alice/asset.enc", b"durable", "key-reference", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            processing
+                .get_object("raw/alice/asset.enc")
+                .await
+                .unwrap()
+                .ciphertext,
+            b"processing"
+        );
+        assert!(processing
+            .get_object("recordings/alice/asset.enc")
+            .await
+            .is_err());
+        assert_eq!(
+            recordings
+                .get_object("recordings/alice/asset.enc")
+                .await
+                .unwrap()
+                .ciphertext,
+            b"durable"
+        );
+        assert!(router
+            .copy_generation_if_absent("raw/alice/asset.enc", 1, "recordings/alice/copied.enc")
+            .await
+            .is_err());
+
+        let unbound = RoutedMediaGcsClient::new(processing as Arc<dyn GcsClient>, None);
+        assert!(matches!(
+            unbound.get_object("recordings/alice/asset.enc").await,
+            Err(EnclaveError::Store(_))
+        ));
     }
 
     #[tokio::test]

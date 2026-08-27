@@ -8,6 +8,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ const ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
 const STATE_TTL_SECS: u64 = 600; // 10m
 const AUTH_CODE_TTL_SECS: u64 = 300; // 5m
 const CONSENT_TTL_SECS: u64 = 300; // 5m
+const RECORDING_RETENTION_LEASE_DOMAIN: &[u8] = b"kioku.recording-retention-lease.v1\0";
+
+type HmacSha256 = Hmac<Sha256>;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -105,6 +109,125 @@ pub fn derive_provider_uuid(provider: &str, subject: &str) -> String {
     }
 }
 
+// ── Recording-retention lease authority ─────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordingRetentionLeaseClaims {
+    pub(crate) user_id: String,
+    pub(crate) lease_id: String,
+    pub(crate) policy_revision: i64,
+    pub(crate) policy_epoch: String,
+    pub(crate) valid_from_epoch_millis: i64,
+    pub(crate) capture_started_before_epoch_millis: i64,
+    pub(crate) valid_until_epoch_millis: i64,
+}
+
+fn valid_recording_retention_lease_claims(claims: &RecordingRetentionLeaseClaims) -> bool {
+    crate::store::validate_user_id(&claims.user_id).is_ok()
+        && claims.lease_id.starts_with("lease_")
+        && claims.lease_id.len() == 70
+        && claims
+            .lease_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && claims.policy_revision > 0
+        && claims.policy_epoch.starts_with("rpe_")
+        && claims.policy_epoch.len() == 68
+        && claims.policy_epoch[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && claims.valid_from_epoch_millis >= 0
+        && claims.capture_started_before_epoch_millis > claims.valid_from_epoch_millis
+        && claims.valid_until_epoch_millis >= claims.capture_started_before_epoch_millis
+        && claims
+            .valid_until_epoch_millis
+            .saturating_sub(claims.valid_from_epoch_millis)
+            <= 5 * 60 * 1_000
+}
+
+pub(crate) fn issue_recording_retention_lease(
+    secret: &str,
+    claims: &RecordingRetentionLeaseClaims,
+) -> Result<String> {
+    if secret.len() < 16 || !valid_recording_retention_lease_claims(claims) {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid recording retention lease authority".into(),
+        ));
+    }
+    let payload = serde_json::to_vec(claims)?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| EnclaveError::Auth("invalid recording authority key".into()))?;
+    mac.update(RECORDING_RETENTION_LEASE_DOMAIN);
+    mac.update(encoded.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    Ok(format!("rrl1.{encoded}.{}", hex_bytes(&signature)))
+}
+
+pub(crate) fn verify_recording_retention_lease(
+    secrets: &[String],
+    token: &str,
+) -> Result<RecordingRetentionLeaseClaims> {
+    if token.len() > 2_048 {
+        return Err(EnclaveError::Auth(
+            "recording retention lease rejected".into(),
+        ));
+    }
+    let mut parts = token.split('.');
+    let (Some("rrl1"), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(EnclaveError::Auth(
+            "recording retention lease rejected".into(),
+        ));
+    };
+    let signature = decode_hex_32(signature)
+        .ok_or_else(|| EnclaveError::Auth("recording retention lease rejected".into()))?;
+    let authenticated = secrets.iter().any(|secret| {
+        HmacSha256::new_from_slice(secret.as_bytes()).is_ok_and(|mut mac| {
+            mac.update(RECORDING_RETENTION_LEASE_DOMAIN);
+            mac.update(payload.as_bytes());
+            mac.verify_slice(&signature).is_ok()
+        })
+    });
+    if !authenticated {
+        return Err(EnclaveError::Auth(
+            "recording retention lease rejected".into(),
+        ));
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| EnclaveError::Auth("recording retention lease rejected".into()))?;
+    let claims: RecordingRetentionLeaseClaims = serde_json::from_slice(&decoded)
+        .map_err(|_| EnclaveError::Auth("recording retention lease rejected".into()))?;
+    if !valid_recording_retention_lease_claims(&claims) {
+        return Err(EnclaveError::Auth(
+            "recording retention lease rejected".into(),
+        ));
+    }
+    Ok(claims)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, slot) in decoded.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(decoded)
+}
+
 // ── Access token (our own HS256 JWT) ────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -112,6 +235,8 @@ struct AccessClaims {
     sub: String,
     iss: String,
     aud: String,
+    #[serde(default)]
+    iat: Option<u64>,
     exp: u64,
 }
 
@@ -121,6 +246,7 @@ pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result
         sub: user_id.to_string(),
         iss: base_url.to_string(),
         aud: base_url.to_string(),
+        iat: Some(now_secs()),
         exp: now_secs() + ACCESS_TOKEN_TTL_SECS,
     };
     encode(
@@ -133,7 +259,16 @@ pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result
 
 /// Verify one of our own access JWTs against the current secret, then any
 /// rotation-fallback secrets. Returns the `sub` (user id). Alg pinned to HS256.
+#[cfg(test)]
 pub fn verify_access_token(secrets: &[String], base_url: &str, token: &str) -> Result<String> {
+    verify_access_token_with_issued_at(secrets, base_url, token).map(|(subject, _)| subject)
+}
+
+pub(crate) fn verify_access_token_with_issued_at(
+    secrets: &[String],
+    base_url: &str,
+    token: &str,
+) -> Result<(String, Option<u64>)> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[base_url]);
     // The canonical resource URL is the MCP authorization audience. Keep the
@@ -148,7 +283,7 @@ pub fn verify_access_token(secrets: &[String], base_url: &str, token: &str) -> R
             &DecodingKey::from_secret(secret.as_bytes()),
             &validation,
         ) {
-            Ok(data) => return Ok(data.claims.sub),
+            Ok(data) => return Ok((data.claims.sub, data.claims.iat)),
             Err(e) => last_err = Some(e),
         }
     }
@@ -350,6 +485,36 @@ mod tests {
         let sub = verify_access_token(&["new".to_string(), "old".to_string()], "https://k", &tok)
             .unwrap();
         assert_eq!(sub, "u");
+    }
+
+    #[test]
+    fn recording_retention_lease_is_owner_epoch_and_signature_bound() {
+        let claims = RecordingRetentionLeaseClaims {
+            user_id: "11111111-1111-4111-8111-111111111111".into(),
+            lease_id: format!("lease_{}", "a".repeat(64)),
+            policy_revision: 7,
+            policy_epoch: format!("rpe_{}", "b".repeat(64)),
+            valid_from_epoch_millis: 1_800_000_000_000,
+            capture_started_before_epoch_millis: 1_800_000_060_000,
+            valid_until_epoch_millis: 1_800_000_060_000,
+        };
+        let secret = "recording-retention-test-secret";
+        let token = issue_recording_retention_lease(secret, &claims).unwrap();
+        assert_eq!(
+            verify_recording_retention_lease(&[secret.into()], &token).unwrap(),
+            claims
+        );
+        assert!(
+            verify_recording_retention_lease(&["different-secret-value".into()], &token).is_err()
+        );
+        let mut tampered = token.into_bytes();
+        let index = tampered.len() / 2;
+        tampered[index] = if tampered[index] == b'a' { b'b' } else { b'a' };
+        assert!(verify_recording_retention_lease(
+            &[secret.into()],
+            &String::from_utf8(tampered).unwrap(),
+        )
+        .is_err());
     }
 
     #[test]

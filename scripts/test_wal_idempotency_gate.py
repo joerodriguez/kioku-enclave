@@ -281,7 +281,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Claim-lane wedge hardening adds one B-classified sealed quarantine submit:
 # 235 -> 236. The final third-state derivation against the merged gate-lift
 # baseline is recorded immediately above the digest below.
-EXPECTED_STORE_CALL_COUNT = 258
+EXPECTED_STORE_CALL_COUNT = 263
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -720,8 +720,17 @@ EXPECTED_STORE_CALL_COUNT = 258
 # of the new voice-profile owner, so its B read and B submit are two additional
 # owner-body-only moves. Their keys, classifications, and call-expression
 # hashes are byte-identical; the count and surviving-key order remain fixed.
-EXPECTED_STORE_CALL_SHA256 = "f2f02b476c8748846def0ca2901a8474be81ffde40ad244802a031beb171c2a1"
-EXPECTED_STORE_SURFACE_COUNT = 13
+# ADR-0036 adds five A-class routed reads: memory manifest, segment lookup,
+# Person conversations, retention inventory, and epoch-2 table presence. No
+# new generic writer is admitted; durable capture remains inside the existing
+# sealed canonical-capture submit whose plan fingerprints the new row.
+# ADR-0036 retention inventory hardening changes only the existing A-class
+# recording_inventory owner body: settled durable reads are fenced to the
+# current Control revision/epoch, while an active downgrade inventories every
+# durable epoch. The 263 keys, call expressions, and classifications remain
+# unchanged.
+EXPECTED_STORE_CALL_SHA256 = "c23ac28ff04adc4dc7616a5e402ebf2c74a7c94d12d5939351780a92c3d69385"
+EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map. Later history below
 # records the two retired advisory-capture construction nodes removed by the
@@ -814,10 +823,13 @@ EXPECTED_STORE_SURFACE_COUNT = 13
 # Archive V3-only cleanup: the retired exact-user advisory capture constructor
 # and its optional selection were deleted. The construction graph loses those
 # two nodes (15 -> 13); the remaining chain is pinned below.
-EXPECTED_STORE_SURFACE_SHA256 = "8656c58920205527a629a6855314bfdb17ab8017f8af82a997dcfc5763777053"
+# ADR-0036 replaces main's ordinary media constructor call with the fixed
+# recording-aware constructor and adds only that constructor's definition and
+# delegation nodes. The provider remains image-derived and namespace-scoped.
+EXPECTED_STORE_SURFACE_SHA256 = "82d6066d03b41a321f9be2e979ed3ae02fd1e3bab06dd64d085cffd77d3ba64f"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
-        "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
+        "src/main.rs::async_main#0::Store::new_with_recording_media#0",
         "src/store.rs::new#2::Self::new_internal#0",
         "src/store.rs::new#2::factory_definition::new#0",
         "src/store.rs::new_internal#0::Self::new_internal_with_max_open#0",
@@ -830,6 +842,8 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
         "src/store.rs::new_with_media#0::factory_definition::new_with_media#0",
         "src/store.rs::new_with_media_and_legacy#0::Self::new_internal#0",
         "src/store.rs::new_with_media_and_legacy#0::factory_definition::new_with_media_and_legacy#0",
+        "src/store.rs::new_with_recording_media#0::Self::new_internal#0",
+        "src/store.rs::new_with_recording_media#0::factory_definition::new_with_recording_media#0",
     }
 )
 # Deliberate ADR-0022 slice F-c re-pin: policy consultation is now the single
@@ -878,7 +892,10 @@ EXPECTED_POLICY_SITE_COUNT = 46
 # Removing the retired capture constructor also exposes the shared open core as
 # the direct policy owner in the structural scanner. Four policy references
 # move into that named owner; no target or classification changes.
-EXPECTED_POLICY_SITE_SHA256 = "92d066143e38e52fc6cf8eef68a318b9daff99b9e44a48c962d52bc307ac4ecb"
+# ADR-0036 changes only the owner-body hashes for the shared constructor's
+# existing policy references by adding a fixed recording-provider field; all
+# 46 targets, expressions, classifications, and key order remain unchanged.
+EXPECTED_POLICY_SITE_SHA256 = "711d9e187ef8988224e1a35bba4fc4688f45723dd4147a03be14ccb2f1dae444"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -922,7 +939,7 @@ EXPECTED_WAL_OWNER_AUTHORITATIVE_KEYS = frozenset(
 # pass in src/archive_v3_genesis_trigger.rs. It is deliberately a worker and
 # not an awaited call — sign-in must never block on, or fail because of,
 # genesis — and it classifies "C" with the rest of the archive-v3 family.
-EXPECTED_WORKER_SPAWN_COUNT = 29
+EXPECTED_WORKER_SPAWN_COUNT = 30
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
@@ -1074,7 +1091,11 @@ EXPECTED_WORKER_SPAWN_COUNT = 29
 # Control-backed fleet discovery changes only the enclosing bodies of the
 # existing Genesis convergence spawn and startup spawn; all 29 spawn sites,
 # call expressions, and classifications are unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "d21650eecde432b644b20eb592d2e60880f998b2c6299cacdbc5b1bb5c1d968e"
+# ADR-0036 adds one C-class Control/lifecycle reconciler for already-settled
+# recording-policy downgrades. Main's existing startup-spawn owner hash moves
+# with the fixed recording provider and reconciler wiring; no existing spawn
+# is removed or reclassified.
+EXPECTED_WORKER_SPAWN_SHA256 = "9d13cd79b789d3cfcd059e1b9db9eeb6e5da45b7578a330fdd7eb8ebce2ad7a0"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1628,6 +1649,14 @@ A_OWNERS = frozenset(
         "src/cp/media.rs::person_profile#0",
         "src/cp/media.rs::person_evidence#0",
         "src/cp/media.rs::person_statements#0",
+        # ADR-0036 owner-only playback and retention inventories are routed,
+        # side-effect-free archive reads. Retention mutation itself remains in
+        # the sealed capture plan or the Control-store lifecycle owner.
+        "src/cp/playback.rs::memory_playback_manifest#0",
+        "src/cp/playback.rs::memory_playback_segment#0",
+        "src/cp/playback.rs::person_memories#0",
+        "src/cp/retention.rs::recording_inventory#0",
+        "src/cp/retention.rs::recording_authority_schema_present#0",
         "src/cp/media_worker.rs::candidate_name_vocabulary#0",
         "src/cp/summarizer.rs::span_holds_recoverable_media#0",
         "src/cp/media_worker.rs::persist_actual_media_usage#0",
@@ -2382,7 +2411,7 @@ impl X {
         # preflight, and the selected E2E fixture reuses it instead of minting
         # a second test-only constructor. Reference construction remains
         # directly in the route.
-        self.assertEqual(media.count("CanonicalCaptureEventPlan::new("), 1)
+        self.assertEqual(media.count("CanonicalCaptureEventPlan::new_with_authority("), 1)
         # The single-event reference family: the OTHER media disposition the
         # one ingest route serves. Both arms had to migrate together -- a
         # mac_screen stream interleaves canonical screenshots and reference
@@ -3983,7 +4012,15 @@ def classify_worker_spawn(site: CallSite) -> str:
     # whether a future WAL-only runtime could allow the spawned owner today.
     if site.owner.path.startswith("src/archive_v3_"):
         return "C"
-    if site.owner.path in {"src/acme.rs", "src/cp/billing.rs", "src/cp/control_store.rs"}:
+    if site.owner.path in {
+        "src/acme.rs",
+        "src/cp/billing.rs",
+        "src/cp/control_store.rs",
+        # ADR-0036's retention reconciler is a Control/lifecycle owner. It
+        # submits no generic user mutation and only advances already-settled
+        # downgrade deletion/key-erasure work.
+        "src/cp/retention.rs",
+    }:
         return "C"
     if site.owner.path in {"src/cp/sync.rs", "src/store.rs"}:
         return "C"

@@ -183,14 +183,22 @@ pub(crate) const SCHEMA_EPOCH_MIN_SERVABLE: u32 = 0;
 """
 
 _EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT = """
-pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[SchemaStep {
-    epoch: 1,
-    id: "0001_capture_events_stream_sequence",
-    class: StepClass::Index,
-    sql: "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence);",
-}];
+pub(crate) const SCHEMA_LADDER: &[SchemaStep] = &[
+    SchemaStep {
+        epoch: 1,
+        id: "0001_capture_events_stream_sequence",
+        class: StepClass::Index,
+        sql: "CREATE INDEX idx_capture_events_stream_sequence ON capture_events (stream_id, sequence);",
+    },
+    SchemaStep {
+        epoch: 2,
+        id: "0002_recording_media_authority",
+        class: StepClass::Table,
+        sql: "CREATE TABLE recording_media_authority (asset_id TEXT PRIMARY KEY REFERENCES media_objects(asset_id) ON DELETE CASCADE, capture_policy_revision INTEGER NOT NULL CHECK(capture_policy_revision >= 0), retention_policy_revision INTEGER NOT NULL CHECK(retention_policy_revision >= 0), retention_policy_epoch TEXT, retention_decision TEXT NOT NULL CHECK(retention_decision IN ('processing_window_30d','until_deleted')), storage_backend TEXT NOT NULL CHECK(storage_backend IN ('processing','recordings')), recording_key_epoch INTEGER, recording_state TEXT NOT NULL CHECK(recording_state IN ('processing_only','durable','delete_pending','deleted','unavailable')), decision_at TEXT NOT NULL, updated_at TEXT NOT NULL, CHECK((retention_decision='until_deleted' AND storage_backend='recordings' AND retention_policy_revision>0 AND retention_policy_epoch IS NOT NULL AND recording_key_epoch IS NOT NULL AND recording_key_epoch>0 AND recording_state IN ('durable','delete_pending','deleted','unavailable')) OR (retention_decision='processing_window_30d' AND storage_backend='processing' AND retention_policy_epoch IS NULL AND recording_key_epoch IS NULL AND recording_state IN ('processing_only','deleted','unavailable'))));",
+    },
+];
 
-pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 1;
+pub(crate) const SCHEMA_EPOCH_HEAD: u32 = 2;
 
 pub(crate) const SCHEMA_EPOCH_TARGET: u32 = 1;
 
@@ -426,7 +434,7 @@ def validate_checked_final_source(
         raise FreshReleaseError("schema phase declaration delimiters are not exact")
     fragment = schema.split(begin, 1)[1].split(end, 1)[0]
     if fragment != _EXPECTED_FINAL_SCHEMA_PHASE_FRAGMENT:
-        raise FreshReleaseError("fresh FINAL schema phase is not exact 1/1/1")
+        raise FreshReleaseError("fresh FINAL schema phase is not exact 2/1/1")
     if (
         HEX64.fullmatch(FINAL_SCHEMA_BASELINE_SEAL_SHA256) is None
         or FINAL_SCHEMA_BASELINE_SEAL_SHA256 == "0" * 64
@@ -538,7 +546,7 @@ def _release_binding(
     canary_admin_uuid: str,
     *,
     genesis: str,
-    epoch: int,
+    schema_epochs: tuple[int, int, int],
 ) -> dict[str, Any]:
     validate_canary_binding(canary_identity_preparation_sha256, canary_admin_uuid)
     binding: dict[str, Any] = {
@@ -572,9 +580,9 @@ def _release_binding(
         ),
         "adr0022_canary_admin_uuid": canary_admin_uuid,
         "production_genesis_wal_native": genesis,
-        "schema_epoch_head": epoch,
-        "schema_epoch_target": epoch,
-        "schema_epoch_minimum_servable": epoch,
+        "schema_epoch_head": schema_epochs[0],
+        "schema_epoch_target": schema_epochs[1],
+        "schema_epoch_minimum_servable": schema_epochs[2],
         "signup_mode": "positive",
     }
     if tuple(binding) != RELEASE_BINDING_FIELD_ORDER:
@@ -593,7 +601,7 @@ def bootstrap_release_binding(
         canary_identity_preparation_sha256,
         canary_admin_uuid,
         genesis="off",
-        epoch=0,
+        schema_epochs=(0, 0, 0),
     )
 
 
@@ -611,7 +619,7 @@ def final_release_binding(
         canary_identity_preparation_sha256,
         canary_admin_uuid,
         genesis="on",
-        epoch=1,
+        schema_epochs=(2, 1, 1),
     )
     if tuple(binding) != RELEASE_BINDING_FIELD_ORDER:
         raise FreshReleaseError("fresh FINAL release binding order drifted")

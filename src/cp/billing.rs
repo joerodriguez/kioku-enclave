@@ -31,6 +31,12 @@ const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
 const ID_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 const RECORDING_LEASE_SECONDS: i64 = 60;
+// A source segment may begin just before a one-minute billing lease rolls and
+// finish at the capture hard cap. The signed retention authority therefore
+// distinguishes the last permitted *start* from the last permitted *end*.
+// This does not extend billing authority: the ordinary lease check remains
+// independent and the current server policy epoch is revalidated at ingest.
+const RECORDING_RETENTION_SEGMENT_TAIL_MILLIS: i64 = 125_000;
 const RECORDING_LEASE_RENEWAL_HEADROOM_MS: i64 = 20_000;
 // Clients schedule renewal from the server-authored absolute expiry using their
 // local wall clock. Permit a small positive client/server skew without turning
@@ -674,15 +680,91 @@ fn lease_authorized_summary(mut summary: Value) -> Value {
     summary
 }
 
-fn recording_lease_response(lease_id: String, expires_at: String, summary: Value) -> Response {
+fn recording_lease_response(lease_id: String, expires_at: String, mut summary: Value) -> Response {
+    let recording_retention = summary
+        .as_object_mut()
+        .and_then(|object| object.remove("_recording_retention_authority"));
     no_store(
         Json(serde_json::json!({
             "lease_id":lease_id,
             "expires_at":expires_at,
-            "billing":lease_authorized_summary(summary)
+            "billing":lease_authorized_summary(summary),
+            "recording_retention":recording_retention,
         }))
         .into_response(),
     )
+}
+
+async fn attach_recording_retention_authority(
+    state: &CpState,
+    user_id: &str,
+    lease_id: &str,
+    expires_at: &str,
+    mut summary: Value,
+) -> Result<Value, RecordingAuthorizationFailure> {
+    if summary.get("_recording_retention_authority").is_some() {
+        return Ok(summary);
+    }
+    let preference = state
+        .control
+        .get_recording_retention_preference(user_id)
+        .await
+        .map_err(|_| RecordingAuthorizationFailure::Unavailable)?;
+    let mut authority = serde_json::json!({
+        "policy": preference.policy,
+        "policy_revision": preference.revision,
+        "consent_version": preference.consent_version,
+        "status": "processing_only",
+    });
+    if preference.policy == super::control_store::RecordingRetentionPolicy::UntilDeleted {
+        let schema_present = super::retention::recording_authority_schema_present(state, user_id)
+            .await
+            .map_err(|_| RecordingAuthorizationFailure::Unavailable)?;
+        let policy_epoch = preference
+            .policy_epoch
+            .as_deref()
+            .ok_or(RecordingAuthorizationFailure::Unavailable)?;
+        let expires_ms = super::isotime::parse_epoch_millis(expires_at)
+            .ok_or(RecordingAuthorizationFailure::Unavailable)?;
+        if !state.store.durable_recording_storage_bound() || !schema_present {
+            authority["status"] = Value::String("temporarily_unavailable".into());
+        } else {
+            let claims = super::tokens::RecordingRetentionLeaseClaims {
+                user_id: user_id.to_string(),
+                lease_id: lease_id.to_string(),
+                policy_revision: preference.revision,
+                policy_epoch: policy_epoch.to_string(),
+                valid_from_epoch_millis: expires_ms
+                    .saturating_sub(RECORDING_LEASE_SECONDS.saturating_mul(1_000)),
+                capture_started_before_epoch_millis: expires_ms,
+                valid_until_epoch_millis: expires_ms
+                    .saturating_add(RECORDING_RETENTION_SEGMENT_TAIL_MILLIS),
+            };
+            let secret = state
+                .config
+                .jwt_secrets
+                .first()
+                .ok_or(RecordingAuthorizationFailure::Unavailable)?;
+            let token = super::tokens::issue_recording_retention_lease(secret, &claims)
+                .map_err(|_| RecordingAuthorizationFailure::Unavailable)?;
+            authority = serde_json::json!({
+                "policy": preference.policy,
+                "policy_revision": preference.revision,
+                "policy_epoch": policy_epoch,
+                "consent_version": preference.consent_version,
+                "status": "authorized",
+                "valid_from": super::isotime::format_epoch_millis(claims.valid_from_epoch_millis),
+                "capture_started_before": expires_at,
+                "valid_until": super::isotime::format_epoch_millis(claims.valid_until_epoch_millis),
+                "authority_token": token,
+            });
+        }
+    }
+    let object = summary
+        .as_object_mut()
+        .ok_or(RecordingAuthorizationFailure::Unavailable)?;
+    object.insert("_recording_retention_authority".into(), authority);
+    Ok(summary)
 }
 
 async fn current_recording_summary(
@@ -860,6 +942,10 @@ async fn create_recording_lease(
             let Some(summary) = existing.summary.clone() else {
                 return service_unavailable();
             };
+            // A granted request is an immutable idempotency receipt. In
+            // particular, do not synthesize a new retention epoch into an old
+            // response after the account setting changes. A fresh lease (or
+            // reattachment request) is the only way to obtain new authority.
             return recording_lease_response(
                 existing.issued_lease_id.clone(),
                 existing.expires_at.clone(),
@@ -929,6 +1015,18 @@ async fn create_recording_lease(
                         }
                         Err(RecordingAuthorizationFailure::Denied { .. }) => unreachable!(),
                     };
+                    let summary = match attach_recording_retention_authority(
+                        &state,
+                        &user.0,
+                        &active_id,
+                        &expires_at,
+                        summary,
+                    )
+                    .await
+                    {
+                        Ok(summary) => summary,
+                        Err(_) => return service_unavailable(),
+                    };
                     return recording_lease_response(active_id, expires_at, summary);
                 }
                 // With at most the renewal headroom left, or after expiry,
@@ -996,6 +1094,22 @@ async fn create_recording_lease(
             .await;
         return idempotency_conflict();
     }
+    let pending = match state.control.pending_recording_lease_request(&user.0).await {
+        Ok(Some((_request_id, pending))) => pending,
+        _ => return service_unavailable(),
+    };
+    let summary = match attach_recording_retention_authority(
+        &state,
+        &user.0,
+        &pending.issued_lease_id,
+        &pending.expires_at,
+        summary,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(_) => return service_unavailable(),
+    };
     let retry_now_ms = existing_pending.then(epoch_millis);
     let (lease_id, expires_at) = match state
         .control

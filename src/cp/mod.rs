@@ -32,8 +32,10 @@ pub mod media_planner;
 pub mod media_worker;
 pub mod model_usage;
 pub mod oauth;
+pub mod playback;
 pub mod push;
 pub mod query;
+pub mod retention;
 pub mod reviewer;
 pub(crate) mod schema_epoch;
 // Retained for legacy-index migrations and focused regression tests after

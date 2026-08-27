@@ -496,7 +496,7 @@ class SelectorTests(unittest.TestCase):
         probe = main.index("archive_v3_firestore_probe::run_startup_probe")
         kms = main.index("crypto::GcpKmsClient::from_env()", probe)
         gcs = main.index("GcpGcsClient::from_env()", probe)
-        store = main.index("Store::new_with_media_and_legacy", probe)
+        store = main.index("Store::new_with_recording_media", probe)
         self.assertLess(probe, kms)
         self.assertLess(probe, gcs)
         self.assertLess(probe, store)

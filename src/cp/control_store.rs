@@ -124,6 +124,11 @@ const IDENTITY_REBIND_USER_ID_TABLES: &[&str] = &[
     "billing_accounts",
     "recording_leases",
     "recording_lease_requests",
+    "recording_retention_preferences",
+    "recording_retention_history",
+    "recording_key_epochs",
+    "recording_retention_previews",
+    "recording_retention_change_receipts",
     "refresh_tokens",
     "oauth_authorization_codes",
     "oauth_consents",
@@ -497,6 +502,78 @@ CREATE TABLE IF NOT EXISTS recording_lease_requests (
     summary_json  TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (user_id, request_id)
+);
+-- ADR-0036 account-wide recording retention authority. An absent preference
+-- is the immutable compatibility default `processing_window_30d`, revision 0.
+-- Every non-default decision is history-preserving and each `until_deleted`
+-- epoch receives a new opaque identifier plus a distinct recording-key epoch.
+CREATE TABLE IF NOT EXISTS recording_retention_preferences (
+    user_id          TEXT PRIMARY KEY REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    policy           TEXT NOT NULL CHECK (policy IN ('processing_window_30d','until_deleted')),
+    consent_version  INTEGER NOT NULL CHECK (consent_version >= 0),
+    revision         INTEGER NOT NULL CHECK (revision > 0),
+    policy_epoch     TEXT,
+    effective_at     TEXT NOT NULL,
+    revocation_cutoff TEXT,
+    updated_at       TEXT NOT NULL,
+    CHECK ((policy='until_deleted' AND consent_version>0 AND policy_epoch IS NOT NULL
+            AND revocation_cutoff IS NULL)
+        OR (policy='processing_window_30d' AND policy_epoch IS NULL))
+);
+CREATE TABLE IF NOT EXISTS recording_retention_history (
+    user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    revision         INTEGER NOT NULL CHECK (revision > 0),
+    policy           TEXT NOT NULL CHECK (policy IN ('processing_window_30d','until_deleted')),
+    consent_version  INTEGER NOT NULL CHECK (consent_version >= 0),
+    policy_epoch     TEXT,
+    effective_at     TEXT NOT NULL,
+    revocation_cutoff TEXT,
+    operation_id     TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint)=64),
+    PRIMARY KEY (user_id, revision),
+    UNIQUE (user_id, operation_id)
+);
+CREATE TABLE IF NOT EXISTS recording_key_epochs (
+    user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    key_epoch        INTEGER NOT NULL CHECK (key_epoch > 0),
+    policy_epoch     TEXT NOT NULL,
+    wrapped_dek      TEXT NOT NULL,
+    state            TEXT NOT NULL CHECK (state IN ('active','retired','erased')),
+    created_at       TEXT NOT NULL,
+    erased_at        TEXT,
+    PRIMARY KEY (user_id, key_epoch),
+    UNIQUE (user_id, policy_epoch),
+    CHECK ((state='erased' AND wrapped_dek='' AND erased_at IS NOT NULL)
+        OR (state<>'erased' AND wrapped_dek<>'' AND erased_at IS NULL))
+);
+CREATE TABLE IF NOT EXISTS recording_retention_previews (
+    user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    preview_id       TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
+    target_policy    TEXT NOT NULL CHECK(target_policy IN ('processing_window_30d','until_deleted')),
+    consent_version  INTEGER NOT NULL CHECK(consent_version > 0),
+    promote_existing INTEGER NOT NULL CHECK(promote_existing IN (0,1)),
+    inventory_fingerprint TEXT NOT NULL CHECK(length(inventory_fingerprint)=64),
+    object_count     INTEGER NOT NULL CHECK(object_count >= 0),
+    byte_count       INTEGER NOT NULL CHECK(byte_count >= 0),
+    recording_count  INTEGER NOT NULL CHECK(recording_count >= 0),
+    created_at       TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    PRIMARY KEY(user_id,preview_id)
+);
+CREATE TABLE IF NOT EXISTS recording_retention_change_receipts (
+    user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    idempotency_key_hash TEXT NOT NULL CHECK(length(idempotency_key_hash)=64),
+    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint)=64),
+    preview_id       TEXT NOT NULL,
+    operation_id     TEXT NOT NULL,
+    resulting_revision INTEGER NOT NULL CHECK(resulting_revision > 0),
+    resulting_policy TEXT NOT NULL CHECK(resulting_policy IN ('processing_window_30d','until_deleted')),
+    state            TEXT NOT NULL CHECK(state IN ('settled','delete_pending','purging_control','physical_complete')),
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (user_id, idempotency_key_hash),
+    UNIQUE (user_id, operation_id)
 );
 CREATE TABLE IF NOT EXISTS recording_lease_denials (
     user_id      TEXT NOT NULL,
@@ -2410,6 +2487,155 @@ pub struct EpisodeEmailPreference {
     pub updated_at: String,
 }
 
+pub const RECORDING_RETENTION_CONSENT_VERSION: i64 = 1;
+const RECORDING_RETENTION_PREVIEW_TTL_MILLIS: i64 = 15 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingRetentionPolicy {
+    ProcessingWindow30d,
+    UntilDeleted,
+}
+
+impl RecordingRetentionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessingWindow30d => "processing_window_30d",
+            Self::UntilDeleted => "until_deleted",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "processing_window_30d" => Ok(Self::ProcessingWindow30d),
+            "until_deleted" => Ok(Self::UntilDeleted),
+            _ => Err(EnclaveError::Store(
+                "recording retention policy is invalid".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RecordingRetentionPreference {
+    pub policy: RecordingRetentionPolicy,
+    pub consent_version: i64,
+    pub revision: i64,
+    pub policy_epoch: Option<String>,
+    pub effective_at: String,
+    pub revocation_cutoff: Option<String>,
+    pub active_operation_id: Option<String>,
+    pub operation_state: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordingKeyEpoch {
+    pub(crate) key_epoch: i64,
+    pub(crate) policy_epoch: String,
+    pub(crate) wrapped_dek_b64: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RecordingRetentionInventory {
+    pub inventory_fingerprint: String,
+    pub object_count: i64,
+    pub byte_count: i64,
+    pub recording_count: i64,
+}
+
+impl RecordingRetentionInventory {
+    fn validate(&self) -> Result<()> {
+        if self.object_count < 0
+            || self.byte_count < 0
+            || self.recording_count < 0
+            || self.inventory_fingerprint.len() != 64
+            || !self
+                .inventory_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid recording retention inventory".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RecordingRetentionPreview {
+    pub preview_id: String,
+    pub target_policy: RecordingRetentionPolicy,
+    pub expected_revision: i64,
+    pub consent_version: i64,
+    pub promote_existing: bool,
+    pub inventory: RecordingRetentionInventory,
+    pub request_fingerprint: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RecordingRetentionChange {
+    pub operation_id: String,
+    pub policy: RecordingRetentionPolicy,
+    pub revision: i64,
+    pub state: String,
+    pub updated_at: String,
+}
+
+fn valid_retention_idempotency_key(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn recording_retention_request_fingerprint(
+    policy: RecordingRetentionPolicy,
+    expected_revision: i64,
+    consent_version: i64,
+    promote_existing: bool,
+    preview_id: &str,
+    inventory_fingerprint: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.recording-retention-change.v1\0");
+    for value in [
+        policy.as_str().as_bytes(),
+        &expected_revision.to_be_bytes(),
+        &consent_version.to_be_bytes(),
+        &[u8::from(promote_existing)],
+        preview_id.as_bytes(),
+        inventory_fingerprint.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn recording_retention_preview_fingerprint(
+    policy: RecordingRetentionPolicy,
+    expected_revision: i64,
+    consent_version: i64,
+    promote_existing: bool,
+    inventory_fingerprint: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.recording-retention-preview.v1\0");
+    for value in [
+        policy.as_str().as_bytes(),
+        &expected_revision.to_be_bytes(),
+        &consent_version.to_be_bytes(),
+        &[u8::from(promote_existing)],
+        inventory_fingerprint.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EmailControlCancellation {
     AccountInactive,
@@ -2926,6 +3152,93 @@ fn load_email_preference_for_fence_conn(
             consented_at: None,
             updated_at: "1970-01-01T00:00:00.000Z".into(),
         }))
+}
+
+fn load_recording_retention_preference_conn(
+    connection: &Connection,
+    user_id: &str,
+) -> Result<RecordingRetentionPreference> {
+    let (status, created_at): (String, String) = connection
+        .query_row(
+            "SELECT status,created_at FROM users WHERE id=?1",
+            [user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Auth("unknown user".into()))?;
+    if status != "active" {
+        return Err(EnclaveError::Auth("account inactive or deleting".into()));
+    }
+    let stored = connection
+        .query_row(
+            "SELECT policy,consent_version,revision,policy_epoch,effective_at,
+                    revocation_cutoff
+             FROM recording_retention_preferences WHERE user_id=?1",
+            [user_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let operation = connection
+        .query_row(
+            "SELECT operation_id,state FROM recording_retention_change_receipts
+             WHERE user_id=?1 AND state IN ('delete_pending','purging_control')
+             ORDER BY resulting_revision DESC LIMIT 1",
+            [user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (active_operation_id, operation_state) = operation
+        .map(|(id, state)| (Some(id), Some(state)))
+        .unwrap_or((None, None));
+    match stored {
+        Some((policy, consent_version, revision, policy_epoch, effective_at, cutoff)) => {
+            let policy = RecordingRetentionPolicy::from_db(&policy)?;
+            if revision <= 0
+                || consent_version < 0
+                || (policy == RecordingRetentionPolicy::UntilDeleted
+                    && (consent_version != RECORDING_RETENTION_CONSENT_VERSION
+                        || policy_epoch
+                            .as_deref()
+                            .is_none_or(|epoch| !epoch.starts_with("rpe_") || epoch.len() != 68)
+                        || cutoff.is_some()))
+                || (policy == RecordingRetentionPolicy::ProcessingWindow30d
+                    && policy_epoch.is_some())
+            {
+                return Err(EnclaveError::Store(
+                    "recording retention preference is malformed".into(),
+                ));
+            }
+            Ok(RecordingRetentionPreference {
+                policy,
+                consent_version,
+                revision,
+                policy_epoch,
+                effective_at,
+                revocation_cutoff: cutoff,
+                active_operation_id,
+                operation_state,
+            })
+        }
+        None => Ok(RecordingRetentionPreference {
+            policy: RecordingRetentionPolicy::ProcessingWindow30d,
+            consent_version: 0,
+            revision: 0,
+            policy_epoch: None,
+            effective_at: created_at,
+            revocation_cutoff: None,
+            active_operation_id,
+            operation_state,
+        }),
+    }
 }
 
 fn load_active_email_preference_conn(
@@ -19255,6 +19568,26 @@ fn delete_user_identity_conn(
     )?;
     tx.execute("DELETE FROM recording_leases WHERE user_id = ?1", [user_id])?;
     tx.execute(
+        "DELETE FROM recording_retention_change_receipts WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_retention_previews WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_key_epochs WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_retention_history WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_retention_preferences WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
         "DELETE FROM recording_lease_requests WHERE user_id = ?1",
         [user_id],
     )?;
@@ -24288,6 +24621,720 @@ impl ControlStore {
             }))
         })
         .await
+    }
+
+    pub async fn get_recording_retention_preference(
+        &self,
+        user_id: &str,
+    ) -> Result<RecordingRetentionPreference> {
+        let user_id = user_id.to_string();
+        self.read(move |connection| load_recording_retention_preference_conn(connection, &user_id))
+            .await
+    }
+
+    pub(crate) async fn create_recording_retention_preview(
+        &self,
+        user_id: &str,
+        policy: RecordingRetentionPolicy,
+        expected_revision: i64,
+        consent_version: i64,
+        promote_existing: bool,
+        inventory: RecordingRetentionInventory,
+    ) -> Result<RecordingRetentionPreview> {
+        validate_user_id(user_id)?;
+        inventory.validate()?;
+        if expected_revision < 0
+            || consent_version != RECORDING_RETENTION_CONSENT_VERSION
+            || (promote_existing && policy != RecordingRetentionPolicy::UntilDeleted)
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid recording retention preview".into(),
+            ));
+        }
+        // Promotion requires the schema-routed, exact-generation migration
+        // lane. Keep the prospective foundation honest until that lane is
+        // active rather than accepting a confirmation that cannot settle.
+        if promote_existing {
+            return Err(EnclaveError::Conflict(
+                "existing-audio promotion is not available in this release".into(),
+            ));
+        }
+        let preview_id = format!("rrp_{}", super::tokens::random_token_hex());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let created_at = isotime::format_epoch_millis(now_ms);
+        let expires_at = isotime::format_epoch_millis(
+            now_ms.saturating_add(RECORDING_RETENTION_PREVIEW_TTL_MILLIS),
+        );
+        let request_fingerprint = recording_retention_preview_fingerprint(
+            policy,
+            expected_revision,
+            consent_version,
+            promote_existing,
+            &inventory.inventory_fingerprint,
+        );
+        let user_id = user_id.to_string();
+        self.write(move |connection| {
+            let current = load_recording_retention_preference_conn(connection, &user_id)?;
+            if current.revision != expected_revision || current.operation_state.is_some() {
+                return Err(EnclaveError::Conflict(
+                    "recording retention revision is stale".into(),
+                ));
+            }
+            if current.policy == policy {
+                return Err(EnclaveError::Conflict(
+                    "recording retention policy is already selected".into(),
+                ));
+            }
+            connection.execute(
+                "DELETE FROM recording_retention_previews
+                 WHERE user_id=?1 AND expires_at<=?2",
+                rusqlite::params![user_id, created_at],
+            )?;
+            connection.execute(
+                "INSERT INTO recording_retention_previews
+                 (user_id,preview_id,expected_revision,target_policy,consent_version,
+                  promote_existing,inventory_fingerprint,object_count,byte_count,
+                  recording_count,created_at,expires_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params![
+                    user_id,
+                    preview_id,
+                    expected_revision,
+                    policy.as_str(),
+                    consent_version,
+                    i64::from(promote_existing),
+                    inventory.inventory_fingerprint,
+                    inventory.object_count,
+                    inventory.byte_count,
+                    inventory.recording_count,
+                    created_at,
+                    expires_at,
+                ],
+            )?;
+            Ok(RecordingRetentionPreview {
+                preview_id,
+                target_policy: policy,
+                expected_revision,
+                consent_version,
+                promote_existing,
+                inventory,
+                request_fingerprint,
+                expires_at,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn recording_retention_change(
+        &self,
+        user_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<RecordingRetentionChange>> {
+        validate_user_id(user_id)?;
+        if !operation_id.starts_with("rrc_") || operation_id.len() != 68 {
+            return Ok(None);
+        }
+        let user_id = user_id.to_string();
+        let operation_id = operation_id.to_string();
+        self.read(move |connection| {
+            let _ = load_recording_retention_preference_conn(connection, &user_id)?;
+            connection
+                .query_row(
+                    "SELECT resulting_policy,resulting_revision,state,updated_at
+                     FROM recording_retention_change_receipts
+                     WHERE user_id=?1 AND operation_id=?2",
+                    rusqlite::params![user_id, operation_id],
+                    |row| {
+                        let policy = row.get::<_, String>(0)?;
+                        Ok((policy, row.get(1)?, row.get(2)?, row.get(3)?))
+                    },
+                )
+                .optional()?
+                .map(|(policy, revision, state, updated_at)| {
+                    Ok(RecordingRetentionChange {
+                        operation_id,
+                        policy: RecordingRetentionPolicy::from_db(&policy)?,
+                        revision,
+                        state,
+                        updated_at,
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    /// Resume the destructive half of a retention downgrade. The settled
+    /// preference is already the read/write fence before this method starts.
+    /// Provider deletion is proved first; only then are key envelopes erased
+    /// and the sanitized Control database cycled through every snapshot-ring
+    /// slot before old generations are purged.
+    pub(crate) async fn reconcile_recording_retention_change(
+        &self,
+        user_id: &str,
+        operation_id: &str,
+    ) -> Result<RecordingRetentionChange> {
+        validate_user_id(user_id)?;
+        let store = self.lifecycle_store.as_ref().cloned().ok_or_else(|| {
+            EnclaveError::Store(
+                "recording retention reconciliation lacks lifecycle authority".into(),
+            )
+        })?;
+        let _lifecycle_guard = store.lock_user_lifecycle(user_id).await?;
+        let mut operation = self
+            .recording_retention_change(user_id, operation_id)
+            .await?
+            .ok_or(EnclaveError::NotFound)?;
+        if matches!(operation.state.as_str(), "settled" | "physical_complete") {
+            return Ok(operation);
+        }
+        if operation.policy != RecordingRetentionPolicy::ProcessingWindow30d {
+            return Err(EnclaveError::Store(
+                "only a recording retention downgrade may enter deletion".into(),
+            ));
+        }
+        if operation.state == "delete_pending" {
+            store
+                .delete_user_recordings_under_lifecycle(user_id)
+                .await?;
+            let expected_revision = operation.revision;
+            let user_id_owned = user_id.to_string();
+            let operation_id_owned = operation_id.to_string();
+            let now = isotime::format_epoch_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64,
+            );
+            operation = self
+                .write(move |connection| {
+                    let current =
+                        load_recording_retention_preference_conn(connection, &user_id_owned)?;
+                    if current.policy != RecordingRetentionPolicy::ProcessingWindow30d
+                        || current.revision != expected_revision
+                    {
+                        return Err(EnclaveError::Conflict(
+                            "recording retention deletion fence changed".into(),
+                        ));
+                    }
+                    let state: String = connection.query_row(
+                        "SELECT state FROM recording_retention_change_receipts
+                         WHERE user_id=?1 AND operation_id=?2",
+                        rusqlite::params![user_id_owned, operation_id_owned],
+                        |row| row.get(0),
+                    )?;
+                    if state == "delete_pending" {
+                        connection.execute(
+                            "UPDATE recording_key_epochs
+                             SET wrapped_dek='',state='erased',erased_at=?2
+                             WHERE user_id=?1 AND state<>'erased'",
+                            rusqlite::params![user_id_owned, now],
+                        )?;
+                        connection.execute(
+                            "UPDATE recording_retention_change_receipts
+                             SET state='purging_control',updated_at=?3
+                             WHERE user_id=?1 AND operation_id=?2 AND state='delete_pending'",
+                            rusqlite::params![user_id_owned, operation_id_owned, now],
+                        )?;
+                    } else if state != "purging_control" {
+                        return Err(EnclaveError::Conflict(
+                            "recording retention deletion state changed".into(),
+                        ));
+                    }
+                    let remaining: i64 = connection.query_row(
+                        "SELECT COUNT(*) FROM recording_key_epochs
+                         WHERE user_id=?1 AND state<>'erased'",
+                        [&user_id_owned],
+                        |row| row.get(0),
+                    )?;
+                    if remaining != 0 {
+                        return Err(EnclaveError::Store(
+                            "recording key erasure did not settle".into(),
+                        ));
+                    }
+                    Ok(RecordingRetentionChange {
+                        operation_id: operation_id_owned,
+                        policy: RecordingRetentionPolicy::ProcessingWindow30d,
+                        revision: current.revision,
+                        state: "purging_control".into(),
+                        updated_at: now,
+                    })
+                })
+                .await?;
+        }
+        if operation.state != "purging_control" {
+            return Err(EnclaveError::Store(
+                "recording retention deletion state is invalid".into(),
+            ));
+        }
+
+        self.purge_superseded_control_snapshots().await?;
+
+        let user_id_owned = user_id.to_string();
+        let operation_id_owned = operation_id.to_string();
+        let now = isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        );
+        let completed = self
+            .write(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE recording_retention_change_receipts
+                     SET state='physical_complete',updated_at=?3
+                     WHERE user_id=?1 AND operation_id=?2 AND state='purging_control'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM recording_key_epochs
+                         WHERE user_id=?1 AND state<>'erased'
+                       )",
+                    rusqlite::params![user_id_owned, operation_id_owned, now],
+                )?;
+                if updated != 1 {
+                    return Err(EnclaveError::Conflict(
+                        "recording retention deletion completion changed".into(),
+                    ));
+                }
+                Ok(RecordingRetentionChange {
+                    operation_id: operation_id_owned,
+                    policy: RecordingRetentionPolicy::ProcessingWindow30d,
+                    revision: operation.revision,
+                    state: "physical_complete".into(),
+                    updated_at: now,
+                })
+            })
+            .await?;
+        // The completion status itself is not content, but cycling it through
+        // the ring and purging once more leaves one exact sanitized generation
+        // per slot. That makes `physical_complete` literal rather than merely
+        // relying on the fact that its one superseded predecessor was already
+        // key-free.
+        self.purge_superseded_control_snapshots().await?;
+        Ok(completed)
+    }
+
+    async fn purge_superseded_control_snapshots(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.load().await?);
+        }
+        for _ in 1..self.control_object_slot_count {
+            if let Err(error) = self
+                .flush(guard.as_mut().ok_or(EnclaveError::NotFound)?)
+                .await
+            {
+                *guard = None;
+                return Err(error);
+            }
+        }
+        let current_generations = guard
+            .as_ref()
+            .map(|handle| handle.meta.slot_generations)
+            .ok_or(EnclaveError::NotFound)?;
+        for (slot, generation) in current_generations
+            .into_iter()
+            .enumerate()
+            .take(self.control_object_slot_count)
+        {
+            if generation <= 0 {
+                continue;
+            }
+            crate::store::delete_object_generations_except(
+                self.gcs.as_ref(),
+                &control_object_name(slot),
+                generation,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn pending_recording_retention_changes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let limit = limit.clamp(1, 256) as i64;
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT user_id,operation_id
+                 FROM recording_retention_change_receipts
+                 WHERE state IN ('delete_pending','purging_control')
+                 ORDER BY updated_at,operation_id LIMIT ?1",
+            )?;
+            let operations = statement
+                .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(EnclaveError::from)?;
+            Ok(operations)
+        })
+        .await
+    }
+
+    /// Settle one account-wide retention decision. The caller owns the same
+    /// Store lifecycle lock used by capture ingest, so this Control commit is
+    /// the monotonic fence: later uploads cannot observe the superseded epoch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two-step retention CAS keeps every preview-bound input explicit"
+    )]
+    pub(crate) async fn change_recording_retention_policy(
+        &self,
+        user_id: &str,
+        policy: RecordingRetentionPolicy,
+        expected_revision: i64,
+        consent_version: i64,
+        promote_existing: bool,
+        preview_id: &str,
+        inventory: RecordingRetentionInventory,
+        idempotency_key: &str,
+    ) -> Result<RecordingRetentionChange> {
+        validate_user_id(user_id)?;
+        inventory.validate()?;
+        if expected_revision < 0
+            || consent_version != RECORDING_RETENTION_CONSENT_VERSION
+            || promote_existing
+            || !preview_id.starts_with("rrp_")
+            || preview_id.len() != 68
+            || !valid_retention_idempotency_key(idempotency_key)
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid recording retention change".into(),
+            ));
+        }
+        let request_fingerprint = recording_retention_request_fingerprint(
+            policy,
+            expected_revision,
+            consent_version,
+            promote_existing,
+            preview_id,
+            &inventory.inventory_fingerprint,
+        );
+        let idempotency_key_hash = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
+        let operation_id = format!("rrc_{}", super::tokens::random_token_hex());
+        let proposed_policy_epoch = format!("rpe_{}", super::tokens::random_token_hex());
+        let now = isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        );
+        let user_id = user_id.to_string();
+        let preview_id = preview_id.to_string();
+        self.write(move |connection| {
+            if let Some((stored_fingerprint, operation_id, revision, policy, state, updated_at)) =
+                connection
+                    .query_row(
+                        "SELECT request_fingerprint,operation_id,resulting_revision,
+                            resulting_policy,state,updated_at
+                     FROM recording_retention_change_receipts
+                     WHERE user_id=?1 AND idempotency_key_hash=?2",
+                        rusqlite::params![user_id, idempotency_key_hash],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+            {
+                if stored_fingerprint != request_fingerprint {
+                    return Err(EnclaveError::Conflict(
+                        "recording retention idempotency key was reused".into(),
+                    ));
+                }
+                return Ok(RecordingRetentionChange {
+                    operation_id,
+                    policy: RecordingRetentionPolicy::from_db(&policy)?,
+                    revision,
+                    state,
+                    updated_at,
+                });
+            }
+
+            let current = load_recording_retention_preference_conn(connection, &user_id)?;
+            if current.revision != expected_revision || current.operation_state.is_some() {
+                return Err(EnclaveError::Conflict(
+                    "recording retention revision is stale".into(),
+                ));
+            }
+            if current.policy == policy {
+                return Err(EnclaveError::Conflict(
+                    "recording retention policy is already selected".into(),
+                ));
+            }
+            let preview = connection
+                .query_row(
+                    "SELECT expected_revision,target_policy,consent_version,promote_existing,
+                            inventory_fingerprint,object_count,byte_count,recording_count,
+                            expires_at
+                     FROM recording_retention_previews
+                     WHERE user_id=?1 AND preview_id=?2",
+                    rusqlite::params![user_id, preview_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    EnclaveError::Conflict("recording retention preview is stale".into())
+                })?;
+            if preview.0 != expected_revision
+                || preview.1 != policy.as_str()
+                || preview.2 != consent_version
+                || preview.3 != i64::from(promote_existing)
+                || preview.4 != inventory.inventory_fingerprint
+                || preview.5 != inventory.object_count
+                || preview.6 != inventory.byte_count
+                || preview.7 != inventory.recording_count
+                || preview.8 <= now
+            {
+                return Err(EnclaveError::Conflict(
+                    "recording retention preview is stale".into(),
+                ));
+            }
+            let revision = current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| EnclaveError::Store("retention revision exhausted".into()))?;
+            if current.policy == RecordingRetentionPolicy::UntilDeleted {
+                connection.execute(
+                    "UPDATE recording_retention_history SET revocation_cutoff=?3
+                     WHERE user_id=?1 AND revision=?2 AND revocation_cutoff IS NULL",
+                    rusqlite::params![user_id, current.revision, now],
+                )?;
+            }
+            let policy_epoch = (policy == RecordingRetentionPolicy::UntilDeleted)
+                .then_some(proposed_policy_epoch.as_str());
+            let revocation_cutoff =
+                (policy == RecordingRetentionPolicy::ProcessingWindow30d).then_some(now.as_str());
+            let retained_key_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM recording_key_epochs
+                 WHERE user_id=?1 AND state<>'erased'",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            let state = match policy {
+                RecordingRetentionPolicy::UntilDeleted => "settled",
+                RecordingRetentionPolicy::ProcessingWindow30d if retained_key_count > 0 => {
+                    "delete_pending"
+                }
+                RecordingRetentionPolicy::ProcessingWindow30d => "physical_complete",
+            };
+
+            connection.execute(
+                "INSERT INTO recording_retention_preferences
+                 (user_id,policy,consent_version,revision,policy_epoch,effective_at,
+                  revocation_cutoff,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?6)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                   policy=excluded.policy,consent_version=excluded.consent_version,
+                   revision=excluded.revision,policy_epoch=excluded.policy_epoch,
+                   effective_at=excluded.effective_at,
+                   revocation_cutoff=excluded.revocation_cutoff,
+                   updated_at=excluded.updated_at",
+                rusqlite::params![
+                    user_id,
+                    policy.as_str(),
+                    consent_version,
+                    revision,
+                    policy_epoch,
+                    now,
+                    revocation_cutoff,
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO recording_retention_history
+                 (user_id,revision,policy,consent_version,policy_epoch,effective_at,
+                  revocation_cutoff,operation_id,request_fingerprint)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    user_id,
+                    revision,
+                    policy.as_str(),
+                    consent_version,
+                    policy_epoch,
+                    now,
+                    revocation_cutoff,
+                    operation_id,
+                    request_fingerprint,
+                ],
+            )?;
+            if policy == RecordingRetentionPolicy::ProcessingWindow30d {
+                connection.execute(
+                    "UPDATE recording_key_epochs SET state='retired'
+                     WHERE user_id=?1 AND state='active'",
+                    [&user_id],
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO recording_retention_change_receipts
+                 (user_id,idempotency_key_hash,request_fingerprint,preview_id,operation_id,
+                  resulting_revision,resulting_policy,state,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+                rusqlite::params![
+                    user_id,
+                    idempotency_key_hash,
+                    request_fingerprint,
+                    preview_id,
+                    operation_id,
+                    revision,
+                    policy.as_str(),
+                    state,
+                    now,
+                ],
+            )?;
+            connection.execute(
+                "DELETE FROM recording_retention_previews WHERE user_id=?1",
+                [&user_id],
+            )?;
+            Ok(RecordingRetentionChange {
+                operation_id,
+                policy,
+                revision,
+                state: state.to_string(),
+                updated_at: now,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn load_or_create_recording_key_epoch(
+        &self,
+        user_id: &str,
+        policy_revision: i64,
+        policy_epoch: &str,
+    ) -> Result<RecordingKeyEpoch> {
+        validate_user_id(user_id)?;
+        if policy_revision <= 0 || !policy_epoch.starts_with("rpe_") || policy_epoch.len() != 68 {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid recording key authority".into(),
+            ));
+        }
+        let (_, candidate_wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
+        let user_id = user_id.to_string();
+        let policy_epoch = policy_epoch.to_string();
+        self.write(move |connection| {
+            let preference = load_recording_retention_preference_conn(connection, &user_id)?;
+            if preference.policy != RecordingRetentionPolicy::UntilDeleted
+                || preference.revision != policy_revision
+                || preference.policy_epoch.as_deref() != Some(policy_epoch.as_str())
+                || preference.operation_state.is_some()
+            {
+                return Err(EnclaveError::Conflict(
+                    "recording key policy authority changed".into(),
+                ));
+            }
+            connection.execute(
+                "INSERT OR IGNORE INTO recording_key_epochs
+                 (user_id,key_epoch,policy_epoch,wrapped_dek,state,created_at)
+                 VALUES (?1,?2,?3,?4,'active',strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![user_id, policy_revision, policy_epoch, candidate_wrapped,],
+            )?;
+            let (key_epoch, stored_epoch, wrapped_dek_b64, state): (i64, String, String, String) =
+                connection.query_row(
+                    "SELECT key_epoch,policy_epoch,wrapped_dek,state
+                 FROM recording_key_epochs WHERE user_id=?1 AND policy_epoch=?2",
+                    rusqlite::params![user_id, policy_epoch],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            if key_epoch != policy_revision || state != "active" || wrapped_dek_b64.is_empty() {
+                return Err(EnclaveError::Store(
+                    "recording key epoch is malformed".into(),
+                ));
+            }
+            Ok(RecordingKeyEpoch {
+                key_epoch,
+                policy_epoch: stored_epoch,
+                wrapped_dek_b64,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn recording_key_epoch(
+        &self,
+        user_id: &str,
+        key_epoch: i64,
+        policy_epoch: &str,
+    ) -> Result<Option<RecordingKeyEpoch>> {
+        let user_id = user_id.to_string();
+        let policy_epoch = policy_epoch.to_string();
+        self.read(move |connection| {
+            let row = connection
+                .query_row(
+                    "SELECT key_epoch,policy_epoch,wrapped_dek,state
+                     FROM recording_key_epochs
+                     WHERE user_id=?1 AND key_epoch=?2 AND policy_epoch=?3",
+                    rusqlite::params![user_id, key_epoch, policy_epoch],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match row {
+                Some((key_epoch, policy_epoch, wrapped_dek_b64, state))
+                    if matches!(state.as_str(), "active" | "retired")
+                        && !wrapped_dek_b64.is_empty() =>
+                {
+                    Ok(Some(RecordingKeyEpoch {
+                        key_epoch,
+                        policy_epoch,
+                        wrapped_dek_b64,
+                    }))
+                }
+                Some(_) => Ok(None),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Open one centrally registered recording key inside the enclave. The
+    /// wrapped envelope never needs to be copied into durable-object metadata
+    /// or a per-user archive row; callers retain only the non-secret epoch
+    /// reference needed to resolve this authority again on playback.
+    pub(crate) async fn open_recording_key_epoch(
+        &self,
+        user_id: &str,
+        key_epoch: i64,
+        policy_epoch: &str,
+    ) -> Result<Option<crate::crypto::Dek>> {
+        let Some(epoch) = self
+            .recording_key_epoch(user_id, key_epoch, policy_epoch)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::crypto::load_dek(self.kms.as_ref(), &epoch.wrapped_dek_b64).await?,
+        ))
     }
 
     pub(crate) async fn email_outbox_deletion_owned(&self, user_id: &str) -> Result<bool> {
@@ -37823,6 +38870,296 @@ mod tests {
         ] {
             assert!(!main.contains(forbidden), "live wiring: {forbidden}");
         }
+    }
+
+    #[tokio::test]
+    async fn recording_retention_policy_and_key_epoch_are_versioned_and_replay_safe() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = store
+            .upsert_user(
+                "recording-retention-subject",
+                "retention@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+
+        let default = store
+            .get_recording_retention_preference(&user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            default.policy,
+            RecordingRetentionPolicy::ProcessingWindow30d
+        );
+        assert_eq!(default.revision, 0);
+        assert_eq!(default.consent_version, 0);
+
+        let inventory = RecordingRetentionInventory {
+            inventory_fingerprint: format!("{:064x}", 1),
+            object_count: 0,
+            byte_count: 0,
+            recording_count: 0,
+        };
+        let enable_preview = store
+            .create_recording_retention_preview(
+                &user.id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                inventory.clone(),
+            )
+            .await
+            .unwrap();
+
+        let enabled = store
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &enable_preview.preview_id,
+                inventory.clone(),
+                "retention-change-0001",
+            )
+            .await
+            .unwrap();
+        assert_eq!(enabled.revision, 1);
+        assert_eq!(enabled.state, "settled");
+        let replay = store
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &enable_preview.preview_id,
+                inventory.clone(),
+                "retention-change-0001",
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, enabled);
+        let downgrade_preview = store
+            .create_recording_retention_preview(
+                &user.id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                1,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                inventory.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                1,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &downgrade_preview.preview_id,
+                inventory.clone(),
+                "retention-change-0001",
+            )
+            .await
+            .is_err());
+
+        let preference = store
+            .get_recording_retention_preference(&user.id)
+            .await
+            .unwrap();
+        let epoch = preference.policy_epoch.clone().unwrap();
+        let key = store
+            .load_or_create_recording_key_epoch(&user.id, preference.revision, &epoch)
+            .await
+            .unwrap();
+        let same_key = store
+            .load_or_create_recording_key_epoch(&user.id, preference.revision, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(same_key, key);
+        assert_eq!(key.key_epoch, preference.revision);
+        assert!(!key.wrapped_dek_b64.is_empty());
+
+        let downgraded = store
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                1,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &downgrade_preview.preview_id,
+                inventory,
+                "retention-change-0002",
+            )
+            .await
+            .unwrap();
+        assert_eq!(downgraded.revision, 2);
+        assert_eq!(downgraded.state, "delete_pending");
+        let fenced = store
+            .get_recording_retention_preference(&user.id)
+            .await
+            .unwrap();
+        assert_eq!(fenced.policy, RecordingRetentionPolicy::ProcessingWindow30d);
+        assert_eq!(fenced.operation_state.as_deref(), Some("delete_pending"));
+        assert!(store
+            .load_or_create_recording_key_epoch(&user.id, 1, &epoch)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn recording_retention_downgrade_deletes_objects_and_purges_old_key_snapshots() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let indexes = Arc::new(FakeGcs::new());
+        let processing = Arc::new(FakeGcs::new());
+        let recordings = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let content = Arc::new(Store::new_with_recording_media(
+            kms.clone(),
+            indexes.clone(),
+            processing,
+            recordings.clone(),
+            legacy,
+        ));
+        assert!(content.durable_recording_storage_bound());
+        let mut control =
+            ControlStore::new_with_store(kms.clone(), indexes.clone(), content.clone());
+        control.control_object_slot_count = 4;
+        let user = control
+            .upsert_user(
+                "recording-retention-delete-subject",
+                "recording-delete@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
+            .await
+            .unwrap();
+        let inventory = RecordingRetentionInventory {
+            inventory_fingerprint: format!("{:064x}", 2),
+            object_count: 0,
+            byte_count: 0,
+            recording_count: 0,
+        };
+        let preview = control
+            .create_recording_retention_preview(
+                &user.id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                inventory.clone(),
+            )
+            .await
+            .unwrap();
+        control
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &preview.preview_id,
+                inventory.clone(),
+                "recording-delete-enable",
+            )
+            .await
+            .unwrap();
+        let preference = control
+            .get_recording_retention_preference(&user.id)
+            .await
+            .unwrap();
+        let policy_epoch = preference.policy_epoch.clone().unwrap();
+        let key = control
+            .load_or_create_recording_key_epoch(&user.id, preference.revision, &policy_epoch)
+            .await
+            .unwrap();
+
+        let object_name =
+            crate::store::canonical_recording_media_object_key(&user.id, "asset_1").unwrap();
+        let first = recordings
+            .put_object(&object_name, b"first", "recording-key-reference", 0)
+            .await
+            .unwrap();
+        recordings
+            .put_object(&object_name, b"second", "recording-key-reference", first)
+            .await
+            .unwrap();
+        assert_eq!(recordings.exact_generation_count(&object_name), 2);
+
+        let downgrade_inventory = RecordingRetentionInventory {
+            inventory_fingerprint: format!("{:064x}", 3),
+            object_count: 2,
+            byte_count: 11,
+            recording_count: 1,
+        };
+        let preview = control
+            .create_recording_retention_preview(
+                &user.id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                1,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                downgrade_inventory.clone(),
+            )
+            .await
+            .unwrap();
+        let pending = control
+            .change_recording_retention_policy(
+                &user.id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                1,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                &preview.preview_id,
+                downgrade_inventory,
+                "recording-delete-disable",
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.state, "delete_pending");
+
+        let complete = control
+            .reconcile_recording_retention_change(&user.id, &pending.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(complete.state, "physical_complete");
+        assert_eq!(recordings.exact_generation_count(&object_name), 0);
+        assert!(control
+            .recording_key_epoch(&user.id, key.key_epoch, &policy_epoch)
+            .await
+            .unwrap()
+            .is_none());
+        for slot in 0..control.control_object_slot_count {
+            assert_eq!(
+                indexes.exact_generation_count(&control_object_name(slot)),
+                1
+            );
+        }
+
+        drop(control);
+        let mut restarted = ControlStore::new_with_store(kms, indexes, content);
+        restarted.control_object_slot_count = 4;
+        assert_eq!(
+            restarted
+                .recording_retention_change(&user.id, &pending.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "physical_complete"
+        );
+        assert!(restarted
+            .recording_key_epoch(&user.id, key.key_epoch, &policy_epoch)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
