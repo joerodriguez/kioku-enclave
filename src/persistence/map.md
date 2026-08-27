@@ -6,7 +6,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 
 | File | Role |
 |---|---|
-| `mod.rs` | `RepositorySet` composition root for the legacy and PostgreSQL implementations. Production still constructs only legacy until every domain port is complete. |
+| `mod.rs` | `RepositorySet` composition root for the legacy and PostgreSQL implementations. Startup selects exactly one complete repository set without request-time fallback or dual authority. |
 | `billing.rs` | Backend-neutral billing pseudonym, recording authorization/credit, coverage, and detach-outbox contract. |
 | `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
 | `lifecycle.rs` | Backend-neutral account tombstone, deletion progress, Apple-revocation, and final identity cleanup contract. |
@@ -21,7 +21,9 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | [`legacy/`](legacy/map.md) | Private behavior-preserving adapters over the current encrypted SQLite/GCS stores. |
 | [`postgres/`](postgres/map.md) | Bounded SQLx pool plus PostgreSQL implementations of the extracted ports. |
 | `media_object.rs` / `gcs_media.rs` | Encrypted GCS object contract and provider implementation, including exact account and durable-recording purge. |
+| `disabled_legacy.rs` | Fail-closed GCS implementation installed behind unavoidable compatibility structs in PostgreSQL mode so an accidentally missed legacy call cannot read or mutate the retired SQLite authority. |
 
-The legacy adapter remains authoritative while interfaces are extracted. It is not a
-production dual-write or fallback mechanism. A future PostgreSQL repository set will be
-selected once at startup and must implement the same behavioral contracts.
+`PERSISTENCE_BACKEND` selects the legacy or PostgreSQL repository set once at startup.
+The legacy adapter remains a reference/development implementation, not a dual-write or
+fallback mechanism. PostgreSQL mode verifies the reviewed schema and uses encrypted GCS
+only through `MediaObjectStore` for large media bytes.

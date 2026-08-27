@@ -1031,10 +1031,11 @@ async fn reviewer_login(
             )
         }
     };
-    if super::reviewer::ensure_demo_archive(&s.store, &user.id)
-        .await
-        .is_err()
-    {
+    let fixture = match s.repositories.memory_formation() {
+        Some(repository) => repository.ensure_reviewer_fixture(&user.id).await,
+        None => super::reviewer::ensure_demo_archive(&s.store, &user.id).await,
+    };
+    if fixture.is_err() {
         return reviewer_json(
             &s,
             &headers,

@@ -72,6 +72,9 @@ pub(crate) struct EpisodeEmbeddingWrite {
 /// holding a database transaction open over a model call.
 #[async_trait]
 pub(crate) trait MemoryFormationRepository: Send + Sync {
+    /// Seed the synthetic plugin-review account exactly once.
+    async fn ensure_reviewer_fixture(&self, account_id: &str) -> Result<bool>;
+
     async fn claim_summary_window(
         &self,
         account_id: &str,

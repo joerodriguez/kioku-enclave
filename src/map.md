@@ -1,9 +1,9 @@
 # map.md — src/ (enclave service)
 
-The entire attested Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
+The entire Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
 account, quotas, capture-session feedback, APNs ready receipts, and the summarizer—see [`cp/`](cp/map.md)—alongside authenticated
-`410 Gone` tombstones for the retired `/v1/*` query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
-persistent disk; bounded audio, screenshot pixels, transcript/screen text, and metadata
+`410 Gone` tombstones for the retired `/v1/*` query/storage API. The legacy backend keeps plaintext databases in SEV tmpfs;
+the PostgreSQL backend deliberately places structured plaintext in its private managed database. Bounded audio, screenshot pixels, transcript/screen text, and metadata
 leave the TEE through the documented Vertex inference boundary, while explicitly
 configured webhook events use the separate webhook boundary.
 
@@ -27,11 +27,11 @@ old rows decode, new ones cannot be minted.
 
 | File | Role |
 |---|---|
-| `main.rs` | Entry point; wires public OAuth, auth-gated Cloud Capture/session/push/query routes and separate single-event/reference-batch request budgets, environment-separated Secret-Manager APNs credentials, legacy `/v1/*`, public health/attestation, and offline ADR-0016 commands; starts media, summarization, finalization, push, and deletion workers; production fails closed without APNs configuration and serves only through `serve_tls`; before any listener binds, the active signed profile installs Archive V3 deletion and WAL serving authority, then uses encrypted Control's complete active-account inventory and the identical per-user Genesis driver to converge every account, failing closed on conversion and logging only aggregate counts. |
+| `main.rs` | Entry point and single-authority composition root. `PERSISTENCE_BACKEND` selects legacy SQLite/GCS or PostgreSQL once at startup; PostgreSQL mode verifies or explicitly migrates the schema, installs fail-closed legacy compatibility objects, and exposes content-free `/livez` and dependency-aware `/readyz`. It wires OAuth, Cloud Capture/session/push/query routes, Secret-Manager credentials, TLS, workers, and offline ADR-0016 commands. Legacy mode alone installs Archive V3/WAL authority. |
 | `tls.rs` | In-enclave rustls termination with a swappable certificate resolver and SHA-256 leaf fingerprint. Production uses ACME; static/generated certificate paths are custom/debug fallback mechanisms, not production launch overrides |
 | `acme.rs` | Required production ACME lifecycle: answers HTTP-01 on :80, generates the TLS key in the TEE, persists account/cert/key as context-bound KMS-wrapped state (`acme/tls.json.enc`), blocks boot until a usable cert exists, and hot-swaps renewals |
 | [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, capture-session feedback, ready-push installation/outbox/handoff, summarizer, and the encrypted identity control store |
-| [`persistence/`](persistence/map.md) | Backend-neutral typed application persistence ports and repository composition. The first identity/session slice delegates to the legacy encrypted control store while PostgreSQL is implemented behind the same contracts. |
+| [`persistence/`](persistence/map.md) | Backend-neutral typed application persistence ports plus complete legacy and PostgreSQL repository sets. PostgreSQL owns structured state; encrypted GCS remains the large-media object store. |
 | `attestation.rs` | Shared bounded/zeroizing Confidential Space launcher socket protocol plus two active separated token paths: internal WIF-audience STS exchange/cache for KMS credentials, and public HTTPS-verifier-audience OIDC tokens that can never use the WIF audience; exposes only a sealed typed no-nonce launcher seam to the exact signed-runtime Firestore and archive-GCS identity types, not credentials, cache, or authority |
 | `archive_v3_firestore_auth.rs` | **Signed-runtime ADR-0022 Firestore identity:** a type-separated Confidential Space bearer for the exact named-witness WIF audience, using the no-nonce launcher seam and fixed retry-disabled Google STS exchange with zeroizing bounded tokens and cache. It has no metadata/default credentials, KMS/public-attestation sharing, Store/route selection, or caller authority. |
 | `archive_v3_firestore_shadow.rs` | **Conditionally active Firestore witness composition:** the signed runtime constructs the exact named-database adapter and dedicated attestation bearer for Genesis, WAL publication, and deletion-only witness recovery; a private token releases the native async deletion view only to the sealed deletion composer. Off-profile images construct none of it. |

@@ -1,8 +1,7 @@
 //! PostgreSQL implementation of the ADR-0040 application persistence ports.
 //!
-//! This module is compiled while extraction proceeds, but serving startup does
-//! not select it until every application domain has a PostgreSQL port. That
-//! keeps the intermediate releases single-authority.
+//! Serving startup selects this complete implementation as one authority. It
+//! never constructs a readable or writable legacy SQLite/GCS authority.
 
 mod billing;
 mod capture;
@@ -30,7 +29,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 22;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 23;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -86,10 +85,6 @@ impl PostgresPersistence {
             .connect_with(options)
             .await?;
         Ok(Self { pool })
-    }
-
-    pub(crate) fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
     }
 
     pub(crate) fn pool(&self) -> &PgPool {
@@ -271,6 +266,14 @@ impl PostgresPersistence {
         if version == 21 {
             sqlx::raw_sql(include_str!(
                 "../../../migrations/0022_reference_batch_billing.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
+            version = 22;
+        }
+        if version == 22 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0023_reviewer_fixture.sql"
             ))
             .execute(&mut *transaction)
             .await?;
@@ -1597,6 +1600,20 @@ mod tests {
             .unwrap(),
             "delivered"
         );
+        let webhook_status = repositories
+            .deliveries()
+            .unwrap()
+            .webhook_delivery_status(&account_id, &webhook.id)
+            .await
+            .unwrap();
+        assert_eq!(webhook_status.sent, 1);
+        assert_eq!(webhook_status.latest.unwrap().outcome, "sent");
+        repositories
+            .deliveries()
+            .unwrap()
+            .cancel_webhook_deliveries(&account_id, &webhook.id)
+            .await
+            .unwrap();
         assert!(opted_in.consented_at.is_some());
 
         let installation = PushInstallation {
@@ -1675,6 +1692,15 @@ mod tests {
             .await
             .unwrap(),
             "delivered"
+        );
+        assert_eq!(
+            repositories
+                .deliveries()
+                .unwrap()
+                .resolve_push_handoff(&account_id, &push_claim.handoff_handle)
+                .await
+                .unwrap(),
+            Some(push_claim.episode_id)
         );
 
         let fence_webhook = WebhookSubscription {
@@ -2623,6 +2649,34 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+
+        let reviewer_account = repositories
+            .identity_sessions()
+            .upsert_subject_account("reviewer-contract", "reviewer@example.com", 3)
+            .await
+            .unwrap();
+        assert!(repositories
+            .memory_formation()
+            .unwrap()
+            .ensure_reviewer_fixture(&reviewer_account.id)
+            .await
+            .unwrap());
+        assert!(!repositories
+            .memory_formation()
+            .unwrap()
+            .ensure_reviewer_fixture(&reviewer_account.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM episodes WHERE account_id=$1 AND model='synthetic-review'",
+            )
+            .bind(&reviewer_account.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            4
         );
 
         let billing_detach_id = repositories

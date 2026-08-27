@@ -201,11 +201,20 @@ async fn resolve_notification_handoff(
     if !valid_handoff(&handoff_handle) {
         return EnclaveError::NotFound.into_response();
     }
-    match state
-        .store
-        .resolve_push_handoff(&user.0, &handoff_handle)
-        .await
-    {
+    let resolved = match state.repositories.deliveries() {
+        Some(repository) => {
+            repository
+                .resolve_push_handoff(&user.0, &handoff_handle)
+                .await
+        }
+        None => {
+            state
+                .store
+                .resolve_push_handoff(&user.0, &handoff_handle)
+                .await
+        }
+    };
+    match resolved {
         Ok(Some(memory_id)) => Json(json!({"memory_id": memory_id})).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
         Err(error) if state.store.is_wal_authoritative(&user.0) => {
