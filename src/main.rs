@@ -722,7 +722,11 @@ async fn limit_public_oauth(
     req: Request,
     next: Next,
 ) -> Response {
-    if state.oauth_limiter.consume("public-oauth").await {
+    if state
+        .oauth_limiter
+        .consume_scoped(&state.repositories, "oauth-public", "global")
+        .await
+    {
         next.run(req).await
     } else {
         (

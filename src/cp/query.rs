@@ -1278,7 +1278,11 @@ async fn mcp_endpoint(
         //
         // A volatile rate limit protects the service without making read-only
         // tool calls persist usage or query-log state.
-        if !s.mcp_limiter.consume(&user_id).await {
+        if !s
+            .mcp_limiter
+            .consume_scoped(&s.repositories, "mcp-tool", &user_id)
+            .await
+        {
             return rpc_error(&rpc.id, -32000, "rate_limited");
         }
     }
@@ -4593,7 +4597,11 @@ async fn rest_test_episode_email(
             .into_response();
     };
 
-    if !s.test_email_limiter.consume(&user.0).await {
+    if !s
+        .test_email_limiter
+        .consume_scoped(&s.repositories, "test-email", &user.0)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("cache-control", "no-store")],

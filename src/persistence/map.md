@@ -7,6 +7,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | File | Role |
 |---|---|
 | `mod.rs` | `RepositorySet` composition root for the legacy and PostgreSQL implementations. Startup selects exactly one complete repository set without request-time fallback or dual authority. |
+| `admission.rs` | Backend-neutral fleet token-bucket and crash-recoverable concurrency-lease contract. |
 | `billing.rs` | Backend-neutral billing pseudonym, recording authorization/credit, coverage, and detach-outbox contract. |
 | `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
 | `lifecycle.rs` | Backend-neutral account tombstone, deletion progress, Apple-revocation, and final identity cleanup contract. |

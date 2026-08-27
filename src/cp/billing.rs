@@ -73,8 +73,10 @@ impl RecordingLeaseGates {
         gate.lock_owned().await
     }
 
-    async fn allow(&self, user_id: &str) -> bool {
-        self.limiter.consume(user_id).await
+    async fn allow(&self, repositories: &crate::persistence::RepositorySet, user_id: &str) -> bool {
+        self.limiter
+            .consume_scoped(repositories, "recording-lease", user_id)
+            .await
     }
 }
 
@@ -982,7 +984,11 @@ async fn create_recording_lease(
             return recording_denial_response(code, summary);
         }
     }
-    if !state.recording_lease_gate.allow(&user.0).await {
+    if !state
+        .recording_lease_gate
+        .allow(&state.repositories, &user.0)
+        .await
+    {
         return no_store(
             (
                 StatusCode::TOO_MANY_REQUESTS,

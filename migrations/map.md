@@ -51,3 +51,6 @@ migration lock; serving instances only verify `persistence_schema.version`.
   reservations, ordered event fingerprints, replay, and completion receipts.
 - `0023_reviewer_fixture.sql` records the idempotent synthetic plugin-review
   fixture in PostgreSQL.
+- `0024_fleet_admission.sql` adds fleet-wide token buckets and
+  crash-recoverable concurrency leases so replica count cannot multiply
+  request budgets.
