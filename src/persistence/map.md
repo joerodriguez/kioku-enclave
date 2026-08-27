@@ -11,7 +11,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
 | `lifecycle.rs` | Backend-neutral account tombstone, deletion progress, Apple-revocation, and final identity cleanup contract. |
 | `oauth.rs` | Backend-neutral OAuth client, consent, authorization-code, and refresh-token transaction contract. |
-| `query.rs` | Backend-neutral tenant-scoped structured-memory search contract. |
+| `query.rs` | Backend-neutral tenant-scoped structured-memory search, episode pagination/detail projection, and capture-freshness contract. |
 | `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
 | `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
 | `work.rs` | Backend-neutral fleet account enumeration, summarizer cursor, and durable email, webhook, and push disclosure-fence contracts; provider I/O occurs outside the repository transaction. |

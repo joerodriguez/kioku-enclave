@@ -22,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 8;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -31,6 +31,9 @@ pub(crate) struct PostgresPersistence {
 
 pub(crate) struct PostgresPoolConfig {
     pub(crate) database_url: String,
+    /// PEM-encoded root used to verify the private Cloud SQL server
+    /// certificate. Tests against a local PostgreSQL instance may omit it.
+    pub(crate) root_ca_pem: Option<Vec<u8>>,
     pub(crate) max_connections: u32,
     pub(crate) acquire_timeout: Duration,
     pub(crate) statement_timeout: Duration,
@@ -43,8 +46,16 @@ impl PostgresPersistence {
                 "PostgreSQL max_connections must be positive".into(),
             ));
         }
-        let options = PgConnectOptions::from_str(&config.database_url)
+        let mut options = PgConnectOptions::from_str(&config.database_url)
             .map_err(|error| EnclaveError::Config(format!("invalid PostgreSQL URL: {error}")))?;
+        if let Some(root_ca_pem) = config.root_ca_pem {
+            if root_ca_pem.is_empty() {
+                return Err(EnclaveError::Config(
+                    "PostgreSQL root CA must not be empty".into(),
+                ));
+            }
+            options = options.ssl_root_cert_from_pem(root_ca_pem);
+        }
         let statement_timeout_ms =
             i64::try_from(config.statement_timeout.as_millis()).map_err(|_| {
                 EnclaveError::Config("PostgreSQL statement timeout is too large".into())
@@ -145,6 +156,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 8;
+        }
+        if version == 8 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0009_episode_query_contract.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -205,8 +224,8 @@ mod tests {
     use crate::persistence::RepositorySet;
     use crate::persistence::{
         CaptureCommit, CapturePreflight, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
-        EmailSendFenceDisposition, PushInstallation, PushProviderOutcome, PushProviderReceipt,
-        PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
+        EmailSendFenceDisposition, EpisodeListRequest, PushInstallation, PushProviderOutcome,
+        PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
@@ -221,6 +240,7 @@ mod tests {
         };
         let persistence = PostgresPersistence::connect(PostgresPoolConfig {
             database_url,
+            root_ca_pem: None,
             max_connections: 8,
             acquire_timeout: Duration::from_secs(5),
             statement_timeout: Duration::from_secs(10),
@@ -1076,6 +1096,52 @@ mod tests {
                 ..
             }]
         ));
+        sqlx::query(
+            "INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+             VALUES($1,1,'utterance',1),($1,1,'screenshot',1)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
+             VALUES($1,1,'Ready','[]'::jsonb,'[\"Ship\"]'::jsonb,'[]'::jsonb,'[]'::jsonb)",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let episode_page = repositories
+            .memory_queries()
+            .list_episodes(
+                &account_id,
+                &EpisodeListRequest {
+                    from: None,
+                    to: None,
+                    limit: 20,
+                    include_low: false,
+                    episode_id: None,
+                    before_started_at: None,
+                    before_id: None,
+                    probe_for_more: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(episode_page.episodes.len(), 1);
+        assert!(!episode_page.has_more);
+        assert_eq!(episode_page.episodes[0]["member_count"], 2);
+        assert_eq!(episode_page.episodes[0]["top_domains"][0], "example.com");
+        assert_eq!(episode_page.episodes[0]["final_brief"]["overview"], "Ready");
+        let capture_status = repositories
+            .memory_queries()
+            .capture_status(&account_id)
+            .await
+            .unwrap();
+        assert_eq!(capture_status.total_utterances, 1);
+        assert_eq!(capture_status.total_screenshots, 1);
+        assert_eq!(capture_status.episode_count, 1);
 
         let billing_detach_id = repositories
             .billing()
