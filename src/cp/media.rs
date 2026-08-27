@@ -55,7 +55,6 @@ const MAX_SCREEN_DEDUPE_VERSION: u32 = 2;
 const MAX_REFERENCE_BATCH_EVENTS: usize = 64;
 const REFERENCE_BATCH_ID_DOMAIN: &[u8] = b"kioku.screen-reference-batch.v1\0";
 const REFERENCE_BATCH_MANIFEST_DOMAIN: &[u8] = b"kioku.screen-reference-manifests.v1\0";
-const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 const REQUEST_LOCAL_LABEL_MIGRATION_KEY: &str = "request-local-speaker-labels-v1";
 const SPEAKER_IDENTITY_BACKFILL_KEY: &str = "speaker-identity-backfill-v2";
 #[allow(dead_code)]
@@ -1379,29 +1378,37 @@ async fn upload_screen_reference_batch(
             )
         }
     };
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return capture_failure_response_for_route(
-                "screen_reference_batch",
-                started_at,
-                manifest,
-                CaptureIngestFailureReason::LifecycleUnavailable,
-                error.into_response(),
-            )
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                return capture_failure_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    CaptureIngestFailureReason::LifecycleUnavailable,
+                    error.into_response(),
+                )
+            }
         }
+    } else {
+        None
     };
-    let _content_write = match state.store.acquire_content_write(&user_id).await {
-        Ok(lease) => lease,
-        Err(error) => {
-            return capture_failure_response_for_route(
-                "screen_reference_batch",
-                started_at,
-                manifest,
-                CaptureIngestFailureReason::LifecycleUnavailable,
-                error.into_response(),
-            )
+    let _content_write = if state.repositories.uses_legacy_state() {
+        match state.store.acquire_content_write(&user_id).await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return capture_failure_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    CaptureIngestFailureReason::LifecycleUnavailable,
+                    error.into_response(),
+                )
+            }
         }
+    } else {
+        None
     };
     let mut preflight = Vec::with_capacity(request.events.len());
     for (event, digest) in request.events.iter().zip(&validated.manifest_digests) {
@@ -1734,30 +1741,38 @@ async fn upload_capture_event(
         }
         None => None,
     };
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(error) => {
-            return capture_failure_response(
-                started_at,
-                Some(&manifest),
-                CaptureIngestFailureReason::LifecycleUnavailable,
-                error.into_response(),
-            )
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::LifecycleUnavailable,
+                    error.into_response(),
+                )
+            }
         }
+    } else {
+        None
     };
     // Keep admission alive through the GCS object and durable SQLite record.
     // DELETE /api/account closes this barrier before it inventories media, so
     // an already-authorized capture cannot recreate an object afterward.
-    let _content_write = match state.store.acquire_content_write(&user_id).await {
-        Ok(lease) => lease,
-        Err(error) => {
-            return capture_failure_response(
-                started_at,
-                Some(&manifest),
-                CaptureIngestFailureReason::LifecycleUnavailable,
-                error.into_response(),
-            )
+    let _content_write = if state.repositories.uses_legacy_state() {
+        match state.store.acquire_content_write(&user_id).await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::LifecycleUnavailable,
+                    error.into_response(),
+                )
+            }
         }
+    } else {
+        None
     };
     let preflight = state
         .repositories
@@ -1820,8 +1835,10 @@ async fn upload_capture_event(
     let commit_stamp = enclave_commit_stamp();
     let mut media_generation = None;
     let mut object_key = None;
+    let mut upload_token = None;
     let mut media_authority = None;
     if manifest.media_disposition == MediaDisposition::Canonical {
+        let media = manifest.media.as_ref().expect("validated canonical media");
         let media_bytes = media_bytes.as_deref().expect("validated canonical media");
         let write =
             match prepare_canonical_media_write(&state, &user_id, &manifest, &commit_stamp).await {
@@ -1852,10 +1869,32 @@ async fn upload_capture_event(
                 );
             }
         };
+        upload_token = match state
+            .repositories
+            .captures()
+            .reserve_media_upload(
+                &user_id,
+                &manifest.event_id,
+                &media.asset_id,
+                &write.object_key,
+                &digest,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::LifecycleUnavailable,
+                    error.into_response(),
+                )
+            }
+        };
         // The child keeps the provider PUT alive if the HTTP future is
         // cancelled. Deletion waits for that child lease and therefore scans
         // only after the provider has definitively accepted or rejected it.
-        let put_lease = _content_write.child();
+        let put_lease = _content_write.as_ref().map(|lease| lease.child());
         let put_store = state.repositories.media_objects_arc();
         let put_user_id = user_id.clone();
         let put_object_key = write.object_key.clone();
@@ -1920,6 +1959,7 @@ async fn upload_capture_event(
             manifest_digest: digest.clone(),
             object_key,
             object_generation: media_generation,
+            upload_token,
             media_authority,
             committed_at: commit_stamp,
         })
@@ -2895,70 +2935,25 @@ pub(crate) fn committed_through_sequence(conn: &Connection, stream_id: &str) -> 
     .ok_or(EnclaveError::NotFound)
 }
 
-fn install_media_dek_candidate(conn: &Connection, candidate: &str) -> Result<String> {
-    conn.execute(
-        "INSERT INTO app_metadata (key,value) VALUES (?1,?2) ON CONFLICT(key) DO NOTHING",
-        params![MEDIA_DEK_METADATA_KEY, candidate],
-    )?;
-    Ok(conn.query_row(
-        "SELECT value FROM app_metadata WHERE key=?1",
-        [MEDIA_DEK_METADATA_KEY],
-        |row| row.get(0),
-    )?)
-}
-
 pub(in crate::cp) async fn load_or_create_media_dek(
     state: &CpState,
     user_id: &str,
 ) -> Result<(crate::crypto::Dek, String)> {
-    // Routed unconditionally: an unselected user falls through to the legacy
-    // read path, a selected user reads the settled lane.
-    let existing = read_media_dek_wrapped(state, user_id).await?;
+    let existing = state
+        .repositories
+        .captures()
+        .media_dek_wrapped(user_id)
+        .await?;
     if let Some(wrapped) = existing {
         let dek = crate::crypto::load_dek(state.kms.as_ref(), &wrapped).await?;
         return Ok((dek, wrapped));
     }
     let (candidate_dek, candidate_wrapped) =
         crate::crypto::generate_and_wrap_dek(state.kms.as_ref()).await?;
-    if state.store.is_wal_authoritative(user_id) {
-        let plan = wal::MediaDekInstallPlan::new(
-            user_id.to_owned(),
-            candidate_wrapped.clone(),
-            &candidate_dek,
-        )
-        .map_err(|_| EnclaveError::Store("media DEK install plan construction failed".into()))?;
-        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-            .map_err(|_| {
-                EnclaveError::Store("media DEK install plan construction failed".into())
-            })?;
-        return match state
-            .store
-            .wal_authoritative_submit(user_id, prepared)
-            .await
-        {
-            // Settled: our candidate is durably the account DEK (an exact
-            // replay of a lost ack lands here too, with identical bytes).
-            Ok(_receipt) => Ok((candidate_dek, candidate_wrapped)),
-            // A different DEK won between our read and our submit. The plan
-            // fails closed on the mismatch; converge by loading the winner
-            // exactly as the legacy loser branch does.
-            Err(EnclaveError::Conflict(_)) => {
-                let winner = read_media_dek_wrapped(state, user_id)
-                    .await?
-                    .ok_or_else(|| {
-                        EnclaveError::Store("media DEK install lost a race to no winner".into())
-                    })?;
-                let dek = crate::crypto::load_dek(state.kms.as_ref(), &winner).await?;
-                Ok((dek, winner))
-            }
-            Err(error) => Err(error),
-        };
-    }
     let winner = state
-        .store
-        .with_user(user_id, |conn| {
-            install_media_dek_candidate(conn, &candidate_wrapped)
-        })
+        .repositories
+        .captures()
+        .install_media_dek(user_id, &candidate_wrapped, &candidate_dek)
         .await?;
     if winner == candidate_wrapped {
         Ok((candidate_dek, winner))
@@ -2966,23 +2961,6 @@ pub(in crate::cp) async fn load_or_create_media_dek(
         let dek = crate::crypto::load_dek(state.kms.as_ref(), &winner).await?;
         Ok((dek, winner))
     }
-}
-
-/// The one production read of the account media-DEK row, routed through the
-/// dual-path read so both populations resolve it the same way.
-async fn read_media_dek_wrapped(state: &CpState, user_id: &str) -> Result<Option<String>> {
-    state
-        .store
-        .wal_authoritative_read(user_id, |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT value FROM app_metadata WHERE key=?1",
-                    [MEDIA_DEK_METADATA_KEY],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .await
 }
 
 struct CanonicalMediaWrite {
@@ -5660,12 +5638,9 @@ mod tests {
     }
 
     #[test]
-    fn media_dek_route_is_exactly_dual_path() {
-        // ADR-0022 F1: the DEK bootstrap reads through the routed dual-path
-        // surface for BOTH populations, submits the sealed install plan for a
-        // selected user, and keeps the exact legacy compare-and-install for
-        // everyone else. A Conflict from the submit converges by re-reading
-        // the winner, never by rebuilding the plan (R5).
+    fn media_dek_route_uses_only_the_capture_repository() {
+        // ADR-0040: the route owns KMS key material while the selected
+        // persistence adapter owns the atomic account-key installation.
         let source = include_str!("media.rs");
         let start = source
             .find(concat!("async fn load_or_create_", "media_dek"))
@@ -5674,38 +5649,20 @@ mod tests {
             .find(concat!("async fn verify_existing_", "media"))
             .unwrap();
         let route = &source[start..end];
+        assert_eq!(route.matches(".media_dek_wrapped(").count(), 1);
+        assert_eq!(route.matches(".install_media_dek(").count(), 1);
+        assert_eq!(route.matches("state.store").count(), 0);
         assert_eq!(
-            route.matches(concat!("is_wal_", "authoritative(")).count(),
-            1
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            0
         );
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "submit("))
                 .count(),
-            1
-        );
-        // Exactly one legacy write install; every read goes through the
-        // routed helper (which itself is the only wal_authoritative_read).
-        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 1);
-        assert_eq!(
-            route
-                .matches(concat!("read_media_dek_", "wrapped(state, user_id)"))
-                .count(),
-            2
-        );
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "read("))
-                .count(),
-            1
-        );
-        // The plan is constructed exactly once, above any retry/converge
-        // path, from the candidate the caller minted (R5).
-        assert_eq!(
-            route
-                .matches(concat!("MediaDekInstallPlan::", "new("))
-                .count(),
-            1
+            0
         );
     }
 
@@ -5725,7 +5682,8 @@ mod tests {
         let route = &source[start..end];
         assert_eq!(route.matches(".preflight_event(").count(), 1);
         assert_eq!(route.matches(".commit_event(").count(), 1);
-        assert_eq!(route.matches(".captures()").count(), 2);
+        assert_eq!(route.matches(".captures()").count(), 3);
+        assert_eq!(route.matches(".reserve_media_upload(").count(), 1);
         assert_eq!(
             route
                 .matches(concat!("wal_authoritative_", "read("))

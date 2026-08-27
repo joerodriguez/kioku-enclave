@@ -39,3 +39,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   tenant-qualified webhook, email, and push delivery outboxes.
 - `0017_delivery_claims.sql` adds fleet-wide provider lanes and durable frozen
   outbound request evidence for crash-safe multi-process delivery.
+- `0018_capture_upload_admission.sql` adds fleet-wide GCS upload admission and
+  the single installed processing-media key for each account.

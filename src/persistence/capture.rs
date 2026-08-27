@@ -81,6 +81,10 @@ pub(crate) struct CaptureCommit {
     pub(crate) manifest_digest: String,
     pub(crate) object_key: Option<String>,
     pub(crate) object_generation: Option<i64>,
+    /// PostgreSQL fleet-wide admission token for a canonical GCS upload.
+    /// The legacy adapter deliberately leaves this unset because its
+    /// process-local lifecycle barrier remains authoritative there.
+    pub(crate) upload_token: Option<String>,
     pub(crate) media_authority: Option<RecordingMediaAuthorityDecision>,
     pub(crate) committed_at: String,
 }
@@ -123,6 +127,29 @@ pub(crate) trait CaptureRepository: Send + Sync {
         manifest_digest: &str,
         allowed_object_keys: Option<&[String]>,
     ) -> Result<CapturePreflight>;
+
+    /// Reserve the right to publish one canonical GCS object while the
+    /// account is active. PostgreSQL returns a durable token; the legacy
+    /// adapter returns `None` and continues to use its local write barrier.
+    async fn reserve_media_upload(
+        &self,
+        account_id: &str,
+        event_id: &str,
+        asset_id: &str,
+        object_key: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<String>>;
+
+    async fn media_dek_wrapped(&self, account_id: &str) -> Result<Option<String>>;
+
+    /// Install the first processing-media DEK and return the persisted winner.
+    /// `candidate_dek` is needed only by the legacy WAL binding proof.
+    async fn install_media_dek(
+        &self,
+        account_id: &str,
+        candidate_wrapped: &str,
+        candidate_dek: &crate::crypto::Dek,
+    ) -> Result<String>;
 
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult>;
 
