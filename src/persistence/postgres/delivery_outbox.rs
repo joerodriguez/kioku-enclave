@@ -9,7 +9,8 @@ use crate::{
     error::{EnclaveError, Result},
     persistence::{
         DeliveryRepository, EmailDeliveryCandidate, EmailDeliveryClaim, EmailProviderOutcome,
-        FrozenEmailDelivery, FrozenWebhookDelivery, WebhookDeliveryCandidate, WebhookDeliveryClaim,
+        FrozenEmailDelivery, FrozenPushDelivery, FrozenWebhookDelivery, PushDeliveryCandidate,
+        PushDeliveryClaim, PushProviderOutcome, WebhookDeliveryCandidate, WebhookDeliveryClaim,
         WebhookProviderOutcome,
     },
 };
@@ -164,6 +165,56 @@ async fn recover_expired_webhook_claims(
         sqlx::query(
             "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL,updated_at=now() \
               WHERE provider='webhook' AND owner_token=$1",
+        )
+        .bind(&claim_token)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn recover_expired_push_claims(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    let expired = sqlx::query(
+        "SELECT d.delivery_id,d.claim_token,EXISTS( \
+             SELECT 1 FROM push_send_fences f WHERE f.account_id=d.account_id \
+               AND f.claim_id=d.claim_token) AS disclosed \
+           FROM push_deliveries d WHERE d.account_id=$1 AND d.state='processing' \
+            AND d.claim_until<=clock_timestamp() FOR UPDATE",
+    )
+    .bind(account_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for row in expired {
+        let delivery_id: String = row.try_get("delivery_id")?;
+        let claim_token: String = row.try_get("claim_token")?;
+        let disclosed: bool = row.try_get("disclosed")?;
+        sqlx::query(
+            "UPDATE push_deliveries SET state=$1,completed_claim_token=claim_token, \
+                    claim_token=NULL,claim_until=NULL,last_error=$2,error_code=$2,updated_at=now() \
+              WHERE account_id=$3 AND delivery_id=$4 AND claim_token=$5",
+        )
+        .bind(if disclosed { "ambiguous" } else { "retry_wait" })
+        .bind(if disclosed {
+            "claim_expired_after_disclosure"
+        } else {
+            "claim_expired_before_disclosure"
+        })
+        .bind(account_id)
+        .bind(&delivery_id)
+        .bind(&claim_token)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query("DELETE FROM push_send_fences WHERE account_id=$1 AND claim_id=$2")
+            .bind(account_id)
+            .bind(&claim_token)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL,updated_at=now() \
+              WHERE provider='push' AND owner_token=$1",
         )
         .bind(&claim_token)
         .execute(&mut **transaction)
@@ -898,6 +949,367 @@ impl DeliveryRepository for PostgresPersistence {
                     circuit_until=CASE WHEN $2::double precision IS NULL THEN circuit_until \
                       ELSE clock_timestamp()+make_interval(secs=>$2) END,updated_at=now() \
               WHERE provider='webhook' AND owner_token=$3",
+        )
+        .bind(PROVIDER_PACE_MILLIS as f64 / 1_000.0)
+        .bind(circuit_seconds.map(|seconds| seconds as f64))
+        .bind(&claim.claim_token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn next_push_candidate(&self, account_id: &str) -> Result<Option<PushDeliveryCandidate>> {
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        advisory_transaction_lock(&mut transaction, "push-registry", "global").await?;
+        recover_expired_push_claims(&mut transaction, account_id).await?;
+        sqlx::query(
+            "UPDATE push_deliveries SET state='cancelled',last_error='delivery_expired', \
+                    error_code='delivery_expired',updated_at=now() \
+              WHERE account_id=$1 AND state IN ('pending','retry_wait') \
+                AND created_at<=clock_timestamp()-make_interval(secs=>$2)",
+        )
+        .bind(account_id)
+        .bind(MAX_DELIVERY_AGE_SECONDS as f64)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE push_deliveries d SET state='cancelled',last_error='push_not_authorized', \
+                    error_code='push_not_authorized',updated_at=now() \
+              WHERE d.account_id=$1 AND d.state IN ('pending','retry_wait') AND NOT EXISTS ( \
+                SELECT 1 FROM accounts a JOIN push_installations p ON p.account_id=a.id \
+                 WHERE a.id=d.account_id AND a.status='active' AND p.enabled \
+                   AND d.installation_binding=('p1:'||p.id||':'||p.token_generation::text))",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        let row = sqlx::query(
+            "SELECT d.account_id,d.episode_id,d.installation_binding,p.id AS installation_id, \
+                    d.delivery_version,d.delivery_id,d.handoff_handle,d.collapse_id,d.attempt_count, \
+                    floor(extract(epoch FROM d.created_at)*1000)::bigint AS created_at_ms, \
+                    p.topic,p.environment,p.device_token,p.token_generation \
+               FROM push_deliveries d JOIN accounts a ON a.id=d.account_id \
+               JOIN push_installations p ON p.account_id=d.account_id \
+                    AND d.installation_binding=('p1:'||p.id||':'||p.token_generation::text) \
+              WHERE d.account_id=$1 AND d.state IN ('pending','retry_wait') \
+                AND d.next_attempt_at<=clock_timestamp() AND a.status='active' AND p.enabled \
+                AND NOT EXISTS(SELECT 1 FROM push_deliveries earlier \
+                    WHERE earlier.account_id=d.account_id \
+                      AND earlier.installation_binding=d.installation_binding \
+                      AND earlier.state IN ('pending','processing','retry_wait') \
+                      AND (earlier.created_at<d.created_at OR \
+                           (earlier.created_at=d.created_at AND earlier.delivery_id<d.delivery_id))) \
+              ORDER BY d.created_at,d.installation_binding,d.delivery_id LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let candidate = row
+            .as_ref()
+            .map(|row| -> Result<PushDeliveryCandidate> {
+                Ok(PushDeliveryCandidate {
+                    account_id: row.try_get("account_id")?,
+                    episode_id: row.try_get("episode_id")?,
+                    installation_binding: row.try_get("installation_binding")?,
+                    installation_id: row.try_get("installation_id")?,
+                    delivery_version: row.try_get("delivery_version")?,
+                    delivery_id: row.try_get("delivery_id")?,
+                    handoff_handle: row.try_get("handoff_handle")?,
+                    collapse_id: row.try_get("collapse_id")?,
+                    attempt_count: row.try_get("attempt_count")?,
+                    created_at: isotime::format_epoch_millis(row.try_get("created_at_ms")?),
+                    topic: row.try_get("topic")?,
+                    environment: row.try_get("environment")?,
+                    device_token: row.try_get("device_token")?,
+                    token_generation: row.try_get("token_generation")?,
+                })
+            })
+            .transpose()?;
+        transaction.commit().await?;
+        Ok(candidate)
+    }
+
+    async fn claim_push(
+        &self,
+        candidate: &PushDeliveryCandidate,
+        request: FrozenPushDelivery,
+        lease_seconds: i64,
+    ) -> Result<Option<PushDeliveryClaim>> {
+        if !(1..=120).contains(&lease_seconds)
+            || candidate.attempt_count < 0
+            || candidate.attempt_count >= 10
+            || request.topic != candidate.topic
+            || request.environment != candidate.environment
+            || request.device_token != candidate.device_token
+            || request.token_generation != candidate.token_generation
+            || request.token_generation <= 0
+        {
+            return Err(EnclaveError::Store(
+                "push delivery candidate is invalid".into(),
+            ));
+        }
+        bounded(&request.topic, 256, "push topic")?;
+        bounded(&request.environment, 32, "push environment")?;
+        bounded(&request.device_token, 512, "push device token")?;
+        let token = tokens::new_uuid();
+        let lease = duration_seconds(std::time::Duration::from_secs(
+            u64::try_from(lease_seconds)
+                .map_err(|_| EnclaveError::Store("push lease is invalid".into()))?,
+        ))?;
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", &candidate.account_id)
+            .await?;
+        advisory_transaction_lock(&mut transaction, "push-registry", "global").await?;
+        recover_expired_push_claims(&mut transaction, &candidate.account_id).await?;
+        let lane_available = sqlx::query_scalar::<_, bool>(
+            "SELECT owner_token IS NULL AND next_send_at<=clock_timestamp() \
+                    AND (circuit_until IS NULL OR circuit_until<=clock_timestamp()) \
+               FROM provider_send_lanes WHERE provider='push' FOR UPDATE",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !lane_available {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let current = sqlx::query(
+            "SELECT d.attempt_count,a.status,p.enabled,p.topic,p.environment,p.device_token, \
+                    p.token_generation \
+               FROM push_deliveries d JOIN accounts a ON a.id=d.account_id \
+               JOIN push_installations p ON p.account_id=d.account_id AND p.id=$5 \
+              WHERE d.account_id=$1 AND d.episode_id=$2 AND d.delivery_version=$3 \
+                AND d.delivery_id=$4 AND d.installation_binding=$6 \
+                AND d.state IN ('pending','retry_wait') AND d.next_attempt_at<=clock_timestamp() \
+              FOR UPDATE OF d",
+        )
+        .bind(&candidate.account_id)
+        .bind(candidate.episode_id)
+        .bind(candidate.delivery_version)
+        .bind(&candidate.delivery_id)
+        .bind(&candidate.installation_id)
+        .bind(&candidate.installation_binding)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(current) = current else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let authorized = current.try_get::<String, _>("status")? == "active"
+            && current.try_get::<bool, _>("enabled")?
+            && current.try_get::<String, _>("topic")? == request.topic
+            && current.try_get::<String, _>("environment")? == request.environment
+            && current.try_get::<String, _>("device_token")? == request.device_token
+            && current.try_get::<i64, _>("token_generation")? == request.token_generation
+            && current.try_get::<i64, _>("attempt_count")? == candidate.attempt_count;
+        if !authorized {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let new_attempt = candidate
+            .attempt_count
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("push attempt count overflow".into()))?;
+        let lease_expires_at_ms = sqlx::query_scalar::<_, i64>(
+            "SELECT floor(extract(epoch FROM (clock_timestamp()+make_interval(secs=>$1)))*1000)::bigint",
+        )
+        .bind(lease)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let changed = sqlx::query(
+            "UPDATE push_deliveries SET state='processing',attempt_count=$1,claim_token=$2, \
+                    claim_until=to_timestamp($3::double precision/1000.0),frozen_topic=$4, \
+                    frozen_environment=$5,frozen_device_token=$6,frozen_token_generation=$7, \
+                    send_started_at=clock_timestamp(),last_error=NULL,error_code=NULL,updated_at=now() \
+              WHERE account_id=$8 AND episode_id=$9 AND installation_binding=$10 \
+                AND delivery_version=$11 AND delivery_id=$12 AND state IN ('pending','retry_wait')",
+        )
+        .bind(new_attempt)
+        .bind(&token)
+        .bind(lease_expires_at_ms)
+        .bind(&request.topic)
+        .bind(&request.environment)
+        .bind(&request.device_token)
+        .bind(request.token_generation)
+        .bind(&candidate.account_id)
+        .bind(candidate.episode_id)
+        .bind(&candidate.installation_binding)
+        .bind(candidate.delivery_version)
+        .bind(&candidate.delivery_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "INSERT INTO push_send_fences(account_id,installation_id,token_generation,claim_id, \
+                                          lease_expires_at) \
+             VALUES($1,$2,$3,$4,to_timestamp($5::double precision/1000.0))",
+        )
+        .bind(&candidate.account_id)
+        .bind(&candidate.installation_id)
+        .bind(request.token_generation)
+        .bind(&token)
+        .bind(lease_expires_at_ms)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=$1, \
+                    lease_until=to_timestamp($2::double precision/1000.0),updated_at=now() \
+              WHERE provider='push'",
+        )
+        .bind(&token)
+        .bind(lease_expires_at_ms)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(PushDeliveryClaim {
+            account_id: candidate.account_id.clone(),
+            episode_id: candidate.episode_id,
+            installation_binding: candidate.installation_binding.clone(),
+            installation_id: candidate.installation_id.clone(),
+            delivery_version: candidate.delivery_version,
+            delivery_id: candidate.delivery_id.clone(),
+            handoff_handle: candidate.handoff_handle.clone(),
+            collapse_id: candidate.collapse_id.clone(),
+            claim_token: token,
+            lease_expires_at: isotime::format_epoch_millis(lease_expires_at_ms),
+            attempt_count: new_attempt,
+            created_at: candidate.created_at.clone(),
+            request,
+        }))
+    }
+
+    async fn settle_push(
+        &self,
+        claim: &PushDeliveryClaim,
+        outcome: PushProviderOutcome,
+        circuit_seconds: Option<i64>,
+    ) -> Result<()> {
+        if !outcome.is_valid()
+            || circuit_seconds.is_some_and(|seconds| !(1..=6 * 60 * 60).contains(&seconds))
+        {
+            return Err(EnclaveError::Store(
+                "push delivery settlement is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "push-registry", "global").await?;
+        let row = sqlx::query(
+            "SELECT state,claim_token,completed_claim_token FROM push_deliveries \
+              WHERE account_id=$1 AND episode_id=$2 AND installation_binding=$3 \
+                AND delivery_version=$4 AND delivery_id=$5 FOR UPDATE",
+        )
+        .bind(&claim.account_id)
+        .bind(claim.episode_id)
+        .bind(&claim.installation_binding)
+        .bind(claim.delivery_version)
+        .bind(&claim.delivery_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| EnclaveError::Conflict("push delivery disappeared".into()))?;
+        if row
+            .try_get::<Option<String>, _>("completed_claim_token")?
+            .as_deref()
+            == Some(&claim.claim_token)
+        {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        if row.try_get::<String, _>("state")? != "processing"
+            || row.try_get::<Option<String>, _>("claim_token")?.as_deref()
+                != Some(&claim.claim_token)
+        {
+            return Err(EnclaveError::Conflict(
+                "push delivery claim is no longer authoritative".into(),
+            ));
+        }
+        let fence_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM push_send_fences WHERE account_id=$1 \
+                    AND installation_id=$2 AND token_generation=$3 AND claim_id=$4)",
+        )
+        .bind(&claim.account_id)
+        .bind(&claim.installation_id)
+        .bind(claim.request.token_generation)
+        .bind(&claim.claim_token)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !fence_exists {
+            return Err(EnclaveError::Conflict(
+                "push disclosure fence disappeared".into(),
+            ));
+        }
+        let (state, status, error_code, retry_at) = match &outcome {
+            PushProviderOutcome::Accepted { status } => ("delivered", Some(*status), None, None),
+            PushProviderOutcome::Retry {
+                status,
+                code,
+                retry_at,
+            } => (
+                "retry_wait",
+                *status,
+                Some(code.as_str()),
+                Some(timestamp(retry_at)?),
+            ),
+            PushProviderOutcome::Ambiguous => ("ambiguous", None, Some("outcome_unknown"), None),
+            PushProviderOutcome::Failed { status, code } => {
+                ("failed", *status, Some(code.as_str()), None)
+            }
+            PushProviderOutcome::TokenTerminal { status, code } => {
+                ("failed", Some(*status), Some(code.as_str()), None)
+            }
+        };
+        let changed = sqlx::query(
+            "UPDATE push_deliveries SET state=$1,completed_claim_token=$2,claim_token=NULL, \
+                    claim_until=NULL,next_attempt_at=CASE WHEN $3::bigint IS NULL THEN next_attempt_at \
+                      ELSE to_timestamp($3::double precision/1000.0) END,response_status=$4, \
+                    error_code=$5,last_error=$5,updated_at=now() \
+              WHERE account_id=$6 AND episode_id=$7 AND installation_binding=$8 \
+                AND delivery_version=$9 AND delivery_id=$10 AND state='processing' AND claim_token=$2",
+        )
+        .bind(state)
+        .bind(&claim.claim_token)
+        .bind(retry_at)
+        .bind(status)
+        .bind(error_code)
+        .bind(&claim.account_id)
+        .bind(claim.episode_id)
+        .bind(&claim.installation_binding)
+        .bind(claim.delivery_version)
+        .bind(&claim.delivery_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "push delivery was not settled exactly once".into(),
+            ));
+        }
+        if matches!(outcome, PushProviderOutcome::TokenTerminal { .. }) {
+            sqlx::query(
+                "UPDATE push_installations SET enabled=false,updated_at=now() \
+                  WHERE account_id=$1 AND id=$2 AND token_generation=$3",
+            )
+            .bind(&claim.account_id)
+            .bind(&claim.installation_id)
+            .bind(claim.request.token_generation)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query("DELETE FROM push_send_fences WHERE account_id=$1 AND claim_id=$2")
+            .bind(&claim.account_id)
+            .bind(&claim.claim_token)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL, \
+                    next_send_at=clock_timestamp()+make_interval(secs=>$1), \
+                    circuit_until=CASE WHEN $2::double precision IS NULL THEN circuit_until \
+                      ELSE clock_timestamp()+make_interval(secs=>$2) END,updated_at=now() \
+              WHERE provider='push' AND owner_token=$3",
         )
         .bind(PROVIDER_PACE_MILLIS as f64 / 1_000.0)
         .bind(circuit_seconds.map(|seconds| seconds as f64))

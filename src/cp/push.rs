@@ -523,6 +523,9 @@ async fn deliver_user_pushes_routed(
     transport: &dyn PushTransport,
     user_id: &str,
 ) -> Result<()> {
+    if state.repositories.deliveries().is_some() {
+        return deliver_postgres_user_pushes(state, transport, user_id).await;
+    }
     reconcile_push_send_fences(state, user_id).await?;
     emit_push_depth(state, user_id).await;
     for _ in 0..MAX_DELIVERIES_PER_SWEEP {
@@ -933,6 +936,153 @@ async fn deliver_user_pushes_routed(
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+async fn deliver_postgres_user_pushes(
+    state: &CpState,
+    transport: &dyn PushTransport,
+    user_id: &str,
+) -> Result<()> {
+    let repository = state
+        .repositories
+        .deliveries()
+        .ok_or_else(|| EnclaveError::Store("PostgreSQL delivery repository is missing".into()))?;
+    for _ in 0..MAX_DELIVERIES_PER_SWEEP {
+        let Some(candidate) = repository.next_push_candidate(user_id).await? else {
+            break;
+        };
+        let frozen = crate::persistence::FrozenPushDelivery {
+            topic: candidate.topic.clone(),
+            environment: candidate.environment.clone(),
+            device_token: candidate.device_token.clone(),
+            token_generation: candidate.token_generation,
+        };
+        let mut claim = repository
+            .claim_push(&candidate, frozen.clone(), 60)
+            .await?;
+        if claim.is_none() {
+            tokio::time::sleep(Duration::from_millis(
+                GLOBAL_SEND_PACE_MILLIS.saturating_add(25),
+            ))
+            .await;
+            claim = repository.claim_push(&candidate, frozen, 60).await?;
+        }
+        let Some(claim) = claim else {
+            break;
+        };
+        let created_at = crate::cp::isotime::parse_epoch_millis(&claim.created_at)
+            .ok_or_else(|| EnclaveError::Store("push creation time is invalid".into()))?;
+        let expiration_millis = created_at
+            .checked_add(MAX_DELIVERY_AGE_SECONDS * 1_000)
+            .ok_or_else(|| EnclaveError::Store("push expiration overflow".into()))?;
+        let now = epoch_millis();
+        if expiration_millis <= now {
+            repository
+                .settle_push(
+                    &claim,
+                    PushProviderOutcome::Failed {
+                        status: None,
+                        code: "delivery_expired".into(),
+                    },
+                    None,
+                )
+                .await?;
+            continue;
+        }
+        let expiration_epoch_seconds = u64::try_from(expiration_millis / 1_000)
+            .map_err(|_| EnclaveError::Store("push expiration is invalid".into()))?;
+        let result = transport
+            .send(PushRequest {
+                topic: claim.request.topic.clone(),
+                environment: claim.request.environment.clone(),
+                device_token: claim.request.device_token.clone(),
+                token_generation: claim.request.token_generation,
+                apns_id: claim.delivery_id.clone(),
+                collapse_id: claim.collapse_id.clone(),
+                handoff_handle: claim.handoff_handle.clone(),
+                expiration_epoch_seconds,
+            })
+            .await;
+        let outcome_at = crate::cp::isotime::format_epoch_millis(epoch_millis());
+        let (outcome, circuit_seconds) = match result {
+            Ok(status) => (
+                PushProviderOutcome::Accepted {
+                    status: i64::from(status),
+                },
+                None,
+            ),
+            Err(PushTransportError::TokenTerminal { status, code }) => (
+                PushProviderOutcome::TokenTerminal {
+                    status: i64::from(status),
+                    code: code.into(),
+                },
+                None,
+            ),
+            Err(PushTransportError::Retryable {
+                status,
+                code: _,
+                retry_after_seconds: _,
+                scope,
+            }) if status.is_none() => (
+                PushProviderOutcome::Ambiguous,
+                (scope == PushRetryScope::ProviderWide).then_some(RETRYABLE_CIRCUIT_SECONDS as i64),
+            ),
+            Err(PushTransportError::Retryable {
+                status,
+                code,
+                retry_after_seconds,
+                scope,
+            }) => {
+                let circuit = (scope == PushRetryScope::ProviderWide).then_some(
+                    i64::try_from(retry_after_seconds.unwrap_or(RETRYABLE_CIRCUIT_SECONDS))
+                        .unwrap_or(RETRYABLE_CIRCUIT_SECONDS as i64)
+                        .clamp(1, 6 * 60 * 60),
+                );
+                if claim.attempt_count >= i64::from(MAX_ATTEMPTS) {
+                    (
+                        PushProviderOutcome::Failed {
+                            status: status.map(i64::from),
+                            code: "attempt_cap".into(),
+                        },
+                        circuit,
+                    )
+                } else {
+                    let delay = retry_after_seconds
+                        .and_then(|seconds| i64::try_from(seconds).ok())
+                        .unwrap_or_else(|| retry_delay(claim.attempt_count))
+                        .clamp(1, 6 * 60 * 60);
+                    (
+                        PushProviderOutcome::Retry {
+                            status: status.map(i64::from),
+                            code: code.into(),
+                            retry_at: add_seconds(&outcome_at, delay)?,
+                        },
+                        circuit,
+                    )
+                }
+            }
+            Err(PushTransportError::ProviderTerminal { status, code }) => {
+                let outcome = if claim.attempt_count >= i64::from(MAX_ATTEMPTS) {
+                    PushProviderOutcome::Failed {
+                        status: status.map(i64::from),
+                        code: code.into(),
+                    }
+                } else {
+                    PushProviderOutcome::Retry {
+                        status: status.map(i64::from),
+                        code: code.into(),
+                        retry_at: add_seconds(&outcome_at, 60 * 60)?,
+                    }
+                };
+                (outcome, Some(PROVIDER_CIRCUIT_SECONDS as i64))
+            }
+        };
+        repository
+            .settle_push(&claim, outcome, circuit_seconds)
+            .await?;
+        emit_push_outcome("settled");
     }
     Ok(())
 }
