@@ -9,6 +9,7 @@
 | `lifecycle.rs` | Behavior-preserving deletion operation, credential-revocation, tombstone, and final identity cleanup operations. |
 | `notification.rs` | Behavior-preserving webhook, email preference, and push installation operations backed by `ControlStore`. |
 | `oauth.rs` | Behavior-preserving OAuth registry, grant, code, and refresh-token operations backed by `ControlStore`. |
+| `playback.rs` | Behavior-preserving playback and person-memory projections backed by routed per-account SQLite reads. |
 | `query.rs` | Behavior-preserving routed search, episode list/detail, merged feed, and capture status backed by the per-account encrypted SQLite store. |
 | `recording_retention.rs` | Behavior-preserving retention preview/CAS, inventory, key-epoch, and downgrade operations across `ControlStore` and the per-account store. |
 | `work.rs` | Behavior-preserving fleet account enumeration, summarizer cursor, provider-send fence, and deletion-ownership operations backed by `ControlStore`. |
