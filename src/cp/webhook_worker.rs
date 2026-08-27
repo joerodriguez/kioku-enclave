@@ -821,7 +821,12 @@ async fn deliver_selected_user_webhooks(
         let Some(snapshot) = next_selected_delivery(state, user_id).await? else {
             break;
         };
-        if state.control.webhook_outbox_deletion_owned(user_id).await? {
+        if state
+            .repositories
+            .work()
+            .webhook_outbox_deletion_owned(user_id)
+            .await?
+        {
             emit_webhook_metric("deletion_owned");
             break;
         }
@@ -996,7 +1001,8 @@ async fn deliver_selected_user_webhooks(
             Ok(None) => break,
             Err(error) => {
                 if let Ok(None) = state
-                    .control
+                    .repositories
+                    .work()
                     .get_webhook_send_fence(user_id, &snapshot.event_id)
                     .await
                 {
@@ -1029,7 +1035,8 @@ async fn deliver_selected_user_webhooks(
             .checked_add(wal::MIN_SEND_LEASE_MILLIS)
             .ok_or_else(|| EnclaveError::Store("webhook lease horizon overflow".into()))?;
         if !state
-            .control
+            .repositories
+            .work()
             .validate_webhook_send_fence(&fence, minimum_valid_at)
             .await?
         {
@@ -1369,7 +1376,8 @@ async fn begin_or_reload_webhook_fence(
 ) -> Result<Option<WebhookSendFence>> {
     let requested = fence_for_webhook_claim(user_id, claim, None, None);
     match state
-        .control
+        .repositories
+        .work()
         .begin_webhook_send_fence(
             &requested,
             &now_for_webhook_snapshot(claim.predecessor(), Some(claim)),
@@ -1498,7 +1506,11 @@ async fn replay_webhook_fence_receipt(
         Some(committed_at),
     )
     .await?;
-    state.control.close_webhook_send_fence(&fence).await
+    state
+        .repositories
+        .work()
+        .close_webhook_send_fence(&fence)
+        .await
 }
 
 async fn persist_webhook_provider_outcome(
@@ -1511,7 +1523,8 @@ async fn persist_webhook_provider_outcome(
     outcome_at: String,
 ) -> Result<()> {
     let control_result = state
-        .control
+        .repositories
+        .work()
         .record_webhook_send_outcome(&fence, outcome.clone(), &outcome_at)
         .await;
     let archive_result = settle_exact_webhook(
@@ -1526,11 +1539,16 @@ async fn persist_webhook_provider_outcome(
     archive_result?;
     control_result?;
     let completed = state
-        .control
+        .repositories
+        .work()
         .get_webhook_send_fence(user_id, &fence.event_id)
         .await?
         .ok_or_else(|| EnclaveError::Conflict("webhook send receipt disappeared".into()))?;
-    state.control.close_webhook_send_fence(&completed).await
+    state
+        .repositories
+        .work()
+        .close_webhook_send_fence(&completed)
+        .await
 }
 
 async fn recover_existing_webhook_claim(
@@ -1540,7 +1558,8 @@ async fn recover_existing_webhook_claim(
     claim: wal::WebhookSendClaim,
 ) -> Result<bool> {
     let fence = state
-        .control
+        .repositories
+        .work()
         .get_webhook_send_fence(user_id, &predecessor.event_id)
         .await?;
     if let Some(fence) = fence {
@@ -1597,10 +1616,20 @@ async fn recover_existing_webhook_claim(
 }
 
 async fn reconcile_webhook_send_fences(state: &CpState, user_id: &str) -> Result<()> {
-    for fence in state.control.list_webhook_send_fences(user_id).await? {
+    for fence in state
+        .repositories
+        .work()
+        .list_webhook_send_fences(user_id)
+        .await?
+    {
         let Some(recovery) = load_webhook_claim_recovery(state, user_id, &fence.claim_id).await?
         else {
-            if state.control.webhook_outbox_deletion_owned(user_id).await? {
+            if state
+                .repositories
+                .work()
+                .webhook_outbox_deletion_owned(user_id)
+                .await?
+            {
                 return Ok(());
             }
             return Err(EnclaveError::Store(
@@ -1647,18 +1676,24 @@ async fn reconcile_webhook_send_fences(state: &CpState, user_id: &str) -> Result
                     let mut completed = fence.clone();
                     if completed.outcome.is_none() {
                         state
-                            .control
+                            .repositories
+                            .work()
                             .record_webhook_send_outcome(&completed, provider.clone(), settled_at)
                             .await?;
                         completed = state
-                            .control
+                            .repositories
+                            .work()
                             .get_webhook_send_fence(user_id, claim.predecessor().event_id.as_str())
                             .await?
                             .ok_or_else(|| {
                                 EnclaveError::Conflict("webhook receipt disappeared".into())
                             })?;
                     }
-                    state.control.close_webhook_send_fence(&completed).await?;
+                    state
+                        .repositories
+                        .work()
+                        .close_webhook_send_fence(&completed)
+                        .await?;
                 } else if let wal::WebhookClaimRecovery::Cancelled {
                     code, settled_at, ..
                 } = recovery
@@ -1671,7 +1706,11 @@ async fn reconcile_webhook_send_fences(state: &CpState, user_id: &str) -> Result
                         completed.outcome = Some(WebhookFenceOutcome::Cancellation(cancellation));
                         completed.outcome_at = Some(settled_at);
                     }
-                    state.control.close_webhook_send_fence(&completed).await?;
+                    state
+                        .repositories
+                        .work()
+                        .close_webhook_send_fence(&completed)
+                        .await?;
                 }
             }
         }

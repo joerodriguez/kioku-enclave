@@ -554,7 +554,12 @@ async fn deliver_user_pushes_routed(
         // purge own this row and any open claim. WAL ingress correctly closes;
         // do not turn that monotone ownership transfer into a provider send or
         // a noisy cancellation retry.
-        if state.control.push_outbox_deletion_owned(user_id).await? {
+        if state
+            .repositories
+            .work()
+            .push_outbox_deletion_owned(user_id)
+            .await?
+        {
             emit_push_deletion_owned();
             break;
         }
@@ -693,7 +698,8 @@ async fn deliver_user_pushes_routed(
         let expiration_epoch_seconds = u64::try_from(expiration_millis / 1_000)
             .map_err(|_| EnclaveError::Store("push expiration is invalid".into()))?;
         let authorized_installation = match state
-            .control
+            .repositories
+            .work()
             .begin_push_send_fence(
                 user_id,
                 &binding.installation_id,
@@ -715,7 +721,8 @@ async fn deliver_user_pushes_routed(
             }
             Err(error) => {
                 if state
-                    .control
+                    .repositories
+                    .work()
                     .list_push_send_fences(user_id)
                     .await
                     .is_ok_and(|fences| {
@@ -749,7 +756,8 @@ async fn deliver_user_pushes_routed(
             .checked_add(wal::MIN_SEND_LEASE_MILLIS)
             .ok_or_else(|| EnclaveError::Store("push lease horizon overflow".into()))?;
         if !state
-            .control
+            .repositories
+            .work()
             .validate_push_send_fence(
                 user_id,
                 &binding.installation_id,
@@ -979,7 +987,11 @@ async fn settle_before_provider_or_deletion_owned(
     match settle_delivery(state, user_id, predecessor, claim, kind).await {
         Ok(()) => Ok(true),
         Err(EnclaveError::Conflict(_))
-            if state.control.push_outbox_deletion_owned(user_id).await? =>
+            if state
+                .repositories
+                .work()
+                .push_outbox_deletion_owned(user_id)
+                .await? =>
         {
             emit_push_deletion_owned();
             Ok(false)
@@ -1008,7 +1020,8 @@ async fn recover_expired_send_claim(
     let binding = PushInstallationBinding::parse(&predecessor.installation_binding)
         .ok_or_else(|| EnclaveError::Store("push claim binding became invalid".into()))?;
     let fence = state
-        .control
+        .repositories
+        .work()
         .get_push_send_fence(user_id, &binding.installation_id)
         .await?;
     if let Some(fence) = fence {
@@ -1162,7 +1175,8 @@ async fn persist_control_cancellation(
     )
     .await?;
     state
-        .control
+        .repositories
+        .work()
         .finish_push_cancellation_fence(&fence, cancellation)
         .await
 }
@@ -1235,7 +1249,8 @@ async fn persist_provider_outcome(
     let mut authoritative_outcome = outcome;
     let mut authoritative_at = outcome_at;
     let control_result = state
-        .control
+        .repositories
+        .work()
         .record_push_send_outcome(
             user_id,
             &binding.installation_id,
@@ -1249,7 +1264,8 @@ async fn persist_provider_outcome(
         Ok(()) => None,
         Err(error) => {
             let fence = state
-                .control
+                .repositories
+                .work()
                 .get_push_send_fence(user_id, &binding.installation_id)
                 .await?;
             let Some(fence) = fence else {
@@ -1313,7 +1329,8 @@ async fn persist_provider_outcome(
         Some(authoritative_at),
     );
     state
-        .control
+        .repositories
+        .work()
         .finish_push_send_fence(&fence, authoritative_outcome)
         .await
 }
@@ -1462,10 +1479,20 @@ fn recovery_provider_outcome_at(recovery: &wal::PushClaimRecovery) -> Option<&st
 }
 
 async fn reconcile_push_send_fences(state: &CpState, user_id: &str) -> Result<()> {
-    for fence in state.control.list_push_send_fences(user_id).await? {
+    for fence in state
+        .repositories
+        .work()
+        .list_push_send_fences(user_id)
+        .await?
+    {
         let Some(recovery) = load_send_claim_recovery(state, user_id, &fence.claim_id).await?
         else {
-            if state.control.push_outbox_deletion_owned(user_id).await? {
+            if state
+                .repositories
+                .work()
+                .push_outbox_deletion_owned(user_id)
+                .await?
+            {
                 emit_push_deletion_owned();
                 return Ok(());
             }
@@ -1538,7 +1565,8 @@ async fn reconcile_push_send_fences(state: &CpState, user_id: &str) -> Result<()
                     ));
                 }
                 state
-                    .control
+                    .repositories
+                    .work()
                     .finish_push_cancellation_fence(&fence, cancellation)
                     .await?;
             }
@@ -1557,7 +1585,8 @@ async fn reconcile_push_send_fences(state: &CpState, user_id: &str) -> Result<()
                     ..fence
                 };
                 state
-                    .control
+                    .repositories
+                    .work()
                     .finish_push_send_fence(&archive_fence, outcome)
                     .await?;
             }
@@ -2105,7 +2134,8 @@ mod tests {
             let outcome_at = now_for_snapshot(&snapshot, Some(&claim));
             assert!(matches!(
                 state
-                    .control
+                    .repositories
+                    .work()
                     .begin_push_send_fence(
                         &user.id,
                         installation_id,
@@ -2119,7 +2149,8 @@ mod tests {
                 PushSendFenceDisposition::Authorized(_)
             ));
             state
-                .control
+                .repositories
+                .work()
                 .record_push_send_outcome(
                     &user.id,
                     installation_id,
@@ -2225,7 +2256,8 @@ mod tests {
         let outcome_at = now_for_snapshot(&snapshot, Some(&claim));
         assert!(matches!(
             state
-                .control
+                .repositories
+                .work()
                 .begin_push_send_fence(
                     &user.id,
                     installation_id,

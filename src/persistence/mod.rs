@@ -10,6 +10,7 @@ mod identity;
 mod legacy;
 mod notification;
 mod oauth;
+mod work;
 // PostgreSQL is compiled and contract-tested now, but production construction
 // stays disabled until the interface freeze makes one whole repository set
 // selectable without split authority.
@@ -28,10 +29,17 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use postgres::PostgresPersistence;
+pub(crate) use work::{
+    EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
+    EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,
+    PushProviderReceipt, PushSendFence, PushSendFenceDisposition, WebhookControlCancellation,
+    WebhookFenceOutcome, WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition,
+    WorkRepository,
+};
 
 use self::legacy::{
     LegacyBillingRepository, LegacyEntitlementRepository, LegacyIdentitySessionRepository,
-    LegacyNotificationRepository, LegacyOAuthRepository,
+    LegacyNotificationRepository, LegacyOAuthRepository, LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 
@@ -46,6 +54,7 @@ pub(crate) struct RepositorySet {
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
     notifications: Arc<dyn NotificationRepository>,
+    work: Arc<dyn WorkRepository>,
 }
 
 impl RepositorySet {
@@ -55,7 +64,8 @@ impl RepositorySet {
             billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
-            notifications: Arc::new(LegacyNotificationRepository::new(control)),
+            notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
+            work: Arc::new(LegacyWorkRepository::new(control)),
         }
     }
 
@@ -66,7 +76,8 @@ impl RepositorySet {
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
-            notifications: persistence,
+            notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
+            work: persistence,
         }
     }
 
@@ -88,6 +99,10 @@ impl RepositorySet {
 
     pub(crate) fn notifications(&self) -> &dyn NotificationRepository {
         self.notifications.as_ref()
+    }
+
+    pub(crate) fn work(&self) -> &dyn WorkRepository {
+        self.work.as_ref()
     }
 }
 

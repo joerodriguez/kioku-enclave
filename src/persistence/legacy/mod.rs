@@ -8,9 +8,11 @@ mod entitlement;
 mod identity;
 mod notification;
 mod oauth;
+mod work;
 
 pub(super) use billing::LegacyBillingRepository;
 pub(super) use entitlement::LegacyEntitlementRepository;
 pub(super) use identity::LegacyIdentitySessionRepository;
 pub(super) use notification::LegacyNotificationRepository;
 pub(super) use oauth::LegacyOAuthRepository;
+pub(super) use work::LegacyWorkRepository;
