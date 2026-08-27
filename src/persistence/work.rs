@@ -416,6 +416,10 @@ pub(crate) enum PushSendFenceDisposition {
 /// persist and reconcile its typed outcome.
 #[async_trait]
 pub(crate) trait WorkRepository: Send + Sync {
+    async fn active_account_ids(&self) -> Result<Vec<String>>;
+    async fn summarized_until(&self, account_id: &str) -> Result<Option<String>>;
+    async fn set_summarized_until(&self, account_id: &str, value: &str) -> Result<()>;
+
     async fn webhook_outbox_deletion_owned(&self, account_id: &str) -> Result<bool>;
     async fn begin_webhook_send_fence(
         &self,

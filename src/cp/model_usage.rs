@@ -1443,7 +1443,7 @@ pub fn spawn_delivery_worker(state: Arc<CpState>) {
 }
 
 pub async fn drain_outbox(state: &CpState) {
-    let users = match state.control.all_user_ids().await {
+    let users = match state.repositories.work().active_account_ids().await {
         Ok(users) => users,
         Err(error) => {
             warn!(error = %error, "Vertex usage outbox user scan deferred");

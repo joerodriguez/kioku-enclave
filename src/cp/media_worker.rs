@@ -4634,7 +4634,7 @@ async fn selected_voice_embedding_outcome(
 }
 
 async fn sweep(state: &Arc<CpState>) {
-    let users = match state.control.all_user_ids().await {
+    let users = match state.repositories.work().active_account_ids().await {
         Ok(users) => users,
         Err(error) => {
             warn!(error = %error, "media worker user listing failed");

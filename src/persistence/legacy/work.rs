@@ -25,6 +25,18 @@ impl LegacyWorkRepository {
 
 #[async_trait]
 impl WorkRepository for LegacyWorkRepository {
+    async fn active_account_ids(&self) -> Result<Vec<String>> {
+        self.control.all_user_ids().await
+    }
+
+    async fn summarized_until(&self, account_id: &str) -> Result<Option<String>> {
+        self.control.summarized_until(account_id).await
+    }
+
+    async fn set_summarized_until(&self, account_id: &str, value: &str) -> Result<()> {
+        self.control.set_summarized_until(account_id, value).await
+    }
+
     async fn webhook_outbox_deletion_owned(&self, account_id: &str) -> Result<bool> {
         self.control.webhook_outbox_deletion_owned(account_id).await
     }

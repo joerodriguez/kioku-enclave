@@ -20,7 +20,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 5;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -123,6 +123,12 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 5;
+        }
+        if version == 5 {
+            sqlx::raw_sql(include_str!("../../../migrations/0006_worker_cursors.sql"))
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -255,6 +261,32 @@ mod tests {
                 .await
                 .unwrap(),
             Some(AccountStatus::Active)
+        );
+        assert_eq!(
+            repositories.work().active_account_ids().await.unwrap(),
+            vec![account_id.clone()]
+        );
+        assert_eq!(
+            repositories
+                .work()
+                .summarized_until(&account_id)
+                .await
+                .unwrap(),
+            None
+        );
+        repositories
+            .work()
+            .set_summarized_until(&account_id, "2026-08-27T12:34:56.789Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .work()
+                .summarized_until(&account_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-08-27T12:34:56.789Z")
         );
         assert!(matches!(
             repositories
@@ -804,6 +836,12 @@ mod tests {
                 .unwrap(),
             Some(AccountStatus::Deleting)
         );
+        assert!(repositories
+            .work()
+            .active_account_ids()
+            .await
+            .unwrap()
+            .is_empty());
         let credentials = repositories
             .lifecycle()
             .apple_refresh_credentials(&account_id)

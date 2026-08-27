@@ -570,6 +570,39 @@ async fn load_push_fence(
 
 #[async_trait]
 impl WorkRepository for PostgresPersistence {
+    async fn active_account_ids(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM accounts WHERE status='active' ORDER BY created_at,id",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    async fn summarized_until(&self, account_id: &str) -> Result<Option<String>> {
+        let value = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT floor(extract(epoch FROM summarized_until) * 1000)::bigint \
+             FROM accounts WHERE id=$1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?
+        .flatten();
+        Ok(value.map(isotime::format_epoch_millis))
+    }
+
+    async fn set_summarized_until(&self, account_id: &str, value: &str) -> Result<()> {
+        let millis = parse_timestamp(value)?;
+        sqlx::query(
+            "UPDATE accounts SET summarized_until=to_timestamp($2::double precision/1000.0), \
+                    updated_at=now() WHERE id=$1",
+        )
+        .bind(account_id)
+        .bind(millis)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     async fn webhook_outbox_deletion_owned(&self, account_id: &str) -> Result<bool> {
         let mut transaction = self.pool().begin().await?;
         deletion_owned(&mut transaction, account_id).await

@@ -1042,7 +1042,7 @@ async fn summarize_user_window(
     // Existing rows remain readable and can be explicitly repaired by a
     // future bounded operator/user queue without competing with live capture.
 
-    let summarized_until = state.control.summarized_until(user_id).await?;
+    let summarized_until = state.repositories.work().summarized_until(user_id).await?;
     // A window this lane already refused to settle held the cursor rather
     // than stepping over evidence it never wrote (see
     // `wal_authoritative_upsert`) — but the window ahead of a held cursor is
@@ -1124,7 +1124,8 @@ async fn summarize_user_window(
             );
         }
         state
-            .control
+            .repositories
+            .work()
             .set_summarized_until(user_id, &new_to_iso)
             .await?;
         return Ok(serde_json::json!({ "skipped": true, "reason": "no_new_records" }));
@@ -1144,7 +1145,8 @@ async fn summarize_user_window(
             );
         }
         state
-            .control
+            .repositories
+            .work()
             .set_summarized_until(user_id, &new_to_iso)
             .await?;
         return Ok(serde_json::json!({ "skipped": true, "reason": "no_new_records" }));
@@ -1461,7 +1463,8 @@ async fn summarize_user_window(
 
     let cutoff_iso = format_epoch_millis(effective_cutoff);
     state
-        .control
+        .repositories
+        .work()
         .set_summarized_until(user_id, &cutoff_iso)
         .await?;
     info!(user_id, upserted, dropped, "summarized");
@@ -2050,7 +2053,7 @@ async fn fetch_open_episodes(
 /// (bounded) so a cold-start backfill — up to 7 d ÷ 6 h = 28 windows — catches
 /// up within one tick instead of one window per 10-min tick (~5 h).
 pub async fn summarize_all(state: &CpState) {
-    let ids = match state.control.all_user_ids().await {
+    let ids = match state.repositories.work().active_account_ids().await {
         Ok(ids) => ids,
         Err(e) => {
             warn!(error = %e, "summarize_all: list users failed");
@@ -2113,7 +2116,12 @@ pub async fn summarize_all(state: &CpState) {
                     );
                     guard.remove(&id);
                     drop(guard);
-                    if let Err(e) = state.control.set_summarized_until(&id, window_to).await {
+                    if let Err(e) = state
+                        .repositories
+                        .work()
+                        .set_summarized_until(&id, window_to)
+                        .await
+                    {
                         warn!(user_id = %id, error = %e, "failed to skip stuck window");
                         break;
                     }

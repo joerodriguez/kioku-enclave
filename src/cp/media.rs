@@ -2468,7 +2468,7 @@ async fn capture_status(
 /// effort: an unreadable cursor degrades to "unknown", which can only delay
 /// the terminal zero-result — never invent it.
 async fn summarized_until_ms(state: &CpState, user_id: &str) -> Option<i64> {
-    match state.control.summarized_until(user_id).await {
+    match state.repositories.work().summarized_until(user_id).await {
         Ok(cursor) => cursor
             .as_deref()
             .and_then(super::isotime::parse_epoch_millis),
