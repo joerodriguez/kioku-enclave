@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
-use crate::cp::control_store::ControlStore;
 use crate::error::Result;
 
 /// The account fields required by authentication and session issuance.
@@ -22,7 +19,7 @@ pub(crate) enum AccountStatus {
 }
 
 impl AccountStatus {
-    fn from_legacy(value: &str) -> Self {
+    pub(super) fn from_legacy(value: &str) -> Self {
         match value {
             "active" => Self::Active,
             "deleting" => Self::Deleting,
@@ -30,6 +27,24 @@ impl AccountStatus {
             _ => Self::Unavailable,
         }
     }
+}
+
+/// One coherent account/session view returned to first-party clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountSession {
+    pub(crate) account: Account,
+    pub(crate) providers: Vec<String>,
+}
+
+/// A server-verified Apple authorization grant ready for durable settlement.
+///
+/// Deliberately does not implement `Debug`: the refresh token must never be
+/// formatted into logs, panic messages, or test failure output.
+pub(crate) struct AppleAccountGrant {
+    pub(crate) subject: String,
+    pub(crate) email: String,
+    pub(crate) client_id: String,
+    pub(crate) refresh_token: String,
 }
 
 /// Account and credential operations used by authentication/session flows.
@@ -51,43 +66,14 @@ pub(crate) trait IdentitySessionRepository: Send + Sync {
         email: &str,
         signup_limit_per_day: i64,
     ) -> Result<Account>;
-}
 
-/// Behavior-preserving adapter over the current encrypted control store.
-pub(super) struct LegacyIdentitySessionRepository {
-    control: Arc<ControlStore>,
-}
-
-impl LegacyIdentitySessionRepository {
-    pub(super) fn new(control: Arc<ControlStore>) -> Self {
-        Self { control }
-    }
-}
-
-#[async_trait]
-impl IdentitySessionRepository for LegacyIdentitySessionRepository {
-    async fn account_status(&self, account_id: &str) -> Result<Option<AccountStatus>> {
-        Ok(self
-            .control
-            .user_status(account_id)
-            .await?
-            .as_deref()
-            .map(AccountStatus::from_legacy))
-    }
-
-    async fn upsert_subject_account(
+    async fn upsert_apple_account(
         &self,
-        subject: &str,
-        email: &str,
+        grant: AppleAccountGrant,
         signup_limit_per_day: i64,
-    ) -> Result<Account> {
-        let user = self
-            .control
-            .upsert_user(subject, email, signup_limit_per_day)
-            .await?;
-        Ok(Account {
-            id: user.id,
-            email: user.email,
-        })
-    }
+    ) -> Result<Account>;
+
+    async fn link_apple_identity(&self, account_id: &str, grant: AppleAccountGrant) -> Result<()>;
+
+    async fn account_session(&self, account_id: &str) -> Result<Option<AccountSession>>;
 }

@@ -5,7 +5,7 @@
 //! upstream IdP for Google, while the sibling Apple module reuses the same
 //! validated downstream request and consent/code machinery.
 
-use std::{net::IpAddr, str::FromStr, sync::Arc};
+use std::{net::IpAddr, str::FromStr, sync::Arc, time::Duration};
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
@@ -14,10 +14,18 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
+
+#[cfg(test)]
+use rusqlite::OptionalExtension;
+
+use crate::persistence::{
+    AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
+    OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
+    PendingConsent, RefreshTokenRotation,
+};
 
 use super::{tokens, CpState};
 
@@ -48,30 +56,13 @@ pub const FIRST_PARTY_WEB_CLIENT_ID: &str = "b9b7d59f-3fdd-4cd4-93a2-a68972aef42
 
 pub(super) async fn ensure_first_party_web_client(s: &Arc<CpState>) -> crate::error::Result<()> {
     let redirect_uri = format!("{}/app/apple-callback", s.config.web_origin);
-    let redirect_uris = serde_json::to_string(&[redirect_uri])?;
-    s.control
-        .write_if_changed(move |conn| {
-            let existing: Option<(Option<String>, String)> = conn
-                .query_row(
-                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
-                    [FIRST_PARTY_WEB_CLIENT_ID],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((name, stored_redirects)) = existing {
-                if name.as_deref() != Some("Kioku Web") || stored_redirects != redirect_uris {
-                    return Err(crate::error::EnclaveError::Conflict(
-                        "first-party web OAuth client configuration mismatch".into(),
-                    ));
-                }
-                return Ok(((), false));
-            }
-            conn.execute(
-                "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
-                 VALUES (?1, 'Kioku Web', ?2)",
-                rusqlite::params![FIRST_PARTY_WEB_CLIENT_ID, redirect_uris],
-            )?;
-            Ok(((), true))
+    s.repositories
+        .oauth()
+        .ensure_client(OAuthClientDefinition {
+            id: FIRST_PARTY_WEB_CLIENT_ID.to_string(),
+            name: "Kioku Web".to_string(),
+            redirect_uris: vec![redirect_uri],
+            allow_empty_redirect_upgrade: false,
         })
         .await
 }
@@ -82,42 +73,13 @@ pub(super) async fn ensure_first_party_web_client(s: &Arc<CpState>) -> crate::er
 /// clients; the stored URI deliberately omits that port and the matcher below
 /// still requires the exact loopback host and callback path.
 pub(super) async fn ensure_first_party_native_client(s: &Arc<CpState>) -> crate::error::Result<()> {
-    let redirect_uris = serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI])?;
-    s.control
-        .write_if_changed(move |conn| {
-            let existing: Option<(Option<String>, String)> = conn
-                .query_row(
-                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
-                    [FIRST_PARTY_NATIVE_CLIENT_ID],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            match existing {
-                Some((name, stored_redirects))
-                    if name.as_deref() == Some("Kioku Native Apps")
-                        && (stored_redirects == "[]" || stored_redirects == redirect_uris) =>
-                {
-                    if stored_redirects == redirect_uris {
-                        return Ok(((), false));
-                    }
-                    conn.execute(
-                        "UPDATE oauth_clients SET redirect_uris = ?1 WHERE client_id = ?2",
-                        rusqlite::params![redirect_uris, FIRST_PARTY_NATIVE_CLIENT_ID],
-                    )?;
-                    Ok(((), true))
-                }
-                Some(_) => Err(crate::error::EnclaveError::Conflict(
-                    "first-party native OAuth client configuration mismatch".into(),
-                )),
-                None => {
-                    conn.execute(
-                        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
-                         VALUES (?1, 'Kioku Native Apps', ?2)",
-                        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, redirect_uris],
-                    )?;
-                    Ok(((), true))
-                }
-            }
+    s.repositories
+        .oauth()
+        .ensure_client(OAuthClientDefinition {
+            id: FIRST_PARTY_NATIVE_CLIENT_ID.to_string(),
+            name: "Kioku Native Apps".to_string(),
+            redirect_uris: vec![FIRST_PARTY_NATIVE_REDIRECT_URI.to_string()],
+            allow_empty_redirect_upgrade: true,
         })
         .await
 }
@@ -673,12 +635,18 @@ struct RegisterBody {
     redirect_uris: Vec<String>,
 }
 
+// These SQLite helpers remain test-only while their behavioral fixtures move
+// into the shared repository contract suite. Serving code must use
+// `OAuthRepository`; keeping the fixtures here during the extraction avoids a
+// large, behavior-changing test rewrite in the same slice.
+#[cfg(test)]
 enum ClientRegistration {
     Existing(String),
     Created(String),
     AtCapacity,
 }
 
+#[cfg(test)]
 fn register_client_conn(
     conn: &rusqlite::Connection,
     proposed_client_id: &str,
@@ -690,7 +658,7 @@ fn register_client_conn(
         .query_row(
             "SELECT client_id FROM oauth_clients WHERE redirect_uris = ?1 LIMIT 1",
             [redirect_uris_json],
-            |r| r.get(0),
+            |row| row.get(0),
         )
         .optional()?;
     if let Some(client_id) = existing {
@@ -701,7 +669,7 @@ fn register_client_conn(
     let mut count: i64 = tx.query_row(
         "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
         rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
-        |r| r.get(0),
+        |row| row.get(0),
     )?;
     let mut reclaimed = 0;
     if count >= MAX_OAUTH_CLIENTS {
@@ -728,7 +696,7 @@ fn register_client_conn(
         count = tx.query_row(
             "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
             rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
-            |r| r.get(0),
+            |row| row.get(0),
         )?;
     }
     if count >= MAX_OAUTH_CLIENTS {
@@ -767,18 +735,26 @@ async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>)
     };
 
     let proposed_client_id = tokens::new_uuid();
-    let uris_json = match serde_json::to_string(&redirect_uris) {
-        Ok(json) => json,
-        Err(_) => return server_error(),
-    };
     let res = s
-        .control
-        .write_if_changed(move |conn| {
-            register_client_conn(conn, &proposed_client_id, name.as_deref(), &uris_json)
+        .repositories
+        .oauth()
+        .register_client(OAuthClientRegistrationRequest {
+            proposed_id: proposed_client_id,
+            name,
+            redirect_uris: redirect_uris.clone(),
+            protected_client_ids: [
+                FIRST_PARTY_NATIVE_CLIENT_ID.to_string(),
+                FIRST_PARTY_WEB_CLIENT_ID.to_string(),
+            ],
+            capacity: MAX_OAUTH_CLIENTS,
+            unused_ttl: Duration::from_secs(UNUSED_CLIENT_TTL_SECS as u64),
         })
         .await;
     match res {
-        Ok(ClientRegistration::Existing(client_id) | ClientRegistration::Created(client_id)) => (
+        Ok(
+            OAuthClientRegistration::Existing(client_id)
+            | OAuthClientRegistration::Created(client_id),
+        ) => (
             StatusCode::CREATED,
             Json(json!({
                 "client_id": client_id,
@@ -789,7 +765,7 @@ async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>)
             })),
         )
             .into_response(),
-        Ok(ClientRegistration::AtCapacity) => (
+        Ok(OAuthClientRegistration::AtCapacity) => (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({
                 "error": "invalid_client_metadata",
@@ -886,17 +862,11 @@ pub(super) async fn validated_authorization_request(
         ));
     }
 
-    let registered = s
-        .control
-        .read({
-            let client_id = client_id.clone();
-            let redirect_uri = redirect_uri.clone();
-            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
-        })
-        .await;
+    let registered = s.repositories.oauth().client(&client_id).await;
     match registered {
-        Ok(Some(_)) => {}
+        Ok(Some(client)) if registered_client(&client, &redirect_uri).is_some() => {}
         Ok(None) => return Err(bad_request("invalid_client")),
+        Ok(Some(_)) => return Err(bad_request("invalid_client")),
         Err(_) => return Err(server_error()),
     }
 
@@ -1090,14 +1060,14 @@ async fn reviewer_login(
             )
         }
     };
-    let code_hash = tokens::sha256_hex(&auth_code);
-    let (user_id, client_id) = (user.id, state.client_id.clone());
     let stored = s
-        .control
-        .write_if_changed(move |conn| {
-            let stored =
-                store_direct_authorization_code_conn(conn, &code_hash, &user_id, &client_id)?;
-            Ok((stored, stored))
+        .repositories
+        .oauth()
+        .store_direct_authorization_code(DirectAuthorizationCode {
+            authorization_code_hash: tokens::sha256_hex(&auth_code),
+            account_id: user.id,
+            client_id: state.client_id.clone(),
+            ttl: Duration::from_secs(AUTH_CODE_TTL_SECS as u64),
         })
         .await;
     if !matches!(stored, Ok(true)) {
@@ -1199,32 +1169,19 @@ struct RegisteredClient {
     name: Option<String>,
 }
 
-fn registered_client_conn(
-    conn: &rusqlite::Connection,
-    client_id: &str,
-    redirect_uri: &str,
-) -> crate::error::Result<Option<RegisteredClient>> {
-    let row: Option<(Option<String>, String)> = conn
-        .query_row(
-            "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
-            [client_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((name, redirect_uris_json)) = row else {
-        return Ok(None);
-    };
-    let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)?;
-    let exact_match = redirect_uris.iter().any(|uri| uri == redirect_uri);
-    let redirect_matches = if client_id == FIRST_PARTY_NATIVE_CLIENT_ID {
+fn registered_client(client: &OAuthClient, redirect_uri: &str) -> Option<RegisteredClient> {
+    let exact_match = client.redirect_uris.iter().any(|uri| uri == redirect_uri);
+    let redirect_matches = if client.id == FIRST_PARTY_NATIVE_CLIENT_ID {
         native_loopback_redirect_matches(redirect_uri)
     } else {
         exact_match
     };
     if !is_valid_redirect_uri(redirect_uri) || !redirect_matches {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(RegisteredClient { name }))
+    Some(RegisteredClient {
+        name: client.name.clone(),
+    })
 }
 
 fn native_loopback_redirect_matches(redirect_uri: &str) -> bool {
@@ -1362,6 +1319,7 @@ fn consent_page(
         .into_response()
 }
 
+#[cfg(test)]
 fn store_pending_consent_conn(
     conn: &rusqlite::Connection,
     consent_hash: &str,
@@ -1396,6 +1354,7 @@ fn store_pending_consent_conn(
     Ok(true)
 }
 
+#[cfg(test)]
 fn approve_consent_conn(
     conn: &rusqlite::Connection,
     consent_hash: &str,
@@ -1431,6 +1390,7 @@ fn approve_consent_conn(
     Ok(true)
 }
 
+#[cfg(test)]
 fn store_direct_authorization_code_conn(
     conn: &rusqlite::Connection,
     code_hash: &str,
@@ -1617,16 +1577,18 @@ pub(super) async fn begin_authorization_consent(
         user_id,
     );
     let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
-    let registered = s
-        .control
-        .read({
-            let client_id = client_id.clone();
-            let redirect_uri = redirect_uri.clone();
-            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
-        })
-        .await;
+    let registered = s.repositories.oauth().client(&client_id).await;
     let RegisteredClient { name } = match registered {
-        Ok(Some(client)) => client,
+        Ok(Some(client)) => match registered_client(&client, &redirect_uri) {
+            Some(client) => client,
+            None => {
+                return callback_error(
+                    StatusCode::BAD_REQUEST,
+                    "Authentication failed",
+                    "The OAuth client registration is unavailable.",
+                )
+            }
+        },
         _ => {
             return callback_error(
                 StatusCode::BAD_REQUEST,
@@ -1664,19 +1626,15 @@ pub(super) async fn begin_authorization_consent(
             )
         }
     };
-    let consent_hash = tokens::sha256_hex(&consent_token);
-    let user_id = user_id.to_string();
     let stored = s
-        .control
-        .write_if_changed(move |conn| {
-            let stored = store_pending_consent_conn(
-                conn,
-                &consent_hash,
-                &user_id,
-                &client_id,
-                &redirect_uri,
-            )?;
-            Ok((stored, stored))
+        .repositories
+        .oauth()
+        .store_pending_consent(PendingConsent {
+            consent_hash: tokens::sha256_hex(&consent_token),
+            account_id: user_id.to_string(),
+            client_id,
+            redirect_uri,
+            ttl: Duration::from_secs(AUTH_CODE_TTL_SECS as u64),
         })
         .await;
     if !matches!(stored, Ok(true)) {
@@ -1762,15 +1720,11 @@ async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
         );
     }
 
-    let registered = s
-        .control
-        .read({
-            let client_id = claims.client_id.clone();
-            let redirect_uri = claims.redirect_uri.clone();
-            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
-        })
-        .await;
-    if !matches!(registered, Ok(Some(_))) {
+    let registered = s.repositories.oauth().client(&claims.client_id).await;
+    if !matches!(
+        registered,
+        Ok(Some(ref client)) if registered_client(client, &claims.redirect_uri).is_some()
+    ) {
         return callback_error(
             StatusCode::BAD_REQUEST,
             "Authorization failed",
@@ -1788,25 +1742,16 @@ async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
         Ok(code) => code,
         Err(_) => return server_error(),
     };
-    let consent_hash = tokens::sha256_hex(&consent_token);
-    let code_hash = tokens::sha256_hex(&auth_code);
-    let (user_id, client_id, redirect_uri) = (
-        claims.user_id.clone(),
-        claims.client_id.clone(),
-        claims.redirect_uri.clone(),
-    );
     let approved = s
-        .control
-        .write_if_changed(move |conn| {
-            let approved = approve_consent_conn(
-                conn,
-                &consent_hash,
-                &code_hash,
-                &user_id,
-                &client_id,
-                &redirect_uri,
-            )?;
-            Ok((approved, approved))
+        .repositories
+        .oauth()
+        .approve_consent(ConsentApproval {
+            consent_hash: tokens::sha256_hex(&consent_token),
+            authorization_code_hash: tokens::sha256_hex(&auth_code),
+            account_id: claims.user_id.clone(),
+            client_id: claims.client_id.clone(),
+            redirect_uri: claims.redirect_uri.clone(),
+            code_ttl: Duration::from_secs(AUTH_CODE_TTL_SECS as u64),
         })
         .await;
     match approved {
@@ -1856,6 +1801,7 @@ async fn token(State(s): State<Arc<CpState>>, body: String) -> Response {
     }
 }
 
+#[cfg(test)]
 fn exchange_authorization_code_conn(
     conn: &rusqlite::Connection,
     code_hash: &str,
@@ -1890,6 +1836,7 @@ fn exchange_authorization_code_conn(
     Ok(true)
 }
 
+#[cfg(test)]
 fn rotate_refresh_token_conn(
     conn: &rusqlite::Connection,
     old_hash: &str,
@@ -1994,19 +1941,15 @@ async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
     };
     let raw_refresh = tokens::random_token_hex();
     let refresh_hash = tokens::sha256_hex(&raw_refresh);
-    let code_hash = tokens::sha256_hex(&code);
-    let (user_id, stored_client_id) = (claims.user_id, client_id);
     let exchanged = s
-        .control
-        .write_if_changed(move |conn| {
-            let exchanged = exchange_authorization_code_conn(
-                conn,
-                &code_hash,
-                &user_id,
-                &stored_client_id,
-                &refresh_hash,
-            )?;
-            Ok((exchanged, exchanged))
+        .repositories
+        .oauth()
+        .exchange_authorization_code(AuthorizationCodeExchange {
+            authorization_code_hash: tokens::sha256_hex(&code),
+            account_id: claims.user_id,
+            client_id,
+            refresh_token_hash: refresh_hash,
+            refresh_ttl: Duration::from_secs(REFRESH_TTL_SECS as u64),
         })
         .await;
     match exchanged {
@@ -2041,10 +1984,13 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
     let raw_refresh = tokens::random_token_hex();
     let new_hash = tokens::sha256_hex(&raw_refresh);
     let rotated = s
-        .control
-        .write_if_changed(move |conn| {
-            let user_id = rotate_refresh_token_conn(conn, &old_hash, &client_id, &new_hash)?;
-            Ok((user_id.clone(), user_id.is_some()))
+        .repositories
+        .oauth()
+        .rotate_refresh_token(RefreshTokenRotation {
+            old_token_hash: old_hash,
+            client_id,
+            new_token_hash: new_hash,
+            refresh_ttl: Duration::from_secs(REFRESH_TTL_SECS as u64),
         })
         .await;
     let user_id = match rotated {
@@ -2080,37 +2026,19 @@ pub async fn issue_native_session(
     let access = tokens::issue_access_token(&s.config.jwt_secrets[0], &s.config.base_url, user_id)?;
     let raw_refresh = tokens::random_token_hex();
     let refresh_hash = tokens::sha256_hex(&raw_refresh);
-    let user_id = user_id.to_string();
-    let genesis_user_id = user_id.clone();
-    s.control
-        .write(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let active: i64 = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
-                [&user_id],
-                |row| row.get(0),
-            )?;
-            if active == 0 {
-                tx.rollback()?;
-                return Err(crate::error::EnclaveError::Auth("account inactive".into()));
-            }
-            tx.execute(
-                "INSERT OR IGNORE INTO oauth_clients (client_id, client_name, redirect_uris) \
-                 VALUES (?1, 'Kioku Native Apps', '[]')",
-                [FIRST_PARTY_NATIVE_CLIENT_ID],
-            )?;
-            tx.execute(
-                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-                rusqlite::params![
-                    refresh_hash,
-                    user_id,
-                    FIRST_PARTY_NATIVE_CLIENT_ID,
-                    format!("+{REFRESH_TTL_SECS} seconds")
-                ],
-            )?;
-            tx.commit()?;
-            Ok(())
+    let genesis_user_id = user_id.to_string();
+    s.repositories
+        .oauth()
+        .create_native_session_refresh(NativeSessionRefresh {
+            account_id: user_id.to_string(),
+            client: OAuthClientDefinition {
+                id: FIRST_PARTY_NATIVE_CLIENT_ID.to_string(),
+                name: "Kioku Native Apps".to_string(),
+                redirect_uris: Vec::new(),
+                allow_empty_redirect_upgrade: true,
+            },
+            refresh_token_hash: refresh_hash,
+            refresh_ttl: Duration::from_secs(REFRESH_TTL_SECS as u64),
         })
         .await?;
     // Apple-primary native login returns its first access/refresh pair here.
@@ -2237,24 +2165,12 @@ mod tests {
 
     #[test]
     fn fixed_native_client_accepts_only_ephemeral_kioku_loopback_redirects() {
-        let conn = oauth_conn();
-        conn.execute(
-            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
-             VALUES (?1, 'Kioku Native Apps', ?2)",
-            rusqlite::params![
-                FIRST_PARTY_NATIVE_CLIENT_ID,
-                serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI]).unwrap()
-            ],
-        )
-        .unwrap();
-
-        assert!(registered_client_conn(
-            &conn,
-            FIRST_PARTY_NATIVE_CLIENT_ID,
-            "http://127.0.0.1:49152/oauth/callback"
-        )
-        .unwrap()
-        .is_some());
+        let native = OAuthClient {
+            id: FIRST_PARTY_NATIVE_CLIENT_ID.to_string(),
+            name: Some("Kioku Native Apps".to_string()),
+            redirect_uris: vec![FIRST_PARTY_NATIVE_REDIRECT_URI.to_string()],
+        };
+        assert!(registered_client(&native, "http://127.0.0.1:49152/oauth/callback").is_some());
         for rejected in [
             FIRST_PARTY_NATIVE_REDIRECT_URI,
             "http://localhost:49152/oauth/callback",
@@ -2263,17 +2179,16 @@ mod tests {
             "https://127.0.0.1:49152/oauth/callback",
         ] {
             assert!(
-                registered_client_conn(&conn, FIRST_PARTY_NATIVE_CLIENT_ID, rejected)
-                    .unwrap()
-                    .is_none(),
+                registered_client(&native, rejected).is_none(),
                 "accepted {rejected:?}"
             );
         }
-        assert!(
-            registered_client_conn(&conn, CLIENT, "http://127.0.0.1:49152/oauth/callback")
-                .unwrap()
-                .is_none()
-        );
+        let third_party = OAuthClient {
+            id: CLIENT.to_string(),
+            name: Some("Test Client".to_string()),
+            redirect_uris: vec![REDIRECT.to_string()],
+        };
+        assert!(registered_client(&third_party, "http://127.0.0.1:49152/oauth/callback").is_none());
     }
 
     #[test]
