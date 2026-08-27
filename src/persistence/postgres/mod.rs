@@ -9,6 +9,7 @@ mod capture;
 mod entitlement;
 mod identity;
 mod lifecycle;
+mod media_processing;
 mod model_usage;
 mod notification;
 mod oauth;
@@ -23,7 +24,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 13;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 14;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -197,6 +198,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 13;
+        }
+        if version == 13 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0014_media_processing.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -219,6 +228,32 @@ impl PostgresPersistence {
         }
         Ok(())
     }
+}
+
+pub(super) async fn allocate_content_id(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    entity_kind: &str,
+) -> Result<i64> {
+    if entity_kind.is_empty()
+        || entity_kind.len() > 64
+        || !entity_kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return Err(EnclaveError::Store(
+            "content id counter kind is invalid".into(),
+        ));
+    }
+    Ok(sqlx::query_scalar(
+        "INSERT INTO content_id_counters(account_id,entity_kind,next_id) \
+         VALUES($1,$2,2) ON CONFLICT(account_id,entity_kind) DO UPDATE \
+         SET next_id=content_id_counters.next_id+1 RETURNING next_id-1",
+    )
+    .bind(account_id)
+    .bind(entity_kind)
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 pub(super) fn duration_seconds(duration: Duration) -> Result<f64> {
@@ -258,9 +293,10 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedRequest,
-        PeopleListRequest, PushInstallation, PushProviderOutcome, PushProviderReceipt,
-        PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
+        McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
+        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
+        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
+        ScreenMediaSettlement, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
@@ -522,6 +558,89 @@ mod tests {
             .unwrap();
         assert_eq!(event_status.processing_state, "queued");
         assert_eq!(event_status.attempt_count, 0);
+        let media = repositories
+            .media_processing()
+            .expect("PostgreSQL media repository");
+        assert_eq!(
+            media
+                .pending_classes(&account_id, "2026-08-27T12:00:05.000Z")
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        let screen_claim = media
+            .claim(
+                &account_id,
+                MediaProcessingClass::Screen,
+                "2026-08-27T12:00:05.000Z",
+                300,
+                128,
+            )
+            .await
+            .unwrap()
+            .expect("screen work claim");
+        assert!(media
+            .claim(
+                &account_id,
+                MediaProcessingClass::Screen,
+                "2026-08-27T12:00:06.000Z",
+                300,
+                128,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        media
+            .record_reservation(&screen_claim, 1_024, "2026-08-27T12:00:06.000Z")
+            .await
+            .unwrap();
+        media
+            .settle_usage(MediaUsageSettlement {
+                claim: screen_claim.clone(),
+                usage: serde_json::json!({
+                    "work_unit_id": screen_claim.work_unit_id,
+                    "reservation_state": "reserved",
+                    "actual_output_tokens": 42,
+                    "outcome": "model_returned"
+                }),
+            })
+            .await
+            .unwrap();
+        let screen_projection = MediaScreenProjection {
+            event_id: canonical.event_id.clone(),
+            literal_description: "Database diagram".into(),
+            screen_state: "focused".into(),
+            content_type: "document".into(),
+            visible_text: "PostgreSQL diagram".into(),
+            salient_text: "PostgreSQL architecture".into(),
+            people: Vec::new(),
+        };
+        media
+            .settle_screens(ScreenMediaSettlement {
+                claim: screen_claim.clone(),
+                results: vec![screen_projection.clone()],
+            })
+            .await
+            .unwrap();
+        // Lost-response replay is a no-op, and the durable result remains
+        // authoritative even after the original lease deadline.
+        media
+            .settle_screens(ScreenMediaSettlement {
+                claim: screen_claim,
+                results: vec![screen_projection],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .captures()
+                .event_status(&account_id, "capture-contract-0")
+                .await
+                .unwrap()
+                .unwrap()
+                .processing_state,
+            "ready"
+        );
         let session_status = repositories
             .captures()
             .session_status(&account_id, "session-contract", None)
@@ -529,9 +648,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(session_status.event_count, 2);
-        assert_eq!(session_status.processing.queued, 1);
-        assert_eq!(session_status.processing.ready, 1);
-        assert_eq!(session_status.stage, CaptureSessionStage::Processing);
+        assert_eq!(session_status.processing.queued, 0);
+        assert_eq!(session_status.processing.ready, 2);
+        assert_eq!(session_status.stage, CaptureSessionStage::Received);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM media_processing_jobs WHERE account_id=$1",
@@ -1129,10 +1248,9 @@ mod tests {
             .unwrap();
         }
         sqlx::query(
-            "INSERT INTO screenshots(account_id,id,captured_at,ocr_text,url,source_key, \
-                                      browser_snapshot_source_key,embedding) \
-             VALUES($1,1,'2026-08-27T12:00:00Z','PostgreSQL diagram','https://example.com/db', \
-                    'cloud-v2:capture-contract-0','capture-v2-browser:capture-contract-0',$2::vector)",
+            "UPDATE screenshots SET url='https://example.com/db', \
+                    browser_snapshot_source_key='capture-v2-browser:capture-contract-0', \
+                    embedding=$2::vector WHERE account_id=$1 AND id=1",
         )
         .bind(&account_id)
         .bind(&embedding)
@@ -1208,11 +1326,8 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO screen_observations \
-             (account_id,screenshot_id,input_revision,observation_version,status,generation_method, \
-              literal_description,screen_state,content_type,visible_text_summary,notable_items,prompt_version) \
-             VALUES($1,1,'screen-1',1,'ready','model','Database diagram','focused', \
-                    'document','PostgreSQL architecture','[\"schema\"]'::jsonb,1)",
+            "UPDATE screen_observations SET notable_items='[\"schema\"]'::jsonb \
+             WHERE account_id=$1 AND screenshot_id=1",
         )
         .bind(&account_id)
         .execute(&pool)

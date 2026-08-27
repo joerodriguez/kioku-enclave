@@ -31,3 +31,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   speaker-observation, and voice-lineage records used by public memory queries.
 - `0013_vertex_usage_ledger.sql` adds fleet-wide paid-model invocation intents,
   billing delivery claims, and coverage reconciliation.
+- `0014_media_processing.sql` adds fleet-wide media work-unit claims and
+  tenant-qualified transcript, screen, speaker, and voice-job projections.
