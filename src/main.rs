@@ -1,9 +1,9 @@
 //! # kioku-enclave — attested Kioku backend
 //!
 //! This process terminates TLS and handles server-side user plaintext inside a
-//! GCP Confidential Space VM (AMD SEV). Deliberate Vertex summarization and
-//! user-configured webhook delivery are documented egresses; encrypted storage and the
-//! workload operator do not otherwise receive plaintext.
+//! GCP Confidential Space VM (AMD SEV). PostgreSQL mode deliberately trusts a
+//! private managed database with structured plaintext; Vertex summarization
+//! and user-configured webhook delivery are additional documented egresses.
 //!
 //! ## Authentication
 //!
@@ -34,8 +34,8 @@
 //! **ACME auto-renewal (ADR-0003):** when `ENCLAVE_ACME` is set, the enclave
 //! obtains and renews that certificate itself from Let's Encrypt — HTTP-01
 //! answered on :80, key generated in-TEE, state persisted KMS-encrypted in GCS,
-//! live cert hot-swapped on renewal. See `acme.rs`. Static `ENCLAVE_TLS_*`
-//! inputs remain only for debug/custom bootstrap images.
+//! live cert hot-swapped on renewal. See `acme.rs`. Static Secret-Manager or
+//! `ENCLAVE_TLS_*` inputs also support a shared fleet certificate.
 //!
 //! ## Public and retired compatibility routes
 //!
@@ -44,7 +44,15 @@
 //! | GET    | /health                    | Liveness probe; `{"ok":true}` + WAL counts   |
 //! | ANY    | /v1/* data routes          | Authenticated `410 Gone`; permanently retired|
 
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -464,10 +472,88 @@ pub struct AppState {
     pub store: Arc<Store>,
     persistence_backend: PersistenceBackend,
     postgres: Option<Arc<persistence::PostgresPersistence>>,
+    serving_lifecycle: Arc<ServingLifecycle>,
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
     pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
+}
+
+#[derive(Default)]
+struct ServingLifecycle {
+    draining: AtomicBool,
+    active_requests: AtomicUsize,
+    shutdown_complete: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl ServingLifecycle {
+    fn enter(self: &Arc<Self>) -> Option<ServingRequestGuard> {
+        if self.draining.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_requests.fetch_add(1, Ordering::AcqRel);
+        if self.draining.load(Ordering::Acquire) {
+            self.request_finished();
+            return None;
+        }
+        Some(ServingRequestGuard {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
+    fn request_finished(&self) {
+        if self.active_requests.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn begin_draining(&self) {
+        self.draining.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    fn is_ready(&self) -> bool {
+        !self.draining.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_quiet(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.changed.notified();
+            if self.active_requests.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    fn finish_shutdown(&self) {
+        self.shutdown_complete.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_for_shutdown(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.shutdown_complete.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct ServingRequestGuard {
+    lifecycle: Arc<ServingLifecycle>,
+}
+
+impl Drop for ServingRequestGuard {
+    fn drop(&mut self) {
+        self.lifecycle.request_finished();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +751,17 @@ async fn handle_livez() -> Json<serde_json::Value> {
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
+    if !state.serving_lifecycle.is_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "service": "kioku-enclave",
+                "reason": "draining",
+            })),
+        )
+            .into_response();
+    }
     if let Some(postgres) = state.postgres.as_ref() {
         let ready = postgres.verify_schema().await.is_ok();
         let status = if ready {
@@ -685,6 +782,60 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
     let progress = state.store.legacy_checkpoint_reconciliation().await;
     let wal_serving = state.store.wal_serving_health();
     (StatusCode::OK, Json(health_json(progress, wal_serving))).into_response()
+}
+
+async fn admit_while_serving(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if matches!(request.uri().path(), "/health" | "/livez" | "/readyz") {
+        return next.run(request).await;
+    }
+    let Some(_guard) = state.serving_lifecycle.enter() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::RETRY_AFTER, "1"),
+            ],
+            Json(json!({"error":"service_draining"})),
+        )
+            .into_response();
+    };
+    next.run(request).await
+}
+
+async fn wait_for_termination() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.expect("install Ctrl-C handler"),
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install Ctrl-C handler");
+}
+
+async fn drain_on_termination(lifecycle: Arc<ServingLifecycle>, timeout: Duration) {
+    wait_for_termination().await;
+    lifecycle.begin_draining();
+    info!(
+        timeout_seconds = timeout.as_secs(),
+        "shutdown drain started"
+    );
+    if lifecycle.wait_for_quiet(timeout).await {
+        info!("shutdown drain completed");
+    } else {
+        warn!("shutdown drain deadline reached");
+    }
+    lifecycle.finish_shutdown();
 }
 
 fn health_json(
@@ -1308,6 +1459,11 @@ async fn async_main() {
         .expect("bind failed");
 
     let acme_opt = acme::AcmeConfig::from_env().expect("ACME config");
+    if !persistence_backend.is_legacy() && acme_opt.is_some() {
+        panic!(
+            "PostgreSQL fleet mode requires shared Secret-Manager TLS; per-process ACME is disabled"
+        );
+    }
     let (keystone, cert_fingerprint) = match acme_opt {
         Some(acme_config) => {
             // ADR-0003: in-enclave ACME. The :80 HTTP-01 listener must be up
@@ -1530,10 +1686,12 @@ async fn async_main() {
             Some(postgres),
         )
     };
+    let serving_lifecycle = Arc::new(ServingLifecycle::default());
     let state = Arc::new(AppState {
         store: Arc::clone(&store),
         persistence_backend,
         postgres: postgres.clone(),
+        serving_lifecycle: Arc::clone(&serving_lifecycle),
         id_token_verifier,
         attestation_cache: attestation_cache.clone(),
         tls_keystone: keystone.clone(),
@@ -1632,17 +1790,59 @@ async fn async_main() {
         .merge(control_plane)
         .layer(middleware::from_fn(observe_billing_request))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            admit_while_serving,
+        ))
         .with_state(Arc::clone(&state));
+
+    if let Some(health_port) = std::env::var("HEALTH_PORT").ok().map(|value| {
+        value
+            .parse::<u16>()
+            .unwrap_or_else(|_| panic!("HEALTH_PORT must be a valid TCP port"))
+    }) {
+        if health_port == port {
+            panic!("HEALTH_PORT must differ from PORT");
+        }
+        let health_addr = SocketAddr::from(([0, 0, 0, 0], health_port));
+        let health_listener = tokio::net::TcpListener::bind(health_addr)
+            .await
+            .expect("bind health listener failed");
+        let health_app = Router::new()
+            .route("/livez", get(handle_livez))
+            .route("/readyz", get(handle_health))
+            .with_state(Arc::clone(&state));
+        let health_lifecycle = Arc::clone(&serving_lifecycle);
+        tokio::spawn(async move {
+            info!(addr = %health_addr, "content-free health listener up");
+            axum::serve(health_listener, health_app)
+                .with_graceful_shutdown(async move { health_lifecycle.wait_for_shutdown().await })
+                .await
+                .expect("health listener failed");
+        });
+    }
+
+    let drain_timeout = std::env::var("DRAIN_TIMEOUT_SECONDS")
+        .unwrap_or_else(|_| "105".into())
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=115).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| panic!("DRAIN_TIMEOUT_SECONDS must be between 1 and 115"));
+    let shutdown = drain_on_termination(Arc::clone(&serving_lifecycle), drain_timeout);
 
     // Listen
     match keystone {
         Some(ks) => {
             info!(addr = %addr, tls = true, "listening (in-enclave TLS termination)");
-            serve_tls(listener, app, ks).await;
+            serve_tls(listener, app, ks, shutdown).await;
         }
         None if test_mode_enabled() => {
             warn!(addr = %addr, tls = false, "listening over plain HTTP in debug test mode");
-            axum::serve(listener, app).await.expect("server error");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("server error");
         }
         None => panic!("production startup refused: in-enclave TLS is not configured"),
     }
@@ -1691,29 +1891,39 @@ async fn acme_boot_keystone(
 /// the rustls handshake, then hand the connection to hyper with the axum router wrapped as
 /// a hyper service. One task per connection; a handshake or connection error drops only
 /// that connection.
-async fn serve_tls(
+async fn serve_tls<F>(
     listener: tokio::net::TcpListener,
     app: Router,
     keystone: Arc<tls::TlsKeystone>,
-) {
+    shutdown: F,
+) where
+    F: Future<Output = ()>,
+{
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
     use hyper_util::service::TowerToHyperService;
     use tokio_rustls::TlsAcceptor;
 
     let acceptor = TlsAcceptor::from(Arc::clone(&keystone.server_config));
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
 
     loop {
-        let (tcp, _peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (tcp, _peer) = match accepted {
             Ok(pair) => pair,
-            Err(e) => {
-                warn!(error = %e, "TCP accept failed");
+            Err(error) => {
+                warn!(error = %error, "TCP accept failed");
                 continue;
             }
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let tls_stream = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1732,16 +1942,48 @@ async fn serve_tls(
             }
         });
     }
+
+    let finish_connections = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(Duration::from_secs(10), finish_connections)
+        .await
+        .is_err()
+    {
+        warn!("closing idle TLS connections after drain grace");
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
 }
 
 #[cfg(test)]
 mod email_startup_tests {
-    use super::{health_json, resolve_apns_identifiers, resolve_resend_api_key};
+    use super::{health_json, resolve_apns_identifiers, resolve_resend_api_key, ServingLifecycle};
     use crate::store::{self, LegacyCheckpointReconciliation};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn serving_lifecycle_closes_admission_before_waiting_for_inflight_work() {
+        let lifecycle = Arc::new(ServingLifecycle::default());
+        let request = lifecycle.enter().expect("initial request admitted");
+        lifecycle.begin_draining();
+        assert!(!lifecycle.is_ready());
+        assert!(lifecycle.enter().is_none());
+        assert!(
+            !lifecycle
+                .wait_for_quiet(std::time::Duration::from_millis(1))
+                .await
+        );
+        drop(request);
+        assert!(
+            lifecycle
+                .wait_for_quiet(std::time::Duration::from_secs(1))
+                .await
+        );
+        lifecycle.finish_shutdown();
+        lifecycle.wait_for_shutdown().await;
+    }
 
     #[test]
     fn production_startup_requires_complete_apns_identifiers() {
@@ -1986,6 +2228,7 @@ mod retired_route_tests {
             store: Arc::clone(&store),
             persistence_backend: PersistenceBackend::LegacySqliteGcs,
             postgres: None,
+            serving_lifecycle: Arc::new(ServingLifecycle::default()),
             id_token_verifier: Arc::new(auth::IdTokenVerifier::new(
                 "test-audience".into(),
                 "caller@example.com".into(),

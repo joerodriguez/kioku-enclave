@@ -16,11 +16,11 @@
 //!
 //! ## ACME renewal (ADR-0003)
 //!
-//! The live deployment no longer bakes a cert: [`crate::acme`] obtains and renews it
-//! from Let's Encrypt with the private key generated **inside** the enclave, and swaps
-//! it into the running server via [`TlsKeystone::swap`] (a swappable rustls cert
-//! resolver — no restart). The env-var path below remains as the static/bootstrap
-//! fallback and for local testing.
+//! Singleton legacy deployments can use [`crate::acme`] to obtain and renew a
+//! certificate in-enclave. Fleet deployments load one reviewed shared
+//! certificate generation from Secret Manager and roll to a renewed version;
+//! every backend must present the same public identity behind the passthrough
+//! load balancer.
 //!
 //! Verifiers remain responsible for validating the attestation signature, claims,
 //! audience, nonce, and expected image digest, then comparing the nonce with the
@@ -263,14 +263,18 @@ pub async fn from_env(base_url: &str, enclave_audience: &str) -> Result<Option<T
 
             match fetched {
                 Some(pair) => pair,
-                None => {
-                    // 3. Fall back to generating a self-signed cert dynamically at runtime
-                    info!("generating dynamic self-signed cert/key at runtime");
+                None if crate::test_mode_enabled() => {
+                    info!("generating dynamic self-signed cert/key in test mode");
                     let (cert_der, key_der) = generate_self_signed(base_url, enclave_audience)?;
                     CertKeyPair {
                         chain_der: vec![cert_der],
                         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
                     }
+                }
+                None => {
+                    return Err(Error::Config(
+                        "production TLS certificate/key secrets are unavailable".into(),
+                    ));
                 }
             }
         }
