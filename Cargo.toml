@@ -60,6 +60,13 @@ http-body = "1"
 # SQLite, bundled so the binary carries its own libsqlite3 with FTS5 compiled in.
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 
+# PostgreSQL production persistence (ADR-0040). Runtime queries are checked by
+# the shared repository contracts against real PostgreSQL; no compile-time
+# DATABASE_URL or OpenSSL dependency is required. Reviewed schema files are
+# embedded for the dedicated release migrator, while serving startup only
+# verifies the installed schema version.
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
+
 # Serialisation
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["raw_value"] }

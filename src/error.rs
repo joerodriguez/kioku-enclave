@@ -253,6 +253,9 @@ pub enum EnclaveError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] sqlx::Error),
+
     #[error("serialisation error: {0}")]
     Json(#[from] serde_json::Error),
 
