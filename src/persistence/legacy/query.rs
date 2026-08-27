@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::persistence::{
-    CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryQueryRepository,
+    CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryFeedPage, MemoryFeedRecord,
+    MemoryFeedRequest, MemoryQueryRepository,
 };
 use crate::search::{search_all, SearchHit, SearchRequest};
 use crate::store::Store;
@@ -179,6 +180,115 @@ impl MemoryQueryRepository for LegacyMemoryQueryRepository {
             })
             .await
     }
+
+    async fn feed(&self, account_id: &str, request: &MemoryFeedRequest) -> Result<MemoryFeedPage> {
+        let request = request.clone();
+        self.store
+            .wal_authoritative_read(account_id, move |connection| {
+                legacy_feed(connection, &request)
+            })
+            .await
+    }
+}
+
+fn legacy_feed(
+    connection: &rusqlite::Connection,
+    request: &MemoryFeedRequest,
+) -> Result<MemoryFeedPage> {
+    let limit = request.limit.min(200);
+    let mut records = Vec::new();
+    let mut utterances = connection.prepare(
+        "WITH rows AS ( \
+           SELECT u.id,u.speaker_label,u.text,u.source_key, \
+                  strftime('%Y-%m-%dT%H:%M:%fZ',s.started_at,'+'||u.start_offset_seconds||' seconds') AS at \
+             FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id) \
+         SELECT id,speaker_label,text,source_key,at FROM rows WHERE at IS NOT NULL \
+          AND (?1 IS NULL OR at>=?1) AND (?2 IS NULL OR at<=?2) AND (?3 IS NULL OR at<?3) \
+         ORDER BY at DESC LIMIT ?4",
+    )?;
+    let rows = utterances.query_map(
+        params![request.from, request.to, request.before, limit as i64],
+        |row| {
+            Ok(MemoryFeedRecord {
+                kind: "utterance".into(),
+                id: row.get(0)?,
+                speaker_label: row.get(1)?,
+                text: row.get(2)?,
+                source_key: row.get(3)?,
+                at: row.get(4)?,
+                active_app: None,
+                window_title: None,
+                url: None,
+                ocr_excerpt: None,
+                observation_status: None,
+                literal_description: None,
+                screen_state: None,
+                episode_id: None,
+            })
+        },
+    )?;
+    records.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+
+    let mut screenshots = connection.prepare(
+        "SELECT s.id,s.captured_at,s.active_app,s.window_title,s.url,s.ocr_text, \
+                s.salient_ocr_text,s.source_key,o.status,o.literal_description,o.screen_state \
+           FROM screenshots s LEFT JOIN screen_observations o ON o.screenshot_id=s.id \
+          WHERE s.captured_at IS NOT NULL AND s.is_duplicate=0 \
+            AND (?1 IS NULL OR s.captured_at>=?1) AND (?2 IS NULL OR s.captured_at<=?2) \
+            AND (?3 IS NULL OR s.captured_at<?3) ORDER BY s.captured_at DESC LIMIT ?4",
+    )?;
+    let rows = screenshots.query_map(
+        params![request.from, request.to, request.before, limit as i64],
+        |row| {
+            let raw: Option<String> = row.get(5)?;
+            let salient: Option<String> = row.get(6)?;
+            let excerpt =
+                crate::ocr::select_salient_ocr(raw.as_deref(), salient.as_deref()).map(|value| {
+                    if value.chars().count() > 300 {
+                        value.chars().take(300).collect()
+                    } else {
+                        value
+                    }
+                });
+            Ok(MemoryFeedRecord {
+                kind: "screenshot".into(),
+                id: row.get(0)?,
+                at: row.get(1)?,
+                active_app: row.get(2)?,
+                window_title: row.get(3)?,
+                url: row.get(4)?,
+                ocr_excerpt: excerpt,
+                source_key: row.get(7)?,
+                observation_status: row.get(8)?,
+                literal_description: row.get(9)?,
+                screen_state: row.get(10)?,
+                speaker_label: None,
+                text: None,
+                episode_id: None,
+            })
+        },
+    )?;
+    records.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    records.sort_by(|left, right| right.at.cmp(&left.at));
+    records.truncate(limit);
+
+    for record in &mut records {
+        record.episode_id = connection
+            .query_row(
+                "SELECT episode_id FROM episode_members WHERE record_type=?1 AND record_id=?2 \
+                 ORDER BY episode_id DESC LIMIT 1",
+                params![record.kind, record.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+    }
+    let next_before = (records.len() == limit)
+        .then(|| records.last().map(|record| record.at.clone()))
+        .flatten();
+    Ok(MemoryFeedPage {
+        records,
+        next_before,
+    })
 }
 
 fn json_array(raw: Option<String>) -> Value {

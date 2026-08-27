@@ -2725,34 +2725,7 @@ struct FeedParams {
     before: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
-struct FeedRecord {
-    kind: String, // "utterance" | "screenshot"
-    id: i64,
-    at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    speaker_label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    active_app: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    window_title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ocr_excerpt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observation_status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    literal_description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    screen_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_key: Option<String>,
-    episode_id: Option<i64>,
-}
-
+#[cfg(test)]
 fn query_feed(
     conn: &rusqlite::Connection,
     p: &FeedParams,
@@ -2793,7 +2766,7 @@ fn query_feed(
     let mut records = Vec::new();
 
     while let Some(row) = rows.next()? {
-        records.push(FeedRecord {
+        records.push(crate::persistence::MemoryFeedRecord {
             kind: "utterance".to_string(),
             id: row.get(0)?,
             at: row.get(3)?,
@@ -2852,7 +2825,7 @@ fn query_feed(
                     }
                 },
             );
-        records.push(FeedRecord {
+        records.push(crate::persistence::MemoryFeedRecord {
             kind: "screenshot".to_string(),
             id: row.get(0)?,
             at: row.get(1)?,
@@ -2939,6 +2912,9 @@ fn query_feed(
     }))
 }
 
+#[cfg(test)]
+type FeedRecord = crate::persistence::MemoryFeedRecord;
+
 async fn rest_feed(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -2948,13 +2924,20 @@ async fn rest_feed(
     // `utterances`+`audio_segments` with `screenshots`+`screen_observations`
     // and annotates from `episode_members`; all five are written by live
     // sealed families for a selected user.
+    let request = crate::persistence::MemoryFeedRequest {
+        from: p.from,
+        to: p.to,
+        limit: p.limit.unwrap_or(50).min(200),
+        before: p.before,
+    };
     let result = s
-        .store
-        .wal_authoritative_read(&user.0, move |conn| query_feed(conn, &p))
+        .repositories
+        .memory_queries()
+        .feed(&user.0, &request)
         .await;
 
     match result {
-        Ok(val) => Json(val).into_response(),
+        Ok(page) => Json(page).into_response(),
         Err(e) => super::routed_read_unavailable("api.feed", &e),
     }
 }

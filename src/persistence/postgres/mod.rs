@@ -224,9 +224,9 @@ mod tests {
     use crate::persistence::RepositorySet;
     use crate::persistence::{
         CaptureCommit, CapturePreflight, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
-        EmailSendFenceDisposition, EpisodeListRequest, PushInstallation, PushProviderOutcome,
-        PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
-        WebhookSendFenceDisposition, WebhookSubscription,
+        EmailSendFenceDisposition, EpisodeListRequest, MemoryFeedRequest, PushInstallation,
+        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, WebhookProviderOutcome,
+        WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
 
@@ -1142,6 +1142,24 @@ mod tests {
         assert_eq!(capture_status.total_utterances, 1);
         assert_eq!(capture_status.total_screenshots, 1);
         assert_eq!(capture_status.episode_count, 1);
+        let feed = repositories
+            .memory_queries()
+            .feed(
+                &account_id,
+                &MemoryFeedRequest {
+                    from: None,
+                    to: None,
+                    limit: 20,
+                    before: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(feed.records.len(), 2);
+        assert_eq!(feed.records[0].kind, "screenshot");
+        assert_eq!(feed.records[0].episode_id, Some(1));
+        assert_eq!(feed.records[1].kind, "utterance");
+        assert_eq!(feed.records[1].episode_id, Some(1));
 
         let billing_detach_id = repositories
             .billing()
