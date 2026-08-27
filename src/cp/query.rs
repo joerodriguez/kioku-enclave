@@ -629,8 +629,7 @@ async fn query_episodes_rows_value(
                     }))
                     },
                 )?
-                .filter_map(|x| x.ok())
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
 
             let next_before = if let Some(page_size) = rest_page_size {
                 let has_more = episodes.len() > page_size;
@@ -662,34 +661,45 @@ async fn query_episodes_rows_value(
                 )?
             };
 
-            // Top apps + domains per episode from member screenshots (top 3
-            // each, by frequency). One grouped query, merged in memory.
+            // Top apps + domains per returned episode from member screenshots
+            // (top 3 each, by frequency). The REST path has already removed
+            // its max+1 probe row, so the generated placeholder list covers
+            // only the page the client will receive instead of rescanning the
+            // account's complete screenshot membership on every page.
             {
-                let mut apps = conn.prepare(
-                    "SELECT m.episode_id, c.active_app, c.url, count(*) AS n \
-                     FROM episode_members m JOIN screenshots c ON c.id = m.record_id \
-                     WHERE m.record_type = 'screenshot' \
-                       AND (?1 IS NULL OR m.episode_id = ?1) \
-                     GROUP BY m.episode_id, c.active_app, c.url",
-                )?;
-                use std::collections::HashMap;
+                let episode_ids: Vec<i64> = episodes
+                    .iter()
+                    .map(|episode| episode["id"].as_i64())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
                 let mut app_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
                 let mut dom_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
-                let rows = apps.query_map([episode_id], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })?;
-                for row in rows.filter_map(|x| x.ok()) {
-                    let (ep_id, app, url, n) = row;
-                    if let Some(app) = app.filter(|a| !a.is_empty()) {
-                        *app_counts.entry(ep_id).or_default().entry(app).or_insert(0) += n;
-                    }
-                    if let Some(dom) = url.as_deref().and_then(url_domain) {
-                        *dom_counts.entry(ep_id).or_default().entry(dom).or_insert(0) += n;
+                if !episode_ids.is_empty() {
+                    let placeholders = vec!["?"; episode_ids.len()].join(",");
+                    let sql = format!(
+                        "SELECT m.episode_id, c.active_app, c.url, count(*) AS n \
+                         FROM episode_members m JOIN screenshots c ON c.id = m.record_id \
+                         WHERE m.record_type = 'screenshot' \
+                           AND m.episode_id IN ({placeholders}) \
+                         GROUP BY m.episode_id, c.active_app, c.url"
+                    );
+                    let mut apps = conn.prepare(&sql)?;
+                    let rows = apps.query_map(rusqlite::params_from_iter(episode_ids.iter()), |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (ep_id, app, url, n) = row?;
+                        if let Some(app) = app.filter(|a| !a.is_empty()) {
+                            *app_counts.entry(ep_id).or_default().entry(app).or_insert(0) += n;
+                        }
+                        if let Some(dom) = url.as_deref().and_then(url_domain) {
+                            *dom_counts.entry(ep_id).or_default().entry(dom).or_insert(0) += n;
+                        }
                     }
                 }
                 let top3 = |m: Option<&HashMap<String, i64>>| -> Vec<String> {
@@ -5814,6 +5824,107 @@ mod tests {
         .expect("list_episodes dispatches");
         assert_eq!(mcp["episode_count"], 2);
         assert!(mcp.get("next_before").is_none());
+    }
+
+    #[tokio::test]
+    async fn rest_episode_page_fails_loudly_when_probe_row_cannot_decode() {
+        let state = query_test_state();
+        let user_id = "episode-malformed-probe-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute_batch(
+                    "
+                    INSERT INTO episodes
+                        (id, started_at, ended_at, title, substance, finalization_version)
+                    VALUES
+                        (30, '2026-08-20T12:00:00.000Z', '2026-08-20T12:01:00.000Z',
+                         'Newest', 'normal', 1),
+                        (20, '2026-08-20T11:00:00.000Z', '2026-08-20T11:01:00.000Z',
+                         'Second', 'normal', 1),
+                        (10, '2026-08-20T10:00:00.000Z', '2026-08-20T10:01:00.000Z',
+                         'Malformed probe', 'normal', 'not-an-integer');
+                    ",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // With a page size of two, id 10 is the max+1 probe row. Dropping its
+        // decode error would return ids 30 and 20 with next_before=null,
+        // silently making the older history unreachable.
+        let response = rest_episodes(
+            State(state),
+            Extension(AuthUser(user_id.to_string())),
+            Query(EpisodesParams {
+                from: None,
+                to: None,
+                max_episodes: Some(2),
+                include_low: None,
+                before: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
+    }
+
+    #[tokio::test]
+    async fn rest_episode_page_aggregates_only_returned_episode_ids() {
+        let state = query_test_state();
+        let user_id = "episode-page-aggregate-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute_batch(
+                    "
+                    INSERT INTO episodes (id, started_at, ended_at, title, substance) VALUES
+                        (20, '2026-08-20T12:00:00.000Z', '2026-08-20T12:01:00.000Z',
+                         'Returned', 'normal'),
+                        (10, '2026-08-20T11:00:00.000Z', '2026-08-20T11:01:00.000Z',
+                         'Probe only', 'normal');
+                    INSERT INTO screenshots (id, captured_at, active_app, url) VALUES
+                        (200, '2026-08-20T12:00:30.000Z', 'Safari', 'https://returned.example'),
+                        (100, '2026-08-20T11:00:30.000Z', X'FF', 'https://probe.example');
+                    INSERT INTO episode_members (episode_id, record_type, record_id) VALUES
+                        (20, 'screenshot', 200),
+                        (10, 'screenshot', 100);
+                    ",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // The older episode is fetched only as the max+1 probe. Its malformed
+        // screenshot metadata must not enter the aggregate for this page; it
+        // will fail loudly when that episode itself is requested later.
+        let response = rest_episodes(
+            State(state),
+            Extension(AuthUser(user_id.to_string())),
+            Query(EpisodesParams {
+                from: None,
+                to: None,
+                max_episodes: Some(1),
+                include_low: None,
+                before: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["episode_count"], 1);
+        assert_eq!(body["episodes"][0]["id"], 20);
+        assert_eq!(body["episodes"][0]["top_apps"], json!(["Safari"]));
+        assert!(body["next_before"].is_string());
     }
 
     #[tokio::test]
