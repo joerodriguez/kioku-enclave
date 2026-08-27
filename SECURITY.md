@@ -32,7 +32,9 @@ rewrites every live slot with the sanitized snapshot before purging older genera
 
 ### Out of scope or accepted external trust
 
-- The macOS client, which is a separate binary with its own threat model.
+- Authorized endpoint clients (macOS, iOS, and the active browser during playback),
+  which are separate binaries/environments with their own threat models. The enclave's
+  authentication, response, cache-control, and cross-account isolation remain in scope.
 - Payment processing, tax, invoices, subscription webhooks, and catalog pricing occur in
   an external control plane. The enclave's pseudonymous usage reservation, entitlement
   enforcement, bounded compatibility facade, and owner authorization are in scope. This
@@ -428,6 +430,48 @@ the account's installed value, and accepts only the current v2 AAD format; it ne
 the legacy provider for a `capture-v2:` ID. Provider and KMS transport outages are
 retryable 503 responses, while malformed identity, AEAD, length, or digest failures are
 500 faults that return no content.
+
+### Staged durable recordings and owner playback
+
+ADR-0036 introduces a second encrypted-media namespace without weakening the existing
+one. Eligible immutable source audio uses `recordings/{user_id}/{asset_id}.enc` in a
+separate private regional bucket. The object remains AES-256-GCM ciphertext bound to its
+authenticated account and exact object identity; GCS's server-side encryption is defense
+in depth, not the user-isolation boundary. Screenshots never enter this namespace.
+
+The source currently declares archive schema `HEAD=2`, `TARGET=1`, and
+`MINIMUM_SERVABLE=1`. Epoch 2 adds only `recording_media_authority`, and the sealed capture
+plan fingerprints/inserts its retention decision atomically with the existing capture
+event/media pointer/result. Until later reviewed TARGET and MINIMUM_SERVABLE releases,
+durable writes and playback fail closed even if the bucket exists. This prevents an
+observing binary or Terraform apply from creating a new retention or plaintext-serving
+boundary by itself.
+
+Encrypted Control owns retention preference history, signed interval-bounded lease
+authority, recording-key epochs, previews/receipts, the downgrade read fence, key erasure,
+and delete reconciliation. The client echo cannot select storage: ingest verifies its
+signature/account/interval and rechecks current Control state under the user lifecycle
+lock. Missing, stale, revoked, or malformed evidence falls back to the ordinary 30-day
+processing path. A downgrade first fences reads, then exact-generation-deletes the
+`recordings/` inventory and erases its key epoch; account deletion freezes and drains the
+same namespace before physical completion.
+
+Activated playback is an explicit endpoint-boundary expansion. An authenticated owner
+may receive one bounded source M4A only after the enclave reauthenticates the complete
+memory/recording/segment chain and exact provider generation, unwraps the correct DEK,
+checks object/user AAD, plaintext length and SHA-256, and validates codec/container.
+Responses are private/no-store and reveal no object key, generation, wrapped key, or DEK.
+Wrong-owner and unknown resources are indistinguishable. Direct GCS URLs are impossible
+because GCS stores ciphertext; no signed URL, CDN plaintext cache, MCP, webhook,
+notification, or public sharing path is introduced.
+
+The browser and its extensions/OS are an accepted endpoint risk during active playback.
+The companion client retains only one route-scoped Blob URL and clears media `src`,
+buffers, manifest/transcript indexes, and in-flight requests on advance, navigation,
+sign-out, or account change. Browser controls cannot prove decoder reclamation, so the
+claim is limited to application-owned state. External activation remains blocked until
+the full media-byte export and independent recording-audio deletion inventories are
+complete; the legacy JSON export is metadata-only.
 
 Browser evidence is served only through a live episode-member screenshot association.
 The Cloud Capture v2 path reauthenticates its exact capture event, observation, context

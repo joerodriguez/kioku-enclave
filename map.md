@@ -59,10 +59,11 @@ OAuth clients and legacy service-identity integrations
         │  authenticated HTTPS
         ▼
    THIS SERVICE (Confidential Space VM, SEV)
-        ├── context-bound AES-256-GCM blobs ──► GCS (ciphertext only)
+        ├── context-bound AES-256-GCM blobs ──► GCS processing/archive/recording buckets (ciphertext only)
         ├── attestation-derived credentials ─► Cloud KMS
         ├── documented plaintext egress ─────► Vertex / Resend transactional email / user-configured webhooks
         ├── generic metadata-only egress ────► Apple Push Notification service
+        ├── gated private/no-store source M4A ► authenticated owner's active browser
         └── content-free pseudonymous egress ► monorepo billing service
 ```
 
@@ -96,7 +97,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image. Stable tool/model/dependency layers precede final configuration; explicit committed Cargo/source subset hashes prevent stale BuildKit records while source time stays in signed evidence rather than Docker's global cache inputs. Configuration is assembled from an ephemeral BuildKit secret whose non-secret `CONFIG_SHA256` is declared only in the late image-config stage and verified against the assembled bytes. Native OCI output and the explicitly confirmed fallback are driven by `scripts/local_image_pipeline.py`; remaining rebuild limits are documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
-| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, bounded Mac screenshot-reference batches, durable session finish, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, and learned people profiles |
+| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, bounded Mac screenshot-reference batches, durable session finish, signed retention echoes/settings, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, learned people profiles, and gated owner playback |
 | [eval/](eval/map.md) | Public, content-free voice/identity quality scoring plus archive-capacity contracts, synthetic regression inputs, and real-corpus methodology |
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools, including the exact provider-free fresh-BOOTSTRAP schema-10 producer/verifier |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |

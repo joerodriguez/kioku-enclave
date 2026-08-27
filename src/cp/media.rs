@@ -213,6 +213,55 @@ pub(crate) struct BrowserV2PersistedEvidence<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RecordingRetentionCaptureAuthority {
+    pub policy_revision: i64,
+    pub policy_epoch: String,
+    pub lease_id: String,
+    pub authority_token: String,
+}
+
+/// Server-final retention decision carried into the immutable archive write.
+/// A client echo can identify a signed policy interval, but it cannot select
+/// this value; ingest rechecks the current Control authority while holding the
+/// same account lifecycle lock used by downgrade and deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "retention_decision", rename_all = "snake_case")]
+pub(crate) enum RecordingMediaAuthorityDecision {
+    ProcessingWindow30d {
+        capture_policy_revision: i64,
+        decision_at: String,
+    },
+    UntilDeleted {
+        capture_policy_revision: i64,
+        retention_policy_revision: i64,
+        retention_policy_epoch: String,
+        recording_key_epoch: i64,
+        decision_at: String,
+    },
+}
+
+impl RecordingMediaAuthorityDecision {
+    fn processing(capture_policy_revision: i64, decision_at: String) -> Self {
+        Self::ProcessingWindow30d {
+            capture_policy_revision: capture_policy_revision.max(0),
+            decision_at,
+        }
+    }
+
+    pub(crate) const fn is_durable(&self) -> bool {
+        matches!(self, Self::UntilDeleted { .. })
+    }
+
+    pub(crate) fn decision_at(&self) -> &str {
+        match self {
+            Self::ProcessingWindow30d { decision_at, .. }
+            | Self::UntilDeleted { decision_at, .. } => decision_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureEventManifest {
     pub schema_version: i64,
     pub event_id: String,
@@ -244,6 +293,8 @@ pub struct CaptureEventManifest {
     pub audio_route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_retention: Option<RecordingRetentionCaptureAuthority>,
 }
 
 impl CaptureEventManifest {
@@ -266,6 +317,26 @@ impl CaptureEventManifest {
             return Err(EnclaveError::InvalidRequest(
                 "schema_version must be 2 or 3".into(),
             ));
+        }
+        if let Some(authority) = self.recording_retention.as_ref() {
+            if !self.stream_kind.is_audio()
+                || self.media_disposition != MediaDisposition::Canonical
+                || authority.policy_revision <= 0
+                || !authority.policy_epoch.starts_with("rpe_")
+                || authority.policy_epoch.len() != 68
+                || !authority.policy_epoch[4..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || !authority.lease_id.starts_with("lease_")
+                || authority.lease_id.len() != 70
+                || authority.authority_token.is_empty()
+                || authority.authority_token.len() > 2_048
+                || !authority.authority_token.is_ascii()
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "recording_retention authority is malformed".into(),
+                ));
+            }
         }
         if let Some(role) = self.audio_role.as_deref() {
             if !matches!(
@@ -1881,12 +1952,24 @@ async fn upload_capture_event(
         Ok(value) => value,
         Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
-    let object_key = match manifest.media.as_ref() {
+    let object_key_candidates = match manifest.media.as_ref() {
         Some(media) => {
-            match crate::store::canonical_capture_media_object_key(&user_id, &media.asset_id) {
-                Ok(key) => Some(key),
-                Err(error) => return capture_error_response(started_at, Some(&manifest), error),
-            }
+            let processing =
+                match crate::store::canonical_capture_media_object_key(&user_id, &media.asset_id) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        return capture_error_response(started_at, Some(&manifest), error)
+                    }
+                };
+            let durable =
+                match crate::store::canonical_recording_media_object_key(&user_id, &media.asset_id)
+                {
+                    Ok(key) => key,
+                    Err(error) => {
+                        return capture_error_response(started_at, Some(&manifest), error)
+                    }
+                };
+            Some(vec![processing, durable])
         }
         None => None,
     };
@@ -1935,7 +2018,7 @@ async fn upload_capture_event(
     let preflight = if wal_authoritative {
         let preflight_manifest = manifest.clone();
         let preflight_digest = digest.clone();
-        let preflight_object_key = object_key.clone();
+        let preflight_object_keys = object_key_candidates.clone();
         state
             .store
             .wal_authoritative_read(&user_id, move |conn| {
@@ -1943,7 +2026,7 @@ async fn upload_capture_event(
                     conn,
                     &preflight_manifest,
                     &preflight_digest,
-                    preflight_object_key.as_deref(),
+                    preflight_object_keys.as_deref(),
                 )
             })
             .await
@@ -1951,7 +2034,7 @@ async fn upload_capture_event(
         state
             .store
             .with_user(&user_id, |conn| {
-                preflight_source_event(conn, &manifest, &digest, object_key.as_deref())
+                preflight_source_event(conn, &manifest, &digest, object_key_candidates.as_deref())
             })
             .await
     };
@@ -2023,30 +2106,17 @@ async fn upload_capture_event(
         }
     }
 
+    let commit_stamp = enclave_commit_stamp();
     let mut media_generation = None;
+    let mut object_key = None;
+    let mut media_authority = None;
     if manifest.media_disposition == MediaDisposition::Canonical {
-        let object_key = object_key
-            .as_deref()
-            .expect("validated canonical object key");
         let media_bytes = media_bytes.as_deref().expect("validated canonical media");
-        let (media_dek, wrapped_dek) = match load_or_create_media_dek(&state, &user_id).await {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::error!(error = %error, "capture media key setup failed");
-                return capture_failure_response(
-                    started_at,
-                    Some(&manifest),
-                    CaptureIngestFailureReason::MediaStorageUnavailable,
-                    (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
-                );
-            }
-        };
-        let media_context = crate::store::media_blob_context(&user_id, object_key);
-        let encrypted =
-            match crate::crypto::encrypt_bound_blob(&media_dek, media_bytes, &media_context) {
+        let write =
+            match prepare_canonical_media_write(&state, &user_id, &manifest, &commit_stamp).await {
                 Ok(value) => value,
                 Err(error) => {
-                    tracing::error!(error = %error, "capture media encryption failed");
+                    tracing::error!(error = %error, "capture media key setup failed");
                     return capture_failure_response(
                         started_at,
                         Some(&manifest),
@@ -2055,18 +2125,39 @@ async fn upload_capture_event(
                     );
                 }
             };
+        let encrypted = match crate::crypto::encrypt_bound_blob(
+            &write.encryption_key,
+            media_bytes,
+            &write.encryption_context,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(error = %error, "capture media encryption failed");
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::MediaStorageUnavailable,
+                    (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                );
+            }
+        };
         // The child keeps the provider PUT alive if the HTTP future is
         // cancelled. Deletion waits for that child lease and therefore scans
         // only after the provider has definitively accepted or rejected it.
         let put_lease = _content_write.child();
         let put_store = Arc::clone(&state.store);
         let put_user_id = user_id.clone();
-        let put_object_key = object_key.to_string();
-        let put_wrapped_dek = wrapped_dek.clone();
+        let put_object_key = write.object_key.clone();
+        let put_key_reference = write.provider_key_reference.clone();
         let put = tokio::spawn(async move {
             let _put_lease = put_lease;
             put_store
-                .put_user_media(&put_user_id, &put_object_key, &encrypted, &put_wrapped_dek)
+                .put_user_media(
+                    &put_user_id,
+                    &put_object_key,
+                    &encrypted,
+                    &put_key_reference,
+                )
                 .await
         });
         match put.await {
@@ -2074,11 +2165,11 @@ async fn upload_capture_event(
             Ok(Err(put_error)) => {
                 media_generation = match verify_existing_media(
                     &state,
-                    object_key,
-                    &media_context,
+                    &write.object_key,
+                    &write.encryption_context,
                     media_bytes,
-                    &media_dek,
-                    &wrapped_dek,
+                    &write.encryption_key,
+                    &write.provider_key_reference,
                 )
                 .await
                 {
@@ -2105,6 +2196,8 @@ async fn upload_capture_event(
                 );
             }
         }
+        object_key = Some(write.object_key);
+        media_authority = Some(write.authority);
     }
 
     // The settle-submit replaces the legacy write+save pair: acknowledgement
@@ -2137,7 +2230,10 @@ async fn upload_capture_event(
                     manifest.clone(),
                     object_key.to_string(),
                     generation,
-                    enclave_commit_stamp(),
+                    media_authority
+                        .clone()
+                        .expect("canonical media has a retention decision"),
+                    commit_stamp.clone(),
                 ) {
                     Ok(prepared) => prepared,
                     Err(_) => {
@@ -2227,6 +2323,7 @@ async fn upload_capture_event(
                             .as_deref()
                             .expect("validated canonical object key"),
                         media_generation,
+                        media_authority.as_ref(),
                     )?,
                     MediaDisposition::Reference => {
                         record_reference_event(conn, &user_id, &manifest, &digest)?
@@ -3297,7 +3394,7 @@ fn preflight_source_event(
     conn: &Connection,
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
-    object_key: Option<&str>,
+    allowed_object_keys: Option<&[String]>,
 ) -> Result<PreflightOutcome> {
     let existing: Option<(String, Option<String>, String, String)> = conn
         .query_row(
@@ -3316,9 +3413,13 @@ fn preflight_source_event(
         MediaDisposition::Canonical => "canonical",
         MediaDisposition::Reference => "reference",
     };
-    if existing_digest != manifest_digest
-        || existing_object.as_deref() != object_key
-        || existing_disposition != disposition
+    let object_matches = match allowed_object_keys {
+        Some(keys) => existing_object
+            .as_deref()
+            .is_some_and(|stored| keys.iter().any(|candidate| candidate == stored)),
+        None => existing_object.is_none(),
+    };
+    if existing_digest != manifest_digest || !object_matches || existing_disposition != disposition
     {
         return Err(EnclaveError::Conflict(
             "idempotency conflict for event_id".into(),
@@ -3429,20 +3530,194 @@ async fn read_media_dek_wrapped(state: &CpState, user_id: &str) -> Result<Option
         .await
 }
 
+struct CanonicalMediaWrite {
+    object_key: String,
+    encryption_key: crate::crypto::Dek,
+    provider_key_reference: String,
+    encryption_context: Vec<u8>,
+    authority: RecordingMediaAuthorityDecision,
+}
+
+async fn recording_media_authority_decision(
+    state: &CpState,
+    user_id: &str,
+    manifest: &CaptureEventManifest,
+    decision_at: &str,
+) -> Result<RecordingMediaAuthorityDecision> {
+    if !manifest.stream_kind.is_audio() {
+        return Ok(RecordingMediaAuthorityDecision::processing(
+            0,
+            decision_at.to_owned(),
+        ));
+    }
+    let Some(echo) = manifest.recording_retention.as_ref() else {
+        // An older/offline client with no server-verifiable interval remains
+        // eligible only for the established processing window. Promotion is a
+        // separate explicit operation and never inferred here.
+        return Ok(RecordingMediaAuthorityDecision::processing(
+            0,
+            decision_at.to_owned(),
+        ));
+    };
+    let claims = super::tokens::verify_recording_retention_lease(
+        state.config.jwt_secrets.as_ref(),
+        &echo.authority_token,
+    )
+    .map_err(|_| {
+        EnclaveError::InvalidRequest("recording retention authority was rejected".into())
+    })?;
+    if claims.user_id != user_id
+        || claims.lease_id != echo.lease_id
+        || claims.policy_revision != echo.policy_revision
+        || claims.policy_epoch != echo.policy_epoch
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "recording retention authority did not match the capture".into(),
+        ));
+    }
+    let started_ms = super::isotime::parse_epoch_millis(&manifest.started_at)
+        .ok_or_else(|| EnclaveError::InvalidRequest("started_at must be ISO-8601".into()))?;
+    let ended_ms = super::isotime::parse_epoch_millis(&manifest.ended_at)
+        .ok_or_else(|| EnclaveError::InvalidRequest("ended_at must be ISO-8601".into()))?;
+    let interval_covered = started_ms >= claims.valid_from_epoch_millis
+        && started_ms < claims.capture_started_before_epoch_millis
+        && ended_ms <= claims.valid_until_epoch_millis;
+    if !interval_covered {
+        return Ok(RecordingMediaAuthorityDecision::processing(
+            claims.policy_revision,
+            decision_at.to_owned(),
+        ));
+    }
+
+    let preference = state
+        .control
+        .get_recording_retention_preference(user_id)
+        .await?;
+    if preference.policy != super::control_store::RecordingRetentionPolicy::UntilDeleted
+        || preference.revision != claims.policy_revision
+        || preference.policy_epoch.as_deref() != Some(claims.policy_epoch.as_str())
+        || preference.operation_state.is_some()
+    {
+        // The lifecycle lock makes this check linear with revocation. A stale
+        // client echo is retained as evidence, never as authority to recreate
+        // an object after downgrade.
+        return Ok(RecordingMediaAuthorityDecision::processing(
+            claims.policy_revision,
+            decision_at.to_owned(),
+        ));
+    }
+    if !state.store.durable_recording_storage_bound()
+        || !super::retention::recording_authority_schema_present(state, user_id).await?
+    {
+        return Err(EnclaveError::Store(
+            "durable recording storage is temporarily unavailable".into(),
+        ));
+    }
+    let key_epoch = preference.revision;
+    if state
+        .control
+        .recording_key_epoch(user_id, key_epoch, &claims.policy_epoch)
+        .await?
+        .is_none()
+    {
+        return Err(EnclaveError::Store(
+            "durable recording key authority is unavailable".into(),
+        ));
+    }
+    Ok(RecordingMediaAuthorityDecision::UntilDeleted {
+        capture_policy_revision: claims.policy_revision,
+        retention_policy_revision: preference.revision,
+        retention_policy_epoch: claims.policy_epoch,
+        recording_key_epoch: key_epoch,
+        decision_at: decision_at.to_owned(),
+    })
+}
+
+async fn prepare_canonical_media_write(
+    state: &CpState,
+    user_id: &str,
+    manifest: &CaptureEventManifest,
+    decision_at: &str,
+) -> Result<CanonicalMediaWrite> {
+    let media = manifest
+        .media
+        .as_ref()
+        .ok_or_else(|| EnclaveError::InvalidRequest("canonical media is required".into()))?;
+    let authority =
+        recording_media_authority_decision(state, user_id, manifest, decision_at).await?;
+    match &authority {
+        RecordingMediaAuthorityDecision::UntilDeleted {
+            retention_policy_epoch,
+            recording_key_epoch,
+            ..
+        } => {
+            let object_key =
+                crate::store::canonical_recording_media_object_key(user_id, &media.asset_id)?;
+            let encryption_key = state
+                .control
+                .open_recording_key_epoch(user_id, *recording_key_epoch, retention_policy_epoch)
+                .await?
+                .ok_or_else(|| {
+                    EnclaveError::Store("durable recording key authority is unavailable".into())
+                })?;
+            let provider_key_reference = crate::store::recording_media_key_reference(
+                *recording_key_epoch,
+                retention_policy_epoch,
+            )?;
+            let encryption_context = crate::store::recording_media_blob_context(
+                user_id,
+                &object_key,
+                *recording_key_epoch,
+                retention_policy_epoch,
+                &manifest.event_id,
+                &media.asset_id,
+                &manifest.capture_session_id,
+                manifest.stream_kind.as_str(),
+                &media.codec,
+                media.byte_length,
+                &media.sha256,
+            )?;
+            Ok(CanonicalMediaWrite {
+                object_key,
+                encryption_key,
+                provider_key_reference,
+                encryption_context,
+                authority,
+            })
+        }
+        RecordingMediaAuthorityDecision::ProcessingWindow30d { .. } => {
+            let object_key =
+                crate::store::canonical_capture_media_object_key(user_id, &media.asset_id)?;
+            let (encryption_key, provider_key_reference) =
+                load_or_create_media_dek(state, user_id).await?;
+            let encryption_context = crate::store::media_blob_context(user_id, &object_key);
+            Ok(CanonicalMediaWrite {
+                object_key,
+                encryption_key,
+                provider_key_reference,
+                encryption_context,
+                authority,
+            })
+        }
+    }
+}
+
 fn prepare_canonical_capture_event(
     user_id: String,
     manifest: CaptureEventManifest,
     object_key: String,
     generation: i64,
+    authority: RecordingMediaAuthorityDecision,
     commit_stamp: String,
 ) -> Result<
     crate::archive_v3_wal_idempotency::PreparedLogicalMutation<wal::CanonicalCaptureEventPlan>,
 > {
-    let plan = wal::CanonicalCaptureEventPlan::new(
+    let plan = wal::CanonicalCaptureEventPlan::new_with_authority(
         user_id,
         manifest,
         object_key,
         generation,
+        authority,
         commit_stamp,
     )
     .map_err(|_| EnclaveError::Store("canonical capture plan construction failed".into()))?;
@@ -3510,12 +3785,14 @@ pub(crate) async fn submit_selected_screen_capture_fixture(
         .put_user_media(user_id, &object_key, &encrypted, &wrapped_dek)
         .await?;
     let asset_id = media.asset_id.clone();
+    let commit_stamp = enclave_commit_stamp();
     let prepared = prepare_canonical_capture_event(
         user_id.to_owned(),
         manifest,
         object_key,
         generation,
-        enclave_commit_stamp(),
+        RecordingMediaAuthorityDecision::processing(0, commit_stamp.clone()),
+        commit_stamp,
     )
     .map_err(|_| EnclaveError::Store("selected capture fixture plan failed".into()))?;
     state
@@ -4659,6 +4936,7 @@ pub fn record_source_event(
         manifest_digest,
         object_key,
         None,
+        None,
     )
 }
 
@@ -4671,6 +4949,7 @@ pub fn record_source_event_with_generation(
     manifest_digest: &str,
     object_key: &str,
     object_generation: Option<i64>,
+    media_authority: Option<&RecordingMediaAuthorityDecision>,
 ) -> Result<RecordOutcome> {
     let tx = conn.unchecked_transaction()?;
     let outcome = record_source_event_in_transaction(
@@ -4680,12 +4959,17 @@ pub fn record_source_event_with_generation(
         manifest_digest,
         object_key,
         object_generation,
+        media_authority,
         None,
     )?;
     tx.commit()?;
     Ok(outcome)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sealed capture transaction keeps every authenticated media fact explicit"
+)]
 fn record_source_event_in_transaction(
     conn: &Connection,
     account_id: &str,
@@ -4693,6 +4977,7 @@ fn record_source_event_in_transaction(
     manifest_digest: &str,
     object_key: &str,
     object_generation: Option<i64>,
+    media_authority: Option<&RecordingMediaAuthorityDecision>,
     commit_stamp: CommitStamp<'_>,
 ) -> Result<RecordOutcome> {
     manifest.validate()?;
@@ -4713,6 +4998,27 @@ fn record_source_event_in_transaction(
     }
     if object_key.is_empty() || object_key.len() > 512 || object_key.contains("..") {
         return Err(EnclaveError::InvalidRequest("object_key is invalid".into()));
+    }
+    let authority_was_explicit = media_authority.is_some();
+    let default_authority = RecordingMediaAuthorityDecision::processing(
+        manifest
+            .recording_retention
+            .as_ref()
+            .map_or(0, |authority| authority.policy_revision),
+        commit_stamp
+            .unwrap_or(manifest.ended_at.as_str())
+            .to_owned(),
+    );
+    let media_authority = media_authority.unwrap_or(&default_authority);
+    let expected_object_key = if media_authority.is_durable() {
+        crate::store::canonical_recording_media_object_key(account_id, &media.asset_id)?
+    } else {
+        crate::store::canonical_capture_media_object_key(account_id, &media.asset_id)?
+    };
+    if authority_was_explicit && object_key != expected_object_key {
+        return Err(EnclaveError::InvalidRequest(
+            "object_key does not match the settled retention decision".into(),
+        ));
     }
 
     let existing: Option<(String, String)> = conn
@@ -4810,17 +5116,30 @@ fn record_source_event_in_transaction(
         }
         return Err(error.into());
     }
+    // The frozen epoch-0 column names the active media router and is CHECKed
+    // to `current`. The additive authority table carries the concrete routed
+    // backend (`processing|recordings`) without rewriting that baseline.
+    let object_backend = object_generation.map(|_| "current");
+    let retain_until = if media_authority.is_durable() {
+        None
+    } else {
+        Some(super::isotime::add_seconds(
+            &manifest.ended_at,
+            30.0 * 86_400.0,
+        ))
+    };
     conn.execute(
         "INSERT INTO media_objects \
          (asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,sample_rate,channels, \
           frame_count,width,height,scale,orientation,retain_until,created_at) \
-         VALUES (?1,?2,?3,?4,CASE WHEN ?4 IS NULL THEN NULL ELSE 'current' END,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
-                 COALESCE(?17,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
+                 COALESCE(?18,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
         params![
             media.asset_id,
             manifest.event_id,
             object_key,
             object_generation,
+            object_backend,
             media.mime_type,
             media.codec,
             media.byte_length,
@@ -4832,10 +5151,11 @@ fn record_source_event_in_transaction(
             media.height,
             media.scale,
             media.orientation,
-            super::isotime::add_seconds(&manifest.ended_at, 30.0 * 86_400.0),
+            retain_until,
             commit_stamp
         ],
     )?;
+    record_media_authority(conn, &media.asset_id, media_authority)?;
     record_browser_observation(conn, manifest, commit_stamp)?;
     let job_kind = if manifest.stream_kind.is_audio() {
         "gemini_audio"
@@ -4855,6 +5175,73 @@ fn record_source_event_in_transaction(
     )?;
     advance_contiguous_ack(conn, &manifest.stream_id)?;
     Ok(RecordOutcome::Created)
+}
+
+fn record_media_authority(
+    conn: &Connection,
+    asset_id: &str,
+    authority: &RecordingMediaAuthorityDecision,
+) -> Result<()> {
+    let table_present: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recording_media_authority')",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_present == 0 {
+        return if authority.is_durable() {
+            Err(EnclaveError::Store(
+                "durable recording authority schema is unavailable".into(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    if super::isotime::parse_epoch_millis(authority.decision_at()).is_none() {
+        return Err(EnclaveError::InvalidRequest(
+            "recording retention decision timestamp is invalid".into(),
+        ));
+    }
+    let changed = match authority {
+        RecordingMediaAuthorityDecision::ProcessingWindow30d {
+            capture_policy_revision,
+            decision_at,
+        } => conn.execute(
+            "INSERT INTO recording_media_authority
+             (asset_id,capture_policy_revision,retention_policy_revision,
+              retention_policy_epoch,retention_decision,storage_backend,recording_key_epoch,
+              recording_state,decision_at,updated_at)
+             VALUES (?1,?2,0,NULL,'processing_window_30d','processing',NULL,
+                     'processing_only',?3,?3)",
+            params![asset_id, capture_policy_revision, decision_at],
+        )?,
+        RecordingMediaAuthorityDecision::UntilDeleted {
+            capture_policy_revision,
+            retention_policy_revision,
+            retention_policy_epoch,
+            recording_key_epoch,
+            decision_at,
+        } => conn.execute(
+            "INSERT INTO recording_media_authority
+             (asset_id,capture_policy_revision,retention_policy_revision,
+              retention_policy_epoch,retention_decision,storage_backend,recording_key_epoch,
+              recording_state,decision_at,updated_at)
+             VALUES (?1,?2,?3,?4,'until_deleted','recordings',?5,'durable',?6,?6)",
+            params![
+                asset_id,
+                capture_policy_revision,
+                retention_policy_revision,
+                retention_policy_epoch,
+                recording_key_epoch,
+                decision_at,
+            ],
+        )?,
+    };
+    if changed != 1 {
+        return Err(EnclaveError::Store(
+            "recording media authority was not inserted exactly once".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Value {
@@ -5909,7 +6296,10 @@ mod tests {
         );
         assert_eq!(
             source
-                .matches(concat!("CanonicalCaptureEventPlan::", "new("))
+                .matches(concat!(
+                    "CanonicalCaptureEventPlan::",
+                    "new_with_authority("
+                ))
                 .count(),
             1,
             "production and selected E2E fixtures share the one sealed constructor"
@@ -6327,6 +6717,7 @@ mod tests {
             &digest_1,
             "object-1",
             Some(42),
+            None,
         )
         .unwrap();
         assert_eq!(first, RecordOutcome::Created);
@@ -6356,6 +6747,85 @@ mod tests {
         let conflict =
             record_source_event(&conn, "account-1", &manifest, &digest_2, "object-2").unwrap_err();
         assert!(conflict.to_string().contains("idempotency"));
+    }
+
+    #[test]
+    fn durable_recording_pointer_and_authority_settle_together_without_prune_deadline() {
+        let conn = crate::schema_ladder::build_canonical(2).unwrap();
+        let mut manifest = valid_manifest();
+        let policy_epoch = format!("rpe_{}", "a".repeat(64));
+        manifest.recording_retention = Some(RecordingRetentionCaptureAuthority {
+            policy_revision: 3,
+            policy_epoch: policy_epoch.clone(),
+            lease_id: format!("lease_{}", "b".repeat(64)),
+            authority_token: "rrl1.fixture.signature".into(),
+        });
+        let decision_at = "2026-07-31T18:00:06.000Z".to_string();
+        let authority = RecordingMediaAuthorityDecision::UntilDeleted {
+            capture_policy_revision: 3,
+            retention_policy_revision: 3,
+            retention_policy_epoch: policy_epoch.clone(),
+            recording_key_epoch: 3,
+            decision_at: decision_at.clone(),
+        };
+        let asset_id = manifest.media.as_ref().unwrap().asset_id.clone();
+        let object_key =
+            crate::store::canonical_recording_media_object_key("account-1", &asset_id).unwrap();
+        assert_eq!(
+            record_source_event_with_generation(
+                &conn,
+                "account-1",
+                &manifest,
+                &"c".repeat(64),
+                &object_key,
+                Some(77),
+                Some(&authority),
+            )
+            .unwrap(),
+            RecordOutcome::Created
+        );
+        let media: (String, Option<String>) = conn
+            .query_row(
+                "SELECT object_backend,retain_until FROM media_objects WHERE asset_id=?1",
+                [&asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(media, ("current".into(), None));
+        let stored: (i64, i64, String, String, String, i64, String, String) = conn
+            .query_row(
+                "SELECT capture_policy_revision,retention_policy_revision,
+                        retention_policy_epoch,retention_decision,storage_backend,
+                        recording_key_epoch,recording_state,decision_at
+                 FROM recording_media_authority WHERE asset_id=?1",
+                [&asset_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                3,
+                3,
+                policy_epoch,
+                "until_deleted".into(),
+                "recordings".into(),
+                3,
+                "durable".into(),
+                decision_at,
+            )
+        );
     }
 
     #[test]

@@ -927,6 +927,8 @@ async fn async_main() {
 
     // ── KMS + GCS ─────────────────────────────────────────────────────────────
 
+    let kms_project =
+        std::env::var("KMS_PROJECT").expect("KMS_PROJECT must be baked into the image");
     let concrete_kms = Arc::new(
         crypto::GcpKmsClient::from_env()
             .expect("KMS env vars (KMS_PROJECT, KMS_LOCATION, KMS_KEY_RING, KMS_KEY) must be set"),
@@ -945,14 +947,27 @@ async fn async_main() {
         panic!("GCS_LEGACY_MEDIA_BUCKET must exactly match GCS_BUCKET for the Phase-0 dual-media migration");
     }
     let media_gcs: Arc<dyn crate::store::GcsClient> =
-        Arc::new(GcpGcsClient::from_bucket(media_bucket));
+        Arc::new(GcpGcsClient::from_bucket(media_bucket.clone()));
+    // ADR-0036 deliberately derives the fourth provider name from the already
+    // baked, image-attested project rather than accepting a mutable runtime
+    // override. Terraform uses the same collision-resistant project suffix.
+    let recording_media_bucket = format!("{kms_project}-enclave-recordings");
+    if recording_media_bucket == index_bucket
+        || recording_media_bucket == media_bucket
+        || recording_media_bucket == legacy_media_bucket
+    {
+        panic!("the durable recordings bucket must be isolated from index and processing media storage");
+    }
+    let recording_media_gcs: Arc<dyn crate::store::GcsClient> =
+        Arc::new(GcpGcsClient::from_bucket(recording_media_bucket));
     let legacy_media_gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_bucket(legacy_media_bucket));
 
-    let store = Arc::new(Store::new_with_media_and_legacy(
+    let store = Arc::new(Store::new_with_recording_media(
         Arc::clone(&kms),
         Arc::clone(&gcs),
         media_gcs,
+        recording_media_gcs,
         legacy_media_gcs,
     ));
     Store::spawn_metrics_reporter(Arc::clone(&store));
@@ -1410,6 +1425,7 @@ async fn async_main() {
         cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
         cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
         cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
+        cp::retention::spawn_reconciler(Arc::clone(&cp_state));
     }
 
     // ── Retired legacy data-plane tombstones ─────────────────────────────────
@@ -1418,6 +1434,8 @@ async fn async_main() {
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
         .merge(cp::media::router())
+        .merge(cp::playback::router())
+        .merge(cp::retention::router())
         .merge(cp::push::router())
         .merge(cp::query::router())
         .merge(cp::billing::router())

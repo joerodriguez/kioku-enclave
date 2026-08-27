@@ -22,7 +22,9 @@ use crate::archive_v3_wal_idempotency::{
 };
 use crate::error::EnclaveError;
 
-use super::super::{CaptureEventManifest, MediaDisposition, RecordOutcome};
+use super::super::{
+    CaptureEventManifest, MediaDisposition, RecordOutcome, RecordingMediaAuthorityDecision,
+};
 
 const REQUEST_V1: u16 = 1;
 const REQUEST_CANONICAL_CAPTURE: u8 = 2;
@@ -77,6 +79,7 @@ pub(crate) struct CanonicalCaptureEventPlan {
     manifest_digest: String,
     object_key: String,
     object_generation: i64,
+    recording_authority: RecordingMediaAuthorityDecision,
     committed_at: String,
 }
 
@@ -88,12 +91,40 @@ impl CanonicalCaptureEventPlan {
         object_generation: i64,
         committed_at: String,
     ) -> Result<Self> {
+        let capture_policy_revision = manifest
+            .recording_retention
+            .as_ref()
+            .map_or(0, |authority| authority.policy_revision);
+        let recording_authority = RecordingMediaAuthorityDecision::processing(
+            capture_policy_revision,
+            committed_at.clone(),
+        );
         Self::build(
             None,
             account_id,
             manifest,
             object_key,
             object_generation,
+            recording_authority,
+            committed_at,
+        )
+    }
+
+    pub(in crate::cp::media) fn new_with_authority(
+        account_id: String,
+        manifest: CaptureEventManifest,
+        object_key: String,
+        object_generation: i64,
+        recording_authority: RecordingMediaAuthorityDecision,
+        committed_at: String,
+    ) -> Result<Self> {
+        Self::build(
+            None,
+            account_id,
+            manifest,
+            object_key,
+            object_generation,
+            recording_authority,
             committed_at,
         )
     }
@@ -104,6 +135,7 @@ impl CanonicalCaptureEventPlan {
         manifest: CaptureEventManifest,
         object_key: String,
         object_generation: i64,
+        recording_authority: RecordingMediaAuthorityDecision,
         committed_at: String,
     ) -> Result<Self> {
         super::super::validate_id("account_id", &account_id)
@@ -121,7 +153,37 @@ impl CanonicalCaptureEventPlan {
             .media
             .as_ref()
             .ok_or(WalIdempotencyError::Malformed)?;
-        let expected_object_key = format!("raw/{account_id}/{}.enc", media.asset_id);
+        if recording_authority.decision_at() != committed_at {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        match &recording_authority {
+            RecordingMediaAuthorityDecision::ProcessingWindow30d {
+                capture_policy_revision,
+                ..
+            } if *capture_policy_revision >= 0 => {}
+            RecordingMediaAuthorityDecision::UntilDeleted {
+                capture_policy_revision,
+                retention_policy_revision,
+                retention_policy_epoch,
+                recording_key_epoch,
+                ..
+            } if manifest.stream_kind.is_audio()
+                && *capture_policy_revision > 0
+                && *capture_policy_revision == *retention_policy_revision
+                && *recording_key_epoch > 0
+                && retention_policy_epoch.starts_with("rpe_")
+                && retention_policy_epoch.len() == 68
+                && manifest.recording_retention.as_ref().is_some_and(|echo| {
+                    echo.policy_revision == *capture_policy_revision
+                        && echo.policy_epoch == *retention_policy_epoch
+                }) => {}
+            _ => return Err(WalIdempotencyError::Malformed),
+        }
+        let expected_object_key = if recording_authority.is_durable() {
+            format!("recordings/{account_id}/{}.enc", media.asset_id)
+        } else {
+            format!("raw/{account_id}/{}.enc", media.asset_id)
+        };
         if object_key != expected_object_key
             || object_key.len() > MAX_OBJECT_KEY_BYTES
             || object_key.contains("..")
@@ -153,6 +215,7 @@ impl CanonicalCaptureEventPlan {
             manifest_digest,
             object_key,
             object_generation,
+            recording_authority,
             committed_at,
         })
     }
@@ -166,12 +229,21 @@ impl CanonicalCaptureEventPlan {
         object_generation: i64,
         committed_at: String,
     ) -> Result<Self> {
+        let capture_policy_revision = manifest
+            .recording_retention
+            .as_ref()
+            .map_or(0, |authority| authority.policy_revision);
+        let recording_authority = RecordingMediaAuthorityDecision::processing(
+            capture_policy_revision,
+            committed_at.clone(),
+        );
         Self::build(
             Some(operation_id),
             account_id,
             manifest,
             object_key,
             object_generation,
+            recording_authority,
             committed_at,
         )
     }
@@ -283,6 +355,31 @@ impl WalLogicalDomainPlan for CanonicalCaptureEventPlan {
         request.extend_from_slice(self.manifest_digest.as_bytes());
         encode_string(&mut request, &self.object_key)?;
         request.extend_from_slice(&self.object_generation.to_be_bytes());
+        // Bind the retention and key decision but deliberately exclude the
+        // enclave-clock `decision_at`, for the same replay reason that
+        // `committed_at` is excluded below.
+        match &self.recording_authority {
+            RecordingMediaAuthorityDecision::ProcessingWindow30d {
+                capture_policy_revision,
+                ..
+            } => {
+                request.push(0);
+                request.extend_from_slice(&capture_policy_revision.to_be_bytes());
+            }
+            RecordingMediaAuthorityDecision::UntilDeleted {
+                capture_policy_revision,
+                retention_policy_revision,
+                retention_policy_epoch,
+                recording_key_epoch,
+                ..
+            } => {
+                request.push(1);
+                request.extend_from_slice(&capture_policy_revision.to_be_bytes());
+                request.extend_from_slice(&retention_policy_revision.to_be_bytes());
+                encode_string(&mut request, retention_policy_epoch)?;
+                request.extend_from_slice(&recording_key_epoch.to_be_bytes());
+            }
+        }
         // `committed_at` is deliberately NOT here, and not in the identity
         // either: it is a clock, and the Mac outbox re-posts one event many
         // times. See `commit_stamp` and the F2 precedent in
@@ -300,6 +397,7 @@ impl WalLogicalDomainPlan for CanonicalCaptureEventPlan {
             &self.manifest_digest,
             &self.object_key,
             Some(self.object_generation),
+            Some(&self.recording_authority),
             Some(self.commit_stamp()),
         )
         .map_err(map_domain_error)?;
@@ -720,8 +818,9 @@ fn validate_committed_rows(
             },
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
-    let retain_until =
-        super::super::super::isotime::add_seconds(&plan.manifest.ended_at, 30.0 * 86_400.0);
+    let retain_until = (!plan.recording_authority.is_durable()).then(|| {
+        super::super::super::isotime::add_seconds(&plan.manifest.ended_at, 30.0 * 86_400.0)
+    });
     if stored_media.event_id != plan.manifest.event_id
         || stored_media.object_key != plan.object_key
         || stored_media.object_generation != Some(plan.object_generation)
@@ -738,11 +837,12 @@ fn validate_committed_rows(
         || stored_media.scale != media.scale
         || stored_media.orientation != media.orientation
         || stored_media.processing_state != "queued"
-        || stored_media.retain_until.as_deref() != Some(retain_until.as_str())
+        || stored_media.retain_until != retain_until
         || stored_media.deleted_at.is_some()
     {
         return Err(WalIdempotencyError::Corrupt);
     }
+    validate_recording_authority_row(connection, plan, &media.asset_id)?;
 
     let stored_job = connection
         .query_row(
@@ -787,6 +887,88 @@ fn validate_committed_rows(
         return Err(WalIdempotencyError::Corrupt);
     }
     validate_committed_stamps(connection, plan)
+}
+
+fn validate_recording_authority_row(
+    connection: &Connection,
+    plan: &CanonicalCaptureEventPlan,
+    asset_id: &str,
+) -> Result<()> {
+    let table_present = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recording_media_authority')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+        != 0;
+    if !table_present {
+        return if plan.recording_authority.is_durable() {
+            Err(WalIdempotencyError::Corrupt)
+        } else {
+            Ok(())
+        };
+    }
+    let stored = connection
+        .query_row(
+            "SELECT capture_policy_revision,retention_policy_revision,
+                    retention_policy_epoch,retention_decision,storage_backend,
+                    recording_key_epoch,recording_state,decision_at,updated_at
+             FROM recording_media_authority WHERE asset_id=?1",
+            [asset_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    let Some(stored) = stored else {
+        return Err(WalIdempotencyError::Corrupt);
+    };
+    let matches = match &plan.recording_authority {
+        RecordingMediaAuthorityDecision::ProcessingWindow30d {
+            capture_policy_revision,
+            decision_at,
+        } => {
+            stored.0 == *capture_policy_revision
+                && stored.1 == 0
+                && stored.2.is_none()
+                && stored.3 == "processing_window_30d"
+                && stored.4 == "processing"
+                && stored.5.is_none()
+                && stored.6 == "processing_only"
+                && stored.7 == *decision_at
+                && stored.8 == *decision_at
+        }
+        RecordingMediaAuthorityDecision::UntilDeleted {
+            capture_policy_revision,
+            retention_policy_revision,
+            retention_policy_epoch,
+            recording_key_epoch,
+            decision_at,
+        } => {
+            stored.0 == *capture_policy_revision
+                && stored.1 == *retention_policy_revision
+                && stored.2.as_deref() == Some(retention_policy_epoch.as_str())
+                && stored.3 == "until_deleted"
+                && stored.4 == "recordings"
+                && stored.5 == Some(*recording_key_epoch)
+                && stored.6 == "durable"
+                && stored.7 == *decision_at
+                && stored.8 == *decision_at
+        }
+    };
+    matches.then_some(()).ok_or(WalIdempotencyError::Corrupt)
 }
 
 /// Read back every column whose live-clock DEFAULT this family now binds. A
@@ -1340,6 +1522,7 @@ mod tests {
             &digest,
             &object_key(&event),
             Some(41),
+            None,
         )
         .unwrap();
         let error = execute_prepared_for_owner(

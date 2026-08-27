@@ -146,6 +146,15 @@ screenshot.
     },
     "visible_windows": [],
     "visible_windows_truncated": false
+  },
+  "audio_role": "remote_received",
+  "audio_route": "system_output",
+  "route_epoch": 3,
+  "recording_retention": {
+    "policy_revision": 7,
+    "policy_epoch": "rpe_<64 lowercase hexadecimal characters>",
+    "lease_id": "lease_<64 lowercase hexadecimal characters>",
+    "authority_token": "rrl1.<signed opaque value>"
   }
 }
 ```
@@ -163,6 +172,16 @@ consent bit.
 it on its final durable, gracefully completed audio event. Acceptance atomically records
 the exact capture session as ended; byte-identical replay remains idempotent. A separate
 session-finish request may accelerate that fact but is not the durable boundary.
+
+`recording_retention` is optional, audio-only, and strict. It contains exactly the four
+server-issued fields shown above. The recording lease response also includes client-local
+validity timestamps; clients use those to decide whether the complete source interval is
+covered but never serialize them into this deny-unknown-fields object. The echo is not
+authority by itself. Ingest verifies its signature, account, lease, policy epoch, and
+interval, then rechecks the current encrypted-Control preference under the account
+lifecycle lock. Missing, stale, revoked, out-of-interval, or malformed authority falls
+back to the ordinary 30-day processing path. Durable storage unavailability never becomes
+a claimed durable acknowledgement.
 
 `media_disposition` is `canonical` or `reference`; omission means `canonical`
 for compatibility. Canonical events require `media`, forbid `reference`, and
@@ -741,6 +760,65 @@ Large histories are available without growing the profile response:
 positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
 person returns `404`. Unknown query fields return `400`.
 
+### Recording retention setting (staged)
+
+The cross-platform `recording_retention_v1` setting uses a two-step, revision-bound
+contract:
+
+- `GET /api/v2/settings/recording-retention` returns the capability, settled
+  `processing_window_30d|until_deleted` policy, consent/revision/epoch/effective fields,
+  active operation, and bounded recording/object/byte inventory.
+- `POST /api/v2/settings/recording-retention/preview` accepts only
+  `{target_policy,expected_revision,consent_version,promote_existing}` and returns a
+  short-lived preview bound to that exact settled revision and inventory.
+- `POST /api/v2/settings/recording-retention/changes` accepts the same decision plus
+  `preview_id` and requires `Idempotency-Key`. A destructive downgrade additionally
+  requires provider authentication no more than ten minutes old; it read-fences durable
+  audio before asynchronous exact-generation deletion and recording-key erasure.
+- `GET /api/v2/settings/recording-retention/changes/{operation_id}` returns the bounded
+  operation status. IDs are opaque and owner scoped.
+
+All responses are private/no-store. Enabling is prospective; `promote_existing=true` is
+not currently advertised. The implementation is intentionally dark while schema epoch 2
+is only known: source declares `HEAD=2`, `TARGET=1`, and `MINIMUM_SERVABLE=1`. During this
+phase `capability.available` is false, an enable preview returns `412`, capture remains on
+the existing processing bucket, and playback returns an owner-indistinguishable `404`.
+Separate reviewed releases must first advance TARGET and then MINIMUM_SERVABLE.
+
+### Person conversations and memory playback
+
+`GET /api/v2/people/{person_id}/memories?limit=25&before_id=123` returns
+person-ID-attributed memories newest first. Each row includes the attributed
+utterance count, contributing recording count, truthful aggregate audio availability,
+and optional `playback_start_ms` / `playback_utterance_id` deep-link coordinates.
+`limit` is 1–100. The person must be identified; display-name equality is never used
+as a join key.
+
+`GET /api/v2/memories/{memory_id}/playback?at_ms=0` returns a version-1,
+owner-only playback window. A window covers at most 15 minutes, 128 source segments,
+1,000 utterances, and 4,000 ordered source spans. The response contains opaque
+recording, track, and segment IDs; a memory-relative wall-clock timeline; separate
+mic/system/iPhone tracks; transcript rows; source-span seek coordinates; availability;
+and a positive `projection_revision`. It never exposes a provider object name,
+generation, wrapped key, or media key. Pass only one of `at_ms` or the returned opaque
+`cursor`; the cursor is account, memory, revision, offset, issue-time, and expiry bound.
+
+`GET /api/v2/memories/{memory_id}/recordings/{recording_id}/segments/{segment_id}?projection_revision=7`
+returns one complete bounded source M4A after reauthorizing the memory/recording/segment
+chain and revalidating the exact provider generation, per-user envelope, object-bound
+AAD, plaintext length, SHA-256, codec, and container. A stale revision returns `409`.
+The endpoint intentionally does not advertise arbitrary byte ranges because current
+segments are whole-object AES-GCM ciphertext.
+
+All three surfaces require the ordinary authenticated owner, are rate limited, and set
+`Cache-Control: private, no-store, max-age=0` plus `Pragma: no-cache`. Segment success
+also sets canonical `Content-Type: audio/mp4` and `X-Content-Type-Options: nosniff`.
+After epoch-2 activation, playback may cover source audio still present under the
+processing-window policy as well as affirmatively retained durable audio. It does not
+change either retention decision. Before activation the routes remain dark, and external
+durable rollout additionally remains blocked on full media-byte export and complete
+recording-audio deletion inventory required by ADR-0036.
+
 ## Archive-v3 activation binding (owner only)
 
 `GET /api/admin/archive-v3/activation-binding` is a temporary operational
@@ -899,8 +977,11 @@ the bounded server-side reconciler.
 - Facts may be learned from every confidently attributed turn, not only an
   introduction. Facts retain source event/turn, observed time, literal evidence,
   confidence, derivation version, and temporal supersession history.
-- Raw encrypted media is retained for 30 days to support processing retries and
-  voice-profile reconciliation, then deleted automatically. Account export
+- By default, raw encrypted media is retained for 30 days to support processing retries
+  and voice-profile reconciliation, then deleted automatically. Once every ADR-0036
+  activation gate is satisfied, an account may affirmatively retain original source audio
+  until deletion in the separate encrypted recordings bucket; screenshots remain on the
+  30-day policy. Account export
   includes profile proposals, revisions, and sample-assignment lineage. Account
   deletion removes raw objects, derived records, profiles, lineage, credentials,
   and the encrypted user database. For every exact GCS object name, deletion lists,

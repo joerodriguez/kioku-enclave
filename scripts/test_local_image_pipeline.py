@@ -588,7 +588,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
         self.assertEqual(metadata["schema_version"], 10)
         self.assertEqual(metadata["source_ref"], fresh.CURRENT_TAG)
-        self.assertEqual(metadata["schema_epoch_head"], 1)
+        self.assertEqual(metadata["schema_epoch_head"], 2)
         self.assertEqual(metadata["schema_epoch_target"], 1)
         self.assertEqual(metadata["schema_epoch_minimum_servable"], 1)
         self.assertEqual(metadata["production_genesis_wal_native"], "on")

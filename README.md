@@ -19,10 +19,12 @@ Kioku's privacy claim is:
 > Kioku's macOS and iOS clients are capture-only: bounded audio snippets, screenshots,
 > authoritative timestamps, foreground-app state, and available browser URLs are sent to
 > the hardware-attested Kioku Cloud Core as the product's standard processing path. Raw
-> objects are encrypted per user, processed by Vertex Gemini from inside the enclave,
-> retained for a bounded retry/voice-learning window, and then deleted. Derived records,
-> evidence, and voice profiles remain in the encrypted user archive and are covered by
-> export and deletion. The server code handling that plaintext is open source.
+> objects are encrypted per user and processed by Vertex Gemini from inside the enclave.
+> The current/default policy retains them for a bounded retry/voice-learning window and
+> then deletes them. ADR-0036 stages an opt-in durable original-audio path and owner-only
+> playback, but it remains inactive until its schema, privacy, export, deletion, and
+> rollout gates are complete. Derived records, evidence, and voice profiles remain in the
+> encrypted user archive. The server code handling that plaintext is open source.
 
 The exact deployed image digest is public. A Confidential Space attestation token reports
 the running container digest; a detached Ed25519 signature from the separately pinned
@@ -66,7 +68,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Classifies every signed image as either `owner_only_unvalidated` or
   `validated_real_corpus`. The former permits owner-only production evaluation but
   explicitly authorizes no speaker-quality claim and no external users.
-- Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
+- Serves device sync, search, timeline, episode, feed, MCP, export, deletion, and gated
+  owner-only person-conversation/playback APIs.
 - Enforces provider-authored wall-clock recording allowances through server-timed, idempotent
   60-second leases plus domain-separated, idempotent 60-second reconciliation ticks for
   time recorded into the Mac's encrypted local outbox during a network outage. Offline
@@ -102,6 +105,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
 the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Audio,
 screenshots, and selected text leave the TEE through the documented Vertex boundary.
+After the separately gated ADR-0036 activation, one bounded verified audio segment may
+also leave to its authenticated owner's active browser as a private/no-store response;
+storage credentials and media keys never do.
 Content-free pseudonymous usage/accounting events leave through the billing boundary;
 explicitly configured webhook paths are a separate egress boundary.
 
@@ -249,7 +255,7 @@ The same binary serves all of these surfaces:
 | OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/oauth/apple/authorize`, `/oauth/apple/callback`, `/token` | Protocol-specific validation |
 | Apple identity/linking | `/oauth/apple/native`, `/api/auth/session`, `/api/auth/apple/link`, `/api/auth/apple/web-link` | Apple authorization or an existing authenticated account |
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account`, `/api/account/deletion` | Kioku access token or accepted Google ID token |
-| Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
+| Cloud Capture v2, retention, and owner playback | `/api/v2/capture/*`, `/api/v2/settings/recording-retention*`, `/api/v2/people*`, `/api/v2/memories/*/playback` | Kioku access token or accepted Google ID token; durable retention/playback remain epoch-gated |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images/{id}/content` | Kioku access token or accepted Google ID token |
 | Retired selected screenshot upload | `GET /api/screenshot-images/plan`, `POST /api/screenshot-images` | Kioku access token or accepted Google ID token; Genesis-selected archives receive `410 Gone`, while unselected legacy compatibility remains |
@@ -524,6 +530,12 @@ binding.
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
+
+The ADR-0036 recording bucket is not a mutable environment input. The binary derives its
+exact name as `${KMS_PROJECT}-enclave-recordings`, rejects equality with the index/current/
+legacy media buckets, and constructs the separate provider only from the same fixed
+attested storage boundary. The adapter is still insufficient to activate the feature:
+durable write/read authority additionally requires schema epoch 2 to be minimum-servable.
 
 The Google web OAuth secret, optional Apple login `.p8` key, and environment-separated
 APNs provider `.p8` keys are fetched at runtime from Secret Manager. Production startup

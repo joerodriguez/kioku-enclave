@@ -41,6 +41,48 @@ struct UserClaims {
     email: String,
     #[serde(default)]
     email_verified: bool,
+    #[serde(default)]
+    iat: Option<u64>,
+    #[serde(default)]
+    auth_time: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthCredentialKind {
+    KiokuAccessToken,
+    GoogleIdToken,
+}
+
+/// Content-free authentication evidence attached alongside [`AuthUser`].
+/// Ordinary access tokens deliberately do not satisfy destructive step-up;
+/// callers must present a freshly issued provider identity token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthEvidence {
+    pub(crate) kind: AuthCredentialKind,
+    pub(crate) authenticated_at_epoch_seconds: Option<u64>,
+}
+
+impl AuthEvidence {
+    pub(crate) fn is_recent_provider_auth(self, max_age: Duration) -> bool {
+        if self.kind != AuthCredentialKind::GoogleIdToken {
+            return false;
+        }
+        let Some(authenticated_at) = self.authenticated_at_epoch_seconds else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        authenticated_at <= now.saturating_add(EXP_LEEWAY_SECS)
+            && now.saturating_sub(authenticated_at) <= max_age.as_secs()
+    }
+}
+
+struct VerifiedUserToken {
+    subject: String,
+    email: String,
+    authenticated_at_epoch_seconds: Option<u64>,
 }
 
 struct JwksCache {
@@ -70,6 +112,11 @@ impl UserIdTokenVerifier {
 
     /// Returns `(google_sub, email)` on success.
     pub async fn verify(&self, token: &str) -> Result<(String, String)> {
+        let verified = self.verify_with_evidence(token).await?;
+        Ok((verified.subject, verified.email))
+    }
+
+    async fn verify_with_evidence(&self, token: &str) -> Result<VerifiedUserToken> {
         if self.audiences.is_empty() {
             return Err(EnclaveError::Auth("no Google client ids configured".into()));
         }
@@ -93,7 +140,11 @@ impl UserIdTokenVerifier {
         if !data.claims.email_verified {
             return Err(EnclaveError::Auth("email_verified false".into()));
         }
-        Ok((data.claims.sub, data.claims.email))
+        Ok(VerifiedUserToken {
+            subject: data.claims.sub,
+            email: data.claims.email,
+            authenticated_at_epoch_seconds: data.claims.auth_time.or(data.claims.iat),
+        })
     }
 
     async fn get_jwk(&self, kid: &str) -> Result<jsonwebtoken::jwk::Jwk> {
@@ -367,9 +418,11 @@ pub async fn require_auth(
     };
 
     // 1) our own access token (fast, no network)
-    if let Ok(user_id) =
-        tokens::verify_access_token(&state.config.jwt_secrets, &state.config.base_url, &token)
-    {
+    if let Ok((user_id, issued_at)) = tokens::verify_access_token_with_issued_at(
+        &state.config.jwt_secrets,
+        &state.config.base_url,
+        &token,
+    ) {
         match state.control.user_status(&user_id).await {
             Ok(Some(status))
                 if status == "active"
@@ -377,6 +430,10 @@ pub async fn require_auth(
                         && matches!(status.as_str(), "deleting" | "deleted")) =>
             {
                 req.extensions_mut().insert(AuthUser(user_id));
+                req.extensions_mut().insert(AuthEvidence {
+                    kind: AuthCredentialKind::KiokuAccessToken,
+                    authenticated_at_epoch_seconds: issued_at,
+                });
                 return next.run(req).await;
             }
             Ok(_) => return unavailable_account(),
@@ -388,13 +445,20 @@ pub async fn require_auth(
     }
 
     // 2) Google ID token (device sync / web)
-    match state.user_verifier.verify(&token).await {
-        Ok((google_sub, email)) => {
+    match state.user_verifier.verify_with_evidence(&token).await {
+        Ok(verified) => {
+            let google_sub = verified.subject;
+            let email = verified.email;
+            let evidence = AuthEvidence {
+                kind: AuthCredentialKind::GoogleIdToken,
+                authenticated_at_epoch_seconds: verified.authenticated_at_epoch_seconds,
+            };
             if deletion_status_access {
                 let user_id = tokens::derive_stable_uuid(&google_sub);
                 match state.control.user_status(&user_id).await {
                     Ok(Some(status)) if matches!(status.as_str(), "deleting" | "deleted") => {
                         req.extensions_mut().insert(AuthUser(user_id));
+                        req.extensions_mut().insert(evidence);
                         return next.run(req).await;
                     }
                     Ok(Some(status)) if status == "active" => {}
@@ -412,6 +476,7 @@ pub async fn require_auth(
             {
                 Ok(user) => {
                     req.extensions_mut().insert(AuthUser(user.id));
+                    req.extensions_mut().insert(evidence);
                     next.run(req).await
                 }
                 Err(EnclaveError::SignupLimited) => {

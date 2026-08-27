@@ -1241,6 +1241,37 @@ mod tests {
     }
 
     #[test]
+    fn recording_authority_table_advances_one_to_two_with_exact_delta_and_page_bound() {
+        let view = LadderView::for_test(crate::schema_ladder::SCHEMA_LADDER, 2, 2, 1);
+        let mut archive = view.build_canonical(1).unwrap();
+        archive.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        seed_epoch_marker(&archive, 1).unwrap();
+        let before = product_descriptor(&archive).unwrap();
+        let pages_before = pragma(&archive, "page_count");
+        let freelist_before = pragma(&archive, "freelist_count");
+
+        let plan = SchemaEpochAdvancePlan::over_ladder(ACCOUNT.into(), 1, view).unwrap();
+        assert_eq!(
+            settle(&mut archive, plan).unwrap(),
+            LogicalMutationDisposition::Applied
+        );
+        assert_eq!(read_archive_epoch(&archive).unwrap().epoch, 2);
+        let canonical = view.build_canonical(2).unwrap();
+        let after = product_descriptor(&archive).unwrap();
+        assert_eq!(after, product_descriptor(&canonical).unwrap());
+        let added: Vec<_> = after.iter().filter(|row| !before.contains(row)).collect();
+        assert_eq!(added.len(), 1, "the rung must add exactly one object");
+        assert_eq!(added[0].0, "table");
+        assert_eq!(added[0].1, "recording_media_authority");
+        assert!(before.iter().all(|row| after.contains(row)));
+
+        let allocated = pragma(&archive, "page_count")
+            .saturating_sub(pages_before)
+            .saturating_add(freelist_before.saturating_sub(pragma(&archive, "freelist_count")));
+        assert!(allocated <= MAX_STEP_ALLOCATED_PAGES);
+    }
+
+    #[test]
     fn an_archive_already_at_the_target_is_a_no_op() {
         let view = ladder(LADDER_ONE);
         let mut archive = archive_at_epoch_zero();
@@ -1968,7 +1999,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            head, "74336a506af544588f1572e592cb2e238090247fba8aea25187836a4d8c35701",
+            head, "cc396448ff879dc53ee7624271542109d353985390307f695b316bf8320deab3",
             "SEALED_LADDER_CHAIN_HEAD in the gate script must move with this"
         );
     }
