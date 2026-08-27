@@ -21,6 +21,7 @@ mod model_usage;
 mod notification;
 mod oauth;
 mod query;
+mod recording_retention;
 mod work;
 // PostgreSQL is compiled and contract-tested now, but production construction
 // stays disabled until the interface freeze makes one whole repository set
@@ -84,6 +85,9 @@ pub(crate) use query::{
     PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
     PersonStatementView, PersonSummary, ScreenshotMediaLocator,
 };
+pub(crate) use recording_retention::{
+    RecordingRetentionChangeRequest, RecordingRetentionRepository,
+};
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
     EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,
@@ -96,7 +100,7 @@ use self::legacy::{
     LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
     LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMediaObjectStore,
     LegacyMemoryQueryRepository, LegacyModelUsageRepository, LegacyNotificationRepository,
-    LegacyOAuthRepository, LegacyWorkRepository,
+    LegacyOAuthRepository, LegacyRecordingRetentionRepository, LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 use crate::store::Store;
@@ -118,6 +122,7 @@ pub(crate) struct RepositorySet {
     deliveries: Option<Arc<dyn DeliveryRepository>>,
     finalization: Option<Arc<dyn FinalizationRepository>>,
     notifications: Arc<dyn NotificationRepository>,
+    recording_retention: Arc<dyn RecordingRetentionRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
     media_objects: Arc<dyn MediaObjectStore>,
     media_processing: Option<Arc<dyn MediaProcessingRepository>>,
@@ -140,6 +145,10 @@ impl RepositorySet {
             deliveries: None,
             finalization: None,
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
+            recording_retention: Arc::new(LegacyRecordingRetentionRepository::new(
+                Arc::clone(&control),
+                Arc::clone(&store),
+            )),
             memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
             media_objects: Arc::new(LegacyMediaObjectStore::new(Arc::clone(&store))),
             media_processing: None,
@@ -166,6 +175,7 @@ impl RepositorySet {
             deliveries: Some(Arc::clone(&persistence) as Arc<dyn DeliveryRepository>),
             finalization: Some(Arc::clone(&persistence) as Arc<dyn FinalizationRepository>),
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
+            recording_retention: Arc::clone(&persistence) as Arc<dyn RecordingRetentionRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
             media_objects,
             media_processing: Some(Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>),
@@ -217,6 +227,10 @@ impl RepositorySet {
 
     pub(crate) fn notifications(&self) -> &dyn NotificationRepository {
         self.notifications.as_ref()
+    }
+
+    pub(crate) fn recording_retention(&self) -> &dyn RecordingRetentionRepository {
+        self.recording_retention.as_ref()
     }
 
     pub(crate) fn memory_queries(&self) -> &dyn MemoryQueryRepository {

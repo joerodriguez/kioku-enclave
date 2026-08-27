@@ -24,6 +24,9 @@ pub(crate) trait MediaObjectStore: Send + Sync {
     ) -> Result<GcsGetResponse>;
     async fn delete_compatible(&self, object_name: &str) -> Result<()>;
 
+    /// Delete and verify every durable recording generation for one account.
+    async fn purge_recordings(&self, account_id: &str) -> Result<()>;
+
     /// Delete and verify every GCS generation under this account's exact
     /// processing, legacy, and durable-recording prefixes.
     async fn purge_account(&self, account_id: &str) -> Result<()>;

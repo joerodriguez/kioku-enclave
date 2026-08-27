@@ -3023,8 +3023,9 @@ async fn recording_media_authority_decision(
     }
 
     let preference = state
-        .control
-        .get_recording_retention_preference(user_id)
+        .repositories
+        .recording_retention()
+        .preference(user_id)
         .await?;
     if preference.policy != super::control_store::RecordingRetentionPolicy::UntilDeleted
         || preference.revision != claims.policy_revision
@@ -3048,8 +3049,9 @@ async fn recording_media_authority_decision(
     }
     let key_epoch = preference.revision;
     if state
-        .control
-        .recording_key_epoch(user_id, key_epoch, &claims.policy_epoch)
+        .repositories
+        .recording_retention()
+        .key_epoch(user_id, key_epoch, &claims.policy_epoch)
         .await?
         .is_none()
     {
@@ -3086,13 +3088,16 @@ async fn prepare_canonical_media_write(
         } => {
             let object_key =
                 crate::store::canonical_recording_media_object_key(user_id, &media.asset_id)?;
-            let encryption_key = state
-                .control
-                .open_recording_key_epoch(user_id, *recording_key_epoch, retention_policy_epoch)
+            let key_epoch = state
+                .repositories
+                .recording_retention()
+                .key_epoch(user_id, *recording_key_epoch, retention_policy_epoch)
                 .await?
                 .ok_or_else(|| {
                     EnclaveError::Store("durable recording key authority is unavailable".into())
                 })?;
+            let encryption_key =
+                crate::crypto::load_dek(state.kms.as_ref(), &key_epoch.wrapped_dek_b64).await?;
             let provider_key_reference = crate::store::recording_media_key_reference(
                 *recording_key_epoch,
                 retention_policy_epoch,

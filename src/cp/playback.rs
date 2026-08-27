@@ -352,8 +352,9 @@ async fn current_durable_read_fence(
     user_id: &str,
 ) -> Result<Option<DurableReadFence>> {
     let preference = state
-        .control
-        .get_recording_retention_preference(user_id)
+        .repositories
+        .recording_retention()
+        .preference(user_id)
         .await?;
     if preference.policy == super::control_store::RecordingRetentionPolicy::UntilDeleted
         && preference.operation_state.is_none()
@@ -582,17 +583,30 @@ async fn memory_playback_segment(
                     Err(_) => return internal_error(),
                 };
             let media_dek = match state
-                .control
-                .open_recording_key_epoch(&lookup_user, key_epoch, policy_epoch)
+                .repositories
+                .recording_retention()
+                .key_epoch(&lookup_user, key_epoch, policy_epoch)
                 .await
             {
-                Ok(Some(value)) => value,
-                Ok(None) => return internal_error(),
-                Err(error @ (EnclaveError::Http(_) | EnclaveError::Attestation(_))) => {
-                    return super::routed_read_unavailable("api.playback_segment.kms", &error)
+                Ok(Some(value)) => {
+                    match crate::crypto::load_dek(state.kms.as_ref(), &value.wrapped_dek_b64).await
+                    {
+                        Ok(value) => value,
+                        Err(error @ (EnclaveError::Http(_) | EnclaveError::Attestation(_))) => {
+                            return super::routed_read_unavailable(
+                                "api.playback_segment.kms",
+                                &error,
+                            )
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "playback recording key load failed");
+                            return internal_error();
+                        }
+                    }
                 }
+                Ok(None) => return internal_error(),
                 Err(error) => {
-                    tracing::error!(error = %error, "playback recording key load failed");
+                    tracing::error!(error = %error, "playback recording key lookup failed");
                     return internal_error();
                 }
             };

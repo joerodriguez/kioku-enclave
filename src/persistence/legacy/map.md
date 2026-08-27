@@ -10,6 +10,7 @@
 | `notification.rs` | Behavior-preserving webhook, email preference, and push installation operations backed by `ControlStore`. |
 | `oauth.rs` | Behavior-preserving OAuth registry, grant, code, and refresh-token operations backed by `ControlStore`. |
 | `query.rs` | Behavior-preserving routed search, episode list/detail, merged feed, and capture status backed by the per-account encrypted SQLite store. |
+| `recording_retention.rs` | Behavior-preserving retention preview/CAS, inventory, key-epoch, and downgrade operations across `ControlStore` and the per-account store. |
 | `work.rs` | Behavior-preserving fleet account enumeration, summarizer cursor, provider-send fence, and deletion-ownership operations backed by `ControlStore`. |
 
 Application handlers and workers depend on the typed ports in the parent

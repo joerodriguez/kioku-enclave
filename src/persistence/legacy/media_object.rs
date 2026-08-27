@@ -54,6 +54,12 @@ impl MediaObjectStore for LegacyMediaObjectStore {
         self.store.delete_media(object_name).await
     }
 
+    async fn purge_recordings(&self, account_id: &str) -> Result<()> {
+        self.store
+            .delete_user_recordings_under_lifecycle(account_id)
+            .await
+    }
+
     async fn purge_account(&self, account_id: &str) -> Result<()> {
         self.store.delete_user(account_id).await
     }

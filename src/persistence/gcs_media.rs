@@ -149,6 +149,35 @@ impl MediaObjectStore for GcsMediaObjectStore {
         Ok(())
     }
 
+    async fn purge_recordings(&self, account_id: &str) -> Result<()> {
+        crate::store::validate_user_id(account_id)?;
+        let prefix = format!("recordings/{account_id}/");
+        let providers = if Arc::ptr_eq(&self.current, &self.legacy) {
+            vec![Arc::clone(&self.current)]
+        } else {
+            vec![Arc::clone(&self.current), Arc::clone(&self.legacy)]
+        };
+        let mut hard_delete_time: Option<String> = None;
+        for provider in providers {
+            if let Some(candidate) = purge_prefix(provider.as_ref(), &prefix).await? {
+                if hard_delete_time
+                    .as_ref()
+                    .is_none_or(|current| candidate > *current)
+                {
+                    hard_delete_time = Some(candidate);
+                }
+            }
+        }
+        if hard_delete_time.is_some() {
+            return Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                retry_after_seconds: Some(3600),
+                hard_delete_time,
+            }));
+        }
+        Ok(())
+    }
+
     async fn purge_account(&self, account_id: &str) -> Result<()> {
         crate::store::validate_user_id(account_id)?;
         let prefixes = [

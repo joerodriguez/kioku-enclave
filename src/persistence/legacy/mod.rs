@@ -13,6 +13,7 @@ mod model_usage;
 mod notification;
 mod oauth;
 mod query;
+mod recording_retention;
 mod work;
 
 pub(super) use billing::LegacyBillingRepository;
@@ -25,4 +26,5 @@ pub(super) use model_usage::LegacyModelUsageRepository;
 pub(super) use notification::LegacyNotificationRepository;
 pub(super) use oauth::LegacyOAuthRepository;
 pub(super) use query::LegacyMemoryQueryRepository;
+pub(super) use recording_retention::LegacyRecordingRetentionRepository;
 pub(super) use work::LegacyWorkRepository;

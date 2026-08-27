@@ -45,3 +45,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   identity-binding records exposed by the user export contract.
 - `0020_episode_deletion.sql` adds a durable freeze/provider-purge/database-
   purge state machine and replayable receipt for user-requested episode deletion.
+- `0021_recording_retention.sql` adds fleet-wide recording-retention policy,
+  preview/CAS receipts, durable key epochs, and downgrade reconciliation state.
