@@ -952,7 +952,10 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    load_baked_image_configuration();
+    let postgres_migration_only = std::env::args().nth(1).as_deref() == Some("--migrate-postgres");
+    if !postgres_migration_only {
+        load_baked_image_configuration();
+    }
     // Do not let Tokio create worker threads before the image-baked security
     // configuration has been parsed and installed. The Tokio main attribute
     // constructs the runtime before entering the
@@ -966,6 +969,10 @@ fn main() {
 
 async fn async_main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--migrate-postgres") {
+        migrate_postgres_release_schema().await;
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--measure-voice-eval-similarity") {
         let spec_path = args.get(2).expect(
             "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
@@ -1854,6 +1861,39 @@ async fn async_main() {
         }
         None => panic!("production startup refused: in-enclave TLS is not configured"),
     }
+}
+
+/// One-shot release role used by the private Cloud Run migration job.
+///
+/// It deliberately runs before image configuration, KMS, GCS, provider, model,
+/// listener, and worker construction. The job can therefore hold only the two
+/// PostgreSQL secret grants and cannot accidentally become a serving runtime.
+async fn migrate_postgres_release_schema() {
+    if std::env::var("POSTGRES_MIGRATION_CONFIRM").as_deref() != Ok("empty-production-adr0040") {
+        panic!("POSTGRES_MIGRATION_CONFIRM must authorize the ADR-0040 empty-database release");
+    }
+    let database_url = std::env::var("POSTGRES_DATABASE_URL")
+        .expect("POSTGRES_DATABASE_URL is required by --migrate-postgres");
+    let root_ca_pem = std::env::var("POSTGRES_ROOT_CA_PEM")
+        .ok()
+        .map(String::into_bytes);
+    let persistence = persistence::PostgresPersistence::connect(persistence::PostgresPoolConfig {
+        database_url,
+        root_ca_pem,
+        max_connections: 2,
+        acquire_timeout: std::time::Duration::from_secs(10),
+        statement_timeout: std::time::Duration::from_secs(120),
+    })
+    .await
+    .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
+    persistence
+        .migrate()
+        .await
+        .unwrap_or_else(|error| panic!("PostgreSQL migration failed: {error}"));
+    println!(
+        "ADR-0040 PostgreSQL schema version {} installed and verified",
+        persistence::EXPECTED_SCHEMA_VERSION
+    );
 }
 
 /// Get a serving-ready keystone at boot in ACME mode (ADR-0003), in order of

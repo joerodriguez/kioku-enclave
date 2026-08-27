@@ -251,5 +251,9 @@ ENV VOICE_MODEL_PATH=/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx
 EXPOSE 443
 EXPOSE 80
 EXPOSE 8080
+# Dedicated content-free fleet health listener. Confidential Space publishes
+# only declared ports, so omitting this would make the MIG healthy in-process
+# while every load-balancer and autohealing probe timed out at the VM boundary.
+EXPOSE 8081
 
 ENTRYPOINT ["/kioku-enclave"]
