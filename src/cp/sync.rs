@@ -23,7 +23,9 @@ use tracing::{info, warn};
 
 use crate::{
     error::{EnclaveError, Result as EnclaveResult},
-    persistence::{AccountDeletionOperation, AccountLifecycleRepository, AccountStatus},
+    persistence::{
+        AccountDeletionOperation, AccountLifecycleRepository, AccountStatus, RepositorySet,
+    },
     store::Store,
 };
 
@@ -126,7 +128,7 @@ async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUs
     // literal self-identification plus its active profile can now populate
     // `people`, `person_facts`, and `voice_profiles` on this same lane. The
     // export reports either state faithfully.
-    match dump_user_export(&s.store, &user.0).await {
+    match s.repositories.memory_queries().export(&user.0).await {
         Ok(data) => export_success_response(data),
         Err(e) => {
             // `export_failed` is a client contract and stays, but the status
@@ -170,7 +172,10 @@ fn export_success_response(data: serde_json::Value) -> Response {
 /// logical-export digest the inactive shadow verification hashes is unchanged.
 /// An unreadable archive still propagates its error to the route's 503 rather
 /// than exporting a truncated or empty document.
-async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_json::Value> {
+pub(crate) async fn dump_user_export(
+    store: &Store,
+    user_id: &str,
+) -> EnclaveResult<serde_json::Value> {
     crate::store::validate_user_id(user_id)?;
     store
         .wal_authoritative_read(user_id, canonical_logical_export)
@@ -675,12 +680,16 @@ async fn delete_account(
     };
     // Serialize with every centralized Vertex call. Once acquired, all prior
     // calls have durably recorded terminal telemetry and no new call can begin.
-    let lifecycle_guard = match s.store.lock_user_lifecycle(&user_id).await {
-        Ok(guard) => guard,
-        Err(e) => {
-            warn!(error = %e, "failed to lock account lifecycle for deletion");
-            return err503();
+    let lifecycle_guard = if s.repositories.uses_legacy_state() {
+        match s.store.lock_user_lifecycle(&user_id).await {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                warn!(error = %e, "failed to lock account lifecycle for deletion");
+                return err503();
+            }
         }
+    } else {
+        None
     };
     // A transition to `deleting` happens only after settlement succeeds. On a
     // retry, content may already be gone, so reopening an empty index to settle
@@ -720,17 +729,19 @@ async fn delete_account(
         // be wedged forever on the first crash. Doing it here, under the same
         // lifecycle guard as settlement and before any tombstone, makes the
         // rung idempotently re-runnable instead.
-        if let Some(lane) = s.store.wal_deletion_lane() {
-            if let Err(e) = lane
-                .freeze_media_inventory(s.control.as_ref(), s.store.as_ref(), &user_id)
-                .await
-            {
-                warn!(error = %e, "failed to freeze media inventory before deletion");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "deletion_media_inventory_unavailable"})),
-                )
-                    .into_response();
+        if s.repositories.uses_legacy_state() {
+            if let Some(lane) = s.store.wal_deletion_lane() {
+                if let Err(e) = lane
+                    .freeze_media_inventory(s.control.as_ref(), s.store.as_ref(), &user_id)
+                    .await
+                {
+                    warn!(error = %e, "failed to freeze media inventory before deletion");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "deletion_media_inventory_unavailable"})),
+                    )
+                        .into_response();
+                }
             }
         }
     } else if !matches!(
@@ -816,7 +827,14 @@ async fn delete_account(
 
     // 2. Delete content. Any incomplete outcome remains a durable 202
     // operation; every non-deletion account route stays denied.
-    if let Err(error) = delete_account_content(&s.control, s.store.as_ref(), &user_id).await {
+    if let Err(error) = delete_selected_account_content(
+        Some(&s.repositories),
+        &s.control,
+        s.store.as_ref(),
+        &user_id,
+    )
+    .await
+    {
         let (reason, retry_after_seconds, hard_delete_time) = match &error {
             EnclaveError::DeletionPending(pending) => (
                 pending.reason.as_str(),
@@ -1011,6 +1029,7 @@ async fn begin_adr0022_cutover_account_deletion(
 /// repeats DELETE. Work is serial and bounded so one sweep cannot fan out GCS,
 /// KMS, or control-DB writes.
 async fn reconcile_pending_account_deletions(
+    repositories: Option<&RepositorySet>,
     lifecycle: &dyn AccountLifecycleRepository,
     control: &Arc<ControlStore>,
     store: &Store,
@@ -1062,7 +1081,7 @@ async fn reconcile_pending_account_deletions(
             continue;
         }
 
-        match delete_account_content(control, store, &user_id).await {
+        match delete_selected_account_content(repositories, control, store, &user_id).await {
             Ok(()) => match lifecycle.finalize_account_deletion(&user_id).await {
                 Ok(_) => summary.completed += 1,
                 Err(_) => {
@@ -1110,6 +1129,23 @@ async fn reconcile_pending_account_deletions(
         }
     }
     Ok(summary)
+}
+
+async fn delete_selected_account_content(
+    repositories: Option<&RepositorySet>,
+    control: &Arc<ControlStore>,
+    store: &Store,
+    user_id: &str,
+) -> EnclaveResult<()> {
+    if repositories.is_none_or(RepositorySet::uses_legacy_state) {
+        delete_account_content(control, store, user_id).await
+    } else {
+        repositories
+            .expect("PostgreSQL repository set")
+            .media_objects()
+            .purge_account(user_id)
+            .await
+    }
 }
 
 /// Consume any durable identity-rebind authority before account content
@@ -1209,6 +1245,7 @@ pub fn spawn_account_deletion_reconciler(state: Arc<CpState>) {
         loop {
             interval.tick().await;
             match reconcile_pending_account_deletions(
+                Some(&state.repositories),
                 state.repositories.lifecycle(),
                 &state.control,
                 &state.store,
@@ -1269,6 +1306,7 @@ pub fn spawn_adr0022_zero_archive_cutover(state: Arc<CpState>) {
             }
 
             let reconciliation = reconcile_pending_account_deletions(
+                Some(&state.repositories),
                 state.repositories.lifecycle(),
                 &state.control,
                 &state.store,
@@ -1993,6 +2031,7 @@ mod tests {
         let restarted_store = Store::new(kms, gcs);
 
         let summary = reconcile_pending_account_deletions(
+            None,
             restarted_control.as_ref(),
             &restarted_control,
             &restarted_store,
@@ -2070,6 +2109,7 @@ mod tests {
         let restarted_store = Store::new(kms, gcs);
 
         let summary = reconcile_pending_account_deletions(
+            None,
             restarted_control.as_ref(),
             &restarted_control,
             &restarted_store,
@@ -2136,6 +2176,7 @@ mod tests {
         let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
         let summary = reconcile_pending_account_deletions(
+            None,
             restarted_control.as_ref(),
             &restarted_control,
             &restarted_store,
@@ -2252,6 +2293,7 @@ mod tests {
         let restarted_store = Store::new(kms, gcs.clone());
 
         let summary = reconcile_pending_account_deletions(
+            None,
             restarted_control.as_ref(),
             &restarted_control,
             &restarted_store,

@@ -199,6 +199,7 @@ pub(crate) struct PersonStatementPage {
 /// implementation.
 #[async_trait]
 pub(crate) trait MemoryQueryRepository: Send + Sync {
+    async fn export(&self, account_id: &str) -> Result<Value>;
     async fn search(&self, account_id: &str, request: &SearchRequest) -> Result<Vec<SearchHit>>;
     async fn list_episodes(
         &self,
