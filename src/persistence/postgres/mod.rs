@@ -7,6 +7,7 @@
 mod billing;
 mod entitlement;
 mod identity;
+mod lifecycle;
 mod notification;
 mod oauth;
 mod work;
@@ -19,7 +20,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 4;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -114,6 +115,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 4;
+        }
+        if version == 4 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0005_account_lifecycle.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -197,7 +206,7 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE offline_recording_usage_receipts, recording_delivery_reservations, \
+            "TRUNCATE account_deletion_operations, offline_recording_usage_receipts, recording_delivery_reservations, \
              recording_delivery_balances, recording_lease_denials, recording_lease_requests, \
              recording_leases, vertex_coverage_anchors, billing_detach_outbox, billing_accounts, \
              push_send_fences, push_installations, email_send_fences, \
@@ -764,5 +773,88 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        let billing_detach_id = repositories
+            .billing()
+            .billing_account_id_for_deletion(&account_id)
+            .await
+            .unwrap();
+        let deletion = repositories
+            .lifecycle()
+            .begin_account_deletion(&account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion.status, "pending");
+        assert_eq!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            deletion.operation_id
+        );
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_status(&account_id)
+                .await
+                .unwrap(),
+            Some(AccountStatus::Deleting)
+        );
+        let credentials = repositories
+            .lifecycle()
+            .apple_refresh_credentials(&account_id)
+            .await
+            .unwrap();
+        assert_eq!(credentials.len(), 1);
+        repositories
+            .lifecycle()
+            .mark_apple_credential_revoked(&account_id, &credentials[0].0)
+            .await
+            .unwrap();
+        let pending = repositories
+            .lifecycle()
+            .update_account_deletion_status(
+                &account_id,
+                "identity_cleanup_in_progress",
+                Some(30),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.operation_id, deletion.operation_id);
+        let completed = repositories
+            .lifecycle()
+            .finalize_account_deletion(&account_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, "physical_complete");
+        assert_eq!(completed.reason, "content_deleted");
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_status(&account_id)
+                .await
+                .unwrap(),
+            Some(AccountStatus::Deleted)
+        );
+        assert_eq!(
+            repositories
+                .billing()
+                .pending_billing_detach_ids(10)
+                .await
+                .unwrap(),
+            vec![billing_detach_id]
+        );
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .upsert_subject_account("concurrent-subject", "owner@example.com", 10)
+                .await,
+            Err(crate::error::EnclaveError::Auth(_))
+        ));
     }
 }

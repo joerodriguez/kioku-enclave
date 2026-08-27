@@ -595,6 +595,8 @@ impl WorkRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", &requested.user_id)
+            .await?;
         advisory_transaction_lock(&mut transaction, "webhook-registry", &requested.user_id).await?;
         if let Some(current) = load_webhook_fence(
             &mut transaction,
@@ -905,6 +907,8 @@ impl WorkRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", &requested.user_id)
+            .await?;
         advisory_transaction_lock(&mut transaction, "email-preference", &requested.user_id).await?;
         if let Some(current) = load_email_fence(
             &mut transaction,
@@ -1180,6 +1184,7 @@ impl WorkRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
         advisory_transaction_lock(&mut transaction, "push-registry", "global").await?;
         if let Some(current) =
             load_push_fence(&mut transaction, account_id, installation_id, true).await?

@@ -11,6 +11,7 @@ not select it until every active domain has moved off the legacy stores.
 | `billing.rs` | Fleet-wide billing pseudonyms, recording lease/credit receipts, coverage anchors, and detach outbox. |
 | `entitlement.rs` | Fleet-wide active-account checks and atomic daily quota/Vertex reservations. |
 | `identity.rs` | PostgreSQL accounts, identities, signup budget, Apple credentials, and coherent session reads. |
+| `lifecycle.rs` | PostgreSQL account tombstones, deletion progress, Apple-revocation settlement, cascading purge, and billing-detach creation. |
 | `notification.rs` | PostgreSQL webhook destinations, email consent, and bounded push installation registry serialized against send fences. |
 | `oauth.rs` | PostgreSQL OAuth client registration, consent/code consumption, and refresh-token rotation. |
 | `work.rs` | PostgreSQL-authoritative email, webhook, and push send capabilities, outcome receipts, cancellation, and exact reconciliation. |

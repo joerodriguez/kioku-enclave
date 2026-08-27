@@ -54,10 +54,16 @@ async fn reserve_signup(
 #[async_trait]
 impl IdentitySessionRepository for PostgresPersistence {
     async fn account_status(&self, account_id: &str) -> Result<Option<AccountStatus>> {
-        let status = sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id = $1")
-            .bind(account_id)
-            .fetch_optional(self.pool())
-            .await?;
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM accounts WHERE id=$1 \
+             UNION ALL \
+             SELECT 'deleted' FROM deleted_accounts WHERE account_id=$1 \
+               AND NOT EXISTS(SELECT 1 FROM accounts WHERE id=$1) \
+             LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
         Ok(status.as_deref().map(AccountStatus::from_legacy))
     }
 

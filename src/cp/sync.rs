@@ -25,11 +25,12 @@ use rusqlite::OptionalExtension;
 
 use crate::{
     error::{EnclaveError, Result as EnclaveResult},
+    persistence::{AccountDeletionOperation, AccountLifecycleRepository, AccountStatus},
     store::Store,
 };
 
 use super::auth::AuthUser;
-use super::control_store::{AccountDeletionOperation, ControlStore};
+use super::control_store::ControlStore;
 use super::CpState;
 
 const DELETION_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
@@ -658,7 +659,12 @@ async fn delete_account(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
-    let account_status = match s.control.user_status(&user_id).await {
+    let account_status = match s
+        .repositories
+        .identity_sessions()
+        .account_status(&user_id)
+        .await
+    {
         Ok(Some(status)) => status,
         Ok(None) => {
             return (
@@ -688,7 +694,7 @@ async fn delete_account(
     // A transition to `deleting` happens only after settlement succeeds. On a
     // retry, content may already be gone, so reopening an empty index to settle
     // again would violate deletion. Finalized tombstone retries likewise skip.
-    if account_status == "active" {
+    if account_status == AccountStatus::Active {
         let account_id = match s
             .repositories
             .billing()
@@ -736,7 +742,10 @@ async fn delete_account(
                     .into_response();
             }
         }
-    } else if !matches!(account_status.as_str(), "deleting" | "deleted") {
+    } else if !matches!(
+        account_status,
+        AccountStatus::Deleting | AccountStatus::Deleted
+    ) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "account_unavailable"})),
@@ -747,7 +756,12 @@ async fn delete_account(
     // 1. Fail closed before touching content: stop every other authenticated
     // route and revoke pending/renewable OAuth credentials. A retry of this
     // deletion route remains allowed while status is `deleting`.
-    let operation = match s.control.begin_user_deletion(&user_id).await {
+    let operation = match s
+        .repositories
+        .lifecycle()
+        .begin_account_deletion(&user_id)
+        .await
+    {
         Ok(Some(operation)) => operation,
         Ok(None) => {
             return (
@@ -783,8 +797,9 @@ async fn delete_account(
     // an observed missing exact generation is promoted separately to
     // failed_retryable before this request returns.
     let operation = match s
-        .control
-        .update_user_deletion_status(&user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
+        .repositories
+        .lifecycle()
+        .update_account_deletion_status(&user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
         .await
     {
         Ok(operation) => operation,
@@ -794,9 +809,13 @@ async fn delete_account(
         }
     };
 
-    if revoke_apple_before_content_delete(s.control.as_ref(), s.apple_provider.as_ref(), &user_id)
-        .await
-        .is_err()
+    if revoke_apple_before_content_delete(
+        s.repositories.lifecycle(),
+        s.apple_provider.as_ref(),
+        &user_id,
+    )
+    .await
+    .is_err()
     {
         // The operation is durably fenced already. Do not delete content or
         // finalize identity state until revocation is durably recorded.
@@ -819,7 +838,7 @@ async fn delete_account(
             }
         };
         let operation = persist_deletion_status(
-            s.control.as_ref(),
+            s.repositories.lifecycle(),
             &user_id,
             operation,
             reason,
@@ -830,12 +849,17 @@ async fn delete_account(
         return deletion_delete_response(operation);
     }
     // 3. Remove identity/accounting rows and leave a stable deletion tombstone.
-    match s.control.finalize_user_deletion(&user_id).await {
+    match s
+        .repositories
+        .lifecycle()
+        .finalize_account_deletion(&user_id)
+        .await
+    {
         Ok(operation) => deletion_delete_response(operation),
         Err(_) => {
             warn!("identity cleanup remains pending");
             let operation = persist_deletion_status(
-                s.control.as_ref(),
+                s.repositories.lifecycle(),
                 &user_id,
                 operation,
                 "identity_cleanup_in_progress",
@@ -852,7 +876,12 @@ async fn account_deletion_status(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    match s.control.account_deletion_operation(&user.0).await {
+    match s
+        .repositories
+        .lifecycle()
+        .account_deletion_operation(&user.0)
+        .await
+    {
         Ok(Some(operation)) => deletion_operation_response(StatusCode::OK, operation),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -871,15 +900,15 @@ async fn account_deletion_status(
 }
 
 async fn persist_deletion_status(
-    control: &ControlStore,
+    lifecycle: &dyn AccountLifecycleRepository,
     user_id: &str,
     durable_fallback: AccountDeletionOperation,
     reason: &str,
     retry_after_seconds: Option<u64>,
     hard_delete_time: Option<&str>,
 ) -> AccountDeletionOperation {
-    match control
-        .update_user_deletion_status(user_id, reason, retry_after_seconds, hard_delete_time)
+    match lifecycle
+        .update_account_deletion_status(user_id, reason, retry_after_seconds, hard_delete_time)
         .await
     {
         Ok(operation) => operation,
@@ -898,11 +927,11 @@ async fn persist_deletion_status(
 /// This intentionally returns only a generic error so callers never log a
 /// refresh token, provider response, account id, or object name.
 async fn revoke_apple_before_content_delete(
-    control: &ControlStore,
+    lifecycle: &dyn AccountLifecycleRepository,
     apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
     user_id: &str,
 ) -> EnclaveResult<()> {
-    let credentials = control.apple_refresh_credentials(user_id).await?;
+    let credentials = lifecycle.apple_refresh_credentials(user_id).await?;
     if credentials.is_empty() {
         return Ok(());
     }
@@ -914,7 +943,7 @@ async fn revoke_apple_before_content_delete(
             .revoke_refresh_token(&client_id, &refresh_token)
             .await
             .map_err(|_| EnclaveError::Store("Apple credential revocation failed".into()))?;
-        control
+        lifecycle
             .mark_apple_credential_revoked(user_id, &client_id)
             .await?;
     }
@@ -945,14 +974,15 @@ async fn begin_adr0022_cutover_account_deletion(
 ) -> EnclaveResult<()> {
     let lifecycle_guard = state.store.lock_user_lifecycle(user_id).await?;
     let status = state
-        .control
-        .user_status(user_id)
+        .repositories
+        .identity_sessions()
+        .account_status(user_id)
         .await?
         .ok_or_else(|| EnclaveError::Store("cutover account disappeared".into()))?;
-    if matches!(status.as_str(), "deleting" | "deleted") {
+    if matches!(status, AccountStatus::Deleting | AccountStatus::Deleted) {
         return Ok(());
     }
-    if status != "active" {
+    if status != AccountStatus::Active {
         return Err(EnclaveError::Conflict(
             "cutover account is neither active nor deleting".into(),
         ));
@@ -969,8 +999,9 @@ async fn begin_adr0022_cutover_account_deletion(
             .await?;
     }
     let operation = state
-        .control
-        .begin_user_deletion(user_id)
+        .repositories
+        .lifecycle()
+        .begin_account_deletion(user_id)
         .await?
         .ok_or_else(|| EnclaveError::Conflict("cutover account became unavailable".into()))?;
     drop(lifecycle_guard);
@@ -978,8 +1009,9 @@ async fn begin_adr0022_cutover_account_deletion(
         return Ok(());
     }
     state
-        .control
-        .update_user_deletion_status(user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
+        .repositories
+        .lifecycle()
+        .update_account_deletion_status(user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
         .await?;
     Ok(())
 }
@@ -988,17 +1020,18 @@ async fn begin_adr0022_cutover_account_deletion(
 /// repeats DELETE. Work is serial and bounded so one sweep cannot fan out GCS,
 /// KMS, or control-DB writes.
 async fn reconcile_pending_account_deletions(
+    lifecycle: &dyn AccountLifecycleRepository,
     control: &Arc<ControlStore>,
     store: &Store,
     apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
 ) -> EnclaveResult<DeletionReconcileSummary> {
-    let user_ids = control
-        .deleting_user_ids(DELETION_RECONCILE_BATCH_SIZE)
+    let user_ids = lifecycle
+        .deleting_account_ids(DELETION_RECONCILE_BATCH_SIZE)
         .await?;
     let mut summary = DeletionReconcileSummary::default();
     for user_id in user_ids {
         summary.attempted += 1;
-        let operation = match control.begin_user_deletion(&user_id).await {
+        let operation = match lifecycle.begin_account_deletion(&user_id).await {
             Ok(Some(operation)) => operation,
             Ok(None) | Err(_) => {
                 summary.failures += 1;
@@ -1013,7 +1046,7 @@ async fn reconcile_pending_account_deletions(
             summary.failed_retryable += 1;
             continue;
         }
-        if revoke_apple_before_content_delete(control, apple_provider, &user_id)
+        if revoke_apple_before_content_delete(lifecycle, apple_provider, &user_id)
             .await
             .is_err()
         {
@@ -1023,14 +1056,14 @@ async fn reconcile_pending_account_deletions(
             continue;
         }
         if operation.reason == "identity_cleanup_in_progress" {
-            match control.finalize_user_deletion(&user_id).await {
+            match lifecycle.finalize_account_deletion(&user_id).await {
                 Ok(_) => summary.completed += 1,
                 Err(_) => summary.pending += 1,
             }
             continue;
         }
-        if control
-            .update_user_deletion_status(&user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
+        if lifecycle
+            .update_account_deletion_status(&user_id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
             .await
             .is_err()
         {
@@ -1039,11 +1072,11 @@ async fn reconcile_pending_account_deletions(
         }
 
         match delete_account_content(control, store, &user_id).await {
-            Ok(()) => match control.finalize_user_deletion(&user_id).await {
+            Ok(()) => match lifecycle.finalize_account_deletion(&user_id).await {
                 Ok(_) => summary.completed += 1,
                 Err(_) => {
-                    if control
-                        .update_user_deletion_status(
+                    if lifecycle
+                        .update_account_deletion_status(
                             &user_id,
                             "identity_cleanup_in_progress",
                             Some(30),
@@ -1067,8 +1100,8 @@ async fn reconcile_pending_account_deletions(
                     ),
                     _ => ("content_store_unavailable", Some(30), None),
                 };
-                match control
-                    .update_user_deletion_status(
+                match lifecycle
+                    .update_account_deletion_status(
                         &user_id,
                         reason,
                         retry_after_seconds,
@@ -1185,6 +1218,7 @@ pub fn spawn_account_deletion_reconciler(state: Arc<CpState>) {
         loop {
             interval.tick().await;
             match reconcile_pending_account_deletions(
+                state.repositories.lifecycle(),
                 &state.control,
                 &state.store,
                 state.apple_provider.as_ref(),
@@ -1244,6 +1278,7 @@ pub fn spawn_adr0022_zero_archive_cutover(state: Arc<CpState>) {
             }
 
             let reconciliation = reconcile_pending_account_deletions(
+                state.repositories.lifecycle(),
                 &state.control,
                 &state.store,
                 state.apple_provider.as_ref(),
@@ -1966,10 +2001,14 @@ mod tests {
         let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
 
-        let summary =
-            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
-                .await
-                .unwrap();
+        let summary = reconcile_pending_account_deletions(
+            restarted_control.as_ref(),
+            &restarted_control,
+            &restarted_store,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.completed, 1);
         assert_eq!(summary.pending, 0);
@@ -2039,10 +2078,14 @@ mod tests {
         let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
 
-        let summary =
-            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
-                .await
-                .unwrap();
+        let summary = reconcile_pending_account_deletions(
+            restarted_control.as_ref(),
+            &restarted_control,
+            &restarted_store,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.completed, 1);
         assert_eq!(summary.pending, 0);
@@ -2101,10 +2144,14 @@ mod tests {
         drop(control);
         let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs);
-        let summary =
-            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
-                .await
-                .unwrap();
+        let summary = reconcile_pending_account_deletions(
+            restarted_control.as_ref(),
+            &restarted_control,
+            &restarted_store,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.completed, 0);
@@ -2213,10 +2260,14 @@ mod tests {
         let restarted_control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let restarted_store = Store::new(kms, gcs.clone());
 
-        let summary =
-            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
-                .await
-                .unwrap();
+        let summary = reconcile_pending_account_deletions(
+            restarted_control.as_ref(),
+            &restarted_control,
+            &restarted_store,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.attempted, 0);
         assert_eq!(summary.completed, 0);
         assert_eq!(summary.pending, 0);

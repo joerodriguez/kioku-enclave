@@ -8,6 +8,7 @@ mod billing;
 mod entitlement;
 mod identity;
 mod legacy;
+mod lifecycle;
 mod notification;
 mod oauth;
 mod work;
@@ -21,6 +22,8 @@ use std::sync::Arc;
 
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
+pub use lifecycle::AccountDeletionOperation;
+pub(crate) use lifecycle::AccountLifecycleRepository;
 pub(crate) use notification::NotificationRepository;
 pub use notification::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
 pub(crate) use oauth::{
@@ -38,8 +41,9 @@ pub(crate) use work::{
 };
 
 use self::legacy::{
-    LegacyBillingRepository, LegacyEntitlementRepository, LegacyIdentitySessionRepository,
-    LegacyNotificationRepository, LegacyOAuthRepository, LegacyWorkRepository,
+    LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyEntitlementRepository,
+    LegacyIdentitySessionRepository, LegacyNotificationRepository, LegacyOAuthRepository,
+    LegacyWorkRepository,
 };
 use crate::cp::control_store::ControlStore;
 
@@ -50,6 +54,7 @@ use crate::cp::control_store::ControlStore;
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
+    lifecycle: Arc<dyn AccountLifecycleRepository>,
     billing: Arc<dyn BillingRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
@@ -61,6 +66,7 @@ impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>) -> Self {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
+            lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
             billing: Arc::new(LegacyBillingRepository::new(Arc::clone(&control))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
@@ -73,6 +79,7 @@ impl RepositorySet {
     pub(crate) fn postgres(persistence: Arc<PostgresPersistence>) -> Self {
         Self {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
+            lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
@@ -83,6 +90,10 @@ impl RepositorySet {
 
     pub(crate) fn identity_sessions(&self) -> &dyn IdentitySessionRepository {
         self.identity_sessions.as_ref()
+    }
+
+    pub(crate) fn lifecycle(&self) -> &dyn AccountLifecycleRepository {
+        self.lifecycle.as_ref()
     }
 
     pub(crate) fn billing(&self) -> &dyn BillingRepository {

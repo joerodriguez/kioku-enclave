@@ -9,6 +9,7 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | `mod.rs` | `RepositorySet` composition root for the legacy and PostgreSQL implementations. Production still constructs only legacy until every domain port is complete. |
 | `billing.rs` | Backend-neutral billing pseudonym, recording authorization/credit, coverage, and detach-outbox contract. |
 | `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
+| `lifecycle.rs` | Backend-neutral account tombstone, deletion progress, Apple-revocation, and final identity cleanup contract. |
 | `oauth.rs` | Backend-neutral OAuth client, consent, authorization-code, and refresh-token transaction contract. |
 | `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
 | `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
