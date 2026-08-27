@@ -20,6 +20,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::error::{EnclaveError, Result};
+use crate::persistence::RecordingRetentionChangeRequest;
 
 use super::{
     auth::{AuthEvidence, AuthUser},
@@ -138,26 +139,38 @@ fn retention_response(
 }
 
 fn durable_recording_retention_available(state: &CpState) -> bool {
-    state.durable_recording_storage_bound && crate::schema_ladder::durable_recording_schema_active()
+    state.durable_recording_storage_bound
+        && (!state.repositories.uses_legacy_state()
+            || crate::schema_ladder::durable_recording_schema_active())
 }
 
 async fn get_recording_retention(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user.0).await {
-        Ok(guard) => guard,
-        Err(error) => return retention_error(error),
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user.0).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return retention_error(error),
+        }
+    } else {
+        None
     };
     let preference = match state
-        .control
-        .get_recording_retention_preference(&user.0)
+        .repositories
+        .recording_retention()
+        .preference(&user.0)
         .await
     {
         Ok(preference) => preference,
         Err(error) => return retention_error(error),
     };
-    let inventory = match recording_inventory(&state, &user.0, &preference).await {
+    let inventory = match state
+        .repositories
+        .recording_retention()
+        .inventory(&user.0, &preference)
+        .await
+    {
         Ok(inventory) => inventory,
         Err(error) => return retention_error(error),
     };
@@ -180,25 +193,36 @@ async fn preview_recording_retention(
             json!({"error": "recording_retention_unavailable"}),
         );
     }
-    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user.0).await {
-        Ok(guard) => guard,
-        Err(error) => return retention_error(error),
+    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user.0).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return retention_error(error),
+        }
+    } else {
+        None
     };
     let preference = match state
-        .control
-        .get_recording_retention_preference(&user.0)
+        .repositories
+        .recording_retention()
+        .preference(&user.0)
         .await
     {
         Ok(preference) => preference,
         Err(error) => return retention_error(error),
     };
-    let inventory = match recording_inventory(&state, &user.0, &preference).await {
+    let inventory = match state
+        .repositories
+        .recording_retention()
+        .inventory(&user.0, &preference)
+        .await
+    {
         Ok(inventory) => inventory,
         Err(error) => return retention_error(error),
     };
     match state
-        .control
-        .create_recording_retention_preview(
+        .repositories
+        .recording_retention()
+        .create_preview(
             &user.0,
             request.target_policy,
             request.expected_revision,
@@ -251,33 +275,46 @@ async fn change_recording_retention(
         );
     };
 
-    let lifecycle_guard = match state.store.lock_user_lifecycle(&user.0).await {
-        Ok(guard) => guard,
-        Err(error) => return retention_error(error),
+    let lifecycle_guard = if state.repositories.uses_legacy_state() {
+        match state.store.lock_user_lifecycle(&user.0).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return retention_error(error),
+        }
+    } else {
+        None
     };
     let preference = match state
-        .control
-        .get_recording_retention_preference(&user.0)
+        .repositories
+        .recording_retention()
+        .preference(&user.0)
         .await
     {
         Ok(preference) => preference,
         Err(error) => return retention_error(error),
     };
-    let inventory = match recording_inventory(&state, &user.0, &preference).await {
+    let inventory = match state
+        .repositories
+        .recording_retention()
+        .inventory(&user.0, &preference)
+        .await
+    {
         Ok(inventory) => inventory,
         Err(error) => return retention_error(error),
     };
     let change = match state
-        .control
-        .change_recording_retention_policy(
+        .repositories
+        .recording_retention()
+        .change_policy(
             &user.0,
-            request.target_policy,
-            request.expected_revision,
-            request.consent_version,
-            request.promote_existing,
-            &request.preview_id,
-            inventory,
-            idempotency_key,
+            RecordingRetentionChangeRequest {
+                policy: request.target_policy,
+                expected_revision: request.expected_revision,
+                consent_version: request.consent_version,
+                promote_existing: request.promote_existing,
+                preview_id: &request.preview_id,
+                inventory,
+                idempotency_key,
+            },
         )
         .await
     {
@@ -287,8 +324,9 @@ async fn change_recording_retention(
 
     if change.policy == RecordingRetentionPolicy::UntilDeleted {
         let preference = match state
-            .control
-            .get_recording_retention_preference(&user.0)
+            .repositories
+            .recording_retention()
+            .preference(&user.0)
             .await
         {
             Ok(preference) => preference,
@@ -299,9 +337,18 @@ async fn change_recording_retention(
                 "durable recording policy lost its key epoch".into(),
             ));
         };
+        let candidate = if state.repositories.uses_legacy_state() {
+            String::new()
+        } else {
+            match crate::crypto::generate_and_wrap_dek(state.kms.as_ref()).await {
+                Ok((_, wrapped)) => wrapped,
+                Err(error) => return retention_error(error),
+            }
+        };
         if let Err(error) = state
-            .control
-            .load_or_create_recording_key_epoch(&user.0, preference.revision, policy_epoch)
+            .repositories
+            .recording_retention()
+            .install_key_epoch(&user.0, preference.revision, policy_epoch, &candidate)
             .await
         {
             return retention_error(error);
@@ -313,11 +360,30 @@ async fn change_recording_retention(
     // the caller-owned gate before the reconciler reacquires it to do bounded
     // provider work; a failure remains a visible, retryable 202 operation.
     drop(lifecycle_guard);
-    match state
-        .control
-        .reconcile_recording_retention_change(&user.0, &change.operation_id)
-        .await
-    {
+    let completion = if state.repositories.uses_legacy_state() {
+        state
+            .repositories
+            .recording_retention()
+            .complete_downgrade(&user.0, &change.operation_id)
+            .await
+    } else {
+        match state
+            .repositories
+            .media_objects()
+            .purge_recordings(&user.0)
+            .await
+        {
+            Ok(()) => {
+                state
+                    .repositories
+                    .recording_retention()
+                    .complete_downgrade(&user.0, &change.operation_id)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    };
+    match completion {
         Ok(completed) => no_store_json(StatusCode::OK, json!(completed)),
         Err(error) => {
             tracing::warn!(error = %error, "recording retention deletion remains pending");
@@ -332,8 +398,9 @@ async fn get_recording_retention_change(
     Path(operation_id): Path<String>,
 ) -> Response {
     match state
-        .control
-        .recording_retention_change(&user.0, &operation_id)
+        .repositories
+        .recording_retention()
+        .change(&user.0, &operation_id)
         .await
     {
         Ok(Some(change)) => no_store_json(StatusCode::OK, json!(change)),
@@ -342,44 +409,13 @@ async fn get_recording_retention_change(
     }
 }
 
-async fn recording_inventory(
-    state: &CpState,
-    user_id: &str,
-    preference: &super::control_store::RecordingRetentionPreference,
-) -> Result<RecordingRetentionInventory> {
-    let (policy_revision, policy_epoch) = match preference.policy {
-        RecordingRetentionPolicy::UntilDeleted => {
-            let epoch = preference.policy_epoch.clone().ok_or_else(|| {
-                EnclaveError::Store("durable recording policy lost its epoch".into())
-            })?;
-            (Some(preference.revision), Some(epoch))
-        }
-        RecordingRetentionPolicy::ProcessingWindow30d if preference.operation_state.is_some() => {
-            // A downgrade deletes the complete durable prefix, including any
-            // historical epoch. Keep displaying that bounded work until its
-            // provider/key purge settles.
-            (None, None)
-        }
-        RecordingRetentionPolicy::ProcessingWindow30d => return Ok(empty_recording_inventory()),
-    };
-    let user_id = user_id.to_string();
-    state
-        .store
-        .wal_authoritative_read(&user_id.clone(), move |connection| {
-            recording_inventory_conn(
-                connection,
-                &user_id,
-                policy_revision,
-                policy_epoch.as_deref(),
-            )
-        })
-        .await
-}
-
 pub(crate) async fn recording_authority_schema_present(
     state: &CpState,
     user_id: &str,
 ) -> Result<bool> {
+    if !state.repositories.uses_legacy_state() {
+        return Ok(true);
+    }
     state
         .store
         .wal_authoritative_read(user_id, |connection| {
@@ -394,7 +430,7 @@ pub(crate) async fn recording_authority_schema_present(
         .await
 }
 
-fn recording_inventory_conn(
+pub(crate) fn recording_inventory_conn(
     connection: &Connection,
     user_id: &str,
     policy_revision: Option<i64>,
@@ -488,7 +524,7 @@ fn recording_inventory_conn(
     })
 }
 
-fn empty_recording_inventory() -> RecordingRetentionInventory {
+pub(crate) fn empty_recording_inventory() -> RecordingRetentionInventory {
     RecordingRetentionInventory {
         inventory_fingerprint: format!(
             "{:x}",
@@ -506,8 +542,9 @@ pub(crate) fn spawn_reconciler(state: Arc<CpState>) {
         loop {
             interval.tick().await;
             let pending = match state
-                .control
-                .pending_recording_retention_changes(RECONCILE_BATCH_SIZE)
+                .repositories
+                .recording_retention()
+                .pending_changes(RECONCILE_BATCH_SIZE)
                 .await
             {
                 Ok(pending) => pending,
@@ -517,11 +554,30 @@ pub(crate) fn spawn_reconciler(state: Arc<CpState>) {
                 }
             };
             for (user_id, operation_id) in pending {
-                if let Err(error) = state
-                    .control
-                    .reconcile_recording_retention_change(&user_id, &operation_id)
-                    .await
-                {
+                let result = if state.repositories.uses_legacy_state() {
+                    state
+                        .repositories
+                        .recording_retention()
+                        .complete_downgrade(&user_id, &operation_id)
+                        .await
+                } else {
+                    match state
+                        .repositories
+                        .media_objects()
+                        .purge_recordings(&user_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            state
+                                .repositories
+                                .recording_retention()
+                                .complete_downgrade(&user_id, &operation_id)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "recording retention reconciliation deferred");
                 }
             }

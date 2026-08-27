@@ -2368,7 +2368,7 @@ impl RecordingRetentionPolicy {
         }
     }
 
-    fn from_db(value: &str) -> Result<Self> {
+    pub(crate) fn from_db(value: &str) -> Result<Self> {
         match value {
             "processing_window_30d" => Ok(Self::ProcessingWindow30d),
             "until_deleted" => Ok(Self::UntilDeleted),
@@ -2407,7 +2407,7 @@ pub struct RecordingRetentionInventory {
 }
 
 impl RecordingRetentionInventory {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.object_count < 0
             || self.byte_count < 0
             || self.recording_count < 0
@@ -2446,14 +2446,14 @@ pub struct RecordingRetentionChange {
     pub updated_at: String,
 }
 
-fn valid_retention_idempotency_key(value: &str) -> bool {
+pub(crate) fn valid_retention_idempotency_key(value: &str) -> bool {
     (8..=128).contains(&value.len())
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-fn recording_retention_request_fingerprint(
+pub(crate) fn recording_retention_request_fingerprint(
     policy: RecordingRetentionPolicy,
     expected_revision: i64,
     consent_version: i64,
@@ -2477,7 +2477,7 @@ fn recording_retention_request_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-fn recording_retention_preview_fingerprint(
+pub(crate) fn recording_retention_preview_fingerprint(
     policy: RecordingRetentionPolicy,
     expected_revision: i64,
     consent_version: i64,
@@ -24883,27 +24883,6 @@ impl ControlStore {
             }
         })
         .await
-    }
-
-    /// Open one centrally registered recording key inside the enclave. The
-    /// wrapped envelope never needs to be copied into durable-object metadata
-    /// or a per-user archive row; callers retain only the non-secret epoch
-    /// reference needed to resolve this authority again on playback.
-    pub(crate) async fn open_recording_key_epoch(
-        &self,
-        user_id: &str,
-        key_epoch: i64,
-        policy_epoch: &str,
-    ) -> Result<Option<crate::crypto::Dek>> {
-        let Some(epoch) = self
-            .recording_key_epoch(user_id, key_epoch, policy_epoch)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            crate::crypto::load_dek(self.kms.as_ref(), &epoch.wrapped_dek_b64).await?,
-        ))
     }
 
     pub(crate) async fn email_outbox_deletion_owned(&self, user_id: &str) -> Result<bool> {

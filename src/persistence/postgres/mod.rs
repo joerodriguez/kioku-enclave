@@ -18,6 +18,7 @@ mod model_usage;
 mod notification;
 mod oauth;
 mod query;
+mod recording_retention;
 mod work;
 
 use std::str::FromStr;
@@ -28,7 +29,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 20;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 21;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -256,6 +257,14 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 20;
+        }
+        if version == 20 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0021_recording_retention.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -334,6 +343,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{PostgresPersistence, PostgresPoolConfig};
+    use crate::cp::control_store::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
     use crate::episodes::EpisodeInput;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
@@ -349,8 +359,9 @@ mod tests {
         McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
         MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
         PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
-        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+        RecordingRetentionChangeRequest, ScreenMediaSettlement, ScreenshotMediaLocator,
+        SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
+        WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::search::{SearchHit, SearchRequest};
@@ -434,6 +445,134 @@ mod tests {
         assert!(repositories
             .captures()
             .media_dek_wrapped(&account_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let initial_retention = repositories
+            .recording_retention()
+            .preference(&account_id)
+            .await
+            .unwrap();
+        assert_eq!(initial_retention.revision, 0);
+        assert_eq!(
+            initial_retention.policy,
+            RecordingRetentionPolicy::ProcessingWindow30d
+        );
+        let initial_inventory = repositories
+            .recording_retention()
+            .inventory(&account_id, &initial_retention)
+            .await
+            .unwrap();
+        assert_eq!(initial_inventory.object_count, 0);
+        let durable_preview = repositories
+            .recording_retention()
+            .create_preview(
+                &account_id,
+                RecordingRetentionPolicy::UntilDeleted,
+                0,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                initial_inventory.clone(),
+            )
+            .await
+            .unwrap();
+        let durable_change_request = RecordingRetentionChangeRequest {
+            policy: RecordingRetentionPolicy::UntilDeleted,
+            expected_revision: 0,
+            consent_version: RECORDING_RETENTION_CONSENT_VERSION,
+            promote_existing: false,
+            preview_id: &durable_preview.preview_id,
+            inventory: initial_inventory,
+            idempotency_key: "retention-contract-1",
+        };
+        let durable_change = repositories
+            .recording_retention()
+            .change_policy(&account_id, durable_change_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(durable_change.state, "settled");
+        assert_eq!(
+            repositories
+                .recording_retention()
+                .change_policy(&account_id, durable_change_request)
+                .await
+                .unwrap(),
+            durable_change
+        );
+        let durable_preference = repositories
+            .recording_retention()
+            .preference(&account_id)
+            .await
+            .unwrap();
+        let policy_epoch = durable_preference.policy_epoch.clone().unwrap();
+        let installed_key = repositories
+            .recording_retention()
+            .install_key_epoch(
+                &account_id,
+                durable_preference.revision,
+                &policy_epoch,
+                "wrapped-retention-key",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .recording_retention()
+                .key_epoch(&account_id, installed_key.key_epoch, &policy_epoch)
+                .await
+                .unwrap()
+                .unwrap(),
+            installed_key
+        );
+        let durable_inventory = repositories
+            .recording_retention()
+            .inventory(&account_id, &durable_preference)
+            .await
+            .unwrap();
+        let downgrade_preview = repositories
+            .recording_retention()
+            .create_preview(
+                &account_id,
+                RecordingRetentionPolicy::ProcessingWindow30d,
+                durable_preference.revision,
+                RECORDING_RETENTION_CONSENT_VERSION,
+                false,
+                durable_inventory.clone(),
+            )
+            .await
+            .unwrap();
+        let downgrade = repositories
+            .recording_retention()
+            .change_policy(
+                &account_id,
+                RecordingRetentionChangeRequest {
+                    policy: RecordingRetentionPolicy::ProcessingWindow30d,
+                    expected_revision: durable_preference.revision,
+                    consent_version: RECORDING_RETENTION_CONSENT_VERSION,
+                    promote_existing: false,
+                    preview_id: &downgrade_preview.preview_id,
+                    inventory: durable_inventory,
+                    idempotency_key: "retention-contract-2",
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(downgrade.state, "delete_pending");
+        repositories
+            .media_objects()
+            .purge_recordings(&account_id)
+            .await
+            .unwrap();
+        let completed_downgrade = repositories
+            .recording_retention()
+            .complete_downgrade(&account_id, &downgrade.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(completed_downgrade.state, "physical_complete");
+        assert!(repositories
+            .recording_retention()
+            .key_epoch(&account_id, installed_key.key_epoch, &policy_epoch)
             .await
             .unwrap()
             .is_none());

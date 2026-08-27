@@ -15,9 +15,11 @@ connections, SQL callbacks, or whole-file persistence behavior.
 | `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
 | `episode_deletion.rs` | Backend-neutral two-step episode freeze, provider cleanup inventory, and durable purge receipt. |
 | `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
+| `recording_retention.rs` | Backend-neutral preview/CAS policy, durable recording-key epoch, inventory, and downgrade-completion contract. |
 | `work.rs` | Backend-neutral fleet account enumeration, summarizer cursor, and durable email, webhook, and push disclosure-fence contracts; provider I/O occurs outside the repository transaction. |
 | [`legacy/`](legacy/map.md) | Private behavior-preserving adapters over the current encrypted SQLite/GCS stores. |
 | [`postgres/`](postgres/map.md) | Bounded SQLx pool plus PostgreSQL implementations of the extracted ports. |
+| `media_object.rs` / `gcs_media.rs` | Encrypted GCS object contract and provider implementation, including exact account and durable-recording purge. |
 
 The legacy adapter remains authoritative while interfaces are extracted. It is not a
 production dual-write or fallback mechanism. A future PostgreSQL repository set will be

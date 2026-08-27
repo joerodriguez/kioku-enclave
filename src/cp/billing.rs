@@ -711,8 +711,9 @@ async fn attach_recording_retention_authority(
         return Ok(summary);
     }
     let preference = state
-        .control
-        .get_recording_retention_preference(user_id)
+        .repositories
+        .recording_retention()
+        .preference(user_id)
         .await
         .map_err(|_| RecordingAuthorizationFailure::Unavailable)?;
     let mut authority = serde_json::json!({
