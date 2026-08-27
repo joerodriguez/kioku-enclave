@@ -31,11 +31,11 @@ pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 1_024;
 /// send plaintext after the account has become inactive.
 async fn lock_active_user_lifecycle(
     store: &crate::store::Store,
-    control: &super::control_store::ControlStore,
+    repositories: &crate::persistence::RepositorySet,
     user_id: &str,
 ) -> Result<OwnedMutexGuard<()>> {
     let guard = store.lock_user_lifecycle(user_id).await?;
-    if !super::limits::account_active(control, user_id).await? {
+    if !super::limits::account_active(repositories, user_id).await? {
         return Err(EnclaveError::Auth("account inactive".into()));
     }
     Ok(guard)
@@ -294,7 +294,7 @@ pub async fn generate_custom(
     // Hold through the durable terminal usage write on every response/error
     // path. Account deletion waits here before it destroys the usage ledger.
     let _lifecycle_guard =
-        lock_active_user_lifecycle(&state.store, &state.control, user_id).await?;
+        lock_active_user_lifecycle(&state.store, &state.repositories, user_id).await?;
     let config = &state.config;
     let model = &config.vertex_model;
     if config.vertex_project.is_empty() {
@@ -480,7 +480,7 @@ async fn send_media_request(
     // Both audio and storyboard calls share the same deletion fence as the
     // text path; no user-specific Vertex egress bypasses this function.
     let _lifecycle_guard =
-        lock_active_user_lifecycle(&state.store, &state.control, user_id).await?;
+        lock_active_user_lifecycle(&state.store, &state.repositories, user_id).await?;
     let config = &state.config;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
@@ -687,14 +687,15 @@ mod tests {
         let terminal_usage_persisted = Arc::new(AtomicBool::new(false));
         let egresses = Arc::new(AtomicUsize::new(0));
         let call_store = Arc::clone(&store);
-        let call_control = Arc::clone(&control);
+        let call_repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
         let call_user = user.id.clone();
         let call_started = Arc::clone(&started);
         let call_release = Arc::clone(&release);
         let call_terminal = Arc::clone(&terminal_usage_persisted);
         let call_egresses = Arc::clone(&egresses);
         let in_flight = tokio::spawn(async move {
-            let _guard = lock_active_user_lifecycle(&call_store, &call_control, &call_user).await?;
+            let _guard =
+                lock_active_user_lifecycle(&call_store, &call_repositories, &call_user).await?;
             call_egresses.fetch_add(1, Ordering::SeqCst);
             call_started.notify_one();
             call_release.notified().await;
@@ -716,12 +717,12 @@ mod tests {
         assert!(!deletion.is_finished());
 
         let queued_store = Arc::clone(&store);
-        let queued_control = Arc::clone(&control);
+        let queued_repositories = crate::persistence::RepositorySet::legacy(Arc::clone(&control));
         let queued_user = user.id.clone();
         let queued_egresses = Arc::clone(&egresses);
         let queued = tokio::spawn(async move {
             let result =
-                lock_active_user_lifecycle(&queued_store, &queued_control, &queued_user).await;
+                lock_active_user_lifecycle(&queued_store, &queued_repositories, &queued_user).await;
             if result.is_ok() {
                 queued_egresses.fetch_add(1, Ordering::SeqCst);
             }

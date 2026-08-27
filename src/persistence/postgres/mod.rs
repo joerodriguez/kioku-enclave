@@ -4,6 +4,7 @@
 //! not select it until every application domain has a PostgreSQL port. That
 //! keeps the intermediate releases single-authority.
 
+mod entitlement;
 mod identity;
 mod oauth;
 
@@ -15,7 +16,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 1;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -82,6 +83,16 @@ impl PostgresPersistence {
         .await?;
         if !installed {
             sqlx::raw_sql(include_str!("../../../migrations/0001_identity_oauth.sql"))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let version = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM persistence_schema WHERE singleton = true",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if version == 1 {
+            sqlx::raw_sql(include_str!("../../../migrations/0002_entitlements.sql"))
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -162,7 +173,7 @@ mod tests {
         persistence.migrate().await.unwrap();
         persistence.verify_schema().await.unwrap();
         sqlx::raw_sql(
-            "TRUNCATE refresh_tokens, oauth_authorization_codes, oauth_consents, \
+            "TRUNCATE usage_daily, refresh_tokens, oauth_authorization_codes, oauth_consents, \
              oauth_clients, apple_credentials, auth_identities, deleted_identities, \
              deleted_accounts, signup_daily, accounts CASCADE",
         )
@@ -235,6 +246,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(session.providers, vec!["apple", "google"]);
+
+        let mut reservations = Vec::new();
+        for _ in 0..8 {
+            let repositories = Arc::clone(&repositories);
+            let account_id = account_id.clone();
+            reservations.push(tokio::spawn(async move {
+                repositories
+                    .entitlements()
+                    .reserve_vertex_output_tokens_for_class(
+                        &account_id,
+                        crate::persistence::VertexWorkClass::Audio,
+                        100,
+                        400,
+                    )
+                    .await
+                    .unwrap()
+                    .allowed
+            }));
+        }
+        let mut allowed = 0;
+        for reservation in reservations {
+            allowed += usize::from(reservation.await.unwrap());
+        }
+        assert_eq!(allowed, 2, "the protected audio budget is fleet-wide");
 
         let client_id = "11111111-1111-4111-8111-111111111111";
         repositories

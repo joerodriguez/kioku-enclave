@@ -9,7 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 
-use super::control_store::ControlStore;
+use crate::persistence::RepositorySet;
+
+pub(crate) use crate::persistence::VertexWorkClass;
 
 /// Token-bucket rate limiter keyed by user id.
 pub struct RateLimiter {
@@ -48,8 +50,8 @@ impl RateLimiter {
 
 /// Returns true only for an existing active account. Unknown/deleted users are
 /// denied so a stale access token cannot recreate content after deletion.
-pub async fn account_active(control: &ControlStore, user_id: &str) -> Result<bool> {
-    Ok(control.user_status(user_id).await?.as_deref() == Some("active"))
+pub async fn account_active(repositories: &RepositorySet, user_id: &str) -> Result<bool> {
+    repositories.entitlements().account_active(user_id).await
 }
 
 pub struct QuotaResult {
@@ -58,31 +60,7 @@ pub struct QuotaResult {
     pub quota: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VertexWorkClass {
-    Audio,
-    Screen,
-    DerivedText,
-}
-
-impl VertexWorkClass {
-    fn quota_name(self) -> &'static str {
-        match self {
-            Self::Audio => "vertex_audio_output_tokens_per_day",
-            Self::Screen => "vertex_screen_output_tokens_per_day",
-            Self::DerivedText => "vertex_derived_output_tokens_per_day",
-        }
-    }
-
-    fn protected_limit(self, daily_limit: i64) -> i64 {
-        let percent = match self {
-            Self::Audio => 50,
-            Self::Screen | Self::DerivedText => 25,
-        };
-        daily_limit.saturating_mul(percent) / 100
-    }
-}
-
+#[cfg(test)]
 fn vertex_reservation_allowed(current: i64, requested: i64, limit: i64) -> bool {
     requested > 0 && limit > 0 && current.saturating_add(requested) <= limit
 }
@@ -92,45 +70,19 @@ fn vertex_reservation_allowed(current: i64, requested: i64, limit: i64) -> bool 
 /// reservation because the model may still have completed billable work.
 #[cfg(test)]
 pub async fn reserve_vertex_output_tokens(
-    control: &ControlStore,
+    repositories: &RepositorySet,
     user_id: &str,
     requested: i64,
     daily_limit: i64,
 ) -> Result<QuotaResult> {
-    let user_id = user_id.to_string();
-    control
-        .write(move |conn| {
-            let today: String =
-                conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |row| row.get(0))?;
-            let current: i64 = conn
-                .query_row(
-                    "SELECT vertex_output_tokens FROM usage_daily \
-                     WHERE user_id = ?1 AND day = ?2",
-                    rusqlite::params![user_id, today],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            if !vertex_reservation_allowed(current, requested, daily_limit) {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some("vertex_output_tokens_per_day".into()),
-                });
-            }
-            conn.execute(
-                "INSERT INTO usage_daily \
-                 (user_id, day, vertex_requests, vertex_output_tokens) \
-                 VALUES (?1, ?2, 1, ?3) \
-                 ON CONFLICT(user_id, day) DO UPDATE SET \
-                   vertex_requests = vertex_requests + 1, \
-                   vertex_output_tokens = vertex_output_tokens + excluded.vertex_output_tokens",
-                rusqlite::params![user_id, today, requested],
-            )?;
-            Ok(QuotaResult {
-                allowed: true,
-                quota: None,
-            })
-        })
-        .await
+    let result = repositories
+        .entitlements()
+        .reserve_vertex_output_tokens(user_id, requested, daily_limit)
+        .await?;
+    Ok(QuotaResult {
+        allowed: result.allowed,
+        quota: result.quota,
+    })
 }
 
 /// Atomically reserve a bounded Vertex output ceiling from both the global
@@ -138,144 +90,48 @@ pub async fn reserve_vertex_output_tokens(
 /// is deliberately disabled until source-settled state can be proven; this is
 /// the fail-closed policy that prevents screens from consuming audio capacity.
 pub async fn reserve_vertex_output_tokens_for_class(
-    control: &ControlStore,
+    repositories: &RepositorySet,
     user_id: &str,
     class: VertexWorkClass,
     requested: i64,
     daily_limit: i64,
 ) -> Result<QuotaResult> {
-    let user_id = user_id.to_string();
-    control
-        .write(move |conn| {
-            let today: String =
-                conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |row| row.get(0))?;
-            let current: (i64, i64, i64, i64) = conn
-                .query_row(
-                    "SELECT vertex_output_tokens,vertex_audio_output_tokens,\
-                            vertex_screen_output_tokens,vertex_derived_output_tokens \
-                     FROM usage_daily WHERE user_id=?1 AND day=?2",
-                    rusqlite::params![user_id, today],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap_or((0, 0, 0, 0));
-            let class_current = match class {
-                VertexWorkClass::Audio => current.1,
-                VertexWorkClass::Screen => current.2,
-                VertexWorkClass::DerivedText => current.3,
-            };
-            if !vertex_reservation_allowed(current.0, requested, daily_limit) {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some("vertex_output_tokens_per_day".into()),
-                });
-            }
-            if !vertex_reservation_allowed(
-                class_current,
-                requested,
-                class.protected_limit(daily_limit),
-            ) {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some(class.quota_name().into()),
-                });
-            }
-            let (audio, screen, derived) = match class {
-                VertexWorkClass::Audio => (requested, 0, 0),
-                VertexWorkClass::Screen => (0, requested, 0),
-                VertexWorkClass::DerivedText => (0, 0, requested),
-            };
-            conn.execute(
-                "INSERT INTO usage_daily \
-                 (user_id,day,vertex_requests,vertex_output_tokens,\
-                  vertex_audio_output_tokens,vertex_screen_output_tokens,vertex_derived_output_tokens) \
-                 VALUES (?1,?2,1,?3,?4,?5,?6) \
-                 ON CONFLICT(user_id,day) DO UPDATE SET \
-                   vertex_requests=vertex_requests+1,\
-                   vertex_output_tokens=vertex_output_tokens+excluded.vertex_output_tokens,\
-                   vertex_audio_output_tokens=vertex_audio_output_tokens+excluded.vertex_audio_output_tokens,\
-                   vertex_screen_output_tokens=vertex_screen_output_tokens+excluded.vertex_screen_output_tokens,\
-                   vertex_derived_output_tokens=vertex_derived_output_tokens+excluded.vertex_derived_output_tokens",
-                rusqlite::params![user_id, today, requested, audio, screen, derived],
-            )?;
-            Ok(QuotaResult {
-                allowed: true,
-                quota: None,
-            })
-        })
-        .await
+    let result = repositories
+        .entitlements()
+        .reserve_vertex_output_tokens_for_class(user_id, class, requested, daily_limit)
+        .await?;
+    Ok(QuotaResult {
+        allowed: result.allowed,
+        quota: result.quota,
+    })
 }
 
 /// Check-then-increment daily usage. Mildly racy under concurrency (acceptable —
 /// a few items past the cap don't matter and the next call re-checks).
 #[allow(dead_code)] // retained for old-index tooling after `/api/sync/batch` retirement
 pub async fn daily_quota(
-    control: &ControlStore,
+    repositories: &RepositorySet,
     user_id: &str,
     utterances: i64,
     screenshots: i64,
     mcp_calls: i64,
     limits: (i64, i64, i64),
 ) -> Result<QuotaResult> {
-    if utterances == 0 && screenshots == 0 && mcp_calls == 0 {
-        return Ok(QuotaResult {
-            allowed: true,
-            quota: None,
-        });
-    }
-    let user_id = user_id.to_string();
-    let (lim_utt, lim_scr, lim_mcp) = limits;
-    control
-        .write(move |conn| {
-            let today: String =
-                conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |r| r.get(0))?;
-            let (cur_utt, cur_scr, cur_mcp): (i64, i64, i64) = conn
-                .query_row(
-                    "SELECT utterances, screenshots, mcp_calls FROM usage_daily \
-                     WHERE user_id = ?1 AND day = ?2",
-                    rusqlite::params![user_id, today],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .unwrap_or((0, 0, 0));
-
-            if utterances > 0 && cur_utt + utterances > lim_utt {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some("utterances_per_day".into()),
-                });
-            }
-            if screenshots > 0 && cur_scr + screenshots > lim_scr {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some("screenshots_per_day".into()),
-                });
-            }
-            if mcp_calls > 0 && cur_mcp + mcp_calls > lim_mcp {
-                return Ok(QuotaResult {
-                    allowed: false,
-                    quota: Some("mcp_calls_per_day".into()),
-                });
-            }
-
-            conn.execute(
-                "INSERT INTO usage_daily (user_id, day, utterances, screenshots, mcp_calls) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(user_id, day) DO UPDATE SET \
-                   utterances  = utterances  + excluded.utterances, \
-                   screenshots = screenshots + excluded.screenshots, \
-                   mcp_calls   = mcp_calls   + excluded.mcp_calls",
-                rusqlite::params![user_id, today, utterances, screenshots, mcp_calls],
-            )?;
-            Ok(QuotaResult {
-                allowed: true,
-                quota: None,
-            })
-        })
-        .await
+    let result = repositories
+        .entitlements()
+        .reserve_daily_usage(user_id, utterances, screenshots, mcp_calls, limits)
+        .await?;
+    Ok(QuotaResult {
+        allowed: result.allowed,
+        quota: result.quota,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cp::control_store::ControlStore;
+    use crate::persistence::RepositorySet;
     use crate::store::tests::{FakeGcs, FakeKms};
     use std::sync::Arc;
 
@@ -289,7 +145,10 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_output_reservations_are_persistent_and_atomic() {
-        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
         let user = control
             .upsert_user(
                 "vertex-budget-user",
@@ -299,10 +158,11 @@ mod tests {
             .await
             .unwrap();
 
-        let first = reserve_vertex_output_tokens(&control, &user.id, 8_192, 8_192)
+        let repositories = RepositorySet::legacy(Arc::clone(&control));
+        let first = reserve_vertex_output_tokens(&repositories, &user.id, 8_192, 8_192)
             .await
             .unwrap();
-        let second = reserve_vertex_output_tokens(&control, &user.id, 1, 8_192)
+        let second = reserve_vertex_output_tokens(&repositories, &user.id, 1, 8_192)
             .await
             .unwrap();
         assert!(first.allowed);
@@ -330,7 +190,10 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_work_classes_have_persistent_protected_budgets() {
-        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
         let user = control
             .upsert_user(
                 "class-budget-user",
@@ -340,10 +203,11 @@ mod tests {
             .await
             .unwrap();
         let daily_limit = 16_384;
+        let repositories = RepositorySet::legacy(Arc::clone(&control));
 
         assert!(
             reserve_vertex_output_tokens_for_class(
-                &control,
+                &repositories,
                 &user.id,
                 VertexWorkClass::Screen,
                 4_096,
@@ -354,7 +218,7 @@ mod tests {
             .allowed
         );
         let screen_over = reserve_vertex_output_tokens_for_class(
-            &control,
+            &repositories,
             &user.id,
             VertexWorkClass::Screen,
             1,
@@ -370,7 +234,7 @@ mod tests {
 
         assert!(
             reserve_vertex_output_tokens_for_class(
-                &control,
+                &repositories,
                 &user.id,
                 VertexWorkClass::Audio,
                 8_192,
@@ -382,7 +246,7 @@ mod tests {
         );
         assert!(
             reserve_vertex_output_tokens_for_class(
-                &control,
+                &repositories,
                 &user.id,
                 VertexWorkClass::DerivedText,
                 4_096,
@@ -412,7 +276,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_billable_media_retry_consumes_a_distinct_output_ceiling() {
-        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
         let user = control
             .upsert_user(
                 "media-retry-budget-user",
@@ -421,6 +288,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let repositories = RepositorySet::legacy(Arc::clone(&control));
 
         // Audio owns half of the 600-token daily ceiling. Three ambiguous or
         // invalid-output attempts may each have been billed and therefore
@@ -428,7 +296,7 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 reserve_vertex_output_tokens_for_class(
-                    &control,
+                    &repositories,
                     &user.id,
                     VertexWorkClass::Audio,
                     100,
@@ -440,7 +308,7 @@ mod tests {
             );
         }
         let fourth = reserve_vertex_output_tokens_for_class(
-            &control,
+            &repositories,
             &user.id,
             VertexWorkClass::Audio,
             100,

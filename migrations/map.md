@@ -6,3 +6,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
 
 - `0001_identity_oauth.sql` creates the account, identity, Apple credential,
   signup-budget, OAuth client/consent/code, and refresh-token foundation.
+- `0002_entitlements.sql` adds tenant-scoped, fleet-wide daily quota and Vertex
+  reservation counters.
