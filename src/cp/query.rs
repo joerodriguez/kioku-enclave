@@ -1928,7 +1928,7 @@ pub(crate) fn spawn_episode_delete_worker(state: Arc<CpState>) {
             if queue.is_empty() {
                 tokio::select! {
                     _ = scan.tick() => {
-                        match state.control.all_user_ids().await {
+                        match state.repositories.work().active_account_ids().await {
                             Ok(ids) => {
                                 for id in ids {
                                     if queued.insert(id.clone()) {
@@ -1956,7 +1956,7 @@ pub(crate) fn spawn_episode_delete_worker(state: Arc<CpState>) {
                     }
                 }
                 _ = scan.tick() => {
-                    match state.control.all_user_ids().await {
+                    match state.repositories.work().active_account_ids().await {
                         Ok(ids) => {
                             for id in ids {
                                 if queued.insert(id.clone()) {

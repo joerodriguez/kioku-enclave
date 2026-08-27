@@ -2520,7 +2520,7 @@ async fn finalize_user_episodes_scoped(
     let user = user_id.to_string();
 
     // Get the summarizer cursor
-    let summarized_until = match state.control.summarized_until(user_id).await? {
+    let summarized_until = match state.repositories.work().summarized_until(user_id).await? {
         Some(c) => c,
         None => {
             if let Some(episode_id) = target_episode_id {
