@@ -8,5 +8,6 @@ not select it until every active domain has moved off the legacy stores.
 | File | Role |
 |---|---|
 | `mod.rs` | Pool construction, UTC/timeout policy, explicit migrator, schema verification, and shared transaction helpers. |
+| `entitlement.rs` | Fleet-wide active-account checks and atomic daily quota/Vertex reservations. |
 | `identity.rs` | PostgreSQL accounts, identities, signup budget, Apple credentials, and coherent session reads. |
 | `oauth.rs` | PostgreSQL OAuth client registration, consent/code consumption, and refresh-token rotation. |

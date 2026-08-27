@@ -1466,7 +1466,7 @@ async fn upload_screen_reference_batch(
             bad_request("reference batches require encrypted outbox delivery mode"),
         );
     }
-    match limits::account_active(&state.control, &user_id).await {
+    match limits::account_active(&state.repositories, &user_id).await {
         Ok(true) => {}
         Ok(false) => {
             return capture_failure_response_for_route(
@@ -1753,7 +1753,7 @@ async fn upload_capture_event(
         .get("kioku-delivery-mode")
         .and_then(|value| value.to_str().ok())
         == Some("encrypted-outbox-v1");
-    match limits::account_active(&state.control, &user_id).await {
+    match limits::account_active(&state.repositories, &user_id).await {
         Ok(true) => {}
         Ok(false) => {
             return capture_failure_response(

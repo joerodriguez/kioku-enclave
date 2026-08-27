@@ -2108,7 +2108,7 @@ async fn reserve_media_output(state: &CpState, user_id: &str, work: &MediaWorkUn
         ),
     };
     let reserved = super::limits::reserve_vertex_output_tokens_for_class(
-        &state.control,
+        &state.repositories,
         user_id,
         class,
         requested,

@@ -1914,7 +1914,7 @@ async fn defer_finalization_for_budget(
 
 async fn reserve_finalizer_output(state: &CpState, user_id: &str) -> Result<()> {
     let reserved = super::limits::reserve_vertex_output_tokens_for_class(
-        &state.control,
+        &state.repositories,
         user_id,
         super::limits::VertexWorkClass::DerivedText,
         i64::from(FINALIZER_MAX_OUTPUT_TOKENS),

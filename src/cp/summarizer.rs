@@ -117,7 +117,7 @@ fn now_ms() -> i64 {
 
 async fn reserve_vertex_output(state: &CpState, user_id: &str, output_tokens: u32) -> Result<()> {
     let reserved = super::limits::reserve_vertex_output_tokens_for_class(
-        &state.control,
+        &state.repositories,
         user_id,
         super::limits::VertexWorkClass::DerivedText,
         i64::from(output_tokens),

@@ -4,6 +4,7 @@
 //! connection or SQL callback. The legacy adapter delegates to the existing
 //! SQLite/GCS stores while the PostgreSQL implementation is built vertically.
 
+mod entitlement;
 mod identity;
 mod legacy;
 mod oauth;
@@ -15,6 +16,7 @@ mod postgres;
 
 use std::sync::Arc;
 
+pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub(crate) use oauth::{
     AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
@@ -23,7 +25,9 @@ pub(crate) use oauth::{
 };
 pub(crate) use postgres::PostgresPersistence;
 
-use self::legacy::{LegacyIdentitySessionRepository, LegacyOAuthRepository};
+use self::legacy::{
+    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyOAuthRepository,
+};
 use crate::cp::control_store::ControlStore;
 
 /// The persistence dependencies injected into application code.
@@ -34,13 +38,15 @@ use crate::cp::control_store::ControlStore;
 pub(crate) struct RepositorySet {
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     oauth: Arc<dyn OAuthRepository>,
+    entitlements: Arc<dyn EntitlementRepository>,
 }
 
 impl RepositorySet {
     pub(crate) fn legacy(control: Arc<ControlStore>) -> Self {
         Self {
             identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
-            oauth: Arc::new(LegacyOAuthRepository::new(control)),
+            oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
+            entitlements: Arc::new(LegacyEntitlementRepository::new(control)),
         }
     }
 
@@ -48,7 +54,8 @@ impl RepositorySet {
     pub(crate) fn postgres(persistence: Arc<PostgresPersistence>) -> Self {
         Self {
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
-            oauth: persistence,
+            oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
+            entitlements: persistence,
         }
     }
 
@@ -58,6 +65,10 @@ impl RepositorySet {
 
     pub(crate) fn oauth(&self) -> &dyn OAuthRepository {
         self.oauth.as_ref()
+    }
+
+    pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {
+        self.entitlements.as_ref()
     }
 }
 
