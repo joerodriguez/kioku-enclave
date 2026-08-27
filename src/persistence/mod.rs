@@ -78,6 +78,7 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use playback::PlaybackRepository;
+pub(crate) use postgres::EXPECTED_SCHEMA_VERSION;
 pub(crate) use postgres::{PostgresPersistence, PostgresPoolConfig};
 pub(crate) use query::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
