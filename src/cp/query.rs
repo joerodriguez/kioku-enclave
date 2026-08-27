@@ -355,6 +355,14 @@ enum EpisodeQueryMode {
     RestPage { before: Option<EpisodeBeforeCursor> },
 }
 
+struct EpisodeRowsQuery {
+    from: Option<String>,
+    to: Option<String>,
+    max: i64,
+    include_low: bool,
+    episode_id: Option<i64>,
+}
+
 fn encode_episode_before_cursor(started_at: &str, id: i64) -> String {
     let mut payload = Vec::with_capacity(1 + std::mem::size_of::<i64>() + started_at.len());
     payload.push(EPISODE_CURSOR_VERSION);
@@ -458,11 +466,13 @@ async fn query_episodes_value(
     query_episodes_rows_value(
         s,
         user_id,
-        from,
-        to,
-        max,
-        include_low,
-        episode_id,
+        EpisodeRowsQuery {
+            from,
+            to,
+            max,
+            include_low,
+            episode_id,
+        },
         EpisodeQueryMode::Legacy,
     )
     .await
@@ -474,21 +484,14 @@ async fn query_episodes_value(
 async fn query_episodes_page_value(
     s: &CpState,
     user_id: &str,
-    from: Option<String>,
-    to: Option<String>,
-    max: i64,
-    include_low: bool,
-    episode_id: Option<i64>,
+    query: EpisodeRowsQuery,
     before: Option<EpisodeBeforeCursor>,
 ) -> crate::error::Result<Value> {
+    let max = query.max.clamp(1, 50);
     query_episodes_rows_value(
         s,
         user_id,
-        from,
-        to,
-        max.clamp(1, 50),
-        include_low,
-        episode_id,
+        EpisodeRowsQuery { max, ..query },
         EpisodeQueryMode::RestPage { before },
     )
     .await
@@ -497,13 +500,16 @@ async fn query_episodes_page_value(
 async fn query_episodes_rows_value(
     s: &CpState,
     user_id: &str,
-    from: Option<String>,
-    to: Option<String>,
-    max: i64,
-    include_low: bool,
-    episode_id: Option<i64>,
+    query: EpisodeRowsQuery,
     mode: EpisodeQueryMode,
 ) -> crate::error::Result<Value> {
+    let EpisodeRowsQuery {
+        from,
+        to,
+        max,
+        include_low,
+        episode_id,
+    } = query;
     // Normalize offset-bearing timestamps (e.g. -04:00) to UTC before SQL.
     // DB stores UTC Z-suffixed strings; after normalization both sides are UTC
     // and simple string comparison works correctly.
@@ -1384,11 +1390,13 @@ async fn rest_episodes(
     match query_episodes_page_value(
         &s,
         &user.0,
-        p.from,
-        p.to,
-        p.max_episodes.unwrap_or(50).clamp(1, 50),
-        include_low,
-        None,
+        EpisodeRowsQuery {
+            from: p.from,
+            to: p.to,
+            max: p.max_episodes.unwrap_or(50).clamp(1, 50),
+            include_low,
+            episode_id: None,
+        },
         before,
     )
     .await
