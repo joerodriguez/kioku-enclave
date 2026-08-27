@@ -329,9 +329,8 @@ impl MemoryFormationRepository for PostgresPersistence {
                 existing_minutes.as_deref(),
                 episode.minute_summaries.as_deref().unwrap_or(&[]),
             );
-            let (minutes_json, minutes_text) = merged_minutes
-                .map(|(json, text)| (json, text))
-                .unwrap_or_else(|| ("[]".into(), String::new()));
+            let (minutes_json, minutes_text) =
+                merged_minutes.unwrap_or_else(|| ("[]".into(), String::new()));
             let substance = if existing_id.is_some() {
                 merge_substance(existing_substance.as_deref(), episode.substance.as_deref())
             } else {

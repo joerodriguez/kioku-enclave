@@ -301,11 +301,146 @@ pub async fn deliver_user_emails(
     transport: &dyn EmailTransport,
     user_id: &str,
 ) -> Result<()> {
+    if state.repositories.deliveries().is_some() {
+        return deliver_postgres_user_emails(state, transport, user_id).await;
+    }
     if state.store.is_wal_authoritative(user_id) {
         deliver_selected_user_emails(state, transport, user_id).await
     } else {
         deliver_legacy_user_emails(state, transport, user_id).await
     }
+}
+
+async fn deliver_postgres_user_emails(
+    state: &CpState,
+    transport: &dyn EmailTransport,
+    user_id: &str,
+) -> Result<()> {
+    let repository = state
+        .repositories
+        .deliveries()
+        .ok_or_else(|| EnclaveError::Store("PostgreSQL delivery repository is missing".into()))?;
+    for _ in 0..MAX_DELIVERIES_PER_SWEEP {
+        let Some(candidate) = repository.next_email_candidate(user_id).await? else {
+            break;
+        };
+        let subject =
+            email_renderer::render_email_subject(&candidate.episode, candidate.include_content);
+        let (text_body, html_body) = email_renderer::render_email_body(
+            &candidate.episode,
+            candidate.include_content,
+            &state.config.web_origin,
+        );
+        let frozen = crate::persistence::FrozenEmailDelivery {
+            recipient_email: candidate.recipient_email.clone(),
+            include_content: candidate.include_content,
+            subject,
+            text_body,
+            html_body,
+        };
+        let mut claim = repository
+            .claim_email(&candidate, frozen.clone(), 60)
+            .await?;
+        if claim.is_none() {
+            // The provider lane deliberately serializes calls across every
+            // process. Give the prior settlement's short pacing window one
+            // chance to elapse; a circuit or competing sender waits for the
+            // next normal sweep.
+            tokio::time::sleep(Duration::from_millis(
+                GLOBAL_SEND_PACE_MILLIS.saturating_add(25),
+            ))
+            .await;
+            claim = repository.claim_email(&candidate, frozen, 60).await?;
+        }
+        let Some(claim) = claim else {
+            break;
+        };
+        let result = transport
+            .send(EmailRequest {
+                to: claim.request.recipient_email.clone(),
+                subject: claim.request.subject.clone(),
+                text_body: claim.request.text_body.clone(),
+                html_body: claim.request.html_body.clone(),
+                idempotency_key: claim.delivery_id.clone(),
+            })
+            .await;
+        let now = isotime::format_epoch_millis(epoch_millis());
+        let (outcome, circuit_seconds) = match result {
+            Ok(response) => (
+                EmailProviderOutcome::Accepted {
+                    status: i64::from(response.status),
+                    provider_message_id: response.provider_message_id,
+                },
+                None,
+            ),
+            Err(EmailTransportError::Ambiguous { .. }) => (EmailProviderOutcome::Ambiguous, None),
+            Err(EmailTransportError::DeliveryTerminal { status, code }) => (
+                EmailProviderOutcome::Failed {
+                    status: status.map(i64::from),
+                    code,
+                },
+                None,
+            ),
+            Err(EmailTransportError::Retryable {
+                status,
+                code,
+                retry_after_seconds,
+            }) => {
+                let circuit = status
+                    .is_some_and(|value| value == 429 || value >= 500)
+                    .then_some(
+                        retry_after_seconds
+                            .unwrap_or(PROVIDER_CIRCUIT_SECONDS)
+                            .clamp(1, 6 * 60 * 60),
+                    );
+                if claim.attempt_count >= MAX_ATTEMPTS {
+                    (
+                        EmailProviderOutcome::Failed {
+                            status: status.map(i64::from),
+                            code: "attempt_cap".into(),
+                        },
+                        circuit,
+                    )
+                } else {
+                    let delay = retry_after_seconds
+                        .and_then(|seconds| i64::try_from(seconds).ok())
+                        .unwrap_or_else(|| retry_delay(claim.attempt_count));
+                    (
+                        EmailProviderOutcome::Retry {
+                            status: status.map(i64::from),
+                            code,
+                            retry_at: add_seconds(&now, delay)?,
+                        },
+                        circuit,
+                    )
+                }
+            }
+            Err(EmailTransportError::ProviderTerminal { status, code }) => {
+                let outcome = if claim.attempt_count >= MAX_ATTEMPTS {
+                    EmailProviderOutcome::Failed {
+                        status: status.map(i64::from),
+                        code,
+                    }
+                } else {
+                    EmailProviderOutcome::Retry {
+                        status: status.map(i64::from),
+                        code,
+                        retry_at: add_seconds(&now, 60 * 60)?,
+                    }
+                };
+                (outcome, Some(PROVIDER_CIRCUIT_SECONDS))
+            }
+        };
+        repository
+            .settle_email(
+                &claim,
+                outcome,
+                circuit_seconds.and_then(|seconds| i64::try_from(seconds).ok()),
+            )
+            .await?;
+        emit_email_metric("settled");
+    }
+    Ok(())
 }
 
 async fn deliver_selected_user_emails(

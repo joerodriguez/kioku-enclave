@@ -6,6 +6,7 @@
 
 mod billing;
 mod capture;
+mod delivery_outbox;
 mod entitlement;
 mod finalization;
 mod gcs_media;
@@ -28,16 +29,22 @@ mod postgres;
 
 use std::sync::Arc;
 
+pub(crate) use billing::BillingRepository;
+pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor};
 pub(crate) use capture::{
     CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight, CaptureRepository,
     CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage,
     CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
+};
+pub(crate) use delivery_outbox::{
+    DeliveryRepository, EmailDeliveryCandidate, EmailDeliveryClaim, FrozenEmailDelivery,
 };
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use finalization::{
     FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationScreenResult,
     FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
 };
+#[allow(unused_imports)]
 pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
@@ -99,6 +106,7 @@ pub(crate) struct RepositorySet {
     captures: Arc<dyn CaptureRepository>,
     oauth: Arc<dyn OAuthRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
+    deliveries: Option<Arc<dyn DeliveryRepository>>,
     finalization: Option<Arc<dyn FinalizationRepository>>,
     notifications: Arc<dyn NotificationRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
@@ -118,6 +126,7 @@ impl RepositorySet {
             captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
             oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
             entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
+            deliveries: None,
             finalization: None,
             notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
             memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
@@ -141,6 +150,7 @@ impl RepositorySet {
             captures: Arc::clone(&persistence) as Arc<dyn CaptureRepository>,
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
+            deliveries: Some(Arc::clone(&persistence) as Arc<dyn DeliveryRepository>),
             finalization: Some(Arc::clone(&persistence) as Arc<dyn FinalizationRepository>),
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
@@ -174,6 +184,10 @@ impl RepositorySet {
 
     pub(crate) fn entitlements(&self) -> &dyn EntitlementRepository {
         self.entitlements.as_ref()
+    }
+
+    pub(crate) fn deliveries(&self) -> Option<&dyn DeliveryRepository> {
+        self.deliveries.as_deref()
     }
 
     pub(crate) fn finalization(&self) -> Option<&dyn FinalizationRepository> {
@@ -291,5 +305,3 @@ mod tests {
         assert!(installed.token_generation > 0);
     }
 }
-pub(crate) use billing::BillingRepository;
-pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor};

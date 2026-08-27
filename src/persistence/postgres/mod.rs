@@ -6,6 +6,7 @@
 
 mod billing;
 mod capture;
+mod delivery_outbox;
 mod entitlement;
 mod finalization;
 mod identity;
@@ -26,7 +27,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 16;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 17;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -224,6 +225,12 @@ impl PostgresPersistence {
             ))
             .execute(&mut *transaction)
             .await?;
+            version = 16;
+        }
+        if version == 16 {
+            sqlx::raw_sql(include_str!("../../../migrations/0017_delivery_claims.sql"))
+                .execute(&mut *transaction)
+                .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -312,11 +319,11 @@ mod tests {
     use crate::persistence::{
         CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
         EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeListRequest,
-        FinalizationScreenResult, FinalizationSettlement, McpContextRequest, McpTimeRangeRequest,
-        McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
-        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
-        PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition, ScreenMediaSettlement,
-        SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
+        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, McpContextRequest,
+        McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
+        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
+        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
+        ScreenMediaSettlement, SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
         WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
@@ -1162,6 +1169,65 @@ mod tests {
             .await
             .unwrap();
         assert!(opted_in.enabled && opted_in.include_content);
+        let email_candidate = repositories
+            .deliveries()
+            .expect("PostgreSQL delivery repository")
+            .next_email_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("finalization email candidate");
+        assert!(email_candidate.include_content);
+        let email_claim = repositories
+            .deliveries()
+            .unwrap()
+            .claim_email(
+                &email_candidate,
+                FrozenEmailDelivery {
+                    recipient_email: email_candidate.recipient_email.clone(),
+                    include_content: email_candidate.include_content,
+                    subject: "PostgreSQL delivery contract".into(),
+                    text_body: "Text contract".into(),
+                    html_body: "<p>HTML contract</p>".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("email claim");
+        assert!(repositories
+            .deliveries()
+            .unwrap()
+            .next_email_candidate(&account_id)
+            .await
+            .unwrap()
+            .is_none());
+        let accepted_email = EmailProviderOutcome::Accepted {
+            status: 202,
+            provider_message_id: "msg_postgres_contract".into(),
+        };
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_email(&email_claim, accepted_email.clone(), None)
+            .await
+            .unwrap();
+        repositories
+            .deliveries()
+            .unwrap()
+            .settle_email(&email_claim, accepted_email, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "delivered"
+        );
         assert!(opted_in.consented_at.is_some());
 
         let installation = PushInstallation {
