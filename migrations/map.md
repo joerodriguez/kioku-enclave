@@ -49,3 +49,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   preview/CAS receipts, durable key epochs, and downgrade reconciliation state.
 - `0022_reference_batch_billing.sql` adds durable reference-batch credit
   reservations, ordered event fingerprints, replay, and completion receipts.
+- `0023_reviewer_fixture.sql` records the idempotent synthetic plugin-review
+  fixture in PostgreSQL.

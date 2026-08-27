@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 
-use crate::{cp::delivery::FinalizedEpisode, error::Result};
+use crate::{
+    cp::{delivery::FinalizedEpisode, webhook_worker::WebhookDeliveryStatusSummary},
+    error::Result,
+};
 
 use super::EmailProviderOutcome;
 use super::PushProviderOutcome;
@@ -161,6 +164,24 @@ impl std::fmt::Debug for PushDeliveryClaim {
 /// the provider without a returned claim.
 #[async_trait]
 pub(crate) trait DeliveryRepository: Send + Sync {
+    async fn resolve_push_handoff(
+        &self,
+        account_id: &str,
+        handoff_handle: &str,
+    ) -> Result<Option<i64>>;
+
+    async fn webhook_delivery_status(
+        &self,
+        account_id: &str,
+        subscription_id: &str,
+    ) -> Result<WebhookDeliveryStatusSummary>;
+
+    async fn cancel_webhook_deliveries(
+        &self,
+        account_id: &str,
+        subscription_id: &str,
+    ) -> Result<()>;
+
     async fn next_email_candidate(
         &self,
         account_id: &str,

@@ -225,6 +225,124 @@ async fn recover_expired_push_claims(
 
 #[async_trait]
 impl DeliveryRepository for PostgresPersistence {
+    async fn resolve_push_handoff(
+        &self,
+        account_id: &str,
+        handoff_handle: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT d.episode_id FROM push_deliveries d \
+             JOIN episodes e ON e.account_id=d.account_id AND e.id=d.episode_id \
+             WHERE d.account_id=$1 AND d.handoff_handle=$2 \
+               AND d.state IN ('pending','processing','retry_wait','delivered','ambiguous') \
+               AND e.finalization_status='complete' LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(handoff_handle)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn webhook_delivery_status(
+        &self,
+        account_id: &str,
+        subscription_id: &str,
+    ) -> Result<crate::cp::webhook_worker::WebhookDeliveryStatusSummary> {
+        let row = sqlx::query(
+            "SELECT count(*) FILTER (WHERE state IN ('pending','processing'))::bigint AS pending, \
+                    count(*) FILTER (WHERE state='retry_wait')::bigint AS retry, \
+                    count(*) FILTER (WHERE state='delivered')::bigint AS sent, \
+                    count(*) FILTER (WHERE state='failed')::bigint AS failed, \
+                    count(*) FILTER (WHERE state='ambiguous')::bigint AS ambiguous, \
+                    count(*) FILTER (WHERE state='cancelled')::bigint AS cancelled \
+             FROM webhook_deliveries WHERE account_id=$1 AND subscription_id=$2",
+        )
+        .bind(account_id)
+        .bind(subscription_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let latest = sqlx::query(
+            "SELECT state,attempt_count,response_status, \
+                    floor(extract(epoch FROM updated_at)*1000)::bigint AS updated_at_ms \
+             FROM webhook_deliveries WHERE account_id=$1 AND subscription_id=$2 \
+             ORDER BY updated_at DESC,event_id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(subscription_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(
+            |row| -> Result<crate::cp::webhook_worker::WebhookDeliveryStatusEntry> {
+                let state: String = row.try_get("state")?;
+                let outcome = match state.as_str() {
+                    "pending" | "processing" => "pending",
+                    "retry_wait" => "retry",
+                    "delivered" => "sent",
+                    "failed" => "failed",
+                    "ambiguous" => "ambiguous",
+                    "cancelled" => "cancelled",
+                    _ => "invalid",
+                };
+                let attempt_count: i64 = row.try_get("attempt_count")?;
+                let response_status: Option<i64> = row.try_get("response_status")?;
+                Ok(crate::cp::webhook_worker::WebhookDeliveryStatusEntry {
+                    outcome,
+                    attempt_count: (0..=10).contains(&attempt_count).then_some(attempt_count),
+                    response_status: response_status.filter(|status| (100..=599).contains(status)),
+                    updated_at: Some(isotime::format_epoch_millis(row.try_get("updated_at_ms")?)),
+                })
+            },
+        )
+        .transpose()?;
+        Ok(crate::cp::webhook_worker::WebhookDeliveryStatusSummary {
+            pending: row.try_get("pending")?,
+            retry: row.try_get("retry")?,
+            sent: row.try_get("sent")?,
+            failed: row.try_get("failed")?,
+            ambiguous: row.try_get("ambiguous")?,
+            cancelled: row.try_get("cancelled")?,
+            latest,
+        })
+    }
+
+    async fn cancel_webhook_deliveries(
+        &self,
+        account_id: &str,
+        subscription_id: &str,
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        advisory_transaction_lock(&mut transaction, "webhook-registry", account_id).await?;
+        recover_expired_webhook_claims(&mut transaction, account_id).await?;
+        let open = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM webhook_deliveries \
+             WHERE account_id=$1 AND subscription_id=$2 AND state='processing') \
+             OR EXISTS(SELECT 1 FROM webhook_send_fences \
+             WHERE account_id=$1 AND subscription_id=$2)",
+        )
+        .bind(account_id)
+        .bind(subscription_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if open {
+            return Err(EnclaveError::Conflict(
+                "webhook subscription has an in-flight send".into(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE webhook_deliveries SET state='cancelled', \
+                    error_code='subscription_deleted',last_error='subscription_deleted', \
+                    updated_at=now() WHERE account_id=$1 AND subscription_id=$2 \
+                    AND state IN ('pending','retry_wait')",
+        )
+        .bind(account_id)
+        .bind(subscription_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn next_email_candidate(
         &self,
         account_id: &str,

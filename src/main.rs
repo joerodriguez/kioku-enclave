@@ -462,10 +462,42 @@ fn resolve_apns_identifiers(
 
 pub struct AppState {
     pub store: Arc<Store>,
+    persistence_backend: PersistenceBackend,
+    postgres: Option<Arc<persistence::PostgresPersistence>>,
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
     pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistenceBackend {
+    LegacySqliteGcs,
+    Postgres,
+}
+
+impl PersistenceBackend {
+    fn from_env() -> Result<Self, String> {
+        match std::env::var("PERSISTENCE_BACKEND")
+            .unwrap_or_else(|_| "sqlite-gcs".into())
+            .as_str()
+        {
+            "sqlite-gcs" => Ok(Self::LegacySqliteGcs),
+            "postgres" => Ok(Self::Postgres),
+            value => Err(format!("unsupported PERSISTENCE_BACKEND {value:?}")),
+        }
+    }
+
+    const fn is_legacy(self) -> bool {
+        matches!(self, Self::LegacySqliteGcs)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacySqliteGcs => "sqlite-gcs",
+            Self::Postgres => "postgres",
+        }
+    }
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -628,10 +660,31 @@ fn legacy_data_plane_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 // ── Health handler ────────────────────────────────────────────────────────────
 
-async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn handle_livez() -> Json<serde_json::Value> {
+    Json(json!({"ok": true, "service": "kioku-enclave"}))
+}
+
+async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(postgres) = state.postgres.as_ref() {
+        let ready = postgres.verify_schema().await.is_ok();
+        let status = if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return (
+            status,
+            Json(json!({
+                "ok": ready,
+                "service": "kioku-enclave",
+                "persistence_backend": state.persistence_backend.as_str(),
+            })),
+        )
+            .into_response();
+    }
     let progress = state.store.legacy_checkpoint_reconciliation().await;
     let wal_serving = state.store.wal_serving_health();
-    Json(health_json(progress, wal_serving))
+    (StatusCode::OK, Json(health_json(progress, wal_serving))).into_response()
 }
 
 fn health_json(
@@ -887,6 +940,12 @@ async fn async_main() {
         version = env!("CARGO_PKG_VERSION"),
         "kioku-enclave starting"
     );
+    let persistence_backend = PersistenceBackend::from_env()
+        .unwrap_or_else(|error| panic!("Invalid persistence configuration: {error}"));
+    info!(
+        persistence_backend = persistence_backend.as_str(),
+        "selected one application persistence authority"
+    );
 
     // Non-authoritative ADR-0022 transport probe. Off is the baked default and
     // performs zero I/O. probe-v1 is awaited under one fixed deadline before
@@ -964,14 +1023,30 @@ async fn async_main() {
     let legacy_media_gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_bucket(legacy_media_bucket));
 
-    let store = Arc::new(Store::new_with_recording_media(
-        Arc::clone(&kms),
-        Arc::clone(&gcs),
-        media_gcs,
-        recording_media_gcs,
-        legacy_media_gcs,
-    ));
-    Store::spawn_metrics_reporter(Arc::clone(&store));
+    let application_media_gcs: Arc<dyn crate::store::GcsClient> =
+        Arc::new(crate::store::RoutedMediaGcsClient::new(
+            Arc::clone(&media_gcs),
+            Some(Arc::clone(&recording_media_gcs)),
+        ));
+    let (store, legacy_control_gcs): (Arc<Store>, Arc<dyn crate::store::GcsClient>) =
+        if persistence_backend.is_legacy() {
+            let store = Arc::new(Store::new_with_recording_media(
+                Arc::clone(&kms),
+                Arc::clone(&gcs),
+                media_gcs,
+                recording_media_gcs,
+                legacy_media_gcs,
+            ));
+            Store::spawn_metrics_reporter(Arc::clone(&store));
+            (store, Arc::clone(&gcs))
+        } else {
+            let disabled: Arc<dyn crate::store::GcsClient> =
+                Arc::new(persistence::DisabledLegacyGcs);
+            (
+                Arc::new(Store::new(Arc::clone(&kms), Arc::clone(&disabled))),
+                disabled,
+            )
+        };
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.
@@ -980,181 +1055,186 @@ async fn async_main() {
 
     // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
     let control_store = Arc::new(cp::control_store::ControlStore::new_with_store(
-        kms,
-        gcs,
+        Arc::clone(&kms),
+        legacy_control_gcs,
         Arc::clone(&store),
     ));
-    control_store
-        .initialize_legacy_fence_key()
-        .await
-        .unwrap_or_else(|error| panic!("Failed to initialize legacy fence key: {error}"));
-
-    // ADR-0022 Group D: install the exact archive-v3 deletion runtime before
-    // any selected account can enter deletion or the startup reconciler can
-    // revisit an interrupted operation. Off-profile images install nothing;
-    // an active but malformed runtime fails startup closed. The principal and
-    // lifecycle-page roots are derived from the durable encrypted Control DEK
-    // and no raw key material escapes this composition.
-    if let Some(deployment) =
-        archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeDeployment::from_baked_env()
-            .unwrap_or_else(|error| panic!("Failed to validate deletion runtime: {error}"))
-    {
-        let secrets = control_store
-            .archive_deletion_runtime_secrets()
+    if persistence_backend.is_legacy() {
+        control_store
+            .initialize_legacy_fence_key()
             .await
-            .unwrap_or_else(|error| panic!("Failed to derive deletion runtime keys: {error}"));
-        let factory = Arc::new(
-            archive_v3_shadow_runtime::ProductionArchiveDeletionRuntimeFactory::new(
-                deployment,
-                Arc::clone(&concrete_kms),
+            .unwrap_or_else(|error| panic!("Failed to initialize legacy fence key: {error}"));
+    }
+
+    if persistence_backend.is_legacy() {
+        // ADR-0022 Group D: install the exact archive-v3 deletion runtime before
+        // any selected account can enter deletion or the startup reconciler can
+        // revisit an interrupted operation. Off-profile images install nothing;
+        // an active but malformed runtime fails startup closed. The principal and
+        // lifecycle-page roots are derived from the durable encrypted Control DEK
+        // and no raw key material escapes this composition.
+        if let Some(deployment) =
+            archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeDeployment::from_baked_env()
+                .unwrap_or_else(|error| panic!("Failed to validate deletion runtime: {error}"))
+        {
+            let secrets = control_store
+                .archive_deletion_runtime_secrets()
+                .await
+                .unwrap_or_else(|error| panic!("Failed to derive deletion runtime keys: {error}"));
+            let factory = Arc::new(
+                archive_v3_shadow_runtime::ProductionArchiveDeletionRuntimeFactory::new(
+                    deployment,
+                    Arc::clone(&concrete_kms),
+                    Arc::clone(&control_store),
+                    secrets.lifecycle_page_key,
+                    Arc::clone(&secrets.principal_key),
+                ),
+            );
+            store
+                .install_wal_deletion_lane(Arc::new(
+                    archive_v3_deletion_lane::WalDeletionLane::new(secrets.principal_key, factory),
+                ))
+                .unwrap_or_else(|error| {
+                    panic!("Failed to install archive-v3 deletion runtime: {error}")
+                });
+            info!("archive-v3 account deletion runtime installed");
+        }
+        let baked_signup_limit = std::env::var("SIGNUP_LIMIT_PER_DAY")
+            .expect("SIGNUP_LIMIT_PER_DAY must be baked into the image");
+        if should_spawn_legacy_checkpoint_reconciler(&baked_signup_limit) {
+            Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
+        } else {
+            info!("legacy checkpoint reconciliation skipped for the zero-archive cutover");
+        }
+        let recovered_rebinds = control_store
+            .reconcile_pending_identity_rebinds()
+            .await
+            .unwrap_or_else(|error| panic!("Failed to reconcile identity rebinds: {error}"));
+        if recovered_rebinds > 0 {
+            info!(
+                recovered = recovered_rebinds,
+                "reconciled pending identity rebinds before request admission"
+            );
+        }
+
+        // ADR-0022: a user whose archive durably reached the wal_authoritative
+        // terminal must never see legacy snapshot persistence again, across every
+        // restart. Install the Control-derived selections before any request is
+        // admitted; any refusal fails startup closed. Content-free: count only.
+        let wal_authority_selections = control_store
+            .load_wal_authoritative_persistence_selections()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Failed to load WAL-authority persistence selections: {error}")
+            });
+        let installed_wal_authority_selections = wal_authority_selections.len();
+        for selection in wal_authority_selections {
+            store
+                .install_wal_authority_persistence(selection)
+                .unwrap_or_else(|error| {
+                    panic!("Failed to install a WAL-authority persistence selection: {error}")
+                });
+        }
+        if installed_wal_authority_selections > 0 {
+            info!(
+                installed = installed_wal_authority_selections,
+                "installed WAL-authority persistence selections before request admission"
+            );
+        }
+
+        // ADR-0022: relaunch every selected user's WAL serving authority from
+        // durable state through the image-baked runtime coordinates, so the
+        // routed read serves the settled lane from the first admitted request.
+        // Off-config images with selected users fail startup closed here.
+        let wal_serving_relaunch_counts =
+            archive_v3_serving_relaunch::relaunch_wal_serving_authorities(
+                || Ok(Arc::clone(&concrete_kms)),
                 Arc::clone(&control_store),
-                secrets.lifecycle_page_key,
-                Arc::clone(&secrets.principal_key),
-            ),
-        );
-        store
-            .install_wal_deletion_lane(Arc::new(archive_v3_deletion_lane::WalDeletionLane::new(
-                secrets.principal_key,
-                factory,
-            )))
-            .unwrap_or_else(|error| {
-                panic!("Failed to install archive-v3 deletion runtime: {error}")
-            });
-        info!("archive-v3 account deletion runtime installed");
-    }
-    let baked_signup_limit = std::env::var("SIGNUP_LIMIT_PER_DAY")
-        .expect("SIGNUP_LIMIT_PER_DAY must be baked into the image");
-    if should_spawn_legacy_checkpoint_reconciler(&baked_signup_limit) {
-        Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
-    } else {
-        info!("legacy checkpoint reconciliation skipped for the zero-archive cutover");
-    }
-    let recovered_rebinds = control_store
-        .reconcile_pending_identity_rebinds()
-        .await
-        .unwrap_or_else(|error| panic!("Failed to reconcile identity rebinds: {error}"));
-    if recovered_rebinds > 0 {
+                Arc::clone(&store),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("Failed to relaunch WAL serving authorities: {error}"));
         info!(
-            recovered = recovered_rebinds,
-            "reconciled pending identity rebinds before request admission"
-        );
-    }
-
-    // ADR-0022: a user whose archive durably reached the wal_authoritative
-    // terminal must never see legacy snapshot persistence again, across every
-    // restart. Install the Control-derived selections before any request is
-    // admitted; any refusal fails startup closed. Content-free: count only.
-    let wal_authority_selections = control_store
-        .load_wal_authoritative_persistence_selections()
-        .await
-        .unwrap_or_else(|error| {
-            panic!("Failed to load WAL-authority persistence selections: {error}")
-        });
-    let installed_wal_authority_selections = wal_authority_selections.len();
-    for selection in wal_authority_selections {
-        store
-            .install_wal_authority_persistence(selection)
-            .unwrap_or_else(|error| {
-                panic!("Failed to install a WAL-authority persistence selection: {error}")
-            });
-    }
-    if installed_wal_authority_selections > 0 {
-        info!(
-            installed = installed_wal_authority_selections,
-            "installed WAL-authority persistence selections before request admission"
-        );
-    }
-
-    // ADR-0022: relaunch every selected user's WAL serving authority from
-    // durable state through the image-baked runtime coordinates, so the
-    // routed read serves the settled lane from the first admitted request.
-    // Off-config images with selected users fail startup closed here.
-    let wal_serving_relaunch_counts =
-        archive_v3_serving_relaunch::relaunch_wal_serving_authorities(
-            || Ok(Arc::clone(&concrete_kms)),
-            Arc::clone(&control_store),
-            Arc::clone(&store),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("Failed to relaunch WAL serving authorities: {error}"));
-    info!(
-        metric = "archive_v3_schema_epoch_rollout",
-        schema_epoch_head = crate::schema_ladder::SCHEMA_EPOCH_HEAD,
-        schema_epoch_target = crate::schema_ladder::SCHEMA_EPOCH_TARGET,
-        schema_epoch_min_servable = crate::schema_ladder::SCHEMA_EPOCH_MIN_SERVABLE,
-        selected = wal_serving_relaunch_counts.selected(),
-        relaunched = wal_serving_relaunch_counts.relaunched,
-        at_target = wal_serving_relaunch_counts.at_target,
-        advanced = wal_serving_relaunch_counts.advanced,
-        behind_target = wal_serving_relaunch_counts.behind_target,
-        unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
-        unavailable = wal_serving_relaunch_counts.unavailable,
-        "authenticated the content-free schema epoch rollout state before request admission"
-    );
-    if wal_serving_relaunch_counts.relaunched > 0 {
-        info!(
+            metric = "archive_v3_schema_epoch_rollout",
+            schema_epoch_head = crate::schema_ladder::SCHEMA_EPOCH_HEAD,
+            schema_epoch_target = crate::schema_ladder::SCHEMA_EPOCH_TARGET,
+            schema_epoch_min_servable = crate::schema_ladder::SCHEMA_EPOCH_MIN_SERVABLE,
+            selected = wal_serving_relaunch_counts.selected(),
             relaunched = wal_serving_relaunch_counts.relaunched,
-            "relaunched WAL serving authorities before request admission"
-        );
-    }
-    if wal_serving_relaunch_counts.unavailable > 0 {
-        // Contained, not ignored: these users are refused rather than served a
-        // stale snapshot, and the rest of the fleet is admitted. Startup no
-        // longer dies for everyone because one archive could not be
-        // reconstructed.
-        error!(
-            unavailable = wal_serving_relaunch_counts.unavailable,
-            "WAL serving authorities failed to relaunch; those users are unavailable"
-        );
-    }
-    if wal_serving_relaunch_counts.behind_target > 0 {
-        // A SUBSET of `relaunched`: these users are serving normally, at the
-        // schema epoch their archive recorded, which is a complete servable
-        // state. What it blocks is raising SCHEMA_EPOCH_MIN_SERVABLE — see the
-        // runbook in `schema_ladder`. A ladder step no archive can take is a
-        // step to split or withdraw, never one to force.
-        error!(
+            at_target = wal_serving_relaunch_counts.at_target,
+            advanced = wal_serving_relaunch_counts.advanced,
             behind_target = wal_serving_relaunch_counts.behind_target,
             unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
-            "WAL serving authorities are serving below this binary's schema epoch target"
+            unavailable = wal_serving_relaunch_counts.unavailable,
+            "authenticated the content-free schema epoch rollout state before request admission"
         );
-    }
+        if wal_serving_relaunch_counts.relaunched > 0 {
+            info!(
+                relaunched = wal_serving_relaunch_counts.relaunched,
+                "relaunched WAL serving authorities before request admission"
+            );
+        }
+        if wal_serving_relaunch_counts.unavailable > 0 {
+            // Contained, not ignored: these users are refused rather than served a
+            // stale snapshot, and the rest of the fleet is admitted. Startup no
+            // longer dies for everyone because one archive could not be
+            // reconstructed.
+            error!(
+                unavailable = wal_serving_relaunch_counts.unavailable,
+                "WAL serving authorities failed to relaunch; those users are unavailable"
+            );
+        }
+        if wal_serving_relaunch_counts.behind_target > 0 {
+            // A SUBSET of `relaunched`: these users are serving normally, at the
+            // schema epoch their archive recorded, which is a complete servable
+            // state. What it blocks is raising SCHEMA_EPOCH_MIN_SERVABLE — see the
+            // runbook in `schema_ladder`. A ladder step no archive can take is a
+            // step to split or withdraw, never one to force.
+            error!(
+                behind_target = wal_serving_relaunch_counts.behind_target,
+                unservable_epoch = wal_serving_relaunch_counts.unservable_epoch,
+                "WAL serving authorities are serving below this binary's schema epoch target"
+            );
+        }
 
-    // ADR-0022 Group C: supervise the slots startup just registered. A
-    // transient publication failure after a local commit used to take a user
-    // 100% offline for reads and writes until the process restarted; the
-    // driver replaces a proven-dead authority in place through the identical
-    // ladder above. It fabricates nothing and re-submits nothing.
-    store
-        .install_wal_serving_relaunch(Arc::new(
-            archive_v3_serving_relaunch::StartupWalServingRelaunch::new(
-                Arc::clone(&concrete_kms),
-                Arc::clone(&control_store),
-            ),
-        ))
-        .unwrap_or_else(|error| {
-            panic!("Failed to install the WAL serving relaunch driver: {error}")
-        });
+        // ADR-0022 Group C: supervise the slots startup just registered. A
+        // transient publication failure after a local commit used to take a user
+        // 100% offline for reads and writes until the process restarted; the
+        // driver replaces a proven-dead authority in place through the identical
+        // ladder above. It fabricates nothing and re-submits nothing.
+        store
+            .install_wal_serving_relaunch(Arc::new(
+                archive_v3_serving_relaunch::StartupWalServingRelaunch::new(
+                    Arc::clone(&concrete_kms),
+                    Arc::clone(&control_store),
+                ),
+            ))
+            .unwrap_or_else(|error| {
+                panic!("Failed to install the WAL serving relaunch driver: {error}")
+            });
 
-    // ADR-0022 genesis spine (G9): validate the new-user genesis gate against
-    // the image before any request is admitted. An armed gate on an image with
-    // no baked archive-v3 runtime coordinates has nothing to mint an archive
-    // with, so it fails startup closed instead of silently never firing.
-    // Content-free: one boolean.
-    let genesis_native_signin = archive_v3_genesis_trigger::genesis_startup_agreement()
-        .unwrap_or_else(|error| panic!("Failed to validate the genesis sign-in gate: {error}"));
-    if genesis_native_signin {
-        info!("new-user archive-v3 genesis is armed for sign-in");
-        let converged =
-            archive_v3_genesis_trigger::converge_all_active_users(&control_store, &store)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("Failed to converge every active account to Archive V3: {error}")
-                });
-        info!(
-            converged,
-            "converged every active account to Archive V3 before request admission"
-        );
+        // ADR-0022 genesis spine (G9): validate the new-user genesis gate against
+        // the image before any request is admitted. An armed gate on an image with
+        // no baked archive-v3 runtime coordinates has nothing to mint an archive
+        // with, so it fails startup closed instead of silently never firing.
+        // Content-free: one boolean.
+        let genesis_native_signin = archive_v3_genesis_trigger::genesis_startup_agreement()
+            .unwrap_or_else(|error| panic!("Failed to validate the genesis sign-in gate: {error}"));
+        if genesis_native_signin {
+            info!("new-user archive-v3 genesis is armed for sign-in");
+            let converged =
+                archive_v3_genesis_trigger::converge_all_active_users(&control_store, &store)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to converge every active account to Archive V3: {error}")
+                    });
+            info!(
+                converged,
+                "converged every active account to Archive V3 before request admission"
+            );
+        }
+    } else {
+        info!("legacy SQLite/GCS initialization and Archive V3 runtime skipped");
     }
 
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {
@@ -1177,10 +1257,16 @@ async fn async_main() {
                 .await
                 .unwrap_or_else(|e| panic!("Failed to fetch web client secret: {}", e));
 
-        let jwt_secrets = control_store
-            .get_or_generate_jwt_secrets()
-            .await
-            .unwrap_or_else(|e| panic!("Failed to load/generate JWT secrets: {}", e));
+        let jwt_secrets = if persistence_backend.is_legacy() {
+            control_store
+                .get_or_generate_jwt_secrets()
+                .await
+                .unwrap_or_else(|e| panic!("Failed to load/generate JWT secrets: {}", e))
+        } else {
+            vec![cp::fetch_secret_from_manager("kioku-jwt-secret", "latest")
+                .await
+                .unwrap_or_else(|e| panic!("Failed to fetch JWT secret: {e}"))]
+        };
 
         (jwt_secrets, client_secret)
     };
@@ -1271,13 +1357,6 @@ async fn async_main() {
             attestation::AttestationCache::new(public_attestation_audience.clone())
                 .expect("valid public attestation audience"),
         )
-    });
-
-    let state = Arc::new(AppState {
-        store: Arc::clone(&store),
-        id_token_verifier,
-        attestation_cache: attestation_cache.clone(),
-        tls_keystone: keystone.clone(),
     });
 
     // In-enclave query embedder for hybrid search. Loading is eager (boot
@@ -1382,13 +1461,85 @@ async fn async_main() {
             .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
     );
 
-    let repositories =
-        persistence::RepositorySet::legacy(Arc::clone(&control_store), Arc::clone(&store));
-    let cp_state = Arc::new(cp::CpState {
-        kms: Arc::clone(&store.kms),
-        durable_recording_storage_bound: store.durable_recording_storage_bound(),
+    let (repositories, postgres) = if persistence_backend.is_legacy() {
+        (
+            persistence::RepositorySet::legacy(Arc::clone(&control_store), Arc::clone(&store)),
+            None,
+        )
+    } else {
+        let database_url = if test_mode_enabled() {
+            std::env::var("POSTGRES_DATABASE_URL")
+                .expect("POSTGRES_DATABASE_URL is required in PostgreSQL test mode")
+        } else {
+            cp::fetch_secret_from_manager("kioku-app-database-url", "latest")
+                .await
+                .unwrap_or_else(|error| panic!("Failed to fetch PostgreSQL URL: {error}"))
+        };
+        let root_ca_pem = if test_mode_enabled() {
+            std::env::var("POSTGRES_ROOT_CA_PEM")
+                .ok()
+                .map(String::into_bytes)
+        } else {
+            Some(
+                cp::fetch_secret_from_manager("kioku-app-database-ca", "latest")
+                    .await
+                    .unwrap_or_else(|error| panic!("Failed to fetch PostgreSQL root CA: {error}"))
+                    .into_bytes(),
+            )
+        };
+        let max_connections = std::env::var("POSTGRES_MAX_CONNECTIONS")
+            .unwrap_or_else(|_| "12".into())
+            .parse::<u32>()
+            .unwrap_or_else(|_| panic!("POSTGRES_MAX_CONNECTIONS must be a positive integer"));
+        let postgres = Arc::new(
+            persistence::PostgresPersistence::connect(persistence::PostgresPoolConfig {
+                database_url,
+                root_ca_pem,
+                max_connections,
+                acquire_timeout: std::time::Duration::from_secs(5),
+                statement_timeout: std::time::Duration::from_secs(30),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL: {error}")),
+        );
+        match std::env::var("POSTGRES_SCHEMA_MODE")
+            .unwrap_or_else(|_| "verify".into())
+            .as_str()
+        {
+            "migrate" => postgres
+                .migrate()
+                .await
+                .unwrap_or_else(|error| panic!("Failed to migrate PostgreSQL: {error}")),
+            "verify" => postgres
+                .verify_schema()
+                .await
+                .unwrap_or_else(|error| panic!("PostgreSQL is not release-ready: {error}")),
+            value => panic!("unsupported POSTGRES_SCHEMA_MODE {value:?}"),
+        }
+        let media_objects: Arc<dyn persistence::MediaObjectStore> =
+            Arc::new(persistence::GcsMediaObjectStore::new(
+                Arc::clone(&application_media_gcs),
+                Arc::clone(&application_media_gcs),
+            ));
+        (
+            persistence::RepositorySet::postgres(Arc::clone(&postgres), media_objects),
+            Some(postgres),
+        )
+    };
+    let state = Arc::new(AppState {
         store: Arc::clone(&store),
-        control: control_store,
+        persistence_backend,
+        postgres: postgres.clone(),
+        id_token_verifier,
+        attestation_cache: attestation_cache.clone(),
+        tls_keystone: keystone.clone(),
+    });
+    let cp_state = Arc::new(cp::CpState {
+        kms: Arc::clone(&kms),
+        durable_recording_storage_bound: !persistence_backend.is_legacy()
+            || store.durable_recording_storage_bound(),
+        store: Arc::clone(&store),
+        control: Arc::clone(&control_store),
         repositories,
         billing: billing_gateway,
         recording_lease_gate: Arc::new(cp::billing::RecordingLeaseGates::default()),
@@ -1470,6 +1621,8 @@ async fn async_main() {
 
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/livez", get(handle_livez))
+        .route("/readyz", get(handle_health))
         .route("/v1/attestation", get(handle_attestation))
         .merge(authenticated)
         .merge(control_plane)
@@ -1827,6 +1980,8 @@ mod retired_route_tests {
 
         let state = Arc::new(AppState {
             store: Arc::clone(&store),
+            persistence_backend: PersistenceBackend::LegacySqliteGcs,
+            postgres: None,
             id_token_verifier: Arc::new(auth::IdTokenVerifier::new(
                 "test-audience".into(),
                 "caller@example.com".into(),

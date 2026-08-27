@@ -2,11 +2,12 @@
 //!
 //! Product code depends on the typed ports exposed here, never on a database
 //! connection or SQL callback. The legacy adapter delegates to the existing
-//! SQLite/GCS stores while the PostgreSQL implementation is built vertically.
+//! SQLite/GCS stores or the PostgreSQL implementation selected once at startup.
 
 mod billing;
 mod capture;
 mod delivery_outbox;
+mod disabled_legacy;
 mod entitlement;
 mod episode_deletion;
 mod finalization;
@@ -21,14 +22,10 @@ mod model_usage;
 mod notification;
 mod oauth;
 mod playback;
+mod postgres;
 mod query;
 mod recording_retention;
 mod work;
-// PostgreSQL is compiled and contract-tested now, but production construction
-// stays disabled until the interface freeze makes one whole repository set
-// selectable without split authority.
-#[allow(dead_code)]
-mod postgres;
 
 use std::sync::Arc;
 
@@ -44,6 +41,7 @@ pub(crate) use delivery_outbox::{
     FrozenPushDelivery, FrozenWebhookDelivery, PushDeliveryCandidate, PushDeliveryClaim,
     WebhookDeliveryCandidate, WebhookDeliveryClaim,
 };
+pub(crate) use disabled_legacy::DisabledLegacyGcs;
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
 pub(crate) use episode_deletion::{
     EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart,
@@ -53,7 +51,6 @@ pub(crate) use finalization::{
     FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
     FinalizationUtterance,
 };
-#[allow(unused_imports)]
 pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
 pub use lifecycle::AccountDeletionOperation;
@@ -79,7 +76,7 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use playback::PlaybackRepository;
-pub(crate) use postgres::PostgresPersistence;
+pub(crate) use postgres::{PostgresPersistence, PostgresPoolConfig};
 pub(crate) use query::{
     CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
     McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
@@ -110,8 +107,8 @@ use crate::store::Store;
 
 /// The persistence dependencies injected into application code.
 ///
-/// This starts with authentication because it is the first vertical slice.
-/// Additional ports join this set as their handlers and workers are extracted.
+/// The complete set is selected once at startup; requests never fall back
+/// between authorities.
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
     legacy_state_authoritative: bool,
@@ -166,7 +163,6 @@ impl RepositorySet {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn postgres(
         persistence: Arc<PostgresPersistence>,
         media_objects: Arc<dyn MediaObjectStore>,

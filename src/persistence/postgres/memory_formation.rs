@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::{allocate_content_id, duration_seconds, PostgresPersistence};
+use super::{
+    advisory_transaction_lock, allocate_content_id, duration_seconds, PostgresPersistence,
+};
 
 fn timestamp(value: &str, field: &str) -> Result<i64> {
     isotime::parse_epoch_millis(value)
@@ -46,6 +48,119 @@ fn string_array(raw: Option<String>) -> Vec<String> {
 
 #[async_trait]
 impl MemoryFormationRepository for PostgresPersistence {
+    async fn ensure_reviewer_fixture(&self, account_id: &str) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND status='active')",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !active {
+            return Err(EnclaveError::Auth("account inactive".into()));
+        }
+        let inserted = sqlx::query_scalar::<_, String>(
+            "INSERT INTO reviewer_fixtures(account_id,fixture_version) VALUES($1,1) \
+             ON CONFLICT(account_id) DO NOTHING RETURNING account_id",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !inserted {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO audio_segments \
+                (account_id,id,started_at,ended_at,duration_seconds,source_type,transcription_status) VALUES \
+             ($1,910001,'2026-07-22T09:00:00Z','2026-07-22T09:35:00Z',2100,'mic','done'), \
+             ($1,910002,'2026-07-22T10:15:00Z','2026-07-22T10:50:00Z',2100,'system','done'), \
+             ($1,910003,'2026-07-22T14:00:00Z','2026-07-22T15:00:00Z',3600,'mic','done')",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO utterances \
+                (account_id,id,audio_segment_id,start_offset_seconds,end_offset_seconds,text,language,confidence,speaker_label,source_key) VALUES \
+             ($1,920001,910001,90,104,'We agreed to move the Kioku launch from August 12 to August 19 so QA can finish the release checks.','en',0.99,'Maya','review:launch:decision'), \
+             ($1,920002,910001,118,134,'Alex owns the launch checklist and will confirm the migration rehearsal by Friday.','en',0.99,'Maya','review:launch:action'), \
+             ($1,920003,910002,240,263,'The stale dashboard came from a cache invalidation bug: the episode detail key was not cleared after an update.','en',0.99,'Me','review:cache:diagnosis'), \
+             ($1,920004,910002,284,302,'The fix is to invalidate both the episode list and episode detail cache keys after a successful write.','en',0.99,'Me','review:cache:fix'), \
+             ($1,920005,910003,300,326,'Use depuis for an action that began in the past and continues now; depuis is followed by the starting point or duration.','en',0.99,'Camille','review:french:depuis'), \
+             ($1,920006,910003,690,714,'Use pendant for a completed duration. Practice contrasting depuis deux ans with pendant deux ans.','en',0.99,'Camille','review:french:pendant')",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO screenshots \
+                (account_id,id,captured_at,active_app,window_title,ocr_text,salient_ocr_text,url,image_hash,is_duplicate,source_key) VALUES \
+             ($1,930001,'2026-07-22T11:20:00Z','Google Chrome','Vendor renewal checklist', \
+              'Renewal checklist: review the synthetic agreement at https://example.com/renewal before August 1.', \
+              'Renewal checklist at example.com/renewal','https://example.com/renewal', \
+              'review-synthetic-renewal',false,'review:screen:renewal')",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO episodes \
+                (account_id,id,started_at,ended_at,type,title,summary,participants,languages,action_items,model,minute_summaries,minutes_text,substance,visual_evidence,finalized_at,finalization_version,finalization_status) VALUES \
+             ($1,940001,'2026-07-22T09:00:00Z','2026-07-22T09:35:00Z','meeting','Launch planning and QA decision', \
+              'The team moved the Kioku launch from August 12 to August 19 so QA could complete release checks. Alex owns the launch checklist.', \
+              '[\"Maya\",\"Alex\",\"Me\"]','[\"en\"]','[\"Alex: confirm the migration rehearsal by Friday\",\"Complete the launch checklist before August 19\"]','synthetic-review','[]','Reviewed QA readiness. Moved launch to August 19. Assigned the checklist to Alex.','normal','none','2026-07-22T16:00:00Z',3,'complete'), \
+             ($1,940002,'2026-07-22T10:15:00Z','2026-07-22T10:50:00Z','coding','Dashboard cache invalidation fix', \
+              'Diagnosed stale episode details as an invalidation bug and updated the write path to clear list and detail cache keys.', \
+              '[\"Me\"]','[\"en\"]','[\"Add a regression test for episode detail invalidation\"]','synthetic-review','[]','Reproduced stale dashboard state. Found the missing detail-key invalidation. Implemented the cache fix.','normal','none','2026-07-22T16:00:00Z',3,'complete'), \
+             ($1,940003,'2026-07-22T11:18:00Z','2026-07-22T11:24:00Z','browsing','Vendor renewal page', \
+              'Reviewed a synthetic vendor renewal checklist and its example.com renewal link.', \
+              '[\"Me\"]','[\"en\"]','[\"Review the renewal checklist before August 1\"]','synthetic-review','[]','Opened the vendor renewal checklist at example.com/renewal.','normal','useful','2026-07-22T16:00:00Z',3,'complete'), \
+             ($1,940004,'2026-07-22T14:00:00Z','2026-07-22T15:00:00Z','lesson','French lesson: depuis and pendant', \
+              'Practiced the difference between depuis for continuing situations and pendant for completed durations.', \
+              '[\"Camille\",\"Me\"]','[\"fr\",\"en\"]','[\"Practice five sentence pairs contrasting depuis and pendant\"]','synthetic-review','[]','Reviewed depuis for continuing actions. Contrasted depuis with pendant. Assigned practice.','normal','none','2026-07-22T16:00:00Z',3,'complete')",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO episode_members(account_id,episode_id,record_type,record_id) VALUES \
+             ($1,940001,'utterance',920001),($1,940001,'utterance',920002), \
+             ($1,940002,'utterance',920003),($1,940002,'utterance',920004), \
+             ($1,940003,'screenshot',930001),($1,940004,'utterance',920005), \
+             ($1,940004,'utterance',920006)",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO episode_final_briefs \
+                (account_id,episode_id,overview,decisions,action_items,important_links,open_questions) VALUES \
+             ($1,940001,'The team delayed the Kioku launch by one week to finish QA.','[\"Move the launch from August 12 to August 19\"]','[{\"owner\":\"Alex\",\"task\":\"Confirm the migration rehearsal by Friday\"}]','[]','[]'), \
+             ($1,940002,'The stale dashboard was traced to incomplete cache invalidation.','[\"Invalidate both episode list and detail keys after writes\"]','[{\"owner\":\"Me\",\"task\":\"Add a regression test for episode detail invalidation\"}]','[]','[]'), \
+             ($1,940003,'Reviewed the synthetic vendor renewal checklist.','[]','[{\"owner\":\"Me\",\"task\":\"Review the renewal checklist before August 1\"}]','[{\"url\":\"https://example.com/renewal\",\"label\":\"Synthetic renewal checklist\"}]','[]'), \
+             ($1,940004,'Practiced choosing depuis for continuing situations and pendant for completed durations.','[]','[{\"owner\":\"Me\",\"task\":\"Write five sentence pairs contrasting depuis and pendant\"}]','[]','[]')",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO content_id_counters(account_id,entity_kind,next_id) VALUES \
+             ($1,'audio_segment',910004),($1,'utterance',920007), \
+             ($1,'screenshot',930002),($1,'episodes',940005) \
+             ON CONFLICT(account_id,entity_kind) DO UPDATE SET \
+             next_id=greatest(content_id_counters.next_id,excluded.next_id)",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     async fn claim_summary_window(
         &self,
         account_id: &str,

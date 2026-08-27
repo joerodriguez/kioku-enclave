@@ -55,21 +55,21 @@ struct OutboxRow {
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct WebhookDeliveryStatusSummary {
-    pending: i64,
-    retry: i64,
-    sent: i64,
-    failed: i64,
-    ambiguous: i64,
-    cancelled: i64,
-    latest: Option<WebhookDeliveryStatusEntry>,
+    pub(crate) pending: i64,
+    pub(crate) retry: i64,
+    pub(crate) sent: i64,
+    pub(crate) failed: i64,
+    pub(crate) ambiguous: i64,
+    pub(crate) cancelled: i64,
+    pub(crate) latest: Option<WebhookDeliveryStatusEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-struct WebhookDeliveryStatusEntry {
-    outcome: &'static str,
-    attempt_count: Option<i64>,
-    response_status: Option<i64>,
-    updated_at: Option<String>,
+pub(crate) struct WebhookDeliveryStatusEntry {
+    pub(crate) outcome: &'static str,
+    pub(crate) attempt_count: Option<i64>,
+    pub(crate) response_status: Option<i64>,
+    pub(crate) updated_at: Option<String>,
 }
 
 struct DeliveryStateUpdate<'a> {
@@ -789,6 +789,11 @@ pub(crate) async fn cancel_subscription_deliveries(
     user_id: &str,
     subscription_id: &str,
 ) -> Result<()> {
+    if let Some(repository) = state.repositories.deliveries() {
+        return repository
+            .cancel_webhook_deliveries(user_id, subscription_id)
+            .await;
+    }
     if state.store.is_wal_authoritative(user_id) {
         loop {
             let subscription_id = subscription_id.to_owned();
@@ -846,6 +851,11 @@ pub(crate) async fn webhook_delivery_status(
     user_id: &str,
     subscription_id: &str,
 ) -> Result<WebhookDeliveryStatusSummary> {
+    if let Some(repository) = state.repositories.deliveries() {
+        return repository
+            .webhook_delivery_status(user_id, subscription_id)
+            .await;
+    }
     let subscription_id = subscription_id.to_owned();
     if state.store.is_wal_authoritative(user_id) {
         state
