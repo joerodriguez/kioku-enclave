@@ -1046,8 +1046,8 @@ pub(crate) mod tests {
             .expect("canonical native session handler end moved");
         let session = &session[..session_end];
         let linked = session
-            .find("linked_providers")
-            .expect("session must authenticate linked providers first");
+            .find(".account_session(&user.0)")
+            .expect("session must load the durable account and linked providers first");
         let genesis = session
             .find("spawn_genesis_convergence")
             .expect("Google ID-token session no longer resumes Genesis");
