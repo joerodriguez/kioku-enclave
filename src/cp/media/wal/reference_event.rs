@@ -98,11 +98,11 @@ impl MediaReferenceEventOutcome {
         &self.stream_id
     }
 
-    pub(in crate::cp::media) const fn duplicate(&self) -> bool {
+    pub(crate) const fn duplicate(&self) -> bool {
         self.duplicate
     }
 
-    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
+    pub(crate) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -118,7 +118,7 @@ pub(crate) struct MediaReferenceEventPlan {
 }
 
 impl MediaReferenceEventPlan {
-    pub(in crate::cp::media) fn new(
+    pub(crate) fn new(
         account_id: String,
         manifest: CaptureEventManifest,
         committed_at: String,
@@ -195,7 +195,7 @@ impl MediaReferenceEventPlan {
     /// Handle on the rebase-required reason `apply()` refused with, taken by
     /// the route before `prepare` consumes the plan. See
     /// [`RebaseRefusalSink`].
-    pub(in crate::cp::media) fn refusal_sink(&self) -> RebaseRefusalSink {
+    pub(crate) fn refusal_sink(&self) -> RebaseRefusalSink {
         self.refusal.clone()
     }
 

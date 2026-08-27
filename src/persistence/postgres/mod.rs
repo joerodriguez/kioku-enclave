@@ -5,6 +5,7 @@
 //! keeps the intermediate releases single-authority.
 
 mod billing;
+mod capture;
 mod entitlement;
 mod identity;
 mod lifecycle;
@@ -21,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 7;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -136,6 +137,14 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0007_content_search.sql"))
                 .execute(&mut *transaction)
                 .await?;
+            version = 7;
+        }
+        if version == 7 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0008_capture_ingestion.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -195,9 +204,10 @@ mod tests {
     };
     use crate::persistence::RepositorySet;
     use crate::persistence::{
-        EmailFenceOutcome, EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition,
-        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition, WebhookSubscription,
+        CaptureCommit, CapturePreflight, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
+        EmailSendFenceDisposition, PushInstallation, PushProviderOutcome, PushProviderReceipt,
+        PushSendFenceDisposition, WebhookProviderOutcome, WebhookSendFence,
+        WebhookSendFenceDisposition, WebhookSubscription,
     };
     use crate::search::{SearchHit, SearchRequest};
 
@@ -275,6 +285,149 @@ mod tests {
         assert_eq!(
             repositories.work().active_account_ids().await.unwrap(),
             vec![account_id.clone()]
+        );
+
+        let canonical: crate::cp::media::CaptureEventManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "event_id": "capture-contract-0",
+                "device_id": "device-contract",
+                "install_id": "install-contract",
+                "capture_session_id": "session-contract",
+                "stream_id": "screen-contract",
+                "stream_kind": "mac_screen",
+                "sequence": 0,
+                "source_wall_at": "2026-08-27T12:00:00.000Z",
+                "source_monotonic_ns": 1000_u64,
+                "started_at": "2026-08-27T12:00:00.000Z",
+                "ended_at": "2026-08-27T12:00:02.000Z",
+                "timezone_id": "America/New_York",
+                "utc_offset_minutes": -240,
+                "clock_uncertainty_ms": 10,
+                "media": {
+                    "asset_id": "capture-asset-contract",
+                    "mime_type": "image/jpeg",
+                    "codec": "jpeg",
+                    "byte_length": 12,
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "width": 1280,
+                    "height": 720
+                },
+                "context": {
+                    "capture_status": "stable",
+                    "active_app": "Safari",
+                    "primary_bundle_id": "com.apple.Safari",
+                    "primary_window_id": 7,
+                    "window_title": "Contract",
+                    "display_id": 1,
+                    "active_url": "https://example.com/contract",
+                    "active_url_title": "Contract",
+                    "browser_permission_status": "granted"
+                }
+            }))
+            .unwrap();
+        let canonical_digest = crate::cp::media::manifest_digest(&canonical).unwrap();
+        let object_key = crate::store::canonical_capture_media_object_key(
+            &account_id,
+            &canonical.media.as_ref().unwrap().asset_id,
+        )
+        .unwrap();
+        let canonical_command = CaptureCommit {
+            account_id: account_id.clone(),
+            manifest: canonical.clone(),
+            manifest_digest: canonical_digest.clone(),
+            object_key: Some(object_key.clone()),
+            object_generation: Some(1),
+            media_authority: Some(
+                crate::cp::media::RecordingMediaAuthorityDecision::ProcessingWindow30d {
+                    capture_policy_revision: 0,
+                    decision_at: "2026-08-27T12:00:03.000Z".into(),
+                },
+            ),
+            committed_at: "2026-08-27T12:00:03.000Z".into(),
+        };
+        let committed = repositories
+            .captures()
+            .commit_event(canonical_command.clone())
+            .await
+            .unwrap();
+        assert!(!committed.duplicate);
+        assert_eq!(committed.committed_through_sequence, 0);
+        assert!(matches!(
+            repositories
+                .captures()
+                .preflight_event(
+                    &account_id,
+                    &canonical,
+                    &canonical_digest,
+                    Some(std::slice::from_ref(&object_key)),
+                )
+                .await
+                .unwrap(),
+            CapturePreflight::Duplicate {
+                committed_through_sequence: 0
+            }
+        ));
+        assert!(
+            repositories
+                .captures()
+                .commit_event(canonical_command)
+                .await
+                .unwrap()
+                .duplicate
+        );
+
+        let mut reference = canonical.clone();
+        reference.event_id = "capture-contract-1".into();
+        reference.sequence = 1;
+        reference.source_monotonic_ns = 2000;
+        reference.media_disposition = crate::cp::media::MediaDisposition::Reference;
+        let canonical_media = reference.media.take().unwrap();
+        let context = reference.context.as_ref().unwrap();
+        reference.reference = Some(crate::cp::media::ScreenReferenceDescriptor {
+            canonical_event_id: canonical.event_id.clone(),
+            canonical_asset_id: canonical_media.asset_id,
+            canonical_media_sha256: canonical_media.sha256,
+            perceptual_hash: "0123456789abcdef".into(),
+            hamming_distance: 1,
+            pixel_change_ratio: 0.001,
+            context_fingerprint: crate::cp::media::semantic_context_fingerprint(context, 1)
+                .unwrap(),
+            dedupe_version: 1,
+        });
+        let reference_digest = crate::cp::media::manifest_digest(&reference).unwrap();
+        let referenced = repositories
+            .captures()
+            .commit_event(CaptureCommit {
+                account_id: account_id.clone(),
+                manifest: reference,
+                manifest_digest: reference_digest,
+                object_key: None,
+                object_generation: None,
+                media_authority: None,
+                committed_at: "2026-08-27T12:00:04.000Z".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!referenced.duplicate);
+        assert_eq!(referenced.committed_through_sequence, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM media_processing_jobs WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox_events WHERE account_id=$1",)
+                .bind(&account_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
         );
         assert_eq!(
             repositories

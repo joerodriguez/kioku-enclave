@@ -19,3 +19,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   durable summarizer cursor.
 - `0007_content_search.sql` adds tenant-qualified structured memories plus
   PostgreSQL full-text and pgvector indexes.
+- `0008_capture_ingestion.sql` adds atomic capture receipts, media metadata,
+  browser evidence, processing jobs, and the transactional work outbox.

@@ -58,7 +58,7 @@ use crate::error::{CaptureReferenceFailureReason, EnclaveError};
 /// did. Only the FIRST refusal is retained (`OnceLock`), which matches the
 /// batch loop's own abort-on-first-item semantics.
 #[derive(Clone, Default)]
-pub(in crate::cp::media) struct RebaseRefusalSink(Arc<OnceLock<RebaseRefusal>>);
+pub(crate) struct RebaseRefusalSink(Arc<OnceLock<RebaseRefusal>>);
 
 #[derive(Clone, Copy)]
 struct RebaseRefusal {
@@ -80,7 +80,7 @@ impl RebaseRefusalSink {
     /// The exact error the legacy branch would have returned, if `apply()`
     /// observed a rebase-required refusal. `None` means the submit failed for
     /// some other reason and the caller must keep its own error.
-    pub(in crate::cp::media) fn observed(&self) -> Option<EnclaveError> {
+    pub(crate) fn observed(&self) -> Option<EnclaveError> {
         self.0.get().map(|refusal| match refusal.batch_position {
             Some((index, sequence)) => EnclaveError::CaptureReferenceBatch {
                 reason: refusal.reason,
