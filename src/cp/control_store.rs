@@ -15477,6 +15477,171 @@ fn prepare_wal_checkpoint_conn(
     Ok((attempt, true))
 }
 
+/// Supersede only a manual checkpoint whose provider read proves that its
+/// retained candidate never became authoritative. The provider proof must be
+/// a byte-distinct exact heartbeat/reacquire successor of the checkpoint's
+/// expected predecessor; equality cannot fence a delayed root CAS. The stale
+/// source/candidate tuple is cleared, while its immutable artifact rows stay
+/// attached to the superseded attempt for later authorized cleanup.
+fn supersede_unpublished_manual_checkpoint_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    retained: &CheckpointAttempt,
+    observed_predecessor: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<(CheckpointAttempt, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_wal_checkpoint_conn(&tx, binding)?;
+    if current.control_view(WalOwnerPersistenceContext(()))
+        != retained.control_view(WalOwnerPersistenceContext(()))
+    {
+        return Err(EnclaveError::Conflict(
+            "manual checkpoint attempt changed".into(),
+        ));
+    }
+    let expected = crate::archive_v3_witness::WitnessRecord::decode(binding.witness_bytes())
+        .map_err(|_| EnclaveError::Store("invalid checkpoint expected witness".into()))?;
+    if observed_predecessor == &expected
+        || observed_predecessor
+            .exact_wal_owner_checkpoint_lease_successor_from(
+                &expected,
+                crate::archive_v3_wal_owner::WalCheckpointSourceContext::for_control(
+                    WalOwnerPersistenceContext(()),
+                ),
+            )
+            .is_err()
+    {
+        return Err(EnclaveError::Conflict(
+            "manual checkpoint candidate publication remains ambiguous".into(),
+        ));
+    }
+    let unresolved_publication: i64 = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_wal_publications
+         WHERE archive_id=?1 AND stage!='witnessed')",
+        [binding.archive_id().as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if unresolved_publication != 0 {
+        return Err(EnclaveError::Conflict(
+            "logical WAL publication is unresolved".into(),
+        ));
+    }
+    let next_attempt_id = ShadowAttemptId::random();
+    let next = current
+        .restart_unpublished_manual_for_control(
+            WalOwnerPersistenceContext(()),
+            binding,
+            next_attempt_id,
+        )
+        .map_err(map_wal_owner_error)?;
+    let (
+        operation,
+        _,
+        old_attempt_id,
+        old_attempt,
+        old_revision,
+        old_stage,
+        _,
+        _,
+        _,
+        instance,
+        old_commitment,
+    ) = current.control_view(WalOwnerPersistenceContext(()));
+    let (
+        _,
+        _,
+        _,
+        next_attempt,
+        next_revision,
+        next_stage,
+        source,
+        candidate,
+        artifacts,
+        _,
+        next_commitment,
+    ) = next.control_view(WalOwnerPersistenceContext(()));
+    if old_stage != CheckpointStage::ManualRequired
+        || next_stage != CheckpointStage::Prepared
+        || source.is_some()
+        || candidate.is_some()
+        || artifacts.is_some()
+    {
+        return Err(EnclaveError::Conflict(
+            "manual checkpoint replacement changed shape".into(),
+        ));
+    }
+    if tx.execute(
+        "UPDATE archive_v3_wal_checkpoint_attempts SET state='superseded'
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND attempt_id=?4
+           AND owner_instance_id=?5 AND state='manual_required'",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            operation.as_bytes().as_slice(),
+            i64::from(old_attempt),
+            old_attempt_id.as_bytes().as_slice(),
+            instance.as_bytes().as_slice(),
+        ],
+    )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_checkpoints
+             SET attempt=?1,attempt_id=?2,stage=?3,
+                 source_length=NULL,source_hash=NULL,sqlite_schema_version=NULL,
+                 source_commitment=NULL,candidate_root_seq=NULL,
+                 candidate_root_object_id=NULL,candidate_root_hash=NULL,
+                 candidate_owner_fencing_epoch=NULL,artifact_commitment=NULL,
+                 observed_witness=NULL,commitment=?4,revision=?5,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id=?6 AND operation_id=?7 AND attempt=?8
+               AND attempt_id=?9 AND owner_instance_id=?10 AND stage='manual_required'
+               AND expected_witness=?11 AND expected_binding_commitment=?12
+               AND commitment=?13 AND revision=?14",
+            rusqlite::params![
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+                checkpoint_stage_as_db(next_stage),
+                next_commitment.as_slice(),
+                i64::try_from(next_revision)
+                    .map_err(|_| EnclaveError::Store("checkpoint revision overflow".into()))?,
+                binding.archive_id().as_bytes().as_slice(),
+                operation.as_bytes().as_slice(),
+                i64::from(old_attempt),
+                old_attempt_id.as_bytes().as_slice(),
+                instance.as_bytes().as_slice(),
+                binding.witness_bytes().as_slice(),
+                binding.commitment().as_slice(),
+                old_commitment.as_slice(),
+                i64::try_from(old_revision)
+                    .map_err(|_| EnclaveError::Store("checkpoint revision overflow".into()))?,
+            ],
+        )? != 1
+        || tx.execute(
+            "INSERT INTO archive_v3_wal_checkpoint_attempts
+             (archive_id,operation_id,attempt,attempt_id,owner_instance_id,state)
+             VALUES (?1,?2,?3,?4,?5,'active')",
+            rusqlite::params![
+                binding.archive_id().as_bytes().as_slice(),
+                operation.as_bytes().as_slice(),
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+                instance.as_bytes().as_slice(),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "manual checkpoint supersession raced".into(),
+        ));
+    }
+    let loaded = load_wal_checkpoint_conn(&tx, binding)?;
+    if loaded.control_view(WalOwnerPersistenceContext(()))
+        != next.control_view(WalOwnerPersistenceContext(()))
+    {
+        return Err(EnclaveError::Conflict(
+            "manual checkpoint replacement changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
 fn has_pending_wal_checkpoint_conn(
     conn: &Connection,
     binding: &WalOwnerStoreBinding,
@@ -27237,6 +27402,24 @@ impl WalPublisherControl for ControlStore {
         .map_err(map_wal_persistence_error)
     }
 
+    async fn supersede_unpublished_manual_checkpoint(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        attempt: &CheckpointAttempt,
+        observed_predecessor: &crate::archive_v3_witness::WitnessRecord,
+    ) -> std::result::Result<CheckpointAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            supersede_unpublished_manual_checkpoint_conn(
+                conn,
+                binding,
+                attempt,
+                observed_predecessor,
+            )
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
     async fn record_checkpoint_source(
         &self,
         binding: &WalOwnerStoreBinding,
@@ -37605,6 +37788,124 @@ mod tests {
                     .unwrap()
                     .1
             );
+        }
+
+        for reacquire in [false, true] {
+            let conn = account_conn();
+            maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+            let (_terminal, expected, lease, binding) = bound_wal_publisher_fixture(&conn);
+            let (candidate, published_candidate) = candidate_wal_checkpoint_fixture(
+                &conn,
+                &expected,
+                lease,
+                &binding,
+                wal_owner_instance(0xdc),
+            );
+            require_wal_checkpoint_manual_conn(&conn, &binding, &candidate).unwrap();
+            let manual = load_wal_checkpoint_conn(&conn, &binding).unwrap();
+
+            // Equality cannot fence a delayed provider CAS, and a published
+            // candidate must settle rather than be discarded.
+            assert!(supersede_unpublished_manual_checkpoint_conn(
+                &conn, &binding, &manual, &expected,
+            )
+            .is_err());
+            assert!(supersede_unpublished_manual_checkpoint_conn(
+                &conn,
+                &binding,
+                &manual,
+                &published_candidate,
+            )
+            .is_err());
+
+            let observed_predecessor = if reacquire {
+                expected.reacquired_maintenance_lease_for_test()
+            } else {
+                expected.renewed_maintenance_lease_for_test()
+            };
+            let (replacement, changed) = supersede_unpublished_manual_checkpoint_conn(
+                &conn,
+                &binding,
+                &manual,
+                &observed_predecessor,
+            )
+            .unwrap();
+            assert!(changed);
+            let view = replacement.control_view(WalOwnerPersistenceContext::for_test());
+            assert_eq!(view.5, CheckpointStage::Prepared);
+            assert!(view.6.is_none());
+            assert!(view.7.is_none());
+            assert!(view.8.is_none());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_wal_checkpoint_attempts
+                     WHERE state='superseded'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_wal_checkpoint_attempts
+                     WHERE state='active'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_wal_checkpoint_artifacts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                    > 0,
+                "superseded immutable objects remain cleanup-visible"
+            );
+
+            // The normal lease-successor path must now be able to consume the
+            // same provider proof, rebase the Prepared checkpoint, and make
+            // the provider-confirmed binding the sole Control authority.
+            let owner = load_bound_wal_owner_conn(&conn, &expected)
+                .unwrap()
+                .control_view(WalOwnerPersistenceContext::for_test())
+                .0;
+            let successor_lease = if reacquire {
+                observed_predecessor
+                    .exact_wal_owner_reacquire_from(&expected, owner.as_bytes())
+                    .unwrap()
+            } else {
+                observed_predecessor
+                    .exact_wal_owner_heartbeat_from(&expected, owner.as_bytes())
+                    .unwrap()
+            };
+            let (persisted, changed) = persist_wal_owner_lease_successor_conn(
+                &conn,
+                &expected,
+                &observed_predecessor,
+                successor_lease,
+                reacquire,
+            )
+            .unwrap();
+            assert!(changed);
+            assert_eq!(
+                persisted
+                    .control_view(WalOwnerPersistenceContext::for_test())
+                    .3,
+                &observed_predecessor
+            );
+            let successor_binding =
+                WalOwnerStoreBinding::from_authenticated_witness(&observed_predecessor).unwrap();
+            let rebound = load_wal_checkpoint_conn(&conn, &successor_binding).unwrap();
+            let rebound_view = rebound.control_view(WalOwnerPersistenceContext::for_test());
+            assert_eq!(rebound_view.5, CheckpointStage::Prepared);
+            assert!(rebound_view.6.is_none());
+            assert!(rebound_view.7.is_none());
+            assert!(rebound_view.8.is_none());
         }
     }
 

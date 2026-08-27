@@ -867,6 +867,60 @@ impl CheckpointAttempt {
         )
     }
 
+    /// Supersede a manual checkpoint only after the provider independently
+    /// proves that its authoritative root never adopted the retained
+    /// candidate. The old source and immutable objects remain attached to the
+    /// superseded attempt for cleanup evidence, but none of their fence-bound
+    /// facts may authorize the replacement attempt.
+    pub(crate) fn restart_unpublished_manual_for_control(
+        &self,
+        token: crate::cp::control_store::WalOwnerPersistenceContext,
+        binding: &WalOwnerStoreBinding,
+        attempt_id: ShadowAttemptId,
+    ) -> Result<Self> {
+        if self.stage != CheckpointStage::ManualRequired
+            || self.source_commitment.is_none()
+            || self.candidate.is_none()
+            || self.artifact_commitment.is_none()
+        {
+            return Err(WalOwnerError::Conflict);
+        }
+        let attempt = self
+            .attempt
+            .checked_add(1)
+            .filter(|attempt| *attempt <= MAX_CHECKPOINT_ATTEMPTS)
+            .ok_or(WalOwnerError::Conflict)?;
+        let revision = self.revision.checked_add(1).ok_or(WalOwnerError::Corrupt)?;
+        let commitment = checkpoint_attempt_commitment(
+            binding,
+            self.operation_id,
+            self.session_id,
+            attempt_id,
+            attempt,
+            revision,
+            CheckpointStage::Prepared,
+            None,
+            None,
+            None,
+            self.owner_instance_id,
+        );
+        Self::from_control(
+            token,
+            binding,
+            self.operation_id,
+            self.session_id,
+            attempt_id,
+            attempt,
+            revision,
+            CheckpointStage::Prepared,
+            None,
+            None,
+            None,
+            self.owner_instance_id,
+            commitment,
+        )
+    }
+
     pub(crate) fn heartbeat_for_control(
         &self,
         token: crate::cp::control_store::WalOwnerPersistenceContext,
@@ -1262,6 +1316,16 @@ pub(crate) trait WalPublisherControl: WalOwnerControl {
         &self,
         binding: &WalOwnerStoreBinding,
         owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<CheckpointAttempt>;
+
+    /// Abandon only a fully materialized manual candidate after an exact
+    /// provider read proves that the authoritative root stayed on the
+    /// retained predecessor. No provider mutation is performed here.
+    async fn supersede_unpublished_manual_checkpoint(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        attempt: &CheckpointAttempt,
+        observed_predecessor: &WitnessRecord,
     ) -> Result<CheckpointAttempt>;
 
     async fn record_checkpoint_source(
@@ -1952,9 +2016,11 @@ impl SingleArchiveWalPublisher {
     /// the recovered predecessor SQLite file after a process restart is both
     /// unnecessary and incorrect: SQLite may reproduce a byte-distinct but
     /// logically equivalent main file, while the retained candidate remains
-    /// the sole exact recovery authority. This path authenticates and settles
-    /// only that candidate, then rebuilds the Store lane from its witnessed
-    /// successor.
+    /// the sole exact recovery authority when the provider names it. This
+    /// path authenticates and settles that candidate. A manual candidate may
+    /// be superseded only when an exact same-root provider lease successor
+    /// proves that it never published; a replacement checkpoint can then be
+    /// regenerated from that still-authoritative predecessor.
     async fn recover_pending_checkpoint_candidate_inner(
         &self,
         binding: &WalOwnerStoreBinding,
@@ -1999,6 +2065,32 @@ impl SingleArchiveWalPublisher {
                 .await
                 .map_err(|_| WalOwnerError::Publication)?;
             if advance.validate_observed(&observed).is_err() {
+                if attempt.stage == CheckpointStage::ManualRequired
+                    && observed != expected
+                    && observed
+                        .exact_wal_owner_checkpoint_lease_successor_from(
+                            &expected,
+                            super::WalCheckpointSourceContext(()),
+                        )
+                        .is_ok()
+                {
+                    // The provider still names the retained predecessor and
+                    // changed only its exact lease tuple. The manual
+                    // candidate therefore never became authoritative. Move
+                    // Control to that provider-confirmed binding, which
+                    // supersedes the stale source/candidate attempt before a
+                    // fresh checkpoint can be produced under the live fence.
+                    self.control
+                        .supersede_unpublished_manual_checkpoint(
+                            &current_binding,
+                            &attempt,
+                            &observed,
+                        )
+                        .await?;
+                    let refreshed = self.maintain_live_owner_binding(&current_binding).await?;
+                    current_binding = refreshed;
+                    continue;
+                }
                 if observed != expected {
                     let _ = self
                         .control
@@ -2007,9 +2099,8 @@ impl SingleArchiveWalPublisher {
                     return Err(WalOwnerError::Conflict);
                 }
                 if attempt.stage == CheckpointStage::ManualRequired {
-                    // A manual fence may be settled only by exact adoption of
-                    // its retained candidate. Never renew, resend, or replace
-                    // provider state from this branch.
+                    // No provider-confirmed predecessor succession was
+                    // available, so the manual fence remains terminal.
                     return Err(WalOwnerError::Conflict);
                 }
                 if attempt.stage == CheckpointStage::CandidateReady {
