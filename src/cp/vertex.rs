@@ -33,8 +33,12 @@ async fn lock_active_user_lifecycle(
     store: &crate::store::Store,
     repositories: &crate::persistence::RepositorySet,
     user_id: &str,
-) -> Result<OwnedMutexGuard<()>> {
-    let guard = store.lock_user_lifecycle(user_id).await?;
+) -> Result<Option<OwnedMutexGuard<()>>> {
+    let guard = if repositories.uses_legacy_state() {
+        Some(store.lock_user_lifecycle(user_id).await?)
+    } else {
+        None
+    };
     if !super::limits::account_active(repositories, user_id).await? {
         return Err(EnclaveError::Auth("account inactive".into()));
     }
@@ -493,7 +497,10 @@ async fn send_media_request(
     // for a selected user, so a pinned identity for an unselected user
     // refuses here — before any provider traffic — instead of egressing
     // without a durable billing intent.
-    if pinned_invocation.is_some() && !state.store.is_wal_authoritative(user_id) {
+    if pinned_invocation.is_some()
+        && state.repositories.uses_legacy_state()
+        && !state.store.is_wal_authoritative(user_id)
+    {
         return Err(EnclaveError::Store(
             "pinned media invocation requires a WAL-authoritative user".into(),
         ));

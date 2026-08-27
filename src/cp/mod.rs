@@ -488,6 +488,9 @@ impl CpState {
         reason = "the empty D4 registry keeps one reviewed fail-closed worker gate for a future explicitly named domain"
     )]
     pub(crate) fn wal_domain_skipped(&self, user_id: &str, domain: &'static str) -> bool {
+        if !self.repositories.uses_legacy_state() {
+            return false;
+        }
         if !self.store.is_wal_authoritative(user_id) {
             return false;
         }
@@ -516,6 +519,9 @@ impl CpState {
         user_id: &str,
         domain: &'static str,
     ) -> Option<crate::error::EnclaveError> {
+        if !self.repositories.uses_legacy_state() {
+            return None;
+        }
         self.store
             .is_wal_authoritative(user_id)
             .then(|| crate::error::EnclaveError::wal_domain_unmigrated(domain))

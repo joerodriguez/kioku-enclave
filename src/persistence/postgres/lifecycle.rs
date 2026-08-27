@@ -66,7 +66,9 @@ async fn refuse_open_provider_fences(
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE account_id=$1) AS email, \
                 EXISTS(SELECT 1 FROM webhook_send_fences WHERE account_id=$1) AS webhook, \
-                EXISTS(SELECT 1 FROM push_send_fences WHERE account_id=$1) AS push",
+                EXISTS(SELECT 1 FROM push_send_fences WHERE account_id=$1) AS push, \
+                EXISTS(SELECT 1 FROM vertex_usage_events \
+                    WHERE account_id=$1 AND outcome='started') AS vertex",
     )
     .bind(account_id)
     .fetch_one(&mut **transaction)
@@ -84,6 +86,11 @@ async fn refuse_open_provider_fences(
     if row.try_get::<bool, _>("push")? {
         return Err(EnclaveError::Conflict(
             "account has an in-flight push send".into(),
+        ));
+    }
+    if row.try_get::<bool, _>("vertex")? {
+        return Err(EnclaveError::Conflict(
+            "account has an in-flight Vertex invocation".into(),
         ));
     }
     Ok(())

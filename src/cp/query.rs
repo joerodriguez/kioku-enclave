@@ -201,6 +201,13 @@ async fn rest_archive_v3_activation_binding(
     if !s.config.is_admin(&user.0) {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response();
     }
+    if !s.repositories.uses_legacy_state() {
+        return (
+            StatusCode::GONE,
+            Json(json!({"error": "archive_v3_retired"})),
+        )
+            .into_response();
+    }
     match crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeDeployment::from_baked_env() {
         Ok(None) => {}
         Ok(Some(_)) => {

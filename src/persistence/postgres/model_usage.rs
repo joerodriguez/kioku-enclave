@@ -13,7 +13,7 @@ use crate::{
     persistence::{ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository},
 };
 
-use super::PostgresPersistence;
+use super::{advisory_transaction_lock, PostgresPersistence};
 
 const OUTBOX_BATCH: i64 = 100;
 const CLAIM_SECONDS: f64 = 120.0;
@@ -193,6 +193,16 @@ impl ModelUsageRepository for PostgresPersistence {
         );
         let event_id = event_id(&fingerprint);
         let mut transaction = self.pool.begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND status='active')",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !active {
+            return Err(EnclaveError::Auth("account inactive".into()));
+        }
         let inserted = sqlx::query(
             "INSERT INTO vertex_usage_events
                  (account_id,event_id,request_fingerprint,operation,requested_model,location,outcome)
