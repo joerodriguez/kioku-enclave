@@ -37,3 +37,5 @@ migration lock; serving instances only verify `persistence_schema.version`.
   atomic episode/cursor settlement.
 - `0016_finalization_delivery.sql` adds fleet-owned finalization claims and
   tenant-qualified webhook, email, and push delivery outboxes.
+- `0017_delivery_claims.sql` adds fleet-wide provider lanes and durable frozen
+  outbound request evidence for crash-safe multi-process delivery.

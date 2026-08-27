@@ -29,6 +29,7 @@ pub(crate) struct FinalizationUtterance {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct FinalizationScreenshot {
     pub(crate) id: i64,
     pub(crate) captured_at: String,

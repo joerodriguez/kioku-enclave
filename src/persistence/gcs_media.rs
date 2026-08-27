@@ -9,12 +9,14 @@ use crate::{
 };
 
 /// GCS implementation used with PostgreSQL structured state.
+#[allow(dead_code)]
 pub(crate) struct GcsMediaObjectStore {
     current: Arc<dyn GcsClient>,
     legacy: Arc<dyn GcsClient>,
 }
 
 impl GcsMediaObjectStore {
+    #[allow(dead_code)]
     pub(crate) fn new(current: Arc<dyn GcsClient>, legacy: Arc<dyn GcsClient>) -> Self {
         Self { current, legacy }
     }

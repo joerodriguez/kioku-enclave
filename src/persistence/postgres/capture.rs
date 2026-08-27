@@ -350,7 +350,7 @@ async fn insert_event(
     if let CapturePreflight::Duplicate {
         committed_through_sequence,
     } = preflight(
-        &mut **transaction,
+        transaction,
         &command.account_id,
         manifest,
         &command.manifest_digest,
