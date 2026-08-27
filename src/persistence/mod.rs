@@ -38,7 +38,10 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use postgres::PostgresPersistence;
-pub(crate) use query::{CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryQueryRepository};
+pub(crate) use query::{
+    CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryFeedPage, MemoryFeedRecord,
+    MemoryFeedRequest, MemoryQueryRepository,
+};
 pub(crate) use work::{
     EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
     EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,

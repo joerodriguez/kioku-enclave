@@ -14,5 +14,5 @@ not select it until every active domain has moved off the legacy stores.
 | `lifecycle.rs` | PostgreSQL account tombstones, deletion progress, Apple-revocation settlement, cascading purge, and billing-detach creation. |
 | `notification.rs` | PostgreSQL webhook destinations, email consent, and bounded push installation registry serialized against send fences. |
 | `oauth.rs` | PostgreSQL OAuth client registration, consent/code consumption, and refresh-token rotation. |
-| `query.rs` | Tenant-qualified PostgreSQL full-text/vector retrieval, hybrid fusion, stable episode pagination/facets/final briefs, and capture status. |
+| `query.rs` | Tenant-qualified PostgreSQL full-text/vector retrieval, hybrid fusion, stable episode pagination/facets/final briefs, merged feed, and capture status. |
 | `work.rs` | PostgreSQL-authoritative fleet account enumeration, summarizer cursor, email, webhook, and push send capabilities, outcome receipts, cancellation, and exact reconciliation. |

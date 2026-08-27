@@ -9,7 +9,7 @@
 | `lifecycle.rs` | Behavior-preserving deletion operation, credential-revocation, tombstone, and final identity cleanup operations. |
 | `notification.rs` | Behavior-preserving webhook, email preference, and push installation operations backed by `ControlStore`. |
 | `oauth.rs` | Behavior-preserving OAuth registry, grant, code, and refresh-token operations backed by `ControlStore`. |
-| `query.rs` | Behavior-preserving routed structured-memory search, episode list/detail projection, and capture status backed by the per-account encrypted SQLite store. |
+| `query.rs` | Behavior-preserving routed search, episode list/detail, merged feed, and capture status backed by the per-account encrypted SQLite store. |
 | `work.rs` | Behavior-preserving fleet account enumeration, summarizer cursor, provider-send fence, and deletion-ownership operations backed by `ControlStore`. |
 
 Application handlers and workers depend on the typed ports in the parent

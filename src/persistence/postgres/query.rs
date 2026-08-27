@@ -7,7 +7,10 @@ use sqlx::Row;
 use crate::{
     cp::isotime,
     error::{EnclaveError, Result},
-    persistence::{CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryQueryRepository},
+    persistence::{
+        CaptureStatus, EpisodeListPage, EpisodeListRequest, MemoryFeedPage, MemoryFeedRecord,
+        MemoryFeedRequest, MemoryQueryRepository,
+    },
     search::{extract_speaker_filter, rrf_merge, SearchHit, SearchRequest},
 };
 
@@ -766,6 +769,149 @@ impl MemoryQueryRepository for PostgresPersistence {
             last_screenshot_at: row
                 .try_get::<Option<i64>, _>("last_screenshot_ms")?
                 .map(isotime::format_epoch_millis),
+        })
+    }
+
+    async fn feed(&self, account_id: &str, request: &MemoryFeedRequest) -> Result<MemoryFeedPage> {
+        let limit = request.limit.min(200);
+        let row_limit = i64::try_from(limit)
+            .map_err(|_| EnclaveError::InvalidRequest("feed limit is too large".into()))?;
+        let from = bound(&request.from)?;
+        let to = bound(&request.to)?;
+        let before = bound(&request.before)?;
+        let utterance_rows = sqlx::query(
+            "SELECT u.id,u.speaker_label,u.text,u.source_key, \
+                    floor(extract(epoch FROM (s.started_at + make_interval(secs => u.start_offset_seconds)))*1000)::bigint AS at_ms \
+               FROM utterances u JOIN audio_segments s \
+                 ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+              WHERE u.account_id=$1 \
+                AND ($2::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)>=to_timestamp($2::double precision/1000.0)) \
+                AND ($3::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)<=to_timestamp($3::double precision/1000.0)) \
+                AND ($4::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)<to_timestamp($4::double precision/1000.0)) \
+              ORDER BY at_ms DESC LIMIT $5",
+        )
+        .bind(account_id)
+        .bind(from)
+        .bind(to)
+        .bind(before)
+        .bind(row_limit)
+        .fetch_all(self.pool())
+        .await?;
+        let mut records = utterance_rows
+            .iter()
+            .map(|row| {
+                Ok(MemoryFeedRecord {
+                    kind: "utterance".into(),
+                    id: row.try_get("id")?,
+                    at: required_timestamp(row, "at_ms")?,
+                    speaker_label: row.try_get("speaker_label")?,
+                    text: row.try_get("text")?,
+                    source_key: row.try_get("source_key")?,
+                    active_app: None,
+                    window_title: None,
+                    url: None,
+                    ocr_excerpt: None,
+                    observation_status: None,
+                    literal_description: None,
+                    screen_state: None,
+                    episode_id: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let screenshot_rows = sqlx::query(
+            "SELECT s.id,s.active_app,s.window_title,s.url,s.ocr_text,s.salient_ocr_text, \
+                    s.source_key,o.status AS observation_status,o.literal_description,o.screen_state, \
+                    floor(extract(epoch FROM s.captured_at)*1000)::bigint AS at_ms \
+               FROM screenshots s LEFT JOIN screen_observations o \
+                 ON o.account_id=s.account_id AND o.screenshot_id=s.id \
+              WHERE s.account_id=$1 AND NOT s.is_duplicate \
+                AND ($2::bigint IS NULL OR s.captured_at>=to_timestamp($2::double precision/1000.0)) \
+                AND ($3::bigint IS NULL OR s.captured_at<=to_timestamp($3::double precision/1000.0)) \
+                AND ($4::bigint IS NULL OR s.captured_at<to_timestamp($4::double precision/1000.0)) \
+              ORDER BY s.captured_at DESC LIMIT $5",
+        )
+        .bind(account_id)
+        .bind(from)
+        .bind(to)
+        .bind(before)
+        .bind(row_limit)
+        .fetch_all(self.pool())
+        .await?;
+        for row in &screenshot_rows {
+            let raw: Option<String> = row.try_get("ocr_text")?;
+            let salient: Option<String> = row.try_get("salient_ocr_text")?;
+            let excerpt =
+                crate::ocr::select_salient_ocr(raw.as_deref(), salient.as_deref()).map(|value| {
+                    if value.chars().count() > 300 {
+                        value.chars().take(300).collect()
+                    } else {
+                        value
+                    }
+                });
+            records.push(MemoryFeedRecord {
+                kind: "screenshot".into(),
+                id: row.try_get("id")?,
+                at: required_timestamp(row, "at_ms")?,
+                active_app: row.try_get("active_app")?,
+                window_title: row.try_get("window_title")?,
+                url: row.try_get("url")?,
+                ocr_excerpt: excerpt,
+                source_key: row.try_get("source_key")?,
+                observation_status: row.try_get("observation_status")?,
+                literal_description: row.try_get("literal_description")?,
+                screen_state: row.try_get("screen_state")?,
+                speaker_label: None,
+                text: None,
+                episode_id: None,
+            });
+        }
+        records.sort_by(|left, right| right.at.cmp(&left.at));
+        records.truncate(limit);
+
+        let utterance_ids = records
+            .iter()
+            .filter(|record| record.kind == "utterance")
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        let screenshot_ids = records
+            .iter()
+            .filter(|record| record.kind == "screenshot")
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        let membership_rows = sqlx::query(
+            "SELECT record_type,record_id,max(episode_id)::bigint AS episode_id \
+               FROM episode_members WHERE account_id=$1 \
+                AND ((record_type='utterance' AND record_id=ANY($2)) \
+                  OR (record_type='screenshot' AND record_id=ANY($3))) \
+              GROUP BY record_type,record_id",
+        )
+        .bind(account_id)
+        .bind(&utterance_ids)
+        .bind(&screenshot_ids)
+        .fetch_all(self.pool())
+        .await?;
+        let memberships = membership_rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    (
+                        row.try_get::<String, _>("record_type")?,
+                        row.try_get::<i64, _>("record_id")?,
+                    ),
+                    row.try_get::<i64, _>("episode_id")?,
+                ))
+            })
+            .collect::<Result<HashMap<(String, i64), i64>>>()?;
+        for record in &mut records {
+            record.episode_id = memberships.get(&(record.kind.clone(), record.id)).copied();
+        }
+        let next_before = (records.len() == limit)
+            .then(|| records.last().map(|record| record.at.clone()))
+            .flatten();
+        Ok(MemoryFeedPage {
+            records,
+            next_before,
         })
     }
 }
