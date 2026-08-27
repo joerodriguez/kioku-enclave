@@ -207,14 +207,11 @@ LABEL "tee.launch_policy.allow_mount_destinations"="/tmp"
 # Secret values are not build args: the web client secret is fetched from Secret
 # Manager and JWT secrets live in the KMS-protected control store.
 #
-# TLS (ADR-0003): the certificate is NOT baked. ENCLAVE_ACME=1 makes the enclave
-# obtain + renew it from Let's Encrypt itself (HTTP-01 on :80), generating the
-# private key inside the TEE and persisting it only KMS-encrypted in GCS. This
-# keeps the TLS key out of the container env — Confidential Space publishes the
-# env in the attestation token (serial console / Cloud Logging), which is how
-# the old baked ENCLAVE_TLS_*_PEM_B64 args leaked the key to operator-visible
-# logs. Those env vars remain honored at runtime only as a bootstrap fallback
-# and for local testing; do not reintroduce them as build args.
+# TLS: fleet images bake ENCLAVE_TLS=1 and ENCLAVE_ACME=0. Every replica fetches
+# the same certificate/key generation from Secret Manager; neither PEM value is
+# an environment variable or image input. Renewal publishes new secret versions
+# and rolls the fleet. This avoids per-process HTTP-01 state behind the L4 load
+# balancer while keeping TLS termination in the Confidential Space workload.
 # ── Security flags — hardcoded, not operator-supplied ─────────────────────────
 #
 # These are NOT deployment-specific; they are the hardened-by-default security

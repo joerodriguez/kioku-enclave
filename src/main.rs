@@ -320,6 +320,12 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "VERTEX_PROJECT",
     "VERTEX_LOCATION",
     "VERTEX_MODEL",
+    "PERSISTENCE_BACKEND",
+    "POSTGRES_SCHEMA_MODE",
+    "POSTGRES_MAX_CONNECTIONS",
+    "HEALTH_PORT",
+    "DRAIN_TIMEOUT_SECONDS",
+    "ENCLAVE_TLS",
     "ENCLAVE_ACME",
     "ENCLAVE_ACME_DIRECTORY",
     "ENCLAVE_ACME_CONTACT",
@@ -1106,12 +1112,14 @@ async fn async_main() {
     // performs zero I/O. probe-v1 is awaited under one fixed deadline before
     // any application Store/KMS/GCS construction. Its redacted result is
     // observational only and never gates startup, health, or archive authority.
-    archive_v3_firestore_probe::run_startup_probe(
-        archive_v3_firestore_probe::FirestoreProbeStartupConfig::from_env()
-            .expect("valid image-baked archive witness probe configuration"),
-    )
-    .await
-    .expect("construct archive witness transport probe");
+    if persistence_backend.is_legacy() {
+        archive_v3_firestore_probe::run_startup_probe(
+            archive_v3_firestore_probe::FirestoreProbeStartupConfig::from_env()
+                .expect("valid image-baked archive witness probe configuration"),
+        )
+        .await
+        .expect("construct archive witness transport probe");
+    }
 
     // ── Auth config ───────────────────────────────────────────────────────────
     //

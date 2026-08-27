@@ -500,7 +500,8 @@ class SelectorTests(unittest.TestCase):
         self.assertLess(probe, kms)
         self.assertLess(probe, gcs)
         self.assertLess(probe, store)
-        self.assertIn(".await\n    .expect", main[probe:kms])
+        self.assertIn("if persistence_backend.is_legacy()", main[:probe])
+        self.assertIn(".await\n        .expect", main[probe:kms])
 
     def test_shadow_runtime_is_image_bound_tag_selected_and_has_no_override_or_startup_call(self) -> None:
         completed, selected = self.run_selector("production", environment())
