@@ -1,11 +1,11 @@
 # Working in this repo (agent guide)
 
-`kioku-enclave` is the **entire Kioku backend** — the only process that
-ever holds user plaintext. It terminates TLS and serves OAuth, sync, the MCP server,
+`kioku-enclave` is the **entire Kioku application backend**. It terminates TLS and serves OAuth, sync, the MCP server,
 account export/delete, quotas, and the episode summarizer (`src/cp/`), alongside the
 data-plane query/storage code. It runs inside a GCP Confidential Space VM (AMD SEV) and is
-open source so the running instance can be attested against this exact code. Treat every
-change as security-sensitive by default.
+open source so the running instance can be attested against this exact code. Private
+Cloud SQL PostgreSQL is the structured-state plaintext boundary; large GCS media remains
+application-encrypted per user. Treat every change as security-sensitive by default.
 
 ## `map.md` files — read them first, keep them current
 
@@ -26,9 +26,9 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
 - `CONTRIBUTING.md` — contribution + PR rules (summarized below).
 - **Product + security ground truth: `README.md` and `SECURITY.md` in this repo.** Preserve
   the security invariants they document: bounded raw media follows the authenticated
-  Cloud Capture path by default; persistent objects are encrypted per user; plaintext
-  stays in the attested process except for the documented Vertex inference boundary;
-  key access is bound to the attested digest; no undocumented plaintext sink is
+  Cloud Capture path by default; large persistent media objects are encrypted per user;
+  structured plaintext is limited to the attested application, private Cloud SQL, and
+  the documented Vertex boundary; media-key access is bound to the attested digest; no undocumented plaintext sink is
   introduced; and export/delete remain complete.
   A change that weakens an invariant is wrong by default.
 - Client applications, capture pipelines, and deployment automation are downstream
@@ -110,18 +110,16 @@ When releasing a new version or deploying changes to production, follow these st
    - Always run `git status` before running `./scripts/bump_version.sh <version>`.
    - `./scripts/bump_version.sh` executes `git add -A` to ensure all source code changes, migrations, tests, and documentation are committed together with `Cargo.toml` and `Cargo.lock`. Never commit version files in isolation while source modifications remain unstaged.
 
-2. **GCP Confidential Space Live VM Roll**:
+2. **GCP Confidential Space Fleet Roll**:
    - A tag does not trigger a hosted build. Run `scripts/local_image_pipeline.py`
      on the reviewed Linux/amd64 builder, then sign and verify its evidence locally.
-   - Roll only through the monorepo's explicit local deployment command. It
-     binds KMS to the confirmed digest, applies an exact saved VM-replacement
-     plan, and performs the required health check; do not substitute an
-     in-place metadata edit or an ad hoc VM reset.
-   - Verify boot and version startup by inspecting serial console logs:
-     ```bash
-     gcloud compute instances get-serial-port-output kioku-enclave --project=kioku-joerodriguez --zone=us-central1-b | tail -n 30
-     ```
-     Confirm `kioku-enclave starting version X.Y.Z` and ACME TLS certificate initialization.
+   - Roll only through the monorepo's explicit staged Terraform deployment flow. It
+     drains and scales the old fleet to zero, proves no old instances remain, changes the
+     one KMS-authorized digest and instance-template version, then restores at least two
+     homogeneous members behind the passthrough load balancer. Do not substitute an
+     in-place metadata edit or ad hoc instance reset.
+   - Verify every MIG member reports `kioku-enclave starting version X.Y.Z`, PostgreSQL
+     schema readiness, and the shared static TLS generation before reopening admission.
 
 3. **Timezone & Query Type-Affinity Rules**:
    - Database timestamps are stored in UTC ISO 8601 strings (`2026-07-26T23:51:39.450Z`).
@@ -131,8 +129,9 @@ When releasing a new version or deploying changes to production, follow these st
 
 ## Security reminders specific to this repo
 
-- Plaintext lives only in this process and SEV-encrypted tmpfs (`/tmp`); never write it
-  to persistent disk.
+- Structured plaintext is intentionally queryable in private Cloud SQL; application
+  memory and legacy/reference SQLite use SEV memory/tmpfs, and large media remains
+  encrypted in GCS. Never write plaintext to VM persistent disk or logs.
 - Don't weaken the ID-token / attestation path or log decrypted content.
 - Report vulnerabilities privately (see CONTRIBUTING.md / SECURITY.md) — never in a
   public issue.

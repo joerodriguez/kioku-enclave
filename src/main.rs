@@ -1890,8 +1890,16 @@ async fn migrate_postgres_release_schema() {
         .migrate()
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL migration failed: {error}"));
+    let account_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM accounts")
+        .fetch_one(persistence.pool())
+        .await
+        .unwrap_or_else(|error| panic!("PostgreSQL empty-production check failed: {error}"));
+    assert_eq!(
+        account_count, 0,
+        "ADR-0040 initial migration refuses a database containing production accounts"
+    );
     println!(
-        "ADR-0040 PostgreSQL schema version {} installed and verified",
+        "ADR-0040 PostgreSQL schema version {} installed and verified empty",
         persistence::EXPECTED_SCHEMA_VERSION
     );
 }
