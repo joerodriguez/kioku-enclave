@@ -125,7 +125,7 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 # Server-side voice memory (no Python and no dynamic runtime): decode the
 # bounded AAC/M4A or WAV capture in pure Rust, compute Kaldi-compatible fbank
 # features, and execute the pinned WeSpeaker ONNX model with tract.
-symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4", "wav", "pcm"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4", "wav", "pcm"] }
 kaldi-native-fbank = "0.1.0"
 tract-onnx = { version = "0.23.4", default-features = false }
 
