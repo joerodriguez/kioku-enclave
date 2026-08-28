@@ -1,6 +1,6 @@
 [package]
 name = "kioku-enclave"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2021"
 rust-version = "1.96"
 description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"
@@ -9,8 +9,8 @@ repository = "https://github.com/joerodriguez/kioku-enclave"
 homepage = "https://github.com/joerodriguez/kioku-enclave"
 publish = false
 
-# Vector search: sqlite-vec (C extension, compiled via cc::Build) for KNN
-# storage, plus an in-enclave candle BERT encoder for query embeddings.
+# Hybrid PostgreSQL search plus an in-enclave candle BERT encoder for query
+# embeddings.
 # Design decision (2026-07-05, supersedes the earlier no-ML-runtime stance):
 # MCP queries from Claude/ChatGPT arrive at the enclave as raw text with no
 # Mac in the loop, so query embedding must happen server-side. Running the
@@ -28,7 +28,6 @@ path = "src/main.rs"
 axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio", "multipart"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "signal"] }
 tower = { version = "0.5.2", default-features = false }
-futures-util = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 
 # Production TLS termination inside the enclave (ADR-0001). The attested binary
 # is the first server-side application code to see request plaintext. rustls only
@@ -40,26 +39,6 @@ hyper = { version = "1.10", default-features = false, features = ["server", "htt
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
 hmac = "0.12"
-# Direct, locked Ed25519 verification for the inactive ADR-0022 Phase-1
-# canary admission statement. The operator and independent image-attestation
-# roots remain separately pinned and no signing key enters the enclave.
-ring = "0.17.14"
-
-# ACME (RFC 8555) client for in-enclave TLS certificate issuance/renewal
-# (ADR-0003): the enclave answers HTTP-01 itself and generates the key inside
-# the TEE. default-features OFF is load-bearing: the crate's default HTTP
-# client verifies TLS via the *platform* certificate store, which does not
-# exist in the FROM-scratch image — src/acme.rs plugs in our reqwest
-# (webpki-roots) client instead. "ring" (never aws-lc) keeps the musl build
-# pure-Rust and transitively enables rcgen/ring for in-enclave key+CSR
-# generation (Order::finalize). bytes is needed for the HttpClient adapter.
-instant-acme = { version = "0.8.5", default-features = false, features = ["ring"] }
-bytes = "1"
-http-body = "1"
-
-# SQLite, bundled so the binary carries its own libsqlite3 with FTS5 compiled in.
-rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
-
 # PostgreSQL production persistence (ADR-0040). Runtime queries are checked by
 # the shared repository contracts against real PostgreSQL; no compile-time
 # DATABASE_URL or OpenSSL dependency is required. Reviewed schema files are
@@ -73,16 +52,6 @@ serde_json = { version = "1.0.140", features = ["raw_value"] }
 
 # Crypto: AES-256-GCM
 aes-gcm = { version = "0.10.3", features = ["std"] }
-# Direct, locked primitives used only by the inactive legacy-GCM migration
-# reader. Keeping them explicit makes the low-level composition auditable.
-aes = { version = "0.8.4", features = ["zeroize"] }
-ctr = { version = "0.9.2", features = ["zeroize"] }
-ghash = { version = "0.5.1", features = ["zeroize"] }
-subtle = "2.6.1"
-# Direct declaration of the already-locked HKDF implementation used by the
-# inactive ADR-0022 archive-v3 format foundation.  Keeping this explicit makes
-# the archive KDF auditable rather than relying on a transitive dependency.
-hkdf = "0.12.4"
 rand = "0.8.5"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
@@ -97,10 +66,6 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 # webpki-roots bundles Mozilla's CA roots into the binary so the FROM-scratch
 # container image needs no /etc/ssl/certs on the filesystem.
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json", "http2"] }
-# Strict parsing of the authenticated GCS response Date used for durable
-# legacy-write intent leases. Already present transitively through hyper.
-httpdate = "1.0.3"
-
 # Async trait support (used by KmsClient and GcsClient traits)
 async-trait = "0.1.88"
 
@@ -110,7 +75,7 @@ base64 = "0.23.1"
 # URL-encoding for GCS object names
 urlencoding = "2.1.3"
 
-# Temporary files for per-user SQLite blobs
+# Temporary files for bounded offline voice-evaluation asset assembly.
 tempfile = "3.20.0"
 
 # JWT verification for caller ID-token auth (Google RS256 tokens).
@@ -123,21 +88,13 @@ tempfile = "3.20.0"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 # Self-signed certificate generation at boot for RA-TLS (ADR-0001).
-# Pinned to the same version instant-acme's ACME path uses (ADR-0003) so the
-# auditable binary carries exactly one rcgen; default-features off to skip the
-# aws_lc_rs default and stay on ring.
+# Self-signed RA-TLS certificate generation; default features stay off to skip
+# the aws_lc_rs default and keep the build on rustls/ring.
 rcgen = { version = "0.14.2", default-features = false, features = ["pem", "ring"] }
 
 # URL-form encoding for STS token exchange (RFC 8693 form body).
 # Already an indirect dep via reqwest but we need it directly for tests.
 serde_urlencoded = "0.7.1"
-# sqlite-vec: C-based SQLite vector extension. build.rs compiles sqlite-vec.c
-# with SQLITE_CORE defined so it uses rusqlite's bundled libsqlite3 headers
-# rather than a system sqlite3. The cc crate picks up the musl cross-toolchain
-# automatically when CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER is set in CI
-# (set by apt-get install musl-tools + rustup target add x86_64-unknown-linux-musl).
-sqlite-vec = "0.1.9"
-
 # In-enclave query embedding (hybrid search): candle runs the
 # paraphrase-multilingual-MiniLM-L12-v2 BERT encoder on CPU. Pure-Rust
 # compute (gemm), no ONNX runtime, no dynamic libs — musl/FROM-scratch safe.

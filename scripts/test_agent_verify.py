@@ -45,7 +45,7 @@ class AgentVerifyTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 "printf '%s\\t' \"$@\" >> \"$MOCK_CARGO_LOG\"\n"
                 "printf '\\n' >> \"$MOCK_CARGO_LOG\"\n"
-                "printf '%s|%s|%s\\n' \"${RUSTC_WRAPPER:-}\" \"${SCCACHE_CACHE_SIZE:-}\" \"${SCCACHE_BASEDIRS:-}\" >> \"$MOCK_ENVIRONMENT_LOG\"\n",
+                "printf '%s|%s|%s|%s\\n' \"${RUSTC_WRAPPER:-}\" \"${SCCACHE_CACHE_SIZE:-}\" \"${SCCACHE_BASEDIRS:-}\" \"${KIOKU_REQUIRE_POSTGRES_CONTRACT:-}\" >> \"$MOCK_ENVIRONMENT_LOG\"\n",
                 encoding="utf-8",
             )
             # Dispatch the disk guard to a mock, but execute every other Python
@@ -179,7 +179,18 @@ class AgentVerifyTests(unittest.TestCase):
         )
 
     def test_full_is_locked_and_has_no_separate_build_or_check(self) -> None:
-        completed, commands, _, _ = self.run_script("full")
+        missing, commands, _, disk_guard_calls = self.run_script("full")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("requires KIOKU_TEST_POSTGRES_URL", missing.stderr)
+        self.assertEqual(commands, [])
+        self.assertEqual(disk_guard_calls, [])
+
+        completed, commands, environments, _ = self.run_script(
+            "full",
+            extra_env={
+                "KIOKU_TEST_POSTGRES_URL": "postgresql://kioku-test@127.0.0.1:5432/kioku_test"
+            },
+        )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(
             commands,
@@ -191,6 +202,17 @@ class AgentVerifyTests(unittest.TestCase):
         )
         self.assertNotIn("build", [command[0] for command in commands])
         self.assertNotIn("check", [command[0] for command in commands])
+        self.assertEqual(len(environments), 3)
+        self.assertTrue(all(entry.endswith("|1") for entry in environments))
+
+    def test_full_rejects_ambiguous_postgres_contract_coordinates(self) -> None:
+        for value in ("sqlite:///tmp/test.db", "localhost/kioku", "postgres://ok\nno"):
+            completed, commands, _, disk_guard_calls = self.run_script(
+                "full", extra_env={"KIOKU_TEST_POSTGRES_URL": value}
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(commands, [])
+            self.assertEqual(disk_guard_calls, [])
 
     def test_shared_disk_guard_fails_before_cargo(self) -> None:
         completed, commands, _, disk_guard_calls = self.run_script(disk_guard_exit=1)
@@ -208,23 +230,27 @@ class AgentVerifyTests(unittest.TestCase):
     def test_sccache_is_optional_bounded_and_never_overrides_a_wrapper(self) -> None:
         without_cache, _, environments, _ = self.run_script()
         self.assertEqual(without_cache.returncode, 0, without_cache.stderr)
-        self.assertEqual(environments, ["||", "||"])
+        self.assertEqual(environments, ["|||", "|||"])
 
         with_cache, _, environments, _ = self.run_script(include_sccache=True)
         self.assertEqual(with_cache.returncode, 0, with_cache.stderr)
         self.assertEqual(len(environments), 2)
         for entry in environments:
-            wrapper, cache_size, basedirs = entry.split("|", 2)
+            wrapper, cache_size, basedirs, contract = entry.split("|", 3)
             self.assertTrue(wrapper.endswith("/sccache"))
             self.assertEqual(cache_size, "10G")
             self.assertIn("<worktree>", basedirs.split(os.pathsep))
+            self.assertEqual(contract, "")
 
         caller_wrapper, _, environments, _ = self.run_script(
             include_sccache=True,
             extra_env={"RUSTC_WRAPPER": "/opt/custom-wrapper"},
         )
         self.assertEqual(caller_wrapper.returncode, 0, caller_wrapper.stderr)
-        self.assertEqual(environments, ["/opt/custom-wrapper||", "/opt/custom-wrapper||"])
+        self.assertEqual(
+            environments,
+            ["/opt/custom-wrapper|||", "/opt/custom-wrapper|||"],
+        )
 
         oversized_server, _, environments, _ = self.run_script(
             include_sccache=True,
@@ -232,7 +258,7 @@ class AgentVerifyTests(unittest.TestCase):
         )
         self.assertEqual(oversized_server.returncode, 0, oversized_server.stderr)
         self.assertIn("continuing without it", oversized_server.stderr)
-        self.assertEqual(environments, ["||", "||"])
+        self.assertEqual(environments, ["|||", "|||"])
 
         incompatible_server, _, environments, _ = self.run_script(
             include_sccache=True,
@@ -240,7 +266,7 @@ class AgentVerifyTests(unittest.TestCase):
         )
         self.assertEqual(incompatible_server.returncode, 0, incompatible_server.stderr)
         self.assertIn("does not cover these worktrees", incompatible_server.stderr)
-        self.assertEqual(environments, ["||", "||"])
+        self.assertEqual(environments, ["|||", "|||"])
 
     def test_rejects_unknown_modes_and_unbounded_sccache_configuration(self) -> None:
         unknown, commands, _, disk_guard_calls = self.run_script("unsafe")

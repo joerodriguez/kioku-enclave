@@ -17,7 +17,7 @@
 # ----------------------
 # The musl static target (x86_64-unknown-linux-musl) is the correct target for
 # a FROM-scratch image and for GCP Confidential Space (which runs Linux/x86-64).
-# On macOS arm64 you need a cross-linker; the CI pipeline (Linux x86-64 runner)
+# On macOS arm64 you need a cross-linker; the reviewed local Linux x86-64 builder
 # compiles natively with:
 #   rustup target add x86_64-unknown-linux-musl
 #   cargo build --release --locked --target x86_64-unknown-linux-musl
@@ -35,23 +35,9 @@
 # command-line build arguments (which Docker records in history/progress).
 # The final image still contains the allowlisted non-secret runtime values,
 # because they are part of the attested digest; credentials remain runtime-only.
-# This includes the distinct current `GCS_MEDIA_BUCKET` and the Phase-0
-# migration `GCS_LEGACY_MEDIA_BUCKET` (which the selector requires to equal
-# `GCS_BUCKET`).
-# Archive-v3 image-bound names are also validated/assembled here:
-# ARCHIVE_V3_SHADOW_RUNTIME_MODE ARCHIVE_V3_ARCHIVE_BUCKET
-# ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER ARCHIVE_V3_REGISTRY_KMS_VERSION
-# ARCHIVE_V3_WITNESS_PROJECT_ID ARCHIVE_V3_WITNESS_PROJECT_NUMBER
-# ARCHIVE_V3_WITNESS_DATABASE_ID ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT
-# GENESIS_WAL_NATIVE.
-#
-# GENESIS_WAL_NATIVE is the ADR-0022 cutover gate and is baked for the same
-# reason as the rest: it is covered by the attested image digest, so it cannot
-# be set at launch. It is `off` or `on`, never empty, and `on` additionally
-# requires an active ARCHIVE_V3_SHADOW_RUNTIME_MODE. Flipping the gate is a
-# rebuild and redeploy of a new attested digest, not a restart or an env
-# change. The operator supplies it per profile as PRODUCTION_GENESIS_WAL_NATIVE
-# / EVALUATION_GENESIS_WAL_NATIVE; the selector names the key if it is absent.
+# This includes the one live `GCS_MEDIA_BUCKET`. PostgreSQL is the sole
+# structured-state authority; there is no baked backend selector or legacy
+# database/archive namespace.
 #
 # Required build args (a non-secret config-content hash; CONFIG_SHA256 is
 # declared only in the late image-config stage):
@@ -108,23 +94,13 @@ RUN mkdir -p /models \
     && echo "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b  /models/model.safetensors" | sha256sum -c - \
     && echo "1e98ea05b0de579fcaad3d625b62ea55647142ed674d5f5ebf1440e4bbbb6f23  /models/MODEL_CARD.md" | sha256sum -c -
 
-# WeSpeaker ResNet34-LM (VoxCeleb) for independent server-side voiceprints.
+# WeSpeaker ResNet34-LM (VoxCeleb) for the explicit offline voice-evaluation CLI.
 # The Rust binary supplies decoding, Kaldi fbank, inference, and matching; no
 # Python, sherpa process, or dynamic ONNX runtime is present in the image.
 RUN mkdir -p /models/voice \
     && curl -fsSL -o /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx \
        "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx" \
     && echo "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012  /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx" | sha256sum -c -
-
-# musl does not define the BSD-style u_int*_t aliases that sqlite-vec.c's
-# bundled C uses (typedef u_int8_t uint8_t; ...). glibc/macOS provide them, musl
-# does not — so on musl those typedefs fail and uint8_t silently degrades to
-# `int`, cascading into every vec0 pointer-type error. Map the BSD names onto
-# the standard C99 types for the C compilation; `typedef uint8_t uint8_t;` is
-# a legal redundant typedef in C11. Only sqlite-vec.c references these names;
-# rusqlite's bundled sqlite3.c uses the standard types and is unaffected.
-ENV CFLAGS="-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
-ENV CFLAGS_x86_64_unknown_linux_musl="-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
 
 # Cache dependency compilation separately from source
 ARG CARGO_INPUTS_SHA256
@@ -155,7 +131,6 @@ RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,
 FROM builder AS image-config
 ARG CONFIG_SHA256
 COPY --chmod=0555 scripts/assemble_image_config.sh /build/assemble_image_config.sh
-COPY --chmod=0555 scripts/validate_archive_v3_shadow_runtime_environment.sh /build/validate_archive_v3_shadow_runtime_environment.sh
 RUN --mount=type=secret,id=kioku-config,required \
     /build/assemble_image_config.sh /run/secrets/kioku-config /build/kioku-config "${CONFIG_SHA256}"
 
@@ -177,7 +152,7 @@ FROM scratch
 # digest and an operator CANNOT change it at launch:
 #   - ENCLAVE_KMS_VIA_ATTESTATION can't be flipped off
 #   - RUN_SA_EMAIL (whose ID token is trusted) can't be pointed at an attacker SA
-#   - KMS_*/GCS_BUCKET/ATTEST_STS_AUDIENCE/ENCLAVE_AUDIENCE can't be substituted
+#   - KMS_*/GCS_MEDIA_BUCKET/ATTEST_STS_AUDIENCE/ENCLAVE_AUDIENCE can't be substituted
 # Invariant: a malicious operator cannot boot the attested image with weakened
 # auth or pointed at different infrastructure. Caller authentication is
 # ID-token verification only — there is no shared-secret path in the binary.
@@ -191,12 +166,10 @@ LABEL "tee.launch_policy.allow_env_override"="PORT"
 # tracing here logs operational identifiers, counts, and statuses—not content.
 LABEL "tee.launch_policy.log_redirect"="always"
 
-# Allow the operator to mount a tmpfs at /tmp (tee-mount VM metadata).
-# This is REQUIRED twice over: (1) FROM scratch has no /tmp at all, so SQLite
-# temp-file creation fails without it; (2) decrypted per-user SQLite databases
-# are materialized under /tmp while in use — they must live in tmpfs (encrypted
-# VM memory under SEV), never on the VM disk, where a snapshot could expose
-# plaintext and void the confidentiality claim.
+# Allow the operator to mount a tmpfs at /tmp (tee-mount VM metadata). A scratch
+# image has no temporary directory, while bounded media/provider operations may
+# need transient files. Keeping that space in SEV-protected memory prevents
+# plaintext spill to a persistent VM disk.
 LABEL "tee.launch_policy.allow_mount_destinations"="/tmp"
 
 # ── Control-plane config (ADR-0001) — baked into the attested digest ──────────
@@ -206,9 +179,9 @@ LABEL "tee.launch_policy.allow_mount_destinations"="/tmp"
 # is the access-token issuer) so they are baked, not
 # operator-overridable — same rationale as the KMS config above.
 # Secret values are not build args: the web client secret is fetched from Secret
-# Manager and JWT secrets live in the KMS-protected control store.
+# Manager; JWT signing material comes from its fixed runtime secret boundary.
 #
-# TLS: fleet images bake ENCLAVE_TLS=1 and ENCLAVE_ACME=0. Every replica fetches
+# TLS: fleet images bake ENCLAVE_TLS=1. Every replica fetches
 # the same certificate/key generation from Secret Manager; neither PEM value is
 # an environment variable or image input. Renewal publishes new secret versions
 # and rolls the fleet. This avoids per-process HTTP-01 state behind the L4 load
@@ -233,24 +206,19 @@ COPY --from=image-config /build/kioku-config /kioku-config
 # if the model fails to load the enclave serves FTS-only (never fatal).
 COPY --from=builder /models /models
 ENV EMBED_MODEL_DIR=/models
-ENV VOICE_MODEL_PATH=/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx
 
 # Root, deliberately: the Confidential Space launcher mounts the /tmp tmpfs
 # root-owned with no mode/uid knobs in the tee-mount spec, and a FROM-scratch
-# image has no shell to chown it at startup — a non-root UID gets EACCES on
-# every SQLite temp file. The usual argument for non-root barely applies here:
-# single static binary, no shell, no package manager, hardened TEE, and the
-# data the process touches is the data it owns.
+# image has no shell to chown it at startup. The image is one static binary
+# with no shell or package manager inside a hardened TEE.
 
 # Confidential Space publishes ONLY the EXPOSEd container ports to the host
 # (observed: the launcher logs "Exposed Ports: map[...]" and forwards just those).
 # The enclave now terminates TLS on 443 (ADR-0001), so 443 MUST be exposed or the
-# port is unreachable from the VM's external interface. 80 is the ACME HTTP-01
-# challenge listener (ADR-0003) — without it Let's Encrypt cannot validate and
-# issuance/renewal fails. 8080 is also exposed because it remains the default
-# application `PORT`; production traffic on that port is still TLS.
+# port is unreachable from the VM's external interface. 8080 is also exposed
+# because it remains the default application `PORT`; production traffic on
+# that port is still TLS.
 EXPOSE 443
-EXPOSE 80
 EXPOSE 8080
 # Dedicated content-free fleet health listener. Confidential Space publishes
 # only declared ports, so omitting this would make the MIG healthy in-process

@@ -22,17 +22,6 @@ pub enum SampleDecision {
     Quarantine,
 }
 
-impl SampleDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NoEmbedding => "no_embedding",
-            Self::MatchOnly => "match_only",
-            Self::Enroll => "enroll",
-            Self::Quarantine => "quarantine",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceDiagnostics {
     pub quality_version: i64,
@@ -152,85 +141,6 @@ pub fn cosine(left: &[f32], right: &[f32]) -> f32 {
     left.iter().zip(right).map(|(a, b)| a * b).sum()
 }
 
-#[derive(Debug, Clone)]
-pub struct RobustRepresentative {
-    pub centroid: Vec<f32>,
-    pub medoid_index: usize,
-    pub excluded_indices: Vec<usize>,
-}
-
-pub fn robust_representative(samples: &[Vec<f32>]) -> Result<RobustRepresentative> {
-    let dimension = samples
-        .first()
-        .map(Vec::len)
-        .filter(|dimension| *dimension > 0)
-        .ok_or_else(|| EnclaveError::InvalidRequest("voice profile has no samples".into()))?;
-    if samples
-        .iter()
-        .any(|sample| sample.len() != dimension || sample.iter().any(|value| !value.is_finite()))
-    {
-        return Err(EnclaveError::InvalidRequest(
-            "voice profile samples are incompatible".into(),
-        ));
-    }
-    let medoid_index = (0..samples.len())
-        .max_by(|left, right| {
-            let score = |index: usize| {
-                samples
-                    .iter()
-                    .enumerate()
-                    .filter(|(other, _)| *other != index)
-                    .map(|(_, sample)| cosine(&samples[index], sample))
-                    .sum::<f32>()
-            };
-            score(*left)
-                .partial_cmp(&score(*right))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.cmp(left))
-        })
-        .expect("nonempty samples");
-    let excluded_indices = samples
-        .iter()
-        .enumerate()
-        .filter_map(|(index, sample)| {
-            (cosine(&samples[medoid_index], sample) < OUTLIER_SIMILARITY).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let mut centroid = vec![0_f32; dimension];
-    let mut accepted = 0_f32;
-    for (index, sample) in samples.iter().enumerate() {
-        if excluded_indices.contains(&index) {
-            continue;
-        }
-        for (target, value) in centroid.iter_mut().zip(sample) {
-            *target += *value;
-        }
-        accepted += 1.0;
-    }
-    if accepted == 0.0 {
-        return Err(EnclaveError::InvalidRequest(
-            "voice profile has no coherent samples".into(),
-        ));
-    }
-    for value in &mut centroid {
-        *value /= accepted;
-    }
-    normalize(&mut centroid)?;
-    Ok(RobustRepresentative {
-        centroid,
-        medoid_index,
-        excluded_indices,
-    })
-}
-
-pub fn is_profile_outlier(accepted: &[Vec<f32>], candidate: &[f32]) -> Result<bool> {
-    if accepted.is_empty() {
-        return Ok(false);
-    }
-    let representative = robust_representative(accepted)?;
-    Ok(cosine(&representative.centroid, candidate) < OUTLIER_SIMILARITY)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,12 +149,6 @@ mod tests {
         (0..seconds * SAMPLE_RATE as usize)
             .map(|index| ((index as f32 / 17.0).sin()) * 0.2)
             .collect()
-    }
-
-    fn unit(index: usize) -> Vec<f32> {
-        let mut vector = vec![0.0; 256];
-        vector[index] = 1.0;
-        vector
     }
 
     #[test]
@@ -281,27 +185,5 @@ mod tests {
             diagnose(&vec![1.0; SAMPLE_RATE as usize * 5], false, &[]).decision,
             SampleDecision::Quarantine
         );
-    }
-
-    #[test]
-    fn robust_representative_rejects_a_distant_outlier() {
-        let mut near_a = unit(0);
-        near_a[1] = 0.05;
-        normalize(&mut near_a).unwrap();
-        let mut near_b = unit(0);
-        near_b[2] = 0.06;
-        normalize(&mut near_b).unwrap();
-        let outlier = unit(9);
-        let representative = robust_representative(&[unit(0), near_a, near_b, outlier]).unwrap();
-        assert_eq!(representative.medoid_index, 0);
-        assert!(representative.excluded_indices.contains(&3));
-        assert!(cosine(&representative.centroid, &unit(0)) > 0.99);
-    }
-
-    #[test]
-    fn outlier_gate_abstains_before_a_stable_profile_can_be_poisoned() {
-        let accepted = vec![unit(0), unit(0), unit(0)];
-        assert!(!is_profile_outlier(&accepted, &unit(0)).unwrap());
-        assert!(is_profile_outlier(&accepted, &unit(8)).unwrap());
     }
 }

@@ -492,10 +492,7 @@ pub async fn require_auth(
                     next.run(req).await
                 }
                 Err(EnclaveError::SignupLimited) => {
-                    super::control_store::observe_signup_refused(
-                        "google",
-                        state.config.signup_limit_per_day,
-                    );
+                    super::observe_signup_refused("google", state.config.signup_limit_per_day);
                     signup_limited()
                 }
                 Err(EnclaveError::Auth(_)) => unavailable_account(),

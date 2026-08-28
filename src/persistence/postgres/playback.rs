@@ -34,7 +34,7 @@ impl PlaybackRepository for PostgresPersistence {
         memory_id: i64,
         durable_read: Option<&DurableReadFence>,
     ) -> Result<Option<PlaybackDataset>> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         if memory_id <= 0 {
             return Ok(None);
         }
@@ -244,7 +244,7 @@ impl PlaybackRepository for PostgresPersistence {
         limit: usize,
         durable_read: Option<&DurableReadFence>,
     ) -> Result<PersonMemoriesPage> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM people WHERE account_id=$1 AND id=$2 AND status='identified')",
         )

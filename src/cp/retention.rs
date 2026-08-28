@@ -5,7 +5,7 @@
 //! exact user-store recording inventory; the confirming request recomputes
 //! that inventory while holding the same per-user lifecycle gate as capture.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -14,19 +14,17 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
-use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
-use crate::error::{EnclaveError, Result};
-use crate::persistence::RecordingRetentionChangeRequest;
+use crate::error::EnclaveError;
+use crate::persistence::{
+    RecordingRetentionChangeRequest, RecordingRetentionInventory, RecordingRetentionPolicy,
+    RecordingRetentionPreference, RECORDING_RETENTION_CONSENT_VERSION,
+};
 
 use super::{
     auth::{AuthEvidence, AuthUser},
-    control_store::{
-        RecordingRetentionInventory, RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION,
-    },
     CpState,
 };
 
@@ -113,7 +111,7 @@ fn retention_error(error: EnclaveError) -> Response {
 
 fn retention_response(
     state: &CpState,
-    preference: &super::control_store::RecordingRetentionPreference,
+    preference: &RecordingRetentionPreference,
     inventory: &RecordingRetentionInventory,
 ) -> serde_json::Value {
     json!({
@@ -140,22 +138,12 @@ fn retention_response(
 
 fn durable_recording_retention_available(state: &CpState) -> bool {
     state.durable_recording_storage_bound
-        && (!state.repositories.uses_legacy_state()
-            || crate::schema_ladder::durable_recording_schema_active())
 }
 
 async fn get_recording_retention(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user.0).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return retention_error(error),
-        }
-    } else {
-        None
-    };
     let preference = match state
         .repositories
         .recording_retention()
@@ -193,14 +181,6 @@ async fn preview_recording_retention(
             json!({"error": "recording_retention_unavailable"}),
         );
     }
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user.0).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return retention_error(error),
-        }
-    } else {
-        None
-    };
     let preference = match state
         .repositories
         .recording_retention()
@@ -275,14 +255,6 @@ async fn change_recording_retention(
         );
     };
 
-    let lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user.0).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return retention_error(error),
-        }
-    } else {
-        None
-    };
     let preference = match state
         .repositories
         .recording_retention()
@@ -337,13 +309,9 @@ async fn change_recording_retention(
                 "durable recording policy lost its key epoch".into(),
             ));
         };
-        let candidate = if state.repositories.uses_legacy_state() {
-            String::new()
-        } else {
-            match crate::crypto::generate_and_wrap_dek(state.kms.as_ref()).await {
-                Ok((_, wrapped)) => wrapped,
-                Err(error) => return retention_error(error),
-            }
+        let candidate = match crate::crypto::generate_and_wrap_dek(state.kms.as_ref()).await {
+            Ok((_, wrapped)) => wrapped,
+            Err(error) => return retention_error(error),
         };
         if let Err(error) = state
             .repositories
@@ -356,32 +324,20 @@ async fn change_recording_retention(
         return no_store_json(StatusCode::OK, json!(change));
     }
 
-    // The settled preference is already the monotonic read/write fence. Drop
-    // the caller-owned gate before the reconciler reacquires it to do bounded
-    // provider work; a failure remains a visible, retryable 202 operation.
-    drop(lifecycle_guard);
-    let completion = if state.repositories.uses_legacy_state() {
-        state
-            .repositories
-            .recording_retention()
-            .complete_downgrade(&user.0, &change.operation_id)
-            .await
-    } else {
-        match state
-            .repositories
-            .media_objects()
-            .purge_recordings(&user.0)
-            .await
-        {
-            Ok(()) => {
-                state
-                    .repositories
-                    .recording_retention()
-                    .complete_downgrade(&user.0, &change.operation_id)
-                    .await
-            }
-            Err(error) => Err(error),
+    let completion = match state
+        .repositories
+        .media_objects()
+        .purge_recordings(&user.0)
+        .await
+    {
+        Ok(()) => {
+            state
+                .repositories
+                .recording_retention()
+                .complete_downgrade(&user.0, &change.operation_id)
+                .await
         }
+        Err(error) => Err(error),
     };
     match completion {
         Ok(completed) => no_store_json(StatusCode::OK, json!(completed)),
@@ -409,133 +365,6 @@ async fn get_recording_retention_change(
     }
 }
 
-pub(crate) async fn recording_authority_schema_present(
-    state: &CpState,
-    user_id: &str,
-) -> Result<bool> {
-    if !state.repositories.uses_legacy_state() {
-        return Ok(true);
-    }
-    state
-        .store
-        .wal_authoritative_read(user_id, |connection| {
-            let count: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema
-                 WHERE type='table' AND name='recording_media_authority'",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(count == 1)
-        })
-        .await
-}
-
-pub(crate) fn recording_inventory_conn(
-    connection: &Connection,
-    user_id: &str,
-    policy_revision: Option<i64>,
-    policy_epoch: Option<&str>,
-) -> Result<RecordingRetentionInventory> {
-    if policy_revision.is_some() != policy_epoch.is_some()
-        || policy_revision.is_some_and(|revision| revision <= 0)
-    {
-        return Err(EnclaveError::Store(
-            "recording inventory policy fence is malformed".into(),
-        ));
-    }
-    let authority_table_present: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-         WHERE type='table' AND name='recording_media_authority')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !authority_table_present {
-        return Err(EnclaveError::Store(
-            "recording inventory authority table is unavailable".into(),
-        ));
-    }
-    let prefix = format!("recordings/{user_id}/");
-    let mut statement = connection.prepare(
-        "SELECT m.asset_id,m.object_key,COALESCE(m.object_generation,0),m.byte_length,
-                m.sha256,e.capture_session_id,m.processing_state,COALESCE(m.deleted_at,''),
-                ra.retention_policy_revision,ra.retention_policy_epoch,ra.recording_state
-         FROM media_objects m
-         JOIN capture_events e ON e.event_id=m.event_id
-         JOIN recording_media_authority ra ON ra.asset_id=m.asset_id
-         WHERE substr(m.object_key,1,?2)=?1
-           AND ra.retention_decision='until_deleted'
-           AND ra.storage_backend='recordings'
-           AND ra.recording_state IN ('durable','delete_pending')
-           AND (?3 IS NULL OR (
-             ra.retention_policy_revision=?3 AND ra.retention_policy_epoch=?4
-           ))
-         ORDER BY m.asset_id,m.object_key",
-    )?;
-    let mut rows = statement.query(rusqlite::params![
-        prefix,
-        prefix.len() as i64,
-        policy_revision,
-        policy_epoch,
-    ])?;
-    let mut digest = Sha256::new();
-    digest.update(b"kioku.recording-retention-inventory.v1\0");
-    let mut object_count = 0_i64;
-    let mut byte_count = 0_i64;
-    let mut recordings = BTreeSet::new();
-    while let Some(row) = rows.next()? {
-        let asset_id: String = row.get(0)?;
-        let object_key: String = row.get(1)?;
-        let generation: i64 = row.get(2)?;
-        let bytes: i64 = row.get(3)?;
-        let sha256: String = row.get(4)?;
-        let recording_id: String = row.get(5)?;
-        let state: String = row.get(6)?;
-        let deleted_at: String = row.get(7)?;
-        let authority_revision: i64 = row.get(8)?;
-        let authority_epoch: String = row.get(9)?;
-        let authority_state: String = row.get(10)?;
-        for value in [
-            asset_id.as_bytes(),
-            object_key.as_bytes(),
-            &generation.to_be_bytes(),
-            &bytes.to_be_bytes(),
-            sha256.as_bytes(),
-            recording_id.as_bytes(),
-            state.as_bytes(),
-            deleted_at.as_bytes(),
-            &authority_revision.to_be_bytes(),
-            authority_epoch.as_bytes(),
-            authority_state.as_bytes(),
-        ] {
-            digest.update((value.len() as u64).to_be_bytes());
-            digest.update(value);
-        }
-        if generation > 0 && bytes > 0 && deleted_at.is_empty() && state != "pruned" {
-            object_count = object_count.saturating_add(1);
-            byte_count = byte_count.saturating_add(bytes);
-            recordings.insert(recording_id);
-        }
-    }
-    Ok(RecordingRetentionInventory {
-        inventory_fingerprint: format!("{:x}", digest.finalize()),
-        object_count,
-        byte_count,
-        recording_count: i64::try_from(recordings.len()).unwrap_or(i64::MAX),
-    })
-}
-
-pub(crate) fn empty_recording_inventory() -> RecordingRetentionInventory {
-    RecordingRetentionInventory {
-        inventory_fingerprint: format!(
-            "{:x}",
-            Sha256::digest(b"kioku.recording-retention-inventory.v1\0")
-        ),
-        object_count: 0,
-        byte_count: 0,
-        recording_count: 0,
-    }
-}
-
 pub(crate) fn spawn_reconciler(state: Arc<CpState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
@@ -554,28 +383,20 @@ pub(crate) fn spawn_reconciler(state: Arc<CpState>) {
                 }
             };
             for (user_id, operation_id) in pending {
-                let result = if state.repositories.uses_legacy_state() {
-                    state
-                        .repositories
-                        .recording_retention()
-                        .complete_downgrade(&user_id, &operation_id)
-                        .await
-                } else {
-                    match state
-                        .repositories
-                        .media_objects()
-                        .purge_recordings(&user_id)
-                        .await
-                    {
-                        Ok(()) => {
-                            state
-                                .repositories
-                                .recording_retention()
-                                .complete_downgrade(&user_id, &operation_id)
-                                .await
-                        }
-                        Err(error) => Err(error),
+                let result = match state
+                    .repositories
+                    .media_objects()
+                    .purge_recordings(&user_id)
+                    .await
+                {
+                    Ok(()) => {
+                        state
+                            .repositories
+                            .recording_retention()
+                            .complete_downgrade(&user_id, &operation_id)
+                            .await
                     }
+                    Err(error) => Err(error),
                 };
                 if let Err(error) = result {
                     tracing::warn!(error = %error, "recording retention reconciliation deferred");
@@ -583,57 +404,4 @@ pub(crate) fn spawn_reconciler(state: Arc<CpState>) {
             }
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recording_inventory_is_owner_scoped_and_state_sensitive() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE capture_events(event_id TEXT PRIMARY KEY,capture_session_id TEXT NOT NULL);
-                 CREATE TABLE media_objects(
-                   asset_id TEXT PRIMARY KEY,event_id TEXT NOT NULL,object_key TEXT NOT NULL,
-                   object_generation INTEGER,byte_length INTEGER NOT NULL,sha256 TEXT NOT NULL,
-                   processing_state TEXT NOT NULL,deleted_at TEXT
-                 );
-                 CREATE TABLE recording_media_authority(
-                   asset_id TEXT PRIMARY KEY,retention_policy_revision INTEGER NOT NULL,
-                   retention_policy_epoch TEXT NOT NULL,retention_decision TEXT NOT NULL,
-                   storage_backend TEXT NOT NULL,recording_state TEXT NOT NULL
-                 );
-                 INSERT INTO capture_events VALUES ('e1','session-a'),('e2','session-a'),('e3','session-b');
-                 INSERT INTO media_objects VALUES
-                   ('a1','e1','recordings/alice/a1.enc',1,10,'aa','ready',NULL),
-                   ('a2','e2','recordings/alice/a2.enc',2,20,'bb','ready',NULL),
-                   ('a3','e3','recordings/bob/a3.enc',1,30,'cc','ready',NULL);
-                 INSERT INTO recording_media_authority VALUES
-                   ('a1',3,'rpe_current','until_deleted','recordings','durable'),
-                   ('a2',2,'rpe_old','until_deleted','recordings','durable'),
-                   ('a3',3,'rpe_current','until_deleted','recordings','durable');",
-            )
-            .unwrap();
-        let alice = recording_inventory_conn(&connection, "alice", None, None).unwrap();
-        assert_eq!(alice.object_count, 2);
-        assert_eq!(alice.byte_count, 30);
-        assert_eq!(alice.recording_count, 1);
-        let current =
-            recording_inventory_conn(&connection, "alice", Some(3), Some("rpe_current")).unwrap();
-        assert_eq!(current.object_count, 1);
-        assert_eq!(current.byte_count, 10);
-        let before = alice.inventory_fingerprint;
-        connection
-            .execute(
-                "UPDATE media_objects SET processing_state='pruned' WHERE asset_id='a2'",
-                [],
-            )
-            .unwrap();
-        let after = recording_inventory_conn(&connection, "alice", None, None).unwrap();
-        assert_eq!(after.object_count, 1);
-        assert_ne!(before, after.inventory_fingerprint);
-        assert_eq!(empty_recording_inventory().object_count, 0);
-    }
 }

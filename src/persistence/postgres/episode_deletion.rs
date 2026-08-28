@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use crate::{
-    episodes::EpisodePurge,
     error::{EnclaveError, Result},
-    persistence::{EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart},
+    persistence::{
+        EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart, EpisodePurge,
+    },
 };
 
 use super::PostgresPersistence;
@@ -335,5 +336,30 @@ impl EpisodeDeletionRepository for PostgresPersistence {
         .await?;
         transaction.commit().await?;
         Ok(persisted.purge)
+    }
+
+    async fn pending_episode_deletions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, EpisodeDeletionPlan)>> {
+        let limit = i64::try_from(limit.clamp(1, 256)).map_err(|_| {
+            EnclaveError::InvalidRequest("episode deletion limit is invalid".into())
+        })?;
+        let rows = sqlx::query(
+            "SELECT account_id,episode_id,purge::text AS purge,media_object_keys::text AS media \
+               FROM episode_deletions WHERE state='pending' \
+              ORDER BY updated_at,account_id,episode_id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let account_id = row.try_get("account_id")?;
+                let episode_id = row.try_get("episode_id")?;
+                let plan = decode_plan(episode_id, row.try_get("purge")?, row.try_get("media")?)?;
+                Ok((account_id, plan))
+            })
+            .collect()
     }
 }

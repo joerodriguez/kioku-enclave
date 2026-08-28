@@ -3,8 +3,9 @@
 This is the stable capture contract for the pure-Swift macOS and iOS clients.
 Clients capture bounded audio or screenshots, attach authoritative device-time
 and foreground/browser context, and upload them to the attested enclave. All
-transcription, OCR, diarization, profile learning, voice matching, indexing,
-and summarization run in the cloud.
+transcription, OCR, diarization, indexing, and summarization run in the cloud.
+WeSpeaker profile learning and voice matching are offline evaluation capabilities,
+not part of the serving capture pipeline.
 
 The capture pipeline is a core product behavior. It is not controlled by a
 Kioku feature flag. Apple recording, Screen Recording, and Automation
@@ -178,7 +179,7 @@ server-issued fields shown above. The recording lease response also includes cli
 validity timestamps; clients use those to decide whether the complete source interval is
 covered but never serialize them into this deny-unknown-fields object. The echo is not
 authority by itself. Ingest verifies its signature, account, lease, policy epoch, and
-interval, then rechecks the current encrypted-Control preference under the account
+interval, then rechecks the current durable retention preference under the account
 lifecycle lock. Missing, stale, revoked, out-of-interval, or malformed authority falls
 back to the ordinary 30-day processing path. Durable storage unavailability never becomes
 a claimed durable acknowledgement.
@@ -332,8 +333,8 @@ HTTP `200`:
 
 The enclave validates the whole batch, bulk-reserves the existing per-event delayed-
 delivery authority, records every new reference/browser observation in one user
-transaction, advances the contiguous acknowledgement once, and durably saves the user
-archive once. It returns success only after that save. A failed or ambiguous save retains
+PostgreSQL transaction and advances the contiguous acknowledgement once. It returns success
+only after commit. A failed or ambiguous commit retains
 the per-event reservations for idempotent retry; it does not acknowledge volatile rows or
 spend the same event twice. Every genuinely new reference still costs one event credit and
 zero media bytes. The batch receipt is correlation state, not billing authority.
@@ -492,7 +493,7 @@ validated against the assembled window; source timestamps, URLs, and literal
 device context always remain authoritative.
 
 Gemini `speaker_local_id` values are request-local turn-grouping hints, not
-durable speaker identities. The archive therefore never exposes an unmatched
+durable speaker identities. The structured store therefore never exposes an unmatched
 local ID such as `speaker_0`: it uses `Unidentified voice` instead. Within one
 work unit, unresolved sibling turns may inherit a name or independent voice
 profile label only when the same local ID has exactly one nonconflicting
@@ -543,75 +544,60 @@ final accepted audio manifest carries `session_finished=true`.
 
 ## Screenshot evidence bytes
 
-Cloud Capture v2 does not use the historical device-sync upload planner. For a
-Genesis-selected archive, authenticated `GET /api/screenshot-images/plan` and
+Cloud Capture v2 does not use the retired device-sync upload planner. Authenticated
+`GET /api/screenshot-images/plan` and
 `POST /api/screenshot-images` return
 `410 {"error":"screenshot_upload_retired"}` before reading an upload body or
-performing archive, KMS, reservation, or object-provider work. Canonical capture
+performing PostgreSQL, KMS, reservation, or object-provider work. Canonical capture
 already uploaded the bounded image under its event receipt, and the native client
-does not retain a second local source to upload later. The old plan and multipart
-behavior remain only for unselected legacy archives during their compatibility
-window; new clients must not call them.
+does not retain a second local source to upload later. New clients must not call the
+retired plan or multipart routes.
 
 `GET /api/screenshot-images/{cloud_image_id}/content` serves a complete JPEG to the
 authenticated owner. A Cloud Capture v2 ID has the form `capture-v2:{asset_id}` and is
 available only after the canonical screen result is ready. The enclave reads the exact
 current-provider generation committed by capture ingest and verifies its owner-derived
 object key, installed wrapped DEK, strict v2 authenticated context, plaintext length, and
-SHA-256 before returning bytes. It never substitutes a newer generation or falls back to
-the legacy media provider for a `capture-v2:` ID. Historical screenshot-image IDs retain
-their separate compatibility read path.
+SHA-256 before returning bytes. It never substitutes a newer generation. The only supported
+namespace is `capture-v2:`; another well-formed identifier is absent and returns `404`.
 
 A genuinely absent, non-ready, deleted, non-JPEG, or wrong-owner image returns `404`.
-Archive, current-object-provider, or KMS transport unavailability returns
+PostgreSQL, current-object-provider, or KMS transport unavailability returns
 `503 {"error":"enclave_unavailable"}`. Malformed sealed identity, key mismatch,
 authentication failure, or length/hash corruption returns `500` and no bytes.
 
 ## Browser evidence and episode deletion
 
 Authenticated `GET /api/browser-snapshots/{source_key}` returns browser evidence only
-while the exact legacy snapshot or Cloud Capture v2 event observation remains linked to
+while the exact Cloud Capture v2 event observation remains linked to
 a live screenshot in a live episode. The v2 loader reauthenticates the event, observation,
 state commitment, context status, canonical envelope and screenshot source association;
 missing or mismatched required evidence is an authority failure, not a plausible empty
-snapshot. True absence or wrong ownership returns `404`; archive unavailability or corrupt
+snapshot. True absence or wrong ownership returns `404`; PostgreSQL unavailability or corrupt
 authoritative evidence returns `503 {"error":"enclave_unavailable"}`.
 
-Authenticated `DELETE /api/episodes/{id}` returns the deleted utterance and screenshot
-counts plus their local source keys. For selected Genesis archives, one sealed preparation
-first validates the exact immediate tombstone/cascade closure and cross-episode membership.
-The same transaction removes user-visible plaintext, reserves the bounded permanent receipt,
-and stores only compact, ordered event/voice/legacy selectors before external deletion.
-Each selector is then expanded in its own bounded exact transaction (a legal audio window is
-at most 128 event roots). Before voice identity paging, the selector reserves its exact legal
-maximum of 16,384 cleanup rows and bounded bytes against the global ledger; expansion atomically
-replaces that reservation with the exact inventory. Each first-time current voice-progress row
-is separately charged to that same global ledger before identity mutation, an overwrite adds no
-charge, and expansion releases the exact authenticated progress count. Other selectors
-exact-reserve at expansion. No local or
-provider-backed mutation precedes the applicable reservation, and finishing releases exact
-dynamic capacity while retaining content-free inventory and settlement commitments.
-Canonical event subtrees, explicit and historical NULL-linked audio observations, shared voice
-closures, work units, browser states, and legacy snapshots survive while any non-target evidence
-still references them. Imported pre-lineage voice samples are scoped to the exact affected profile
-closure and receive deterministic, fixed-stamp revision/assignment backfill before recompute; no
-unrelated voice row is touched. Affected surviving episodes are queued through authenticated
-rotating 128-episode pages. One globally charged current progress row per affected episode is overwritten rather
-than retaining page history; restart resumes from the durable cursor, higher IDs are reached
-before wraparound, and identity work completed between pages is detected and queued again before
-the voice purge. A dedicated restart-safe worker scans immediately and every 30 seconds,
-rotates a durable cursor across four episodes per account turn, and continues independent jobs
-after one provider failure. Route wakeups are bounded/coalesced, and an unavailable account uses
-a process-local 1-to-30-second exponential delay without delaying ready neighbors. `202` with
-`{"deletion_pending":true}` means the logical deletion is
-durable and that worker will continue; `200` is returned only after the gap-free selector
-sequence and its authenticated provider inventory are complete. Repeating a completed request
-returns the authenticated receipt
-without another provider call. A never-present episode returns `404`.
-Archive corruption, capacity refusal, or provider cleanup failure returns `503` and never
-claims deletion completed. The retained ledger contains fixed commitments and provider
-identities, not transcript, OCR, browser URL/title/tab, final brief, voice embedding, or
-delivery payload content.
+Authenticated `DELETE /api/episodes/{id}` returns the deleted utterance, screenshot, and
+unreferenced audio-segment counts plus the utterance and screenshot local source keys. For a new
+deletion, one tenant-qualified PostgreSQL transaction locks the episode, inventories its exact
+member IDs, source keys, now-orphaned capture events, and live-media object names, freezes episode
+finalization, and records an immutable pending plan and replayable response. Structured rows are
+not physically removed before external media cleanup. Segments and capture events that still have
+non-target references are excluded from the purge.
+
+The route deletes and verifies every current and noncurrent GCS generation for each exact object
+name in that PostgreSQL plan. Only after every object is absent does a second transaction lock and
+revalidate the durable plan, delete the episode and its inventoried structured rows, and mark the
+receipt complete. A successful request returns `200` with `{"deleted":true,...}`. Repeating a
+completed request returns the persisted receipt without another provider call; a never-present
+episode returns `404`.
+
+Preparation failure returns `503 {"error":"enclave_unavailable"}`. Object cleanup or
+transactional completion failure returns
+`503 {"error":"media_delete_failed","deletion_pending":true}`—the episode API does not use
+`202`. The durable plan remains pending, so another `DELETE` resumes the same idempotent work and a
+restart-safe reconciler also scans immediately and every 30 seconds, processing at most 32 pending
+plans per scan in durable update/account/episode order. No response claims completion while an
+inventoried object generation or the transactional structured purge remains outstanding.
 
 ## Finalized-episode webhooks
 
@@ -627,15 +613,15 @@ Each list item includes a content-free `delivery_status` summary with `pending`,
 `latest` object contains only a normalized outcome, bounded attempt count,
 validated HTTP status, and validated update timestamp; it never returns a
 provider error string, endpoint path, secret, signature, or body.
-If the selected archive authority cannot answer that status read, the list
+If PostgreSQL cannot answer that status read, the list
 request returns `503 {"error":"enclave_unavailable"}` rather than a zeroed
 status or a generic fault.
 
-For selected Genesis archives, only new `w1_` event identities can reach a
-provider. Historical bare `evt_` rows and rows older than 24 hours are cancelled
+Only `w1_` event identities can reach a provider. Malformed rows and rows older than
+24 hours are cancelled
 without network I/O. Before the first provider call, the worker freezes one exact
 bounded endpoint, signing secret, content decision, and canonical body, then
-durably claims the complete delivery row behind an exact Control disclosure
+durably claims the complete delivery row behind an exact PostgreSQL disclosure
 fence. Retries reuse those bytes and the same `webhook-id`; a lost or otherwise
 ambiguous response is never resent. Definitive transient rejects use bounded
 `Retry-After`/backoff up to ten attempts.
@@ -644,18 +630,18 @@ Every DNS lookup has a five-second deadline and at most 64 answers; all answers
 must be public, the chosen address is pinned, environment proxies are disabled,
 and redirects are disabled. A
 subscription is strictly ordered, while another subscription can progress.
-Selected delivery makes at most two provider calls per account per sweep, checks
+Delivery makes at most two provider calls per account per sweep, checks
 that cap before creating a claim, and is
-paced at 250 ms process-locally; production makes that service-wide through the
-release-verified singleton runtime contract. Deletion first disables the
+paced at 250 ms per worker. PostgreSQL claim ownership, lease expiry, and compare-and-set
+settlement make the provider boundary safe across horizontal workers. Deletion first disables the
 destination, exactly cancels its complete backlog in resumable one-row
-transactions, exactly purges terminal archive rows and their frozen endpoint,
+transactions, exactly purges terminal delivery rows and their frozen endpoint,
 signing secret, opted-in body, and claim evidence, then removes it. The
 permanent logical purge record retains only fixed-size commitments. An in-flight
 disclosure fence makes deletion conflict rather than allowing content to leave
 after revocation. Finalization holds the same per-account lifecycle boundary
-from its enabled-destination snapshot through the atomic archive commit;
-deletion holds it through disable, archive drain, and Control removal, so a
+from its enabled-destination snapshot through the atomic PostgreSQL commit;
+deletion holds it through disable, delivery drain, and account removal, so a
 paused stale snapshot cannot enqueue after a successful `204`.
 
 ## Episode-ready email preference
@@ -667,8 +653,8 @@ also returns the verified account email as `recipient_email` and whether the
 provider is configured as `available`. Responses are `no-store`.
 
 An initial completed memory creates one durable email delivery when the
-preference is enabled; recap regeneration does not enqueue another. A selected
-Genesis archive freezes the exact current recipient, rendered text and HTML,
+preference is enabled; recap regeneration does not enqueue another. PostgreSQL freezes the
+exact current recipient, rendered text and HTML,
 content-consent decision, and `e1_` idempotency key before its first provider
 call. Retries reuse those exact bytes. Preference disablement, content downgrade,
 or account deletion cannot pass the durable pre-send disclosure fence; changing
@@ -678,11 +664,11 @@ Deliveries older than 24 hours and malformed, missing, exhausted, or
 capacity-limited rows are cancelled without provider I/O. Known provider
 rejections retry with bounded `Retry-After`/backoff up to ten attempts. A lost
 or otherwise ambiguous response is never resent. Provider acceptance records
-the provider's actual 2xx status and message ID. The selected worker sends at
+the provider's actual 2xx status and message ID. A worker sends at
 most two emails per account per sweep, uses 250-ms process-local pacing, and
-opens a process-local provider circuit for provider-wide failures. Production
-relies on the same release-verified singleton VM/container contract described
-for push; overlapping or horizontal runtimes remain forbidden.
+opens a process-local provider circuit for provider-wide failures. Durable PostgreSQL
+claims, lease expiry, and compare-and-set settlement prevent two horizontal workers from
+sending the same delivery.
 
 ## Apple ready-notification installation
 
@@ -700,25 +686,21 @@ URL, or credential. Authenticated `GET /api/notifications/{handoff_handle}` reso
 handle to the corresponding memory ID; missing, expired/deleted, and wrong-owner handles
 are indistinguishable.
 
-For selected Genesis archives, historical bare-installation delivery rows may
-exist, but they are cancellation-only and can never reach APNs. Push delivery
-is active only for new `p1` rows bound to the current Control token generation,
-so no pre-lift notification is replayed. Each delivery expires within 24 hours and is best-effort
+Only current `p1` rows bound to the current credential generation can reach APNs;
+malformed or stale delivery rows are cancellation-only. Each delivery expires within
+24 hours and is best-effort
 at-most-once: Kioku retries only a provider response known to be a rejection,
 and never resends after a lost or otherwise ambiguous response. A handoff for a
 possibly delivered notification remains resolvable while its finalized memory
-exists. A truly absent or wrong-owner handoff returns 404; temporary selected
-archive authority failure returns 503 so clients do not mistake unavailability
+exists. A truly absent or wrong-owner handoff returns 404; temporary PostgreSQL
+unavailability returns 503 so clients do not mistake unavailability
 for absence.
 
-Push pacing and provider-circuit state are process-local. Production supports
-this endpoint only under the clean, release-verified deployment commit and exact
-Terraform-root source seal whose reviewed source defines one Confidential Space
-VM/container and the reserved addresses. The seal is bound before network access
-and rechecked at roll; the exact tracked deployment owner recomputes it again
-inside its production-infrastructure lock before credentials, planning, or apply.
-Horizontal or overlapping enclave runtimes are forbidden until an external
-provider send fence exists.
+Push pacing and provider-circuit state are process-local. PostgreSQL delivery claims,
+expiry, and compare-and-set settlement provide the service-wide send fence for horizontal
+workers; a lost or ambiguous provider response is terminal and is never resent. Production
+still requires the clean, release-verified deployment source seal and ADR-0041's staged
+zero-unavailable rollout with exact image/KMS/readiness readback.
 
 ## People learned automatically
 
@@ -819,26 +801,6 @@ change either retention decision. Before activation the routes remain dark, and 
 durable rollout additionally remains blocked on full media-byte export and complete
 recording-audio deletion inventory required by ADR-0036.
 
-## Archive-v3 activation binding (owner only)
-
-`GET /api/admin/archive-v3/activation-binding` is a temporary operational
-bootstrap read retained for historical one-canary images and for the account named in the image-baked `ADMIN_USER_IDS` list.
-It is accepted only while the image's archive-v3 runtime profile is still
-`off` and returns a one-way, non-secret commitment to the caller's already
-durable opaque Control archive binding:
-
-```json
-{
-  "schema_version": 1,
-  "archive_binding_commitment": "64 lowercase hexadecimal characters"
-}
-```
-
-The raw archive identifier never leaves encrypted Control. A non-owner gets
-`403`, a malformed or unreadable binding/configuration gets `503`, and an
-already-active image gets `409`; the route cannot become a general archive
-identity oracle after activation.
-
 ## Owner metrics facade
 
 The owner economics routes require an ordinary authenticated account whose stable enclave
@@ -915,7 +877,7 @@ these routes. Silence-removal percentages shown by the dashboard are planning sc
 over complete rate-card-modeled uncached audio-input cost, not measured silence or realized
 savings.
 
-## Account-deletion status (ADR-0022 Phase 0 bridge)
+## Account-deletion status
 
 `DELETE /api/account` begins or retries account deletion. It returns `202` until
 physical deletion finishes and `200` only once it is complete. Each response has
@@ -937,13 +899,11 @@ States are `pending`, `failed_retryable`, and `physical_complete`; `deleted` is
 true only in `physical_complete`. The latter has no retry delay or provider
 deadline. `Retry-After` is supplied when a retry delay is known.
 
-This Phase-0 bridge uses the caller's ordinary account authentication; it does
-not introduce a separate polling credential or claim the future ADR-0022 v3
-content ledger. Deleting or deleted credentials are accepted only for these
-deletion routes. A missing listed legacy generation and the temporary 512 MiB
-historical-snapshot compatibility limit report `failed_retryable`; provider
-retention and transient infrastructure/inventory failures remain `pending` for
-the bounded server-side reconciler.
+The status surface uses the caller's ordinary account authentication and does not
+introduce a separate polling credential. Deleting or deleted credentials are accepted
+only for these deletion routes. PostgreSQL and provider retention/transient cleanup
+failures remain pending or retryable for the bounded server-side reconciler; the API
+never reports physical completion while structured rows or owned media generations remain.
 
 ## Processing and privacy semantics
 
@@ -961,8 +921,9 @@ the bounded server-side reconciler.
   remain distinct. One-to-three-second samples are match-only; overlap, music,
   echo, silence, clipping, and low-purity samples quarantine. At least three
   seconds of clean speech is required for enrollment, and profiles use a
-  versioned medoid/trimmed centroid with outlier rejection. Independent
-  WeSpeaker embeddings then match later turns; Gemini never receives
+  versioned medoid/trimmed centroid with outlier rejection. The offline
+  voice-evaluation path can use WeSpeaker embeddings to measure later-turn
+  matching; serving does not currently execute that path. Gemini never receives
   voiceprints or acts as a biometric identifier. Gemini request-local speaker
   IDs may group turns only inside their source work unit; unmatched IDs are
   displayed as `Unidentified voice`, not persisted as apparent people.
@@ -984,7 +945,7 @@ the bounded server-side reconciler.
   30-day policy. Account export
   includes profile proposals, revisions, and sample-assignment lineage. Account
   deletion removes raw objects, derived records, profiles, lineage, credentials,
-  and the encrypted user database. For every exact GCS object name, deletion lists,
+  and all account-owned PostgreSQL rows. For every exact GCS object name, deletion lists,
   deletes, and verifies the absence of all live and noncurrent generations.
 - Server logs may contain operational IDs, counts, states, and error classes,
   but never media, transcripts, URLs, names, facts, tokens, or key material.

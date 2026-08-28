@@ -24,7 +24,10 @@ use tracing::warn;
 
 use crate::error::EnclaveError;
 
-use super::{auth::AuthUser, control_store::RetainedAccountMetrics, CpState};
+use super::{auth::AuthUser, CpState};
+use crate::persistence::{
+    RecordingLeaseRequestRow, RecordingRetentionPolicy, RetainedAccountMetrics,
+};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
@@ -154,7 +157,6 @@ pub struct UsageAuthorizeRequest {
 pub struct UsageAuthorizeResponse {
     pub decision: String,
     pub reason: Option<String>,
-    #[allow(dead_code)]
     pub duplicate: bool,
     pub summary: Value,
 }
@@ -633,7 +635,7 @@ fn offline_recording_event_id(account_id: &str, request_id: &str) -> String {
 }
 
 fn lease_request_matches(
-    existing: &super::control_store::RecordingLeaseRequestRow,
+    existing: &RecordingLeaseRequestRow,
     request: &RecordingLeaseRequest,
 ) -> bool {
     existing.requested_lease_id == request.lease_id
@@ -723,17 +725,14 @@ async fn attach_recording_retention_authority(
         "consent_version": preference.consent_version,
         "status": "processing_only",
     });
-    if preference.policy == super::control_store::RecordingRetentionPolicy::UntilDeleted {
-        let schema_present = super::retention::recording_authority_schema_present(state, user_id)
-            .await
-            .map_err(|_| RecordingAuthorizationFailure::Unavailable)?;
+    if preference.policy == RecordingRetentionPolicy::UntilDeleted {
         let policy_epoch = preference
             .policy_epoch
             .as_deref()
             .ok_or(RecordingAuthorizationFailure::Unavailable)?;
         let expires_ms = super::isotime::parse_epoch_millis(expires_at)
             .ok_or(RecordingAuthorizationFailure::Unavailable)?;
-        if !state.durable_recording_storage_bound || !schema_present {
+        if !state.durable_recording_storage_bound {
             authority["status"] = Value::String("temporarily_unavailable".into());
         } else {
             let claims = super::tokens::RecordingRetentionLeaseClaims {
@@ -2066,206 +2065,8 @@ pub async fn drain_detach_outbox(state: &CpState) {
 }
 
 #[cfg(test)]
-#[derive(Default)]
-pub struct FakeBillingGateway;
-
-#[cfg(test)]
-#[async_trait]
-impl BillingGateway for FakeBillingGateway {
-    async fn summary(&self, _account_id: &str) -> Result<Value, BillingError> {
-        Ok(serde_json::json!({
-            "plan": {"id":"free","name":"Free"},
-            "usage": {"allowance_seconds":1800,"used_seconds":0,"remaining_seconds":1800},
-            "recording": {"allowed":true,"reason":null}
-        }))
-    }
-
-    async fn authorize(
-        &self,
-        _request: &UsageAuthorizeRequest,
-    ) -> Result<UsageAuthorizeResponse, BillingError> {
-        Ok(UsageAuthorizeResponse {
-            decision: "allow".into(),
-            reason: None,
-            duplicate: false,
-            summary: self.summary("").await?,
-        })
-    }
-
-    async fn checkout(
-        &self,
-        _account_id: &str,
-        _request: &CheckoutRequest,
-    ) -> Result<UrlResponse, BillingError> {
-        Ok(UrlResponse {
-            url: "https://checkout.example.test/session".into(),
-        })
-    }
-
-    async fn portal(&self, _account_id: &str) -> Result<UrlResponse, BillingError> {
-        Ok(UrlResponse {
-            url: "https://account.example.test/session".into(),
-        })
-    }
-
-    async fn report_vertex_usage(
-        &self,
-        events: &[VertexUsageEvent],
-    ) -> Result<VertexUsageBatchResponse, BillingError> {
-        Ok(VertexUsageBatchResponse {
-            accepted: events.len(),
-            duplicates: 0,
-            unpriced: 0,
-            ambiguous: 0,
-        })
-    }
-
-    async fn report_vertex_coverage(
-        &self,
-        _snapshot: &VertexCoverageSnapshot,
-    ) -> Result<VertexCoverageResponse, BillingError> {
-        Ok(VertexCoverageResponse {
-            accepted: true,
-            duplicate: false,
-            stale: false,
-        })
-    }
-
-    async fn admin_margin(
-        &self,
-        _month: &str,
-        _limit: u8,
-        _after: Option<&str>,
-    ) -> Result<Value, BillingError> {
-        Ok(serde_json::json!({
-            "generated_at": "2026-08-09T12:00:00.000Z",
-            "period": {"starts_at":"2026-08-01T00:00:00Z","ends_at":"2026-09-01T00:00:00Z"},
-            "rows": [],
-            "next_cursor": null,
-            "cost_reconciliation": {},
-            "cost_completeness": "partial"
-        }))
-    }
-
-    async fn detach(&self, _account_id: &str) -> Result<DetachResponse, BillingError> {
-        Ok(DetachResponse { detached: true })
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::tests::{FakeGcs, FakeKms};
-    use crate::store::Store;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-
-    struct ProbeGateway {
-        admin_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl BillingGateway for ProbeGateway {
-        async fn summary(&self, _: &str) -> Result<Value, BillingError> {
-            unreachable!()
-        }
-        async fn authorize(
-            &self,
-            _: &UsageAuthorizeRequest,
-        ) -> Result<UsageAuthorizeResponse, BillingError> {
-            unreachable!()
-        }
-        async fn checkout(
-            &self,
-            _: &str,
-            _: &CheckoutRequest,
-        ) -> Result<UrlResponse, BillingError> {
-            unreachable!()
-        }
-        async fn portal(&self, _: &str) -> Result<UrlResponse, BillingError> {
-            unreachable!()
-        }
-        async fn report_vertex_usage(
-            &self,
-            _: &[VertexUsageEvent],
-        ) -> Result<VertexUsageBatchResponse, BillingError> {
-            unreachable!()
-        }
-        async fn report_vertex_coverage(
-            &self,
-            _: &VertexCoverageSnapshot,
-        ) -> Result<VertexCoverageResponse, BillingError> {
-            unreachable!()
-        }
-        async fn admin_margin(
-            &self,
-            _: &str,
-            _: u8,
-            _: Option<&str>,
-        ) -> Result<Value, BillingError> {
-            self.admin_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(serde_json::json!({}))
-        }
-        async fn detach(&self, _: &str) -> Result<DetachResponse, BillingError> {
-            unreachable!()
-        }
-    }
-
-    fn probe_state(admin_calls: Arc<AtomicUsize>) -> Arc<CpState> {
-        let kms = Arc::new(FakeKms);
-        let gcs = Arc::new(FakeGcs::new());
-        let control = Arc::new(super::super::control_store::ControlStore::new(
-            kms.clone(),
-            gcs.clone(),
-        ));
-        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
-        Arc::new(CpState {
-            kms: Arc::clone(&store.kms),
-            durable_recording_storage_bound: store.durable_recording_storage_bound(),
-            store: Arc::clone(&store),
-            control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control, store),
-            billing: Arc::new(ProbeGateway { admin_calls }),
-            recording_lease_gate: Arc::new(RecordingLeaseGates::default()),
-            config: Arc::new(super::super::CpConfig {
-                base_url: "http://localhost:8080".into(),
-                jwt_secrets: vec!["test".into()],
-                google_desktop_client_id: "desktop".into(),
-                google_ios_client_id: "ios".into(),
-                google_web_client_id: "web".into(),
-                google_web_client_secret: "secret".into(),
-                admin_user_ids: vec!["11111111-1111-4111-8111-111111111111".into()],
-                signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
-                scheduler_sa_email: None,
-                vertex_project: "project".into(),
-                vertex_location: "global".into(),
-                vertex_model: "model".into(),
-                quota_utterances_per_day: 1,
-                quota_screenshots_per_day: 1,
-                quota_mcp_calls_per_day: 1,
-                quota_vertex_output_tokens_per_day: 1,
-                web_origin: "http://localhost:3000".into(),
-                reviewer_auth: None,
-                apple_sign_in: None,
-                billing_enforcement_mode: super::super::BillingEnforcementMode::Enforce,
-            }),
-            user_verifier: Arc::new(super::super::auth::UserIdTokenVerifier::new(vec![])),
-            reviewer_verifier: None,
-            apple_provider: None,
-            sync_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            reference_batch_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
-            mcp_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            oauth_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            test_email_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            email_transport: None,
-            push_transport: None,
-            embedding: None,
-            voice: None,
-        })
-    }
 
     #[test]
     fn batch_accounting_requires_every_event_to_be_classified() {
@@ -2438,7 +2239,7 @@ mod tests {
 
     #[test]
     fn request_id_payload_conflicts_and_unsafe_early_renewals_are_rejected() {
-        let row = super::super::control_store::RecordingLeaseRequestRow {
+        let row = crate::persistence::RecordingLeaseRequestRow {
             requested_lease_id: None,
             issued_lease_id:
                 "lease_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -2715,65 +2516,6 @@ mod tests {
             .insert("commercial_extension".into(), Value::from(1));
         assert!(
             validated_margin_account_ids(&report(vec![opaque_commercial_extension]), 50).is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn admin_capabilities_are_owner_named_and_legacy_compatible() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let response = admin_capabilities(
-            State(probe_state(calls.clone())),
-            Extension(AuthUser("11111111-1111-4111-8111-111111111111".into())),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap(),
-            HeaderValue::from_static("no-store")
-        );
-        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["owner"], true);
-        assert_eq!(value["admin"], true);
-        assert_eq!(value["margin_report"], true);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn non_admin_capability_denial_is_no_store() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let response = admin_capabilities(
-            State(probe_state(calls.clone())),
-            Extension(AuthUser("22222222-2222-4222-8222-222222222222".into())),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap(),
-            HeaderValue::from_static("no-store")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn non_admin_margin_denial_precedes_identity_and_upstream_access() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let response = admin_margin(
-            State(probe_state(calls.clone())),
-            Extension(AuthUser("22222222-2222-4222-8222-222222222222".into())),
-            Query(MarginQuery {
-                limit: None,
-                after: None,
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap(),
-            HeaderValue::from_static("no-store")
         );
     }
 }

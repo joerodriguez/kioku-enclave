@@ -29,26 +29,7 @@ pub struct ScreenObservationInput {
     pub browser_context_json: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ScreenObservation {
-    pub screenshot_id: i64,
-    pub input_revision: String,
-    pub observation_version: i32,
-    pub status: String,
-    pub generation_method: String,
-    pub literal_description: String,
-    pub screen_state: String,
-    pub content_type: String,
-    pub visible_text_summary: Option<String>,
-    pub notable_items_json: String,
-    pub model_name: Option<String>,
-    pub prompt_version: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelScreenObservationOutput {
-    pub id: String,
     pub literal_description: String,
     pub screen_state: String,
     pub content_type: String,
@@ -63,64 +44,6 @@ pub fn compute_observation_input_revision(input: &ScreenObservationInput) -> Str
     hasher.update(b"screen-observation-v3\0");
     hasher.update(canonical.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-pub fn build_deterministic_fallback(
-    input: &ScreenObservationInput,
-    revision: &str,
-) -> ScreenObservation {
-    let app = input.primary_app.as_deref().unwrap_or("Application");
-    let title = input.window_title.as_deref().unwrap_or("screen");
-    let ocr = input.salient_ocr_text.as_deref().unwrap_or("").trim();
-    let heading = if title.eq_ignore_ascii_case(app) {
-        app.to_string()
-    } else {
-        format!("{app} · {title}")
-    };
-    let description = if ocr.is_empty() {
-        heading
-    } else {
-        format!(
-            "{heading} — visible text: {}",
-            ocr.chars().take(100).collect::<String>()
-        )
-    };
-    let state_evidence = format!(
-        "{} {} {}",
-        title,
-        ocr,
-        input.visual_signals_json.as_deref().unwrap_or("")
-    )
-    .to_lowercase();
-    let screen_state = if state_evidence.contains("loading") || state_evidence.contains("spinner") {
-        "loading"
-    } else if ocr.is_empty() {
-        "unknown"
-    } else {
-        "content"
-    };
-
-    ScreenObservation {
-        screenshot_id: input.screenshot_id,
-        input_revision: revision.to_string(),
-        observation_version: OBSERVATION_VERSION,
-        status: "fallback".into(),
-        generation_method: "deterministic_fallback".into(),
-        literal_description: description.chars().take(280).collect(),
-        screen_state: screen_state.into(),
-        content_type: if input.active_url.is_some() {
-            "web_page".into()
-        } else {
-            "application_ui".into()
-        },
-        visible_text_summary: input
-            .salient_ocr_text
-            .clone()
-            .map(|text| text.chars().take(200).collect()),
-        notable_items_json: "[]".into(),
-        model_name: None,
-        prompt_version: OBSERVATION_PROMPT_VERSION,
-    }
 }
 
 pub fn validate_model_output(out: &ModelScreenObservationOutput) -> bool {
@@ -185,13 +108,16 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_immediate_and_deterministic() {
+    fn revision_is_deterministic_and_model_output_is_bounded() {
         let input = input();
         let revision = compute_observation_input_revision(&input);
         assert_eq!(revision, compute_observation_input_revision(&input));
-        let fallback = build_deterministic_fallback(&input, &revision);
-        assert_eq!(fallback.status, "fallback");
-        assert_eq!(fallback.content_type, "web_page");
-        assert!(fallback.literal_description.contains("Safari"));
+        assert!(validate_model_output(&ModelScreenObservationOutput {
+            literal_description: "Safari showing Kioku episode 323".into(),
+            screen_state: "content".into(),
+            content_type: "web_page".into(),
+            visible_text_summary: Some("Episode 323".into()),
+            notable_items: vec!["Kioku".into()],
+        }));
     }
 }

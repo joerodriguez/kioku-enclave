@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select one complete enclave image configuration without cross-profile fallback."""
+"""Select one complete PostgreSQL-authoritative enclave image configuration."""
 
 from __future__ import annotations
 
@@ -9,45 +9,15 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
-from archive_witness_probe_config import (
-    ProbeConfigError,
-    load_probe_config,
-    select_probe_config,
-)
-from archive_v3_shadow_runtime_config import (
-    ShadowRuntimeConfigError,
-    load_shadow_runtime_config,
-    select_shadow_runtime_config,
-)
-from adr0022_fresh_release import (
-    CANARY_CONFIG_KEY,
-    FreshReleaseError,
-    claims_bootstrap_role,
-    claims_final_role,
-    is_bootstrap_tag,
-    is_final_tag,
-    require_exact_bootstrap_tag,
-    require_exact_final_tag,
-    validate_bootstrap_configuration,
-    validate_final_configuration,
-)
 
-
-SHARED_KEYS = (
-    "PROJECT_ID",
-    "REGION",
-    "AR_REPOSITORY",
-    "IMAGE_NAME",
-)
+SHARED_KEYS = ("PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME")
 
 PROFILE_KEYS = (
     "ENCLAVE_KMS_PROJECT",
     "ENCLAVE_KMS_LOCATION",
     "ENCLAVE_KMS_KEY_RING",
     "ENCLAVE_KMS_KEY",
-    "ENCLAVE_GCS_BUCKET",
     "ENCLAVE_GCS_MEDIA_BUCKET",
-    "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET",
     "ENCLAVE_RUN_SA_EMAIL",
     "ENCLAVE_AUDIENCE",
     "ENCLAVE_ATTEST_STS_AUDIENCE",
@@ -67,10 +37,6 @@ PROFILE_KEYS = (
     "VERTEX_PROJECT",
     "VERTEX_LOCATION",
     "VERTEX_MODEL",
-    "ENCLAVE_ACME",
-    "ENCLAVE_ACME_DIRECTORY",
-    "ENCLAVE_ACME_CONTACT",
-    "GENESIS_WAL_NATIVE",
 )
 
 OPTIONAL_PROFILE_GROUPS = (
@@ -81,20 +47,8 @@ OPTIONAL_PROFILE_GROUPS = (
         "APPLE_MACOS_CLIENT_ID",
         "APPLE_WEB_CLIENT_ID",
     ),
-    (
-        "APNS_TEAM_ID",
-        "APNS_PRODUCTION_KEY_ID",
-        "APNS_SANDBOX_KEY_ID",
-    ),
+    ("APNS_TEAM_ID", "APNS_PRODUCTION_KEY_ID", "APNS_SANDBOX_KEY_ID"),
 )
-
-# This receipt commitment is an operator-only publication input. It is selected
-# only for the one fixed production BOOTSTRAP role and never enters the runtime
-# configuration assembled into the image.
-FRESH_RELEASE_PROFILE_KEYS = (CANARY_CONFIG_KEY,)
-# Compatibility name for callers that have not yet learned the second fixed
-# role. Both names intentionally denote the same one operator-only input.
-FRESH_BOOTSTRAP_PROFILE_KEYS = FRESH_RELEASE_PROFILE_KEYS
 
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 SERVICE_ACCOUNT_PATTERN = (
@@ -103,6 +57,10 @@ SERVICE_ACCOUNT_PATTERN = (
     + r"\.iam\.gserviceaccount\.com"
 )
 EMAIL_PATTERN = r"[^@,\s]+@[^@,\s]+"
+RELEASE_TAG_PATTERN = (
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)(?:[.-][0-9A-Za-z.-]+)?"
+)
 
 
 def require_value(environment: dict[str, str], name: str) -> str:
@@ -129,9 +87,7 @@ def require_https_origin(configuration: dict[str, str], name: str) -> None:
         parsed = urlsplit(value)
         parsed.port
     except ValueError as error:
-        raise SystemExit(
-            f"invalid HTTPS origin in build configuration: {name}"
-        ) from error
+        raise SystemExit(f"invalid HTTPS origin in build configuration: {name}") from error
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -144,28 +100,8 @@ def require_https_origin(configuration: dict[str, str], name: str) -> None:
         raise SystemExit(f"invalid HTTPS origin in build configuration: {name}")
 
 
-def require_https_url(configuration: dict[str, str], name: str) -> None:
-    value = configuration[name]
-    try:
-        parsed = urlsplit(value)
-        parsed.port
-    except ValueError as error:
-        raise SystemExit(
-            f"invalid HTTPS URL in build configuration: {name}"
-        ) from error
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-    ):
-        raise SystemExit(f"invalid HTTPS URL in build configuration: {name}")
-
-
-def validate(configuration: dict[str, str], profile: str) -> None:
+def validate(configuration: dict[str, str], profile: str, source_ref: str) -> None:
     reject_control_characters(configuration)
-
     require_pattern(configuration, "PROJECT_ID", PROJECT_PATTERN)
     require_pattern(configuration, "REGION", r"[a-z]+-[a-z0-9]+[0-9]")
     require_pattern(configuration, "AR_REPOSITORY", r"[a-z0-9][a-z0-9._-]{0,126}")
@@ -202,22 +138,12 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         require_pattern(configuration, name, r"[a-z0-9][a-z0-9-]{0,62}")
     for name in ("ENCLAVE_KMS_KEY_RING", "ENCLAVE_KMS_KEY"):
         require_pattern(configuration, name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
-    for name in (
-        "ENCLAVE_GCS_BUCKET",
+    require_pattern(
+        configuration,
         "ENCLAVE_GCS_MEDIA_BUCKET",
-        "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET",
-    ):
-        require_pattern(configuration, name, r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
-    if (
-        configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"]
-        != configuration["ENCLAVE_GCS_BUCKET"]
-    ):
-        raise SystemExit(
-            "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must exactly match ENCLAVE_GCS_BUCKET "
-            "for the Phase-0 dual-media migration"
-        )
+        r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]",
+    )
     require_pattern(configuration, "VERTEX_MODEL", r"[A-Za-z0-9._:-]{1,128}")
-
     for name in (
         "ENCLAVE_AUDIENCE",
         "BASE_URL",
@@ -226,60 +152,35 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         "BILLING_SERVICE_AUDIENCE",
     ):
         require_https_origin(configuration, name)
-    require_https_url(configuration, "ENCLAVE_ACME_DIRECTORY")
 
-    if configuration["PERSISTENCE_BACKEND"] != "postgres":
-        raise SystemExit("PERSISTENCE_BACKEND must be postgres for ADR-0040")
-    if configuration["POSTGRES_SCHEMA_MODE"] != "verify":
-        raise SystemExit("serving images must verify, never migrate, PostgreSQL schema")
     if configuration["POSTGRES_MAX_CONNECTIONS"] != "12":
         raise SystemExit("POSTGRES_MAX_CONNECTIONS must match the reviewed fleet pool budget")
     if configuration["HEALTH_PORT"] != "8081":
         raise SystemExit("HEALTH_PORT must be the reviewed health-only port")
     if configuration["DRAIN_TIMEOUT_SECONDS"] != "105":
         raise SystemExit("DRAIN_TIMEOUT_SECONDS must fit the Confidential Space SIGTERM window")
-    if configuration["ENCLAVE_TLS"] != "1" or configuration["ENCLAVE_ACME"] != "0":
-        raise SystemExit("PostgreSQL fleet images require shared TLS and per-process ACME off")
-    if not re.fullmatch(rf"mailto:{EMAIL_PATTERN}", configuration["ENCLAVE_ACME_CONTACT"]):
-        raise SystemExit("invalid format for build configuration: ENCLAVE_ACME_CONTACT")
-
+    if configuration["ENCLAVE_TLS"] != "1":
+        raise SystemExit("PostgreSQL fleet images require shared TLS")
     if not re.fullmatch(r"(?:0|[1-9][0-9]{0,6})", configuration["SIGNUP_LIMIT_PER_DAY"]):
         raise SystemExit("invalid format for build configuration: SIGNUP_LIMIT_PER_DAY")
 
     admin_ids = [value.strip() for value in configuration["ADMIN_USER_IDS"].split(",")]
-    if not admin_ids or any(
-        not re.fullmatch(r"[0-9A-Fa-f-]{36}", value) for value in admin_ids
-    ):
+    if not admin_ids or any(not re.fullmatch(r"[0-9A-Fa-f-]{36}", value) for value in admin_ids):
         raise SystemExit("invalid format for build configuration: ADMIN_USER_IDS")
-
     if configuration["BILLING_SERVICE_AUDIENCE"].rstrip("/") != configuration[
         "BILLING_SERVICE_URL"
     ].rstrip("/"):
-        raise SystemExit(
-            "BILLING_SERVICE_AUDIENCE must exactly match BILLING_SERVICE_URL"
-        )
+        raise SystemExit("BILLING_SERVICE_AUDIENCE must exactly match BILLING_SERVICE_URL")
     if configuration["BILLING_ENFORCEMENT_MODE"] not in ("shadow", "enforce"):
+        raise SystemExit("BILLING_ENFORCEMENT_MODE must be either shadow or enforce")
+    if profile == "production" and not configuration.get("APNS_TEAM_ID"):
         raise SystemExit(
-            "BILLING_ENFORCEMENT_MODE must be either shadow or enforce"
+            "missing required production build configuration: PRODUCTION_APNS_TEAM_ID, "
+            "PRODUCTION_APNS_PRODUCTION_KEY_ID, PRODUCTION_APNS_SANDBOX_KEY_ID"
         )
-
-    # The genesis cutover gate is baked into the image, so flipping it is a
-    # rebuild rather than a restart. Pre-cutover the only correct value is the
-    # explicit `off`: an empty value is already refused by require_value, and
-    # is deliberately not a third spelling of "shut" at build time.
-    if configuration["GENESIS_WAL_NATIVE"] not in ("off", "on"):
-        raise SystemExit("GENESIS_WAL_NATIVE must be either off or on")
-    # Refuse at build time what require_genesis_config_agreement would refuse
-    # at startup: genesis mints a real archive through real providers, so a
-    # gate claimed without archive-v3 coordinates has nothing to mint it with.
-    # Catching it here turns a startup refusal into a named build error.
-    if (
-        configuration["GENESIS_WAL_NATIVE"] == "on"
-        and configuration["ARCHIVE_V3_SHADOW_RUNTIME_MODE"] == "off"
-    ):
-        raise SystemExit(
-            "GENESIS_WAL_NATIVE=on requires an active archive-v3 shadow runtime mode"
-        )
+    tag = source_ref.removeprefix("refs/tags/")
+    if tag.startswith("v") and not re.fullmatch(RELEASE_TAG_PATTERN, tag):
+        raise SystemExit("release source_ref is not a canonical version tag")
 
 
 def selected_configuration(
@@ -287,101 +188,30 @@ def selected_configuration(
     environment: dict[str, str],
     *,
     source_ref: str,
-    probe_config_path: Path,
-    shadow_runtime_config_path: Path,
 ) -> dict[str, str]:
     prefix = profile.upper()
-    if claims_bootstrap_role(source_ref):
-        try:
-            require_exact_bootstrap_tag(source_ref)
-        except FreshReleaseError as error:
-            raise SystemExit(str(error)) from error
-        if profile != "production":
-            raise SystemExit("fresh BOOTSTRAP is eligible only for the production profile")
-    elif claims_final_role(source_ref):
-        try:
-            require_exact_final_tag(source_ref)
-        except FreshReleaseError as error:
-            raise SystemExit(str(error)) from error
-        if profile != "production":
-            raise SystemExit("fresh FINAL is eligible only for the production profile")
-    elif any(
-        f"PRODUCTION_{name}" in environment for name in FRESH_RELEASE_PROFILE_KEYS
-    ):
-        raise SystemExit(
-            "fresh release operator inputs require the generated current-release tag"
-        )
-    configuration = {
-        name: require_value(environment, name) for name in SHARED_KEYS
-    }
+    configuration = {name: require_value(environment, name) for name in SHARED_KEYS}
     for name in PROFILE_KEYS:
-        source_name = f"{prefix}_{name}"
-        configuration[name] = require_value(environment, source_name)
-    if is_bootstrap_tag(source_ref) or is_final_tag(source_ref):
-        for name in FRESH_RELEASE_PROFILE_KEYS:
-            configuration[name] = require_value(environment, f"{prefix}_{name}")
-    try:
-        probe_config = select_probe_config(
-            load_probe_config(probe_config_path),
-            profile=profile,
-            source_ref=source_ref,
-        )
-    except ProbeConfigError as error:
-        raise SystemExit(str(error)) from error
-    configuration.update(probe_config.as_environment())
-    try:
-        shadow_runtime_config = select_shadow_runtime_config(
-            load_shadow_runtime_config(shadow_runtime_config_path),
-            profile=profile,
-            source_ref=source_ref,
-        )
-    except ShadowRuntimeConfigError as error:
-        raise SystemExit(str(error)) from error
-    configuration.update(shadow_runtime_config.as_environment())
+        configuration[name] = require_value(environment, f"{prefix}_{name}")
     for group in OPTIONAL_PROFILE_GROUPS:
-        values = {
-            name: environment.get(f"{prefix}_{name}", "") for name in group
-        }
+        values = {name: environment.get(f"{prefix}_{name}", "") for name in group}
         if any(values.values()) and not all(values.values()):
             missing = ", ".join(
                 f"{prefix}_{name}" for name, value in values.items() if not value
             )
-            raise SystemExit(
-                "incomplete optional build configuration group; missing: " + missing
-            )
+            raise SystemExit("incomplete optional build configuration group; missing: " + missing)
         configuration.update(values)
-    # ADR-0040 is a one-way empty-production cutover. These values describe
-    # the reviewed runtime shape and are source-controlled rather than mutable
-    # operator inputs: PostgreSQL is the sole structured authority, serving
-    # instances never run DDL, and every replica loads the same TLS secret.
+    # These fleet invariants are reviewed source, not operator-selectable modes.
+    # Serving replicas verify the schema unconditionally in Rust and never run DDL.
     configuration.update(
         {
-            "PERSISTENCE_BACKEND": "postgres",
-            "POSTGRES_SCHEMA_MODE": "verify",
             "POSTGRES_MAX_CONNECTIONS": "12",
             "HEALTH_PORT": "8081",
             "DRAIN_TIMEOUT_SECONDS": "105",
             "ENCLAVE_TLS": "1",
-            "ENCLAVE_ACME": "0",
         }
     )
-    if profile == "production" and not configuration.get("APNS_TEAM_ID"):
-        raise SystemExit(
-            "missing required production build configuration: "
-            "PRODUCTION_APNS_TEAM_ID, PRODUCTION_APNS_PRODUCTION_KEY_ID, "
-            "PRODUCTION_APNS_SANDBOX_KEY_ID"
-        )
-    validate(configuration, profile)
-    if is_bootstrap_tag(source_ref):
-        try:
-            validate_bootstrap_configuration(configuration)
-        except FreshReleaseError as error:
-            raise SystemExit(str(error)) from error
-    elif is_final_tag(source_ref):
-        try:
-            validate_final_configuration(configuration, source_ref=source_ref)
-        except FreshReleaseError as error:
-            raise SystemExit(str(error)) from error
+    validate(configuration, profile, source_ref)
     return configuration
 
 
@@ -402,29 +232,13 @@ def main() -> None:
     parser.add_argument("--profile", choices=("production", "evaluation"), required=True)
     parser.add_argument("--source-ref", required=True)
     parser.add_argument(
-        "--archive-witness-probe-config",
-        type=Path,
-        default=Path("config/archive-witness-probe.json"),
-    )
-    parser.add_argument(
-        "--archive-v3-shadow-runtime-config",
-        type=Path,
-        default=Path("config/archive-v3-shadow-runtime.json"),
-    )
-    parser.add_argument(
         "--output-env",
         type=Path,
         help="create a mode-0600 diagnostic environment file; omit to validate only",
     )
     arguments = parser.parse_args()
-
-    environment = dict(os.environ)
     configuration = selected_configuration(
-        arguments.profile,
-        environment,
-        source_ref=arguments.source_ref,
-        probe_config_path=arguments.archive_witness_probe_config,
-        shadow_runtime_config_path=arguments.archive_v3_shadow_runtime_config,
+        arguments.profile, dict(os.environ), source_ref=arguments.source_ref
     )
     if arguments.output_env is not None:
         write_private_environment(arguments.output_env, arguments.profile, configuration)

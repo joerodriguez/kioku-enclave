@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{episodes::EpisodePurge, error::Result};
+use crate::{error::Result, persistence::EpisodePurge};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EpisodeDeletionPlan {
@@ -27,6 +27,13 @@ pub(crate) trait EpisodeDeletionRepository: Send + Sync {
         account_id: &str,
         episode_id: i64,
     ) -> Result<EpisodeDeletionStart>;
+
+    /// Return a bounded batch left pending by an interrupted request or
+    /// worker. Provider deletion remains outside the structured transaction.
+    async fn pending_episode_deletions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, EpisodeDeletionPlan)>>;
 
     /// Atomically purges the frozen content and records a replayable receipt.
     /// The caller must first delete every object from the returned plan.

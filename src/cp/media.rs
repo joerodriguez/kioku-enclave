@@ -1,7 +1,5 @@
 //! V2 raw-media capture API and cloud processing ledger.
 
-pub(crate) mod wal;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,17 +11,13 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
 use crate::persistence::{
-    CaptureCommit, CaptureEventStatus, CapturePreflight, CaptureSessionEvidence,
-    CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage, CaptureSessionStatus,
-    PeopleListRequest, PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile,
-    PersonStatementView, PersonSummary, ReferenceBatchCommit,
+    CaptureCommit, CapturePreflight, CaptureSessionStatus, PeopleListRequest, ReferenceBatchCommit,
 };
 
 use super::isotime::parse_epoch_millis;
@@ -34,16 +28,12 @@ pub(crate) const MAX_SCREENSHOT_BYTES: i64 = 5 * 1024 * 1024;
 const MAX_ID_LEN: usize = 128;
 /// The ingest length bound on the device-supplied `started_at`/`ended_at`.
 ///
-/// It is the SAME 64 that every media settle family spells `MAX_TIMESTAMP_BYTES`
-/// (`media_worker::wal::failure`, `::result`, `::claim`). Ingest admitting a
-/// stamp a settle can never accept is the shape that gets a work unit claimed
-/// and PAID FOR with no path to settle it; keeping the two numbers equal is
-/// what makes that unreachable. Pinned by
-/// `ingest_bounds_the_device_capture_stamps_at_the_settle_families_bound`.
+/// It is the same 64-byte bound enforced when PostgreSQL-claimed media work is
+/// settled. Ingest must not admit a stamp that a paid provider result can never
+/// commit.
 pub(crate) const MAX_DEVICE_TIMESTAMP_BYTES: usize = 64;
-// Re-exported pub(crate) so the ADR-0022 audio transcript plan can never
-// drift from the caps `parse_audio_result` enforces (the text cap counts
-// CHARS, not bytes).
+// Shared with audio-result validation so persisted transcript bounds cannot
+// drift from provider-response parsing (the text cap counts chars, not bytes).
 pub(crate) const MAX_TEXT_LEN: usize = 20_000;
 pub(crate) const MAX_TURNS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
@@ -55,11 +45,6 @@ const MAX_SCREEN_DEDUPE_VERSION: u32 = 2;
 const MAX_REFERENCE_BATCH_EVENTS: usize = 64;
 const REFERENCE_BATCH_ID_DOMAIN: &[u8] = b"kioku.screen-reference-batch.v1\0";
 const REFERENCE_BATCH_MANIFEST_DOMAIN: &[u8] = b"kioku.screen-reference-manifests.v1\0";
-const REQUEST_LOCAL_LABEL_MIGRATION_KEY: &str = "request-local-speaker-labels-v1";
-const SPEAKER_IDENTITY_BACKFILL_KEY: &str = "speaker-identity-backfill-v2";
-#[allow(dead_code)]
-pub(crate) const UNIDENTIFIED_SPEAKER_LABEL: &str = super::identity::UNIDENTIFIED_SPEAKER_LABEL;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamKind {
@@ -225,10 +210,10 @@ pub struct RecordingRetentionCaptureAuthority {
     pub authority_token: String,
 }
 
-/// Server-final retention decision carried into the immutable archive write.
+/// Server-final retention decision carried into the durable capture commit.
 /// A client echo can identify a signed policy interval, but it cannot select
-/// this value; ingest rechecks the current Control authority while holding the
-/// same account lifecycle lock used by downgrade and deletion.
+/// this value; ingest rechecks PostgreSQL retention state, and the repository
+/// commit enforces the account and policy fences used by downgrade/deletion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "retention_decision", rename_all = "snake_case")]
 pub(crate) enum RecordingMediaAuthorityDecision {
@@ -255,13 +240,6 @@ impl RecordingMediaAuthorityDecision {
 
     pub(crate) const fn is_durable(&self) -> bool {
         matches!(self, Self::UntilDeleted { .. })
-    }
-
-    pub(crate) fn decision_at(&self) -> &str {
-        match self {
-            Self::ProcessingWindow30d { decision_at, .. }
-            | Self::UntilDeleted { decision_at, .. } => decision_at,
-        }
     }
 }
 
@@ -371,21 +349,11 @@ impl CaptureEventManifest {
         // a `±HH:MM` offset and ignores fractional digits past the third, and
         // this check is deliberately NOT tightened to reject either.
         //
-        // It is tempting to normalize here as defence in depth, because a
-        // non-canonical device stamp compared as a raw string is what wedged
-        // the media claim lane. But the wedge was a BINDING defect, not an
-        // input-shape one: `source_wall_at` belongs in
-        // `capture_events.source_wall_at` and `browser_observations_v2.
-        // observed_at`, and nowhere else, which is what
-        // `wal::is_canonical_commit_stamp` now enforces at plan construction.
-        // Rejecting offset-bearing stamps here would instead be a client
-        // contract break with no upside: shipped Mac and iOS builds may
-        // already send them (`parse_epoch_millis` supports the form on
-        // purpose), a 400 on ingest is not something the durable outbox can
-        // rebase away, and the tightening would land in a routing change where
-        // nobody would look for it. If a future change does normalize device
-        // stamps, it belongs in its own migration with the client, and it must
-        // never be done by loosening `parse_epoch_millis`.
+        // PostgreSQL stores this value only in its source-wall-clock columns;
+        // server commit/claim timestamps come from database time. Rejecting
+        // offset-bearing stamps would break shipped clients without improving
+        // that binding. Any future canonicalization therefore belongs in a
+        // separately reviewed client/API change.
         if parse_epoch_millis(&self.source_wall_at).is_none() {
             return Err(EnclaveError::InvalidRequest(
                 "source_wall_at must be ISO-8601".into(),
@@ -395,15 +363,10 @@ impl CaptureEventManifest {
         // the paragraph above declines to add, and the two must not be
         // conflated.
         //
-        // `capture_events.started_at`/`ended_at` are device-supplied and are
-        // the only manifest timestamps that reach a settle predicate which
-        // bounds their LENGTH: `media_worker::wal::failure`'s `FailureMember`
-        // and `media_worker::wal::result`'s `valid_timestamp` both refuse a
-        // `capture_started_at` over `MAX_TIMESTAMP_BYTES` (64). Nothing on the
-        // claim path bounded them, so an over-long `started_at` was admitted
-        // here, claimed, PAID FOR with a billed Vertex call, and then refused
-        // by every settle — success and failure alike — leaving the members in
-        // `processing` for the lease to reclaim and re-pay, forever.
+        // `capture_events.started_at`/`ended_at` are device-supplied and reach
+        // the PostgreSQL media-settlement predicate, which enforces the same
+        // 64-byte maximum. Bounding them before a claim prevents a paid Vertex
+        // result from becoming impossible to settle.
         // `parse_epoch_millis` makes this reachable with a stamp that denotes
         // the correct instant: it ignores fractional digits past the third, so
         // `...T14:00:00.<45 zeroes>Z` parses to exactly the same millisecond as
@@ -423,14 +386,9 @@ impl CaptureEventManifest {
         //     string field. `validate_id` 400s over-long ids and `timezone_id`
         //     is capped at 128; `started_at`/`ended_at` were the outliers.
         //
-        // `source_wall_at` is deliberately NOT bounded here. It reaches no
-        // length-bounded settle predicate (the storyboard result carries it
-        // only inside a full-tuple equality CAS), and the commit-stamp path
-        // that once poisoned `updated_at` is closed structurally by
-        // `wal::is_canonical_commit_stamp`. Adding a bound it does not need
-        // would break a stamp a client can send for no gain — and would
-        // silently retire the `ExceedsTimestampBound` case in
-        // `a_poisoned_device_wall_clock_cannot_wedge_the_claim_lane`.
+        // `source_wall_at` is deliberately not length-bounded here. It reaches
+        // no length-bounded settlement predicate and can never become a server
+        // commit/claim timestamp.
         for (name, value) in [
             ("started_at", self.started_at.as_str()),
             ("ended_at", self.ended_at.as_str()),
@@ -1252,12 +1210,6 @@ struct DescendingPageQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreflightOutcome {
-    New,
-    Duplicate { committed_through_sequence: i64 },
-}
-
 fn response_asset_id(manifest: &CaptureEventManifest) -> Result<String> {
     match manifest.media_disposition {
         MediaDisposition::Canonical => manifest
@@ -1373,7 +1325,6 @@ async fn upload_screen_reference_batch(
     let concurrency_holder = format!("{}:{:032x}", request.batch_id, rand::random::<u128>());
     let _batch_permit = match limits::try_acquire_concurrency(
         &state.repositories,
-        Arc::clone(&state.reference_batch_concurrency),
         "capture-reference-batch",
         &concurrency_holder,
         32,
@@ -1401,38 +1352,6 @@ async fn upload_screen_reference_batch(
                 (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response(),
             );
         }
-    };
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user_id).await {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                return capture_failure_response_for_route(
-                    "screen_reference_batch",
-                    started_at,
-                    manifest,
-                    CaptureIngestFailureReason::LifecycleUnavailable,
-                    error.into_response(),
-                )
-            }
-        }
-    } else {
-        None
-    };
-    let _content_write = if state.repositories.uses_legacy_state() {
-        match state.store.acquire_content_write(&user_id).await {
-            Ok(lease) => Some(lease),
-            Err(error) => {
-                return capture_failure_response_for_route(
-                    "screen_reference_batch",
-                    started_at,
-                    manifest,
-                    CaptureIngestFailureReason::LifecycleUnavailable,
-                    error.into_response(),
-                )
-            }
-        }
-    } else {
-        None
     };
     let mut preflight = Vec::with_capacity(request.events.len());
     for (event, digest) in request.events.iter().zip(&validated.manifest_digests) {
@@ -1487,7 +1406,6 @@ async fn upload_screen_reference_batch(
         .captures()
         .commit_reference_batch(ReferenceBatchCommit {
             account_id: user_id.clone(),
-            batch_id: request.batch_id.clone(),
             events: request.events.clone(),
             manifest_digests: validated.manifest_digests.clone(),
             committed_at: enclave_commit_stamp(),
@@ -1569,30 +1487,12 @@ async fn upload_capture_event(
             );
         }
     }
-    // ADR-0022 per-domain routing: capture ingest is MIGRATED. Its D4 gate is
-    // gone because both dispositions this one route serves now have a sealed
-    // family:
-    //   * canonical  -- `wal::CanonicalCaptureEventPlan` (subtype
-    //                   `canonical-capture-event-v1`), taking the object key
-    //                   and positive provider generation the upload boundary
-    //                   below produces. Its residual was never the plan: it
-    //                   treats an already-present event as a hard precondition
-    //                   failure while this route answers 200, so the preflight
-    //                   below had to route to the settled lane before the
-    //                   submit could be reached at all.
-    //   * reference  -- `wal::MediaReferenceEventPlan` (subtype
-    //                   `adr-0022-single-reference-capture-event-v1`), a new
-    //                   family with its own operation-source domain and its
-    //                   own ledger. See that module for why a bespoke plan
-    //                   reusing the batch id derivation would have collided on
-    //                   one `archive_v3_wal_publications` slot and one attempt
-    //                   ladder with a fingerprint it could never match.
-    //
-    // BOTH had to land together. A mac_screen stream interleaves canonical
-    // screenshots and their reference pointers by sequence, and
-    // `advance_contiguous_ack` walks only while the next sequence exists, so
-    // routing the canonical arm alone would have stalled every such stream
-    // permanently at its first refused reference event.
+    // Canonical and reference dispositions share the PostgreSQL capture
+    // preflight/commit contract. Canonical writes persist the exact generation
+    // returned by GCS; reference writes persist no media bytes. Keeping both in
+    // one ordered stream is required because screen streams interleave full
+    // screenshots and reference pointers and advance acknowledgements only
+    // across contiguous committed sequences.
     if !state
         .sync_limiter
         .consume_scoped(&state.repositories, "capture-event", &user_id)
@@ -1751,15 +1651,14 @@ async fn upload_capture_event(
     let object_key_candidates = match manifest.media.as_ref() {
         Some(media) => {
             let processing =
-                match crate::store::canonical_capture_media_object_key(&user_id, &media.asset_id) {
+                match crate::gcs::canonical_capture_media_object_key(&user_id, &media.asset_id) {
                     Ok(key) => key,
                     Err(error) => {
                         return capture_error_response(started_at, Some(&manifest), error)
                     }
                 };
             let durable =
-                match crate::store::canonical_recording_media_object_key(&user_id, &media.asset_id)
-                {
+                match crate::gcs::canonical_recording_media_object_key(&user_id, &media.asset_id) {
                     Ok(key) => key,
                     Err(error) => {
                         return capture_error_response(started_at, Some(&manifest), error)
@@ -1768,39 +1667,6 @@ async fn upload_capture_event(
             Some(vec![processing, durable])
         }
         None => None,
-    };
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user_id).await {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                return capture_failure_response(
-                    started_at,
-                    Some(&manifest),
-                    CaptureIngestFailureReason::LifecycleUnavailable,
-                    error.into_response(),
-                )
-            }
-        }
-    } else {
-        None
-    };
-    // Keep admission alive through the GCS object and durable SQLite record.
-    // DELETE /api/account closes this barrier before it inventories media, so
-    // an already-authorized capture cannot recreate an object afterward.
-    let _content_write = if state.repositories.uses_legacy_state() {
-        match state.store.acquire_content_write(&user_id).await {
-            Ok(lease) => Some(lease),
-            Err(error) => {
-                return capture_failure_response(
-                    started_at,
-                    Some(&manifest),
-                    CaptureIngestFailureReason::LifecycleUnavailable,
-                    error.into_response(),
-                )
-            }
-        }
-    } else {
-        None
     };
     let preflight = state
         .repositories
@@ -1922,13 +1788,11 @@ async fn upload_capture_event(
         // The child keeps the provider PUT alive if the HTTP future is
         // cancelled. Deletion waits for that child lease and therefore scans
         // only after the provider has definitively accepted or rejected it.
-        let put_lease = _content_write.as_ref().map(|lease| lease.child());
         let put_store = state.repositories.media_objects_arc();
         let put_user_id = user_id.clone();
         let put_object_key = write.object_key.clone();
         let put_key_reference = write.provider_key_reference.clone();
         let put = tokio::spawn(async move {
-            let _put_lease = put_lease;
             put_store
                 .put_current(
                     &put_user_id,
@@ -1942,7 +1806,7 @@ async fn upload_capture_event(
             Ok(Ok(generation)) => media_generation = Some(generation),
             Ok(Err(put_error)) => {
                 media_generation = match verify_existing_media(
-                    &state,
+                    state.repositories.media_objects(),
                     &write.object_key,
                     &write.encryption_context,
                     media_bytes,
@@ -2038,18 +1902,9 @@ async fn stream_ack(
     if let Err(error) = validate_id("stream_id", &stream_id) {
         return error.into_response();
     }
-    // ADR-0022 D4: the gate here is GONE because its answerability blocker is.
-    // It was retained not because this handler writes -- it is a pure SELECT
-    // over `capture_streams` -- but because every canonical stream it could
-    // name was created by the then-deferred `upload_capture_event`, so a
-    // routed answer for a selected user could only be `NotFound` -> 404 "no
-    // such stream" when the truth was "ingest for your account is deferred".
-    // Ingest is migrated, so the absence this read reports is now a truthful
-    // one, and the read routes: a selected user reads the settled lane, an
-    // unselected user keeps the legacy path, and neither is served the other's
-    // snapshot. (`with_user_read` rather than the bare `with_user` this
-    // replaced, so the legacy fallthrough also runs under SQLite's
-    // `query_only` guard.)
+    // The same PostgreSQL capture repository creates and reads stream rows, so
+    // NotFound is a truthful account-scoped absence rather than a backend
+    // routing decision.
     match state
         .repositories
         .captures()
@@ -2061,17 +1916,8 @@ async fn stream_ack(
             committed_through_sequence: committed,
         })
         .into_response(),
-        // `committed_through_sequence` folds "no such stream" into
-        // `Err(NotFound)` rather than `Ok(None)`, so this arm carries two
-        // different things and they must not share a status. The absence is a
-        // truthful 404 now that ingest writes every stream this can name --
-        // that is the whole reason the gate above could be lifted. Everything
-        // else is the routed read itself failing (an unregistered, quarantined
-        // or mid-relaunch serving authority arrives as `EnclaveError::Store`),
-        // which is retryable and answers the lane's 503 under
-        // `super::routed_read_unavailable`'s rule. It is deliberately NOT the
-        // 500 the generic arm would render: that makes a retryable read
-        // failure indistinguishable from a genuinely non-retryable one.
+        // Keep an absent stream distinct from PostgreSQL unavailability: the
+        // former is 404, while the latter remains a retryable routed-read 503.
         Err(EnclaveError::NotFound) => EnclaveError::NotFound.into_response(),
         Err(error) => super::routed_read_unavailable("api.media.stream_ack", &error),
     }
@@ -2085,17 +1931,8 @@ async fn capture_status(
     if let Err(error) = validate_id("event_id", &event_id) {
         return error.into_response();
     }
-    // ADR-0022 D4: the gate here is GONE because its answerability blocker is.
-    // This read's only production writer is `upload_capture_event`, which was
-    // deferred; a routed `Ok(None)` -> 404 "no such event" for a selected user
-    // was then indistinguishable from the truthful "you never uploaded that
-    // event". Ingest is migrated, so the 404 is now truthful and the routing
-    // below is answerable.
-    //
-    // The legacy fallthrough is `with_user_read`, so an unselected user's read
-    // runs under SQLite's `query_only` guard; a WAL-authoritative user reads
-    // the settled-only lane and a user with no registered serving authority
-    // refuses as unavailable — never the stale legacy snapshot.
+    // Capture ingest and status share the tenant-qualified PostgreSQL
+    // repository, making `None` a truthful event absence.
     match state
         .repositories
         .captures()
@@ -2104,12 +1941,8 @@ async fn capture_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        // A failed routed read is NOT an absence and NOT a fault: the archive
-        // is present and merely unreadable. 503 under
-        // `super::routed_read_unavailable`'s rule, never the 500 the generic
-        // arm renders for `EnclaveError::Store` -- the D4 gate used to fire
-        // first, so this arm was unreachable for exactly the population it now
-        // serves.
+        // Database unavailability is retryable and must not masquerade as a
+        // missing event.
         Err(error) => super::routed_read_unavailable("api.media.capture_status", &error),
     }
 }
@@ -2134,11 +1967,8 @@ async fn capture_session_status(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
-    // ADR-0022 D4: gate GONE with ingest. The session rows this reads could
-    // once only have been created by the deferred ingest, so a routed answer
-    // could only be an absence; ingest is migrated, so an absence here is
-    // truthful. Routed exactly as `finish_capture_session` routes this same
-    // read.
+    // Session rows are created and read in the same tenant-qualified
+    // PostgreSQL capture repository, so absence is authoritative.
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
         .repositories
@@ -2148,8 +1978,7 @@ async fn capture_session_status(
     {
         Ok(Some(status)) => Json(status).into_response(),
         Ok(None) => EnclaveError::NotFound.into_response(),
-        // See `capture_status`: an unreadable archive is retryable, so it
-        // answers 503 rather than the generic 500.
+        // See `capture_status`: database unavailability is retryable.
         Err(error) => super::routed_read_unavailable("api.media.capture_session_status", &error),
     }
 }
@@ -2162,17 +1991,11 @@ async fn list_capture_sessions(
     Extension(user): Extension<AuthUser>,
     Query(query): Query<CaptureSessionListQuery>,
 ) -> Response {
-    // ADR-0022 D4: gate GONE with ingest, which writes every row this could
-    // list. It was the endpoint the answerability rule mattered most for,
-    // because it answers a COLLECTION: an ungated routed read for a selected
-    // user produced `200 {"sessions": []}`, a deferral wearing the face of a
-    // truthful empty archive. With ingest migrated the empty list is the
-    // truth, and this routes like its single-session sibling.
+    // Ingest writes every row this tenant-qualified PostgreSQL query can list,
+    // so an empty collection is authoritative.
     let window_hours = query.window_hours.unwrap_or(8).clamp(1, 24);
     let max_sessions = query.max_sessions.unwrap_or(5).clamp(1, 10);
     let cursor_ms = summarized_until_ms(&state, &user.0).await;
-    // Per-domain routing, live for every unselected user today: same per-user
-    // facts as the single-session endpoint, so it routes the same way.
     match state
         .repositories
         .captures()
@@ -2180,10 +2003,7 @@ async fn list_capture_sessions(
         .await
     {
         Ok(sessions) => Json(CaptureSessionList { sessions }).into_response(),
-        // A COLLECTION endpoint, so this arm matters most: 503 with the named
-        // reason under `super::routed_read_unavailable`'s rule. Never the
-        // generic 500, and never a 200 carrying an empty `sessions` array --
-        // a refusal must not wear the face of a truthful empty archive.
+        // Unavailability remains a 503, never a false empty collection.
         Err(error) => super::routed_read_unavailable("api.media.capture_sessions", &error),
     }
 }
@@ -2192,27 +2012,6 @@ async fn list_capture_sessions(
 /// recent events (so an in-flight recording is discoverable even when it
 /// started before the window). Stale open sessions age out with their last
 /// event rather than pinning the list forever.
-pub(crate) fn load_recent_capture_session_ids(
-    conn: &Connection,
-    window_hours: i64,
-    max_sessions: i64,
-) -> Result<Vec<String>> {
-    let window_modifier = format!("-{window_hours} hours");
-    let mut statement = conn.prepare(
-        "SELECT id FROM capture_sessions \
-         WHERE started_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) \
-            OR (ended_at IS NULL \
-                AND last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) \
-         ORDER BY started_at DESC LIMIT ?2",
-    )?;
-    let ids = statement
-        .query_map(params![window_modifier, max_sessions], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(ids)
-}
-
 async fn finish_capture_session(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -2239,210 +2038,14 @@ async fn finish_capture_session(
     }
 }
 
-pub(crate) fn load_capture_status(
-    conn: &Connection,
-    event_id: &str,
-) -> Result<Option<CaptureEventStatus>> {
-    conn.query_row(
-        "SELECT e.event_id,COALESCE(m.processing_state,'ready'),j.error_code,\
-                COALESCE(j.attempt_count,0) \
-         FROM capture_events e LEFT JOIN media_objects m USING(event_id) \
-         LEFT JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
-        [event_id],
-        |row| {
-            Ok(CaptureEventStatus {
-                event_id: row.get(0)?,
-                processing_state: row.get(1)?,
-                error_code: row.get(2)?,
-                attempt_count: row.get(3)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-pub(crate) fn load_capture_session_status(
-    conn: &Connection,
-    capture_session_id: &str,
-    summarized_until_ms: Option<i64>,
-) -> Result<Option<CaptureSessionStatus>> {
-    let session = conn
-        .query_row(
-            "SELECT id,device_id,started_at,last_event_at,ended_at FROM capture_sessions WHERE id=?1",
-            [capture_session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((capture_session_id, device_id, started_at, last_event_at, ended_at)) = session else {
-        return Ok(None);
-    };
-
-    let (event_count, queued, processing, retry_wait, ready, failed) = conn.query_row(
-        "SELECT COUNT(*), \
-          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='queued' THEN 1 ELSE 0 END), \
-          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='processing' THEN 1 ELSE 0 END), \
-          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='retry_wait' THEN 1 ELSE 0 END), \
-          SUM(CASE WHEN COALESCE(m.processing_state,'ready') IN ('ready','pruned') THEN 1 ELSE 0 END), \
-          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='failed' THEN 1 ELSE 0 END) \
-         FROM capture_events e LEFT JOIN media_objects m USING(event_id) \
-         WHERE e.capture_session_id=?1",
-        [&capture_session_id],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-            ))
-        },
-    )?;
-
-    // substance='none' episodes are excluded: the finalizer never finalizes
-    // them (they are hidden from browse/search under ADR-0009), so surfacing
-    // one here would wedge the stage at preparing_recap forever. A recording
-    // whose only product is a substance-none episode resolves to no_memory —
-    // the honest outcome (ADR-0034).
-    let mut statement = conn.prepare(
-        "SELECT DISTINCT e.id,e.title,e.started_at,e.ended_at,e.finalization_status,e.finalized_at \
-         FROM episodes e JOIN episode_members m ON m.episode_id=e.id \
-         LEFT JOIN utterances u ON m.record_type='utterance' AND m.record_id=u.id \
-         LEFT JOIN speaker_observations so \
-           ON u.source_key=('cloud-v2:'||so.event_id||':'||so.turn_id) \
-         LEFT JOIN screenshots s ON m.record_type='screenshot' AND m.record_id=s.id \
-         LEFT JOIN capture_events ce ON ce.capture_session_id=?1 AND ( \
-           ce.event_id=so.event_id OR s.source_key=('cloud-v2:'||ce.event_id)) \
-         WHERE ce.event_id IS NOT NULL AND e.substance!='none' \
-         ORDER BY e.started_at DESC,e.id DESC",
-    )?;
-    let memories = statement
-        .query_map([&capture_session_id], |row| {
-            Ok(CaptureSessionMemory {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                started_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                finalization_status: row.get(4)?,
-                finalized_at: row.get(5)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    // Evidence echo (ADR-0034): mechanical aggregates over accepted evidence.
-    // Mic and system audio cover the same wall-clock span, so take the
-    // largest single-kind sum rather than double-counting overlapped tracks.
-    let audio_minutes: Option<i64> = conn.query_row(
-        "SELECT CAST(MAX(kind_seconds)/60.0 + 0.5 AS INTEGER) FROM ( \
-           SELECT SUM((julianday(ended_at)-julianday(started_at))*86400.0) AS kind_seconds \
-           FROM capture_events WHERE capture_session_id=?1 \
-           AND stream_kind IN ('mic','system_audio','ios_mic') GROUP BY stream_kind)",
-        [&capture_session_id],
-        |row| row.get(0),
-    )?;
-    let voice_count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT u.speaker_label) FROM capture_events ce \
-         JOIN speaker_observations so ON so.event_id=ce.event_id \
-         JOIN utterances u ON u.source_key=('cloud-v2:'||so.event_id||':'||so.turn_id) \
-         WHERE ce.capture_session_id=?1 AND u.speaker_label!=''",
-        [&capture_session_id],
-        |row| row.get(0),
-    )?;
-    // Application names only — never window-title text (ADR-0034 §8).
-    let mut contexts_statement = conn.prepare(
-        "SELECT s.active_app FROM capture_events ce \
-         JOIN screenshots s ON s.source_key=('cloud-v2:'||ce.event_id) \
-         WHERE ce.capture_session_id=?1 AND s.active_app IS NOT NULL AND s.active_app!='' \
-         GROUP BY s.active_app ORDER BY COUNT(*) DESC, s.active_app LIMIT 3",
-    )?;
-    let top_contexts = contexts_statement
-        .query_map([&capture_session_id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let has_ready_memory = memories
-        .iter()
-        .any(|memory| memory.finalization_status == "complete" && memory.finalized_at.is_some());
-    // no_memory is declared only from facts: the session is over, every
-    // accepted media item reached a terminal success state, and the
-    // summarizer's cursor moved past the session's end without linking a
-    // memory. A held cursor (ratchet) keeps the stage at organizing — unknown
-    // stays visibly unknown rather than becoming a premature zero result.
-    let summarized_past_end = match (&ended_at, summarized_until_ms) {
-        (Some(ended), Some(cursor)) => {
-            super::isotime::parse_epoch_millis(ended).is_some_and(|end_ms| cursor > end_ms)
-        }
-        _ => false,
-    };
-    // In-flight work outranks residual failures (a resurrected failed job is
-    // retry_wait again), and a formed memory outranks both: one
-    // unprocessable item — or its background retry — must not mask or demote
-    // a recap the user can already read. needs_attention is reserved for
-    // sessions where failures remain AND no memory materialized — the only
-    // case the label can honestly claim the outcome still hinges on the
-    // failed work.
-    let stage = if queued + processing > 0 {
-        CaptureSessionStage::Processing
-    } else if has_ready_memory {
-        CaptureSessionStage::Ready
-    } else if retry_wait > 0 {
-        CaptureSessionStage::Processing
-    } else if !memories.is_empty() {
-        CaptureSessionStage::PreparingRecap
-    } else if failed > 0 {
-        CaptureSessionStage::NeedsAttention
-    } else if ended_at.is_some() {
-        if summarized_past_end {
-            CaptureSessionStage::NoMemory
-        } else {
-            CaptureSessionStage::Organizing
-        }
-    } else {
-        CaptureSessionStage::Received
-    };
-
-    Ok(Some(CaptureSessionStatus {
-        capture_session_id,
-        device_id,
-        started_at,
-        last_event_at,
-        ended_at,
-        event_count,
-        stage,
-        processing: CaptureSessionProcessing {
-            queued,
-            processing,
-            retry_wait,
-            ready,
-            failed,
-        },
-        evidence: CaptureSessionEvidence {
-            audio_minutes,
-            voice_count: (voice_count > 0).then_some(voice_count),
-            top_contexts,
-        },
-        memories,
-    }))
-}
-
 async fn list_people(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
     Query(query): Query<PeopleListQuery>,
 ) -> Response {
-    // ADR-0022 D4 answerability is live: selected audio transcript settlement
-    // freezes literal high-confidence self-identification, and the sealed
-    // provider-free voice-profile owner commits the corresponding person,
-    // accepted name claim, facts, and profile binding before these routed
-    // reads can expose them. Absence is therefore a truthful empty roster.
+    // PostgreSQL audio settlement commits the person, accepted name claim,
+    // facts, and profile binding atomically before this query can expose them.
+    // Absence is therefore a truthful empty roster.
     let after_id = query.after_id.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let search = query
@@ -2451,8 +2054,6 @@ async fn list_people(
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .map(str::to_owned);
-    // Per-domain routing, live for every unselected user today; the gate above
-    // is the one line that lifts when the people writers migrate.
     match state
         .repositories
         .memory_queries()
@@ -2534,198 +2135,6 @@ async fn person_statements(
     }
 }
 
-pub(crate) fn ensure_identified_person(conn: &Connection, person_id: i64) -> Result<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM people WHERE id=?1 AND status='identified')",
-        [person_id],
-        |row| row.get(0),
-    )?;
-    if exists {
-        Ok(())
-    } else {
-        Err(EnclaveError::NotFound)
-    }
-}
-
-pub(crate) fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfile> {
-    let person = conn
-        .query_row(
-            "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
-             FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
-               AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
-                 WHERE r.profile_id=v.id AND r.active=1 \
-                   AND r.status IN ('quarantined','superseded','split')) \
-             LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
-             WHERE p.id=?1 AND p.status='identified' GROUP BY p.id",
-            [person_id],
-            |row| {
-                Ok(PersonSummary {
-                    id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    voice_profile_count: row.get(2)?,
-                    fact_count: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            },
-        )
-        .optional()?
-        .ok_or(EnclaveError::NotFound)?;
-    let mut voice_statement = conn.prepare(
-        "SELECT label FROM voice_profiles v WHERE person_id=?1 AND status<>'quarantined' \
-         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
-           WHERE r.profile_id=v.id AND r.active=1 \
-             AND r.status IN ('quarantined','superseded','split')) ORDER BY id",
-    )?;
-    let voice_labels = voice_statement
-        .query_map([person_id], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let (stable_profiles, accepted_samples): (i64, i64) = conn.query_row(
-        "SELECT \
-           (SELECT COUNT(*) FROM voice_profiles v WHERE person_id=?1 AND status='stable' \
-             AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
-               WHERE r.profile_id=v.id AND r.active=1 \
-                 AND r.status IN ('quarantined','superseded','split'))),\
-           (SELECT COUNT(*) FROM voice_samples s \
-            JOIN voice_sample_profile_assignments a ON a.sample_id=s.id AND a.active=1 \
-            JOIN voice_profiles v ON v.id=a.profile_id \
-            WHERE v.person_id=?1 AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0 \
-              AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
-                WHERE r.profile_id=v.id AND r.active=1 \
-                  AND r.status IN ('quarantined','superseded','split')))",
-        [person_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let voice_coverage = if stable_profiles > 0 {
-        format!(
-            "Recognized from {accepted_samples} high-quality samples across {stable_profiles} stable acoustic profiles"
-        )
-    } else if accepted_samples > 0 {
-        format!("Learning from {accepted_samples} high-quality voice samples")
-    } else {
-        "No stable voice recognition profile yet".into()
-    };
-    let mut aliases_statement = conn.prepare(
-        "SELECT id,name,status,evidence_kind,confidence,observed_at,source_event_id \
-         FROM person_name_claims WHERE person_id=?1 AND status<>'rejected' \
-         ORDER BY observed_at DESC,id DESC LIMIT 100",
-    )?;
-    let aliases = aliases_statement
-        .query_map([person_id], |row| {
-            Ok(PersonNameView {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                evidence_kind: row.get(3)?,
-                confidence: row.get(4)?,
-                observed_at: row.get(5)?,
-                source_event_id: row.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut facts_statement = conn.prepare(
-        "SELECT id,predicate,value,status,evidence_json,source_event_id,speaker_observation_id,\
-                observed_at,literal_evidence,confidence,supersedes_id,created_at \
-         FROM person_facts WHERE person_id=?1 \
-         ORDER BY COALESCE(observed_at,created_at) DESC,id DESC LIMIT 200",
-    )?;
-    let facts = facts_statement
-        .query_map([person_id], |row| {
-            let evidence_json: String = row.get(4)?;
-            Ok(PersonFactView {
-                id: row.get(0)?,
-                predicate: row.get(1)?,
-                value: row.get(2)?,
-                status: row.get(3)?,
-                evidence: serde_json::from_str(&evidence_json).unwrap_or(Value::Null),
-                source_event_id: row.get(5)?,
-                speaker_observation_id: row.get(6)?,
-                observed_at: row.get(7)?,
-                literal_evidence: row.get(8)?,
-                confidence: row.get(9)?,
-                supersedes_id: row.get(10)?,
-                created_at: row.get(11)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let (evidence, _) = load_person_evidence(conn, person_id, None, 100)?;
-    let (recent_statements, _) = load_person_statements(conn, person_id, None, 100)?;
-    Ok(PersonProfile {
-        person,
-        voice_labels,
-        voice_coverage,
-        aliases,
-        facts,
-        evidence,
-        recent_statements,
-    })
-}
-
-pub(crate) fn load_person_evidence(
-    conn: &Connection,
-    person_id: i64,
-    before_id: Option<i64>,
-    limit: usize,
-) -> Result<(Vec<PersonEvidenceView>, Option<i64>)> {
-    let mut statement = conn.prepare(
-        "SELECT id,kind,claimed_name,score,status,observed_at,source_event_id,\
-                speaker_observation_id,evidence_json FROM identity_evidence \
-         WHERE person_id=?1 AND (?2 IS NULL OR id<?2) ORDER BY id DESC LIMIT ?3",
-    )?;
-    let mut evidence = statement
-        .query_map(params![person_id, before_id, limit as i64 + 1], |row| {
-            let raw: String = row.get(8)?;
-            Ok(PersonEvidenceView {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                claimed_name: row.get(2)?,
-                score: row.get(3)?,
-                status: row.get(4)?,
-                observed_at: row.get(5)?,
-                source_event_id: row.get(6)?,
-                speaker_observation_id: row.get(7)?,
-                evidence: serde_json::from_str(&raw).unwrap_or(Value::Null),
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let next_cursor = (evidence.len() > limit).then(|| evidence[limit - 1].id);
-    evidence.truncate(limit);
-    Ok((evidence, next_cursor))
-}
-
-pub(crate) fn load_person_statements(
-    conn: &Connection,
-    person_id: i64,
-    before_id: Option<i64>,
-    limit: usize,
-) -> Result<(Vec<PersonStatementView>, Option<i64>)> {
-    let mut statement = conn.prepare(
-        "SELECT s.id,s.started_at,s.ended_at,s.transcript_text,s.event_id,e.id,e.title \
-         FROM speaker_observations s \
-         LEFT JOIN utterances u ON u.source_key=('cloud-v2:'||s.event_id||':'||s.turn_id) \
-         LEFT JOIN episode_members m ON m.record_type='utterance' AND m.record_id=u.id \
-         LEFT JOIN episodes e ON e.id=m.episode_id \
-         WHERE s.person_id=?1 AND (?2 IS NULL OR s.id<?2) \
-         GROUP BY s.id ORDER BY s.id DESC LIMIT ?3",
-    )?;
-    let mut statements = statement
-        .query_map(params![person_id, before_id, limit as i64 + 1], |row| {
-            Ok(PersonStatementView {
-                speaker_observation_id: row.get(0)?,
-                started_at: row.get(1)?,
-                ended_at: row.get(2)?,
-                text: row.get(3)?,
-                source_event_id: row.get(4)?,
-                episode_id: row.get(5)?,
-                episode_title: row.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let next_cursor =
-        (statements.len() > limit).then(|| statements[limit - 1].speaker_observation_id);
-    statements.truncate(limit);
-    Ok((statements, next_cursor))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureIngestFailureReason {
     AccountSuspended,
@@ -2750,9 +2159,6 @@ enum CaptureIngestFailureReason {
     ReferenceTargetMismatch,
     CanonicalContextUnavailable,
     ReferenceContextTransition,
-    /// ADR-0022 D4: this route's domain has not migrated to the WAL lane and
-    /// the account's archive is WAL-authoritative. A deferral, not a fault.
-    WalDomainUnmigrated,
     Internal,
 }
 
@@ -2770,7 +2176,6 @@ impl CaptureIngestFailureReason {
             Self::MediaTooLarge => "media_too_large",
             Self::MediaInvalid => "media_invalid",
             Self::RequestInvalid => "request_invalid",
-            Self::WalDomainUnmigrated => crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::LifecycleUnavailable => "lifecycle_unavailable",
             Self::RecordingLeaseInactive => "recording_lease_inactive",
@@ -2882,7 +2287,6 @@ fn capture_error_response_for_route(
         },
         EnclaveError::InvalidRequest(_) => CaptureIngestFailureReason::RequestInvalid,
         EnclaveError::Conflict(_) => CaptureIngestFailureReason::IdempotencyConflict,
-        EnclaveError::WalDomainUnmigrated(_) => CaptureIngestFailureReason::WalDomainUnmigrated,
         _ => CaptureIngestFailureReason::Internal,
     };
     let response = error.into_response();
@@ -2913,56 +2317,6 @@ fn rate_limited_response() -> Response {
     response
 }
 
-pub(crate) fn preflight_source_event(
-    conn: &Connection,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-    allowed_object_keys: Option<&[String]>,
-) -> Result<PreflightOutcome> {
-    let existing: Option<(String, Option<String>, String, String)> = conn
-        .query_row(
-            "SELECT e.manifest_digest,m.object_key,e.stream_id,e.media_disposition \
-             FROM capture_events e LEFT JOIN media_objects m ON m.event_id=e.event_id \
-             WHERE e.event_id=?1",
-            [&manifest.event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((existing_digest, existing_object, existing_stream, existing_disposition)) = existing
-    else {
-        return Ok(PreflightOutcome::New);
-    };
-    let disposition = match manifest.media_disposition {
-        MediaDisposition::Canonical => "canonical",
-        MediaDisposition::Reference => "reference",
-    };
-    let object_matches = match allowed_object_keys {
-        Some(keys) => existing_object
-            .as_deref()
-            .is_some_and(|stored| keys.iter().any(|candidate| candidate == stored)),
-        None => existing_object.is_none(),
-    };
-    if existing_digest != manifest_digest || !object_matches || existing_disposition != disposition
-    {
-        return Err(EnclaveError::Conflict(
-            "idempotency conflict for event_id".into(),
-        ));
-    }
-    Ok(PreflightOutcome::Duplicate {
-        committed_through_sequence: committed_through_sequence(conn, &existing_stream)?,
-    })
-}
-
-pub(crate) fn committed_through_sequence(conn: &Connection, stream_id: &str) -> Result<i64> {
-    conn.query_row(
-        "SELECT committed_through_sequence FROM capture_streams WHERE id=?1",
-        [stream_id],
-        |row| row.get(0),
-    )
-    .optional()?
-    .ok_or(EnclaveError::NotFound)
-}
-
 pub(in crate::cp) async fn load_or_create_media_dek(
     state: &CpState,
     user_id: &str,
@@ -2981,7 +2335,7 @@ pub(in crate::cp) async fn load_or_create_media_dek(
     let winner = state
         .repositories
         .captures()
-        .install_media_dek(user_id, &candidate_wrapped, &candidate_dek)
+        .install_media_dek(user_id, &candidate_wrapped)
         .await?;
     if winner == candidate_wrapped {
         Ok((candidate_dek, winner))
@@ -3055,22 +2409,19 @@ async fn recording_media_authority_decision(
         .recording_retention()
         .preference(user_id)
         .await?;
-    if preference.policy != super::control_store::RecordingRetentionPolicy::UntilDeleted
+    if preference.policy != crate::persistence::RecordingRetentionPolicy::UntilDeleted
         || preference.revision != claims.policy_revision
         || preference.policy_epoch.as_deref() != Some(claims.policy_epoch.as_str())
         || preference.operation_state.is_some()
     {
-        // The lifecycle lock makes this check linear with revocation. A stale
-        // client echo is retained as evidence, never as authority to recreate
-        // an object after downgrade.
+        // The PostgreSQL policy revision/state fence makes a stale client echo
+        // evidence only, never authority to recreate an object after downgrade.
         return Ok(RecordingMediaAuthorityDecision::processing(
             claims.policy_revision,
             decision_at.to_owned(),
         ));
     }
-    if !state.durable_recording_storage_bound
-        || !super::retention::recording_authority_schema_present(state, user_id).await?
-    {
+    if !state.durable_recording_storage_bound {
         return Err(EnclaveError::Store(
             "durable recording storage is temporarily unavailable".into(),
         ));
@@ -3115,7 +2466,7 @@ async fn prepare_canonical_media_write(
             ..
         } => {
             let object_key =
-                crate::store::canonical_recording_media_object_key(user_id, &media.asset_id)?;
+                crate::gcs::canonical_recording_media_object_key(user_id, &media.asset_id)?;
             let key_epoch = state
                 .repositories
                 .recording_retention()
@@ -3126,11 +2477,11 @@ async fn prepare_canonical_media_write(
                 })?;
             let encryption_key =
                 crate::crypto::load_dek(state.kms.as_ref(), &key_epoch.wrapped_dek_b64).await?;
-            let provider_key_reference = crate::store::recording_media_key_reference(
+            let provider_key_reference = crate::gcs::recording_media_key_reference(
                 *recording_key_epoch,
                 retention_policy_epoch,
             )?;
-            let encryption_context = crate::store::recording_media_blob_context(
+            let encryption_context = crate::gcs::recording_media_blob_context(
                 user_id,
                 &object_key,
                 *recording_key_epoch,
@@ -3153,10 +2504,10 @@ async fn prepare_canonical_media_write(
         }
         RecordingMediaAuthorityDecision::ProcessingWindow30d { .. } => {
             let object_key =
-                crate::store::canonical_capture_media_object_key(user_id, &media.asset_id)?;
+                crate::gcs::canonical_capture_media_object_key(user_id, &media.asset_id)?;
             let (encryption_key, provider_key_reference) =
                 load_or_create_media_dek(state, user_id).await?;
-            let encryption_context = crate::store::media_blob_context(user_id, &object_key);
+            let encryption_context = crate::gcs::media_blob_context(user_id, &object_key);
             Ok(CanonicalMediaWrite {
                 object_key,
                 encryption_key,
@@ -3168,31 +2519,8 @@ async fn prepare_canonical_media_write(
     }
 }
 
-pub(crate) fn prepare_canonical_capture_event(
-    user_id: String,
-    manifest: CaptureEventManifest,
-    object_key: String,
-    generation: i64,
-    authority: RecordingMediaAuthorityDecision,
-    commit_stamp: String,
-) -> Result<
-    crate::archive_v3_wal_idempotency::PreparedLogicalMutation<wal::CanonicalCaptureEventPlan>,
-> {
-    let plan = wal::CanonicalCaptureEventPlan::new_with_authority(
-        user_id,
-        manifest,
-        object_key,
-        generation,
-        authority,
-        commit_stamp,
-    )
-    .map_err(|_| EnclaveError::Store("canonical capture plan construction failed".into()))?;
-    crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-        .map_err(|_| EnclaveError::Store("canonical capture plan construction failed".into()))
-}
-
 async fn verify_existing_media(
-    state: &CpState,
+    media_objects: &dyn crate::persistence::MediaObjectStore,
     object_key: &str,
     context: &[u8],
     expected: &[u8],
@@ -3203,11 +2531,7 @@ async fn verify_existing_media(
     // live response. It must be encrypted under the account's already chosen
     // DEK and strict v2 AAD; the generation returned here is the same response
     // whose bytes were authenticated, so no verify-N/record-N+1 race exists.
-    let existing = state
-        .repositories
-        .media_objects()
-        .get_current(object_key)
-        .await?;
+    let existing = media_objects.get_current(object_key).await?;
     if existing.generation <= 0 || existing.wrapped_dek_b64 != installed_wrapped_dek {
         return Err(EnclaveError::Conflict(
             "existing canonical media does not match the installed account key".into(),
@@ -3222,1497 +2546,6 @@ async fn verify_existing_media(
         ));
     }
     Ok(existing.generation)
-}
-
-/// Test-only production-boundary fixture for consumers that must prove bytes
-/// written by the canonical selected capture path. It deliberately performs
-/// the same DEK install, strict v2 encryption, current-provider PUT and sealed
-/// `CanonicalCaptureEventPlan` submit as `upload_capture_event`; it exposes no
-/// raw SQLite shortcut.
-#[cfg(test)]
-pub(crate) async fn submit_selected_screen_capture_fixture(
-    state: &CpState,
-    user_id: &str,
-    manifest: CaptureEventManifest,
-    media_bytes: &[u8],
-) -> Result<String> {
-    manifest.validate()?;
-    let media = manifest.media.as_ref().ok_or_else(|| {
-        EnclaveError::InvalidRequest("selected screen fixture requires media".into())
-    })?;
-    if manifest.stream_kind.is_audio() {
-        return Err(EnclaveError::InvalidRequest(
-            "selected screen fixture requires a screen stream".into(),
-        ));
-    }
-    validate_media_bytes(&manifest, media_bytes, Some(media.mime_type.as_str()))?;
-    let object_key = crate::store::canonical_capture_media_object_key(user_id, &media.asset_id)?;
-    let (dek, wrapped_dek) = load_or_create_media_dek(state, user_id).await?;
-    let context = crate::store::media_blob_context(user_id, &object_key);
-    let encrypted = crate::crypto::encrypt_bound_blob(&dek, media_bytes, &context)?;
-    let generation = state
-        .repositories
-        .media_objects()
-        .put_current(user_id, &object_key, &encrypted, &wrapped_dek)
-        .await?;
-    let asset_id = media.asset_id.clone();
-    let commit_stamp = enclave_commit_stamp();
-    let prepared = prepare_canonical_capture_event(
-        user_id.to_owned(),
-        manifest,
-        object_key,
-        generation,
-        RecordingMediaAuthorityDecision::processing(0, commit_stamp.clone()),
-        commit_stamp,
-    )
-    .map_err(|_| EnclaveError::Store("selected capture fixture plan failed".into()))?;
-    state
-        .store
-        .wal_authoritative_submit(user_id, prepared)
-        .await?;
-    Ok(asset_id)
-}
-
-pub fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE IF NOT EXISTS capture_sessions (
-            id TEXT PRIMARY KEY,
-            device_id TEXT NOT NULL,
-            install_id TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            last_event_at TEXT NOT NULL,
-            ended_at TEXT,
-            schema_version INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS capture_streams (
-            id TEXT PRIMARY KEY,
-            capture_session_id TEXT NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
-            device_id TEXT NOT NULL,
-            stream_kind TEXT NOT NULL,
-            committed_through_sequence INTEGER NOT NULL DEFAULT -1,
-            sealed_sequence INTEGER,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS capture_events (
-            event_id TEXT PRIMARY KEY,
-            device_id TEXT NOT NULL,
-            install_id TEXT NOT NULL,
-            capture_session_id TEXT NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
-            stream_id TEXT NOT NULL REFERENCES capture_streams(id) ON DELETE CASCADE,
-            stream_kind TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            source_wall_at TEXT NOT NULL,
-            source_monotonic_ns TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            timezone_id TEXT NOT NULL,
-            utc_offset_minutes INTEGER NOT NULL,
-            clock_uncertainty_ms INTEGER NOT NULL,
-            asset_id TEXT NOT NULL UNIQUE,
-            manifest_digest TEXT NOT NULL,
-            context_json TEXT,
-            media_disposition TEXT NOT NULL DEFAULT 'canonical'
-                CHECK (media_disposition IN ('canonical','reference')),
-            canonical_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            canonical_asset_id TEXT,
-            canonical_media_sha256 TEXT,
-            perceptual_hash TEXT,
-            hamming_distance INTEGER,
-            pixel_change_ratio REAL,
-            context_fingerprint TEXT,
-            dedupe_version INTEGER,
-            audio_role TEXT,
-            audio_route TEXT,
-            route_epoch INTEGER,
-            received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(device_id, stream_id, sequence)
-        );
-        CREATE INDEX IF NOT EXISTS idx_capture_events_time
-            ON capture_events(started_at, event_id);
-        CREATE INDEX IF NOT EXISTS idx_capture_events_session
-            ON capture_events(capture_session_id);
-        CREATE TABLE IF NOT EXISTS media_objects (
-            asset_id TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL UNIQUE REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            object_key TEXT NOT NULL UNIQUE,
-            object_generation INTEGER,
-            object_backend TEXT CHECK (object_backend IN ('current')),
-            mime_type TEXT NOT NULL,
-            codec TEXT NOT NULL,
-            byte_length INTEGER NOT NULL,
-            sha256 TEXT NOT NULL,
-            sample_rate INTEGER,
-            channels INTEGER,
-            frame_count INTEGER,
-            width INTEGER,
-            height INTEGER,
-            scale REAL,
-            orientation TEXT,
-            processing_state TEXT NOT NULL DEFAULT 'queued'
-                CHECK (processing_state IN ('queued','processing','ready','retry_wait','failed','pruned')),
-            retain_until TEXT,
-            deleted_at TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS browser_states_v2 (
-            state_key TEXT PRIMARY KEY,
-            browser_bundle_id TEXT NOT NULL,
-            browser_name TEXT NOT NULL,
-            permission_status TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            tabs_json TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS browser_observations_v2 (
-            observation_id TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL UNIQUE REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            observed_at TEXT NOT NULL,
-            state_key TEXT REFERENCES browser_states_v2(state_key) ON DELETE SET NULL,
-            context_status TEXT NOT NULL,
-            active_url TEXT,
-            active_title TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS media_processing_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            job_kind TEXT NOT NULL,
-            input_revision TEXT NOT NULL,
-            processor_version INTEGER NOT NULL,
-            state TEXT NOT NULL DEFAULT 'pending'
-                CHECK (state IN ('pending','processing','retry_wait','succeeded','failed_terminal','canceled')),
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            lease_until TEXT,
-            error_code TEXT,
-            model_id TEXT,
-            prompt_version INTEGER,
-            schema_version INTEGER,
-            usage_json TEXT,
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(job_kind, input_revision, processor_version)
-        );
-        CREATE INDEX IF NOT EXISTS idx_media_jobs_state
-            ON media_processing_jobs(state, updated_at, id);
-        CREATE TABLE IF NOT EXISTS media_work_units (
-            id TEXT PRIMARY KEY,
-            work_class TEXT NOT NULL CHECK (work_class IN ('audio','screen')),
-            processor_version INTEGER NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('planned','processing','retry_wait','succeeded','failed_terminal')),
-            started_at TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            reserved_output_tokens INTEGER NOT NULL,
-            reservation_retained INTEGER NOT NULL DEFAULT 0,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            error_code TEXT,
-            usage_json TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS media_work_members (
-            work_unit_id TEXT NOT NULL REFERENCES media_work_units(id) ON DELETE CASCADE,
-            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            job_id INTEGER NOT NULL REFERENCES media_processing_jobs(id) ON DELETE CASCADE,
-            ordinal INTEGER NOT NULL,
-            window_start_ms INTEGER NOT NULL,
-            window_end_ms INTEGER NOT NULL,
-            PRIMARY KEY (work_unit_id,event_id),
-            UNIQUE (work_unit_id,ordinal)
-        );
-        CREATE TABLE IF NOT EXISTS speaker_observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            turn_id TEXT NOT NULL,
-            speaker_local_id TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            transcript_text TEXT NOT NULL,
-            language TEXT,
-            overlap INTEGER NOT NULL DEFAULT 0,
-            voice_eligibility TEXT,
-            voice_diagnostics_json TEXT,
-            UNIQUE(event_id, turn_id)
-        );
-        CREATE TABLE IF NOT EXISTS speaker_observation_sources (
-            speaker_observation_id INTEGER NOT NULL REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            window_start_ms INTEGER NOT NULL,
-            window_end_ms INTEGER NOT NULL,
-            event_start_ms INTEGER NOT NULL,
-            event_end_ms INTEGER NOT NULL,
-            PRIMARY KEY (speaker_observation_id,event_id,window_start_ms)
-        );
-        CREATE TABLE IF NOT EXISTS people (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            display_name TEXT,
-            normalized_name TEXT,
-            status TEXT NOT NULL DEFAULT 'unknown' CHECK (status IN ('unknown','identified','quarantined')),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS person_name_claims (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            normalized_name TEXT NOT NULL,
-            normalized_email TEXT,
-            source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            observed_at TEXT NOT NULL,
-            evidence_kind TEXT NOT NULL,
-            evidence_json TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('proposed','probationary','accepted','conflicted','superseded','rejected')),
-            supersedes_id INTEGER REFERENCES person_name_claims(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_person_name_claims_name
-            ON person_name_claims(normalized_name, observed_at);
-        CREATE INDEX IF NOT EXISTS idx_person_name_claims_person
-            ON person_name_claims(person_id, status, observed_at);
-        CREATE TABLE IF NOT EXISTS profile_identity_bindings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            voice_profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-            evidence_count INTEGER NOT NULL DEFAULT 1,
-            confidence REAL NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('probationary','accepted','conflicted','superseded','rejected')),
-            derivation_version INTEGER NOT NULL,
-            evidence_json TEXT NOT NULL,
-            supersedes_id INTEGER REFERENCES profile_identity_bindings(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS voice_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-            label TEXT NOT NULL UNIQUE,
-            embedding_space TEXT NOT NULL,
-            channel_domain TEXT NOT NULL,
-            centroid BLOB NOT NULL,
-            sample_count INTEGER NOT NULL DEFAULT 0,
-            scorer_version INTEGER NOT NULL DEFAULT 2,
-            representative_kind TEXT NOT NULL DEFAULT 'medoid_trimmed_centroid',
-            medoid_sample_id INTEGER,
-            status TEXT NOT NULL DEFAULT 'tentative' CHECK (status IN ('tentative','stable','quarantined')),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS voice_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            speaker_observation_id INTEGER NOT NULL REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            voice_profile_id INTEGER REFERENCES voice_profiles(id) ON DELETE SET NULL,
-            embedding_space TEXT NOT NULL,
-            channel_domain TEXT NOT NULL,
-            embedding BLOB NOT NULL,
-            quality_score REAL NOT NULL,
-            diagnostics_json TEXT NOT NULL DEFAULT '{}',
-            quality_version INTEGER NOT NULL DEFAULT 1,
-            scorer_version INTEGER NOT NULL DEFAULT 2,
-            eligibility TEXT NOT NULL DEFAULT 'enroll',
-            duration_ms INTEGER NOT NULL DEFAULT 0,
-            speech_ratio REAL NOT NULL DEFAULT 0,
-            snr_proxy_db REAL NOT NULL DEFAULT 0,
-            clipping_ratio REAL NOT NULL DEFAULT 0,
-            silence_ratio REAL NOT NULL DEFAULT 0,
-            embedding_norm REAL NOT NULL DEFAULT 1,
-            outlier INTEGER NOT NULL DEFAULT 0,
-            similarity REAL,
-            decision_margin REAL,
-            accepted INTEGER NOT NULL DEFAULT 0,
-            embedding_job_id INTEGER REFERENCES voice_embedding_jobs(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS voice_profile_proposals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            proposal_key TEXT NOT NULL UNIQUE,
-            kind TEXT NOT NULL CHECK (kind IN ('merge','split')),
-            state TEXT NOT NULL DEFAULT 'proposed' CHECK (state IN ('proposed','approved','applied','revert_requested','rejected','reverted')),
-            scorer_version INTEGER NOT NULL,
-            derivation_version INTEGER NOT NULL,
-            reason_code TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS voice_profile_revisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            status TEXT NOT NULL CHECK (status IN ('tentative','stable','quarantined','superseded','split')),
-            derivation_version INTEGER NOT NULL,
-            scorer_version INTEGER NOT NULL,
-            representative_kind TEXT NOT NULL,
-            centroid BLOB NOT NULL,
-            sample_count INTEGER NOT NULL,
-            medoid_sample_id INTEGER REFERENCES voice_samples(id) ON DELETE SET NULL,
-            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-            proposal_id INTEGER REFERENCES voice_profile_proposals(id) ON DELETE SET NULL,
-            predecessor_revision_id INTEGER REFERENCES voice_profile_revisions(id) ON DELETE SET NULL,
-            reason_code TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_profile_revisions_active
-            ON voice_profile_revisions(profile_id) WHERE active=1;
-        CREATE TABLE IF NOT EXISTS voice_sample_profile_assignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sample_id INTEGER NOT NULL REFERENCES voice_samples(id) ON DELETE CASCADE,
-            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            proposal_id INTEGER REFERENCES voice_profile_proposals(id) ON DELETE SET NULL,
-            predecessor_assignment_id INTEGER REFERENCES voice_sample_profile_assignments(id) ON DELETE SET NULL,
-            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sample_assignment_active
-            ON voice_sample_profile_assignments(sample_id) WHERE active=1;
-        CREATE INDEX IF NOT EXISTS idx_voice_sample_assignment_profile
-            ON voice_sample_profile_assignments(profile_id,active,sample_id);
-        CREATE TABLE IF NOT EXISTS voice_profile_proposal_profiles (
-            proposal_id INTEGER NOT NULL REFERENCES voice_profile_proposals(id) ON DELETE CASCADE,
-            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            role TEXT NOT NULL CHECK (role IN ('source','result')),
-            partition_ordinal INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (proposal_id,profile_id,role)
-        );
-        CREATE TABLE IF NOT EXISTS voice_profile_proposal_samples (
-            proposal_id INTEGER NOT NULL REFERENCES voice_profile_proposals(id) ON DELETE CASCADE,
-            sample_id INTEGER NOT NULL REFERENCES voice_samples(id) ON DELETE CASCADE,
-            source_profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            partition_ordinal INTEGER NOT NULL,
-            PRIMARY KEY (proposal_id,sample_id)
-        );
-        CREATE TABLE IF NOT EXISTS identity_evidence (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
-            voice_profile_id INTEGER REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            observed_at TEXT,
-            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL,
-            claimed_name TEXT,
-            evidence_json TEXT NOT NULL,
-            score REAL,
-            status TEXT NOT NULL CHECK (status IN ('proposed','accepted','rejected','quarantined')),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS person_facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-            predicate TEXT NOT NULL,
-            value TEXT NOT NULL,
-            evidence_json TEXT NOT NULL,
-            derivation_version INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','conflicted')),
-            supersedes_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL,
-            source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            observed_at TEXT,
-            literal_evidence TEXT,
-            confidence REAL NOT NULL DEFAULT 0,
-            conflicts_with_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE TABLE IF NOT EXISTS speaker_clusters (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            work_unit_id      TEXT NOT NULL REFERENCES media_work_units(id) ON DELETE CASCADE,
-            speaker_local_id  TEXT NOT NULL,
-            voice_profile_id  INTEGER REFERENCES voice_profiles(id) ON DELETE SET NULL,
-            person_id         INTEGER REFERENCES people(id) ON DELETE SET NULL,
-            attribution_state TEXT NOT NULL CHECK (attribution_state IN ('owner_transmit','person_bound','anonymous_profile','request_local','unsegmented')),
-            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(work_unit_id, speaker_local_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_speaker_clusters_lookup ON speaker_clusters(work_unit_id, speaker_local_id);
-        CREATE TABLE IF NOT EXISTS audio_segments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            ended_at TEXT NOT NULL,
-            duration_seconds REAL NOT NULL,
-            source_type TEXT NOT NULL,
-            audio_format TEXT,
-            transcription_status TEXT
-        );
-        CREATE TABLE IF NOT EXISTS utterances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            audio_segment_id INTEGER NOT NULL,
-            start_offset_seconds REAL,
-            end_offset_seconds REAL,
-            text TEXT,
-            language TEXT,
-            confidence REAL,
-            speaker_label TEXT,
-            source_key TEXT,
-            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL
-        );
-        CREATE TABLE IF NOT EXISTS episodes (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at                  TEXT NOT NULL,
-            ended_at                    TEXT NOT NULL,
-            type                        TEXT,
-            title                       TEXT,
-            summary                     TEXT,
-            participants                TEXT,
-            languages                   TEXT,
-            action_items                TEXT,
-            model                       TEXT,
-            topics                      TEXT,
-            people                      TEXT,
-            minute_summaries            TEXT,
-            minutes_text                TEXT,
-            substance                   TEXT NOT NULL DEFAULT 'normal' CHECK (substance IN ('none','low','normal')),
-            visual_evidence             TEXT NOT NULL DEFAULT 'none' CHECK (visual_evidence IN ('none','useful')),
-            created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at                  TEXT,
-            finalized_at                TEXT,
-            finalization_version        INTEGER,
-            finalization_status         TEXT NOT NULL DEFAULT 'pending',
-            finalization_error          TEXT,
-            finalization_attempt_count  INTEGER NOT NULL DEFAULT 0,
-            finalization_next_attempt_at TEXT,
-            identity_revision           INTEGER NOT NULL DEFAULT 0,
-            finalized_identity_revision INTEGER NOT NULL DEFAULT 0,
-            identity_refresh_status     TEXT DEFAULT NULL CHECK (identity_refresh_status IN ('queued', 'processing', 'ready', 'failed')),
-            speaker_processing_status   TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))
-        );
-        CREATE TABLE IF NOT EXISTS episode_members (
-            episode_id  INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-            record_id   INTEGER NOT NULL,
-            record_type TEXT NOT NULL CHECK (record_type IN ('utterance','screenshot')),
-            PRIMARY KEY (episode_id, record_type, record_id)
-        );
-        CREATE TABLE IF NOT EXISTS episode_speaker_slots (
-            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-            episode_id         INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-            voice_profile_id   INTEGER REFERENCES voice_profiles(id) ON DELETE RESTRICT,
-            speaker_cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE RESTRICT,
-            slot_ordinal       INTEGER NOT NULL CHECK (slot_ordinal >= 0),
-            status             TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded')),
-            created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            CHECK (
-                (status = 'active' AND ((voice_profile_id IS NULL) != (speaker_cluster_id IS NULL)))
-                OR status = 'superseded'
-            )
-        );
-        CREATE TABLE IF NOT EXISTS voice_profile_representatives (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id       INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
-            channel_domain   TEXT NOT NULL,
-            centroid         BLOB NOT NULL,
-            sample_count     INTEGER NOT NULL DEFAULT 0,
-            medoid_sample_id INTEGER REFERENCES voice_samples(id) ON DELETE SET NULL,
-            scorer_version   INTEGER NOT NULL DEFAULT 2,
-            created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(profile_id, channel_domain)
-        );
-        CREATE INDEX IF NOT EXISTS idx_voice_profile_rep_domain ON voice_profile_representatives(channel_domain);
-        CREATE TABLE IF NOT EXISTS voice_embedding_jobs (
-            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-            speaker_observation_id INTEGER NOT NULL REFERENCES speaker_observations(id) ON DELETE CASCADE,
-            embedding_space        TEXT NOT NULL,
-            processor_version      INTEGER NOT NULL DEFAULT 1,
-            quality_version        INTEGER NOT NULL DEFAULT 1,
-            scorer_version         INTEGER NOT NULL DEFAULT 2,
-            state                  TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','failed','ready','raw_media_expired')),
-            lease_owner            TEXT,
-            lease_token            TEXT,
-            lease_until            TEXT,
-            attempt_count          INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at        TEXT,
-            error_code             TEXT,
-            created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(speaker_observation_id, embedding_space, processor_version, quality_version, scorer_version)
-        );
-        CREATE INDEX IF NOT EXISTS idx_voice_embedding_jobs_lease ON voice_embedding_jobs(state, next_attempt_at, lease_until);
-        CREATE TABLE IF NOT EXISTS episode_participants (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-            participant_key     TEXT NOT NULL,
-            person_id           INTEGER REFERENCES people(id) ON DELETE SET NULL,
-            source_claimed_name TEXT,
-            speaker_slot_id     INTEGER REFERENCES episode_speaker_slots(id) ON DELETE SET NULL,
-            attribution_kind    TEXT NOT NULL CHECK (attribution_kind IN ('owner','verified_voice','direct_identity_evidence','context_inferred')),
-            state               TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','superseded','quarantined')),
-            derivation_version  INTEGER NOT NULL DEFAULT 1,
-            confidence          REAL NOT NULL DEFAULT 1.0,
-            evidence_json       TEXT NOT NULL DEFAULT '{}',
-            created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(episode_id, participant_key)
-        );
-        CREATE INDEX IF NOT EXISTS idx_episode_participants_ep ON episode_participants(episode_id, state);
-        CREATE TABLE IF NOT EXISTS visual_speaker_observations (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id          TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
-            screenshot_id     INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
-            observed_at       TEXT NOT NULL,
-            platform          TEXT NOT NULL,
-            displayed_name    TEXT NOT NULL,
-            normalized_name   TEXT NOT NULL,
-            highlight_state   TEXT NOT NULL CHECK (highlight_state IN ('active_speaker_box','audio_waveform','roster_indicator','none')),
-            bounding_box_json TEXT,
-            model_version     INTEGER NOT NULL DEFAULT 1,
-            confidence        REAL NOT NULL,
-            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_visual_speaker_obs ON visual_speaker_observations(observed_at, normalized_name);
-        "#,
-    )?;
-    add_column_if_missing(
-        conn,
-        "capture_sessions",
-        "ended_at",
-        "ALTER TABLE capture_sessions ADD COLUMN ended_at TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "media_objects",
-        "object_generation",
-        "ALTER TABLE media_objects ADD COLUMN object_generation INTEGER",
-    )?;
-    add_column_if_missing(
-        conn,
-        "media_objects",
-        "object_backend",
-        "ALTER TABLE media_objects ADD COLUMN object_backend TEXT CHECK (object_backend IN ('current'))",
-    )?;
-    let has_normalized_name: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('people') WHERE name='normalized_name'",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_normalized_name == 0 {
-        conn.execute_batch("ALTER TABLE people ADD COLUMN normalized_name TEXT;")?;
-    }
-    add_column_if_missing(
-        conn,
-        "speaker_observations",
-        "person_id",
-        "ALTER TABLE speaker_observations ADD COLUMN person_id INTEGER REFERENCES people(id) ON DELETE SET NULL",
-    )?;
-    for (table, column, alteration) in [
-        (
-            "speaker_observations",
-            "voice_eligibility",
-            "ALTER TABLE speaker_observations ADD COLUMN voice_eligibility TEXT",
-        ),
-        (
-            "speaker_observations",
-            "voice_diagnostics_json",
-            "ALTER TABLE speaker_observations ADD COLUMN voice_diagnostics_json TEXT",
-        ),
-        (
-            "voice_profiles",
-            "scorer_version",
-            "ALTER TABLE voice_profiles ADD COLUMN scorer_version INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "voice_profiles",
-            "representative_kind",
-            "ALTER TABLE voice_profiles ADD COLUMN representative_kind TEXT NOT NULL DEFAULT 'running_mean'",
-        ),
-        (
-            "voice_profiles",
-            "medoid_sample_id",
-            "ALTER TABLE voice_profiles ADD COLUMN medoid_sample_id INTEGER",
-        ),
-        (
-            "voice_samples",
-            "diagnostics_json",
-            "ALTER TABLE voice_samples ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'",
-        ),
-        (
-            "voice_samples",
-            "quality_version",
-            "ALTER TABLE voice_samples ADD COLUMN quality_version INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "voice_samples",
-            "scorer_version",
-            "ALTER TABLE voice_samples ADD COLUMN scorer_version INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "voice_samples",
-            "eligibility",
-            "ALTER TABLE voice_samples ADD COLUMN eligibility TEXT NOT NULL DEFAULT 'enroll'",
-        ),
-        (
-            "voice_samples",
-            "duration_ms",
-            "ALTER TABLE voice_samples ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "voice_samples",
-            "speech_ratio",
-            "ALTER TABLE voice_samples ADD COLUMN speech_ratio REAL NOT NULL DEFAULT 0",
-        ),
-        (
-            "voice_samples",
-            "snr_proxy_db",
-            "ALTER TABLE voice_samples ADD COLUMN snr_proxy_db REAL NOT NULL DEFAULT 0",
-        ),
-        (
-            "voice_samples",
-            "clipping_ratio",
-            "ALTER TABLE voice_samples ADD COLUMN clipping_ratio REAL NOT NULL DEFAULT 0",
-        ),
-        (
-            "voice_samples",
-            "silence_ratio",
-            "ALTER TABLE voice_samples ADD COLUMN silence_ratio REAL NOT NULL DEFAULT 0",
-        ),
-        (
-            "voice_samples",
-            "embedding_norm",
-            "ALTER TABLE voice_samples ADD COLUMN embedding_norm REAL NOT NULL DEFAULT 1",
-        ),
-        (
-            "voice_samples",
-            "outlier",
-            "ALTER TABLE voice_samples ADD COLUMN outlier INTEGER NOT NULL DEFAULT 0",
-        ),
-    ] {
-        add_column_if_missing(conn, table, column, alteration)?;
-    }
-    add_column_if_missing(
-        conn,
-        "identity_evidence",
-        "source_event_id",
-        "ALTER TABLE identity_evidence ADD COLUMN source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE",
-    )?;
-    add_column_if_missing(
-        conn,
-        "identity_evidence",
-        "observed_at",
-        "ALTER TABLE identity_evidence ADD COLUMN observed_at TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "identity_evidence",
-        "speaker_observation_id",
-        "ALTER TABLE identity_evidence ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE",
-    )?;
-    for (column, alteration) in [
-        (
-            "media_disposition",
-            "ALTER TABLE capture_events ADD COLUMN media_disposition TEXT NOT NULL DEFAULT 'canonical' CHECK (media_disposition IN ('canonical','reference'))",
-        ),
-        (
-            "canonical_event_id",
-            "ALTER TABLE capture_events ADD COLUMN canonical_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE",
-        ),
-        (
-            "canonical_asset_id",
-            "ALTER TABLE capture_events ADD COLUMN canonical_asset_id TEXT",
-        ),
-        (
-            "canonical_media_sha256",
-            "ALTER TABLE capture_events ADD COLUMN canonical_media_sha256 TEXT",
-        ),
-        (
-            "perceptual_hash",
-            "ALTER TABLE capture_events ADD COLUMN perceptual_hash TEXT",
-        ),
-        (
-            "hamming_distance",
-            "ALTER TABLE capture_events ADD COLUMN hamming_distance INTEGER",
-        ),
-        (
-            "pixel_change_ratio",
-            "ALTER TABLE capture_events ADD COLUMN pixel_change_ratio REAL",
-        ),
-        (
-            "context_fingerprint",
-            "ALTER TABLE capture_events ADD COLUMN context_fingerprint TEXT",
-        ),
-        (
-            "dedupe_version",
-            "ALTER TABLE capture_events ADD COLUMN dedupe_version INTEGER",
-        ),
-        (
-            "audio_role",
-            "ALTER TABLE capture_events ADD COLUMN audio_role TEXT",
-        ),
-        (
-            "audio_route",
-            "ALTER TABLE capture_events ADD COLUMN audio_route TEXT",
-        ),
-        (
-            "route_epoch",
-            "ALTER TABLE capture_events ADD COLUMN route_epoch INTEGER",
-        ),
-    ] {
-        add_column_if_missing(conn, "capture_events", column, alteration)?;
-    }
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_people_normalized_name;\
-         INSERT INTO person_name_claims \
-           (person_id,name,normalized_name,observed_at,evidence_kind,evidence_json,confidence,status) \
-         SELECT p.id,p.display_name,p.normalized_name,p.created_at,'legacy_migration','{}',1.0,'accepted' \
-         FROM people p WHERE p.normalized_name IS NOT NULL AND p.display_name IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM person_name_claims c WHERE c.person_id=p.id);\
-         UPDATE people SET normalized_name=NULL WHERE normalized_name IS NOT NULL;\
-         CREATE INDEX IF NOT EXISTS idx_capture_events_canonical_reference \
-         ON capture_events(canonical_event_id) WHERE canonical_event_id IS NOT NULL;",
-    )?;
-    for (column, alteration) in [
-        (
-            "source_event_id",
-            "ALTER TABLE person_facts ADD COLUMN source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE",
-        ),
-        (
-            "speaker_observation_id",
-            "ALTER TABLE person_facts ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE",
-        ),
-        (
-            "observed_at",
-            "ALTER TABLE person_facts ADD COLUMN observed_at TEXT",
-        ),
-        (
-            "literal_evidence",
-            "ALTER TABLE person_facts ADD COLUMN literal_evidence TEXT",
-        ),
-        (
-            "confidence",
-            "ALTER TABLE person_facts ADD COLUMN confidence REAL NOT NULL DEFAULT 0",
-        ),
-        (
-            "conflicts_with_id",
-            "ALTER TABLE person_facts ADD COLUMN conflicts_with_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL",
-        ),
-    ] {
-        add_column_if_missing(conn, "person_facts", column, alteration)?;
-    }
-    for (table, column, alteration) in [
-        (
-            "people",
-            "kind",
-            "ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'person' CHECK (kind IN ('owner','person'))",
-        ),
-        (
-            "profile_identity_bindings",
-            "active",
-            "ALTER TABLE profile_identity_bindings ADD COLUMN active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))",
-        ),
-        (
-            "profile_identity_bindings",
-            "operation_id",
-            "ALTER TABLE profile_identity_bindings ADD COLUMN operation_id TEXT",
-        ),
-        (
-            "profile_identity_bindings",
-            "conflicts_with_id",
-            "ALTER TABLE profile_identity_bindings ADD COLUMN conflicts_with_id INTEGER REFERENCES profile_identity_bindings(id) ON DELETE SET NULL",
-        ),
-        (
-            "speaker_observations",
-            "cluster_id",
-            "ALTER TABLE speaker_observations ADD COLUMN cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE SET NULL",
-        ),
-        (
-            "speaker_observations",
-            "direct_evidence_id",
-            "ALTER TABLE speaker_observations ADD COLUMN direct_evidence_id INTEGER REFERENCES identity_evidence(id) ON DELETE SET NULL",
-        ),
-        (
-            "utterances",
-            "speaker_observation_id",
-            "ALTER TABLE utterances ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL",
-        ),
-        // Must exist before migrate_speaker_identity_backfill_v2 below: the
-        // backfill recalculates this column on databases created before the
-        // zero-touch speaker-identity release, and store.rs run_migrations
-        // adds it only AFTER init_schema returns (v0.8.26 production 500s).
-        (
-            "episodes",
-            "speaker_processing_status",
-            "ALTER TABLE episodes ADD COLUMN speaker_processing_status TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))",
-        ),
-        (
-            "identity_evidence",
-            "speaker_cluster_id",
-            "ALTER TABLE identity_evidence ADD COLUMN speaker_cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE SET NULL",
-        ),
-        (
-            "voice_samples",
-            "embedding_job_id",
-            "ALTER TABLE voice_samples ADD COLUMN embedding_job_id INTEGER REFERENCES voice_embedding_jobs(id) ON DELETE RESTRICT",
-        ),
-    ] {
-        add_column_if_missing(conn, table, column, alteration)?;
-    }
-    reconcile_profile_identity_bindings_migration(conn)?;
-    super::voice_lineage::backfill_profile_lineage(conn)?;
-    migrate_request_local_speaker_labels(conn)?;
-    migrate_speaker_identity_backfill_v2(conn)?;
-    Ok(())
-}
-
-/// One-time v2 backfill for the zero-touch speaker-identity release.
-///
-/// Existing archives predate `utterances.speaker_observation_id`,
-/// `visual_speaker_observations`, and durable voice embedding jobs. This
-/// migration links historical utterances to their observations, re-resolves
-/// their labels through the shared attribution resolver, projects historical
-/// active-speaker screen claims into `visual_speaker_observations`, and
-/// enqueues embedding jobs only for observations whose retained raw media is
-/// still fully present (pruned/expired history is left untouched rather than
-/// mass-failing into `degraded`).
-fn migrate_speaker_identity_backfill_v2(conn: &Connection) -> Result<()> {
-    let has_metadata: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_metadata'",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_metadata == 0 {
-        return Ok(());
-    }
-    let complete: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key=?1)",
-        [SPEAKER_IDENTITY_BACKFILL_KEY],
-        |row| row.get(0),
-    )?;
-    if complete {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
-
-    // Historical active-speaker screen evidence becomes queryable visual
-    // observations so vocative corroboration can see pre-release frames.
-    tx.execute(
-        "INSERT INTO visual_speaker_observations \
-         (event_id, screenshot_id, observed_at, platform, displayed_name, normalized_name, \
-          highlight_state, bounding_box_json, model_version, confidence) \
-         SELECT c.source_event_id, s.id, c.observed_at, 'screen_capture', c.name, \
-                c.normalized_name, 'active_speaker_box', NULL, 1, c.confidence \
-         FROM person_name_claims c \
-         JOIN capture_events e ON e.event_id = c.source_event_id \
-         JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id \
-                                OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence) \
-         WHERE c.evidence_kind = 'screen_active_speaker' \
-           AND c.source_event_id IS NOT NULL \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM visual_speaker_observations v \
-               WHERE v.event_id = c.source_event_id \
-                 AND v.normalized_name = c.normalized_name \
-                 AND v.observed_at = c.observed_at)",
-        [],
-    )?;
-
-    // Link utterances to observations and re-resolve every label through the
-    // shared attribution authority.
-    reconcile_request_local_speaker_labels(&tx, None)?;
-
-    // Durable embedding jobs for sample-less observations whose media is still
-    // fully retained. Overlapped observations are skipped (policy abstains).
-    let candidate_obs: Vec<i64> = {
-        let mut stmt = tx.prepare(
-            "SELECT o.id FROM speaker_observations o \
-             WHERE COALESCE(o.overlap, 0) = 0 \
-               AND NOT EXISTS (SELECT 1 FROM voice_samples vs WHERE vs.speaker_observation_id = o.id) \
-               AND NOT EXISTS (SELECT 1 FROM voice_embedding_jobs j WHERE j.speaker_observation_id = o.id) \
-               AND EXISTS (SELECT 1 FROM speaker_observation_sources src WHERE src.speaker_observation_id = o.id) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM speaker_observation_sources src \
-                   LEFT JOIN media_objects mo ON mo.event_id = src.event_id \
-                   WHERE src.speaker_observation_id = o.id \
-                     AND (mo.object_key IS NULL OR COALESCE(mo.processing_state, '') = 'pruned'))",
-        )?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
-        rows
-    };
-    for obs_id in candidate_obs {
-        super::voice_memory::enqueue_embedding_job(&tx, obs_id)?;
-    }
-
-    super::voice_memory::recalculate_all_episode_speaker_processing_status(&tx)?;
-
-    tx.execute(
-        "INSERT INTO app_metadata(key,value) VALUES (?1,'complete')",
-        [SPEAKER_IDENTITY_BACKFILL_KEY],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn reconcile_profile_identity_bindings_migration(conn: &Connection) -> Result<()> {
-    let has_owner: bool = conn
-        .query_row(
-            "SELECT 1 FROM people WHERE kind = 'owner' LIMIT 1",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if !has_owner {
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_owner_person ON people(kind) WHERE kind = 'owner';
-             INSERT OR IGNORE INTO people (kind, display_name) VALUES ('owner', 'Me');",
-        )?;
-    }
-
-    let profile_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT voice_profile_id FROM profile_identity_bindings WHERE state = 'accepted'",
-        )?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
-        rows
-    };
-
-    for pid in profile_ids {
-        let person_count: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT person_id) FROM profile_identity_bindings \
-             WHERE voice_profile_id = ?1 AND state = 'accepted'",
-            [pid],
-            |r| r.get(0),
-        )?;
-
-        if person_count == 1 {
-            let leaf_id: Option<(i64, i64)> = conn
-                .query_row(
-                    "SELECT b1.id, b1.person_id FROM profile_identity_bindings b1 \
-                     WHERE b1.voice_profile_id = ?1 AND b1.state = 'accepted' \
-                       AND NOT EXISTS ( \
-                           SELECT 1 FROM profile_identity_bindings b2 \
-                           WHERE b2.voice_profile_id = b1.voice_profile_id \
-                             AND b2.supersedes_id = b1.id \
-                             AND b2.state = 'accepted' \
-                       ) \
-                     ORDER BY b1.id DESC LIMIT 1",
-                    [pid],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-
-            if let Some((b_id, p_id)) = leaf_id {
-                conn.execute(
-                    "UPDATE profile_identity_bindings SET active = 0 WHERE voice_profile_id = ?1",
-                    [pid],
-                )?;
-                conn.execute(
-                    "UPDATE profile_identity_bindings SET active = 1 WHERE id = ?1",
-                    [b_id],
-                )?;
-                conn.execute(
-                    "UPDATE voice_profiles SET person_id = ?1 WHERE id = ?2",
-                    params![p_id, pid],
-                )?;
-            }
-        } else {
-            conn.execute(
-                "UPDATE profile_identity_bindings SET active = 0 WHERE voice_profile_id = ?1",
-                [pid],
-            )?;
-            conn.execute(
-                "UPDATE voice_profiles SET person_id = NULL WHERE id = ?1",
-                [pid],
-            )?;
-        }
-    }
-
-    conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_profile_binding
-         ON profile_identity_bindings(voice_profile_id)
-         WHERE active = 1;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_binding_operation
-         ON profile_identity_bindings(voice_profile_id, operation_id)
-         WHERE operation_id IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_ordinal
-         ON episode_speaker_slots(episode_id, slot_ordinal);
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_profile
-         ON episode_speaker_slots(episode_id, voice_profile_id)
-         WHERE status = 'active' AND voice_profile_id IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_cluster
-         ON episode_speaker_slots(episode_id, speaker_cluster_id)
-         WHERE status = 'active' AND speaker_cluster_id IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_samples_job
-         ON voice_samples(embedding_job_id)
-         WHERE embedding_job_id IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS idx_speaker_obs_cluster ON speaker_observations(cluster_id);
-         CREATE INDEX IF NOT EXISTS idx_speaker_obs_direct_evidence ON speaker_observations(direct_evidence_id);
-         CREATE INDEX IF NOT EXISTS idx_identity_evidence_cluster ON identity_evidence(speaker_cluster_id);",
-    )?;
-
-    let has_utterances: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='utterances'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_utterances > 0 {
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_utterances_speaker_obs ON utterances(speaker_observation_id);",
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Gemini speaker ids are stable only within one media request. They are useful
-/// for joining turns inside that request, but they are not a durable identity
-/// and must never leak into the archive as if `speaker_0` were a person.
-///
-/// First replace exact request-local fallbacks with an explicitly unresolved
-/// label. Then, within one work unit only, let a unique independently resolved
-/// voice/name for the same local id label its sibling turns. Conflicting
-/// resolutions abstain. This preserves the independent voice/evidence graph as
-/// the only cross-request identity authority.
-pub(crate) fn reconcile_request_local_speaker_labels(
-    conn: &Connection,
-    work_unit_id: Option<&str>,
-) -> Result<usize> {
-    let required_tables: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-         ('utterances','speaker_observations','media_work_members')",
-        [],
-        |row| row.get(0),
-    )?;
-    if required_tables != 3 {
-        return Ok(0);
-    }
-
-    // 1. Backfill utterances.speaker_observation_id if missing
-    let has_missing: bool = conn
-        .query_row(
-            "SELECT 1 FROM utterances WHERE speaker_observation_id IS NULL AND source_key IS NOT NULL LIMIT 1",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if has_missing {
-        conn.execute(
-            "UPDATE utterances AS u \
-             SET speaker_observation_id = ( \
-                 SELECT s.id FROM speaker_observations s \
-                 WHERE u.source_key = 'cloud-v2:' || s.event_id || ':' || s.turn_id \
-                 LIMIT 1 \
-             ) \
-             WHERE u.speaker_observation_id IS NULL AND u.source_key IS NOT NULL",
-            [],
-        )?;
-    }
-
-    // 2. Query observations in scope
-    let observation_ids: Vec<i64> = match work_unit_id {
-        Some(w_id) => {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT s.id FROM speaker_observations s \
-                 JOIN media_work_members m ON m.event_id = s.event_id \
-                 WHERE m.work_unit_id = ?1",
-            )?;
-            let rows = stmt
-                .query_map([w_id], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
-            rows
-        }
-        None => {
-            let mut stmt = conn.prepare("SELECT DISTINCT id FROM speaker_observations")?;
-            let rows = stmt
-                .query_map([], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
-            rows
-        }
-    };
-
-    let mut updated = 0;
-    for obs_id in observation_ids {
-        let attribution = crate::cp::identity::resolve_speaker_attribution(conn, obs_id, None)?;
-        let count = conn.execute(
-            "UPDATE utterances SET speaker_label = ?1 \
-             WHERE speaker_observation_id = ?2 AND speaker_label <> ?1",
-            params![attribution.display_label, obs_id],
-        )?;
-        updated += count;
-    }
-
-    Ok(updated)
-}
-
-fn migrate_request_local_speaker_labels(conn: &Connection) -> Result<()> {
-    let has_metadata: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_metadata'",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_metadata == 0 {
-        return Ok(());
-    }
-    let complete: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key=?1)",
-        [REQUEST_LOCAL_LABEL_MIGRATION_KEY],
-        |row| row.get(0),
-    )?;
-    if complete {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
-    reconcile_request_local_speaker_labels(&tx, None)?;
-    tx.execute(
-        "INSERT INTO app_metadata(key,value) VALUES (?1,'complete')",
-        [REQUEST_LOCAL_LABEL_MIGRATION_KEY],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    alteration: &str,
-) -> Result<()> {
-    let table_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(());
-    }
-    let query = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1");
-    let present: i64 = conn.query_row(&query, [column], |row| row.get(0))?;
-    if present == 0 {
-        conn.execute_batch(alteration)?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordOutcome {
-    Created,
-    Duplicate,
-}
-
-#[cfg(test)]
-pub fn record_source_event(
-    conn: &Connection,
-    account_id: &str,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-    object_key: &str,
-) -> Result<RecordOutcome> {
-    record_source_event_with_generation(
-        conn,
-        account_id,
-        manifest,
-        manifest_digest,
-        object_key,
-        None,
-        None,
-    )
-}
-
-/// Records the generation returned by GCS for canonical media when available.
-/// Old rows may not have it; deletion still reconciles the exact user prefix.
-pub fn record_source_event_with_generation(
-    conn: &Connection,
-    account_id: &str,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-    object_key: &str,
-    object_generation: Option<i64>,
-    media_authority: Option<&RecordingMediaAuthorityDecision>,
-) -> Result<RecordOutcome> {
-    let tx = conn.unchecked_transaction()?;
-    let outcome = record_source_event_in_transaction(
-        &tx,
-        account_id,
-        manifest,
-        manifest_digest,
-        object_key,
-        object_generation,
-        media_authority,
-        None,
-    )?;
-    tx.commit()?;
-    Ok(outcome)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the sealed capture transaction keeps every authenticated media fact explicit"
-)]
-fn record_source_event_in_transaction(
-    conn: &Connection,
-    account_id: &str,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-    object_key: &str,
-    object_generation: Option<i64>,
-    media_authority: Option<&RecordingMediaAuthorityDecision>,
-    commit_stamp: CommitStamp<'_>,
-) -> Result<RecordOutcome> {
-    manifest.validate()?;
-    if manifest.media_disposition != MediaDisposition::Canonical {
-        return Err(EnclaveError::InvalidRequest(
-            "record_source_event requires canonical media".into(),
-        ));
-    }
-    let media = manifest
-        .media
-        .as_ref()
-        .ok_or_else(|| EnclaveError::InvalidRequest("canonical media is required".into()))?;
-    validate_id("account_id", account_id)?;
-    if !validate_sha256(manifest_digest) {
-        return Err(EnclaveError::InvalidRequest(
-            "manifest digest is invalid".into(),
-        ));
-    }
-    if object_key.is_empty() || object_key.len() > 512 || object_key.contains("..") {
-        return Err(EnclaveError::InvalidRequest("object_key is invalid".into()));
-    }
-    let authority_was_explicit = media_authority.is_some();
-    let default_authority = RecordingMediaAuthorityDecision::processing(
-        manifest
-            .recording_retention
-            .as_ref()
-            .map_or(0, |authority| authority.policy_revision),
-        commit_stamp
-            .unwrap_or(manifest.ended_at.as_str())
-            .to_owned(),
-    );
-    let media_authority = media_authority.unwrap_or(&default_authority);
-    let expected_object_key = if media_authority.is_durable() {
-        crate::store::canonical_recording_media_object_key(account_id, &media.asset_id)?
-    } else {
-        crate::store::canonical_capture_media_object_key(account_id, &media.asset_id)?
-    };
-    if authority_was_explicit && object_key != expected_object_key {
-        return Err(EnclaveError::InvalidRequest(
-            "object_key does not match the settled retention decision".into(),
-        ));
-    }
-
-    let existing: Option<(String, String)> = conn
-        .query_row(
-            "SELECT e.manifest_digest, m.object_key FROM capture_events e \
-             JOIN media_objects m ON m.event_id=e.event_id WHERE e.event_id=?1",
-            [&manifest.event_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((existing_digest, existing_object)) = existing {
-        if existing_digest == manifest_digest && existing_object == object_key {
-            return Ok(RecordOutcome::Duplicate);
-        }
-        return Err(EnclaveError::Conflict(
-            "idempotency conflict for event_id".into(),
-        ));
-    }
-
-    conn.execute(
-        "INSERT INTO capture_sessions \
-         (id, device_id, install_id, started_at, last_event_at, schema_version, ended_at, \
-          created_at) \
-         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END,\
-                 COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
-         ON CONFLICT(id) DO UPDATE SET \
-           last_event_at=MAX(last_event_at, excluded.last_event_at), \
-           ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at, excluded.ended_at) \
-                         ELSE capture_sessions.ended_at END",
-        params![
-            manifest.capture_session_id,
-            manifest.device_id,
-            manifest.install_id,
-            manifest.started_at,
-            manifest.ended_at,
-            manifest.session_finished.unwrap_or(false),
-            commit_stamp
-        ],
-    )?;
-    conn.execute(
-        "INSERT INTO capture_streams \
-         (id, capture_session_id, device_id, stream_kind, created_at) \
-         VALUES (?1,?2,?3,?4,COALESCE(?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
-         ON CONFLICT(id) DO NOTHING",
-        params![
-            manifest.stream_id,
-            manifest.capture_session_id,
-            manifest.device_id,
-            manifest.stream_kind.as_str(),
-            commit_stamp
-        ],
-    )?;
-    let context_json = manifest
-        .context
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    let event_insert = conn.execute(
-        "INSERT INTO capture_events \
-         (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
-          source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
-          clock_uncertainty_ms,asset_id,manifest_digest,context_json,audio_role,audio_route,route_epoch,\
-          received_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 COALESCE(?21,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-        params![
-            manifest.event_id,
-            manifest.device_id,
-            manifest.install_id,
-            manifest.capture_session_id,
-            manifest.stream_id,
-            manifest.stream_kind.as_str(),
-            manifest.sequence,
-            manifest.source_wall_at,
-            manifest.source_monotonic_ns.to_string(),
-            manifest.started_at,
-            manifest.ended_at,
-            manifest.timezone_id,
-            manifest.utc_offset_minutes,
-            manifest.clock_uncertainty_ms,
-            media.asset_id,
-            manifest_digest,
-            context_json,
-            manifest.audio_role,
-            manifest.audio_route,
-            manifest.route_epoch.map(|v| v as i64),
-            commit_stamp,
-        ],
-    );
-    if let Err(error) = event_insert {
-        if error.to_string().contains("UNIQUE constraint failed") {
-            return Err(EnclaveError::Conflict(
-                "idempotency conflict for stream sequence".into(),
-            ));
-        }
-        return Err(error.into());
-    }
-    // The frozen epoch-0 column names the active media router and is CHECKed
-    // to `current`. The additive authority table carries the concrete routed
-    // backend (`processing|recordings`) without rewriting that baseline.
-    let object_backend = object_generation.map(|_| "current");
-    let retain_until = if media_authority.is_durable() {
-        None
-    } else {
-        Some(super::isotime::add_seconds(
-            &manifest.ended_at,
-            30.0 * 86_400.0,
-        ))
-    };
-    conn.execute(
-        "INSERT INTO media_objects \
-         (asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,sample_rate,channels, \
-          frame_count,width,height,scale,orientation,retain_until,created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
-                 COALESCE(?18,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-        params![
-            media.asset_id,
-            manifest.event_id,
-            object_key,
-            object_generation,
-            object_backend,
-            media.mime_type,
-            media.codec,
-            media.byte_length,
-            media.sha256.to_ascii_lowercase(),
-            media.sample_rate,
-            media.channels,
-            media.frame_count,
-            media.width,
-            media.height,
-            media.scale,
-            media.orientation,
-            retain_until,
-            commit_stamp
-        ],
-    )?;
-    record_media_authority(conn, &media.asset_id, media_authority)?;
-    record_browser_observation(conn, manifest, commit_stamp)?;
-    let job_kind = if manifest.stream_kind.is_audio() {
-        "gemini_audio"
-    } else {
-        "gemini_screen"
-    };
-    // `updated_at` is a retry-backoff deadline only for `state='retry_wait'`;
-    // a freshly inserted `pending` job is selected without consulting it and
-    // the lease scans order by `e.started_at,e.sequence,j.id`, never by it. So
-    // binding the commit stamp here changes no scheduling decision — it only
-    // keeps the stamp out of the live clock.
-    conn.execute(
-        "INSERT INTO media_processing_jobs \
-         (event_id,job_kind,input_revision,processor_version,state,updated_at) \
-         VALUES (?1,?2,?3,1,'pending',COALESCE(?4,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-        params![manifest.event_id, job_kind, manifest_digest, commit_stamp],
-    )?;
-    advance_contiguous_ack(conn, &manifest.stream_id)?;
-    Ok(RecordOutcome::Created)
-}
-
-fn record_media_authority(
-    conn: &Connection,
-    asset_id: &str,
-    authority: &RecordingMediaAuthorityDecision,
-) -> Result<()> {
-    let table_present: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recording_media_authority')",
-        [],
-        |row| row.get(0),
-    )?;
-    if table_present == 0 {
-        return if authority.is_durable() {
-            Err(EnclaveError::Store(
-                "durable recording authority schema is unavailable".into(),
-            ))
-        } else {
-            Ok(())
-        };
-    }
-    if super::isotime::parse_epoch_millis(authority.decision_at()).is_none() {
-        return Err(EnclaveError::InvalidRequest(
-            "recording retention decision timestamp is invalid".into(),
-        ));
-    }
-    let changed = match authority {
-        RecordingMediaAuthorityDecision::ProcessingWindow30d {
-            capture_policy_revision,
-            decision_at,
-        } => conn.execute(
-            "INSERT INTO recording_media_authority
-             (asset_id,capture_policy_revision,retention_policy_revision,
-              retention_policy_epoch,retention_decision,storage_backend,recording_key_epoch,
-              recording_state,decision_at,updated_at)
-             VALUES (?1,?2,0,NULL,'processing_window_30d','processing',NULL,
-                     'processing_only',?3,?3)",
-            params![asset_id, capture_policy_revision, decision_at],
-        )?,
-        RecordingMediaAuthorityDecision::UntilDeleted {
-            capture_policy_revision,
-            retention_policy_revision,
-            retention_policy_epoch,
-            recording_key_epoch,
-            decision_at,
-        } => conn.execute(
-            "INSERT INTO recording_media_authority
-             (asset_id,capture_policy_revision,retention_policy_revision,
-              retention_policy_epoch,retention_decision,storage_backend,recording_key_epoch,
-              recording_state,decision_at,updated_at)
-             VALUES (?1,?2,?3,?4,'until_deleted','recordings',?5,'durable',?6,?6)",
-            params![
-                asset_id,
-                capture_policy_revision,
-                retention_policy_revision,
-                retention_policy_epoch,
-                recording_key_epoch,
-                decision_at,
-            ],
-        )?,
-    };
-    if changed != 1 {
-        return Err(EnclaveError::Store(
-            "recording media authority was not inserted exactly once".into(),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Value {
@@ -4754,60 +2587,6 @@ pub(crate) fn semantic_context_fingerprint(
     ))?))
 }
 
-struct CanonicalReferenceTarget {
-    device_id: String,
-    install_id: String,
-    capture_session_id: String,
-    stream_id: String,
-    sequence: i64,
-    media_disposition: String,
-    context_json: Option<String>,
-    asset_id: String,
-    media_sha256: String,
-}
-
-/// ADR-0022: the commit stamp bound in place of this row set's live-clock
-/// column DEFAULTs.
-///
-/// `capture_sessions.created_at`, `capture_streams.created_at`,
-/// `capture_events.received_at`, `browser_states_v2.created_at`,
-/// `browser_observations_v2.created_at`, `media_objects.created_at` and
-/// `media_processing_jobs.updated_at` are every one of them declared
-/// `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))` in `init_schema` — and NOT
-/// in `SCHEMA_SQL`, which never declares these tables — and no legacy INSERT
-/// binds any of them.
-///
-/// `None` is the LEGACY path: the parameter is NULL, the `COALESCE` collapses
-/// to the identical `strftime` expression the column DEFAULT would have run,
-/// and the row is byte-for-byte what it was before this parameter existed.
-///
-/// `Some(stamp)` is the WAL-authoritative path, where a live clock inside a
-/// sealed plan's `apply()` would make the committed pages a function of wall
-/// time rather than of the plan — breaking byte-exact replay.
-///
-/// **The stamp must be an ENCLAVE stamp**, minted by [`enclave_commit_stamp`]
-/// on the route and carried in the plan — never a device-supplied field such
-/// as `manifest.source_wall_at`. All seven columns above are enclave-side
-/// facts (receipt time, row-creation time, scheduling state), the device's own
-/// wall clock already has `capture_events.source_wall_at` and
-/// `browser_observations_v2.observed_at`, and
-/// `media_processing_jobs.updated_at` is compared as a RAW STRING against an
-/// enclave `committed_at` by `media_worker::wal::claim` — one device stamp
-/// that sorts above `now_iso()` wedges that account's media lane permanently.
-/// `wal::is_canonical_commit_stamp` refuses any non-canonical stamp at plan
-/// construction; see `wal::capture_event::CanonicalCaptureEventPlan::commit_stamp`
-/// for the whole argument.
-type CommitStamp<'a> = Option<&'a str>;
-
-/// The enclave's own receipt clock for the ingest plan families, read ONCE per
-/// request on the route and then carried in the plan.
-///
-/// Hoisted out of every `apply()` deliberately (ADR-0022 R7): a sealed plan's
-/// committed pages must be a function of the plan, not of wall time. The
-/// rendering is `isotime::format_epoch_millis`, which is byte-identical to
-/// `media_worker::now_iso` and to `model_usage::settled_now_iso` — that
-/// matters, because `media_worker::wal::claim` compares this stamp against
-/// `now_iso()` as a raw string.
 fn enclave_commit_stamp() -> String {
     super::isotime::format_epoch_millis(
         std::time::SystemTime::now()
@@ -4815,437 +2594,6 @@ fn enclave_commit_stamp() -> String {
             .unwrap_or_default()
             .as_millis() as i64,
     )
-}
-
-pub(crate) fn record_reference_event(
-    conn: &Connection,
-    account_id: &str,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-) -> Result<RecordOutcome> {
-    let tx = conn.unchecked_transaction()?;
-    let outcome =
-        record_reference_event_in_transaction(&tx, account_id, manifest, manifest_digest, None)?;
-    tx.commit()?;
-    Ok(outcome)
-}
-
-pub(crate) struct RecordedReferenceBatch {
-    pub(crate) new_count: usize,
-    pub(crate) duplicate_count: usize,
-    pub(crate) committed_through_sequence: i64,
-}
-
-pub(crate) fn record_reference_batch(
-    conn: &Connection,
-    account_id: &str,
-    events: &[CaptureEventManifest],
-    manifest_digests: &[String],
-) -> Result<RecordedReferenceBatch> {
-    if events.is_empty() || events.len() != manifest_digests.len() {
-        return Err(EnclaveError::InvalidRequest(
-            "reference batch digest count is invalid".into(),
-        ));
-    }
-    let tx = conn.unchecked_transaction()?;
-    let mut new_count = 0usize;
-    let mut duplicate_count = 0usize;
-    for (index, (event, digest)) in events.iter().zip(manifest_digests).enumerate() {
-        let outcome =
-            match record_reference_event_in_transaction(&tx, account_id, event, digest, None) {
-                Ok(outcome) => outcome,
-                Err(EnclaveError::CaptureReference(reason)) => {
-                    return Err(EnclaveError::CaptureReferenceBatch {
-                        reason,
-                        index,
-                        sequence: event.sequence,
-                    })
-                }
-                Err(error) => return Err(error),
-            };
-        match outcome {
-            RecordOutcome::Created => new_count += 1,
-            RecordOutcome::Duplicate => duplicate_count += 1,
-        }
-    }
-    let committed_through_sequence = committed_through_sequence(&tx, &events[0].stream_id)?;
-    tx.commit()?;
-    Ok(RecordedReferenceBatch {
-        new_count,
-        duplicate_count,
-        committed_through_sequence,
-    })
-}
-
-fn record_reference_event_in_transaction(
-    conn: &Connection,
-    account_id: &str,
-    manifest: &CaptureEventManifest,
-    manifest_digest: &str,
-    commit_stamp: CommitStamp<'_>,
-) -> Result<RecordOutcome> {
-    manifest.validate()?;
-    if manifest.media_disposition != MediaDisposition::Reference {
-        return Err(EnclaveError::InvalidRequest(
-            "record_reference_event requires reference metadata".into(),
-        ));
-    }
-    validate_id("account_id", account_id)?;
-    if !validate_sha256(manifest_digest) {
-        return Err(EnclaveError::InvalidRequest(
-            "manifest digest is invalid".into(),
-        ));
-    }
-    match preflight_source_event(conn, manifest, manifest_digest, None)? {
-        PreflightOutcome::Duplicate { .. } => return Ok(RecordOutcome::Duplicate),
-        PreflightOutcome::New => {}
-    }
-
-    let reference = manifest
-        .reference
-        .as_ref()
-        .ok_or_else(|| EnclaveError::InvalidRequest("reference metadata is required".into()))?;
-    let current_context = manifest.context.as_ref().ok_or_else(|| {
-        EnclaveError::InvalidRequest("reference events require capture context".into())
-    })?;
-    if !reference
-        .context_fingerprint
-        .eq_ignore_ascii_case(&semantic_context_fingerprint(
-            current_context,
-            reference.dedupe_version,
-        )?)
-    {
-        return Err(EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::ContextFingerprintMismatch,
-        ));
-    }
-
-    let canonical: Option<CanonicalReferenceTarget> = conn
-        .query_row(
-            "SELECT e.device_id,e.install_id,e.capture_session_id,e.stream_id,e.sequence,\
-                    e.media_disposition,e.context_json,m.asset_id,m.sha256 \
-             FROM capture_events e JOIN media_objects m ON m.event_id=e.event_id \
-             WHERE e.event_id=?1",
-            [&reference.canonical_event_id],
-            |row| {
-                Ok(CanonicalReferenceTarget {
-                    device_id: row.get(0)?,
-                    install_id: row.get(1)?,
-                    capture_session_id: row.get(2)?,
-                    stream_id: row.get(3)?,
-                    sequence: row.get(4)?,
-                    media_disposition: row.get(5)?,
-                    context_json: row.get(6)?,
-                    asset_id: row.get(7)?,
-                    media_sha256: row.get(8)?,
-                })
-            },
-        )
-        .optional()?;
-    let Some(canonical) = canonical else {
-        return Err(EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::CanonicalUnavailable,
-        ));
-    };
-    if canonical.media_disposition != "canonical"
-        || canonical.device_id != manifest.device_id
-        || canonical.install_id != manifest.install_id
-        || canonical.capture_session_id != manifest.capture_session_id
-        || canonical.stream_id != manifest.stream_id
-        || canonical.sequence >= manifest.sequence
-        || canonical.asset_id != reference.canonical_asset_id
-        || !canonical
-            .media_sha256
-            .eq_ignore_ascii_case(&reference.canonical_media_sha256)
-    {
-        return Err(EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::TargetMismatch,
-        ));
-    }
-    let canonical_context: CaptureContext = canonical
-        .context_json
-        .as_deref()
-        .ok_or(EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::CanonicalContextUnavailable,
-        ))
-        .and_then(|raw| {
-            serde_json::from_str(raw).map_err(|_| {
-                EnclaveError::CaptureReference(
-                    CaptureReferenceFailureReason::CanonicalContextUnavailable,
-                )
-            })
-        })?;
-    // The transition check compares at the reference's dedupe version: a v2
-    // reference matches its canonical when the literal foreground context is
-    // unchanged, even if background window geometry drifted since the
-    // canonical was recorded.
-    if semantic_context_value(&canonical_context, reference.dedupe_version)
-        != semantic_context_value(current_context, reference.dedupe_version)
-    {
-        return Err(EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::ContextTransition,
-        ));
-    }
-
-    // The session upsert's max/coalesce merge semantics are unchanged; only
-    // `created_at` is added, and it is written by the INSERT half alone, never
-    // by the DO UPDATE half, so a second event never rewrites the stamp the
-    // session was created with.
-    conn.execute(
-        "INSERT INTO capture_sessions \
-         (id,device_id,install_id,started_at,last_event_at,schema_version,ended_at,created_at) \
-         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END,\
-                 COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
-         ON CONFLICT(id) DO UPDATE SET \
-           last_event_at=MAX(last_event_at,excluded.last_event_at), \
-           ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at,excluded.ended_at) \
-                         ELSE capture_sessions.ended_at END",
-        params![
-            manifest.capture_session_id,
-            manifest.device_id,
-            manifest.install_id,
-            manifest.started_at,
-            manifest.ended_at,
-            manifest.session_finished.unwrap_or(false),
-            commit_stamp
-        ],
-    )?;
-    conn.execute(
-        "INSERT INTO capture_streams \
-         (id,capture_session_id,device_id,stream_kind,created_at) \
-         VALUES (?1,?2,?3,?4,COALESCE(?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
-         ON CONFLICT(id) DO NOTHING",
-        params![
-            manifest.stream_id,
-            manifest.capture_session_id,
-            manifest.device_id,
-            manifest.stream_kind.as_str(),
-            commit_stamp
-        ],
-    )?;
-    let context_json = serde_json::to_string(current_context)?;
-    let internal_asset_id = format!("reference-{}", manifest.event_id);
-    let event_insert = conn.execute(
-        "INSERT INTO capture_events \
-         (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,\
-          source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
-          clock_uncertainty_ms,asset_id,manifest_digest,context_json,media_disposition,\
-          canonical_event_id,canonical_asset_id,canonical_media_sha256,perceptual_hash,\
-          hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version,\
-          audio_role,audio_route,route_epoch,received_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
-                 'reference',?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,\
-                 COALESCE(?29,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-        params![
-            manifest.event_id,
-            manifest.device_id,
-            manifest.install_id,
-            manifest.capture_session_id,
-            manifest.stream_id,
-            manifest.stream_kind.as_str(),
-            manifest.sequence,
-            manifest.source_wall_at,
-            manifest.source_monotonic_ns.to_string(),
-            manifest.started_at,
-            manifest.ended_at,
-            manifest.timezone_id,
-            manifest.utc_offset_minutes,
-            manifest.clock_uncertainty_ms,
-            internal_asset_id,
-            manifest_digest,
-            context_json,
-            reference.canonical_event_id,
-            reference.canonical_asset_id,
-            reference.canonical_media_sha256.to_ascii_lowercase(),
-            reference.perceptual_hash.to_ascii_lowercase(),
-            reference.hamming_distance,
-            reference.pixel_change_ratio,
-            reference.context_fingerprint.to_ascii_lowercase(),
-            reference.dedupe_version,
-            manifest.audio_role,
-            manifest.audio_route,
-            manifest.route_epoch.map(|v| v as i64),
-            commit_stamp,
-        ],
-    );
-    if let Err(error) = event_insert {
-        if error.to_string().contains("UNIQUE constraint failed") {
-            return Err(EnclaveError::Conflict(
-                "idempotency conflict for stream sequence".into(),
-            ));
-        }
-        return Err(error.into());
-    }
-    record_browser_observation(conn, manifest, commit_stamp)?;
-    advance_contiguous_ack(conn, &manifest.stream_id)?;
-    Ok(RecordOutcome::Created)
-}
-
-fn record_browser_observation(
-    conn: &Connection,
-    manifest: &CaptureEventManifest,
-    commit_stamp: CommitStamp<'_>,
-) -> Result<()> {
-    let Some(context) = &manifest.context else {
-        return Ok(());
-    };
-    if let Some(snapshot) = &context.browser_snapshot {
-        let tabs_json = if snapshot.state_key.contains(":browser-v2:") {
-            serde_json::to_string(&BrowserStateV2Envelope {
-                schema_version: 2,
-                active_window_index: snapshot.active_window_index,
-                active_tab_index: snapshot.active_tab_index,
-                reported_tab_count: snapshot.reported_tab_count,
-                truncated: snapshot.truncated,
-                ambient_tab_collection_enabled: snapshot
-                    .ambient_tab_collection_enabled
-                    .unwrap_or(false),
-                tabs: snapshot.tabs.clone(),
-            })?
-        } else {
-            serde_json::to_string(&snapshot.tabs)?
-        };
-        let normalized_hash = snapshot.content_hash.to_ascii_lowercase();
-        conn.execute(
-            "INSERT INTO browser_states_v2 \
-             (state_key,browser_bundle_id,browser_name,permission_status,content_hash,tabs_json,\
-              created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now'))) \
-             ON CONFLICT(state_key) DO NOTHING",
-            params![
-                snapshot.state_key,
-                snapshot.browser_bundle_id,
-                snapshot.browser_name,
-                snapshot.permission_status,
-                normalized_hash,
-                tabs_json,
-                commit_stamp
-            ],
-        )?;
-        let existing: (String, String, String, String, String) = conn.query_row(
-            "SELECT browser_bundle_id,browser_name,permission_status,content_hash,tabs_json \
-             FROM browser_states_v2 WHERE state_key=?1",
-            [&snapshot.state_key],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        if existing
-            != (
-                snapshot.browser_bundle_id.clone(),
-                snapshot.browser_name.clone(),
-                snapshot.permission_status.clone(),
-                normalized_hash,
-                tabs_json,
-            )
-        {
-            return Err(EnclaveError::Conflict(
-                "browser state key was reused with different content".into(),
-            ));
-        }
-    }
-    let state_key = match context.browser_state_key.as_deref() {
-        Some(key) => {
-            let stored = conn
-                .query_row(
-                    "SELECT state_key,browser_bundle_id,browser_name,permission_status,
-                            content_hash,tabs_json
-                     FROM browser_states_v2 WHERE state_key=?1",
-                    [key],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    },
-                )
-                .optional()?
-                .ok_or_else(|| {
-                    EnclaveError::InvalidRequest(
-                        "browser_state_key does not name an existing exact state".into(),
-                    )
-                })?;
-            if context.browser_snapshot.is_none() && key.contains(":browser-v2:") {
-                let envelope: BrowserStateV2Envelope = serde_json::from_str(&stored.5)
-                    .map_err(|_| EnclaveError::Store("browser-v2 state is corrupt".into()))?;
-                if envelope.schema_version != 2 {
-                    return Err(EnclaveError::Store(
-                        "browser-v2 state version is unsupported".into(),
-                    ));
-                }
-                let snapshot = BrowserSnapshot {
-                    state_key: stored.0.clone(),
-                    browser_bundle_id: stored.1,
-                    browser_name: stored.2,
-                    permission_status: stored.3,
-                    active_window_index: envelope.active_window_index,
-                    active_tab_index: envelope.active_tab_index,
-                    reported_tab_count: envelope.reported_tab_count,
-                    truncated: envelope.truncated,
-                    ambient_tab_collection_enabled: Some(envelope.ambient_tab_collection_enabled),
-                    content_hash: stored.4,
-                    tabs: envelope.tabs,
-                };
-                validate_browser_v2_snapshot(context, &snapshot, &manifest.device_id)?;
-            }
-            Some(stored.0)
-        }
-        None => None,
-    };
-    conn.execute(
-        "INSERT INTO browser_observations_v2 \
-         (observation_id,event_id,observed_at,state_key,context_status,active_url,active_title,\
-          created_at) \
-         VALUES (?1,?1,?2,?3,?4,?5,?6,COALESCE(?7,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-        params![
-            manifest.event_id,
-            manifest.source_wall_at,
-            state_key,
-            context.capture_status,
-            context.active_url,
-            context.active_url_title,
-            commit_stamp
-        ],
-    )?;
-    Ok(())
-}
-
-fn advance_contiguous_ack(conn: &Connection, stream_id: &str) -> Result<()> {
-    let current: i64 = conn.query_row(
-        "SELECT committed_through_sequence FROM capture_streams WHERE id=?1",
-        [stream_id],
-        |row| row.get(0),
-    )?;
-    let mut next = current + 1;
-    loop {
-        let exists: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM capture_events WHERE stream_id=?1 AND sequence=?2)",
-            params![stream_id, next],
-            |row| row.get(0),
-        )?;
-        if exists == 0 {
-            break;
-        }
-        next += 1;
-    }
-    let advanced = next - 1;
-    if advanced > current {
-        conn.execute(
-            "UPDATE capture_streams SET committed_through_sequence=?1 WHERE id=?2",
-            params![advanced, stream_id],
-        )?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5396,2534 +2744,208 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::GcsClient;
-    use rusqlite::Connection;
-    use serde_json::json;
+mod lost_response_adoption_tests {
+    use async_trait::async_trait;
 
-    fn valid_manifest() -> CaptureEventManifest {
-        serde_json::from_value(json!({
-            "schema_version": 2,
-            "event_id": "019fbab2-8413-7053-9117-eb249b72b15b",
-            "device_id": "device-1",
-            "install_id": "install-1",
-            "capture_session_id": "session-1",
-            "stream_id": "system-1",
-            "stream_kind": "system_audio",
-            "sequence": 7,
-            "source_wall_at": "2026-07-31T18:00:00.000Z",
-            "source_monotonic_ns": 9000000000_u64,
-            "started_at": "2026-07-31T18:00:00.000Z",
-            "ended_at": "2026-07-31T18:00:05.000Z",
-            "timezone_id": "America/New_York",
-            "utc_offset_minutes": -240,
-            "clock_uncertainty_ms": 24,
-            "media": {
-                "asset_id": "019fbab2-8413-7053-9117-eb249b72b15c",
-                "mime_type": "audio/m4a",
-                "codec": "aac",
-                "byte_length": 12,
-                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "sample_rate": 48000,
-                "channels": 2,
-                "frame_count": 240000
-            },
-            "context": {
-                "capture_status": "stable",
-                "active_app": "Google Chrome",
-                "primary_bundle_id": "com.google.Chrome",
-                "window_title": "Weekly planning",
-                "display_id": 42,
-                "active_url": "https://meet.google.com/abc-defg-hij?authuser=0",
-                "active_url_title": "Weekly planning",
-                "browser_permission_status": "granted"
+    use super::verify_existing_media;
+    use crate::{
+        crypto::{encrypt_bound_blob, Dek},
+        error::{EnclaveError, Result},
+        gcs::GcsGetResponse,
+        persistence::MediaObjectStore,
+    };
+
+    struct FakeMediaObjectStore {
+        object_name: String,
+        ciphertext: Vec<u8>,
+        wrapped_dek_b64: String,
+        generation: i64,
+    }
+
+    impl FakeMediaObjectStore {
+        fn new(
+            object_name: &str,
+            ciphertext: Vec<u8>,
+            wrapped_dek_b64: &str,
+            generation: i64,
+        ) -> Self {
+            Self {
+                object_name: object_name.to_owned(),
+                ciphertext,
+                wrapped_dek_b64: wrapped_dek_b64.to_owned(),
+                generation,
             }
-        }))
-        .expect("valid fixture")
+        }
     }
 
-    fn valid_screen_manifest(
-        sequence: i64,
-        event_id: &str,
-        asset_id: &str,
-    ) -> CaptureEventManifest {
-        let mut manifest: CaptureEventManifest = serde_json::from_value(json!({
-            "schema_version": 2,
-            "event_id": event_id,
-            "device_id": "device-1",
-            "install_id": "install-1",
-            "capture_session_id": "session-1",
-            "stream_id": "screen-1",
-            "stream_kind": "mac_screen",
-            "sequence": sequence,
-            "source_wall_at": "2026-07-31T18:00:00.000Z",
-            "source_monotonic_ns": 9000000000_u64 + sequence as u64,
-            "started_at": "2026-07-31T18:00:00.000Z",
-            "ended_at": "2026-07-31T18:00:02.000Z",
-            "timezone_id": "America/New_York",
-            "utc_offset_minutes": -240,
-            "clock_uncertainty_ms": 24,
-            "media": {
-                "asset_id": asset_id,
-                "mime_type": "image/jpeg",
-                "codec": "jpeg",
-                "byte_length": 12,
-                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "width": 1280,
-                "height": 720
-            },
-            "context": {
-                "capture_status": "stable",
-                "active_app": "Google Chrome",
-                "primary_bundle_id": "com.google.Chrome",
-                "primary_window_id": 9,
-                "window_title": "Weekly planning",
-                "display_id": 42,
-                "active_url": "https://meet.google.com/abc-defg-hij?authuser=0",
-                "active_url_title": "Weekly planning",
-                "browser_permission_status": "granted",
-                "visible_windows": [{"bundle_id":"com.google.Chrome","window_id":9}],
-                "visible_windows_truncated": false
+    #[async_trait]
+    impl MediaObjectStore for FakeMediaObjectStore {
+        async fn put_current(
+            &self,
+            _account_id: &str,
+            _object_name: &str,
+            _ciphertext: &[u8],
+            _wrapped_dek_b64: &str,
+        ) -> Result<i64> {
+            Err(EnclaveError::Store("unexpected media put".into()))
+        }
+
+        async fn get_current(&self, object_name: &str) -> Result<GcsGetResponse> {
+            if object_name != self.object_name {
+                return Err(EnclaveError::NotFound);
             }
-        }))
-        .expect("valid screen fixture");
-        manifest.source_monotonic_ns += sequence as u64;
-        manifest
-    }
+            Ok(GcsGetResponse {
+                ciphertext: self.ciphertext.clone(),
+                wrapped_dek_b64: self.wrapped_dek_b64.clone(),
+                generation: self.generation,
+            })
+        }
 
-    fn attach_valid_browser_v2(manifest: &mut CaptureEventManifest) {
-        let state_key =
-            "device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3";
-        let context = manifest.context.as_mut().expect("screen context");
-        context.primary_bundle_id = Some("com.apple.Safari".into());
-        context.active_app = Some("Safari".into());
-        context.active_url = Some("https://meet.google.com/abc?authuser=0#frag".into());
-        context.active_url_title = Some("Meeting".into());
-        context.browser_permission_status = Some("granted".into());
-        context.browser_state_key = Some(state_key.into());
-        context.browser_snapshot = Some(BrowserSnapshot {
-            state_key: state_key.into(),
-            browser_bundle_id: "com.apple.Safari".into(),
-            browser_name: "Safari".into(),
-            permission_status: "granted".into(),
-            active_window_index: Some(1),
-            active_tab_index: Some(1),
-            reported_tab_count: 2,
-            truncated: false,
-            ambient_tab_collection_enabled: Some(true),
-            content_hash: "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3".into(),
-            tabs: vec![
-                BrowserTab {
-                    window_index: 1,
-                    tab_index: 1,
-                    title: Some("Meeting".into()),
-                    url: Some("https://meet.google.com/abc?authuser=0#frag".into()),
-                    url_scheme: Some("https".into()),
-                    is_active: true,
-                    is_loading: None,
-                },
-                BrowserTab {
-                    window_index: 1,
-                    tab_index: 2,
-                    title: Some("Document".into()),
-                    url: Some("https://docs.google.com/document/d/exact/edit?tab=t.0".into()),
-                    url_scheme: Some("https".into()),
-                    is_active: false,
-                    is_loading: None,
-                },
-            ],
-        });
-    }
-
-    fn reference_to(
-        canonical: &CaptureEventManifest,
-        sequence: i64,
-        event_id: &str,
-    ) -> CaptureEventManifest {
-        let mut reference = canonical.clone();
-        let media = canonical.media.as_ref().expect("canonical media");
-        let context = canonical.context.as_ref().expect("canonical context");
-        reference.event_id = event_id.into();
-        reference.sequence = sequence;
-        reference.source_monotonic_ns += sequence as u64 + 1;
-        reference.media_disposition = MediaDisposition::Reference;
-        reference.media = None;
-        reference.reference = Some(ScreenReferenceDescriptor {
-            canonical_event_id: canonical.event_id.clone(),
-            canonical_asset_id: media.asset_id.clone(),
-            canonical_media_sha256: media.sha256.clone(),
-            perceptual_hash: "0123456789abcdef".into(),
-            hamming_distance: 2,
-            pixel_change_ratio: 0.004,
-            context_fingerprint: semantic_context_fingerprint(context, 1).unwrap(),
-            dedupe_version: 1,
-        });
-        reference
-    }
-
-    #[test]
-    fn screen_context_fingerprint_matches_macos_fractional_geometry_vector() {
-        let context: CaptureContext = serde_json::from_value(json!({
-            "capture_status": "stable",
-            "active_app": "Safari",
-            "primary_bundle_id": "com.apple.Safari",
-            "primary_window_id": 123,
-            "window_title": "Meeting — José",
-            "display_id": 1,
-            "active_url": "https://example.com/a/b?x=1",
-            "active_url_title": "Meeting",
-            "browser_permission_status": "granted",
-            "visible_windows": [{
-                "window_id": 123,
-                "owner_pid": 456,
-                "bundle_id": "com.apple.Safari",
-                "app_name": "Safari",
-                "window_title": "Meeting — José",
-                "intersection_ratio": 1.0 / 3.0,
-                "z_index": 0
-            }],
-            "visible_windows_truncated": false
-        }))
-        .unwrap();
-
-        assert_eq!(
-            semantic_context_fingerprint(&context, 1).unwrap(),
-            "fba21879bdcd32f61bed713119be4eda7a9736e3fff52ea1576f284fba83dabc"
-        );
-        // Version 2 fingerprints the same context without the volatile
-        // visible-window inventory. This vector is pinned cross-language with
-        // the macOS client (ScreenTransportTests).
-        assert_eq!(
-            semantic_context_fingerprint(&context, 2).unwrap(),
-            "00e628e17b45c3462a25e7396c88503efbda2a9dc4f3f5234ac45d34728480ea"
-        );
-    }
-
-    #[test]
-    fn screen_reference_bounds_are_versioned() {
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        let make = |dedupe_version: u32, hamming_distance: u32, pixel_change_ratio: f64| {
-            let mut manifest = reference_to(&canonical, 1, "screen-event-1");
-            let context = canonical.context.as_ref().unwrap();
-            let descriptor = manifest.reference.as_mut().unwrap();
-            descriptor.dedupe_version = dedupe_version;
-            descriptor.hamming_distance = hamming_distance;
-            descriptor.pixel_change_ratio = pixel_change_ratio;
-            descriptor.context_fingerprint =
-                semantic_context_fingerprint(context, dedupe_version).unwrap();
-            manifest
-        };
-        // Version 1 keeps its historical bounds.
-        assert!(make(1, 3, 0.01).validate().is_ok());
-        assert!(make(1, 4, 0.004).validate().is_err());
-        assert!(make(1, 2, 0.011).validate().is_err());
-        // Version 2 absorbs idle jitter but still rejects real change.
-        assert!(make(2, 8, 0.03).validate().is_ok());
-        assert!(make(2, 9, 0.004).validate().is_err());
-        assert!(make(2, 2, 0.031).validate().is_err());
-        // Unknown future versions stay rejected.
-        assert!(make(3, 1, 0.001).validate().is_err());
-    }
-
-    #[test]
-    fn v2_reference_survives_background_window_drift_that_v1_rejects() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        record_source_event(
-            &conn,
-            "account-1",
-            &canonical,
-            &manifest_digest(&canonical).unwrap(),
-            "object-1",
-        )
-        .unwrap();
-
-        // Pixel-identical screen, but a background window appeared between
-        // captures, so the visible-window inventory drifted.
-        let drift = json!([
-            {"bundle_id":"com.google.Chrome","window_id":9},
-            {"bundle_id":"com.apple.dock","window_id":11}
-        ]);
-
-        let mut v1 = reference_to(&canonical, 1, "screen-event-1");
-        v1.context.as_mut().unwrap().visible_windows = Some(drift.clone());
-        v1.reference.as_mut().unwrap().context_fingerprint =
-            semantic_context_fingerprint(v1.context.as_ref().unwrap(), 1).unwrap();
-        assert!(matches!(
-            record_reference_event(&conn, "account-1", &v1, &"b".repeat(64)),
-            Err(EnclaveError::CaptureReference(
-                CaptureReferenceFailureReason::ContextTransition
+        async fn get_current_generation(
+            &self,
+            _object_name: &str,
+            _generation: i64,
+        ) -> Result<GcsGetResponse> {
+            Err(EnclaveError::Store(
+                "unexpected media generation get".into(),
             ))
-        ));
+        }
 
-        let mut v2 = reference_to(&canonical, 1, "screen-event-2");
-        v2.context.as_mut().unwrap().visible_windows = Some(drift);
-        let descriptor = v2.reference.as_mut().unwrap();
-        descriptor.dedupe_version = 2;
-        descriptor.context_fingerprint =
-            semantic_context_fingerprint(v2.context.as_ref().unwrap(), 2).unwrap();
-        assert!(matches!(
-            record_reference_event(&conn, "account-1", &v2, &"c".repeat(64)),
-            Ok(RecordOutcome::Created)
-        ));
+        async fn delete_current(&self, _object_name: &str) -> Result<()> {
+            Err(EnclaveError::Store("unexpected media delete".into()))
+        }
+
+        async fn purge_recordings(&self, _account_id: &str) -> Result<()> {
+            Err(EnclaveError::Store("unexpected recording purge".into()))
+        }
+
+        async fn purge_account(&self, _account_id: &str) -> Result<()> {
+            Err(EnclaveError::Store("unexpected account purge".into()))
+        }
     }
 
-    #[test]
-    fn media_dek_route_uses_only_the_capture_repository() {
-        // ADR-0040: the route owns KMS key material while the selected
-        // persistence adapter owns the atomic account-key installation.
-        let source = include_str!("media.rs");
-        let start = source
-            .find(concat!("async fn load_or_create_", "media_dek"))
-            .unwrap();
-        let end = source
-            .find(concat!("async fn verify_existing_", "media"))
-            .unwrap();
-        let route = &source[start..end];
-        assert_eq!(route.matches(".media_dek_wrapped(").count(), 1);
-        assert_eq!(route.matches(".install_media_dek(").count(), 1);
-        assert_eq!(route.matches("state.store").count(), 0);
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "read("))
-                .count(),
-            0
-        );
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "submit("))
-                .count(),
-            0
-        );
-    }
+    #[tokio::test]
+    async fn adopts_only_exact_current_v2_ciphertext_under_the_installed_key() {
+        const V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
+        let object_name = "raw/account-1/asset-1.enc";
+        let context = crate::gcs::media_blob_context("account-1", object_name);
+        let plaintext = b"exact captured media";
+        let installed_dek = Dek([0x11; 32]);
+        let installed_key_reference = "wrapped-installed-dek";
+        let ciphertext =
+            encrypt_bound_blob(&installed_dek, plaintext, &context).expect("encrypt current media");
+        let current =
+            FakeMediaObjectStore::new(object_name, ciphertext.clone(), installed_key_reference, 23);
 
-    /// ADR-0040: the route has exactly one typed persistence authority.
-    ///
-    /// Legacy SQLite/WAL selection is private to `LegacyCaptureRepository`;
-    /// the same route therefore runs unchanged against PostgreSQL.
-    #[test]
-    fn capture_event_route_uses_only_the_capture_repository() {
-        let source = include_str!("media.rs");
-        let start = source
-            .find(concat!("async fn upload_capture_", "event"))
-            .unwrap();
-        let end = source
-            .find(concat!("fn capture_requires_recording_", "lease"))
-            .unwrap();
-        let route = &source[start..end];
-        assert_eq!(route.matches(".preflight_event(").count(), 1);
-        assert_eq!(route.matches(".commit_event(").count(), 1);
-        assert_eq!(route.matches(".captures()").count(), 3);
-        assert_eq!(route.matches(".reserve_media_upload(").count(), 1);
         assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "read("))
-                .count(),
-            0
-        );
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "submit("))
-                .count(),
-            0
-        );
-        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 0);
-        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 0);
-    }
-
-    /// The LEGACY path stays byte-intact: `commit_stamp: None` leaves every
-    /// clock DEFAULT to the database exactly as it was before the parameter
-    /// existed. The WAL branch is entered only under selection, so an
-    /// unselected user's rows must still carry the live clock.
-    ///
-    /// Falsifiability, checked by sabotage: passing `Some(...)` from the
-    /// legacy wrappers stamps these columns with the manifest's
-    /// `source_wall_at` and every assertion below fails.
-    #[test]
-    fn the_legacy_writers_still_leave_every_clock_default_to_the_database() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
-        let reference = reference_to(&canonical, 1, "screen-event-1");
-        record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap();
-
-        let stamps: Vec<String> = conn
-            .query_row(
-                "SELECT
-                    (SELECT created_at FROM capture_sessions WHERE id='session-1'),
-                    (SELECT created_at FROM capture_streams WHERE id='screen-1'),
-                    (SELECT received_at FROM capture_events WHERE event_id='screen-event-0'),
-                    (SELECT created_at FROM media_objects WHERE asset_id='screen-asset-0'),
-                    (SELECT updated_at FROM media_processing_jobs
-                     WHERE event_id='screen-event-0'),
-                    (SELECT received_at FROM capture_events WHERE event_id='screen-event-1'),
-                    (SELECT created_at FROM browser_observations_v2
-                     WHERE event_id='screen-event-1')",
-                [],
-                |row| {
-                    Ok(vec![
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ])
-                },
+            verify_existing_media(
+                &current,
+                object_name,
+                &context,
+                plaintext,
+                &installed_dek,
+                installed_key_reference,
             )
-            .unwrap();
-        // 2026-07-31 is the fixture's wall clock; SQLite's `now` is the suite's
-        // real one, so a bound stamp and a live DEFAULT are never equal.
-        for stamp in &stamps {
-            assert_ne!(
-                stamp, "2026-07-31T18:00:00.000Z",
-                "the legacy path must not bind the manifest stamp"
-            );
-            assert!(
-                parse_epoch_millis(stamp).is_some(),
-                "the DEFAULT must still produce an ISO-8601 stamp: {stamp}"
-            );
-        }
-    }
-
-    #[test]
-    fn reference_batch_route_uses_only_the_capture_repository() {
-        let source = include_str!("media.rs");
-        let start = source
-            .find(concat!("async fn upload_screen_", "reference_batch"))
-            .unwrap();
-        let end = source
-            .find(concat!("async fn upload_capture_", "event"))
-            .unwrap();
-        let route = &source[start..end];
-        assert_eq!(route.matches(".preflight_event(").count(), 1);
-        assert_eq!(route.matches(".commit_reference_batch(").count(), 1);
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "read("))
-                .count(),
-            0
-        );
-        assert_eq!(
-            route
-                .matches(concat!("wal_authoritative_", "submit("))
-                .count(),
-            0
-        );
-        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 0);
-        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 0);
-    }
-
-    #[test]
-    fn batch_receipt_advertises_max_dedupe_version() {
-        let receipt = ScreenReferenceBatchAccepted {
-            batch_id: "b".repeat(64),
-            stream_id: "stream-1".into(),
-            first_sequence: 1,
-            last_sequence: 2,
-            new_count: 1,
-            duplicate_count: 1,
-            committed_through_sequence: 2,
-            max_screen_dedupe_version: MAX_SCREEN_DEDUPE_VERSION,
-        };
-        let value = serde_json::to_value(&receipt).unwrap();
-        assert_eq!(value["max_screen_dedupe_version"], json!(2));
-    }
-
-    #[test]
-    fn missing_screen_reference_has_a_stable_rebase_reason() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        let reference = reference_to(&canonical, 1, "screen-event-1");
-
-        assert!(matches!(
-            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)),
-            Err(EnclaveError::CaptureReference(
-                crate::error::CaptureReferenceFailureReason::CanonicalUnavailable
-            ))
-        ));
-    }
-
-    #[tokio::test]
-    async fn screen_reference_rebase_response_is_content_free_and_machine_readable() {
-        let response = EnclaveError::CaptureReference(
-            CaptureReferenceFailureReason::ContextFingerprintMismatch,
-        )
-        .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 1_024)
             .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({
-                "error": "screen_reference_rebase_required",
-                "reason": "context_fingerprint_mismatch"
-            })
+            .expect("adopt exact lost response"),
+            23
         );
-    }
 
-    #[tokio::test]
-    async fn batched_screen_reference_rebase_identifies_only_index_sequence_and_reason() {
-        let response = EnclaveError::CaptureReferenceBatch {
-            reason: CaptureReferenceFailureReason::CanonicalUnavailable,
-            index: 7,
-            sequence: 42,
-        }
-        .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 1_024)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({
-                "error": "screen_reference_rebase_required",
-                "reason": "canonical_unavailable",
-                "index": 7,
-                "sequence": 42
-            })
-        );
-    }
-
-    #[test]
-    fn capture_failure_telemetry_uses_only_fixed_reason_classes() {
-        assert_eq!(
-            CaptureIngestFailureReason::ContextFingerprintMismatch.as_str(),
-            "context_fingerprint_mismatch"
-        );
-        assert_eq!(
-            recording_entitlement_failure_reason(StatusCode::PAYMENT_REQUIRED),
-            CaptureIngestFailureReason::RecordingLeaseInactive
-        );
-        assert_eq!(
-            recording_entitlement_failure_reason(StatusCode::SERVICE_UNAVAILABLE),
-            CaptureIngestFailureReason::RecordingLeaseUnavailable
-        );
-    }
-
-    #[test]
-    fn manifest_accepts_authoritative_clocks_and_exact_browser_url() {
-        let manifest = valid_manifest();
-        manifest.validate().expect("manifest should validate");
-        assert_eq!(manifest.sequence, 7);
-        assert_eq!(manifest.source_monotonic_ns, 9_000_000_000);
-        assert_eq!(manifest.duration_ms().unwrap(), 5_000);
-        assert_eq!(
-            manifest.context.unwrap().active_url.as_deref(),
-            Some("https://meet.google.com/abc-defg-hij?authuser=0")
-        );
-    }
-
-    #[test]
-    fn ingest_bounds_device_capture_stamps_at_the_settle_families_bound() {
-        let bounded = |prefix: &str| {
-            let fractional_digits = MAX_DEVICE_TIMESTAMP_BYTES - prefix.len() - 1;
-            format!("{prefix}{}Z", "0".repeat(fractional_digits))
-        };
-
-        for (field, exact) in [
-            ("started_at", bounded("2026-07-31T18:00:00.")),
-            ("ended_at", bounded("2026-07-31T18:00:05.")),
-        ] {
-            assert_eq!(exact.len(), MAX_DEVICE_TIMESTAMP_BYTES);
-            let mut manifest = valid_manifest();
-            if field == "started_at" {
-                manifest.started_at.clone_from(&exact);
-            } else {
-                manifest.ended_at.clone_from(&exact);
-            }
-            manifest
-                .validate()
-                .unwrap_or_else(|error| panic!("{field} at the bound must remain valid: {error}"));
-
-            let overlong = format!("{}0Z", exact.trim_end_matches('Z'));
-            assert_eq!(overlong.len(), MAX_DEVICE_TIMESTAMP_BYTES + 1);
-            if field == "started_at" {
-                manifest.started_at = overlong;
-            } else {
-                manifest.ended_at = overlong;
-            }
-            assert!(
-                matches!(
-                    manifest.validate(),
-                    Err(EnclaveError::InvalidRequest(ref message))
-                        if message.contains(field)
-                ),
-                "{field} over the settle bound must be rejected before storage"
+        for generation in [0, -1] {
+            let invalid_generation = FakeMediaObjectStore::new(
+                object_name,
+                ciphertext.clone(),
+                installed_key_reference,
+                generation,
             );
-        }
-    }
-
-    #[test]
-    fn manifest_rejects_invalid_hash_time_and_sequence() {
-        let mut manifest = valid_manifest();
-        manifest.media.as_mut().unwrap().sha256 = "not-a-hash".into();
-        assert!(manifest.validate().is_err());
-
-        let mut manifest = valid_manifest();
-        manifest.ended_at = "2026-07-31T17:59:59.000Z".into();
-        assert!(manifest.validate().is_err());
-
-        let mut manifest = valid_manifest();
-        manifest.sequence = -1;
-        assert!(manifest.validate().is_err());
-    }
-
-    #[test]
-    fn media_schema_is_replay_safe_and_separates_browser_state_from_observation() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        init_schema(&conn).unwrap();
-
-        for table in [
-            "capture_sessions",
-            "capture_streams",
-            "capture_events",
-            "media_objects",
-            "browser_states_v2",
-            "browser_observations_v2",
-            "media_processing_jobs",
-            "media_work_units",
-            "media_work_members",
-            "speaker_observations",
-            "speaker_observation_sources",
-            "voice_profiles",
-            "voice_samples",
-            "voice_profile_proposals",
-            "voice_profile_revisions",
-            "voice_sample_profile_assignments",
-            "voice_profile_proposal_profiles",
-            "voice_profile_proposal_samples",
-            "identity_evidence",
-            "people",
-            "person_name_claims",
-            "profile_identity_bindings",
-            "person_facts",
-        ] {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get(0),
+            assert!(matches!(
+                verify_existing_media(
+                    &invalid_generation,
+                    object_name,
+                    &context,
+                    plaintext,
+                    &installed_dek,
+                    installed_key_reference,
                 )
-                .unwrap();
-            assert_eq!(count, 1, "missing {table}");
-        }
-    }
-
-    #[test]
-    fn legacy_unique_names_migrate_to_non_keyed_claims_without_merging_people() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE people (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                display_name TEXT,
-                normalized_name TEXT UNIQUE,
-                status TEXT NOT NULL DEFAULT 'unknown',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
-                updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
-             );
-             INSERT INTO people(display_name,normalized_name,status)
-             VALUES ('John Smith','john smith','identified');",
-        )
-        .unwrap();
-
-        init_schema(&conn).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT normalized_name FROM people WHERE id=1", [], |row| {
-                row.get::<_, Option<String>>(0)
-            },)
-                .unwrap(),
-            None
-        );
-        let migrated: (String, String, String) = conn
-            .query_row(
-                "SELECT name,normalized_name,status FROM person_name_claims WHERE person_id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            migrated,
-            ("John Smith".into(), "john smith".into(), "accepted".into())
-        );
-
-        conn.execute(
-            "INSERT INTO people(display_name,normalized_name,status) VALUES (?1,NULL,'identified')",
-            ["John Smith"],
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM people WHERE display_name='John Smith'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn person_evidence_pagination_is_stable_and_never_exposes_voice_vectors() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO people(display_name,status) VALUES ('John Garcia','identified')",
-            [],
-        )
-        .unwrap();
-        for ordinal in 1..=3 {
-            conn.execute(
-                "INSERT INTO identity_evidence(person_id,kind,claimed_name,evidence_json,score,status) \
-                 VALUES (1,'audio_self_identification','John Garcia',?1,0.99,'accepted')",
-                [format!(r#"{{"ordinal":{ordinal}}}"#)],
-            )
-            .unwrap();
+                .await,
+                Err(EnclaveError::Conflict(_))
+            ));
         }
 
-        let (first, cursor) = load_person_evidence(&conn, 1, None, 2).unwrap();
-        assert_eq!(first.iter().map(|item| item.id).collect::<Vec<_>>(), [3, 2]);
-        assert_eq!(cursor, Some(2));
-        let encoded = serde_json::to_string(&first).unwrap();
-        assert!(!encoded.contains("embedding"));
-        assert!(!encoded.contains("centroid"));
-
-        let (second, cursor) = load_person_evidence(&conn, 1, cursor, 2).unwrap();
-        assert_eq!(second.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
-        assert_eq!(cursor, None);
-    }
-
-    #[test]
-    fn identical_event_is_duplicate_but_changed_manifest_conflicts() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let manifest = valid_manifest();
-        let digest_1 = "a".repeat(64);
-        let digest_2 = "b".repeat(64);
-        let first = record_source_event_with_generation(
-            &conn,
-            "account-1",
-            &manifest,
-            &digest_1,
-            "object-1",
-            Some(42),
-            None,
-        )
-        .unwrap();
-        assert_eq!(first, RecordOutcome::Created);
-        assert_eq!(
-            conn.query_row(
-                "SELECT object_generation FROM media_objects WHERE object_key='object-1'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            42
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT object_backend FROM media_objects WHERE object_key='object-1'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "current"
-        );
-
-        let duplicate =
-            record_source_event(&conn, "account-1", &manifest, &digest_1, "object-1").unwrap();
-        assert_eq!(duplicate, RecordOutcome::Duplicate);
-
-        let conflict =
-            record_source_event(&conn, "account-1", &manifest, &digest_2, "object-2").unwrap_err();
-        assert!(conflict.to_string().contains("idempotency"));
-    }
-
-    #[test]
-    fn durable_recording_pointer_and_authority_settle_together_without_prune_deadline() {
-        let conn = crate::schema_ladder::build_canonical(2).unwrap();
-        let mut manifest = valid_manifest();
-        let policy_epoch = format!("rpe_{}", "a".repeat(64));
-        manifest.recording_retention = Some(RecordingRetentionCaptureAuthority {
-            policy_revision: 3,
-            policy_epoch: policy_epoch.clone(),
-            lease_id: format!("lease_{}", "b".repeat(64)),
-            authority_token: "rrl1.fixture.signature".into(),
-        });
-        let decision_at = "2026-07-31T18:00:06.000Z".to_string();
-        let authority = RecordingMediaAuthorityDecision::UntilDeleted {
-            capture_policy_revision: 3,
-            retention_policy_revision: 3,
-            retention_policy_epoch: policy_epoch.clone(),
-            recording_key_epoch: 3,
-            decision_at: decision_at.clone(),
-        };
-        let asset_id = manifest.media.as_ref().unwrap().asset_id.clone();
-        let object_key =
-            crate::store::canonical_recording_media_object_key("account-1", &asset_id).unwrap();
-        assert_eq!(
-            record_source_event_with_generation(
-                &conn,
-                "account-1",
-                &manifest,
-                &"c".repeat(64),
-                &object_key,
-                Some(77),
-                Some(&authority),
-            )
-            .unwrap(),
-            RecordOutcome::Created
-        );
-        let media: (String, Option<String>) = conn
-            .query_row(
-                "SELECT object_backend,retain_until FROM media_objects WHERE asset_id=?1",
-                [&asset_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(media, ("current".into(), None));
-        let stored: (i64, i64, String, String, String, i64, String, String) = conn
-            .query_row(
-                "SELECT capture_policy_revision,retention_policy_revision,
-                        retention_policy_epoch,retention_decision,storage_backend,
-                        recording_key_epoch,recording_state,decision_at
-                 FROM recording_media_authority WHERE asset_id=?1",
-                [&asset_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            stored,
-            (
-                3,
-                3,
-                policy_epoch,
-                "until_deleted".into(),
-                "recordings".into(),
-                3,
-                "durable".into(),
-                decision_at,
-            )
-        );
-    }
-
-    #[test]
-    fn screen_reference_retains_observation_without_media_or_model_job() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
-        let reference = reference_to(&canonical, 1, "screen-event-1");
-        assert_eq!(
-            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap(),
-            RecordOutcome::Created
-        );
-
-        let (disposition, canonical_id, hamming, ratio): (String, String, i64, f64) = conn
-            .query_row(
-                "SELECT media_disposition,canonical_event_id,hamming_distance,pixel_change_ratio \
-                 FROM capture_events WHERE event_id='screen-event-1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(disposition, "reference");
-        assert_eq!(canonical_id, "screen-event-0");
-        assert_eq!(hamming, 2);
-        assert_eq!(ratio, 0.004);
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM media_objects WHERE event_id='screen-event-1'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM media_processing_jobs WHERE event_id='screen-event-1'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(committed_through_sequence(&conn, "screen-1").unwrap(), 1);
-        let status = load_capture_status(&conn, "screen-event-1")
-            .unwrap()
-            .expect("reference status");
-        assert_eq!(status.processing_state, "ready");
-        assert_eq!(status.attempt_count, 0);
-    }
-
-    #[test]
-    fn screen_reference_is_idempotent_but_changed_evidence_conflicts() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
-        let reference = reference_to(&canonical, 1, "screen-event-1");
-        record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap();
-        assert_eq!(
-            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap(),
-            RecordOutcome::Duplicate
-        );
-        assert!(
-            record_reference_event(&conn, "account-1", &reference, &"c".repeat(64))
-                .unwrap_err()
-                .to_string()
-                .contains("idempotency")
-        );
-    }
-
-    #[test]
-    fn reference_batch_validation_is_bounded_contiguous_and_serializer_independent() {
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        let cross_language_vector = vec![
-            reference_to(&canonical, 43, "reference-event-1"),
-            reference_to(&canonical, 44, "reference-event-2"),
-        ];
-        assert_eq!(
-            reference_batch_id(&cross_language_vector).unwrap(),
-            "e8e70a04d46c07aa978325fc8bec5bc7e8a7d67a1f89d595facc835cbe234709"
-        );
-        let references = vec![
-            reference_to(&canonical, 1, "screen-event-1"),
-            reference_to(&canonical, 2, "screen-event-2"),
-        ];
-        let batch_id = reference_batch_id(&references).unwrap();
-        let request = ScreenReferenceBatchRequest {
-            schema_version: 1,
-            batch_id: batch_id.clone(),
-            events: references.clone(),
-        };
-        let validated = validate_reference_batch(&request).unwrap();
-        assert_eq!(validated.first_sequence, 1);
-        assert_eq!(validated.last_sequence, 2);
-        assert_eq!(validated.event_ids, ["screen-event-1", "screen-event-2"]);
-        assert_eq!(batch_id.len(), 64);
-
-        let mut changed_context = references.clone();
-        changed_context[1].context.as_mut().unwrap().window_title = Some("Changed".into());
-        changed_context[1]
-            .reference
-            .as_mut()
-            .unwrap()
-            .context_fingerprint =
-            semantic_context_fingerprint(changed_context[1].context.as_ref().unwrap(), 1).unwrap();
-        assert_eq!(reference_batch_id(&changed_context).unwrap(), batch_id);
-        let changed_digests = changed_context
-            .iter()
-            .map(manifest_digest)
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert_ne!(
-            reference_batch_manifest_digest(&validated.manifest_digests).unwrap(),
-            reference_batch_manifest_digest(&changed_digests).unwrap()
-        );
-
-        let mut gap = request;
-        gap.events[1].sequence = 3;
-        gap.batch_id = reference_batch_id(&gap.events).unwrap();
-        assert!(validate_reference_batch(&gap).is_err());
-
-        let mut oversized = vec![reference_to(&canonical, 1, "oversized-reference")];
-        oversized[0].context.as_mut().unwrap().visible_windows =
-            Some(json!("x".repeat(MAX_MANIFEST_BYTES)));
-        oversized[0].reference.as_mut().unwrap().context_fingerprint =
-            semantic_context_fingerprint(oversized[0].context.as_ref().unwrap(), 1).unwrap();
-        let oversized = ScreenReferenceBatchRequest {
-            schema_version: 1,
-            batch_id: reference_batch_id(&oversized).unwrap(),
-            events: oversized,
-        };
-        assert!(validate_reference_batch(&oversized).is_err());
-    }
-
-    #[test]
-    fn reference_batch_atomically_records_alternating_displays_and_mixed_duplicates() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let display_one = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        let mut display_two = valid_screen_manifest(1, "screen-event-1", "screen-asset-1");
-        display_two.context.as_mut().unwrap().display_id = Some(84);
-        record_source_event(
-            &conn,
-            "account-1",
-            &display_one,
-            &manifest_digest(&display_one).unwrap(),
-            "object-0",
-        )
-        .unwrap();
-        record_source_event(
-            &conn,
-            "account-1",
-            &display_two,
-            &manifest_digest(&display_two).unwrap(),
-            "object-1",
-        )
-        .unwrap();
-        let first = reference_to(&display_one, 2, "screen-event-2");
-        let second = reference_to(&display_two, 3, "screen-event-3");
-        record_reference_event(
-            &conn,
-            "account-1",
-            &first,
-            &manifest_digest(&first).unwrap(),
-        )
-        .unwrap();
-        let events = vec![first, second];
-        let digests = events
-            .iter()
-            .map(manifest_digest)
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        let outcome = record_reference_batch(&conn, "account-1", &events, &digests).unwrap();
-        assert_eq!(outcome.new_count, 1);
-        assert_eq!(outcome.duplicate_count, 1);
-        assert_eq!(outcome.committed_through_sequence, 3);
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM capture_events WHERE media_disposition='reference'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn invalid_middle_reference_rolls_back_the_complete_batch() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        record_source_event(
-            &conn,
-            "account-1",
-            &canonical,
-            &manifest_digest(&canonical).unwrap(),
-            "object-0",
-        )
-        .unwrap();
-        let first = reference_to(&canonical, 1, "screen-event-1");
-        let mut invalid = reference_to(&canonical, 2, "screen-event-2");
-        invalid.reference.as_mut().unwrap().canonical_event_id = "missing-event".into();
-        let third = reference_to(&canonical, 3, "screen-event-3");
-        let events = vec![first, invalid, third];
-        let digests = events
-            .iter()
-            .map(manifest_digest)
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(matches!(
-            record_reference_batch(&conn, "account-1", &events, &digests),
-            Err(EnclaveError::CaptureReferenceBatch {
-                reason: CaptureReferenceFailureReason::CanonicalUnavailable,
-                index: 1,
-                sequence: 2,
-            })
-        ));
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM capture_events WHERE media_disposition='reference'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(committed_through_sequence(&conn, "screen-1").unwrap(), 0);
-    }
-
-    #[test]
-    fn screen_reference_rejects_missing_forward_cross_stream_chain_digest_and_context() {
-        let cases = [
-            "missing", "forward", "device", "stream", "chain", "digest", "context",
-        ];
-        for case in cases {
-            let conn = Connection::open_in_memory().unwrap();
-            init_schema(&conn).unwrap();
-            let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-            record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0")
-                .unwrap();
-            let mut reference = reference_to(&canonical, 1, "screen-event-1");
-            match case {
-                "missing" => {
-                    reference.reference.as_mut().unwrap().canonical_event_id =
-                        "missing-event".into()
-                }
-                "forward" => reference.sequence = 0,
-                "device" => reference.device_id = "device-2".into(),
-                "stream" => reference.stream_id = "screen-2".into(),
-                "digest" => {
-                    reference.reference.as_mut().unwrap().canonical_media_sha256 = "b".repeat(64)
-                }
-                "context" => {
-                    reference.context.as_mut().unwrap().active_url =
-                        Some("https://meet.google.com/different".into());
-                    reference.reference.as_mut().unwrap().context_fingerprint =
-                        semantic_context_fingerprint(reference.context.as_ref().unwrap(), 1)
-                            .unwrap();
-                }
-                "chain" => {
-                    let first_reference = reference.clone();
-                    record_reference_event(&conn, "account-1", &first_reference, &"b".repeat(64))
-                        .unwrap();
-                    reference = reference_to(&canonical, 2, "screen-event-2");
-                    let descriptor = reference.reference.as_mut().unwrap();
-                    descriptor.canonical_event_id = first_reference.event_id;
-                    descriptor.canonical_asset_id =
-                        format!("reference-{}", descriptor.canonical_event_id);
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                record_reference_event(&conn, "account-1", &reference, &"d".repeat(64)).is_err(),
-                "{case} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn capture_status_distinguishes_an_unknown_event_from_a_store_failure() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        assert!(
-            load_capture_status(&conn, "019fbab2-8413-7053-9117-eb249b72b15b")
-                .unwrap()
-                .is_none()
-        );
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        let status = load_capture_status(&conn, &manifest.event_id)
-            .unwrap()
-            .expect("recorded event has status");
-        assert_eq!(status.event_id, manifest.event_id);
-        assert_eq!(status.processing_state, "queued");
-        assert_eq!(status.attempt_count, 0);
-        assert!(status.error_code.is_none());
-    }
-
-    /// Stand-ins for the user-store tables the session status joins against
-    /// (the real ones live in `store.rs`; production has both in one DB).
-    fn session_status_content_tables(conn: &Connection) {
-        conn.execute_batch(
-            // `init_schema` now creates episodes/utterances/episode_members
-            // itself; only the screenshots stand-in remains external.
-            "CREATE TABLE IF NOT EXISTS screenshots (id INTEGER PRIMARY KEY, source_key TEXT, \
-                active_app TEXT);",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn capture_session_status_tracks_processing_recap_and_ready_without_guessing() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        session_status_content_tables(&conn);
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        let session = load_capture_session_status(&conn, &manifest.capture_session_id, None)
-            .unwrap()
-            .expect("session exists after its first accepted event");
-        assert_eq!(session.stage, CaptureSessionStage::Processing);
-        assert_eq!(session.event_count, 1);
-        assert!(session.memories.is_empty());
-
-        conn.execute(
-            "UPDATE media_objects SET processing_state='ready' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE capture_sessions SET ended_at='2026-08-01T18:01:00.000Z' WHERE id=?1",
-            [&manifest.capture_session_id],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::Organizing
-        );
-
-        conn.execute(
-            "INSERT INTO screenshots(id,source_key) VALUES (1,?1)",
-            [format!("cloud-v2:{}", manifest.event_id)],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO episodes(id,title,started_at,ended_at,finalization_status) \
-             VALUES (7,'First memory',?1,?2,'pending_horizon')",
-            [&manifest.started_at, &manifest.ended_at],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO episode_members(episode_id,record_type,record_id) \
-             VALUES (7,'screenshot',1)",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::PreparingRecap
-        );
-
-        conn.execute(
-            "UPDATE episodes SET finalization_status='complete', \
-             finalized_at='2026-08-01T22:01:00.000Z' WHERE id=7",
-            [],
-        )
-        .unwrap();
-        let ready = load_capture_session_status(&conn, &manifest.capture_session_id, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(ready.stage, CaptureSessionStage::Ready);
-        assert_eq!(ready.memories.len(), 1);
-        assert_eq!(ready.memories[0].id, 7);
-
-        // A residual terminal failure must not mask the formed memory: the
-        // user can already read the recap, so the session stays ready.
-        conn.execute(
-            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::Ready
-        );
-
-        // Nor does that failure's hourly background retry demote it: only
-        // genuinely new work (queued/processing) outranks a ready memory.
-        conn.execute(
-            "UPDATE media_objects SET processing_state='retry_wait' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::Ready
-        );
-    }
-
-    /// needs_attention is reserved for the one case the label is honest: a
-    /// terminal failure remains AND no memory materialized. In-flight work
-    /// (for example a resurrected job back in retry_wait) outranks it.
-    #[test]
-    fn capture_session_needs_attention_only_when_failed_without_memory_or_work() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        session_status_content_tables(&conn);
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        conn.execute(
-            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::NeedsAttention
-        );
-
-        // A resurrected job (retry_wait) means the outcome is still being
-        // worked on, so the stage returns to processing rather than alarming.
-        conn.execute(
-            "UPDATE media_objects SET processing_state='retry_wait' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, None)
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::Processing
-        );
-    }
-
-    /// ADR-0034: the terminal zero-result requires the summarizer cursor past
-    /// the session's end; a held cursor keeps `organizing`, and a
-    /// substance-none episode (never finalized, hidden from browse) does not
-    /// count as a memory.
-    #[test]
-    fn capture_session_no_memory_requires_summarized_past_end_and_ignores_substance_none() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        session_status_content_tables(&conn);
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        conn.execute(
-            "UPDATE media_objects SET processing_state='ready' WHERE event_id=?1",
-            [&manifest.event_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE capture_sessions SET ended_at='2026-07-31T18:05:00.000Z' WHERE id=?1",
-            [&manifest.capture_session_id],
-        )
-        .unwrap();
-
-        let ended_ms = parse_epoch_millis("2026-07-31T18:05:00.000Z").unwrap();
-        // Cursor before the session end: still organizing, never a guess.
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms - 1))
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::Organizing
-        );
-        // Cursor past the end with nothing linked: honest terminal no_memory.
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::NoMemory
-        );
-
-        // A linked substance-none episode is not a memory: the finalizer
-        // skips it, so counting it would wedge the stage at preparing_recap.
-        conn.execute(
-            "INSERT INTO screenshots(id,source_key) VALUES (1,?1)",
-            [format!("cloud-v2:{}", manifest.event_id)],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO episodes(id,title,started_at,ended_at,finalization_status,substance) \
-             VALUES (7,'Fragment',?1,?2,'pending_horizon','none')",
-            [&manifest.started_at, &manifest.ended_at],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO episode_members(episode_id,record_type,record_id) \
-             VALUES (7,'screenshot',1)",
-            [],
-        )
-        .unwrap();
-        let status =
-            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
-                .unwrap()
-                .unwrap();
-        assert_eq!(status.stage, CaptureSessionStage::NoMemory);
-        assert!(status.memories.is_empty());
-
-        // Reclassified upward (e.g. extension added substance): it counts.
-        conn.execute("UPDATE episodes SET substance='normal' WHERE id=7", [])
-            .unwrap();
-        assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
-                .unwrap()
-                .unwrap()
-                .stage,
-            CaptureSessionStage::PreparingRecap
-        );
-    }
-
-    /// ADR-0034 evidence echo: mechanical aggregates only, absent when
-    /// unknown, app names rather than window titles.
-    #[test]
-    fn capture_session_evidence_echo_reports_audio_voices_and_contexts() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        session_status_content_tables(&conn);
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-
-        let before = load_capture_session_status(&conn, &manifest.capture_session_id, None)
-            .unwrap()
-            .unwrap();
-        // A 5-second accepted event rounds to zero whole minutes; no voices
-        // or screen evidence exists yet, so those fields stay absent.
-        assert_eq!(before.evidence.audio_minutes, Some(0));
-        assert_eq!(before.evidence.voice_count, None);
-        assert!(before.evidence.top_contexts.is_empty());
-
-        conn.execute(
-            "INSERT INTO audio_segments(id,started_at,ended_at,duration_seconds,source_type) \
-             VALUES (1,?1,?2,5.0,'mic')",
-            params![manifest.started_at, manifest.ended_at],
-        )
-        .unwrap();
-        for (turn, label) in [("t1", "Me"), ("t2", "Speaker 1"), ("t3", "Me")] {
-            conn.execute(
-                "INSERT INTO speaker_observations(event_id,turn_id,speaker_local_id,\
-                 started_at,ended_at,transcript_text) VALUES (?1,?2,'S0',?3,?4,'hello')",
-                params![
-                    manifest.event_id,
-                    turn,
-                    manifest.started_at,
-                    manifest.ended_at
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO utterances(audio_segment_id,source_key,speaker_label) VALUES (1,?1,?2)",
-                params![format!("cloud-v2:{}:{}", manifest.event_id, turn), label],
-            )
-            .unwrap();
-        }
-        for app in ["Zoom", "Zoom", "Xcode"] {
-            conn.execute(
-                "INSERT INTO screenshots(source_key,active_app) VALUES (?1,?2)",
-                params![format!("cloud-v2:{}", manifest.event_id), app],
-            )
-            .unwrap();
-        }
-
-        let after = load_capture_session_status(&conn, &manifest.capture_session_id, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            after.evidence.voice_count,
-            Some(2),
-            "distinct labels, not turns"
-        );
-        assert_eq!(after.evidence.top_contexts, vec!["Zoom", "Xcode"]);
-    }
-
-    /// ADR-0034 §3: discovery lists sessions started in the window plus
-    /// still-open recently-active sessions; stale open sessions age out.
-    #[test]
-    fn recent_capture_session_listing_is_bounded_and_recency_aware() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-
-        let insert = |id: &str, started_offset: &str, last_offset: &str, ended: bool| {
-            conn.execute(
-                "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                 last_event_at,ended_at,schema_version) VALUES (?1,'d','i',\
-                 strftime('%Y-%m-%dT%H:%M:%fZ','now',?2),\
-                 strftime('%Y-%m-%dT%H:%M:%fZ','now',?3),\
-                 CASE WHEN ?4 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now',?3) END,2)",
-                params![id, started_offset, last_offset, ended],
-            )
-            .unwrap();
-        };
-        insert("fresh-ended", "-1 hours", "-1 hours", true);
-        insert("fresh-open", "-2 hours", "-2 hours", false);
-        insert("old-open-active", "-30 hours", "-1 hours", false);
-        insert("old-open-stale", "-30 hours", "-29 hours", false);
-        insert("old-ended", "-30 hours", "-29 hours", true);
-
-        let ids = load_recent_capture_session_ids(&conn, 8, 5).unwrap();
-        assert_eq!(ids, vec!["fresh-ended", "fresh-open", "old-open-active"]);
-
-        // The clamp bounds the response, newest first.
-        let ids = load_recent_capture_session_ids(&conn, 8, 1).unwrap();
-        assert_eq!(ids, vec!["fresh-ended"]);
-    }
-
-    #[test]
-    fn accepted_final_capture_event_durably_closes_the_exact_session() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let mut manifest = valid_manifest();
-        manifest.session_finished = Some(true);
-        let digest = manifest_digest(&manifest).unwrap();
-
-        assert_eq!(
-            record_source_event(&conn, "account-1", &manifest, &digest, "object-1").unwrap(),
-            RecordOutcome::Created
-        );
-        assert_eq!(
-            record_source_event(&conn, "account-1", &manifest, &digest, "object-1").unwrap(),
-            RecordOutcome::Duplicate
-        );
-        let ended_at: Option<String> = conn
-            .query_row(
-                "SELECT ended_at FROM capture_sessions WHERE id=?1",
-                [&manifest.capture_session_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ended_at.as_deref(), Some(manifest.ended_at.as_str()));
-    }
-
-    #[test]
-    fn stream_ack_returns_not_found_only_for_an_unknown_stream() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        assert!(matches!(
-            committed_through_sequence(&conn, "system-1"),
-            Err(EnclaveError::NotFound)
-        ));
-
-        let manifest = valid_manifest();
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        assert_eq!(
-            committed_through_sequence(&conn, &manifest.stream_id).unwrap(),
-            -1
-        );
-    }
-
-    #[test]
-    fn browser_snapshot_and_exact_active_url_are_retained_with_the_event_time() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let mut manifest = valid_manifest();
-        let context = manifest.context.as_mut().unwrap();
-        context.browser_state_key = Some("device-1:browser-v1:abc123".into());
-        context.browser_snapshot = Some(BrowserSnapshot {
-            state_key: "device-1:browser-v1:abc123".into(),
-            browser_bundle_id: "com.google.Chrome".into(),
-            browser_name: "Google Chrome".into(),
-            permission_status: "granted".into(),
-            active_window_index: Some(0),
-            active_tab_index: Some(1),
-            reported_tab_count: 2,
-            truncated: false,
-            ambient_tab_collection_enabled: None,
-            content_hash: "c".repeat(64),
-            tabs: vec![BrowserTab {
-                window_index: 0,
-                tab_index: 1,
-                title: Some("Weekly planning".into()),
-                url: Some("https://meet.google.com/abc-defg-hij?authuser=0".into()),
-                url_scheme: None,
-                is_active: true,
-                is_loading: Some(false),
-            }],
-        });
-        manifest.validate().unwrap();
-        record_source_event(&conn, "account-1", &manifest, &"d".repeat(64), "object-1").unwrap();
-
-        let (observed_at, active_url, tabs_json): (String, String, String) = conn
-            .query_row(
-                "SELECT o.observed_at,o.active_url,s.tabs_json \
-                 FROM browser_observations_v2 o JOIN browser_states_v2 s USING(state_key)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(observed_at, manifest.source_wall_at);
-        assert_eq!(
-            active_url,
-            "https://meet.google.com/abc-defg-hij?authuser=0"
-        );
-        assert!(tabs_json.contains("authuser=0"));
-    }
-
-    #[test]
-    fn browser_v2_cross_language_commitment_topology_and_exact_storage_are_enforced() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let mut manifest = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
-        attach_valid_browser_v2(&mut manifest);
-        manifest.validate().unwrap();
-        let snapshot = manifest
-            .context
-            .as_ref()
-            .unwrap()
-            .browser_snapshot
-            .as_ref()
-            .unwrap();
-        let client_wire: BrowserSnapshot = serde_json::from_str(
-            r#"{
-                "state_key":"device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3",
-                "browser_bundle_id":"com.apple.Safari",
-                "browser_name":"Safari",
-                "permission_status":"granted",
-                "active_window_index":1,
-                "active_tab_index":1,
-                "reported_tab_count":2,
-                "truncated":false,
-                "ambient_tab_collection_enabled":true,
-                "content_hash":"43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3",
-                "tabs":[
-                    {
-                        "window_index":1,
-                        "tab_index":1,
-                        "title":"Meeting",
-                        "url":"https://meet.google.com/abc?authuser=0#frag",
-                        "url_scheme":"https",
-                        "is_active":true,
-                        "is_loading":null
-                    },
-                    {
-                        "window_index":1,
-                        "tab_index":2,
-                        "title":"Document",
-                        "url":"https://docs.google.com/document/d/exact/edit?tab=t.0",
-                        "url_scheme":"https",
-                        "is_active":false,
-                        "is_loading":null
-                    }
-                ]
-            }"#,
-        )
-        .expect("the exact 0.8.35 browser-v2 wire shape decodes");
-        assert_eq!(&client_wire, snapshot);
-        assert_eq!(
-            browser_v2_content_hash(snapshot).unwrap(),
-            "43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3"
-        );
-        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-0").unwrap();
-        let stored: (String, String, String) = conn
-            .query_row(
-                "SELECT s.content_hash,s.tabs_json,o.state_key \
-                 FROM browser_observations_v2 o JOIN browser_states_v2 s USING(state_key)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(stored.0, snapshot.content_hash);
-        let envelope: BrowserStateV2Envelope = serde_json::from_str(&stored.1).unwrap();
-        assert_eq!(envelope.schema_version, 2);
-        assert!(envelope.ambient_tab_collection_enabled);
-        assert_eq!(envelope.tabs[1].url_scheme.as_deref(), Some("https"));
-        assert_eq!(stored.2, snapshot.state_key);
-
-        let mut uppercase_scheme = manifest.clone();
-        let uppercase_context = uppercase_scheme.context.as_mut().unwrap();
-        let uppercase_snapshot = uppercase_context.browser_snapshot.as_mut().unwrap();
-        uppercase_snapshot.tabs[1].url = Some("HTTPS://docs.example.com/exact".into());
-        uppercase_snapshot.tabs[1].url_scheme = Some("HTTPS".into());
-        let uppercase_hash = browser_v2_content_hash(uppercase_snapshot).unwrap();
-        uppercase_snapshot.content_hash = uppercase_hash.clone();
-        uppercase_snapshot.state_key = format!("device-1:browser-v2:{uppercase_hash}");
-        uppercase_context.browser_state_key = Some(uppercase_snapshot.state_key.clone());
-        uppercase_scheme.validate().unwrap();
-
-        let mut key_only = manifest.clone();
-        key_only.event_id = "screen-event-key-only".into();
-        key_only.sequence = 1;
-        key_only.source_monotonic_ns += 1;
-        key_only.media.as_mut().unwrap().asset_id = "screen-asset-key-only".into();
-        key_only.context.as_mut().unwrap().browser_snapshot = None;
-        key_only.validate().unwrap();
-        record_source_event(
-            &conn,
-            "account-1",
-            &key_only,
-            &"c".repeat(64),
-            "object-key-only",
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT state_key FROM browser_observations_v2 WHERE event_id=?1",
-                [&key_only.event_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .unwrap()
-            .as_deref(),
-            Some(snapshot.state_key.as_str()),
-            "key-only v2 reuse must resolve and revalidate the exact persisted state",
-        );
-
-        let mut unsupported_envelope: serde_json::Value = serde_json::from_str(&stored.1).unwrap();
-        unsupported_envelope["schema_version"] = json!(999);
-        conn.execute(
-            "UPDATE browser_states_v2 SET tabs_json=?1 WHERE state_key=?2",
-            params![unsupported_envelope.to_string(), snapshot.state_key],
-        )
-        .unwrap();
-        let mut wrong_version = key_only.clone();
-        wrong_version.event_id = "screen-event-wrong-version".into();
-        wrong_version.sequence = 2;
-        wrong_version.source_monotonic_ns += 2;
-        wrong_version.media.as_mut().unwrap().asset_id = "screen-asset-wrong-version".into();
-        assert!(record_source_event(
-            &conn,
-            "account-1",
-            &wrong_version,
-            &"e".repeat(64),
-            "object-wrong-version",
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("version is unsupported"));
-
-        let mut audio = valid_manifest();
-        attach_valid_browser_v2(&mut audio);
-        assert!(audio.validate().is_err());
-        let mut unstable = valid_screen_manifest(2, "screen-unstable", "screen-unstable-asset");
-        attach_valid_browser_v2(&mut unstable);
-        unstable.context.as_mut().unwrap().capture_status = "unstable".into();
-        assert!(unstable.validate().is_err());
-
-        for poison in [
-            "missing_consent",
-            "duplicate_coordinate",
-            "ambient_false",
-            "wrong_hash",
-        ] {
-            let mut invalid = valid_screen_manifest(0, "screen-invalid", "screen-invalid-asset");
-            attach_valid_browser_v2(&mut invalid);
-            let snapshot = invalid
-                .context
-                .as_mut()
-                .unwrap()
-                .browser_snapshot
-                .as_mut()
-                .unwrap();
-            match poison {
-                "missing_consent" => snapshot.ambient_tab_collection_enabled = None,
-                "duplicate_coordinate" => snapshot.tabs[1].tab_index = 1,
-                "ambient_false" => snapshot.ambient_tab_collection_enabled = Some(false),
-                "wrong_hash" => snapshot.content_hash = "0".repeat(64),
-                _ => unreachable!(),
-            }
-            assert!(invalid.validate().is_err(), "{poison} must fail closed");
-        }
-
-        let mut missing = valid_screen_manifest(1, "screen-missing", "screen-missing-asset");
-        missing.context.as_mut().unwrap().browser_state_key = Some(
-            "device-1:browser-v2:43206e42c20fd24a9372605a13b6792245ed53e50edf6c1735cfba4053be30f3"
-                .into(),
-        );
-        let fresh = Connection::open_in_memory().unwrap();
-        init_schema(&fresh).unwrap();
-        assert!(record_source_event(
-            &fresh,
-            "account-1",
-            &missing,
-            &"b".repeat(64),
-            "missing-object"
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("existing exact state"));
-    }
-
-    #[test]
-    fn audio_response_requires_bounded_monotonic_turns() {
-        let parsed = parse_audio_result(
-            r#"{"turns":[
-                {"turn_id":"t1","start_ms":0,"end_ms":1100,"speaker_local_id":"speaker_1","text":"Hello","language":"en","overlap":false},
-                {"turn_id":"t2","start_ms":1100,"end_ms":2500,"speaker_local_id":"speaker_2","text":"Hi","language":"en","overlap":false}
-            ]}"#,
-            5_000,
-        )
-        .unwrap();
-        assert_eq!(parsed.len(), 2);
-
-        assert!(parse_audio_result(
-            r#"{"turns":[{"turn_id":"t1","start_ms":10,"end_ms":6000,"speaker_local_id":"speaker_1","text":"bad","language":"en","overlap":false}]}"#,
-            5_000,
-        )
-        .is_err());
-        assert!(parse_audio_result(
-            r#"{"turns":[{"turn_id":"t1","start_ms":100,"end_ms":100,"speaker_local_id":"speaker_1","text":"bad","language":"en","overlap":false}]}"#,
-            5_000,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn uploaded_media_must_match_the_manifest_bytes_and_container() {
-        let mut manifest = valid_manifest();
-        let m4a = b"\0\0\0\x18ftypM4A \0\0\0\0";
-        manifest.media.as_mut().unwrap().byte_length = m4a.len() as i64;
-        manifest.media.as_mut().unwrap().sha256 = sha256_hex(m4a);
-        validate_media_bytes(&manifest, m4a, Some("audio/m4a")).unwrap();
-
-        let mut corrupted = m4a.to_vec();
-        corrupted[9] ^= 1;
-        assert!(validate_media_bytes(&manifest, &corrupted, Some("audio/m4a")).is_err());
-        assert!(validate_media_bytes(&manifest, m4a, Some("image/jpeg")).is_err());
-
-        let invalid_container = vec![0u8; m4a.len()];
-        manifest.media.as_mut().unwrap().sha256 = sha256_hex(&invalid_container);
-        assert!(validate_media_bytes(&manifest, &invalid_container, Some("audio/m4a")).is_err());
-    }
-
-    #[test]
-    fn canonical_manifest_digest_is_stable_after_json_key_reordering() {
-        let manifest = valid_manifest();
-        let value = serde_json::to_value(&manifest).unwrap();
-        let reparsed: CaptureEventManifest = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            manifest_digest(&manifest).unwrap(),
-            manifest_digest(&reparsed).unwrap()
-        );
-        assert_eq!(manifest_digest(&manifest).unwrap().len(), 64);
-    }
-
-    #[test]
-    fn export_ordering_is_valid_for_every_cloud_capture_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        for (table, order) in [
-            ("capture_sessions", "created_at"),
-            ("capture_streams", "created_at"),
-            ("capture_events", "started_at, event_id"),
-            ("media_objects", "created_at, event_id"),
-            ("browser_states_v2", "created_at, state_key"),
-            ("browser_observations_v2", "observed_at, event_id"),
-            ("media_processing_jobs", "updated_at, event_id"),
-            ("media_work_units", "updated_at, id"),
-            ("media_work_members", "work_unit_id, ordinal"),
-            ("speaker_observations", "started_at, event_id, id"),
-            (
-                "speaker_observation_sources",
-                "speaker_observation_id, window_start_ms",
-            ),
-            ("people", "display_name, id"),
-            ("voice_profiles", "person_id, id"),
-            ("voice_samples", "speaker_observation_id, id"),
-            ("voice_profile_proposals", "created_at, id"),
-            ("voice_profile_revisions", "profile_id, id"),
-            ("voice_sample_profile_assignments", "sample_id, id"),
-            (
-                "voice_profile_proposal_profiles",
-                "proposal_id, role, partition_ordinal, profile_id",
-            ),
-            (
-                "voice_profile_proposal_samples",
-                "proposal_id, partition_ordinal, sample_id",
-            ),
-            ("identity_evidence", "created_at, id"),
-            ("person_name_claims", "observed_at, id"),
-            ("profile_identity_bindings", "updated_at, id"),
-            ("person_facts", "person_id, created_at, id"),
-            ("speaker_clusters", "work_unit_id, speaker_local_id"),
-            ("episode_speaker_slots", "episode_id, slot_ordinal"),
-            (
-                "voice_profile_representatives",
-                "profile_id, channel_domain",
-            ),
-            (
-                "voice_embedding_jobs",
-                "state, next_attempt_at, lease_until",
-            ),
-            ("episode_participants", "episode_id, participant_key"),
-            ("visual_speaker_observations", "observed_at, id"),
-        ] {
-            assert!(super::super::sync::dump_optional_table(&conn, table, order).is_ok());
-        }
-    }
-
-    #[test]
-    fn rate_limit_response_exposes_retry_after_to_native_uploaders() {
-        let response = rate_limited_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "5");
-    }
-
-    #[test]
-    fn every_new_capture_kind_requires_a_recording_lease() {
-        for stream in [
-            StreamKind::Mic,
-            StreamKind::SystemAudio,
-            StreamKind::MacScreen,
-            StreamKind::IosMic,
-            StreamKind::IosImportedScreenshot,
-            StreamKind::IosSharedPage,
-        ] {
-            assert!(capture_requires_recording_lease(stream));
-        }
-    }
-
-    fn finish_test_state() -> Arc<CpState> {
-        use crate::store::tests::FakeGcs;
-        let gcs = Arc::new(FakeGcs::new());
-        finish_test_state_with_media(Arc::clone(&gcs), Arc::clone(&gcs), gcs)
-    }
-
-    fn finish_test_state_with_media(
-        index_gcs: Arc<crate::store::tests::FakeGcs>,
-        current_media_gcs: Arc<crate::store::tests::FakeGcs>,
-        legacy_media_gcs: Arc<crate::store::tests::FakeGcs>,
-    ) -> Arc<CpState> {
-        use crate::store::tests::FakeKms;
-        let kms = Arc::new(FakeKms);
-        let control = Arc::new(crate::cp::control_store::ControlStore::new(
-            kms.clone(),
-            index_gcs.clone(),
-        ));
-        let store = Arc::new(crate::store::Store::new_with_media_and_legacy(
-            kms.clone(),
-            index_gcs.clone(),
-            current_media_gcs,
-            legacy_media_gcs,
-        ));
-        Arc::new(CpState {
-            kms: Arc::clone(&store.kms),
-            durable_recording_storage_bound: store.durable_recording_storage_bound(),
-            store: Arc::clone(&store),
-            control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control, store),
-            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
-            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
-            config: Arc::new(crate::cp::CpConfig {
-                base_url: "http://localhost:8080".into(),
-                jwt_secrets: vec!["test".into()],
-                google_desktop_client_id: "desktop".into(),
-                google_ios_client_id: "ios".into(),
-                google_web_client_id: "web".into(),
-                google_web_client_secret: "secret".into(),
-                admin_user_ids: Vec::new(),
-                signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
-                scheduler_sa_email: None,
-                vertex_project: "project".into(),
-                vertex_location: "global".into(),
-                vertex_model: "model".into(),
-                quota_utterances_per_day: 1,
-                quota_screenshots_per_day: 1,
-                quota_mcp_calls_per_day: 1,
-                quota_vertex_output_tokens_per_day: 1,
-                web_origin: "http://localhost:3000".into(),
-                reviewer_auth: None,
-                apple_sign_in: None,
-                billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
-            }),
-            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
-            reviewer_verifier: None,
-            apple_provider: None,
-            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
-            reference_batch_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
-            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
-            mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
-            oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
-            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
-            email_transport: None,
-            push_transport: None,
-            embedding: None,
-            voice: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn lost_response_adopts_only_one_strict_current_provider_response() {
-        use crate::store::tests::FakeGcs;
-
-        let index = Arc::new(FakeGcs::new());
-        let current = Arc::new(FakeGcs::new());
-        let legacy = Arc::new(FakeGcs::new());
-        let state = finish_test_state_with_media(index, Arc::clone(&current), Arc::clone(&legacy));
-        let user_id = "lost-response-owner";
-        let object_key =
-            crate::store::canonical_capture_media_object_key(user_id, "strict-asset").unwrap();
-        let context = crate::store::media_blob_context(user_id, &object_key);
-        let expected = b"strict current response";
-        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
-            .await
-            .unwrap();
-        let blob = crate::crypto::encrypt_bound_blob(&dek, expected, &context).unwrap();
-        let generation = current
-            .put_object(&object_key, &blob, &wrapped_dek, 0)
-            .await
-            .unwrap();
-        let legacy_poison =
-            crate::crypto::encrypt_bound_blob(&dek, b"legacy poison", &context).unwrap();
-        legacy
-            .put_object(&object_key, &legacy_poison, &wrapped_dek, 0)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            verify_existing_media(&state, &object_key, &context, expected, &dek, &wrapped_dek,)
-                .await
-                .unwrap(),
-            generation
-        );
-        assert_eq!(legacy.live_get_count(), 0, "recovery must never use legacy");
-
-        let legacy_only_key =
-            crate::store::canonical_capture_media_object_key(user_id, "legacy-only").unwrap();
-        let legacy_only_context = crate::store::media_blob_context(user_id, &legacy_only_key);
-        let legacy_only_blob =
-            crate::crypto::encrypt_bound_blob(&dek, expected, &legacy_only_context).unwrap();
-        legacy
-            .put_object(&legacy_only_key, &legacy_only_blob, &wrapped_dek, 0)
-            .await
-            .unwrap();
+        let wrong_key_reference =
+            FakeMediaObjectStore::new(object_name, ciphertext.clone(), "wrapped-other-dek", 23);
         assert!(matches!(
             verify_existing_media(
-                &state,
-                &legacy_only_key,
-                &legacy_only_context,
-                expected,
-                &dek,
-                &wrapped_dek,
+                &wrong_key_reference,
+                object_name,
+                &context,
+                plaintext,
+                &installed_dek,
+                installed_key_reference,
             )
             .await,
-            Err(EnclaveError::NotFound)
+            Err(EnclaveError::Conflict(_))
         ));
 
-        let historical_key =
-            crate::store::canonical_capture_media_object_key(user_id, "historical").unwrap();
-        let historical_context = crate::store::media_blob_context(user_id, &historical_key);
-        let historical_blob = crate::crypto::encrypt_blob(&dek, expected).unwrap();
-        current
-            .put_object(&historical_key, &historical_blob, &wrapped_dek, 0)
-            .await
-            .unwrap();
+        let unversioned = FakeMediaObjectStore::new(
+            object_name,
+            ciphertext[V2_MAGIC.len()..].to_vec(),
+            installed_key_reference,
+            23,
+        );
         assert!(matches!(
             verify_existing_media(
-                &state,
-                &historical_key,
-                &historical_context,
-                expected,
-                &dek,
-                &wrapped_dek,
+                &unversioned,
+                object_name,
+                &context,
+                plaintext,
+                &installed_dek,
+                installed_key_reference,
             )
             .await,
             Err(EnclaveError::Crypto(_))
         ));
 
-        let wrong_wrapped_key =
-            crate::store::canonical_capture_media_object_key(user_id, "wrong-wrap").unwrap();
-        let wrong_wrapped_context = crate::store::media_blob_context(user_id, &wrong_wrapped_key);
-        let wrong_wrapped_blob =
-            crate::crypto::encrypt_bound_blob(&dek, expected, &wrong_wrapped_context).unwrap();
-        let (_, different_wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.kms.as_ref())
-            .await
-            .unwrap();
-        current
-            .put_object(
-                &wrong_wrapped_key,
-                &wrong_wrapped_blob,
-                &different_wrapped_dek,
-                0,
-            )
-            .await
-            .unwrap();
+        let wrong_context =
+            crate::gcs::media_blob_context("account-1", "raw/account-1/different-asset.enc");
         assert!(matches!(
             verify_existing_media(
-                &state,
-                &wrong_wrapped_key,
-                &wrong_wrapped_context,
-                expected,
-                &dek,
-                &wrapped_dek,
+                &current,
+                object_name,
+                &wrong_context,
+                plaintext,
+                &installed_dek,
+                installed_key_reference,
+            )
+            .await,
+            Err(EnclaveError::Crypto(_))
+        ));
+
+        let wrong_dek = Dek([0x22; 32]);
+        assert!(matches!(
+            verify_existing_media(
+                &current,
+                object_name,
+                &context,
+                plaintext,
+                &wrong_dek,
+                installed_key_reference,
+            )
+            .await,
+            Err(EnclaveError::Crypto(_))
+        ));
+
+        assert!(matches!(
+            verify_existing_media(
+                &current,
+                object_name,
+                &context,
+                b"different plaintext",
+                &installed_dek,
+                installed_key_reference,
             )
             .await,
             Err(EnclaveError::Conflict(_))
         ));
-        assert_eq!(legacy.live_get_count(), 0, "no recovery arm probes legacy");
-    }
-
-    #[tokio::test]
-    async fn finishing_an_unknown_capture_session_is_an_idempotent_no_op() {
-        let state = finish_test_state();
-        let response = finish_capture_session(
-            State(state),
-            axum::Extension(crate::cp::auth::AuthUser(
-                "11111111-1111-4111-8111-111111111111".into(),
-            )),
-            axum::extract::Path("session-lost-before-finish".into()),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn finishing_a_known_capture_session_still_reports_its_status() {
-        let state = finish_test_state();
-        let user = crate::cp::auth::AuthUser("11111111-1111-4111-8111-111111111111".into());
-        state
-            .store
-            .with_user(&user.0, |conn| {
-                conn.execute(
-                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                     last_event_at,schema_version) \
-                     VALUES('session-1','device-1','install-1',\
-                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        let response = finish_capture_session(
-            State(state),
-            axum::Extension(user),
-            axum::extract::Path("session-1".into()),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 65_536)
-            .await
-            .unwrap();
-        let status: Value = serde_json::from_slice(&body).unwrap();
-        assert!(status["ended_at"].is_string());
-    }
-
-    /// ADR-0022 per-domain routing for the stream-acknowledgement read, now
-    /// that its answerability blocker (deferred ingest) is gone.
-    ///
-    /// The half worth pinning is the one the gate used to make unobservable: a
-    /// WAL-AUTHORITATIVE user must never be answered out of the legacy
-    /// snapshot. The row below is seeded through `with_user` BEFORE the user is
-    /// selected, so it provably exists in that user's own legacy archive; after
-    /// selection the same read must refuse rather than serve it, because a
-    /// selected user with no registered serving authority has no settled lane
-    /// to answer from.
-    ///
-    /// The refusal's STATUS is pinned exactly, not merely as "some server
-    /// error". `wal_authoritative_read` reports an unregistered, quarantined
-    /// or mid-relaunch authority as `EnclaveError::Store`, whose generic arm
-    /// renders `500 {"error":"internal error"}`; the read lane's rule
-    /// (`cp::routed_read_unavailable`) names 500 as one of the three statuses
-    /// it is deliberately NOT, because a 500 makes a retryable read failure
-    /// indistinguishable from a genuinely non-retryable one. A status-class
-    /// assertion would admit that 500.
-    ///
-    /// Falsifiability, checked by sabotage: reverting the handler to
-    /// `with_user` (or to `with_user_read`) turns the refusal into a `200`
-    /// carrying `committed_through_sequence: 7`, and both assertions below
-    /// fail; handing the `Err` arm to `EnclaveError::into_response` instead of
-    /// `routed_read_unavailable` turns the 503 into a 500 and the status and
-    /// reason assertions fail.
-    #[tokio::test]
-    async fn a_selected_stream_ack_is_never_served_the_legacy_snapshot() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
-        use axum::extract::{Path, State};
-        use axum::Extension;
-
-        let state = finish_test_state();
-        let user_id = "media-stream-ack-selected";
-        state
-            .store
-            .with_user(user_id, |conn| {
-                conn.execute(
-                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                     last_event_at,schema_version) \
-                     VALUES('session-1','device-1','install-1',\
-                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
-                    [],
-                )?;
-                conn.execute(
-                    "INSERT INTO capture_streams(id,capture_session_id,device_id,stream_kind,\
-                     committed_through_sequence) \
-                     VALUES('stream-1','session-1','device-1','mic',7)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        // Unselected: the row is readable, so the refusal below is a routing
-        // decision and not an empty or broken store.
-        let served = stream_ack(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("stream-1".to_string()),
-        )
-        .await;
-        assert_eq!(served.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(served.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["committed_through_sequence"], 7);
-
-        // The ABSENCE, at the handler. `committed_through_sequence` folds "no
-        // such stream" into `Err(NotFound)` rather than `Ok(None)`, so the
-        // handler's `Err` arm carries two different things: this truthful 404
-        // -- which is exactly what lifting the D4 gate made truthful -- and the
-        // unreachable-archive 503 below. Funnelling the whole arm into 503
-        // would tell a caller their stream might come back later when it never
-        // existed. Only `committed_through_sequence` itself was tested before,
-        // so this arm had no coverage at the route at all.
-        let absent = stream_ack(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("stream-absent".to_string()),
-        )
-        .await;
-        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
-        assert_ne!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        select_wal_authoritative(&state.store, user_id);
-        let refused = stream_ack(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("stream-1".to_string()),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        // A routed-read failure is retryable. 500 would make it
-        // indistinguishable from the genuinely non-retryable failures that
-        // keep 500 on purpose; see `cp::routed_read_unavailable`.
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
-        assert!(
-            body.get("committed_through_sequence").is_none(),
-            "the stale acknowledgement leaked: {body}"
-        );
-    }
-
-    /// Both sides of the now-ROUTED capture-status read, in one test because
-    /// each is only meaningful against the other:
-    ///
-    /// * an UNSELECTED user reads a real row out of the legacy store, so the
-    ///   store is provably loadable and populated;
-    /// * a WAL-AUTHORITATIVE user reading the SAME archive is refused rather
-    ///   than served that row. This is the property the retained gate used to
-    ///   hide: with no registered serving authority there is no settled lane,
-    ///   and the one thing that must never happen is the stale legacy snapshot
-    ///   being handed back as if it were authoritative.
-    ///
-    /// The gate that used to sit above this is gone: its whole justification
-    /// was that ingest was deferred, so a routed `Ok(None)` -> 404 could not be
-    /// told apart from "you never uploaded that event". Ingest is migrated, so
-    /// the 404 is truthful again.
-    ///
-    /// The refusal is pinned at the lane's named 503 rather than at a status
-    /// class: the unreachable-archive failure must be told apart both from the
-    /// truthful 404 above it and from the 500 the generic `EnclaveError::Store`
-    /// arm would render. See `cp::routed_read_unavailable`.
-    ///
-    /// Falsifiability, checked by sabotage: swapping the handler back to
-    /// `with_user_read` turns the selected user's refusal into
-    /// `200 {"event_id":"evt-1"}` and both selected-side assertions fail;
-    /// dropping the `capture_events` insert turns the unselected user's 200
-    /// into a 404; handing the `Err` arm to `EnclaveError::into_response`
-    /// turns the 503 into a 500 and the status and reason assertions fail.
-    #[tokio::test]
-    async fn a_selected_capture_status_is_never_served_the_legacy_row() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
-        use axum::extract::{Path, State};
-        use axum::Extension;
-
-        let state = finish_test_state();
-        let user_id = "media-status-user";
-        state
-            .store
-            .with_user(user_id, |conn| {
-                conn.execute(
-                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                     last_event_at,schema_version) \
-                     VALUES('session-1','device-1','install-1',\
-                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
-                    [],
-                )?;
-                conn.execute(
-                    "INSERT INTO capture_streams(id,capture_session_id,device_id,stream_kind) \
-                     VALUES('stream-1','session-1','device-1','mic')",
-                    [],
-                )?;
-                conn.execute(
-                    "INSERT INTO capture_events(event_id,device_id,install_id,\
-                     capture_session_id,stream_id,stream_kind,sequence,source_wall_at,\
-                     source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
-                     clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
-                     VALUES('evt-1','device-1','install-1','session-1','stream-1','mic',0,\
-                     '2026-08-14T18:00:00.000Z','1','2026-08-14T18:00:00.000Z',\
-                     '2026-08-14T18:00:05.000Z','UTC',0,0,'asset-1','digest-1','canonical')",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let served = capture_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("evt-1".to_string()),
-        )
-        .await;
-        assert_eq!(served.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(served.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["event_id"], "evt-1");
-
-        select_wal_authoritative(&state.store, user_id);
-        let refused = capture_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("evt-1".to_string()),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 4 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
-        assert!(
-            body.get("event_id").is_none(),
-            "the stale row leaked: {body}"
-        );
-    }
-
-    /// The routed people collection now serves both authorities. A real
-    /// Genesis-selected archive proves the route reaches a serving authority;
-    /// the sealed voice-profile tests independently prove the non-empty
-    /// production writer. The legacy half retains parity with its roster.
-    #[tokio::test]
-    async fn the_lifted_people_list_reads_selected_and_legacy_rosters() {
-        use crate::cp::wal_gate_test_support::answerable_wal_archive;
-        use axum::extract::{Query, State};
-        use axum::Extension;
-
-        let archive = answerable_wal_archive("d0000000-0000-4000-8000-000000000009").await;
-        let state = Arc::clone(&archive.state);
-        let legacy_user = "media-people-legacy";
-        state
-            .store
-            .with_user(legacy_user, |conn| {
-                conn.execute(
-                    // No explicit id: `init_schema` already seeds the owner
-                    // row ('owner','Me'), which stays out of this listing
-                    // because its status is 'unknown', not 'identified'.
-                    "INSERT INTO people(display_name,status,updated_at) \
-                     VALUES('Ada','identified','2026-08-14T18:00:00.000Z')",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let selected_user = archive.user_id.as_str();
-        let selected = list_people(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(selected_user.to_string())),
-            Query(PeopleListQuery::default()),
-        )
-        .await;
-        assert_eq!(selected.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(selected.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["people"].is_array(), "{body}");
-
-        let served = list_people(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(legacy_user.to_string())),
-            Query(PeopleListQuery::default()),
-        )
-        .await;
-        assert_eq!(served.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(served.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["people"].as_array().unwrap().len(), 1);
-        assert_eq!(body["people"][0]["display_name"], "Ada");
-    }
-
-    /// The session listing, now routed. It answers a COLLECTION, which is the
-    /// shape the answerability rule warned about hardest: an unanswerable
-    /// routed read here returns `200 {"sessions": []}`, a refusal wearing the
-    /// face of a truthful empty archive. That is exactly why this one must
-    /// refuse rather than fall through to the legacy snapshot for a selected
-    /// user, and why the assertion checks for the ABSENCE of a `sessions` key
-    /// rather than only a status code — an empty success would pass a
-    /// status-only check.
-    ///
-    /// The gate above it is gone with ingest: `upload_capture_event` writes
-    /// every row this can list, so an empty list is now the truth rather than
-    /// a deferral in disguise.
-    ///
-    /// The status is pinned at the lane's named 503, not at a status class:
-    /// the generic `EnclaveError::Store` arm renders a 500, which
-    /// `cp::routed_read_unavailable` names as one of the three statuses this
-    /// lane deliberately does not use.
-    ///
-    /// Falsifiability, checked by sabotage: swapping the handler back to
-    /// `with_user_read` turns the selected user's refusal into a `200` whose
-    /// `sessions` array has one element and both selected-side assertions
-    /// fail; backdating `started_at` outside the 8-hour window empties the
-    /// unselected user's list; handing the `Err` arm to
-    /// `EnclaveError::into_response` turns the 503 into a 500 and the status
-    /// and reason assertions fail.
-    #[tokio::test]
-    async fn a_selected_session_list_refuses_instead_of_listing_the_legacy_snapshot() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
-        use axum::extract::{Query, State};
-        use axum::Extension;
-
-        let state = finish_test_state();
-        let user_id = "media-session-list-user";
-        state
-            .store
-            .with_user(user_id, |conn| {
-                // Inside the default 8-hour window, sourced from SQLite's own
-                // clock so the row cannot age out of the window as the suite
-                // ages.
-                conn.execute(
-                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                     last_event_at,schema_version) \
-                     VALUES('session-1','device-1','install-1',\
-                     strftime('%Y-%m-%dT%H:%M:%fZ','now'),\
-                     strftime('%Y-%m-%dT%H:%M:%fZ','now'),2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let query = || {
-            Query(CaptureSessionListQuery {
-                window_hours: None,
-                max_sessions: None,
-            })
-        };
-        let served = list_capture_sessions(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            query(),
-        )
-        .await;
-        assert_eq!(served.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(served.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let sessions = body["sessions"].as_array().unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0]["capture_session_id"], "session-1");
-
-        select_wal_authoritative(&state.store, user_id);
-        let refused = list_capture_sessions(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            query(),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
-        assert!(
-            body.get("sessions").is_none(),
-            "a refusal must never carry a collection: {body}"
-        );
-    }
-    /// The fourth read whose D4 gate lifted with ingest, and the only one that
-    /// had no routing test at all. Same two-sided proof as its siblings: an
-    /// UNSELECTED user reads the row out of the legacy store, and a
-    /// WAL-AUTHORITATIVE user reading the SAME archive is refused rather than
-    /// served it.
-    ///
-    /// The refusal is the lane's named 503, never the 500 the generic
-    /// `EnclaveError::Store` arm renders and never the truthful 404 that
-    /// `Ok(None)` above it answers -- those three outcomes mean three
-    /// different things to a client and this endpoint must not conflate them.
-    /// See `cp::routed_read_unavailable`.
-    ///
-    /// Falsifiability, checked by sabotage: swapping the handler back to
-    /// `with_user_read` turns the selected user's refusal into a `200` naming
-    /// `session-1`; handing the `Err` arm to `EnclaveError::into_response`
-    /// turns the 503 into a 500.
-    #[tokio::test]
-    async fn a_selected_capture_session_status_refuses_at_the_named_503() {
-        use crate::cp::wal_gate_test_support::select_wal_authoritative;
-        use axum::extract::{Path, State};
-        use axum::Extension;
-
-        let state = finish_test_state();
-        let user_id = "media-session-status-user";
-        state
-            .store
-            .with_user(user_id, |conn| {
-                conn.execute(
-                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
-                     last_event_at,schema_version) \
-                     VALUES('session-1','device-1','install-1',\
-                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        let served = capture_session_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("session-1".to_string()),
-        )
-        .await;
-        assert_eq!(served.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(served.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["capture_session_id"], "session-1");
-
-        // A session that was never written stays a truthful 404 for the same
-        // unselected user, so the 503 below is provably not just "absent".
-        let absent = capture_session_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("session-absent".to_string()),
-        )
-        .await;
-        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
-
-        select_wal_authoritative(&state.store, user_id);
-        let refused = capture_session_status(
-            State(Arc::clone(&state)),
-            Extension(crate::cp::auth::AuthUser(user_id.to_string())),
-            Path("session-1".to_string()),
-        )
-        .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(refused.status(), StatusCode::OK);
-        assert_ne!(refused.status(), StatusCode::NOT_FOUND);
-        assert_ne!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(refused.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], crate::cp::ROUTED_READ_UNAVAILABLE_REASON);
-        assert!(
-            body.get("capture_session_id").is_none(),
-            "the stale session leaked: {body}"
-        );
     }
 }

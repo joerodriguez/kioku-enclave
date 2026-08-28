@@ -16,7 +16,6 @@ import unittest
 from unittest import mock
 
 import test_local_build_evidence as bundle_fixtures  # noqa: E402
-import adr0022_fresh_release as fresh  # noqa: E402
 
 
 MODULE_PATH = Path(__file__).with_name("release_train_enclave.py")
@@ -470,30 +469,33 @@ class EnclaveAdapterTests(unittest.TestCase):
                 with self.assertRaises(MODULE.AdapterError):
                     MODULE._native_child_env(include_cloud=False)
 
-    def test_adapter_bundle_call_reaches_real_schema_ten_verifier_with_exact_digest_uri(self) -> None:
+    def test_adapter_bundle_call_reaches_schema_eleven_verifier_with_exact_digest_uri(self) -> None:
         helper = bundle_fixtures.LocalEvidenceTests()
+        image_repository = (
+            "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
+        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            _, _, public, fingerprint = helper.create_bundle(
-                directory, fresh_bootstrap=True
-            )
+            _, _, public, fingerprint = helper.create_bundle(directory)
             environment = {
                 "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY": str(public),
                 "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY_SHA256": fingerprint,
             }
-            with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE, "_repository", return_value="owner/repository"
+            ):
                 result = MODULE._verify_bundle(
                     directory,
                     directory / "local.env",
                     bundle_fixtures.COMMIT,
-                    fresh.CURRENT_TAG,
+                    bundle_fixtures.TAG,
                     bundle_fixtures.DIGEST,
-                    image_repository=fresh.IMAGE_REPOSITORY,
+                    image_repository=image_repository,
                 )
-        self.assertEqual(result["metadata"]["schema_version"], 10)
+        self.assertEqual(result["metadata"]["schema_version"], 11)
         self.assertEqual(
             result["evidence"]["image_digest_uri"],
-            f"{fresh.IMAGE_REPOSITORY}@{bundle_fixtures.DIGEST}",
+            f"{image_repository}@{bundle_fixtures.DIGEST}",
         )
 
     def test_adapter_rejects_git_overrides_replacements_and_grafts(self) -> None:

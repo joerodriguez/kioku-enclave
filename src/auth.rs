@@ -61,15 +61,15 @@ const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Subset of Google ID-token claims we need to validate.
 #[derive(Debug, Deserialize)]
 pub struct GoogleIdClaims {
-    #[allow(dead_code)]
-    pub iss: String,
-    #[allow(dead_code)]
-    pub aud: String,
+    #[serde(rename = "iss")]
+    _issuer: String,
+    #[serde(rename = "aud")]
+    _audience: String,
     pub email: String,
     pub email_verified: bool,
     /// Expiry (Unix timestamp). Validated by jsonwebtoken automatically.
-    #[allow(dead_code)]
-    pub exp: u64,
+    #[serde(rename = "exp")]
+    _expires_at: u64,
 }
 
 // ── JWKS cache entry ──────────────────────────────────────────────────────────

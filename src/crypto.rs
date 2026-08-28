@@ -1,15 +1,13 @@
-//! AES-256-GCM envelope encryption for per-user SQLite index blobs.
+//! AES-256-GCM envelope encryption for per-user large-media objects.
 //!
-//! # Blob wire formats
+//! # Media wire format
 //!
 //! ```text
-//! v2:     [ "KIOKU-BLOB\\x02" ][ nonce: 12 bytes ][ ciphertext + auth-tag ]
-//! legacy: [ nonce: 12 bytes ][ ciphertext + auth-tag ]
+//! [ "KIOKU-BLOB\\x02" ][ nonce: 12 bytes ][ ciphertext + auth-tag ]
 //! ```
 //!
-//! V2 authenticates a domain-separated logical-object context as AAD, which
+//! The envelope authenticates a domain-separated logical-object context as AAD, which
 //! prevents a valid ciphertext from being substituted at another object key.
-//! The legacy format is accepted only during an explicitly enabled migration.
 //!
 //! # DEK format
 //!
@@ -42,22 +40,17 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::Deserialize;
 use std::time::Duration;
-use zeroize::Zeroizing;
 
 use crate::attestation::AttestationCredentials;
 use crate::error::{EnclaveError, Result};
 
 /// Version marker for blobs whose AEAD tag binds them to a logical object.
-/// Legacy blobs had no marker and, for databases, no AAD at all.
 const BOUND_BLOB_V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
 const BOUND_BLOB_V2_DOMAIN: &[u8] = b"kioku-enclave:bound-blob:v2\0";
 
 /// Result of opening a context-bound blob.
 pub struct OpenedBoundBlob {
     pub plaintext: Vec<u8>,
-    /// True when the accepted input used a migration-only legacy envelope and
-    /// must be persisted again in the current context-bound v2 format.
-    pub requires_rewrite: bool,
 }
 
 // ── DEK type ──────────────────────────────────────────────────────────────────
@@ -80,37 +73,9 @@ impl Dek {
 
 // ── Blob crypto ───────────────────────────────────────────────────────────────
 
-/// Encrypt `plaintext` with `dek`.  Returns `nonce ‖ ciphertext ‖ tag`.
-#[cfg(test)]
-pub fn encrypt_blob(dek: &Dek, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(dek.as_aes_key());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12 random bytes
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| EnclaveError::Crypto(e.to_string()))?;
-
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// Decrypt the unbound legacy `nonce ‖ ciphertext ‖ tag` format.
-pub fn decrypt_blob(dek: &Dek, blob: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < 12 {
-        return Err(EnclaveError::Crypto("blob too short".into()));
-    }
-    let (nonce_bytes, ciphertext) = blob.split_at(12);
-    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    let cipher = Aes256Gcm::new(dek.as_aes_key());
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| EnclaveError::Crypto(format!("decrypt failed: {e}")))
-}
-
 /// Encrypt `plaintext` with `dek`, binding `aad` as Additional Authenticated Data.
 /// Returns `nonce ‖ ciphertext ‖ tag`.
-pub fn encrypt_blob_with_aad(dek: &Dek, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+fn encrypt_blob_with_aad(dek: &Dek, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::aead::Payload;
     let cipher = Aes256Gcm::new(dek.as_aes_key());
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12 random bytes
@@ -129,7 +94,7 @@ pub fn encrypt_blob_with_aad(dek: &Dek, plaintext: &[u8], aad: &[u8]) -> Result<
 }
 
 /// Decrypt a blob produced by [`encrypt_blob_with_aad`], validating the `aad`.
-pub fn decrypt_blob_with_aad(dek: &Dek, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_blob_with_aad(dek: &Dek, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::aead::Payload;
     if blob.len() < 12 {
         return Err(EnclaveError::Crypto("blob too short".into()));
@@ -165,52 +130,24 @@ pub fn encrypt_bound_blob(dek: &Dek, plaintext: &[u8], context: &[u8]) -> Result
     Ok(out)
 }
 
-/// Open a context-bound blob. Enforces v2 context-bound encryption with legacy fallback.
+/// Open the current context-bound media format.
 pub fn decrypt_bound_blob(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
-    if let Some(encrypted) = blob.strip_prefix(BOUND_BLOB_V2_MAGIC) {
-        let aad = bound_blob_aad(context);
-        return Ok(OpenedBoundBlob {
-            plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
-            requires_rewrite: false,
-        });
-    }
-
-    // Legacy blob fallback (pre-v2 format without KIOKU-BLOB header)
-    if let Ok(plaintext) = decrypt_blob_with_aad(dek, blob, context) {
-        return Ok(OpenedBoundBlob {
-            plaintext,
-            requires_rewrite: true,
-        });
-    }
-    if let Ok(plaintext) = decrypt_blob(dek, blob) {
-        return Ok(OpenedBoundBlob {
-            plaintext,
-            requires_rewrite: true,
-        });
-    }
-
-    Err(EnclaveError::Crypto(
-        "invalid context-bound blob header".into(),
-    ))
-}
-
-/// Open only the current context-bound blob format.
-///
-/// Canonical Cloud Capture objects are minted after the v2 boundary and carry
-/// an exact backend/generation receipt. Accepting either legacy AAD form for
-/// those objects would turn a copied historical ciphertext into plausible
-/// current evidence. Compatibility callers must use [`decrypt_bound_blob`]
-/// explicitly; new capture-v2 serving and lost-response adoption use this
-/// strict entry point.
-pub fn decrypt_bound_blob_v2(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
     let encrypted = blob
         .strip_prefix(BOUND_BLOB_V2_MAGIC)
         .ok_or_else(|| EnclaveError::Crypto("current media blob is not context-bound v2".into()))?;
     let aad = bound_blob_aad(context);
     Ok(OpenedBoundBlob {
         plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
-        requires_rewrite: false,
     })
+}
+
+/// Open only the current context-bound blob format.
+///
+/// Canonical Cloud Capture objects carry an exact provider-generation receipt.
+/// This explicit name is retained at the call sites where accepting any other
+/// format would turn copied ciphertext into plausible current evidence.
+pub fn decrypt_bound_blob_v2(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
+    decrypt_bound_blob(dek, blob, context)
 }
 
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
@@ -290,20 +227,6 @@ impl GcpKmsClient {
     /// decrypt grant and must not grant decrypt to the VM service account.
     async fn kms_token(&self) -> Result<String> {
         self.attestation_creds.kms_access_token().await
-    }
-
-    /// Exact CryptoKey resource already selected by the production KMS
-    /// constructor. The inactive archive-registry adapter may derive one
-    /// numeric version below this key; it cannot substitute another project,
-    /// location, key ring, or key.
-    pub(crate) fn archive_registry_key_name(&self) -> &str {
-        &self.key_name
-    }
-
-    /// Reuse only the existing attestation-derived KMS credential path. The
-    /// returned copy is zeroized when the inactive registry request drops.
-    pub(crate) async fn archive_registry_access_token(&self) -> Result<Zeroizing<String>> {
-        self.kms_token().await.map(Zeroizing::new)
     }
 }
 
@@ -426,21 +349,23 @@ mod tests {
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn blob_roundtrip() {
+    fn bound_blob_roundtrip() {
         let dek = Dek::generate();
         let plaintext = b"hello enclave world -- sensitive content";
-        let blob = encrypt_blob(&dek, plaintext).expect("encrypt");
-        let recovered = decrypt_blob(&dek, &blob).expect("decrypt");
-        assert_eq!(recovered, plaintext);
+        let context = b"media\0account-1\0raw/account-1/asset.enc";
+        let blob = encrypt_bound_blob(&dek, plaintext, context).expect("encrypt");
+        let recovered = decrypt_bound_blob(&dek, &blob, context).expect("decrypt");
+        assert_eq!(recovered.plaintext, plaintext);
     }
 
     #[test]
-    fn blob_wrong_key_fails() {
+    fn bound_blob_wrong_key_fails() {
         let dek1 = Dek::generate();
         let dek2 = Dek::generate();
-        let blob = encrypt_blob(&dek1, b"secret").expect("encrypt");
+        let context = b"media\0account-1\0raw/account-1/asset.enc";
+        let blob = encrypt_bound_blob(&dek1, b"secret", context).expect("encrypt");
         assert!(
-            decrypt_blob(&dek2, &blob).is_err(),
+            decrypt_bound_blob(&dek2, &blob, context).is_err(),
             "decrypting with wrong key must fail"
         );
     }
@@ -450,11 +375,12 @@ mod tests {
         // Two encrypts of identical plaintext must produce different ciphertexts.
         let dek = Dek::generate();
         let pt = b"same plaintext";
-        let b1 = encrypt_blob(&dek, pt).expect("encrypt 1");
-        let b2 = encrypt_blob(&dek, pt).expect("encrypt 2");
+        let context = b"media\0account-1\0raw/account-1/asset.enc";
+        let b1 = encrypt_bound_blob(&dek, pt, context).expect("encrypt 1");
+        let b2 = encrypt_bound_blob(&dek, pt, context).expect("encrypt 2");
         assert_ne!(
-            &b1[..12],
-            &b2[..12],
+            &b1[BOUND_BLOB_V2_MAGIC.len()..BOUND_BLOB_V2_MAGIC.len() + 12],
+            &b2[BOUND_BLOB_V2_MAGIC.len()..BOUND_BLOB_V2_MAGIC.len() + 12],
             "nonces should differ (birthday probability ~1/2^96)"
         );
         assert_ne!(b1, b2, "ciphertexts must differ");
@@ -486,50 +412,32 @@ mod tests {
     #[test]
     fn bound_blob_rejects_object_substitution() {
         let dek = Dek::generate();
-        let alice_context = b"user-db\0indexes/alice.db.enc";
+        let alice_context = b"media\0alice\0raw/alice/asset.enc";
         let blob =
             encrypt_bound_blob(&dek, b"alice data", alice_context).expect("encrypt bound blob");
 
         let opened =
             decrypt_bound_blob(&dek, &blob, alice_context).expect("open with correct context");
         assert_eq!(opened.plaintext, b"alice data");
-        assert!(!opened.requires_rewrite);
 
-        assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc").is_err());
+        assert!(decrypt_bound_blob(&dek, &blob, b"media\0bob\0raw/bob/asset.enc").is_err());
     }
 
     #[test]
-    fn legacy_bound_blob_reports_required_rewrite() {
-        let dek = Dek::generate();
-        let context = b"user-db\0indexes/migration.db.enc";
-        let legacy = encrypt_blob_with_aad(&dek, b"legacy data", context).unwrap();
-        let opened = decrypt_bound_blob(&dek, &legacy, context).unwrap();
-        assert_eq!(opened.plaintext, b"legacy data");
-        assert!(opened.requires_rewrite);
-    }
-
-    #[test]
-    fn strict_bound_blob_rejects_both_legacy_encodings() {
+    fn bound_blob_rejects_unversioned_envelopes() {
         let dek = Dek::generate();
         let context = b"media\0owner\0raw/owner/asset.enc";
-        let legacy_context = encrypt_blob_with_aad(&dek, b"legacy aad", context).unwrap();
-        let legacy_unbound = encrypt_blob(&dek, b"legacy unbound").unwrap();
-
-        assert!(decrypt_bound_blob(&dek, &legacy_context, context).is_ok());
-        assert!(decrypt_bound_blob(&dek, &legacy_unbound, context).is_ok());
-        assert!(decrypt_bound_blob_v2(&dek, &legacy_context, context).is_err());
-        assert!(decrypt_bound_blob_v2(&dek, &legacy_unbound, context).is_err());
-
-        let current = encrypt_bound_blob(&dek, b"current", context).unwrap();
-        let opened = decrypt_bound_blob_v2(&dek, &current, context).unwrap();
-        assert_eq!(opened.plaintext, b"current");
-        assert!(!opened.requires_rewrite);
+        let unversioned = encrypt_blob_with_aad(&dek, b"unversioned", context).unwrap();
+        assert!(decrypt_bound_blob(&dek, &unversioned, context).is_err());
+        assert!(decrypt_bound_blob_v2(&dek, &unversioned, context).is_err());
     }
 
     #[test]
     fn truncated_blob_rejected() {
         let dek = Dek::generate();
-        assert!(decrypt_blob(&dek, &[0u8; 5]).is_err());
+        let mut blob = BOUND_BLOB_V2_MAGIC.to_vec();
+        blob.extend_from_slice(&[0u8; 5]);
+        assert!(decrypt_bound_blob(&dek, &blob, b"media\0owner\0raw/owner/asset.enc").is_err());
     }
 
     #[tokio::test]
@@ -554,11 +462,12 @@ mod tests {
         let kms = FakeKms::new();
         let (dek, wrapped) = generate_and_wrap_dek(&kms).await.unwrap();
         let plaintext = b"user transcript: the meeting was about Q3 budgets";
-        let blob = encrypt_blob(&dek, plaintext).unwrap();
+        let context = b"media\0account-1\0raw/account-1/asset.enc";
+        let blob = encrypt_bound_blob(&dek, plaintext, context).unwrap();
 
         // Simulate: forget the DEK, reload it via KMS, decrypt
         let loaded_dek = load_dek(&kms, &wrapped).await.unwrap();
-        let recovered = decrypt_blob(&loaded_dek, &blob).unwrap();
-        assert_eq!(&recovered, plaintext);
+        let recovered = decrypt_bound_blob(&loaded_dek, &blob, context).unwrap();
+        assert_eq!(&recovered.plaintext, plaintext);
     }
 }

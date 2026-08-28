@@ -20,7 +20,6 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -358,7 +357,7 @@ async fn current_durable_read_fence(
         .recording_retention()
         .preference(user_id)
         .await?;
-    if preference.policy == super::control_store::RecordingRetentionPolicy::UntilDeleted
+    if preference.policy == crate::persistence::RecordingRetentionPolicy::UntilDeleted
         && preference.operation_state.is_none()
     {
         let Some(policy_epoch) = preference.policy_epoch else {
@@ -400,14 +399,6 @@ async fn memory_playback_manifest(
     {
         return too_many_requests();
     }
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user_id).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
-        }
-    } else {
-        None
-    };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
@@ -456,16 +447,6 @@ async fn memory_playback_segment(
     {
         return too_many_requests();
     }
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user_id).await {
-            Ok(guard) => Some(guard),
-            Err(error) => {
-                return super::routed_read_unavailable("api.playback_segment.lookup", &error)
-            }
-        }
-    } else {
-        None
-    };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.playback_segment.lookup", &error),
@@ -536,11 +517,9 @@ async fn memory_playback_segment(
     let asset_id = authority.asset_id.as_deref().unwrap_or_default();
     let expected_key = match authority.retention_decision.as_str() {
         "processing_window_30d" => {
-            crate::store::canonical_capture_media_object_key(&lookup_user, asset_id)
+            crate::gcs::canonical_capture_media_object_key(&lookup_user, asset_id)
         }
-        "until_deleted" => {
-            crate::store::canonical_recording_media_object_key(&lookup_user, asset_id)
-        }
+        "until_deleted" => crate::gcs::canonical_recording_media_object_key(&lookup_user, asset_id),
         _ => Err(EnclaveError::Store(
             "playback segment retention authority is invalid".into(),
         )),
@@ -592,7 +571,7 @@ async fn memory_playback_segment(
             (
                 wrapped_dek,
                 media_dek,
-                crate::store::media_blob_context(&lookup_user, object_key),
+                crate::gcs::media_blob_context(&lookup_user, object_key),
             )
         }
         "until_deleted" => {
@@ -605,7 +584,7 @@ async fn memory_playback_segment(
                 return internal_error();
             };
             let provider_key_reference =
-                match crate::store::recording_media_key_reference(key_epoch, policy_epoch) {
+                match crate::gcs::recording_media_key_reference(key_epoch, policy_epoch) {
                     Ok(value) => value,
                     Err(_) => return internal_error(),
                 };
@@ -637,7 +616,7 @@ async fn memory_playback_segment(
                     return internal_error();
                 }
             };
-            let context = match crate::store::recording_media_blob_context(
+            let context = match crate::gcs::recording_media_blob_context(
                 &lookup_user,
                 object_key,
                 key_epoch,
@@ -700,8 +679,6 @@ async fn memory_playback_segment(
 
 fn playback_capability_available(state: &CpState) -> bool {
     state.durable_recording_storage_bound
-        && (!state.repositories.uses_legacy_state()
-            || crate::schema_ladder::durable_recording_schema_active())
 }
 
 async fn person_memories(
@@ -725,14 +702,6 @@ async fn person_memories(
         .clamp(1, PEOPLE_MEMORIES_MAX_LIMIT);
     let before_id = query.before_id;
     let user_id = user.0;
-    let _lifecycle_guard = if state.repositories.uses_legacy_state() {
-        match state.store.lock_user_lifecycle(&user_id).await {
-            Ok(guard) => Some(guard),
-            Err(error) => return super::routed_read_unavailable("api.person_memories", &error),
-        }
-    } else {
-        None
-    };
     let durable_read = match current_durable_read_fence(&state, &user_id).await {
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.person_memories", &error),
@@ -747,220 +716,6 @@ async fn person_memories(
         Err(EnclaveError::NotFound) => not_found(),
         Err(error) => super::routed_read_unavailable("api.person_memories", &error),
     }
-}
-
-pub(crate) fn load_playback_dataset(
-    conn: &Connection,
-    user_id: &str,
-    memory_id: i64,
-    durable_read: Option<&DurableReadFence>,
-) -> Result<Option<PlaybackDataset>> {
-    let memory = conn
-        .query_row(
-            "SELECT started_at,ended_at FROM episodes WHERE id=?1 AND substance<>'none'",
-            [memory_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((started_at, ended_at)) = memory else {
-        return Ok(None);
-    };
-    let start_epoch_ms = super::isotime::parse_epoch_millis(&started_at)
-        .ok_or_else(|| EnclaveError::Store("memory start time is malformed".into()))?;
-    let end_epoch_ms = super::isotime::parse_epoch_millis(&ended_at)
-        .ok_or_else(|| EnclaveError::Store("memory end time is malformed".into()))?;
-    if end_epoch_ms <= start_epoch_ms {
-        return Err(EnclaveError::Store("memory interval is malformed".into()));
-    }
-
-    let authority_table_present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recording_media_authority')",
-        [],
-        |row| row.get(0),
-    )?;
-    let (authority_columns, authority_join) = if authority_table_present {
-        (
-            "ra.retention_decision,ra.storage_backend,ra.retention_policy_revision,ra.retention_policy_epoch,ra.recording_key_epoch,ra.recording_state",
-            "LEFT JOIN recording_media_authority ra ON ra.asset_id=m.asset_id",
-        )
-    } else {
-        ("NULL,NULL,NULL,NULL,NULL,NULL", "")
-    };
-    let segment_sql = format!(
-        "SELECT DISTINCT e.capture_session_id,e.stream_id,e.stream_kind,e.event_id,
-                e.started_at,e.ended_at,m.asset_id,m.object_key,m.object_generation,
-                m.object_backend,m.mime_type,m.codec,m.byte_length,m.sha256,
-                m.processing_state,m.deleted_at,{authority_columns}
-         FROM episode_members em
-         JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-         JOIN speaker_observation_sources src
-           ON src.speaker_observation_id=u.speaker_observation_id
-         JOIN capture_events e ON e.event_id=src.event_id
-         LEFT JOIN media_objects m ON m.event_id=e.event_id
-         {authority_join}
-         WHERE em.episode_id=?1 AND e.stream_kind IN ('mic','system_audio','ios_mic')
-         ORDER BY e.started_at,e.stream_id,e.sequence,e.event_id"
-    );
-    let mut segment_statement = conn.prepare(&segment_sql)?;
-    let segments = segment_statement
-        .query_map([memory_id], |row| {
-            let capture_session_id: String = row.get(0)?;
-            let stream_id: String = row.get(1)?;
-            let kind: String = row.get(2)?;
-            let event_id: String = row.get(3)?;
-            let event_started_at: String = row.get(4)?;
-            let event_ended_at: String = row.get(5)?;
-            let event_start = super::isotime::parse_epoch_millis(&event_started_at)
-                .ok_or(rusqlite::Error::InvalidQuery)?;
-            let event_end = super::isotime::parse_epoch_millis(&event_ended_at)
-                .ok_or(rusqlite::Error::InvalidQuery)?;
-            let retention_decision = row
-                .get::<_, Option<String>>(16)?
-                .unwrap_or_else(|| "processing_window_30d".into());
-            let storage_backend = row
-                .get::<_, Option<String>>(17)?
-                .unwrap_or_else(|| "processing".into());
-            let retention_policy_revision = row.get::<_, Option<i64>>(18)?;
-            let retention_policy_epoch = row.get::<_, Option<String>>(19)?;
-            let recording_key_epoch = row.get::<_, Option<i64>>(20)?;
-            let recording_state = row
-                .get::<_, Option<String>>(21)?
-                .unwrap_or_else(|| "processing_only".into());
-            let durable_read_authorized = retention_decision == "until_deleted"
-                && durable_read.is_some_and(|fence| {
-                    retention_policy_revision == Some(fence.policy_revision)
-                        && retention_policy_epoch.as_deref() == Some(fence.policy_epoch.as_str())
-                });
-            Ok(SegmentAuthority {
-                recording_id: opaque_id("rec_", &[user_id, &capture_session_id]),
-                segment_id: opaque_id("seg_", &[user_id, &event_id]),
-                track_id: opaque_id("track_", &[user_id, &capture_session_id, &stream_id]),
-                kind,
-                capture_session_id,
-                stream_id,
-                event_id,
-                asset_id: row.get(6)?,
-                object_key: row.get(7)?,
-                generation: row.get(8)?,
-                object_backend: row.get(9)?,
-                stored_mime_type: row.get(10)?,
-                codec: row.get(11)?,
-                byte_length: row.get(12)?,
-                sha256: row.get(13)?,
-                processing_state: row.get(14)?,
-                deleted_at: row.get(15)?,
-                retention_decision,
-                storage_backend,
-                retention_policy_revision,
-                retention_policy_epoch,
-                recording_key_epoch,
-                recording_state,
-                durable_read_authorized,
-                timeline_start_ms: event_start.saturating_sub(start_epoch_ms),
-                timeline_end_ms: event_end.saturating_sub(start_epoch_ms),
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut utterance_statement = conn.prepare(
-        "SELECT u.id,u.speaker_observation_id,o.started_at,o.ended_at,s.started_at,
-                u.start_offset_seconds,u.end_offset_seconds,
-                u.text,u.speaker_label,COALESCE(o.overlap,0)
-         FROM episode_members em
-         JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-         JOIN audio_segments s ON s.id=u.audio_segment_id
-         LEFT JOIN speaker_observations o ON o.id=u.speaker_observation_id
-         WHERE em.episode_id=?1 ORDER BY COALESCE(o.started_at,s.started_at),u.id",
-    )?;
-    let mut utterances = utterance_statement
-        .query_map([memory_id], |row| {
-            let observation_start: Option<String> = row.get(2)?;
-            let observation_end: Option<String> = row.get(3)?;
-            let segment_start: String = row.get(4)?;
-            let start_offset_seconds: f64 = row.get(5)?;
-            let end_offset_seconds: f64 = row.get(6)?;
-            let (absolute_start_ms, absolute_end_ms) = resolve_utterance_interval(
-                observation_start.as_deref(),
-                observation_end.as_deref(),
-                &segment_start,
-                start_offset_seconds,
-                end_offset_seconds,
-            )
-            .ok_or(rusqlite::Error::InvalidQuery)?;
-            Ok(UtteranceAuthority {
-                utterance_id: row.get(0)?,
-                observation_id: row.get(1)?,
-                timeline_start_ms: absolute_start_ms.saturating_sub(start_epoch_ms),
-                timeline_end_ms: absolute_end_ms.saturating_sub(start_epoch_ms),
-                text: row.get(7)?,
-                fallback_label: row.get(8)?,
-                overlap: row.get::<_, i64>(9)? != 0,
-                person_id: None,
-                display_name: None,
-                attribution_state: None,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for utterance in &mut utterances {
-        let Some(observation_id) = utterance.observation_id else {
-            continue;
-        };
-        if let Ok(attribution) =
-            super::identity::resolve_speaker_attribution(conn, observation_id, Some(memory_id))
-        {
-            utterance.person_id = attribution.person_id;
-            utterance.display_name = Some(attribution.display_label);
-            utterance.attribution_state = Some(
-                attribution
-                    .attribution_kind
-                    .to_participant_attribution_kind(attribution.has_direct_evidence)
-                    .to_string(),
-            );
-        }
-    }
-
-    let mut source_statement = conn.prepare(
-        "SELECT src.speaker_observation_id,src.event_id,
-                src.window_start_ms,src.window_end_ms,src.event_start_ms,src.event_end_ms
-         FROM episode_members em
-         JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-         JOIN speaker_observation_sources src
-           ON src.speaker_observation_id=u.speaker_observation_id
-         WHERE em.episode_id=?1
-         ORDER BY src.speaker_observation_id,src.window_start_ms,src.event_id",
-    )?;
-    let sources = source_statement
-        .query_map([memory_id], |row| {
-            Ok(SourceAuthority {
-                observation_id: row.get(0)?,
-                event_id: row.get(1)?,
-                window_start_ms: row.get(2)?,
-                window_end_ms: row.get(3)?,
-                event_start_ms: row.get(4)?,
-                event_end_ms: row.get(5)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let projection_revision = projection_revision(
-        memory_id,
-        &started_at,
-        &ended_at,
-        &segments,
-        &utterances,
-        &sources,
-    );
-    Ok(Some(PlaybackDataset {
-        owner_id: user_id.to_string(),
-        memory_id,
-        started_at,
-        ended_at,
-        duration_ms: end_epoch_ms.saturating_sub(start_epoch_ms),
-        projection_revision,
-        segments,
-        utterances,
-        sources,
-    }))
 }
 
 pub(crate) fn resolve_utterance_interval(
@@ -1204,187 +959,6 @@ fn playback_window_start(dataset: &PlaybackDataset, query: &PlaybackQuery) -> Re
         .unwrap_or(0)
         .min(dataset.duration_ms.saturating_sub(1));
     Ok((at / PLAYBACK_WINDOW_MS) * PLAYBACK_WINDOW_MS)
-}
-
-pub(crate) fn load_person_memories(
-    conn: &Connection,
-    person_id: i64,
-    before_id: Option<i64>,
-    limit: usize,
-    durable_read: Option<&DurableReadFence>,
-) -> Result<PersonMemoriesPage> {
-    let authority_table_present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='recording_media_authority')",
-        [],
-        |row| row.get(0),
-    )?;
-    let authority_join = if authority_table_present {
-        "LEFT JOIN recording_media_authority ra ON ra.asset_id=mo.asset_id"
-    } else {
-        ""
-    };
-    // Keep all six bound parameters in the epoch-1 statement too. This makes
-    // the query shape additive across the schema ladder without treating a
-    // missing authority table as durable permission.
-    let legacy_parameter_fence =
-        "AND (?5 IS NULL OR ?5 IS NOT NULL) AND (?6 IS NULL OR ?6 IS NOT NULL)";
-    let readable_authority = if authority_table_present {
-        "AND (
-            (COALESCE(ra.retention_decision,'processing_window_30d')='processing_window_30d'
-             AND COALESCE(ra.storage_backend,'processing')='processing'
-             AND COALESCE(ra.recording_state,'processing_only')='processing_only')
-            OR
-            (ra.retention_decision='until_deleted'
-             AND ra.storage_backend='recordings'
-             AND ra.recording_state='durable'
-             AND ?5 IS NOT NULL AND ra.retention_policy_revision=?5
-             AND ?6 IS NOT NULL AND ra.retention_policy_epoch=?6)
-        )"
-    } else {
-        legacy_parameter_fence
-    };
-    let processing_authority = if authority_table_present {
-        "AND COALESCE(ra.retention_decision,'processing_window_30d')='processing_window_30d'
-         AND COALESCE(ra.storage_backend,'processing')='processing'
-         AND COALESCE(ra.recording_state,'processing_only')='processing_only'"
-    } else {
-        legacy_parameter_fence
-    };
-    let deleted_predicate = if authority_table_present {
-        "AND (mo.deleted_at IS NOT NULL OR ra.recording_state='delete_pending')
-         AND mo.processing_state<>'pruned'"
-    } else {
-        "AND mo.deleted_at IS NOT NULL AND mo.processing_state<>'pruned'"
-    };
-    let sql = format!(
-        "SELECT e.id,e.title,e.summary,e.started_at,e.ended_at,
-                (SELECT COUNT(*) FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observations o ON o.id=u.speaker_observation_id
-                 WHERE em.episode_id=e.id AND o.person_id=?1),
-                (SELECT MIN(o.started_at) FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observations o ON o.id=u.speaker_observation_id
-                 WHERE em.episode_id=e.id AND o.person_id=?1),
-                (SELECT COUNT(DISTINCT ce.capture_session_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 JOIN capture_events ce ON ce.event_id=src.event_id
-                 WHERE em.episode_id=e.id),
-                (SELECT u.id FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observations o ON o.id=u.speaker_observation_id
-                 WHERE em.episode_id=e.id AND o.person_id=?1
-                 ORDER BY o.started_at,u.id LIMIT 1),
-                (SELECT COUNT(DISTINCT src.event_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 WHERE em.episode_id=e.id),
-                (SELECT COUNT(DISTINCT src.event_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 JOIN media_objects mo ON mo.event_id=src.event_id
-                 {authority_join}
-                 WHERE em.episode_id=e.id AND mo.processing_state='ready'
-                   AND mo.deleted_at IS NULL AND mo.object_backend='current'
-                   AND mo.object_generation>0 AND mo.mime_type IN ('audio/m4a','audio/mp4')
-                   AND mo.codec='aac' AND mo.byte_length BETWEEN 1 AND ?4
-                   AND length(mo.sha256)=64
-                   AND lower(mo.sha256) NOT GLOB '*[^0-9a-f]*'
-                   {readable_authority}),
-                (SELECT COUNT(DISTINCT src.event_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 JOIN media_objects mo ON mo.event_id=src.event_id
-                 {authority_join}
-                 WHERE em.episode_id=e.id AND mo.deleted_at IS NULL
-                   AND mo.processing_state IN ('queued','processing','retry_wait')
-                   {readable_authority}),
-                (SELECT COUNT(DISTINCT src.event_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 JOIN media_objects mo ON mo.event_id=src.event_id
-                 {authority_join}
-                 WHERE em.episode_id=e.id {deleted_predicate}),
-                (SELECT COUNT(DISTINCT src.event_id)
-                 FROM episode_members em
-                 JOIN utterances u ON em.record_type='utterance' AND u.id=em.record_id
-                 JOIN speaker_observation_sources src
-                   ON src.speaker_observation_id=u.speaker_observation_id
-                 JOIN media_objects mo ON mo.event_id=src.event_id
-                 {authority_join}
-                 WHERE em.episode_id=e.id AND mo.processing_state='pruned'
-                   {processing_authority})
-         FROM episodes e
-         JOIN episode_participants p ON p.episode_id=e.id
-         WHERE p.person_id=?1 AND p.state='active' AND e.substance<>'none'
-           AND (?2 IS NULL OR e.id<?2)
-         GROUP BY e.id ORDER BY e.id DESC LIMIT ?3"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let fence_revision = durable_read.map(|fence| fence.policy_revision);
-    let fence_epoch = durable_read.map(|fence| fence.policy_epoch.as_str());
-    let mut rows = statement
-        .query_map(
-            params![
-                person_id,
-                before_id,
-                limit as i64 + 1,
-                MAX_AUDIO_SEGMENT_BYTES,
-                fence_revision,
-                fence_epoch,
-            ],
-            |row| {
-                let started_at: String = row.get(3)?;
-                let first_attributed_at: Option<String> = row.get(6)?;
-                let source_count: i64 = row.get(9)?;
-                let ready_count: i64 = row.get(10)?;
-                let pending_count: i64 = row.get(11)?;
-                let deleted_count: i64 = row.get(12)?;
-                let pruned_count: i64 = row.get(13)?;
-                let playback_start_ms = first_attributed_at
-                    .as_deref()
-                    .and_then(super::isotime::parse_epoch_millis)
-                    .zip(super::isotime::parse_epoch_millis(&started_at))
-                    .map(|(first, start)| first.saturating_sub(start).max(0));
-                let audio_availability = availability_from_counts(
-                    source_count,
-                    ready_count,
-                    pending_count,
-                    deleted_count,
-                    pruned_count,
-                );
-                Ok(PersonMemorySummary {
-                    memory_id: row.get(0)?,
-                    title: row.get(1)?,
-                    summary: row.get(2)?,
-                    started_at,
-                    ended_at: row.get(4)?,
-                    attributed_utterance_count: row.get(5)?,
-                    contributing_recording_count: row.get(8)?,
-                    audio_availability,
-                    playback_start_ms,
-                    playback_utterance_id: row.get(7)?,
-                })
-            },
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let next_cursor = (rows.len() > limit).then(|| rows[limit - 1].memory_id);
-    rows.truncate(limit);
-    Ok(PersonMemoriesPage {
-        memories: rows,
-        next_cursor,
-    })
 }
 
 pub(crate) fn projection_revision(
@@ -1761,90 +1335,6 @@ mod tests {
     }
 
     #[test]
-    fn people_availability_obeys_the_same_durable_policy_fence_as_playback() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE episodes (
-                    id INTEGER PRIMARY KEY,title TEXT,summary TEXT,started_at TEXT,
-                    ended_at TEXT,substance TEXT
-                 );
-                 CREATE TABLE episode_members (
-                    episode_id INTEGER,record_type TEXT,record_id INTEGER
-                 );
-                 CREATE TABLE utterances (
-                    id INTEGER PRIMARY KEY,speaker_observation_id INTEGER
-                 );
-                 CREATE TABLE speaker_observations (
-                    id INTEGER PRIMARY KEY,person_id INTEGER,started_at TEXT
-                 );
-                 CREATE TABLE speaker_observation_sources (
-                    speaker_observation_id INTEGER,event_id TEXT
-                 );
-                 CREATE TABLE capture_events (
-                    event_id TEXT,capture_session_id TEXT
-                 );
-                 CREATE TABLE media_objects (
-                    event_id TEXT,asset_id TEXT,object_key TEXT,object_generation INTEGER,
-                    object_backend TEXT,mime_type TEXT,codec TEXT,byte_length INTEGER,
-                    sha256 TEXT,processing_state TEXT,deleted_at TEXT
-                 );
-                 CREATE TABLE people (id INTEGER PRIMARY KEY,status TEXT);
-                 CREATE TABLE episode_participants (
-                    episode_id INTEGER,person_id INTEGER,state TEXT
-                 );
-                 INSERT INTO people VALUES (3,'identified');
-                 INSERT INTO episodes VALUES (
-                    42,'Conversation','Summary','2026-08-26T14:00:00.000Z',
-                    '2026-08-26T14:02:00.000Z','normal'
-                 );
-                 INSERT INTO utterances VALUES (9,7);
-                 INSERT INTO speaker_observations VALUES (
-                    7,3,'2026-08-26T14:00:20.000Z'
-                 );
-                 INSERT INTO episode_members VALUES (42,'utterance',9);
-                 INSERT INTO episode_participants VALUES (42,3,'active');
-                 INSERT INTO speaker_observation_sources VALUES (7,'event-a');
-                 INSERT INTO capture_events VALUES ('event-a','session-a');
-                 INSERT INTO media_objects VALUES (
-                    'event-a','asset-a','raw/user-a/asset-a.enc',11,'current',
-                    'audio/m4a','aac',1024,
-                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                    'ready',NULL
-                 );",
-            )
-            .unwrap();
-
-        let legacy = load_person_memories(&connection, 3, None, 25, None).unwrap();
-        assert_eq!(legacy.memories[0].audio_availability, "ready");
-
-        connection
-            .execute_batch(
-                "CREATE TABLE recording_media_authority (
-                    asset_id TEXT PRIMARY KEY,retention_decision TEXT,storage_backend TEXT,
-                    retention_policy_revision INTEGER,retention_policy_epoch TEXT,
-                    recording_key_epoch INTEGER,recording_state TEXT
-                 );
-                 INSERT INTO recording_media_authority VALUES (
-                    'asset-a','until_deleted','recordings',7,
-                    'rpe_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                    1,'durable'
-                 );",
-            )
-            .unwrap();
-        let stale = load_person_memories(&connection, 3, None, 25, None).unwrap();
-        assert_eq!(stale.memories[0].audio_availability, "unavailable");
-
-        let fence = DurableReadFence {
-            policy_revision: 7,
-            policy_epoch: "rpe_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .into(),
-        };
-        let current = load_person_memories(&connection, 3, None, 25, Some(&fence)).unwrap();
-        assert_eq!(current.memories[0].audio_availability, "ready");
-    }
-
-    #[test]
     fn cursor_is_memory_revision_and_offset_bound() {
         let key = [7_u8; 32];
         let now = 1_777_777_777;
@@ -1896,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_utterance_offsets_become_canonical_milliseconds_without_sql_datetime() {
+    fn source_offsets_become_canonical_milliseconds_without_sql_datetime() {
         assert_eq!(
             resolve_utterance_interval(None, None, "2026-08-26T14:00:00.000Z", 1.25, 2.75),
             Some((1_787_752_801_250, 1_787_752_802_750))
@@ -1941,80 +1431,5 @@ mod tests {
         let mut video = vec![0, 0, 0, 24];
         video.extend_from_slice(b"ftypavc1");
         assert!(!looks_like_iso_bmff_audio(&video));
-    }
-
-    #[test]
-    fn manifest_projects_authenticated_event_spans_onto_the_memory_clock() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE episodes (
-                    id INTEGER PRIMARY KEY,started_at TEXT,ended_at TEXT,substance TEXT
-                 );
-                 CREATE TABLE episode_members (
-                    episode_id INTEGER,record_type TEXT,record_id INTEGER
-                 );
-                 CREATE TABLE utterances (
-                    id INTEGER PRIMARY KEY,speaker_observation_id INTEGER,audio_segment_id INTEGER,
-                    start_offset_seconds REAL,end_offset_seconds REAL,text TEXT,speaker_label TEXT
-                 );
-                 CREATE TABLE audio_segments (id INTEGER PRIMARY KEY,started_at TEXT);
-                 CREATE TABLE speaker_observations (
-                    id INTEGER PRIMARY KEY,started_at TEXT,ended_at TEXT,overlap INTEGER
-                 );
-                 CREATE TABLE speaker_observation_sources (
-                    speaker_observation_id INTEGER,event_id TEXT,window_start_ms INTEGER,
-                    window_end_ms INTEGER,event_start_ms INTEGER,event_end_ms INTEGER
-                 );
-                 CREATE TABLE capture_events (
-                    capture_session_id TEXT,stream_id TEXT,stream_kind TEXT,event_id TEXT,
-                    started_at TEXT,ended_at TEXT,sequence INTEGER
-                 );
-                 CREATE TABLE media_objects (
-                    event_id TEXT,asset_id TEXT,object_key TEXT,object_generation INTEGER,
-                    object_backend TEXT,mime_type TEXT,codec TEXT,byte_length INTEGER,
-                    sha256 TEXT,processing_state TEXT,deleted_at TEXT
-                 );
-                 INSERT INTO episodes VALUES (
-                    42,'2026-08-26T14:00:00.000Z','2026-08-26T14:02:00.000Z','normal'
-                 );
-                 INSERT INTO audio_segments VALUES (5,'2026-08-26T14:00:10.000Z');
-                 INSERT INTO speaker_observations VALUES (
-                    7,'2026-08-26T14:00:20.000Z','2026-08-26T14:00:22.000Z',0
-                 );
-                 INSERT INTO utterances VALUES (9,7,5,10.0,12.0,'Hello world','Speaker 1');
-                 INSERT INTO episode_members VALUES (42,'utterance',9);
-                 INSERT INTO capture_events VALUES (
-                    'session-a','stream-a','mic','event-a',
-                    '2026-08-26T14:00:10.000Z','2026-08-26T14:01:10.000Z',0
-                 );
-                 INSERT INTO speaker_observation_sources VALUES (7,'event-a',0,2000,10000,12000);
-                 INSERT INTO media_objects VALUES (
-                    'event-a','asset-a','raw/user-a/asset-a.enc',11,'current',
-                    'audio/m4a','aac',1024,
-                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                    'ready',NULL
-                 );",
-            )
-            .unwrap();
-
-        let dataset = load_playback_dataset(&connection, "user-a", 42, None)
-            .unwrap()
-            .unwrap();
-        let manifest = project_manifest(&dataset, 0).unwrap();
-        assert_eq!(manifest.timeline.duration_ms, 120_000);
-        assert_eq!(manifest.availability, "ready");
-        assert_eq!(manifest.segments.len(), 1);
-        assert_eq!(manifest.segments[0].timeline_start_ms, 10_000);
-        assert_eq!(manifest.utterances.len(), 1);
-        assert_eq!(manifest.utterances[0].timeline_start_ms, 20_000);
-        assert_eq!(manifest.utterances[0].timeline_end_ms, 22_000);
-        assert_eq!(manifest.utterances[0].source_spans.len(), 1);
-        assert_eq!(
-            manifest.utterances[0].source_spans[0].timeline_start_ms,
-            20_000
-        );
-        assert_eq!(manifest.utterances[0].source_spans[0].source_state, "ready");
-        assert!(manifest.utterances[0].source_spans[0].playable);
     }
 }

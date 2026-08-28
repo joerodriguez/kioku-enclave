@@ -1,18 +1,16 @@
 //! Incremental LLM episode summarizer with explicit episode membership. It runs
-//! inside the enclave; the cursor lives in
-//! the control DB (`users.summarized_until`) and content I/O is in-process.
+//! inside the enclave; PostgreSQL owns the durable cursor, evidence, claims,
+//! episode writes, and embeddings while content I/O remains in-process.
 //!
 //! Faithful to v2: incremental window since the cursor, open-episode refs the
 //! model extends, membership by innermost-containing span, significance floor,
 //! window cap. Full screenshot OCR remains indexed, while prompts use the
 //! bounded salient projection in [`crate::ocr`] plus conservative
-//! `[screen-facts]` title labels. This replaces the legacy service's broad
-//! `blockScreenTerms`/`blockNameCandidates` hints with evidence that is less
-//! likely to promote menu chrome or neighboring search results.
+//! `[screen-facts]` title labels, which are less likely to promote menu chrome
+//! or neighboring search results than broad block-term hints.
 //!
-//! **Live-tail cursor semantics:** legacy behavior advanced `summarized_until`
-//! to the window end even when the model
-//! returned zero episodes. At the caught-up live tail that is a ratchet bug:
+//! **Live-tail cursor semantics:** advancing `summarized_until` to the window
+//! end when the model returns zero episodes creates a caught-up-tail ratchet:
 //! every 10-min tick fed the model ~10 min of capture (which the prompt rightly
 //! refuses to fragment into an episode), got `[]` back, and *consumed the
 //! content forever* — no episode was ever created after the initial backfill
@@ -26,21 +24,21 @@
 //! The Vertex call sends text outside the TEE (documented caveat — see
 //! [`super::vertex`]).
 
-pub(crate) mod wal;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
 use crate::error::{EnclaveError, Result};
 use crate::persistence::{
-    EpisodeEmbeddingWrite, OpenEpisode as OpenEp, SummaryScreenshot as ScrRow,
-    SummaryUtterance as UttRow, SummaryWindowClaim, SummaryWindowSettlement,
+    EpisodeEmbeddingWrite, EpisodeInput, MinuteBucket, OpenEpisode as OpenEp,
+    SummaryScreenshot as ScrRow, SummaryUtterance as UttRow, SummaryWindowClaim,
+    SummaryWindowSettlement,
 };
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
@@ -72,19 +70,6 @@ const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Clou
 /// never stacks multiple summarizer model calls for one user in one wakeup.
 const SPARSE_LOOKBACK_MAX_WINDOWS: u32 =
     ((LOOKBACK_DAYS * 24 + MAX_WINDOW_HOURS - 1) / MAX_WINDOW_HOURS) as u32 + 1;
-const CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 2_048;
-/// First delay after a window is derived, paid for, and then refused at
-/// submit time. Deliberately longer than one [`SCHEDULER_INTERVAL_SECS`]
-/// sweep: at or below it the backoff would not actually skip a sweep.
-const SETTLE_BACKOFF_BASE_SECS: i64 = 900;
-/// Ceiling on that delay. A lane that never recovers therefore costs at most
-/// a handful of summary calls a day instead of one per sweep, while still
-/// retrying often enough that a healed lane resumes without an operator.
-const SETTLE_BACKOFF_MAX_SECS: i64 = 6 * 60 * 60;
-const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
-const SUBSTANCE_BACKFILL_BATCH: usize = 50;
-const VISUAL_EVIDENCE_BACKFILL_KEY: &str = "adr_0010_visual_evidence_backfill_v1";
-const VISUAL_EVIDENCE_BACKFILL_BATCH: usize = 50;
 
 /// Compute the summarization window ending bound for a run starting at
 /// `new_from` with the live tail at `tail_cutoff` (both epoch ms).
@@ -134,7 +119,7 @@ async fn reserve_vertex_output(state: &CpState, user_id: &str, output_tokens: u3
         state.config.quota_vertex_output_tokens_per_day,
     )
     .await?;
-    if reserved.allowed {
+    if reserved {
         Ok(())
     } else {
         Err(EnclaveError::Config("vertex_daily_budget".into()))
@@ -478,395 +463,6 @@ fn extract_json(text: &str) -> Option<Value> {
     None
 }
 
-fn substance_backfill_schema() -> Value {
-    json!({
-        "type": "OBJECT",
-        "properties": {
-            "classifications": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "id": {"type": "INTEGER"},
-                        "substance": {"type": "STRING", "enum": ["none", "low", "normal"]}
-                    },
-                    "required": ["id", "substance"]
-                }
-            }
-        },
-        "required": ["classifications"]
-    })
-}
-
-fn visual_evidence_backfill_schema() -> Value {
-    json!({
-        "type": "OBJECT",
-        "properties": {
-            "classifications": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "id": {"type": "INTEGER"},
-                        "visual_evidence": {"type": "STRING", "enum": ["none", "useful"]}
-                    },
-                    "required": ["id", "visual_evidence"]
-                }
-            }
-        },
-        "required": ["classifications"]
-    })
-}
-
-/// Classify historical episodes once per encrypted user database. This is
-/// best-effort at the call site: a Vertex outage must not block current-window
-/// summarization. The completion marker is written only after every stored row
-/// has a valid classification, so interrupted runs safely resume.
-#[allow(dead_code)]
-async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
-    let user = user_id.to_string();
-    let pending: Option<Vec<(i64, String)>> = state
-        .store
-        .with_user(&user, |conn| {
-            let complete: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM app_metadata WHERE key = ?1",
-                    [SUBSTANCE_BACKFILL_KEY],
-                    |r| r.get(0),
-                )
-                .ok();
-            if complete.as_deref() == Some("complete") {
-                return Ok(None);
-            }
-
-            let mut stmt = conn
-                .prepare("SELECT id, title, summary, minutes_text FROM episodes ORDER BY id ASC")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    let id: i64 = r.get(0)?;
-                    let parts = [
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ];
-                    let joined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n");
-                    // Keep batches bounded even for unusually long OCR-derived
-                    // summaries. Classification needs the gist, not full fidelity.
-                    let text = joined.chars().take(6_000).collect::<String>();
-                    Ok((id, text))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(Some(rows))
-        })
-        .await?;
-
-    let Some(rows) = pending else {
-        return Ok(());
-    };
-
-    let mut distribution: HashMap<String, usize> = HashMap::new();
-    for batch in rows.chunks(SUBSTANCE_BACKFILL_BATCH) {
-        let input: Vec<Value> = batch
-            .iter()
-            .map(|(id, text)| json!({"id": id, "text": text}))
-            .collect();
-        let message = format!(
-            "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
-            serde_json::to_string(&input)?
-        );
-        reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
-        let response = super::vertex::generate_custom(
-            state,
-            user_id,
-            super::vertex::VertexOperation::SubstanceBackfill,
-            SUBSTANCE_BACKFILL_PROMPT,
-            &message,
-            substance_backfill_schema(),
-            CLASSIFIER_MAX_OUTPUT_TOKENS,
-        )
-        .await?;
-        let parsed = extract_json(&response.text).ok_or_else(|| {
-            EnclaveError::Config("substance backfill response was not valid JSON".into())
-        })?;
-        let classifications = parsed
-            .get("classifications")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                EnclaveError::Config("substance backfill omitted classifications".into())
-            })?;
-
-        let expected: std::collections::HashSet<i64> = batch.iter().map(|(id, _)| *id).collect();
-        let mut updates: HashMap<i64, String> = HashMap::new();
-        for item in classifications {
-            let Some(id) = item.get("id").and_then(Value::as_i64) else {
-                continue;
-            };
-            if !expected.contains(&id) {
-                continue;
-            }
-            let Some(substance) = item
-                .get("substance")
-                .and_then(Value::as_str)
-                .and_then(crate::episodes::validate_substance)
-            else {
-                continue;
-            };
-            updates.insert(id, substance.to_string());
-        }
-        if updates.len() != batch.len() {
-            return Err(EnclaveError::Config(format!(
-                "substance backfill classified {}/{} episodes in a batch",
-                updates.len(),
-                batch.len()
-            )));
-        }
-
-        for substance in updates.values() {
-            *distribution.entry(substance.clone()).or_default() += 1;
-        }
-        state
-            .store
-            .with_user(&user, move |conn| {
-                for (id, substance) in updates {
-                    // Historical rows carry the migration placeholder `normal`;
-                    // this one-time pass intentionally overwrites it. Normal
-                    // summarizer extensions use upgrade-only merge instead.
-                    conn.execute(
-                        "UPDATE episodes SET substance = ?2 WHERE id = ?1",
-                        rusqlite::params![id, substance],
-                    )?;
-                }
-                Ok(())
-            })
-            .await?;
-    }
-
-    state
-        .store
-        .with_user(&user, |conn| {
-            conn.execute(
-                "INSERT INTO app_metadata (key, value) VALUES (?1, 'complete') \
-                 ON CONFLICT(key) DO UPDATE SET value='complete', \
-                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                [SUBSTANCE_BACKFILL_KEY],
-            )?;
-            Ok(())
-        })
-        .await?;
-    state.store.save_user(&user).await?;
-    info!(
-        user_id,
-        episodes = rows.len(),
-        none = distribution.get("none").copied().unwrap_or(0),
-        low = distribution.get("low").copied().unwrap_or(0),
-        normal = distribution.get("normal").copied().unwrap_or(0),
-        "episode substance backfill complete"
-    );
-    Ok(())
-}
-
-/// Repair the historical `visual_evidence='none'` placeholder left by builds
-/// whose Gemini response schema did not expose the field. Classification uses
-/// only already-synced episode text and member screenshot metadata/OCR; image
-/// bytes are never loaded or sent. The per-user marker makes the pass one-shot,
-/// while the completion-after-validation rule makes an interrupted run retryable.
-#[allow(dead_code)]
-async fn run_visual_evidence_backfill(state: &CpState, user_id: &str) -> Result<()> {
-    let user = user_id.to_string();
-    let pending: Option<Vec<(i64, String)>> = state
-        .store
-        .with_user(&user, |conn| {
-            let complete: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM app_metadata WHERE key = ?1",
-                    [VISUAL_EVIDENCE_BACKFILL_KEY],
-                    |r| r.get(0),
-                )
-                .ok();
-            if complete.as_deref() == Some("complete") {
-                return Ok(None);
-            }
-
-            // Only normal episodes can be selected for cloud screenshot
-            // evidence, and rows already marked useful need no repair. Keep
-            // the episode query separate from the member query so each
-            // prepared statement has a simple, deterministic lifetime.
-            let episodes: Vec<(i64, String)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT e.id, e.title, e.summary, e.minutes_text, e.action_items \
-                     FROM episodes e \
-                     WHERE e.substance = 'normal' AND e.visual_evidence = 'none' \
-                       AND EXISTS (SELECT 1 FROM episode_members m \
-                                   WHERE m.episode_id = e.id \
-                                     AND m.record_type = 'screenshot') \
-                     ORDER BY e.id ASC",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        let id: i64 = r.get(0)?;
-                        let parts = [
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                        ];
-                        Ok((
-                            id,
-                            parts.into_iter().flatten().collect::<Vec<_>>().join("\n"),
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            };
-
-            let mut screens = conn.prepare(
-                "SELECT s.captured_at, s.active_app, s.window_title, s.url, \
-                        substr(s.ocr_text, 1, 500) \
-                 FROM episode_members m \
-                 JOIN screenshots s ON s.id = m.record_id \
-                 WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' \
-                   AND s.is_duplicate = 0 \
-                 ORDER BY s.captured_at ASC LIMIT 120",
-            )?;
-            let mut rows = Vec::with_capacity(episodes.len());
-            for (id, episode_text) in episodes {
-                let screen_lines: Vec<String> = screens
-                    .query_map([id], |r| {
-                        let captured_at: String = r.get(0)?;
-                        let app: Option<String> = r.get(1)?;
-                        let title: Option<String> = r.get(2)?;
-                        let url: Option<String> = r.get(3)?;
-                        let ocr: Option<String> = r.get(4)?;
-                        Ok(format!(
-                            "{captured_at} | app={} | title={} | url={} | text={}",
-                            app.as_deref().unwrap_or(""),
-                            title.as_deref().unwrap_or(""),
-                            url.as_deref().unwrap_or(""),
-                            ocr.as_deref().unwrap_or("")
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                if screen_lines.is_empty() {
-                    continue;
-                }
-                let episode_excerpt = episode_text.chars().take(6_000).collect::<String>();
-                let screen_excerpt = screen_lines
-                    .join("\n")
-                    .chars()
-                    .take(10_000)
-                    .collect::<String>();
-                let evidence = format!(
-                    "EPISODE TEXT:\n{episode_excerpt}\n\nSCREEN METADATA (TEXT ONLY; NO PIXELS):\n{screen_excerpt}"
-                );
-                rows.push((id, evidence));
-            }
-            Ok(Some(rows))
-        })
-        .await?;
-
-    let Some(rows) = pending else {
-        return Ok(());
-    };
-
-    let mut distribution: HashMap<String, usize> = HashMap::new();
-    for batch in rows.chunks(VISUAL_EVIDENCE_BACKFILL_BATCH) {
-        let input: Vec<Value> = batch
-            .iter()
-            .map(|(id, evidence)| json!({"id": id, "evidence": evidence}))
-            .collect();
-        let message = format!(
-            "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
-            serde_json::to_string(&input)?
-        );
-        reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
-        let response = super::vertex::generate_custom(
-            state,
-            user_id,
-            super::vertex::VertexOperation::VisualEvidenceBackfill,
-            VISUAL_EVIDENCE_BACKFILL_PROMPT,
-            &message,
-            visual_evidence_backfill_schema(),
-            CLASSIFIER_MAX_OUTPUT_TOKENS,
-        )
-        .await?;
-        let parsed = extract_json(&response.text).ok_or_else(|| {
-            EnclaveError::Config("visual evidence backfill response was not valid JSON".into())
-        })?;
-        let classifications = parsed
-            .get("classifications")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                EnclaveError::Config("visual evidence backfill omitted classifications".into())
-            })?;
-
-        let expected: std::collections::HashSet<i64> = batch.iter().map(|(id, _)| *id).collect();
-        let mut updates: HashMap<i64, String> = HashMap::new();
-        for item in classifications {
-            let Some(id) = item.get("id").and_then(Value::as_i64) else {
-                continue;
-            };
-            if !expected.contains(&id) {
-                continue;
-            }
-            let Some(visual_evidence) = item
-                .get("visual_evidence")
-                .and_then(Value::as_str)
-                .and_then(crate::episodes::validate_visual_evidence)
-            else {
-                continue;
-            };
-            updates.insert(id, visual_evidence.to_string());
-        }
-        if updates.len() != batch.len() {
-            return Err(EnclaveError::Config(format!(
-                "visual evidence backfill classified {}/{} episodes in a batch",
-                updates.len(),
-                batch.len()
-            )));
-        }
-
-        for visual_evidence in updates.values() {
-            *distribution.entry(visual_evidence.clone()).or_default() += 1;
-        }
-        state
-            .store
-            .with_user(&user, move |conn| {
-                for (id, visual_evidence) in updates {
-                    conn.execute(
-                        "UPDATE episodes SET visual_evidence = ?2 WHERE id = ?1",
-                        rusqlite::params![id, visual_evidence],
-                    )?;
-                }
-                Ok(())
-            })
-            .await?;
-    }
-
-    state
-        .store
-        .with_user(&user, |conn| {
-            conn.execute(
-                "INSERT INTO app_metadata (key, value) VALUES (?1, 'complete') \
-                 ON CONFLICT(key) DO UPDATE SET value='complete', \
-                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                [VISUAL_EVIDENCE_BACKFILL_KEY],
-            )?;
-            Ok(())
-        })
-        .await?;
-    state.store.save_user(&user).await?;
-    info!(
-        user_id,
-        episodes = rows.len(),
-        none = distribution.get("none").copied().unwrap_or(0),
-        useful = distribution.get("useful").copied().unwrap_or(0),
-        "episode visual evidence backfill complete"
-    );
-    Ok(())
-}
-
-/// Membership by innermost-containing span. Returns, per episode index, the
-/// member utterance ids and screenshot ids.
 fn derive_membership(
     utterances: &[UttRow],
     screenshots: &[ScrRow],
@@ -903,7 +499,7 @@ fn derive_membership(
 }
 
 /// One user's outstanding settle refusal: a window that was derived, paid for
-/// with a summary call, and then refused by the WAL lane at submit time.
+/// with a summary call, and then refused by PostgreSQL at settlement time.
 ///
 /// Holding the cursor is the right answer for evidence integrity — those
 /// episodes were never written, and a forward-only cursor that steps over
@@ -913,89 +509,16 @@ fn derive_membership(
 /// budget refuses. This memo bounds that: it records which held cursor is
 /// refusing and how long to wait before spending on it again.
 ///
-/// In-process and advisory, like `summarize_all`'s failure ladder. Losing it
-/// across a restart costs at most one extra call, and it can never make a
-/// window fail that would otherwise have settled — the only thing it
-/// suppresses is the spend.
-struct SettleRefusal {
-    /// The Control cursor the refused window started from. A different value
-    /// means the cursor has moved, so this is a different window and the memo
-    /// no longer applies.
-    cursor: Option<String>,
-    consecutive: u32,
-    retry_at_ms: i64,
-}
-
-fn settle_refusals() -> &'static Mutex<HashMap<String, SettleRefusal>> {
-    static SETTLE_REFUSALS: OnceLock<Mutex<HashMap<String, SettleRefusal>>> = OnceLock::new();
-    SETTLE_REFUSALS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Seconds still to wait before this user's window may be derived — and paid
-/// for — again, or `None` when nothing is holding it back. A memo recorded
-/// against a different cursor is dropped on sight: the cursor moved, so the
-/// refusal it recorded is not this window's.
-async fn settle_backoff_holds(user_id: &str, cursor: Option<&str>) -> Option<i64> {
-    let mut refusals = settle_refusals().lock().await;
-    let (stale, retry_at_ms) = {
-        let refusal = refusals.get(user_id)?;
-        (refusal.cursor.as_deref() != cursor, refusal.retry_at_ms)
-    };
-    if stale {
-        refusals.remove(user_id);
-        return None;
-    }
-    let remaining_ms = retry_at_ms - now_ms();
-    if remaining_ms <= 0 {
-        return None;
-    }
-    Some(remaining_ms.div_euclid(1000).max(1))
-}
-
-/// Record that this user's window was refused at settle time, and return the
-/// backoff now in force, in seconds. Doubling from
-/// [`SETTLE_BACKOFF_BASE_SECS`], capped at [`SETTLE_BACKOFF_MAX_SECS`]: a
-/// lane that heals is retried shortly after it does, and a lane that never
-/// heals stops re-buying the same summary once per sweep forever.
-async fn note_settle_refusal(user_id: &str, cursor: Option<&str>) -> i64 {
-    let mut refusals = settle_refusals().lock().await;
-    let entry = refusals
-        .entry(user_id.to_owned())
-        .or_insert_with(|| SettleRefusal {
-            cursor: cursor.map(str::to_owned),
-            consecutive: 0,
-            retry_at_ms: 0,
-        });
-    if entry.cursor.as_deref() != cursor {
-        entry.cursor = cursor.map(str::to_owned);
-        entry.consecutive = 0;
-    }
-    entry.consecutive = entry.consecutive.saturating_add(1);
-    let doublings = 1i64.checked_shl(entry.consecutive - 1).unwrap_or(i64::MAX);
-    let delay_secs = SETTLE_BACKOFF_BASE_SECS
-        .saturating_mul(doublings)
-        .min(SETTLE_BACKOFF_MAX_SECS);
-    entry.retry_at_ms = now_ms() + delay_secs * 1000;
-    delay_secs
-}
-
-/// The lane settled a window for this user: whatever it was refusing before,
-/// it is not refusing now.
-async fn clear_settle_refusal(user_id: &str) {
-    settle_refusals().lock().await.remove(user_id);
-}
-
 const SUMMARY_CLAIM_LEASE_SECONDS: i64 = 15 * 60;
 
 async fn release_summary_claim(
     state: &CpState,
-    claim: Option<&SummaryWindowClaim>,
+    claim: &SummaryWindowClaim,
     error_code: Option<&str>,
 ) {
-    let (Some(repository), Some(claim)) = (state.repositories.memory_formation(), claim) else {
-        return;
-    };
-    if let Err(error) = repository
+    if let Err(error) = state
+        .repositories
+        .memory_formation()
         .release_summary_window(claim, &format_epoch_millis(now_ms()), error_code)
         .await
     {
@@ -1013,65 +536,13 @@ async fn summarize_user_window(
     user_id: &str,
     mode: SummarizeMode,
 ) -> Result<Value> {
-    // ADR-0022: the whole window is now WAL-authoritative for a selected user.
-    // Its evidence reads (`fetch_range`, `fetch_open_episodes`, and the
-    // recoverable-media cursor hold) route through `wal_authoritative_read`,
-    // the F8 upsert at its tail settles as a sealed plan, and `save_user` is a
-    // provider-silent no-op — so the D4 deferral this domain used to take is
-    // gone. A routed lane that cannot serve REFUSES, and that refusal must
-    // reach `summarize_all` as `Err`: flattening it into an empty span would
-    // advance the forward-only cursor past evidence nobody read.
-    //
-    // Serialize runs: the scheduler's catch-up loop and the session-settled
-    // kick (ADR-0034) can fire concurrently for the same user, and two
-    // racing runs would summarize the same window and double-create episodes
-    // (the cursor is only re-read here, under the lock). Global rather than
-    // per-user is fine at current scale — runs are deliberately sequential
-    // anyway to avoid Vertex rate-limit storms.
+    // The durable PostgreSQL claim below is the cross-replica serialization
+    // boundary. This short process-local lock also coalesces the scheduler and
+    // session-settled kick before either attempts to claim or spend at Vertex.
     static SUMMARIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = SUMMARIZE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
 
-    // Historical model migrations are never launched by the recurring worker.
-    // Existing rows remain readable and can be explicitly repaired by a
-    // future bounded operator/user queue without competing with live capture.
-
     let summarized_until = state.repositories.work().summarized_until(user_id).await?;
-    // A window this lane already refused to settle held the cursor rather
-    // than stepping over evidence it never wrote (see
-    // `wal_authoritative_upsert`) — but the window ahead of a held cursor is
-    // re-derived from scratch every sweep, and re-deriving it means re-paying
-    // for the summary. Wait the backoff out before spending again. This
-    // advances nothing and claims no progress: it is the same non-advancing
-    // `skipped` shape the short-tail case uses, so it lands on
-    // `summarize_all`'s `Ok(_) => break`, never on the cursor-advanced arm.
-    // Unselected users can have no memo — nothing arms one off the WAL
-    // path — and the check is gated anyway, so the legacy path is untouched.
-    let settle_backoff = if state.store.is_wal_authoritative(user_id) {
-        settle_backoff_holds(user_id, summarized_until.as_deref()).await
-    } else {
-        None
-    };
-    if let Some(retry_in_secs) = settle_backoff {
-        return Ok(serde_json::json!({
-            "skipped": true,
-            "reason": "settle_backoff",
-            "retry_in_secs": retry_in_secs,
-        }));
-    }
-    // ADR-0022 F8: the archive progress row closes the Control/archive
-    // durability split. If a settled window's Control cursor write was lost,
-    // start from the archive-recorded cutoff instead of re-summarizing the
-    // same range into duplicate episodes.
-    let archive_cutoff = if state.store.is_wal_authoritative(user_id) {
-        state
-            .store
-            .wal_authoritative_read(user_id, |conn| {
-                Ok(wal::window::read_window_progress(conn)?.1)
-            })
-            .await?
-    } else {
-        None
-    };
     let now = now_ms();
     let (tail_cutoff, min_window_ms) = match mode {
         SummarizeMode::Scheduled => (
@@ -1088,10 +559,6 @@ async fn summarize_user_window(
     let new_from = match &summarized_until {
         Some(c) => ms(c).max(max_lookback),
         None => max_lookback,
-    };
-    let new_from = match archive_cutoff.as_deref() {
-        Some(cutoff) => new_from.max(ms(cutoff)),
-        None => new_from,
     };
     let Some(win) = window_bounds(new_from, tail_cutoff, min_window_ms) else {
         // Live tail too short to possibly hold an episode — wait for it to
@@ -1173,30 +640,24 @@ async fn summarize_user_window(
         }
     );
 
-    // PostgreSQL fleet mode admits one provider-backed summarizer for this
-    // user's window. The lease is durable and reclaimable after a crash; the
-    // later settlement verifies the opaque token before applying anything.
-    let summary_claim = if let Some(repository) = state.repositories.memory_formation() {
-        match repository
-            .claim_summary_window(
-                user_id,
-                &new_from_iso,
-                &new_to_iso,
-                &format_epoch_millis(now_ms()),
-                SUMMARY_CLAIM_LEASE_SECONDS,
-            )
-            .await?
-        {
-            Some(claim) => Some(claim),
-            None => {
-                return Ok(serde_json::json!({
-                    "skipped": true,
-                    "reason": "summary_window_claimed"
-                }));
-            }
-        }
-    } else {
-        None
+    // Claim before any provider-backed work. The opaque lease makes one
+    // replica authoritative for this exact window and settlement revalidates it.
+    let Some(summary_claim) = state
+        .repositories
+        .memory_formation()
+        .claim_summary_window(
+            user_id,
+            &new_from_iso,
+            &new_to_iso,
+            &format_epoch_millis(now_ms()),
+            SUMMARY_CLAIM_LEASE_SECONDS,
+        )
+        .await?
+    else {
+        return Ok(serde_json::json!({
+            "skipped": true,
+            "reason": "summary_window_claimed"
+        }));
     };
 
     // Call Vertex. Failed windows return an `error` status carrying
@@ -1206,7 +667,7 @@ async fn summarize_user_window(
     if let Err(error) =
         reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
     {
-        release_summary_claim(state, summary_claim.as_ref(), Some("quota_reservation")).await;
+        release_summary_claim(state, &summary_claim, Some("quota_reservation")).await;
         return Err(error);
     }
     let response = match super::vertex::generate(
@@ -1220,12 +681,12 @@ async fn summarize_user_window(
     {
         Ok(t) => t.text,
         Err(e) if e.to_string().contains("quota") => {
-            release_summary_claim(state, summary_claim.as_ref(), Some("quota")).await;
+            release_summary_claim(state, &summary_claim, Some("quota")).await;
             return Ok(serde_json::json!({ "skipped": true, "reason": "quota" }));
         }
         Err(e) => {
             warn!(error = %e, "summarizer LLM call failed");
-            release_summary_claim(state, summary_claim.as_ref(), Some("model_call")).await;
+            release_summary_claim(state, &summary_claim, Some("model_call")).await;
             return Ok(serde_json::json!({ "error": e.to_string(), "window_to": new_to_iso }));
         }
     };
@@ -1235,7 +696,7 @@ async fn summarize_user_window(
             response_len = response.len(),
             "summarizer LLM response unparseable"
         );
-        release_summary_claim(state, summary_claim.as_ref(), Some("unparseable")).await;
+        release_summary_claim(state, &summary_claim, Some("unparseable")).await;
         return Ok(
             serde_json::json!({ "error": "unparseable LLM response", "window_to": new_to_iso }),
         );
@@ -1259,7 +720,7 @@ async fn summarize_user_window(
         if let Err(error) =
             reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
         {
-            release_summary_claim(state, summary_claim.as_ref(), Some("repair_quota")).await;
+            release_summary_claim(state, &summary_claim, Some("repair_quota")).await;
             return Err(error);
         }
         match super::vertex::generate(
@@ -1420,349 +881,32 @@ async fn summarize_user_window(
     }
 
     let cutoff_iso = format_epoch_millis(effective_cutoff);
-    if let Some(repository) = state.repositories.memory_formation() {
-        let claim = summary_claim
-            .ok_or_else(|| EnclaveError::Store("PostgreSQL summarizer claim disappeared".into()))?;
-        if to_upsert.is_empty() && tail_bounded {
-            release_summary_claim(state, Some(&claim), None).await;
-            info!(
-                user_id,
-                dropped, "summarized nothing; holding cursor for tail to grow"
-            );
-            return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
-        }
-        let ids = repository
-            .settle_summary_window(SummaryWindowSettlement {
-                claim,
-                episodes: to_upsert,
-                cursor: Some(cutoff_iso.clone()),
-            })
-            .await?;
-        let upserted = ids.len();
-        embed_episodes(state, user_id, &ids).await;
-        info!(user_id, upserted, dropped, "summarized");
-        return Ok(
-            serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }),
-        );
-    }
-
-    let mut upserted = 0;
-    if !to_upsert.is_empty() {
-        let user = user_id.to_string();
-        let ids = if state.store.is_wal_authoritative(&user) {
-            // ADR-0022 F8: the window settles as sealed plans (one per
-            // MAX_BATCH_ITEMS chunk); the ids come back from the assignment
-            // tables they wrote. A CONSTRUCTION-time refusal — the window's
-            // own content, not the lane — takes the error/window_to shape so
-            // the sweep's skip ladder can move past the window instead of
-            // freezing on it. A settle-time refusal cannot be told apart
-            // from a lane that is merely down, so it holds the cursor and
-            // arms the backoff instead; see `wal_authoritative_upsert`.
-            match wal_authoritative_upsert(
-                state,
-                &user,
-                &to_upsert,
-                &new_from_iso,
-                &new_to_iso,
-                &format_epoch_millis(effective_cutoff),
-            )
-            .await
-            {
-                Ok(Ok(ids)) => {
-                    clear_settle_refusal(&user).await;
-                    ids
-                }
-                Ok(Err(reason)) => {
-                    warn!(user_id, reason, "episode window plan refused");
-                    return Ok(serde_json::json!({ "error": reason, "window_to": new_to_iso }));
-                }
-                Err(error) => {
-                    // Paid for and not settled. HOLD the cursor — these
-                    // episodes were never written — and stop re-buying the
-                    // same summary once per sweep while the lane stays this
-                    // way. `Err` reaches `summarize_all`'s warn-and-break
-                    // arm, which records no window_to, so the skip ladder
-                    // stays out of it and nothing advances.
-                    let retry_in_secs =
-                        note_settle_refusal(&user, summarized_until.as_deref()).await;
-                    warn!(
-                        user_id,
-                        error = %error,
-                        retry_in_secs,
-                        "episode window did not settle; holding the cursor and \
-                         backing off the summary call"
-                    );
-                    return Err(error);
-                }
-            }
-        } else {
-            state
-                .store
-                .with_user(&user, move |conn| upsert_episodes(conn, &to_upsert))
-                .await?
-        };
-        upserted = ids.len();
-        // §G.2: embed the upserted episodes in-enclave BEFORE the save so the
-        // vectors persist in the same GCS write.
-        embed_episodes(state, &user, &ids).await;
-        state.store.save_user(&user).await?;
-    }
-
-    // Nothing upserted from a tail-bounded window: HOLD the cursor so the tail
-    // keeps growing until an episode can form (the ratchet fix — see module
-    // docs). Once the window hits the 6-h cap it stops being tail-bounded and
-    // the else-branch advances past genuinely insignificant content.
-    if upserted == 0 && tail_bounded {
+    if to_upsert.is_empty() && tail_bounded {
+        release_summary_claim(state, &summary_claim, None).await;
         info!(
             user_id,
             dropped, "summarized nothing; holding cursor for tail to grow"
         );
         return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
     }
-
-    state
+    let ids = state
         .repositories
-        .work()
-        .set_summarized_until(user_id, &cutoff_iso)
+        .memory_formation()
+        .settle_summary_window(SummaryWindowSettlement {
+            claim: summary_claim,
+            episodes: to_upsert,
+            cursor: Some(cutoff_iso.clone()),
+        })
         .await?;
+    let upserted = ids.len();
+    embed_episodes(state, user_id, &ids).await;
     info!(user_id, upserted, dropped, "summarized");
-    Ok(serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }))
+    Ok(serde_json::json!({
+        "episodes": upserted,
+        "dropped": dropped,
+        "to": cutoff_iso
+    }))
 }
-
-/// ADR-0022 F8: settle one summarizer window as a sealed plan per
-/// `MAX_BATCH_ITEMS` chunk (each constructed once, R5) and return the
-/// resulting episode ids in item order from the assignment tables the plans
-/// wrote.
-///
-/// `Ok(Err(reason))` is a **construction-time refusal** — `WindowEpisode`,
-/// `EpisodeWindowUpsertPlan::new`, or `prepare` rejected the window's own
-/// content before anything was submitted. The caller reports it in the
-/// `{"error","window_to"}` shape so the sweep's MAX_WINDOW_FAILURES ladder
-/// skips the window instead of freezing the cursor and re-burning the
-/// Vertex call forever.
-///
-/// Everything else stays `Err`, and that deliberately includes SUBMIT-time
-/// refusals. It is tempting to call those deterministic too, but they cannot
-/// be classified here: `Store::wal_authoritative_submit` surfaces owner-side
-/// refusals content-free — a conflict as `Conflict`, and precondition,
-/// corrupt, limit, malformed, and plain unavailability all alike as
-/// "wal serving authority is unavailable". Routing them into the
-/// error/window_to shape would let a lane that is merely down for half an
-/// hour march the cursor past three windows of real evidence. So they hold
-/// the cursor. The provider spend that would otherwise follow from holding
-/// it — the same window re-derived and the same summary call re-issued every
-/// sweep — is bounded separately, by the settle-refusal backoff the caller
-/// arms on `Err`; see [`note_settle_refusal`].
-async fn wal_authoritative_upsert(
-    state: &CpState,
-    user_id: &str,
-    items: &[EpisodeInput],
-    from_iso: &str,
-    to_iso: &str,
-    effective_cutoff: &str,
-) -> Result<std::result::Result<Vec<i64>, &'static str>> {
-    // Coalesce duplicate episode_refs to the state sequential legacy upserts
-    // net out to: later scalars win, the minute/tier merges accumulate
-    // (both tier merges are lattice joins, so folding here equals chaining
-    // there), members union. Two arms racing one row inside a single CAS'd
-    // batch is inexpressible, so the fold happens before construction.
-    let mut coalesced: Vec<EpisodeInput> = Vec::with_capacity(items.len());
-    for item in items {
-        let slot = item
-            .id
-            .and_then(|id| coalesced.iter().position(|seen| seen.id == Some(id)));
-        let Some(index) = slot else {
-            coalesced.push(item.clone());
-            continue;
-        };
-        let earlier = &coalesced[index];
-        let mut merged = item.clone();
-        let mut minutes = earlier.minute_summaries.clone().unwrap_or_default();
-        minutes.extend(merged.minute_summaries.unwrap_or_default());
-        merged.minute_summaries = Some(minutes);
-        merged.substance = Some(
-            crate::episodes::merge_substance(
-                earlier.substance.as_deref(),
-                item.substance.as_deref(),
-            )
-            .to_string(),
-        );
-        merged.visual_evidence = Some(
-            crate::episodes::merge_visual_evidence(
-                earlier.visual_evidence.as_deref(),
-                item.visual_evidence.as_deref(),
-            )
-            .to_string(),
-        );
-        let mut utterances = earlier.member_utterance_ids.clone();
-        for id in &item.member_utterance_ids {
-            if !utterances.contains(id) {
-                utterances.push(*id);
-            }
-        }
-        merged.member_utterance_ids = utterances;
-        let mut screenshots = earlier.member_screenshot_ids.clone();
-        for id in &item.member_screenshot_ids {
-            if !screenshots.contains(id) {
-                screenshots.push(*id);
-            }
-        }
-        merged.member_screenshot_ids = screenshots;
-        coalesced[index] = merged;
-    }
-
-    // A window that holds more episodes than one sealed plan may carry is
-    // SPLIT across successive plans, never refused: `EpisodeWindowUpsertPlan`
-    // caps a batch at `MAX_BATCH_ITEMS`, and handing it a larger batch used to
-    // surface as the construction-refusal shape — which the sweep's
-    // MAX_WINDOW_FAILURES ladder walks the forward-only cursor PAST after
-    // three passes, discarding every episode in the window permanently and
-    // unrecoverably. The legacy path has no such cap, so that cliff also made
-    // a selected user silently lose windows an unselected one keeps. The
-    // bound is unchanged; only the response to hitting it is.
-    //
-    // One routed read per chunk snapshots the window sequence, the
-    // id-allocation pin, and that chunk's predecessor tuples, because every
-    // settled chunk CAS-advances the sequence and allocates ids: carrying the
-    // first chunk's pair into the second would refuse it with `Precondition`.
-    let committed_at = format_epoch_millis(now_ms());
-    let chunk_count = coalesced.len().div_ceil(wal::window::MAX_BATCH_ITEMS);
-    let mut assigned: Vec<i64> = Vec::with_capacity(coalesced.len());
-    for (chunk_index, chunk) in coalesced.chunks(wal::window::MAX_BATCH_ITEMS).enumerate() {
-        let probe_ids: Vec<Option<i64>> = chunk.iter().map(|item| item.id).collect();
-        let (window_seq, sequence_pin, predecessors) = state
-            .store
-            .wal_authoritative_read(user_id, move |conn| {
-                let (window_seq, _) = wal::window::read_window_progress(conn)?;
-                let sequence_pin = wal::window::read_sequence_pin(conn)?;
-                let mut predecessors = Vec::with_capacity(probe_ids.len());
-                for id in probe_ids {
-                    predecessors.push(match id {
-                        Some(id) => wal::window::read_episode_predecessor(conn, id)?
-                            .map(|predecessor| (id, predecessor)),
-                        None => None,
-                    });
-                }
-                Ok((window_seq, sequence_pin, predecessors))
-            })
-            .await?;
-
-        let mut episodes = Vec::with_capacity(chunk.len());
-        for (item, predecessor) in chunk.iter().zip(predecessors) {
-            let to_json = |values: Option<&[String]>| {
-                values.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))
-            };
-            let (existing_minutes, existing_substance, existing_visual) = match &predecessor {
-                Some((_, p)) => (
-                    p.minute_summaries().map(str::to_owned),
-                    Some(p.substance().to_owned()),
-                    Some(p.visual_evidence().to_owned()),
-                ),
-                None => (None, None, None),
-            };
-            let merged = crate::episodes::merge_minute_summaries(
-                existing_minutes.as_deref(),
-                item.minute_summaries.as_deref().unwrap_or(&[]),
-            );
-            let (minutes_json, minutes_text) = match merged {
-                Some((json, text)) => (Some(json), Some(text)),
-                None => (None, None),
-            };
-            let substance = if predecessor.is_some() {
-                crate::episodes::merge_substance(
-                    existing_substance.as_deref(),
-                    item.substance.as_deref(),
-                )
-            } else {
-                crate::episodes::normalized_substance(item.substance.as_deref())
-            }
-            .to_string();
-            let visual_evidence = if predecessor.is_some() {
-                crate::episodes::merge_visual_evidence(
-                    existing_visual.as_deref(),
-                    item.visual_evidence.as_deref(),
-                )
-            } else {
-                crate::episodes::normalized_visual_evidence(item.visual_evidence.as_deref())
-            }
-            .to_string();
-            let target = wal::window::WindowEpisodeTarget {
-                started_at: item.started_at.clone(),
-                ended_at: item.ended_at.clone(),
-                episode_type: item.episode_type.clone(),
-                title: item.title.clone(),
-                summary: item.summary.clone(),
-                participants_json: to_json(item.participants.as_deref()),
-                languages_json: to_json(item.languages.as_deref()),
-                action_items_json: to_json(item.action_items.as_deref()),
-                model: item.model.clone(),
-                minutes_json,
-                minutes_text,
-                substance,
-                visual_evidence,
-                member_utterance_ids: item.member_utterance_ids.clone(),
-                member_screenshot_ids: item.member_screenshot_ids.clone(),
-            };
-            let episode = match predecessor {
-                Some((id, p)) => wal::window::WindowEpisode::update(id, p, target),
-                None => wal::window::WindowEpisode::insert(target),
-            };
-            let Ok(episode) = episode else {
-                return Ok(Err("episode window item refused"));
-            };
-            episodes.push(episode);
-        }
-        // Only the FINAL chunk publishes the window's real archive cutoff. A
-        // chunk that settles while a later one still might not is not evidence
-        // that the window was consumed, and the progress row's cutoff is a floor
-        // on the next run's `new_from` (see `summarize_user_window`) — publishing
-        // the real cutoff early would step the archive side of the cursor over
-        // episodes that were never written. `from_iso` IS this run's `new_from`,
-        // so a partial window's floor is exactly the floor it already had: the
-        // next run re-derives the same window rather than skipping the tail of
-        // it. The cost of a mid-window failure is therefore a possible duplicate
-        // of an already-settled chunk (the same accepted case as a lost Control
-        // write — see the module docs on why member-exclusivity is deliberately
-        // not a precondition), never a lost one.
-        let chunk_cutoff = if chunk_index + 1 == chunk_count {
-            effective_cutoff
-        } else {
-            from_iso
-        };
-        let Ok(plan) = wal::window::EpisodeWindowUpsertPlan::new(
-            user_id.to_owned(),
-            window_seq,
-            from_iso.to_owned(),
-            to_iso.to_owned(),
-            chunk_cutoff.to_owned(),
-            sequence_pin,
-            committed_at.clone(),
-            episodes,
-        ) else {
-            return Ok(Err("episode window plan refused"));
-        };
-        let Ok(prepared) =
-            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
-        else {
-            return Ok(Err("episode window request refused"));
-        };
-        state
-            .store
-            .wal_authoritative_submit(user_id, prepared)
-            .await?;
-        let settled_seq = window_seq;
-        assigned.extend(
-            state
-                .store
-                .wal_authoritative_read(user_id, move |conn| {
-                    Ok(wal::window::read_window_assignments(conn, settled_seq)?)
-                })
-                .await?,
-        );
-    }
-    Ok(Ok(assigned))
-}
-
 /// In-enclave episode embeddings (ADR-0004 §G.2). Episodes are born in the
 /// enclave — the Mac never sees them — so their vectors are computed HERE
 /// with the in-TEE candle encoder, in the same pinned `MODEL_ID` space as the
@@ -1778,134 +922,48 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
         return;
     };
 
-    let id_list = ids.to_vec();
-    let loaded = if let Some(repository) = state.repositories.memory_formation() {
-        repository
-            .episode_embedding_sources(user_id, &id_list)
-            .await
-            .map(|rows| rows.into_iter().map(|row| (row.id, row.text)).collect())
-    } else {
-        state
-            .store
-            .wal_authoritative_read(user_id, move |conn| {
-                let mut out = Vec::new();
-                for id in id_list {
-                    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
-                        .query_row(
-                            "SELECT title, summary, minutes_text FROM episodes WHERE id = ?1",
-                            [id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                        )
-                        .ok();
-                    if let Some((title, summary, minutes)) = row {
-                        let text = [title, summary, minutes]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !text.trim().is_empty() {
-                            out.push((id, text));
-                        }
-                    }
-                }
-                Ok(out)
-            })
-            .await
-    };
-    let rows: Vec<(i64, String)> = match loaded {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "episode embed: read-back failed");
+    let rows = match state
+        .repositories
+        .memory_formation()
+        .episode_embedding_sources(user_id, ids)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(error = %error, "episode embed: read-back failed");
             return;
         }
     };
 
-    // CPU-bound inference (~10–50 ms each) — blocking pool, not the async worker.
-    let mut vectors: Vec<(i64, String, Vec<f32>)> = Vec::new();
-    for (id, text) in rows {
-        let eng = engine.clone();
-        let embed_text = text.clone();
-        match tokio::task::spawn_blocking(move || eng.embed(&embed_text)).await {
-            Ok(Ok(v)) => vectors.push((id, text, v)),
-            Ok(Err(e)) => {
+    let mut writes = Vec::new();
+    for row in rows {
+        let episode_id = row.id;
+        let text = row.text;
+        let engine = Arc::clone(&engine);
+        match tokio::task::spawn_blocking(move || engine.embed(&text)).await {
+            Ok(Ok(embedding)) => writes.push(EpisodeEmbeddingWrite {
+                id: episode_id,
+                embedding,
+            }),
+            Ok(Err(error)) => {
                 warn!(
-                    episode_id = id,
-                    "episode embed failed ({e}) — FTS-only for this episode"
+                    episode_id,
+                    "episode embed failed ({error}) — FTS-only for this episode"
                 );
             }
-            Err(e) => warn!(episode_id = id, "episode embed task panicked ({e})"),
+            Err(error) => warn!(episode_id, "episode embed task panicked ({error})"),
         }
     }
-    if vectors.is_empty() {
+    if writes.is_empty() {
         return;
     }
-    if let Some(repository) = state.repositories.memory_formation() {
-        let writes = vectors
-            .into_iter()
-            .map(|(id, _, embedding)| EpisodeEmbeddingWrite { id, embedding })
-            .collect::<Vec<_>>();
-        if let Err(error) = repository.write_episode_embeddings(user_id, &writes).await {
-            warn!(error = %error, "episode embed: vector write failed");
-        }
-        return;
-    }
-    if state.store.is_wal_authoritative(user_id) {
-        // ADR-0022 F9: the batch settles as a sealed plan whose identity
-        // binds each episode's exact text and vector bytes, so the
-        // finalizer's re-embed of rewritten content is a NEW operation and a
-        // crash-retry of the same content replays. Best-effort, like the
-        // legacy branch: a refused settle leaves the episode FTS-only.
-        let mut entries = Vec::with_capacity(vectors.len());
-        vectors.sort_by_key(|(id, _, _)| *id);
-        for (id, text, vector) in &vectors {
-            let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-            match wal::EpisodeEmbedding::new(
-                *id,
-                <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()).into(),
-                bytes,
-            ) {
-                Ok(entry) => entries.push(entry),
-                Err(_) => {
-                    warn!(episode_id = id, "episode embed: entry construction failed");
-                    return;
-                }
-            }
-        }
-        let plan = match wal::EpisodeEmbeddingBatchPlan::new(user_id.to_owned(), entries) {
-            Ok(plan) => plan,
-            Err(_) => {
-                warn!("episode embed: plan construction failed");
-                return;
-            }
-        };
-        let prepared =
-            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
-                Ok(prepared) => prepared,
-                Err(_) => {
-                    warn!("episode embed: plan construction failed");
-                    return;
-                }
-            };
-        if let Err(e) = state
-            .store
-            .wal_authoritative_submit(user_id, prepared)
-            .await
-        {
-            warn!(error = %e, "episode embed: settled vector write failed");
-        }
-        return;
-    }
-    if let Err(e) = state
-        .store
-        .with_user(user_id, move |conn| {
-            for (id, _, v) in &vectors {
-                write_episode_embedding(conn, *id, v)?;
-            }
-            Ok(())
-        })
+    if let Err(error) = state
+        .repositories
+        .memory_formation()
+        .write_episode_embeddings(user_id, &writes)
         .await
     {
-        warn!(error = %e, "episode embed: vector write failed");
+        warn!(error = %error, "episode embed: vector write failed");
     }
 }
 
@@ -1971,114 +1029,45 @@ fn compact_tail_excerpt(text: &str, max_chars: usize) -> String {
         .collect()
 }
 
-/// Cursor-hold check (see `media_worker::span_has_recoverable_media`): reads
-/// only; the decision it feeds is to *not* write the cursor this run.
-///
-/// ADR-0022: routed. A selected user reads the settled-only lane; an
-/// unselected one falls through to the same legacy read. A refusal propagates
-/// — the caller advances its forward-only cursor on `Ok(false)`, so a
-/// flattened failure here would strand recoverable media behind the cursor.
+/// Hold the forward-only cursor while recent failed or pending media can still
+/// become searchable evidence.
 async fn span_holds_recoverable_media(
     state: &CpState,
     user_id: &str,
     from: &str,
     to: &str,
 ) -> Result<bool> {
-    let (f, t) = (from.to_string(), to.to_string());
     let resurrection_window_start = format_epoch_millis(
         now_ms() - (super::media_worker::RESURRECTION_WINDOW_SECONDS * 1000.0) as i64,
     );
-    if let Some(repository) = state.repositories.media_processing() {
-        return repository
-            .span_has_recoverable_media(
-                user_id,
-                from,
-                to,
-                &resurrection_window_start,
-                super::media_worker::RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS,
-            )
-            .await;
-    }
     state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            super::media_worker::span_has_recoverable_media(
-                conn,
-                &f,
-                &t,
-                &resurrection_window_start,
-            )
-        })
+        .repositories
+        .media_processing()
+        .span_has_recoverable_media(
+            user_id,
+            from,
+            to,
+            &resurrection_window_start,
+            super::media_worker::RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS,
+        )
         .await
 }
 
-/// The window's primary evidence read. ADR-0022: routed, so a selected user's
-/// utterances and screens come from the settled-only lane instead of the stale
-/// legacy snapshot; an unselected user falls through to the identical legacy
-/// read. Never flatten a refusal into an empty span — see the caller.
+/// Load the bounded evidence for one claimed summarization window.
 async fn fetch_range(
     state: &CpState,
     user_id: &str,
     from: &str,
     to: &str,
 ) -> Result<(Vec<UttRow>, Vec<ScrRow>)> {
-    if let Some(repository) = state.repositories.memory_formation() {
-        return repository
-            .summary_evidence(user_id, from, to, UTT_CAP as i64, SCR_CAP as i64)
-            .await;
-    }
-    let (f, t) = (from.to_string(), to.to_string());
     state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            let mut us = conn.prepare(
-                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text \
-                 FROM utterances u JOIN audio_segments s ON s.id = u.audio_segment_id \
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2 \
-                 ORDER BY s.started_at ASC LIMIT ?3",
-            )?;
-            let utterances: Vec<UttRow> = us
-                .query_map(rusqlite::params![f, t, UTT_CAP as i64], |r| {
-                    Ok(UttRow {
-                        id: r.get(0)?,
-                        started_at: r.get(1)?,
-                        speaker_label: r.get(2)?,
-                        language: r.get(3)?,
-                        text: r.get(4)?,
-                    })
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
-            let mut ss = conn.prepare(
-                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), \
-                        substr(salient_ocr_text,1,4000), url, is_duplicate \
-                 FROM screenshots WHERE captured_at >= ?1 AND captured_at < ?2 \
-                 ORDER BY captured_at ASC LIMIT ?3",
-            )?;
-            let screenshots: Vec<ScrRow> = ss
-                .query_map(rusqlite::params![f, t, SCR_CAP as i64], |r| {
-                    Ok(ScrRow {
-                        id: r.get(0)?,
-                        captured_at: r.get(1)?,
-                        active_app: r.get(2)?,
-                        window_title: r.get(3)?,
-                        ocr_text: r.get(4)?,
-                        salient_ocr_text: r.get(5)?,
-                        url: r.get(6)?,
-                        is_duplicate: r.get(7)?,
-                    })
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
-            Ok((utterances, screenshots))
-        })
+        .repositories
+        .memory_formation()
+        .summary_evidence(user_id, from, to, UTT_CAP as i64, SCR_CAP as i64)
         .await
 }
 
-/// The extend-by-ref digest read. ADR-0022: routed. The episodes it lists are
-/// the ones the F8 upsert may extend, so it must see the same authority that
-/// upsert settles into — reading a stale legacy snapshot here would offer the
-/// model refs to rows the sealed plan's predecessor tuples do not match.
+/// Load the recent episode digests that the model may extend by reference.
 async fn fetch_open_episodes(
     state: &CpState,
     user_id: &str,
@@ -2086,67 +1075,17 @@ async fn fetch_open_episodes(
     list_end: &str,
     open_cutoff_ms: i64,
 ) -> Result<Vec<OpenEp>> {
-    if let Some(repository) = state.repositories.memory_formation() {
-        let mut episodes = repository
-            .open_episodes(user_id, list_start, list_end, 100)
-            .await?;
-        episodes.retain(|episode| ms(&episode.ended_at) >= open_cutoff_ms);
-        let excess = episodes.len().saturating_sub(30);
-        if excess > 0 {
-            episodes.drain(0..excess);
-        }
-        return Ok(episodes);
-    }
-    let (ls, le) = (list_start.to_string(), list_end.to_string());
-    let mut eps = state
-        .store
-        .wal_authoritative_read(user_id, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary, \
-                        e.participants, e.action_items, e.minutes_text, \
-                        (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='utterance'), \
-                        (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='screenshot') \
-                 FROM episodes e WHERE e.ended_at >= ?1 AND e.started_at <= ?2 \
-                 ORDER BY e.ended_at ASC LIMIT 100",
-            )?;
-            let rows: Vec<OpenEp> = stmt
-                .query_map(rusqlite::params![ls, le], |r| {
-                    let participants_json: Option<String> = r.get(6)?;
-                    let participants = participants_json
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-                        .unwrap_or_default();
-                    let action_items_json: Option<String> = r.get(7)?;
-                    let action_items = action_items_json
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-                        .unwrap_or_default();
-                    Ok(OpenEp {
-                        id: r.get(0)?,
-                        started_at: r.get(1)?,
-                        ended_at: r.get(2)?,
-                        episode_type: r.get(3)?,
-                        title: r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "untitled".into()),
-                        summary: r.get(5)?,
-                        participants,
-                        action_items,
-                        recent_minutes: r.get(8)?,
-                        utt_count: r.get(9)?,
-                        scr_count: r.get(10)?,
-                    })
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
-            Ok(rows)
-        })
+    let mut episodes = state
+        .repositories
+        .memory_formation()
+        .open_episodes(user_id, list_start, list_end, 100)
         .await?;
-    // Keep only those still "open" (ended within the window), newest 30.
-    eps.retain(|e| ms(&e.ended_at) >= open_cutoff_ms);
-    let n = eps.len();
-    if n > 30 {
-        eps.drain(0..n - 30);
+    episodes.retain(|episode| ms(&episode.ended_at) >= open_cutoff_ms);
+    let excess = episodes.len().saturating_sub(30);
+    if excess > 0 {
+        episodes.drain(0..excess);
     }
-    Ok(eps)
+    Ok(episodes)
 }
 
 /// Sweep all users (internal cron). Sequential to avoid Vertex rate-limit storms.
@@ -2182,20 +1121,10 @@ pub async fn summarize_all(state: &CpState) {
                 // claim, quota response, or error stops this user's pass.
                 Ok(v) if should_cross_proven_empty_window(&v) => {
                     failing.lock().await.remove(&id);
-                    // Every advanced window PUTs control.db.enc, and GCS
-                    // rate-limits writes to one object to ~1/sec. Windows with
-                    // records pace themselves via the LLM call, but empty
-                    // windows complete in ms. Preserve the established legacy
-                    // pacing; PostgreSQL cursor rows need no artificial wait.
-                    pace_legacy_cursor_write(state).await;
                     continue;
                 }
                 Ok(v) if v.get("to").is_some() => {
                     failing.lock().await.remove(&id);
-                    // Preserve the legacy post-cursor-write pause before the
-                    // finalization tail can rewrite the same Control object.
-                    // PostgreSQL remains a no-op here.
-                    pace_legacy_cursor_write(state).await;
                     break;
                 }
                 // A failed window that did not advance: count consecutive
@@ -2235,10 +1164,8 @@ pub async fn summarize_all(state: &CpState) {
                         break;
                     }
                     // The failed call already spent this wakeup's one model
-                    // attempt. Pace its legacy cursor write before the
-                    // finalization tail, then leave later evidence for the
-                    // next scheduler tick.
-                    pace_legacy_cursor_write(state).await;
+                    // attempt. Leave later evidence for the next scheduler
+                    // tick after the durable PostgreSQL cursor advance.
                     break;
                 }
                 // Caught up ("skipped"), holding for the tail ("waiting"), or
@@ -2259,9 +1186,6 @@ pub async fn summarize_all(state: &CpState) {
 /// and push delivery. Every step is idempotent and no-ops when nothing new
 /// finalized, so both the sweep and the session-settled kick run it.
 async fn finalize_and_deliver_user(state: &CpState, id: &str) {
-    if let Err(e) = super::query::resume_user_episode_deletions(state, id).await {
-        warn!(error = %e, "resume_user_episode_deletions failed");
-    }
     if let Err(e) = super::finalizer::finalize_user_episodes(state, id).await {
         warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
     }
@@ -2300,50 +1224,19 @@ pub fn kick_session_settled(user_id: &str) {
     }
 }
 
-/// The settled gate: the user's tail is complete evidence only when no
-/// capture session is open and recently active, and no accepted media is
-/// still queued, in flight, or awaiting retry. Anything pending means a later
-/// kick (or the sweep) will retry; running early would summarize a window
-/// whose transcript is still forming and could consume it.
-///
-/// ADR-0022: routed. The predicate reads `capture_sessions`/`media_objects`
-/// from the settled-only lane for a selected user and falls through to the
-/// identical legacy read otherwise. The `strftime('now')` recency bound is a
-/// read-time comparison, not a stored default, so nothing here binds a clock
-/// into a write. An unavailable lane keeps the pre-existing failure handler:
-/// "not settled" holds the kick, which is the conservative answer — claiming
-/// "settled" would summarize a transcript that is still forming.
+/// Return true only when the account has no recent open capture session and no
+/// accepted media still eligible for processing.
 async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
-    if let Some(repository) = state.repositories.memory_formation() {
-        let cutoff = format_epoch_millis(now_ms() - 30 * 60 * 1000);
-        return match repository.session_tail_is_settled(user_id, &cutoff).await {
-            Ok(settled) => settled,
-            Err(error) => {
-                warn!(user_id, error = %error, "session-settled gate check failed");
-                false
-            }
-        };
-    }
-    let result = state
-        .store
-        .wal_authoritative_read(user_id, |conn| {
-            let (open_recent, media_pending) = conn.query_row(
-                "SELECT \
-                  (SELECT COUNT(*) FROM capture_sessions WHERE ended_at IS NULL \
-                    AND last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 minutes')), \
-                  (SELECT COUNT(*) FROM media_objects \
-                    WHERE processing_state IN ('queued','processing','retry_wait') \
-                    AND deleted_at IS NULL)",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )?;
-            Ok(open_recent == 0 && media_pending == 0)
-        })
-        .await;
-    match result {
+    let cutoff = format_epoch_millis(now_ms() - 30 * 60 * 1000);
+    match state
+        .repositories
+        .memory_formation()
+        .session_tail_is_settled(user_id, &cutoff)
+        .await
+    {
         Ok(settled) => settled,
-        Err(e) => {
-            warn!(user_id, error = %e, "session-settled gate check failed");
+        Err(error) => {
+            warn!(user_id, error = %error, "session-settled gate check failed");
             false
         }
     }
@@ -2351,12 +1244,6 @@ async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
 
 fn should_cross_proven_empty_window(value: &Value) -> bool {
     value.get("reason").and_then(Value::as_str) == Some("no_new_records")
-}
-
-async fn pace_legacy_cursor_write(state: &CpState) {
-    if state.repositories.memory_formation().is_none() {
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-    }
 }
 
 async fn summarize_session_settled(state: &CpState, user_id: &str) {
@@ -2374,9 +1261,7 @@ async fn summarize_session_settled(state: &CpState, user_id: &str) {
     // any model call, hold, claim, quota response, or error stops this trigger.
     for _ in 0..SPARSE_LOOKBACK_MAX_WINDOWS {
         match summarize_user_window(state, user_id, SummarizeMode::SessionSettled).await {
-            Ok(value) if should_cross_proven_empty_window(&value) => {
-                pace_legacy_cursor_write(state).await;
-            }
+            Ok(value) if should_cross_proven_empty_window(&value) => {}
             Ok(_) => break,
             Err(e) => {
                 warn!(user_id, error = %e, "session-settled summarize failed");
@@ -2433,10 +1318,6 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
     });
 }
 
-const SUBSTANCE_BACKFILL_PROMPT: &str = "Classify the substance of stored personal activity episodes from title, summary, and minute gists. substance=none: fragments with no coherent topic, hallucination-like repetition, or content-free filler. substance=low: real but trivial activity such as a few passing remarks or background TV. substance=normal: everything else. When in doubt, prefer the higher tier. Return one classification for every supplied id and do not invent ids.";
-
-const VISUAL_EVIDENCE_BACKFILL_PROMPT: &str = "Classify whether stored screenshot pixels would materially improve recall or verification for each episode, using only the supplied episode text and member screenshot metadata/OCR. visual_evidence=useful when the screens contain material slides, documents, diagrams, errors, designs, settings state, on-screen instructions, resources, or decision evidence. visual_evidence=none when screens are absent, generic app chrome, duplicated state, or would add no material evidence beyond the text. Do not infer unseen pixels and do not classify an episode as useful merely because screenshots exist. Return one classification for every supplied id and do not invent ids.";
-
 const WORKFLOW_CONTINUITY_RULE: &str = "CRITICAL EXTENSION RULE: Define continuity by the person's concrete real-world objective, subject, or workflow — not by session mechanics. Continuation does NOT require the same call connection, participant, app, or document. A goodbye followed by a new greeting, a transfer, hold time, reconnect, or a call to a different person or organization is not a boundary when the person is still pursuing the same task. For example, calling a provider, then an insurer, then the provider again about one bill is ONE episode using the same OPEN EPISODE ref. Prefer EXTEND when the open episode and new log share the same real-world goal; open a NEW episode only when the goal or subject actually changes.";
 
 const SYSTEM_PROMPT: &str = r#"You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day. The episode fields must also be a useful, evidence-grounded memory of what the person needs to know or do — not a topic inventory.
@@ -2483,7 +1364,6 @@ mod tests {
             "episodes": 1,
             "to": "2026-08-28T12:00:00.000Z"
         })));
-        assert_eq!(CLASSIFIER_MAX_OUTPUT_TOKENS, 2_048);
     }
 
     #[test]
@@ -2880,536 +1760,5 @@ mod tests {
         assert!(rendered.contains("[screen-facts] \"MARY POPPINS\""));
         assert!(rendered.contains("\"MARY POPPINS RETURNS\""));
         assert!(!rendered.contains("File Edit Actions"));
-    }
-
-    #[test]
-    fn historical_visual_evidence_backfill_contract_is_constrained_and_text_only() {
-        let schema = visual_evidence_backfill_schema();
-        let item = &schema["properties"]["classifications"]["items"];
-        assert_eq!(
-            item["properties"]["visual_evidence"]["enum"],
-            json!(["none", "useful"])
-        );
-        assert!(item["required"]
-            .as_array()
-            .expect("required fields")
-            .iter()
-            .any(|field| field.as_str() == Some("visual_evidence")));
-        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT.contains("metadata/OCR"));
-        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT.contains("Do not infer unseen pixels"));
-        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT
-            .contains("do not classify an episode as useful merely because screenshots exist"));
-        assert_ne!(VISUAL_EVIDENCE_BACKFILL_KEY, SUBSTANCE_BACKFILL_KEY);
-    }
-
-    /// ADR-0022. The window's evidence reads are routed now, so the D4
-    /// deferral that made this domain inert is gone — and the failure it
-    /// masked must not return in a worse shape. A routed lane that cannot
-    /// serve REFUSES, and every read on the window path has to surface that
-    /// refusal unchanged: the caller advances its forward-only cursor whenever
-    /// a span comes back empty, so ONE flattened refusal would march the
-    /// cursor through a seven-day backlog reporting `no_new_records` over
-    /// evidence nobody ever read. That is unrecoverable — the cursor only
-    /// moves forward.
-    ///
-    /// The two legs share one fixture, and the LEGACY leg is what makes the
-    /// selected leg mean anything: on exactly these bounds an unselected user
-    /// reaches the empty-span branch and really does advance the cursor. So
-    /// the fixture is live, the window is real, and "the cursor did not move"
-    /// on the selected leg is a fact about the refusal rather than about a
-    /// window that was never offered.
-    ///
-    /// **What this does NOT prove.** On the selected leg the run stops at the
-    /// F8 archive-cutoff read, which is the FIRST routed read in
-    /// `summarize_user_window` and predates this migration — so
-    /// `summarize_user` never reaches `fetch_range` here, and the end-to-end
-    /// assertion cannot distinguish "the window reads propagate their
-    /// refusal" from "something earlier refused". The per-helper assertions
-    /// below cover the helpers themselves, and
-    /// `the_window_reads_are_never_flattened_at_their_call_sites` covers the
-    /// call sites; a refusal flattened at a call site
-    /// (`fetch_range(..).await.unwrap_or_default()`) would still not be
-    /// caught end-to-end by this test. Closing that would need a serving
-    /// authority that answers reads, which this harness deliberately has no
-    /// way to register — `select_wal_authoritative` exists precisely to make
-    /// every store touch fail.
-    #[tokio::test]
-    async fn an_unavailable_lane_refuses_every_window_read_where_the_legacy_path_advances() {
-        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-
-        let state = state();
-        let user = state
-            .control
-            .upsert_user(
-                "google-sub-wal-summarizer",
-                "routed@example.com",
-                crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .expect("the harness creates the account");
-        // Far enough back that a scheduled window really is available: the
-        // refusal, not a short tail, has to be what stops the run.
-        let cursor = format_epoch_millis(now_ms() - 3 * 60 * 60 * 1000);
-        state
-            .control
-            .set_summarized_until(&user.id, &cursor)
-            .await
-            .expect("the baseline cursor is written");
-        assert!(
-            window_bounds(
-                ms(&cursor),
-                now_ms() - TAIL_MINUTES * 60 * 1000,
-                MIN_WINDOW_MINUTES * 60 * 1000,
-            )
-            .is_some(),
-            "the fixture must offer a window, or this proves nothing"
-        );
-
-        // CONTROL LEG. Same bounds, same empty per-user index, no WAL
-        // selection: the empty span is consumed and the cursor MOVES. This is
-        // the behaviour a flattened refusal would counterfeit, and running it
-        // here proves the fixture can actually reach it.
-        let legacy = state
-            .control
-            .upsert_user(
-                "google-sub-legacy-summarizer",
-                "legacy@example.com",
-                crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .expect("the harness creates the account");
-        state
-            .control
-            .set_summarized_until(&legacy.id, &cursor)
-            .await
-            .expect("the baseline cursor is written");
-        let advanced = summarize_user(&state, &legacy.id)
-            .await
-            .expect("an unselected user's empty span is ordinary work");
-        assert_eq!(
-            advanced["reason"], "no_new_records",
-            "the control leg must reach the empty-span branch: {advanced}"
-        );
-        assert_ne!(
-            state
-                .control
-                .summarized_until(&legacy.id)
-                .await
-                .expect("the cursor is readable")
-                .as_deref(),
-            Some(cursor.as_str()),
-            "the control leg must actually advance the cursor, or the \
-             selected leg's 'did not advance' proves nothing"
-        );
-
-        // SELECTED LEG. Selected with no serving authority registered: the
-        // routed lane is unavailable, exactly as it is while one is
-        // quarantined or relaunching. Nothing legacy may answer in its place.
-        select_wal_authoritative(&state.store, &user.id);
-        let from = format_epoch_millis(now_ms() - 2 * 60 * 60 * 1000);
-        let to = format_epoch_millis(now_ms() - 60 * 60 * 1000);
-
-        assert!(
-            fetch_range(&state, &user.id, &from, &to).await.is_err(),
-            "an unavailable lane must refuse, never report an empty span"
-        );
-        assert!(
-            fetch_open_episodes(&state, &user.id, &from, &to, 0)
-                .await
-                .is_err(),
-            "an unavailable lane must refuse, never report zero open episodes"
-        );
-        assert!(
-            span_holds_recoverable_media(&state, &user.id, &from, &to)
-                .await
-                .is_err(),
-            "an unavailable lane must refuse, never report 'nothing to hold for'"
-        );
-
-        let (captured, guard) = capture_events();
-        let outcome = summarize_user(&state, &user.id).await;
-        drop(guard);
-
-        assert!(
-            outcome.is_err(),
-            "the refusal must reach the sweep as an error, not become a \
-             status the sweep treats as progress: {outcome:?}"
-        );
-        assert_eq!(
-            state
-                .control
-                .summarized_until(&user.id)
-                .await
-                .expect("the cursor is readable"),
-            Some(cursor),
-            "a refused window must never advance the forward-only cursor"
-        );
-        assert_eq!(
-            captured.total_skips(),
-            0,
-            "the domain is migrated; nothing may still report a D4 deferral: {}",
-            captured.text()
-        );
-    }
-
-    /// Call-site pin, in production source. The helpers propagate their
-    /// refusals (proved above), but a regression that flattened one at its
-    /// CALL SITE — `fetch_range(..).await.unwrap_or_default()`, or an `.ok()`
-    /// on the cursor-hold probe — would turn a refusal back into an empty
-    /// span and march the cursor through a backlog, and no end-to-end test in
-    /// this harness can reach that (see the note on the test above). Pin it
-    /// structurally instead: every window-read call site in production source
-    /// must hand its refusal straight on with `?`.
-    #[test]
-    fn the_window_reads_are_never_flattened_at_their_call_sites() {
-        let whole = include_str!("summarizer.rs");
-        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
-
-        // `session_tail_is_settled` is deliberately absent: it owns a failure
-        // handler that answers "not settled", which HOLDS the kick and is the
-        // conservative direction. The three below return the refusal itself,
-        // and their callers must not absorb it.
-        for (helper, expected_call_sites) in [
-            (concat!("fetch_", "range("), 1),
-            (concat!("fetch_open_", "episodes("), 1),
-            // Both empty-span branches probe the cursor hold before advancing.
-            (concat!("span_holds_recoverable_", "media("), 2),
-        ] {
-            let mut call_sites = 0;
-            let mut cursor = 0;
-            while let Some(offset) = source[cursor..].find(helper) {
-                let start = cursor + offset;
-                cursor = start + helper.len();
-                // Skip the definitions themselves; only calls are pinned.
-                if source[..start].ends_with("async fn ") {
-                    continue;
-                }
-                call_sites += 1;
-                let tail = &source[start..(start + 200).min(source.len())];
-                let consumed = tail
-                    .find(".await")
-                    .map(|at| &tail[at + ".await".len()..])
-                    .unwrap_or_else(|| panic!("{helper} must be awaited: {tail}"));
-                assert!(
-                    consumed.starts_with('?'),
-                    "{helper} is consumed without propagating its refusal: {}",
-                    &tail[..tail.len().min(160)]
-                );
-            }
-            assert_eq!(
-                call_sites, expected_call_sites,
-                "{helper}: this pin must see every production call site"
-            );
-        }
-    }
-
-    /// The legacy path is untouched: `wal_authoritative_read` falls through to
-    /// the ordinary guarded per-user read for an unselected user, so the same
-    /// SQL returns the same rows it did before the routing branch existed.
-    #[tokio::test]
-    async fn the_routed_evidence_reads_still_serve_an_unselected_user_from_the_legacy_store() {
-        use crate::cp::wal_gate_test_support::state;
-
-        let state = state();
-        let user_id = "summarizer-legacy-user";
-        state
-            .store
-            .with_user(user_id, |conn| {
-                conn.execute_batch(
-                    "INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) \
-                       VALUES (1, '2026-08-01T10:00:00.000Z', '2026-08-01T10:05:00.000Z', 300.0, 'mic'); \
-                     INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, language, speaker_label) \
-                       VALUES (1, 1, 0.0, 12.0, 'the legacy row is still readable', 'en', 'Me'); \
-                     INSERT INTO screenshots (id, captured_at, active_app, window_title) \
-                       VALUES (1, '2026-08-01T10:01:00.000Z', 'Editor', 'notes'); \
-                     INSERT INTO episodes (id, started_at, ended_at, type, title, summary) \
-                       VALUES (1, '2026-08-01T10:00:00.000Z', '2026-08-01T10:05:00.000Z', 'coding', 'Legacy', '- kept');",
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("the legacy store accepts the seed");
-
-        const FROM: &str = "2026-08-01T09:00:00.000Z";
-        const TO: &str = "2026-08-01T11:00:00.000Z";
-
-        let (utterances, screenshots) = fetch_range(&state, user_id, FROM, TO)
-            .await
-            .expect("an unselected user keeps the legacy read");
-        assert_eq!(utterances.len(), 1);
-        assert_eq!(utterances[0].text, "the legacy row is still readable");
-        assert_eq!(utterances[0].started_at, "2026-08-01T10:00:00.000Z");
-        assert_eq!(screenshots.len(), 1);
-        assert_eq!(screenshots[0].captured_at, "2026-08-01T10:01:00.000Z");
-
-        let open = fetch_open_episodes(&state, user_id, FROM, TO, 0)
-            .await
-            .expect("an unselected user keeps the legacy read");
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].id, 1);
-        assert_eq!(open[0].title, "Legacy");
-
-        assert!(
-            !span_holds_recoverable_media(&state, user_id, FROM, TO)
-                .await
-                .expect("an unselected user keeps the legacy read"),
-            "no capture media was seeded, so nothing holds the cursor"
-        );
-        assert!(
-            session_tail_is_settled(&state, user_id).await,
-            "no open session and no pending media: the legacy gate still settles"
-        );
-    }
-
-    /// The ADR-0034 kick's settled gate is routed too. An unavailable lane
-    /// keeps the pre-existing failure handler's conservative answer — "not
-    /// settled" holds the kick rather than summarizing a transcript that may
-    /// still be forming — and it stays LOUD, so an unservable lane can never
-    /// pass for a quiet, finished tail.
-    #[tokio::test]
-    async fn an_unavailable_settled_gate_holds_the_kick_and_says_so() {
-        use crate::cp::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-
-        let state = state();
-        let user_id = "summarizer-settled-user";
-        select_wal_authoritative(&state.store, user_id);
-
-        let (captured, guard) = capture_events();
-        assert!(
-            !session_tail_is_settled(&state, user_id).await,
-            "an unreadable tail is never 'settled'"
-        );
-        drop(guard);
-
-        assert!(
-            captured
-                .text()
-                .contains("session-settled gate check failed"),
-            "an unservable lane must be reported, never silently read as \
-             merely unsettled: {}",
-            captured.text()
-        );
-        assert_eq!(
-            captured.total_skips(),
-            0,
-            "the domain is migrated; nothing may still report a D4 deferral: {}",
-            captured.text()
-        );
-    }
-
-    /// Placement pin, in production source. Both summarizer domains migrated,
-    /// so no D4 gate may survive here — a gate left standing over a migrated
-    /// domain silently disables live work — and every read the window depends
-    /// on must go through the routed helper rather than the legacy per-user
-    /// store. The two historical backfills keep their legacy `with_user`
-    /// calls deliberately: they have no production caller and are explicitly
-    /// out of this migration's scope.
-    #[test]
-    fn the_window_reads_route_and_no_deferral_gate_survives_in_production_source() {
-        let whole = include_str!("summarizer.rs");
-        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
-
-        assert_eq!(
-            source.matches(concat!("wal_domain_", "skipped(")).count(),
-            0,
-            "a migrated domain must not keep the gate that deferred it"
-        );
-        assert_eq!(
-            source.matches(concat!("wal_", "domain")).count(),
-            0,
-            "no deferred-domain name may remain in the summarizer"
-        );
-
-        for (start, end) in [
-            (
-                concat!("async fn span_holds_recoverable_", "media("),
-                concat!("async fn fetch_", "range("),
-            ),
-            (
-                concat!("async fn fetch_", "range("),
-                concat!("async fn fetch_open_", "episodes("),
-            ),
-            (
-                concat!("async fn fetch_open_", "episodes("),
-                concat!("pub async fn summarize_", "all("),
-            ),
-            (
-                concat!("async fn session_tail_is_", "settled("),
-                concat!("async fn summarize_session_", "settled("),
-            ),
-        ] {
-            let from = source
-                .find(start)
-                .unwrap_or_else(|| panic!("{start} must exist"));
-            let to = source
-                .find(end)
-                .unwrap_or_else(|| panic!("{end} must exist"));
-            let body = &source[from..to];
-            assert!(
-                body.contains(concat!(".wal_authoritative_", "read(")),
-                "{start} must read through the routed lane"
-            );
-            assert!(
-                !body.contains(concat!(".with_", "user(")),
-                "{start} must not reach the legacy per-user store"
-            );
-        }
-
-        // The callerless historical backfills keep theirs, and the window's
-        // upsert/embed tails keep their unselected-user legacy branches.
-        let backfills = source
-            .find(concat!("async fn run_substance_", "backfill("))
-            .unwrap()
-            ..source.find(concat!("fn derive_", "membership(")).unwrap();
-        assert!(
-            source[backfills].contains(concat!(".with_", "user(")),
-            "the callerless backfills are deliberately not migrated"
-        );
-        assert!(
-            source[source
-                .find(concat!("pub(crate) async fn embed_", "episodes("))
-                .unwrap()..]
-                .contains(concat!(".with_", "user(")),
-            "the embed tail keeps its legacy write branch for unselected users"
-        );
-    }
-
-    /// Data-loss pin, in production source. A window holding more episodes
-    /// than one sealed plan may carry must be SPLIT, never handed to the plan
-    /// whole: `EpisodeWindowUpsertPlan::new` refuses an oversize batch with
-    /// `Malformed`, that refusal surfaces as the construction-refusal shape,
-    /// and `summarize_all`'s MAX_WINDOW_FAILURES ladder then walks the
-    /// forward-only cursor PAST the window after three sweeps — discarding
-    /// every episode in it, permanently and unrecoverably, while an
-    /// unselected user with the identical window keeps all of them.
-    ///
-    /// The split itself is proved end-to-end against a real connection in
-    /// `wal::window`'s `an_oversize_window_settles_as_successive_plans`. It
-    /// cannot be reached from here: `wal_authoritative_upsert` opens with a
-    /// routed read, and this harness registers no serving authority, so the
-    /// run refuses long before a plan is built. What is pinned here is the
-    /// remaining link — that the production caller feeds the plan CHUNKS
-    /// bounded by the plan's own limit, and publishes the archive cutoff only
-    /// once the last chunk is the one settling.
-    #[test]
-    fn an_oversize_window_is_split_rather_than_handed_to_one_plan() {
-        let whole = include_str!("summarizer.rs");
-        let source = &whole[..whole.rfind(concat!("#[cfg", "(test)]")).unwrap()];
-        let from = source
-            .find(concat!("async fn wal_authoritative_", "upsert("))
-            .expect("the routed upsert must exist");
-        let to = source
-            .find(concat!("pub(crate) async fn embed_", "episodes("))
-            .expect("the embed tail follows it");
-        let body = &source[from..to];
-
-        assert!(
-            body.contains(concat!(".chunks(wal::window::MAX_BATCH_", "ITEMS)")),
-            "the window must be split by the plan's own bound, not refused"
-        );
-        assert!(
-            body.contains(concat!("for (item, predecessor) in chunk", ".iter()")),
-            "each plan must be built from ONE chunk, never the whole batch"
-        );
-        assert!(
-            body.contains("chunk_index + 1 == chunk_count"),
-            "only the final chunk may publish the window's archive cutoff; \
-             an earlier one would step the archive cursor over episodes that \
-             were never written"
-        );
-        assert!(
-            !body.contains(concat!("effective_cutoff.to_", "owned()")),
-            "the plan must take the per-chunk cutoff, not the window's"
-        );
-    }
-
-    /// MONEY. A window that is derived, PAID for with a summary call, and
-    /// then refused by the lane at submit time holds the cursor — correct,
-    /// because those episodes were never written and a forward-only cursor
-    /// that steps over them loses them. But holding alone means the next
-    /// sweep re-derives the identical window and re-issues the identical
-    /// paid call, every ten minutes, until the daily budget refuses. The
-    /// refusal must therefore also BOUND the spend.
-    #[tokio::test]
-    async fn a_settle_refusal_backs_the_paid_call_off_instead_of_re_buying_it_every_sweep() {
-        use crate::cp::wal_gate_test_support::{select_wal_authoritative, state};
-
-        let state = state();
-        let user = state
-            .control
-            .upsert_user(
-                "google-sub-wal-settle-backoff",
-                "backoff@example.com",
-                crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .expect("the harness creates the account");
-        let cursor = format_epoch_millis(now_ms() - 3 * 60 * 60 * 1000);
-        state
-            .control
-            .set_summarized_until(&user.id, &cursor)
-            .await
-            .expect("the baseline cursor is written");
-        select_wal_authoritative(&state.store, &user.id);
-
-        // Without the memo this same call is what the sweep makes every ten
-        // minutes: a full re-derivation, and a fresh summary call with it.
-        let first = note_settle_refusal(&user.id, Some(&cursor)).await;
-        assert_eq!(
-            first, SETTLE_BACKOFF_BASE_SECS,
-            "the first wait must outlast one sweep, or nothing is skipped"
-        );
-        assert!(
-            SETTLE_BACKOFF_BASE_SECS > SCHEDULER_INTERVAL_SECS as i64,
-            "a backoff inside one sweep interval bounds nothing"
-        );
-
-        let held = summarize_user(&state, &user.id)
-            .await
-            .expect("the backoff is a hold, not a failure");
-        assert_eq!(
-            held["reason"], "settle_backoff",
-            "a held window must stop before the window is re-derived and \
-             re-paid for: {held}"
-        );
-        assert!(
-            held.get("to").is_none() && held["reason"] != "no_new_records",
-            "the hold must not look like progress to summarize_all: {held}"
-        );
-        assert_eq!(
-            state
-                .control
-                .summarized_until(&user.id)
-                .await
-                .expect("the cursor is readable")
-                .as_deref(),
-            Some(cursor.as_str()),
-            "holding must never advance the forward-only cursor"
-        );
-
-        // Consecutive refusals on the SAME held cursor widen the wait.
-        assert_eq!(
-            note_settle_refusal(&user.id, Some(&cursor)).await,
-            SETTLE_BACKOFF_BASE_SECS * 2,
-            "a lane that keeps refusing must be re-tried less often, not \
-             just as often"
-        );
-
-        // A moved cursor is a different window: the memo does not apply.
-        let moved = format_epoch_millis(now_ms() - 60 * 60 * 1000);
-        assert!(
-            settle_backoff_holds(&user.id, Some(&moved)).await.is_none(),
-            "the memo names one held cursor; it may not hold a different one"
-        );
-
-        // And a lane that settles clears it outright.
-        note_settle_refusal(&user.id, Some(&cursor)).await;
-        clear_settle_refusal(&user.id).await;
-        assert!(
-            settle_backoff_holds(&user.id, Some(&cursor))
-                .await
-                .is_none(),
-            "a settled window releases the backoff"
-        );
     }
 }

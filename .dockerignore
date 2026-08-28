@@ -12,7 +12,6 @@
 !src/**
 !scripts/
 !scripts/assemble_image_config.sh
-!scripts/validate_archive_v3_shadow_runtime_environment.sh
 
 # Defense in depth for credential-like files placed below an allowed source path.
 **/.env

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 use crate::{
     error::{DeletionPending, DeletionPendingReason, EnclaveError, Result},
+    gcs::{delete_all_object_generations, validate_user_id, GcsClient, GcsGetResponse},
     persistence::MediaObjectStore,
-    store::{GcsClient, GcsGetResponse},
 };
 
 const MAX_PURGE_PAGES: usize = 10_000;
@@ -81,16 +81,13 @@ async fn purge_prefix(gcs: &dyn GcsClient, prefix: &str) -> Result<Option<String
 }
 
 /// GCS implementation used with PostgreSQL structured state.
-#[allow(dead_code)]
 pub(crate) struct GcsMediaObjectStore {
     current: Arc<dyn GcsClient>,
-    legacy: Arc<dyn GcsClient>,
 }
 
 impl GcsMediaObjectStore {
-    #[allow(dead_code)]
-    pub(crate) fn new(current: Arc<dyn GcsClient>, legacy: Arc<dyn GcsClient>) -> Self {
-        Self { current, legacy }
+    pub(crate) fn new(current: Arc<dyn GcsClient>) -> Self {
+        Self { current }
     }
 }
 
@@ -106,14 +103,6 @@ impl MediaObjectStore for GcsMediaObjectStore {
         self.current
             .put_object(object_name, ciphertext, wrapped_dek_b64, 0)
             .await
-    }
-
-    async fn get_compatible(&self, object_name: &str) -> Result<GcsGetResponse> {
-        match self.current.get_object(object_name).await {
-            Ok(object) => Ok(object),
-            Err(EnclaveError::NotFound) => self.legacy.get_object(object_name).await,
-            Err(error) => Err(error),
-        }
     }
 
     async fn get_current(&self, object_name: &str) -> Result<GcsGetResponse> {
@@ -135,31 +124,33 @@ impl MediaObjectStore for GcsMediaObjectStore {
             .await
     }
 
-    async fn delete_compatible(&self, object_name: &str) -> Result<()> {
-        match self.current.delete_object(object_name).await {
-            Ok(()) | Err(EnclaveError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        if !Arc::ptr_eq(&self.current, &self.legacy) {
-            match self.legacy.delete_object(object_name).await {
-                Ok(()) | Err(EnclaveError::NotFound) => {}
-                Err(error) => return Err(error),
-            }
+    async fn delete_current(&self, object_name: &str) -> Result<()> {
+        delete_all_object_generations(self.current.as_ref(), object_name).await
+    }
+
+    async fn purge_recordings(&self, account_id: &str) -> Result<()> {
+        validate_user_id(account_id)?;
+        let prefix = format!("recordings/{account_id}/");
+        let hard_delete_time = purge_prefix(self.current.as_ref(), &prefix).await?;
+        if hard_delete_time.is_some() {
+            return Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                retry_after_seconds: Some(3600),
+                hard_delete_time,
+            }));
         }
         Ok(())
     }
 
-    async fn purge_recordings(&self, account_id: &str) -> Result<()> {
-        crate::store::validate_user_id(account_id)?;
-        let prefix = format!("recordings/{account_id}/");
-        let providers = if Arc::ptr_eq(&self.current, &self.legacy) {
-            vec![Arc::clone(&self.current)]
-        } else {
-            vec![Arc::clone(&self.current), Arc::clone(&self.legacy)]
-        };
+    async fn purge_account(&self, account_id: &str) -> Result<()> {
+        validate_user_id(account_id)?;
+        let prefixes = [
+            format!("raw/{account_id}/"),
+            format!("recordings/{account_id}/"),
+        ];
         let mut hard_delete_time: Option<String> = None;
-        for provider in providers {
-            if let Some(candidate) = purge_prefix(provider.as_ref(), &prefix).await? {
+        for prefix in &prefixes {
+            if let Some(candidate) = purge_prefix(self.current.as_ref(), prefix).await? {
                 if hard_delete_time
                     .as_ref()
                     .is_none_or(|current| candidate > *current)
@@ -177,96 +168,89 @@ impl MediaObjectStore for GcsMediaObjectStore {
         }
         Ok(())
     }
-
-    async fn purge_account(&self, account_id: &str) -> Result<()> {
-        crate::store::validate_user_id(account_id)?;
-        let prefixes = [
-            format!("raw/{account_id}/"),
-            format!("media/{account_id}/"),
-            format!("recordings/{account_id}/"),
-        ];
-        let providers = if Arc::ptr_eq(&self.current, &self.legacy) {
-            vec![Arc::clone(&self.current)]
-        } else {
-            vec![Arc::clone(&self.current), Arc::clone(&self.legacy)]
-        };
-        let mut hard_delete_time: Option<String> = None;
-        for provider in providers {
-            for prefix in &prefixes {
-                if let Some(candidate) = purge_prefix(provider.as_ref(), prefix).await? {
-                    if hard_delete_time
-                        .as_ref()
-                        .is_none_or(|current| candidate > *current)
-                    {
-                        hard_delete_time = Some(candidate);
-                    }
-                }
-            }
-        }
-        if hard_delete_time.is_some() {
-            return Err(EnclaveError::DeletionPending(DeletionPending {
-                reason: DeletionPendingReason::SoftDeleteRetention,
-                retry_after_seconds: Some(3600),
-                hard_delete_time,
-            }));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::tests::FakeGcs;
+    use crate::gcs::tests::FakeGcs;
 
     #[tokio::test]
-    async fn current_writes_and_legacy_reads_are_explicit() {
+    async fn current_methods_use_only_the_current_provider() {
         let current: Arc<dyn GcsClient> = Arc::new(FakeGcs::new());
-        let legacy: Arc<dyn GcsClient> = Arc::new(FakeGcs::new());
-        legacy
-            .put_object("media/legacy", b"old", "wrapped-old", 0)
-            .await
-            .unwrap();
-        let media = GcsMediaObjectStore::new(Arc::clone(&current), Arc::clone(&legacy));
-
-        assert_eq!(
-            media
-                .get_compatible("media/legacy")
-                .await
-                .unwrap()
-                .ciphertext,
-            b"old"
-        );
+        let media = GcsMediaObjectStore::new(Arc::clone(&current));
         let generation = media
-            .put_current("account", "media/current", b"new", "wrapped-new")
+            .put_current("account", "raw/account/current.enc", b"new", "wrapped-new")
             .await
             .unwrap();
         assert!(generation > 0);
         assert_eq!(
             media
-                .get_current_generation("media/current", generation)
+                .get_current_generation("raw/account/current.enc", generation)
                 .await
                 .unwrap()
                 .ciphertext,
             b"new"
         );
-        media.delete_compatible("media/legacy").await.unwrap();
+        media
+            .delete_current("raw/account/current.enc")
+            .await
+            .unwrap();
         assert!(matches!(
-            legacy.get_object("media/legacy").await,
+            current.get_object("raw/account/current.enc").await,
             Err(EnclaveError::NotFound)
         ));
     }
 
     #[tokio::test]
-    async fn account_purge_covers_every_owned_prefix_on_both_providers() {
+    async fn exact_object_deletion_removes_current_and_noncurrent_generations() {
         let current: Arc<dyn GcsClient> = Arc::new(FakeGcs::new());
-        let legacy: Arc<dyn GcsClient> = Arc::new(FakeGcs::new());
-        for (provider, name) in [
-            (&current, "raw/account-1/capture.enc"),
-            (&current, "recordings/account-1/audio.enc"),
-            (&legacy, "media/account-1/legacy.enc"),
+        let object_name = "raw/account/current.enc";
+        let first = current
+            .put_object(object_name, b"first", "wrapped-first", 0)
+            .await
+            .unwrap();
+        current
+            .put_object(object_name, b"second", "wrapped-second", first)
+            .await
+            .unwrap();
+        let media = GcsMediaObjectStore::new(Arc::clone(&current));
+
+        media.delete_current(object_name).await.unwrap();
+
+        assert!(current
+            .list_object_versions(object_name, None)
+            .await
+            .unwrap()
+            .versions
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_object_deletion_waits_for_provider_soft_delete_retention() {
+        let current = Arc::new(FakeGcs::new());
+        current.set_soft_delete_enabled(true);
+        let object_name = "raw/account/current.enc";
+        current
+            .put_object(object_name, b"ciphertext", "wrapped", 0)
+            .await
+            .unwrap();
+        let provider: Arc<dyn GcsClient> = current;
+        let media = GcsMediaObjectStore::new(provider);
+
+        let error = media.delete_current(object_name).await.unwrap_err();
+
+        assert!(matches!(error, EnclaveError::Gcs(_)));
+    }
+
+    #[tokio::test]
+    async fn account_purge_covers_every_owned_prefix_on_the_routed_provider() {
+        let current: Arc<dyn GcsClient> = Arc::new(FakeGcs::new());
+        for name in [
+            "raw/account-1/capture.enc",
+            "recordings/account-1/audio.enc",
         ] {
-            provider
+            current
                 .put_object(name, b"ciphertext", "wrapped", 0)
                 .await
                 .unwrap();
@@ -275,16 +259,12 @@ mod tests {
             .put_object("raw/account-2/keep.enc", b"other", "wrapped", 0)
             .await
             .unwrap();
-        let media = GcsMediaObjectStore::new(Arc::clone(&current), Arc::clone(&legacy));
+        let media = GcsMediaObjectStore::new(Arc::clone(&current));
 
         media.purge_account("account-1").await.unwrap();
 
-        for (provider, prefix) in [
-            (&current, "raw/account-1/"),
-            (&current, "recordings/account-1/"),
-            (&legacy, "media/account-1/"),
-        ] {
-            assert!(provider
+        for prefix in ["raw/account-1/", "recordings/account-1/"] {
+            assert!(current
                 .list_object_versions(prefix, None)
                 .await
                 .unwrap()
@@ -292,5 +272,32 @@ mod tests {
                 .is_empty());
         }
         assert!(current.get_object("raw/account-2/keep.enc").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_generations_keep_account_deletion_pending() {
+        let current = Arc::new(FakeGcs::new());
+        current.set_soft_delete_enabled(true);
+        current
+            .put_object(
+                "recordings/account-1/audio.enc",
+                b"ciphertext",
+                "wrapped",
+                0,
+            )
+            .await
+            .unwrap();
+        let provider: Arc<dyn GcsClient> = current;
+        let media = GcsMediaObjectStore::new(provider);
+
+        let error = media.purge_recordings("account-1").await.unwrap_err();
+        assert!(matches!(
+            error,
+            EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                hard_delete_time: Some(_),
+                ..
+            })
+        ));
     }
 }

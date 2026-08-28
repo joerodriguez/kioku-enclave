@@ -29,7 +29,8 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
   Cloud Capture path by default; large persistent media objects are encrypted per user;
   structured plaintext is limited to the attested application, private Cloud SQL, and
   the documented Vertex boundary; media-key access is bound to the attested digest; no undocumented plaintext sink is
-  introduced; and export/delete remain complete.
+  introduced; export documents its current structured-row/media-metadata coverage and byte-export
+  blocker honestly; and deletion remains complete.
   A change that weakens an invariant is wrong by default.
 - Client applications, capture pipelines, and deployment automation are downstream
   consumers of the public interfaces documented in this repository. Coordinate breaking
@@ -54,10 +55,15 @@ Run the local full suite when a change is broad, security-sensitive, touches
 shared behavior, or CI diagnosis needs local reproduction:
 
 ```bash
+export KIOKU_TEST_POSTGRES_URL='postgresql://...'
 ./scripts/agent-verify.sh full
 ```
 
-The helper uses locked Cargo compilation/test invocations, refuses a heavy build
+Full verification requires an explicitly provisioned disposable PostgreSQL 17 database,
+sets `KIOKU_REQUIRE_POSTGRES_CONTRACT=1`, and fails closed instead of silently skipping
+the real database contracts. It does not assume Docker is installed and does not start a
+database container on the operator's behalf. The helper uses locked Cargo
+compilation/test invocations, refuses a heavy build
 when the worktree's disk has less than its 15-GiB default free-space floor, holds
 a crash-safe per-worktree artifact lock for the entire Cargo sequence, and uses
 a 10-GiB-bounded `sccache` only when it is already installed. A separate
@@ -123,16 +129,18 @@ When releasing a new version or deploying changes to production, follow these st
      schema readiness, and the shared static TLS generation before reopening admission.
 
 3. **Timezone & Query Type-Affinity Rules**:
-   - Database timestamps are stored in UTC ISO 8601 strings (`2026-07-26T23:51:39.450Z`).
-   - SQLite `strftime('%s', ...)` returns a `TEXT` string. Comparing `strftime` outputs to numeric integer offsets (e.g. `+ 14400`) causes SQLite type-affinity failures where `TEXT > INTEGER` evaluates to `FALSE`.
-   - Always wrap `strftime('%s', ...)` expressions in `CAST(strftime('%s', ...) AS INTEGER)`.
-   - Ensure timestamp queries evaluate exact UTC bounds **and** US local timezone offsets (+4h EDT, +5h EST/CDT, +7h PDT) so wall-clock time queries from assistant callers match UTC database records.
+   - PostgreSQL stores database timestamps as `timestamptz`; normalize API values to UTC
+     RFC 3339 (`2026-07-26T23:51:39.450Z`) at the boundary.
+   - Keep wall-clock query behavior explicit about the caller's IANA timezone and daylight-saving
+     transition. Test exact UTC bounds plus representative US offsets (+4h EDT, +5h EST/CDT,
+     +7h PDT) so assistant wall-clock queries match stored instants.
+   - Do not replace typed timestamp comparisons with text casts or process-local timezone state.
 
 ## Security reminders specific to this repo
 
-- Structured plaintext is intentionally queryable in private Cloud SQL; application
-  memory and legacy/reference SQLite use SEV memory/tmpfs, and large media remains
-  encrypted in GCS. Never write plaintext to VM persistent disk or logs.
+- Structured plaintext is intentionally queryable only in private Cloud SQL and application
+  memory; large media remains encrypted in GCS. Never write plaintext to VM persistent disk
+  or logs, and never add a second structured-state authority or fallback.
 - Don't weaken the ID-token / attestation path or log decrypted content.
 - Report vulnerabilities privately (see CONTRIBUTING.md / SECURITY.md) — never in a
   public issue.

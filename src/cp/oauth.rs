@@ -18,9 +18,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
 
-#[cfg(test)]
-use rusqlite::OptionalExtension;
-
 use crate::persistence::{
     AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
     OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
@@ -635,90 +632,6 @@ struct RegisterBody {
     redirect_uris: Vec<String>,
 }
 
-// These SQLite helpers remain test-only while their behavioral fixtures move
-// into the shared repository contract suite. Serving code must use
-// `OAuthRepository`; keeping the fixtures here during the extraction avoids a
-// large, behavior-changing test rewrite in the same slice.
-#[cfg(test)]
-enum ClientRegistration {
-    Existing(String),
-    Created(String),
-    AtCapacity,
-}
-
-#[cfg(test)]
-fn register_client_conn(
-    conn: &rusqlite::Connection,
-    proposed_client_id: &str,
-    client_name: Option<&str>,
-    redirect_uris_json: &str,
-) -> crate::error::Result<(ClientRegistration, bool)> {
-    let tx = conn.unchecked_transaction()?;
-    let existing: Option<String> = tx
-        .query_row(
-            "SELECT client_id FROM oauth_clients WHERE redirect_uris = ?1 LIMIT 1",
-            [redirect_uris_json],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(client_id) = existing {
-        tx.rollback()?;
-        return Ok((ClientRegistration::Existing(client_id), false));
-    }
-
-    let mut count: i64 = tx.query_row(
-        "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
-        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
-        |row| row.get(0),
-    )?;
-    let mut reclaimed = 0;
-    if count >= MAX_OAUTH_CLIENTS {
-        reclaimed = tx.execute(
-            "DELETE FROM oauth_clients \
-             WHERE client_id NOT IN (?2, ?3) \
-               AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
-               AND NOT EXISTS (SELECT 1 FROM oauth_consents p \
-                               WHERE p.client_id = oauth_clients.client_id \
-                                 AND p.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
-               AND NOT EXISTS (SELECT 1 FROM oauth_authorization_codes a \
-                               WHERE a.client_id = oauth_clients.client_id \
-                                 AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
-               AND NOT EXISTS (SELECT 1 FROM refresh_tokens r \
-                               WHERE r.client_id = oauth_clients.client_id \
-                                 AND r.revoked = 0 \
-                                 AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            rusqlite::params![
-                format!("-{UNUSED_CLIENT_TTL_SECS} seconds"),
-                FIRST_PARTY_NATIVE_CLIENT_ID,
-                FIRST_PARTY_WEB_CLIENT_ID
-            ],
-        )?;
-        count = tx.query_row(
-            "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
-            rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
-            |row| row.get(0),
-        )?;
-    }
-    if count >= MAX_OAUTH_CLIENTS {
-        if reclaimed == 0 {
-            tx.rollback()?;
-        } else {
-            tx.commit()?;
-        }
-        return Ok((ClientRegistration::AtCapacity, reclaimed != 0));
-    }
-
-    tx.execute(
-        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, ?2, ?3)",
-        rusqlite::params![proposed_client_id, client_name, redirect_uris_json],
-    )?;
-    tx.commit()?;
-    Ok((
-        ClientRegistration::Created(proposed_client_id.to_string()),
-        true,
-    ))
-}
-
 async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>) -> Response {
     let (name, redirect_uris) = match validated_registration(body) {
         Ok(validated) => validated,
@@ -1027,7 +940,7 @@ async fn reviewer_login(
         .upsert_subject_account(
             &identity_subject,
             &reviewer_email,
-            super::control_store::REVIEWER_SIGNUP_EXEMPT,
+            super::REVIEWER_SIGNUP_EXEMPT,
         )
         .await
     {
@@ -1041,10 +954,11 @@ async fn reviewer_login(
             )
         }
     };
-    let fixture = match s.repositories.memory_formation() {
-        Some(repository) => repository.ensure_reviewer_fixture(&user.id).await,
-        None => super::reviewer::ensure_demo_archive(&s.store, &user.id).await,
-    };
+    let fixture = s
+        .repositories
+        .memory_formation()
+        .ensure_reviewer_fixture(&user.id)
+        .await;
     if fixture.is_err() {
         return reviewer_json(
             &s,
@@ -1330,110 +1244,6 @@ fn consent_page(
         .into_response()
 }
 
-#[cfg(test)]
-fn store_pending_consent_conn(
-    conn: &rusqlite::Connection,
-    consent_hash: &str,
-    user_id: &str,
-    client_id: &str,
-    redirect_uri: &str,
-) -> crate::error::Result<bool> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM oauth_consents \
-         WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        [],
-    )?;
-    let inserted = tx.execute(
-        "INSERT INTO oauth_consents (consent_hash, user_id, client_id, redirect_uri, expires_at) \
-         SELECT ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?5) \
-         WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
-           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
-        rusqlite::params![
-            consent_hash,
-            user_id,
-            client_id,
-            redirect_uri,
-            format!("+{AUTH_CODE_TTL_SECS} seconds")
-        ],
-    )?;
-    if inserted != 1 {
-        tx.rollback()?;
-        return Ok(false);
-    }
-    tx.commit()?;
-    Ok(true)
-}
-
-#[cfg(test)]
-fn approve_consent_conn(
-    conn: &rusqlite::Connection,
-    consent_hash: &str,
-    code_hash: &str,
-    user_id: &str,
-    client_id: &str,
-    redirect_uri: &str,
-) -> crate::error::Result<bool> {
-    let tx = conn.unchecked_transaction()?;
-    let consumed = tx.execute(
-        "DELETE FROM oauth_consents \
-         WHERE consent_hash = ?1 AND user_id = ?2 AND client_id = ?3 AND redirect_uri = ?4 \
-           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-           AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
-           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
-        rusqlite::params![consent_hash, user_id, client_id, redirect_uri],
-    )?;
-    if consumed != 1 {
-        tx.rollback()?;
-        return Ok(false);
-    }
-    tx.execute(
-        "INSERT INTO oauth_authorization_codes (code_hash, user_id, client_id, expires_at) \
-         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-        rusqlite::params![
-            code_hash,
-            user_id,
-            client_id,
-            format!("+{AUTH_CODE_TTL_SECS} seconds")
-        ],
-    )?;
-    tx.commit()?;
-    Ok(true)
-}
-
-#[cfg(test)]
-fn store_direct_authorization_code_conn(
-    conn: &rusqlite::Connection,
-    code_hash: &str,
-    user_id: &str,
-    client_id: &str,
-) -> crate::error::Result<bool> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM oauth_authorization_codes \
-         WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        [],
-    )?;
-    let inserted = tx.execute(
-        "INSERT INTO oauth_authorization_codes (code_hash, user_id, client_id, expires_at) \
-         SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4) \
-         WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
-           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
-        rusqlite::params![
-            code_hash,
-            user_id,
-            client_id,
-            format!("+{AUTH_CODE_TTL_SECS} seconds")
-        ],
-    )?;
-    if inserted != 1 {
-        tx.rollback()?;
-        return Ok(false);
-    }
-    tx.commit()?;
-    Ok(true)
-}
-
 fn authorization_redirect(redirect_uri: &str, client_state: &str, auth_code: &str) -> String {
     let mut params = vec![("code", auth_code)];
     if !client_state.is_empty() {
@@ -1547,7 +1357,7 @@ async fn google_callback(
     {
         Ok(u) => u,
         Err(crate::error::EnclaveError::SignupLimited) => {
-            super::control_store::observe_signup_refused("google", s.config.signup_limit_per_day);
+            super::observe_signup_refused("google", s.config.signup_limit_per_day);
             return signup_limited_page();
         }
         Err(_) => {
@@ -1575,20 +1385,6 @@ pub(super) async fn begin_authorization_consent(
     // native client ID is public and accepts a caller-chosen loopback port, so
     // another local app can reuse it with its own PKCE verifier. Keep the
     // archive-access disclosure for that path rather than calling it official.
-    // ADR-0022 genesis spine (G9). Both Google and Apple sign-ins funnel
-    // through here, immediately after the control-store transaction that
-    // created (or revalidated) this user's `active_legacy` archive binding has
-    // durably committed. The pass is detached and its outcome is swallowed, so
-    // sign-in never blocks on genesis and a wedged, unavailable, or refused
-    // genesis costs the user nothing they already had. It is also the
-    // resumption point: a half-genesis user converges on their next sign-in.
-    if s.repositories.uses_legacy_state() {
-        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-            Arc::clone(&s.control),
-            Arc::clone(&s.store),
-            user_id,
-        );
-    }
     let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
     let registered = s.repositories.oauth().client(&client_id).await;
     let RegisteredClient { name } = match registered {
@@ -1814,88 +1610,6 @@ async fn token(State(s): State<Arc<CpState>>, body: String) -> Response {
     }
 }
 
-#[cfg(test)]
-fn exchange_authorization_code_conn(
-    conn: &rusqlite::Connection,
-    code_hash: &str,
-    user_id: &str,
-    client_id: &str,
-    refresh_hash: &str,
-) -> crate::error::Result<bool> {
-    let tx = conn.unchecked_transaction()?;
-    let consumed = tx.execute(
-        "DELETE FROM oauth_authorization_codes \
-         WHERE code_hash = ?1 AND user_id = ?2 AND client_id = ?3 \
-           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-           AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
-           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
-        rusqlite::params![code_hash, user_id, client_id],
-    )?;
-    if consumed != 1 {
-        tx.rollback()?;
-        return Ok(false);
-    }
-    tx.execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-        rusqlite::params![
-            refresh_hash,
-            user_id,
-            client_id,
-            format!("+{REFRESH_TTL_SECS} seconds")
-        ],
-    )?;
-    tx.commit()?;
-    Ok(true)
-}
-
-#[cfg(test)]
-fn rotate_refresh_token_conn(
-    conn: &rusqlite::Connection,
-    old_hash: &str,
-    client_id: &str,
-    new_hash: &str,
-) -> crate::error::Result<Option<String>> {
-    let tx = conn.unchecked_transaction()?;
-    let user_id: Option<String> = tx
-        .query_row(
-            "SELECT r.user_id FROM refresh_tokens r \
-             JOIN users u ON u.id = r.user_id AND u.status = 'active' \
-             JOIN oauth_clients c ON c.client_id = r.client_id \
-             WHERE r.token_hash = ?1 AND r.client_id = ?2 AND r.revoked = 0 \
-               AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-            rusqlite::params![old_hash, client_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(user_id) = user_id else {
-        tx.rollback()?;
-        return Ok(None);
-    };
-
-    let updated = tx.execute(
-        "UPDATE refresh_tokens SET revoked = 1 \
-         WHERE token_hash = ?1 AND client_id = ?2 AND revoked = 0",
-        rusqlite::params![old_hash, client_id],
-    )?;
-    if updated != 1 {
-        tx.rollback()?;
-        return Ok(None);
-    }
-    tx.execute(
-        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-        rusqlite::params![
-            new_hash,
-            user_id,
-            client_id,
-            format!("+{REFRESH_TTL_SECS} seconds")
-        ],
-    )?;
-    tx.commit()?;
-    Ok(Some(user_id))
-}
-
 async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
     let Some(code) = form.code else {
         return bad_request_desc("invalid_request", "code required");
@@ -2016,18 +1730,6 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
             Ok(t) => t,
             Err(_) => return server_error(),
         };
-    // The second genesis resumption point. A native client refreshes long
-    // before it signs in again, so an archive whose genesis was interrupted
-    // (or whose process-local serving authority was lost to a restart)
-    // converges here on the user's next request rather than waiting for a new
-    // interactive sign-in. Detached and swallowed for the same reason.
-    if s.repositories.uses_legacy_state() {
-        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-            Arc::clone(&s.control),
-            Arc::clone(&s.store),
-            &user_id,
-        );
-    }
     token_response(&access, &raw_refresh)
 }
 
@@ -2041,7 +1743,6 @@ pub async fn issue_native_session(
     let access = tokens::issue_access_token(&s.config.jwt_secrets[0], &s.config.base_url, user_id)?;
     let raw_refresh = tokens::random_token_hex();
     let refresh_hash = tokens::sha256_hex(&raw_refresh);
-    let genesis_user_id = user_id.to_string();
     s.repositories
         .oauth()
         .create_native_session_refresh(NativeSessionRefresh {
@@ -2056,18 +1757,6 @@ pub async fn issue_native_session(
             refresh_ttl: Duration::from_secs(REFRESH_TTL_SECS as u64),
         })
         .await?;
-    // Apple-primary native login returns its first access/refresh pair here.
-    // Waiting for the first refresh would leave a newly selected account on
-    // the pre-Genesis archive for up to one access-token lifetime. Resume only
-    // after the session write is durable, matching the existing code-exchange
-    // and refresh-token boundaries.
-    if s.repositories.uses_legacy_state() {
-        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-            Arc::clone(&s.control),
-            Arc::clone(&s.store),
-            &genesis_user_id,
-        );
-    }
     Ok((access, raw_refresh))
 }
 
@@ -2112,12 +1801,9 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use base64::Engine as _;
-    use rusqlite::Connection;
     use sha2::{Digest, Sha256};
 
     const CLIENT: &str = "11111111-1111-4111-8111-111111111111";
-    const OTHER_CLIENT: &str = "22222222-2222-4222-8222-222222222222";
-    const USER: &str = "33333333-3333-4333-8333-333333333333";
     const REDIRECT: &str = "https://client.example/oauth/callback";
 
     fn assert_exact_style_hash(csp: &str) {
@@ -2127,34 +1813,6 @@ mod tests {
             csp.contains(&format!("style-src 'sha256-{encoded}'")),
             "CSP must authorize the exact embedded OAuth stylesheet"
         );
-    }
-
-    fn oauth_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE users (id TEXT PRIMARY KEY, status TEXT NOT NULL); \
-             CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL); \
-             CREATE TABLE oauth_consents (consent_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE oauth_authorization_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE refresh_tokens (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO users (id, status) VALUES (?1, 'active')",
-            [USER],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, 'Test Client', ?2)",
-            rusqlite::params![CLIENT, serde_json::to_string(&vec![REDIRECT]).unwrap()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, 'Other Client', ?2)",
-            rusqlite::params![OTHER_CLIENT, serde_json::to_string(&vec!["https://other.example/cb"]).unwrap()],
-        )
-        .unwrap();
-        conn
     }
 
     #[test]
@@ -2237,187 +1895,6 @@ mod tests {
     }
 
     #[test]
-    fn registration_is_idempotent_for_the_same_redirect_set() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL);",
-        )
-        .unwrap();
-        let json = serde_json::to_string(&vec![REDIRECT]).unwrap();
-        let (first, changed) = register_client_conn(&conn, CLIENT, Some("Client"), &json).unwrap();
-        assert!(matches!(first, ClientRegistration::Created(_)));
-        assert!(changed);
-        let (second, changed) =
-            register_client_conn(&conn, OTHER_CLIENT, Some("Spoof"), &json).unwrap();
-        assert!(matches!(second, ClientRegistration::Existing(ref id) if id == CLIENT));
-        assert!(!changed);
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM oauth_clients", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn registration_cap_bounds_control_database_growth() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
-             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
-             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
-             INSERT INTO oauth_clients (client_id, redirect_uris) \
-             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x) FROM n;",
-        )
-        .unwrap();
-        let (result, changed) = register_client_conn(
-            &conn,
-            CLIENT,
-            Some("Overflow"),
-            "[\"https://overflow.example/cb\"]",
-        )
-        .unwrap();
-        assert!(matches!(result, ClientRegistration::AtCapacity));
-        assert!(!changed);
-    }
-
-    #[test]
-    fn registration_cap_excludes_and_preserves_fixed_first_party_clients() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
-             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
-             INSERT INTO oauth_clients (client_id, redirect_uris, created_at) VALUES \
-                ('{FIRST_PARTY_NATIVE_CLIENT_ID}', '[]', '2000-01-01T00:00:00.000Z'), \
-                ('{FIRST_PARTY_WEB_CLIENT_ID}', '[\"https://kiokuu.com/app/apple-callback\"]', '2000-01-01T00:00:00.000Z'); \
-             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
-             INSERT INTO oauth_clients (client_id, redirect_uris) \
-             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x) FROM n;"
-        ))
-        .unwrap();
-
-        let (result, changed) = register_client_conn(
-            &conn,
-            CLIENT,
-            Some("Overflow"),
-            "[\"https://overflow.example/cb\"]",
-        )
-        .unwrap();
-        assert!(matches!(result, ClientRegistration::AtCapacity));
-        assert!(!changed);
-        let fixed_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM oauth_clients WHERE client_id IN (?1, ?2)",
-                rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(fixed_count, 2);
-    }
-
-    #[test]
-    fn registration_reclaims_only_stale_unreferenced_clients() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
-             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
-             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
-             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
-             INSERT INTO oauth_clients (client_id, redirect_uris, created_at) \
-             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x), \
-                    '2000-01-01T00:00:00.000Z' FROM n; \
-             INSERT INTO refresh_tokens (client_id, expires_at, revoked) \
-             VALUES ('client-1', '2099-01-01T00:00:00.000Z', 0);",
-        )
-        .unwrap();
-
-        let (result, changed) = register_client_conn(
-            &conn,
-            CLIENT,
-            Some("Replacement"),
-            "[\"https://replacement.example/cb\"]",
-        )
-        .unwrap();
-        assert!(matches!(result, ClientRegistration::Created(ref id) if id == CLIENT));
-        assert!(changed);
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM oauth_clients", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM oauth_clients WHERE client_id = 'client-1'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn consent_and_authorization_code_are_each_single_use() {
-        let conn = oauth_conn();
-        assert!(store_pending_consent_conn(&conn, "consent", USER, CLIENT, REDIRECT).unwrap());
-        assert!(approve_consent_conn(&conn, "consent", "code", USER, CLIENT, REDIRECT).unwrap());
-        assert!(
-            !approve_consent_conn(&conn, "consent", "other-code", USER, CLIENT, REDIRECT).unwrap()
-        );
-
-        assert!(exchange_authorization_code_conn(&conn, "code", USER, CLIENT, "refresh").unwrap());
-        assert!(
-            !exchange_authorization_code_conn(&conn, "code", USER, CLIENT, "other-refresh")
-                .unwrap()
-        );
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM refresh_tokens", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn reviewer_authorization_code_is_client_bound_and_single_use() {
-        let conn = oauth_conn();
-        assert!(store_direct_authorization_code_conn(&conn, "review-code", USER, CLIENT).unwrap());
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM oauth_authorization_codes \
-                 WHERE code_hash = 'review-code' AND user_id = ?1 AND client_id = ?2",
-                rusqlite::params![USER, CLIENT],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
-
-        assert!(exchange_authorization_code_conn(
-            &conn,
-            "review-code",
-            USER,
-            CLIENT,
-            "review-refresh"
-        )
-        .unwrap());
-        assert!(!exchange_authorization_code_conn(
-            &conn,
-            "review-code",
-            USER,
-            CLIENT,
-            "replay-refresh"
-        )
-        .unwrap());
-    }
-
-    #[test]
     fn reviewer_redirect_preserves_client_state_without_open_redirect_logic() {
         let redirect = authorization_redirect(
             "https://client.example/oauth/callback?existing=1",
@@ -2427,58 +1904,6 @@ mod tests {
         assert_eq!(
             redirect,
             "https://client.example/oauth/callback?existing=1&code=authorization+code&state=opaque+state"
-        );
-    }
-
-    #[test]
-    fn refresh_rotation_is_atomic_single_use_and_client_bound() {
-        let conn = oauth_conn();
-        conn.execute(
-            "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-             VALUES ('old', ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'))",
-            rusqlite::params![USER, CLIENT],
-        )
-        .unwrap();
-
-        assert_eq!(
-            rotate_refresh_token_conn(&conn, "old", OTHER_CLIENT, "wrong").unwrap(),
-            None
-        );
-        assert_eq!(
-            rotate_refresh_token_conn(&conn, "old", CLIENT, "new").unwrap(),
-            Some(USER.to_string())
-        );
-        assert_eq!(
-            rotate_refresh_token_conn(&conn, "old", CLIENT, "replay").unwrap(),
-            None
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM refresh_tokens WHERE revoked = 0 AND token_hash = 'new'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn inactive_user_cannot_exchange_or_refresh() {
-        let conn = oauth_conn();
-        assert!(store_pending_consent_conn(&conn, "consent", USER, CLIENT, REDIRECT).unwrap());
-        conn.execute("UPDATE users SET status = 'deleting' WHERE id = ?1", [USER])
-            .unwrap();
-        assert!(!approve_consent_conn(&conn, "consent", "code", USER, CLIENT, REDIRECT).unwrap());
-        conn.execute(
-            "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-             VALUES ('old', ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'))",
-            rusqlite::params![USER, CLIENT],
-        )
-        .unwrap();
-        assert_eq!(
-            rotate_refresh_token_conn(&conn, "old", CLIENT, "new").unwrap(),
-            None
         );
     }
 

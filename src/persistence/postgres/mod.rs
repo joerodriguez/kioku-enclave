@@ -48,6 +48,18 @@ pub(crate) struct PostgresPoolConfig {
 }
 
 impl PostgresPersistence {
+    #[cfg(test)]
+    pub(crate) fn disconnected_test_instance() -> Self {
+        let options =
+            PgConnectOptions::from_str("postgresql://kioku-test:unused@127.0.0.1:1/kioku_test")
+                .expect("static test PostgreSQL URL");
+        Self {
+            pool: PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy_with(options),
+        }
+    }
+
     pub(crate) async fn connect(config: PostgresPoolConfig) -> Result<Self> {
         if config.max_connections == 0 {
             return Err(EnclaveError::Config(
@@ -362,34 +374,37 @@ mod tests {
     use std::time::Duration;
 
     use super::{PostgresPersistence, PostgresPoolConfig};
-    use crate::cp::control_store::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
-    use crate::episodes::EpisodeInput;
+    use crate::gcs::FakeGcs;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
         AuthorizationCodeExchange, ConsentApproval, OAuthClientDefinition, PendingConsent,
         RefreshTokenRotation,
     };
     use crate::persistence::{
-        CaptureCommit, CapturePreflight, CaptureSessionStage, EmailFenceOutcome,
-        EmailProviderOutcome, EmailSendFence, EmailSendFenceDisposition, EpisodeDeletionStart,
-        EpisodeListRequest, FinalizationRequest, FinalizationScreenResult, FinalizationSettlement,
-        FrozenEmailDelivery, FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest,
-        McpTimeRangeRequest, McpTranscriptSearchRequest, MediaProcessingClass,
-        MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest,
-        PushInstallation, PushProviderOutcome, PushProviderReceipt, PushSendFenceDisposition,
-        RecordingRetentionChangeRequest, ScreenMediaSettlement, ScreenshotMediaLocator,
-        SummaryWindowSettlement, WebhookProviderOutcome, WebhookSendFence,
-        WebhookSendFenceDisposition, WebhookSubscription,
+        CaptureCommit, CapturePreflight, CaptureSessionStage, EmailProviderOutcome,
+        EpisodeDeletionStart, EpisodeInput, EpisodeListRequest, FinalizationRequest,
+        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, FrozenPushDelivery,
+        FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest,
+        MediaProcessingClass, MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest,
+        PeopleListRequest, PushInstallation, PushProviderOutcome, RecordingRetentionChangeRequest,
+        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
+        WebhookProviderOutcome, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
-    use crate::search::{SearchHit, SearchRequest};
-    use crate::store::tests::FakeGcs;
+    use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
+    use crate::persistence::{SearchHit, SearchRequest};
 
     async fn test_persistence() -> Option<PostgresPersistence> {
+        let contract_required =
+            std::env::var("KIOKU_REQUIRE_POSTGRES_CONTRACT").as_deref() == Ok("1");
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
             Ok(value) => value,
             Err(_) => {
+                assert!(
+                    !contract_required,
+                    "KIOKU_TEST_POSTGRES_URL is required by the real PostgreSQL contract gate"
+                );
                 eprintln!("KIOKU_TEST_POSTGRES_URL is unset; skipping real PostgreSQL contract");
                 return None;
             }
@@ -441,9 +456,9 @@ mod tests {
         };
         let persistence = Arc::new(persistence);
         let pool = persistence.pool().clone();
-        let media_gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
+        let media_gcs: Arc<dyn crate::gcs::GcsClient> = Arc::new(FakeGcs::new());
         let media_objects: Arc<dyn MediaObjectStore> =
-            Arc::new(GcsMediaObjectStore::new(Arc::clone(&media_gcs), media_gcs));
+            Arc::new(GcsMediaObjectStore::new(media_gcs));
         let repositories = Arc::new(RepositorySet::postgres(persistence, media_objects));
 
         let mut signups = Vec::new();
@@ -481,7 +496,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let admission = repositories.admission().unwrap();
+        let admission = repositories.admission();
         assert!(admission
             .consume_rate("contract-rate", &account_id, 2.0, 0.000_001)
             .await
@@ -664,21 +679,13 @@ mod tests {
             .is_none());
         let first_media_key = repositories
             .captures()
-            .install_media_dek(
-                &account_id,
-                "wrapped-media-key-1",
-                &crate::crypto::Dek([7; 32]),
-            )
+            .install_media_dek(&account_id, "wrapped-media-key-1")
             .await
             .unwrap();
         assert_eq!(first_media_key, "wrapped-media-key-1");
         let raced_media_key = repositories
             .captures()
-            .install_media_dek(
-                &account_id,
-                "wrapped-media-key-2",
-                &crate::crypto::Dek([8; 32]),
-            )
+            .install_media_dek(&account_id, "wrapped-media-key-2")
             .await
             .unwrap();
         assert_eq!(raced_media_key, first_media_key);
@@ -762,7 +769,7 @@ mod tests {
             ],
         });
         let canonical_digest = crate::cp::media::manifest_digest(&canonical).unwrap();
-        let object_key = crate::store::canonical_capture_media_object_key(
+        let object_key = crate::gcs::canonical_capture_media_object_key(
             &account_id,
             &canonical.media.as_ref().unwrap().asset_id,
         )
@@ -875,9 +882,7 @@ mod tests {
             .unwrap();
         assert_eq!(event_status.processing_state, "queued");
         assert_eq!(event_status.attempt_count, 0);
-        let media = repositories
-            .media_processing()
-            .expect("PostgreSQL media repository");
+        let media = repositories.media_processing();
         assert_eq!(
             media
                 .pending_classes(&account_id, "2026-08-27T12:00:05.000Z")
@@ -1009,9 +1014,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let memory = repositories
-            .memory_formation()
-            .expect("PostgreSQL memory formation repository");
+        let memory = repositories.memory_formation();
         let claim = memory
             .claim_summary_window(
                 &account_id,
@@ -1068,10 +1071,10 @@ mod tests {
                 participants: Some(Vec::new()),
                 languages: Some(vec!["en".into()]),
                 action_items: Some(vec!["Implement the repository".into()]),
+                model: Some("contract-model".into()),
                 substance: Some("normal".into()),
                 visual_evidence: Some("useful".into()),
                 minute_summaries: Some(Vec::new()),
-                model: Some("contract-model".into()),
                 member_utterance_ids: Vec::new(),
                 member_screenshot_ids: vec![summary_screenshots[0].id],
             }],
@@ -1132,9 +1135,7 @@ mod tests {
             .set_summarized_until(&account_id, "2026-08-27T17:00:00.000Z")
             .await
             .unwrap();
-        let finalization = repositories
-            .finalization()
-            .expect("PostgreSQL finalization repository");
+        let finalization = repositories.finalization();
         assert_eq!(
             finalization
                 .request_finalization(&account_id, episode_ids[0], 5)
@@ -1319,7 +1320,6 @@ mod tests {
                     )
                     .await
                     .unwrap()
-                    .allowed
             }));
         }
         let mut allowed = 0;
@@ -1580,32 +1580,83 @@ mod tests {
         assert!(opted_in.enabled && opted_in.include_content);
         let email_candidate = repositories
             .deliveries()
-            .expect("PostgreSQL delivery repository")
             .next_email_candidate(&account_id)
             .await
             .unwrap()
             .expect("finalization email candidate");
         assert!(email_candidate.include_content);
-        let email_claim = repositories
-            .deliveries()
-            .unwrap()
-            .claim_email(
-                &email_candidate,
-                FrozenEmailDelivery {
-                    recipient_email: email_candidate.recipient_email.clone(),
-                    include_content: email_candidate.include_content,
-                    subject: "PostgreSQL delivery contract".into(),
-                    text_body: "Text contract".into(),
-                    html_body: "<p>HTML contract</p>".into(),
-                },
-                60,
+        let email_request = FrozenEmailDelivery {
+            recipient_email: email_candidate.recipient_email.clone(),
+            include_content: email_candidate.include_content,
+            subject: "PostgreSQL delivery contract".into(),
+            text_body: "Text contract".into(),
+            html_body: "<p>HTML contract</p>".into(),
+        };
+        let claim_barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut claim_attempts = Vec::new();
+        for _ in 0..2 {
+            let repositories = Arc::clone(&repositories);
+            let email_candidate = email_candidate.clone();
+            let email_request = email_request.clone();
+            let claim_barrier = Arc::clone(&claim_barrier);
+            claim_attempts.push(tokio::spawn(async move {
+                claim_barrier.wait().await;
+                repositories
+                    .deliveries()
+                    .claim_email(&email_candidate, email_request, 60)
+                    .await
+            }));
+        }
+        claim_barrier.wait().await;
+        let mut claim_results = Vec::new();
+        for attempt in claim_attempts {
+            claim_results.push(attempt.await.unwrap().unwrap());
+        }
+        assert_eq!(
+            claim_results.iter().filter(|claim| claim.is_some()).count(),
+            1,
+            "exactly one concurrent email claimant must receive provider authority"
+        );
+        assert_eq!(
+            claim_results.iter().filter(|claim| claim.is_none()).count(),
+            1,
+            "the losing concurrent email claimant must receive no claim"
+        );
+        let email_claim = claim_results
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("single concurrent email claim winner");
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state,claim_token,attempt_count FROM email_deliveries \
+                   WHERE account_id=$1 AND delivery_id=$2",
             )
+            .bind(&account_id)
+            .bind(&email_claim.delivery_id)
+            .fetch_one(&pool)
             .await
-            .unwrap()
-            .expect("email claim");
+            .unwrap(),
+            (
+                "processing".into(),
+                Some(email_claim.claim_token.clone()),
+                1,
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM email_send_fences \
+                   WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
         assert!(repositories
             .deliveries()
-            .unwrap()
             .next_email_candidate(&account_id)
             .await
             .unwrap()
@@ -1616,13 +1667,11 @@ mod tests {
         };
         repositories
             .deliveries()
-            .unwrap()
             .settle_email(&email_claim, accepted_email.clone(), None)
             .await
             .unwrap();
         repositories
             .deliveries()
-            .unwrap()
             .settle_email(&email_claim, accepted_email, None)
             .await
             .unwrap();
@@ -1637,6 +1686,100 @@ mod tests {
             .unwrap(),
             "delivered"
         );
+
+        sqlx::query(
+            "UPDATE email_deliveries SET state='pending',attempt_count=0, \
+                    next_attempt_at=clock_timestamp(),claim_token=NULL,claim_until=NULL, \
+                    completed_claim_token=NULL,last_error=NULL,error_code=NULL \
+              WHERE account_id=$1 AND delivery_id=$2",
+        )
+        .bind(&account_id)
+        .bind(&email_claim.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL, \
+                    next_send_at=clock_timestamp(),circuit_until=NULL WHERE provider='email'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let disclosed_email_candidate = repositories
+            .deliveries()
+            .next_email_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("email candidate for disclosed-expiry contract");
+        let disclosed_email_claim = repositories
+            .deliveries()
+            .claim_email(
+                &disclosed_email_candidate,
+                FrozenEmailDelivery {
+                    recipient_email: disclosed_email_candidate.recipient_email.clone(),
+                    include_content: disclosed_email_candidate.include_content,
+                    subject: "Disclosed-expiry contract".into(),
+                    text_body: "Disclosed-expiry text".into(),
+                    html_body: "<p>Disclosed-expiry HTML</p>".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("email disclosed-expiry claim");
+        assert!(matches!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&account_id)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(message))
+                if message == "account has an in-flight email send"
+        ));
+        sqlx::query(
+            "UPDATE email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&disclosed_email_claim.delivery_id)
+        .bind(&disclosed_email_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repositories
+            .deliveries()
+            .next_email_candidate(&account_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, i64, Option<String>, Option<String>,)>(
+                "SELECT state,error_code,attempt_count,claim_token,completed_claim_token \
+                   FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&disclosed_email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (
+                "ambiguous".into(),
+                Some("claim_expired_after_disclosure".into()),
+                1,
+                None,
+                Some(disclosed_email_claim.claim_token.clone()),
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM email_send_fences WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&disclosed_email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
         sqlx::query("UPDATE webhook_subscriptions SET enabled=true WHERE account_id=$1 AND id=$2")
             .bind(&account_id)
             .bind(&webhook.id)
@@ -1645,14 +1788,12 @@ mod tests {
             .unwrap();
         let webhook_candidate = repositories
             .deliveries()
-            .unwrap()
             .next_webhook_candidate(&account_id)
             .await
             .unwrap()
             .expect("finalization webhook candidate");
         let webhook_claim = repositories
             .deliveries()
-            .unwrap()
             .claim_webhook(
                 &webhook_candidate,
                 FrozenWebhookDelivery {
@@ -1669,13 +1810,11 @@ mod tests {
         let sent_webhook = WebhookProviderOutcome::Sent { status: 204 };
         repositories
             .deliveries()
-            .unwrap()
             .settle_webhook(&webhook_claim, sent_webhook.clone(), None)
             .await
             .unwrap();
         repositories
             .deliveries()
-            .unwrap()
             .settle_webhook(&webhook_claim, sent_webhook, None)
             .await
             .unwrap();
@@ -1692,7 +1831,6 @@ mod tests {
         );
         let webhook_status = repositories
             .deliveries()
-            .unwrap()
             .webhook_delivery_status(&account_id, &webhook.id)
             .await
             .unwrap();
@@ -1700,8 +1838,128 @@ mod tests {
         assert_eq!(webhook_status.latest.unwrap().outcome, "sent");
         repositories
             .deliveries()
-            .unwrap()
             .cancel_webhook_deliveries(&account_id, &webhook.id)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE webhook_deliveries SET state='pending',attempt_count=0, \
+                    next_attempt_at=clock_timestamp(),claim_token=NULL,claim_until=NULL, \
+                    completed_claim_token=NULL,last_error=NULL,error_code=NULL \
+              WHERE account_id=$1 AND event_id=$2",
+        )
+        .bind(&account_id)
+        .bind(&webhook_claim.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL, \
+                    next_send_at=clock_timestamp(),circuit_until=NULL WHERE provider='webhook'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let takeover_webhook_candidate = repositories
+            .deliveries()
+            .next_webhook_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("webhook candidate for takeover contract");
+        let stale_webhook_claim = repositories
+            .deliveries()
+            .claim_webhook(
+                &takeover_webhook_candidate,
+                FrozenWebhookDelivery {
+                    endpoint_url: takeover_webhook_candidate.endpoint_url.clone(),
+                    signing_secret: takeover_webhook_candidate.signing_secret.clone(),
+                    include_content: takeover_webhook_candidate.include_content,
+                    event_body: "{\"takeover\":1}".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("initial webhook takeover claim");
+        sqlx::query(
+            "DELETE FROM webhook_send_fences \
+              WHERE account_id=$1 AND event_id=$2 AND claim_id=$3",
+        )
+        .bind(&account_id)
+        .bind(&stale_webhook_claim.event_id)
+        .bind(&stale_webhook_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE webhook_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND event_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&stale_webhook_claim.event_id)
+        .bind(&stale_webhook_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recovered_webhook_candidate = repositories
+            .deliveries()
+            .next_webhook_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("expired undisclosed webhook claim becomes retryable");
+        assert_eq!(recovered_webhook_candidate.attempt_count, 1);
+        let successor_webhook_claim = repositories
+            .deliveries()
+            .claim_webhook(
+                &recovered_webhook_candidate,
+                FrozenWebhookDelivery {
+                    endpoint_url: recovered_webhook_candidate.endpoint_url.clone(),
+                    signing_secret: recovered_webhook_candidate.signing_secret.clone(),
+                    include_content: recovered_webhook_candidate.include_content,
+                    event_body: "{\"takeover\":2}".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("successor webhook claim");
+        assert_eq!(successor_webhook_claim.attempt_count, 2);
+        assert!(matches!(
+            repositories
+                .deliveries()
+                .settle_webhook(
+                    &stale_webhook_claim,
+                    WebhookProviderOutcome::Sent { status: 204 },
+                    None,
+                )
+                .await,
+            Err(crate::error::EnclaveError::Conflict(message))
+                if message == "webhook delivery claim is no longer authoritative"
+        ));
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
+                "SELECT state,claim_token,completed_claim_token,attempt_count \
+                   FROM webhook_deliveries WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&successor_webhook_claim.event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            (
+                "processing".into(),
+                Some(successor_webhook_claim.claim_token.clone()),
+                None,
+                2,
+            )
+        );
+        repositories
+            .deliveries()
+            .settle_webhook(
+                &successor_webhook_claim,
+                WebhookProviderOutcome::Sent { status: 204 },
+                None,
+            )
             .await
             .unwrap();
         assert!(opted_in.consented_at.is_some());
@@ -1737,7 +1995,6 @@ mod tests {
         );
         let push_candidate = repositories
             .deliveries()
-            .unwrap()
             .next_push_candidate(&account_id)
             .await
             .unwrap()
@@ -1745,7 +2002,6 @@ mod tests {
         assert_eq!(push_candidate.token_generation, installed.token_generation);
         let push_claim = repositories
             .deliveries()
-            .unwrap()
             .claim_push(
                 &push_candidate,
                 FrozenPushDelivery {
@@ -1762,13 +2018,11 @@ mod tests {
         let accepted_push = PushProviderOutcome::Accepted { status: 200 };
         repositories
             .deliveries()
-            .unwrap()
             .settle_push(&push_claim, accepted_push.clone(), None)
             .await
             .unwrap();
         repositories
             .deliveries()
-            .unwrap()
             .settle_push(&push_claim, accepted_push, None)
             .await
             .unwrap();
@@ -1786,186 +2040,126 @@ mod tests {
         assert_eq!(
             repositories
                 .deliveries()
-                .unwrap()
                 .resolve_push_handoff(&account_id, &push_claim.handoff_handle)
                 .await
                 .unwrap(),
             Some(push_claim.episode_id)
         );
 
-        let fence_webhook = WebhookSubscription {
-            id: "44444444-4444-4444-8444-444444444444".into(),
-            user_id: account_id.clone(),
-            name: "Fence contract hook".into(),
-            endpoint_url: "https://hooks.example/fence".into(),
-            signing_secret: "fence-signing-secret".into(),
-            include_content: false,
-            enabled: true,
-            created_at: "2026-08-27T12:03:00.000Z".into(),
-        };
-        repositories
-            .notifications()
-            .create_webhook_subscription(fence_webhook.clone())
-            .await
-            .unwrap();
-        let webhook_fence = WebhookSendFence {
-            user_id: account_id.clone(),
-            event_id: "event-contract".into(),
-            subscription_id: fence_webhook.id.clone(),
-            claim_id: "55555555-5555-4555-8555-555555555555".into(),
-            lease_expires_at: "2026-08-27T12:10:00.000Z".into(),
-            endpoint_url: fence_webhook.endpoint_url.clone(),
-            signing_secret: fence_webhook.signing_secret.clone(),
-            include_content: false,
-            outcome: None,
-            outcome_at: None,
-        };
-        let mut webhook_begins = Vec::new();
-        for _ in 0..8 {
-            let repositories = Arc::clone(&repositories);
-            let webhook_fence = webhook_fence.clone();
-            webhook_begins.push(tokio::spawn(async move {
-                repositories
-                    .work()
-                    .begin_webhook_send_fence(&webhook_fence, "2026-08-27T12:04:00.000Z")
-                    .await
-            }));
-        }
-        for begin in webhook_begins {
-            assert!(matches!(
-                begin.await.unwrap().unwrap(),
-                WebhookSendFenceDisposition::Authorized(_)
-            ));
-        }
-        let mut conflicting_webhook = webhook_fence.clone();
-        conflicting_webhook.claim_id = "88888888-8888-4888-8888-888888888888".into();
-        assert!(matches!(
-            repositories
-                .work()
-                .begin_webhook_send_fence(&conflicting_webhook, "2026-08-27T12:04:00.000Z",)
-                .await,
-            Err(crate::error::EnclaveError::Conflict(_))
-        ));
-        assert!(repositories
-            .work()
-            .validate_webhook_send_fence(
-                &webhook_fence,
-                crate::cp::isotime::parse_epoch_millis("2026-08-27T12:09:00.000Z").unwrap(),
-            )
-            .await
-            .unwrap());
-        let webhook_outcome = WebhookProviderOutcome::Sent { status: 204 };
-        repositories
-            .work()
-            .record_webhook_send_outcome(
-                &webhook_fence,
-                webhook_outcome.clone(),
-                "2026-08-27T12:05:00.000Z",
-            )
-            .await
-            .unwrap();
-        let completed_webhook = repositories
-            .work()
-            .get_webhook_send_fence(&account_id, &webhook_fence.event_id)
+        sqlx::query(
+            "UPDATE push_deliveries SET state='pending',attempt_count=0, \
+                    next_attempt_at=clock_timestamp(),claim_token=NULL,claim_until=NULL, \
+                    completed_claim_token=NULL,last_error=NULL,error_code=NULL \
+              WHERE account_id=$1 AND delivery_id=$2",
+        )
+        .bind(&account_id)
+        .bind(&push_claim.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL, \
+                    next_send_at=clock_timestamp(),circuit_until=NULL WHERE provider='push'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let takeover_push_candidate = repositories
+            .deliveries()
+            .next_push_candidate(&account_id)
             .await
             .unwrap()
-            .unwrap();
-        repositories
-            .work()
-            .record_webhook_send_outcome(
-                &webhook_fence,
-                webhook_outcome,
-                "2026-08-27T12:05:00.000Z",
+            .expect("push candidate for takeover contract");
+        let stale_push_claim = repositories
+            .deliveries()
+            .claim_push(
+                &takeover_push_candidate,
+                FrozenPushDelivery {
+                    topic: takeover_push_candidate.topic.clone(),
+                    environment: takeover_push_candidate.environment.clone(),
+                    device_token: takeover_push_candidate.device_token.clone(),
+                    token_generation: takeover_push_candidate.token_generation,
+                },
+                60,
             )
-            .await
-            .unwrap();
-        repositories
-            .work()
-            .close_webhook_send_fence(&completed_webhook)
-            .await
-            .unwrap();
-
-        let email_fence = EmailSendFence {
-            user_id: account_id.clone(),
-            delivery_id: "delivery-contract".into(),
-            claim_id: "66666666-6666-4666-8666-666666666666".into(),
-            lease_expires_at: "2026-08-27T12:10:00.000Z".into(),
-            recipient_email: "owner@example.com".into(),
-            include_content: true,
-            outcome: None,
-            outcome_at: None,
-        };
-        assert!(matches!(
-            repositories
-                .work()
-                .begin_email_send_fence(&email_fence, "2026-08-27T12:04:00.000Z")
-                .await
-                .unwrap(),
-            EmailSendFenceDisposition::Authorized(_)
-        ));
-        let email_outcome = EmailProviderOutcome::Accepted {
-            status: 202,
-            provider_message_id: "provider-message-contract".into(),
-        };
-        repositories
-            .work()
-            .record_email_send_outcome(
-                &email_fence,
-                email_outcome.clone(),
-                "2026-08-27T12:05:00.000Z",
-            )
-            .await
-            .unwrap();
-        let completed_email = repositories
-            .work()
-            .get_email_send_fence(&account_id, &email_fence.delivery_id)
             .await
             .unwrap()
-            .unwrap();
-        repositories
-            .work()
-            .finish_email_send_fence(&completed_email, EmailFenceOutcome::Provider(email_outcome))
+            .expect("initial push takeover claim");
+        sqlx::query("DELETE FROM push_send_fences WHERE account_id=$1 AND claim_id=$2")
+            .bind(&account_id)
+            .bind(&stale_push_claim.claim_token)
+            .execute(&pool)
             .await
             .unwrap();
-
+        sqlx::query(
+            "UPDATE push_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&stale_push_claim.delivery_id)
+        .bind(&stale_push_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recovered_push_candidate = repositories
+            .deliveries()
+            .next_push_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("expired undisclosed push claim becomes retryable");
+        assert_eq!(recovered_push_candidate.attempt_count, 1);
+        let successor_push_claim = repositories
+            .deliveries()
+            .claim_push(
+                &recovered_push_candidate,
+                FrozenPushDelivery {
+                    topic: recovered_push_candidate.topic.clone(),
+                    environment: recovered_push_candidate.environment.clone(),
+                    device_token: recovered_push_candidate.device_token.clone(),
+                    token_generation: recovered_push_candidate.token_generation,
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("successor push claim");
+        assert_eq!(successor_push_claim.attempt_count, 2);
         assert!(matches!(
             repositories
-                .work()
-                .begin_push_send_fence(
-                    &account_id,
-                    &installed.id,
-                    installed.token_generation,
-                    "77777777-7777-4777-8777-777777777777",
-                    "2026-08-27T12:10:00.000Z",
-                    "2026-08-27T12:04:00.000Z",
+                .deliveries()
+                .settle_push(
+                    &stale_push_claim,
+                    PushProviderOutcome::Accepted { status: 200 },
+                    None,
                 )
-                .await
-                .unwrap(),
-            PushSendFenceDisposition::Authorized(_)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(message))
+                if message == "push delivery claim is no longer authoritative"
         ));
-        let push_outcome = PushProviderOutcome::Accepted { status: 200 };
-        repositories
-            .work()
-            .record_push_send_outcome(
-                &account_id,
-                &installed.id,
-                installed.token_generation,
-                "77777777-7777-4777-8777-777777777777",
-                "2026-08-27T12:10:00.000Z",
-                PushProviderReceipt::new(push_outcome.clone(), "2026-08-27T12:05:00.000Z".into())
-                    .unwrap(),
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
+                "SELECT state,claim_token,completed_claim_token,attempt_count \
+                   FROM push_deliveries WHERE account_id=$1 AND delivery_id=$2",
             )
+            .bind(&account_id)
+            .bind(&successor_push_claim.delivery_id)
+            .fetch_one(&pool)
             .await
-            .unwrap();
-        let completed_push = repositories
-            .work()
-            .get_push_send_fence(&account_id, &installed.id)
-            .await
-            .unwrap()
-            .unwrap();
+            .unwrap(),
+            (
+                "processing".into(),
+                Some(successor_push_claim.claim_token.clone()),
+                None,
+                2,
+            )
+        );
         repositories
-            .work()
-            .finish_push_send_fence(&completed_push, push_outcome)
+            .deliveries()
+            .settle_push(
+                &successor_push_claim,
+                PushProviderOutcome::Accepted { status: 200 },
+                None,
+            )
             .await
             .unwrap();
 
@@ -2123,7 +2317,6 @@ mod tests {
             .search(
                 &account_id,
                 &SearchRequest {
-                    user_id: account_id.clone(),
                     query: "PostgreSQL".into(),
                     speaker: None,
                     time_start: None,
@@ -2145,7 +2338,6 @@ mod tests {
             .search(
                 &account_id,
                 &SearchRequest {
-                    user_id: account_id.clone(),
                     query: "not-in-the-document".into(),
                     speaker: None,
                     time_start: None,
@@ -2685,9 +2877,7 @@ mod tests {
             Some(0)
         );
 
-        let episode_deletions = repositories
-            .episode_deletions()
-            .expect("PostgreSQL episode deletion repository");
+        let episode_deletions = repositories.episode_deletions();
         let plan = match episode_deletions
             .begin_episode_deletion(&account_id, episode_ids[0])
             .await
@@ -2748,13 +2938,11 @@ mod tests {
             .unwrap();
         assert!(repositories
             .memory_formation()
-            .unwrap()
             .ensure_reviewer_fixture(&reviewer_account.id)
             .await
             .unwrap());
         assert!(!repositories
             .memory_formation()
-            .unwrap()
             .ensure_reviewer_fixture(&reviewer_account.id)
             .await
             .unwrap());
@@ -2803,11 +2991,8 @@ mod tests {
                 &account_id,
                 "deletion-race-event",
                 "deletion-race-asset",
-                &crate::store::canonical_capture_media_object_key(
-                    &account_id,
-                    "deletion-race-asset",
-                )
-                .unwrap(),
+                &crate::gcs::canonical_capture_media_object_key(&account_id, "deletion-race-asset")
+                    .unwrap(),
                 &"d".repeat(64),
             )
             .await

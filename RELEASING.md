@@ -1,260 +1,230 @@
 # Local enclave release runbook
 
-GitHub Actions is disabled. A push, merge, tag, or schedule does not build, scan,
-publish, or deploy anything. GitHub remains the reviewed source, pull-request, signed-tag,
-and immutable-release host. The operator runs the release pipeline on a designated
-Linux/amd64 builder; do not repeatedly build the large image on an agent laptop.
+The enclave is built, tested, scanned, signed, and published from reviewed local tooling. GitHub
+hosts source and immutable releases; GitHub Actions does not build or deploy the image.
 
-The local commands reuse the reviewed build, test, image, SBOM, scan, and release checks
-that previously lived in hosted workflows. They do **not** provide GitHub-hosted
-provenance, CodeQL, dependency review, or an independently reproducible build. The build
-evidence is instead a canonical record signed with an independently pinned Ed25519 key.
+Production is PostgreSQL-authoritative. A release must not introduce a backend selector, fallback,
+dual write, shadow read, database-in-GCS configuration, or migration from removed state.
 
-## One-time operator setup
+## Operator prerequisites
 
-- Use a clean, synchronized local `main`, a trusted signed-tag key, GitHub CLI access to
-  push tags and create immutable releases, and a Linux/amd64 Docker builder.
-- Install the pinned tools required by `scripts/local_image_pipeline.py`: Docker Buildx,
-  Rust/Cargo, `cargo-audit`, Syft 1.49.0, Grype 0.116.0, Google Cloud CLI 580.0.0,
-  Python 3, OpenSSL, Git, and GitHub CLI.
-- Keep production build configuration outside the checkout in a regular, current-user-owned
-  file with exact mode `0600`. It is `KEY=VALUE` data, never shell code; unknown keys,
-  symlinks, unsafe permissions, and repository-resident files are rejected. Include the
-  reviewed production build inputs plus `LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT`, a
-  push-only Artifact Registry identity distinct from the enclave runtime identity.
-  All fixed ADR-0022 fresh release coordinates additionally require the same exact
-  `PRODUCTION_ADR0022_CANARY_IDENTITY_PREPARATION_SHA256=<nonzero-lowercase-hex64>` and
-  a sole lowercase UUIDv5 in `PRODUCTION_ADMIN_USER_IDS`; neither value is derived or
-  read from a provider by this repository.
-- Create a distinct Ed25519 build-evidence signing key outside either repository with
-  exact mode `0600`. Independently publish and pin the SHA-256 fingerprint of its public
-  DER key. Set `LOCAL_BUILD_EVIDENCE_PUBLIC_KEY` and
-  `LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256` for release/roll verification.
-  `./scripts/local_build_evidence.py fingerprint --public-key /secure/keys/public.pem`
-  prints that safe lowercase fingerprint without reading the private key.
-- Authenticate `gcloud` as the reviewed human operator. The human may impersonate the
-  push-only builder only for registry publication; no service-account JSON key is used.
+Use a clean checkout of the newest `origin/main`. Keep all credentials, keys, evidence directories,
+Docker/Buildx state, and operator configuration outside the repository with current-user-only
+permissions.
 
-The accepted native-builder baseline on 2026-08-15 completed the full test/audit/build/
-SBOM/scan gate in 10m34s for the final cold cache-key seed and 5m04s on a
-documentation-only cross-commit warm path. The temporary Git archive
-transport normalizes member timestamps before BuildKit consumes it, while retaining the
-original archive digest in evidence. The source commit time is likewise bound in signed
-evidence rather than supplied as a global Docker build argument, so a documentation or
-release-tooling commit does not invalidate byte-identical toolchain, model, dependency,
-or application layers. Treat a
-regression to uncached stable layers as a failed release-performance acceptance check.
+Required local boundaries:
 
-For the one-time hosted-to-local migration, reconstruct the exact production values from
-the immutable image currently pinned by deployment. This avoids guessing the former
-GitHub secret values and never prints them:
+- a reviewed native Linux/amd64 BuildKit worker with the pinned transport/identity configuration;
+- short-lived impersonation of the push-only Artifact Registry service account;
+- an external Ed25519 build-evidence key and independently pinned public-key fingerprint;
+- the reviewed source-tag signing key/fingerprint;
+- a disposable PostgreSQL 17 database for the real contract suite;
+- the separate deployment repository for Terraform plan/apply and ADR-0041 rollout receipts.
 
-```sh
-./scripts/bootstrap_local_operator_config.py \
-  --image us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave@sha256:CURRENT_DIGEST \
-  --output ~/.config/kioku/enclave-production.env
+No service-account JSON key is accepted. `GOOGLE_APPLICATION_CREDENTIALS` must be unset.
+
+## Select the image configuration
+
+The external mode-0600 operator file contains shared build coordinates and complete `PRODUCTION_`
+and `EVALUATION_` profiles. Production includes KMS, the live media bucket, workload/caller identity,
+OAuth audiences, APNs identifiers, public origins, billing, reviewer, and Vertex values.
+
+The selector fixes these serving invariants in reviewed source:
+
+```text
+POSTGRES_MAX_CONNECTIONS=12
+HEALTH_PORT=8081
+DRAIN_TIMEOUT_SECONDS=105
+ENCLAVE_TLS=1
 ```
 
-The command uses a private, temporary registry login, validates the reconstructed values,
-creates the parent directory privately, refuses overwrite, and writes exact mode 0600.
+Serving verifies the required PostgreSQL schema unconditionally in code and never runs DDL. There
+is no schema-mode input, structured-state backend, archive, witness, genesis, index-bucket, or
+legacy-media input. Private provider keys, database credentials, shared TLS material, OAuth
+secrets, and signing secrets remain runtime Secret Manager/database boundaries, not image-build
+arguments.
 
-**That migration is complete, and this command is not a recovery path today.** It reads
-the deployed image's `.Image.Config.Env`, but the reviewed configuration has since moved
-out of image ENV into the baked `/kioku-config` file, so no image built by the current
-`Dockerfile` carries `KIOKU_BUILD_PROFILE` there. The tool refuses any such image with
-"the selected deployed image is not a production build", and no future deploy restores
-it. **The local operator file is therefore the only copy of its values** — including
-`PRODUCTION_REVIEWER_AUTH_API_KEY` and, as of the baked genesis gate,
-`PRODUCTION_GENESIS_WAL_NATIVE`. Keep a backup outside this repository; losing the file
-means reconstructing every secret it holds by hand.
-
-## Verify, build, scan, and sign an image
-
-First merge the reviewed version bump and required ADR-0016 classification. From clean,
-synchronized `main`, create and verify a signed `vX.Y.Z` tag whose version matches
-`Cargo.toml`. The tag must exist locally before producing release evidence.
-
-Use a fresh, private evidence directory. The pipeline performs contract tests, the full
-local Rust verification suite, dependency audit, Linux/amd64 image construction, SPDX SBOM
-generation, and fixed-high Grype scan **before** requesting the short-lived registry
-credential. `verify`, `build`, and `push` require `--apply`: verification creates local
-Rust artifacts, while `push` additionally publishes the image.
+Validate without writing an image:
 
 ```sh
-# Read-only/full local release verification (no cloud credentials or image push)
-./scripts/local_image_pipeline.py verify \
-  --config /secure/kioku-production.env --apply
+python3 scripts/select_build_configuration.py \
+  --profile production \
+  --source-ref main
+```
 
-# Build, scan, resolve a digest, and push the exact signed tag
-./scripts/local_image_pipeline.py push \
-  --config /secure/kioku-production.env \
-  --source-ref refs/tags/vX.Y.Z \
-  --output-dir /secure/evidence/vX.Y.Z \
+For first local-tool adoption, `bootstrap_local_operator_config.py` can extract the allowlisted
+current values from one digest-qualified immutable deployed image into a new external mode-0600
+file. It requires a local Unix-socket Docker context, uses a temporary
+Artifact Registry login, and copies `/kioku-config` from a stopped, exact-ID temporary container.
+It never starts the container or exposes values through image metadata or command output, and it
+removes that container before returning. The embedded profile must be `production` and the current
+selector must accept every mapped value. Review the resulting file privately and never commit it.
+
+## Run the release gate
+
+Provision a disposable PostgreSQL 17 database explicitly. The enclave scripts deliberately do not
+assume Docker is available or start a database container silently.
+
+```sh
+export KIOKU_TEST_POSTGRES_URL='postgresql://…'
+
+./scripts/agent-verify.sh full
+
+python3 scripts/local_image_pipeline.py verify \
+  --config /secure/kioku-operator.env \
+  --profile production \
+  --source-ref main \
+  --apply
+```
+
+`agent-verify.sh full` fails before Cargo if the URL is absent or not a PostgreSQL URL and exports
+`KIOKU_REQUIRE_POSTGRES_CONTRACT=1`; the Rust contract harness must fail rather than skip when that
+signal is present. The full pipeline discovers every checked-in `scripts/test_*.py` and
+`scripts/test_*.sh`, then runs locked Rust tests, all-target Clippy, and RustSec audit.
+
+The real database contract must cover tenant isolation, concurrent claims, expired-lease takeover,
+stale settlement refusal, provider ambiguity/no-resend, export, episode/account deletion,
+no-resurrection, restart enumeration, full-text/vector/time-zone queries, and schema readiness.
+
+Destroy the disposable database after the gate. Do not point the test suite at production.
+
+## Build, scan, and push
+
+Bump the crate version for a new standard release. `deploy_latest.py tag` derives exactly
+`vMAJOR.MINOR.PATCH` from `Cargo.toml`; it does not invent a storage-backend suffix or sequence.
+
+```sh
+python3 scripts/deploy_latest.py tag
+
+python3 scripts/deploy_latest.py pipeline build \
+  --config /secure/kioku-operator.env \
+  --output-dir /secure/kioku-release-vX.Y.Z \
+  --tag-signing-key /secure/release-tag-key.pub \
   --apply
 
-# Sign the canonical local evidence; never add the private key to a repository.
-./scripts/local_build_evidence.py sign \
-  --manifest /secure/evidence/vX.Y.Z/enclave-local-build-evidence.json \
-  --signature /secure/evidence/vX.Y.Z/enclave-local-build-evidence.sig \
-  --private-key /secure/keys/kioku-local-build-ed25519.pem
+python3 scripts/deploy_latest.py pipeline push \
+  --config /secure/kioku-operator.env \
+  --output-dir /secure/kioku-release-vX.Y.Z \
+  --tag-signing-key /secure/release-tag-key.pub \
+  --apply --resume
 ```
 
-The evidence directory contains the canonical evidence JSON and detached signature,
-schema-9 or exact fresh-role schema-10 `enclave-release.json`, SPDX SBOM, and scan result. It binds the source tag and
-commit, digest-qualified image, hashes of the build configuration/Dockerfile/Cargo lock,
-release metadata/SBOM/scan, and tool versions. It contains hashes rather than configuration
-values.
+The source must be clean and equal to `origin/main`; the tag must be a signed annotated tag peeling
+to that source. The pipeline:
 
-### Fixed ADR-0022 fresh release coordinates
+1. freezes and rechecks an immutable Git archive;
+2. binds Cargo/source/config hashes into the build;
+3. verifies the exact named Linux/amd64 worker before and after the build;
+4. emits an OCI archive without loading a mutable daemon tag;
+5. creates the SPDX SBOM and vulnerability scan before cloud authentication;
+6. copies the scanned OCI bytes into a private unlinked read-only quarantine;
+7. promotes only those bytes and verifies the registry digest;
+8. emits canonical schema-11 release metadata and build evidence.
 
-The fresh BOOTSTRAP can be built and published only as
-`v0.8.35-adr0022-fresh-bootstrap.1` from the checked version-0.8.35, schema-0/0/0,
-archive-runtime-off, witness-probe-off, Genesis-off source. Version or attempt aliases,
-evaluation selection, schema-9 metadata, incomplete canary inputs, and any fresh
-bucket/KMS/runtime-SA/WIF/custom-role drift fail before publication.
+The release metadata binds source/tag/image digest, the live media bucket, KMS coordinates,
+PostgreSQL authority, required serving-schema verification, fleet connection budget, health/drain
+values, and shared TLS. The schema-verification claim is a fixed source invariant, not copied from
+operator configuration.
+Earlier metadata that described removed storage authority is ineligible for new promotion.
 
-For this one tag the producer emits an exact 50-field insertion-order compact JSON object
-with one trailing LF. The signed evidence binds those raw bytes and the once-read private
-configuration bytes. The provider-free cross-repository format pin is
-`config/adr0022-fresh-schema10-bootstrap-fixture.json` (3,094 bytes; SHA-256
-`40ce2530b9860133f69ac2d207c0f86165b6971b7207329ed7d09b3a4516e2a9`); its synthetic
-commit, image digest, and canary values are not release evidence or provider authority.
-Generic release roles continue to emit schema 9.
+Sign or verify the canonical evidence:
 
-The separately reviewed FINAL source is reserved only as
-`v0.8.35-archive-v3-wal.14`. It must retain the exact fresh namespace and canary
-bindings, compile the reviewed additive ladder at 1/1/1, enable native Genesis,
-carry the complete active archive runtime plus the live one-way binding
-commitment, and pin the exact completed baseline-seal bytes. The BOOTSTRAP tree
-intentionally carries an empty FINAL seal pin, so renaming a tag, flipping the
-seal bit, or activating a config file cannot make it FINAL-eligible. FINAL
-aliases and BOOTSTRAP/FINAL role crossing are rejected before publication.
+```sh
+python3 scripts/local_build_evidence.py sign \
+  --manifest /secure/kioku-release-vX.Y.Z/enclave-local-build-evidence.json \
+  --signature /secure/kioku-release-vX.Y.Z/enclave-local-build-evidence.sig \
+  --private-key /secure/kioku-build-evidence-private.pem
 
-The capture-latency successor is reserved only as
-`v0.8.36-archive-v3-wal.15`. It retains FINAL.14's exact fresh namespace,
-canary, active archive runtime, Genesis, schema 1/1/1, and completed baseline
-seal bindings while requiring the checked Cargo/lockfile version 0.8.36. No
-other 0.8.36 archive-v3 tag can claim this coordinate, and FINAL.14 remains
-verifiable from its own signed source without becoming an alias for the new
-image.
+python3 scripts/local_build_evidence.py verify \
+  --manifest /secure/kioku-release-vX.Y.Z/enclave-local-build-evidence.json \
+  --signature /secure/kioku-release-vX.Y.Z/enclave-local-build-evidence.sig \
+  --public-key /secure/kioku-build-evidence-public.pem \
+  --expected-public-key-sha256 <pinned-fingerprint>
+```
 
 ## Publish the immutable release
 
-Review the release plan first. It checks the trusted source-tag signer, signed evidence,
-schema-9 or exact fresh-role schema-10 production claims, bucket configuration, immutable registry digest, and exact
-release assets before changing remote state.
+Set the independently pinned tag/evidence key fingerprints, then dry-run:
 
 ```sh
-# Dry run
-RELEASE_SIGNER_FINGERPRINT=<trusted-source-tag-fingerprint> \
-  ./scripts/release.sh vX.Y.Z \
-  --evidence-dir /secure/evidence/vX.Y.Z \
-  --config /secure/kioku-production.env \
+scripts/release.sh vX.Y.Z \
+  --evidence-dir /secure/kioku-release-vX.Y.Z \
+  --config /secure/kioku-operator.env \
   --repository joerodriguez/kioku-enclave
+```
 
-# Push the already signed tag and publish its immutable GitHub Release
-RELEASE_SIGNER_FINGERPRINT=<trusted-source-tag-fingerprint> \
-  ./scripts/release.sh vX.Y.Z \
-  --evidence-dir /secure/evidence/vX.Y.Z \
-  --config /secure/kioku-production.env \
+Apply only after reviewing the exact tag, commit, digest, configuration hash, SBOM, scan, and
+evidence-key identity:
+
+```sh
+scripts/release.sh vX.Y.Z \
+  --evidence-dir /secure/kioku-release-vX.Y.Z \
+  --config /secure/kioku-operator.env \
   --repository joerodriguez/kioku-enclave \
   --apply
 ```
 
-Publication refuses a missing or unknown tag signer, modified evidence, mismatched
-source/config/image/SBOM/scan binding, mutable image reference, changed registry digest,
-or a non-immutable existing release. It attaches exactly the signed evidence, signature,
-release metadata, SBOM, and scan result; it does not replace an existing immutable release.
-The publisher resolves the requested annotated tag once, requires its signed embedded tag
-name and peeled commit to match, verifies the signer on that exact object ID, pushes that
-object ID, and reads back both the remote tag object and peeled commit. Release assets are
-copied once to a private read-only snapshot before verification; only those same snapshot
-bytes are uploaded or compared on resume. Git replacement refs, legacy grafts, and ambient
-repository/object/config overrides are rejected throughout these source boundaries.
+Publication snapshots all five release assets to read-only files before verification, pushes the
+captured signed tag object rather than re-resolving a mutable name, checks the remote object and
+peeled commit, confirms the registry digest, and publishes an immutable GitHub release. Resume is
+accepted only when every existing asset is byte-identical.
 
-`release.sh --roll` refuses every fixed fresh tag. Fresh rollout is owned only
-by the deployment repository's source-frozen direct-provider operation, which
-consumes the signed release plus the fresh provider and health evidence without
-entering the legacy storage/KMS/VM rollout path.
+## PostgreSQL schema changes
 
-## Roll the verified digest
+Schema migrations are append-only and are not run by serving members. For a runtime requiring a new
+schema:
 
-Deployment is owned by the sibling Kioku monorepo and is always explicit. Its local
-operation downloads the immutable release assets and verifies the evidence, tag, commit,
-metadata, image URI, and digest before acquiring deployment credentials. Then it updates
-the KMS digest binding, applies the exact saved Terraform plan, replaces the Confidential
-Space VM, performs health/containment checks, and records a private local ledger.
+1. merge the application and migration after real PostgreSQL contract review;
+2. publish one digest used by both the serving image and dedicated migrator image;
+3. update the digest-pinned one-shot migrator in the deployment repository;
+4. apply the reviewed schema stage while the currently serving image remains compatible;
+5. execute the migrator exactly once under its bounded database role;
+6. independently verify the expected migration version before admitting the candidate runtime.
 
-The generic `enclave-roll` description and example below apply only to the
-legacy/generic release workflow. They are not an ADR-0022 fresh rollout path;
-all fixed fresh tags are rejected there and must use the deployment repository's
-source-frozen direct-provider operation.
+Do not add data backfill or removed-backend migration machinery. There is no legacy user data to
+preserve.
 
-Either invoke it from the monorepo:
+## ADR-0041 compatible fleet rollout
 
-```sh
-KIOKU_ENCLAVE_EVIDENCE_VERIFY=/path/to/kioku-enclave/scripts/verify_local_evidence_bundle.py \
-  ./scripts/local-operations.sh enclave-roll \
-  --release-tag vX.Y.Z \
-  --image-uri us-central1-docker.pkg.dev/PROJECT/REPOSITORY/kioku-enclave@sha256:FULL_DIGEST \
-  --digest sha256:FULL_DIGEST \
-  --config /secure/kioku-production.env \
-  --confirm "ROLL ENCLAVE sha256:FULL_DIGEST" \
-  --apply
-```
+Ordinary compatible releases use the deployment repository's staged Terraform owner, not
+`release.sh --roll`:
 
-or add `--roll --deployment-repo /path/to/kioku` to the `release.sh --apply` command.
-The direct command must pass the exact mode-0600 configuration used for the signed image.
-For schema 10 the verifier derives and checks the fresh bucket and canary expectations from
-those hash-bound bytes; schema 9 keeps its legacy deployment bucket defaults. The combined
-`release.sh --roll` path passes its once-read mode-0600 configuration snapshot, not the
-caller's mutable pathname.
-The deployment checkout must be clean, synchronized `main`. Record the source commit,
-image digest, rollout result, and live checks in the deployment record/`PROGRESS.md`; do not
-record configuration values, credentials, plaintext, ciphertext, or user identifiers.
+1. Capture a clean saved plan that changes only the reviewed candidate digest/KMS admission and
+   intended fleet resources.
+2. Admit at most the exact predecessor/candidate digest pair to KMS.
+3. Start the independent public availability monitor.
+4. Add the candidate as a canary and require PostgreSQL schema readiness, shared TLS readiness, and
+   exact image/KMS/backend readback.
+5. Replace members with `max_unavailable=0`; maintain at least two ready zonal members.
+6. Exercise authenticated capture, search, export, deletion/restart, and content-free provider
+   no-op/effect probes through the public service.
+7. Require homogeneous candidate membership before retiring the predecessor digest.
+8. Retire predecessor KMS admission and verify no old member remains.
+9. Capture a final Terraform plan showing no changes.
 
-## Local cutover and ongoing checks
+Record exact source commit, signed tag, image digest, KMS principals/condition, PostgreSQL authority
+and schema, member names/zones/digests, readiness/liveness, monitor receipt, effect-safety probes,
+and final no-change plan.
 
-Production completed this cutover on 2026-08-13. The guarded sequence below remains the
-audit/recovery reference for another environment; ordinary releases do not repeat it.
+## Incompatible maintenance rollout
 
-1. From the monorepo, bootstrap and verify the exact human-to-deployer and
-   human-to-builder impersonation grants:
+`release.sh --roll` is retained only for a reviewed change that cannot safely overlap predecessor
+and candidate. It invokes the deployment repository's explicit scale-to-zero maintenance lane with
+the exact digest confirmation. This is not a rollback to removed state and must never be used as a
+shortcut around ADR-0041 compatibility qualification.
 
-   ```sh
-   ./scripts/local-operations.sh bootstrap-local-identities --apply \
-     --confirm "BOOTSTRAP LOCAL DEPLOYMENT IDENTITIES"
-   ```
-
-2. Audit, then perform the Actions setting cutover from this checkout:
-
-   ```sh
-   ./scripts/disable_github_actions.py
-   ./scripts/disable_github_actions.py --apply --confirm DISABLE-GITHUB-ACTIONS
-   ```
-
-3. Return to the monorepo and remove the now-unused GitHub OIDC provider and pool:
-
-   ```sh
-   ./scripts/local-operations.sh retire-actions-identities --apply \
-     --confirm "RETIRE GITHUB ACTIONS IDENTITIES"
-   ```
-
-4. Review and apply the monorepo's local infrastructure plan so Terraform forgets the
-   retired GitHub pool and bindings. Retain the deployer's pool-administration role:
-   Terraform still manages the separate `enclave-attest` pool/provider used for
-   Confidential Space admission. A fresh post-cutover plan must report no changes.
-
-The setting cutover removes and verifies stale branch-protection status checks before
-disabling Actions; active ruleset status checks must be reviewed and removed separately,
-and an unreadable protection state fails before mutation. It does not weaken PR review, remaining
-branch protections, signed tags, or immutable-release policy. For every mutation, verify the affected resource,
-`https://api.kiokuu.com/health`, the live attestation digest, effective KMS containment,
-and the relevant client flow.
+The maintenance lane also requires the deployment checkout to match the exact commit, Terraform
+root-source inventory, and content digest compiled into `verify_push_runtime_topology.py`. A local
+`origin/main` ref is not a review authority. When a deployment change must become eligible, merge
+and review that repository first, then use a separate enclave commit/PR to update all three pin
+coordinates from the immutable merged commit; until that second change lands, rollout fails closed.
 
 ## Rollback
 
-Never retag or alter release evidence. To roll back, choose a previously verified immutable
-release, run the monorepo `enclave-roll` command with its exact digest and typed
-confirmation, then verify health, attestation, KMS containment, and user-visible behavior.
-Terraform-only rollback is a reviewed revert followed by a fresh local saved-plan apply.
+After PostgreSQL has accepted a write, rollback means a schema-compatible predecessor application
+image or PostgreSQL restore/roll-forward. It never means selecting SQLite, reading a database from
+GCS, or starting a removed archive runtime.
+
+During a compatible rollout, rollback may return traffic to the still-admitted predecessor only
+while its schema remains compatible and before its KMS admission is retired. After retirement,
+re-admission is a new reviewed saved plan with the same availability and readback checks.

@@ -5,17 +5,15 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
-    cp::{
-        control_store::{
-            recording_retention_preview_fingerprint, recording_retention_request_fingerprint,
-            valid_retention_idempotency_key, RecordingKeyEpoch, RecordingRetentionChange,
-            RecordingRetentionInventory, RecordingRetentionPolicy, RecordingRetentionPreference,
-            RecordingRetentionPreview, RECORDING_RETENTION_CONSENT_VERSION,
-        },
-        isotime,
-    },
+    cp::isotime,
     error::{EnclaveError, Result},
-    persistence::{RecordingRetentionChangeRequest, RecordingRetentionRepository},
+    persistence::{
+        recording_retention_preview_fingerprint, recording_retention_request_fingerprint,
+        valid_retention_idempotency_key, RecordingKeyEpoch, RecordingRetentionChange,
+        RecordingRetentionChangeRequest, RecordingRetentionInventory, RecordingRetentionPolicy,
+        RecordingRetentionPreference, RecordingRetentionPreview, RecordingRetentionRepository,
+        RECORDING_RETENTION_CONSENT_VERSION,
+    },
 };
 
 use super::{advisory_transaction_lock, PostgresPersistence};
@@ -131,7 +129,7 @@ fn change_from_row(
 #[async_trait]
 impl RecordingRetentionRepository for PostgresPersistence {
     async fn preference(&self, account_id: &str) -> Result<RecordingRetentionPreference> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         load_preference(self.pool(), account_id).await
     }
 
@@ -140,7 +138,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         account_id: &str,
         preference: &RecordingRetentionPreference,
     ) -> Result<RecordingRetentionInventory> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         let (revision, epoch) = match preference.policy {
             RecordingRetentionPolicy::UntilDeleted => (
                 Some(preference.revision),
@@ -154,7 +152,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
                 (None, None)
             }
             RecordingRetentionPolicy::ProcessingWindow30d => {
-                return Ok(crate::cp::retention::empty_recording_inventory());
+                return Ok(RecordingRetentionInventory::empty());
             }
         };
         let rows = sqlx::query(
@@ -234,7 +232,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         promote_existing: bool,
         inventory: RecordingRetentionInventory,
     ) -> Result<RecordingRetentionPreview> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         inventory.validate()?;
         if expected_revision < 0
             || consent_version != RECORDING_RETENTION_CONSENT_VERSION
@@ -308,7 +306,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         account_id: &str,
         request: RecordingRetentionChangeRequest<'_>,
     ) -> Result<RecordingRetentionChange> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         request.inventory.validate()?;
         if request.expected_revision < 0
             || request.consent_version != RECORDING_RETENTION_CONSENT_VERSION
@@ -481,7 +479,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         account_id: &str,
         operation_id: &str,
     ) -> Result<Option<RecordingRetentionChange>> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         if !valid_operation_id(operation_id) {
             return Ok(None);
         }
@@ -517,7 +515,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         account_id: &str,
         operation_id: &str,
     ) -> Result<RecordingRetentionChange> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         if !valid_operation_id(operation_id) {
             return Err(EnclaveError::NotFound);
         }
@@ -594,7 +592,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         policy_epoch: &str,
         candidate_wrapped_dek: &str,
     ) -> Result<RecordingKeyEpoch> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         if policy_revision <= 0
             || !valid_policy_epoch(policy_epoch)
             || candidate_wrapped_dek.is_empty()
@@ -656,7 +654,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         key_epoch: i64,
         policy_epoch: &str,
     ) -> Result<Option<RecordingKeyEpoch>> {
-        crate::store::validate_user_id(account_id)?;
+        crate::gcs::validate_user_id(account_id)?;
         if key_epoch <= 0 || !valid_policy_epoch(policy_epoch) {
             return Ok(None);
         }

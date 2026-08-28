@@ -155,7 +155,7 @@ impl FinalizationRepository for PostgresPersistence {
              RETURNING e.id,floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms,\
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
                     e.type,e.title,e.summary,e.participants::text AS participants,\
-                    e.languages::text AS languages,e.action_items::text AS action_items,e.model,\
+                    e.languages::text AS languages,e.action_items::text AS action_items,\
                     e.identity_revision,e.finalization_attempt_count",
         )
         .bind(account_id)
@@ -188,7 +188,6 @@ impl FinalizationRepository for PostgresPersistence {
             participants: row.try_get("participants")?,
             languages: row.try_get("languages")?,
             action_items: row.try_get("action_items")?,
-            model: row.try_get("model")?,
         };
         let input_identity_revision: i64 = row.try_get("identity_revision")?;
         let attempt_count: i64 = row.try_get("finalization_attempt_count")?;
@@ -276,11 +275,6 @@ impl FinalizationRepository for PostgresPersistence {
                 visible_windows: json_value(row.try_get("visible_windows")?),
                 browser_context,
                 visual_signals: json_value(row.try_get("visual_signals")?),
-                literal_description: None,
-                activity_summary: None,
-                relevance_reason: None,
-                milestone_type: None,
-                key_rank: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
