@@ -1433,26 +1433,83 @@ def write_immutable_file(path: Path, data: bytes, label: str) -> None:
             os.close(descriptor)
 
 
+def read_evidence(path: Path) -> dict[str, object]:
+    """Read one canonical immutable pipeline evidence summary."""
+    regular_owned_file(path, "build evidence", private=True)
+    try:
+        encoded = read_owned_bytes(path, "build evidence", private=True)
+        evidence = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PipelineError("existing build evidence is not valid JSON") from error
+    if not isinstance(evidence, dict):
+        raise PipelineError("existing build evidence is not a JSON object")
+    if encoded != (json.dumps(evidence, sort_keys=True, indent=2) + "\n").encode("utf-8"):
+        raise PipelineError("existing build evidence is not canonical JSON")
+    return evidence
+
+
+def utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise PipelineError(f"{label} is invalid")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise PipelineError(f"{label} is invalid") from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise PipelineError(f"{label} is invalid")
+    return parsed
+
+
+def evidence_timestamp(evidence: dict[str, object], field: str) -> datetime:
+    return utc_timestamp(evidence.get(field), f"build evidence {field}")
+
+
+def validate_resume_evidence(
+    path: Path,
+    expected: dict[str, object],
+    *,
+    requested_stage: str,
+) -> None:
+    """Validate the immutable build summary for a forward pipeline resume.
+
+    ``build-evidence.json`` records the first completed invocation and is never
+    rewritten. Its timestamps come from the immutable build/scan receipts, so a
+    later push reconstructs exactly the same canonical bytes. The promoted
+    digest belongs only in the content-addressed push/final-evidence receipts
+    and canonical release evidence, never in this pre-auth summary.
+    """
+    if requested_stage not in {"build", "push"}:
+        raise PipelineError("build evidence resume stage is invalid")
+    if "image_digest" in expected:
+        raise PipelineError("build evidence cannot contain an image digest")
+    expected_created_at = evidence_timestamp(expected, "created_at")
+    expected_completed_at = evidence_timestamp(expected, "completed_at")
+    if expected_completed_at < expected_created_at:
+        raise PipelineError("candidate build evidence completion precedes creation")
+
+    existing = read_evidence(path)
+    if set(existing) != set(expected):
+        raise PipelineError("existing build evidence does not match this run")
+    created_at = evidence_timestamp(existing, "created_at")
+    completed_at = evidence_timestamp(existing, "completed_at")
+    if completed_at < created_at:
+        raise PipelineError("existing build evidence completion precedes creation")
+    if existing != expected:
+        raise PipelineError("existing build evidence does not match this run")
+
+
 def write_evidence(path: Path, evidence: dict[str, object]) -> None:
-    encoded = (json.dumps(evidence, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    """Freeze build evidence, or validate it for an exact same-build resume."""
+    if "image_digest" in evidence:
+        raise PipelineError("build evidence cannot contain an image digest")
+    created_at = evidence_timestamp(evidence, "created_at")
+    completed_at = evidence_timestamp(evidence, "completed_at")
+    if completed_at < created_at:
+        raise PipelineError("candidate build evidence completion precedes creation")
     if path.exists() or path.is_symlink():
-        regular_owned_file(path, "build evidence", private=True)
-        try:
-            existing_raw = read_owned_bytes(path, "build evidence", private=True)
-            existing = json.loads(existing_raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise PipelineError("existing build evidence is not valid JSON") from error
-        if not isinstance(existing, dict) or set(existing) != set(evidence):
-            raise PipelineError("existing build evidence does not match this run")
-        if existing_raw != (json.dumps(existing, sort_keys=True, indent=2) + "\n").encode("utf-8"):
-            raise PipelineError("existing build evidence is not canonical JSON")
-        if any(
-            existing.get(field) != value
-            for field, value in evidence.items()
-            if field != "completed_at"
-        ):
-            raise PipelineError("existing build evidence does not match this run")
+        validate_resume_evidence(path, evidence, requested_stage="build")
         return
+    encoded = (json.dumps(evidence, sort_keys=True, indent=2) + "\n").encode("utf-8")
     write_immutable_file(path, encoded, "build evidence")
 
 
@@ -1508,8 +1565,10 @@ def active_docker_host() -> str:
 
 def sbom_and_scan(image_uri: str, output_dir: Path, *, artifact_ref: str | None = None) -> dict[str, str]:
     sbom_path = output_dir / "enclave-sbom.spdx.json"
-    if sbom_path.exists() or sbom_path.is_symlink():
-        regular_owned_file(sbom_path, "SBOM output", private=True)
+    scan_path = output_dir / "enclave-scan.json"
+    for path, label in ((sbom_path, "SBOM output"), (scan_path, "scan output")):
+        if path.exists() or path.is_symlink():
+            raise PipelineError(f"refusing to overwrite existing {label} without an exact scan receipt")
     scan_target = artifact_ref or f"docker:{image_uri}"
     syft_environment = (
         {"DOCKER_HOST": active_docker_host()}
@@ -1544,7 +1603,6 @@ def sbom_and_scan(image_uri: str, output_dir: Path, *, artifact_ref: str | None 
         ["grype", f"sbom:{sbom_path}", "--only-fixed", "--fail-on", "high", "-o", "json"],
         capture=True,
     )
-    scan_path = output_dir / "enclave-scan.json"
     write_immutable_file(scan_path, scan.stdout.encode("utf-8"), "scan output")
     return {
         "sbom_path": str(sbom_path),
@@ -1623,6 +1681,10 @@ def validate_receipt_outputs(output_dir: Path, stage: str, payload: dict[str, ob
             or not DIGEST.fullmatch(artifact_manifest_digest)
         ):
             return False
+        try:
+            utc_timestamp(outputs.get("created_at"), "build receipt created_at")
+        except PipelineError:
+            return False
         post_builder = outputs.get("builder_post")
         receipt_inputs = payload.get("inputs")
         if not isinstance(post_builder, dict) or not isinstance(receipt_inputs, dict):
@@ -1650,6 +1712,19 @@ def validate_receipt_outputs(output_dir: Path, stage: str, payload: dict[str, ob
     if stage == "scan":
         inputs = payload.get("inputs")
         if not isinstance(inputs, dict):
+            return False
+        try:
+            build_created_at = utc_timestamp(
+                inputs.get("build_created_at"),
+                "scan receipt build_created_at",
+            )
+            completed_at = utc_timestamp(
+                outputs.get("completed_at"),
+                "scan receipt completed_at",
+            )
+        except PipelineError:
+            return False
+        if completed_at < build_created_at:
             return False
         if (
             outputs.get("artifact_sha256") != inputs.get("artifact_sha256")
@@ -1739,8 +1814,37 @@ def stage_receipt_candidates(
 
 
 def valid_stage_receipt(output_dir: Path, stage: str, inputs: dict[str, object]) -> dict[str, object] | None:
-    candidates = stage_receipt_candidates(output_dir, stage, inputs)
-    return candidates[0] if candidates else None
+    # Ambiguity is global to the stage, not merely to receipts matching the
+    # caller's inputs. A second valid receipt for different inputs means this
+    # output directory has competing histories and must fail closed.
+    candidates = stage_receipt_candidates(output_dir, stage)
+    if not candidates:
+        return None
+    candidate = candidates[0]
+    return candidate if candidate.get("inputs") == inputs else None
+
+
+def validate_resume_direction(output_dir: Path, requested_stage: str) -> None:
+    """Forbid reversing an output directory after promotion has a receipt."""
+    if requested_stage == "build" and any(
+        stage_receipt_file_exists(output_dir, stage)
+        for stage in ("push", "evidence")
+    ):
+        raise PipelineError("cannot resume build after a promotion-stage receipt exists")
+
+
+def stage_receipt_file_exists(output_dir: Path, stage: str) -> bool:
+    """Detect prior stage state even when its receipt is malformed or stale."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", stage):
+        raise PipelineError("stage receipt name is invalid")
+    return next(output_dir.glob(f"{stage}-receipt-*.json"), None) is not None
+
+
+def stage_receipt_files_exist(output_dir: Path) -> bool:
+    return any(
+        stage_receipt_file_exists(output_dir, stage)
+        for stage in ("build", "scan", "push", "evidence")
+    )
 
 
 def scan_database_identity() -> dict[str, object]:
@@ -2447,6 +2551,15 @@ def main() -> None:
         if stat.S_IMODE(output_metadata.st_mode) & 0o077:
             raise PipelineError("output directory must not be group/world accessible")
         run_lock_descriptor = acquire_run_lock(output_dir)
+        evidence_path = output_dir / "build-evidence.json"
+        if (
+            arguments.resume
+            and not (evidence_path.exists() or evidence_path.is_symlink())
+            and stage_receipt_files_exist(output_dir)
+        ):
+            raise PipelineError("build evidence is missing for an existing pipeline resume")
+        if arguments.resume:
+            validate_resume_direction(output_dir, arguments.stage)
         commit, source_date_epoch = source_commit(arguments.source_ref)
         release = release_tag(arguments.source_ref) is not None
         builder_snapshot = native_builder_snapshot()
@@ -2468,7 +2581,7 @@ def main() -> None:
             )
         ):
             verify()
-        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        invocation_created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         repository, image_uri = image_coordinates(
             configuration, arguments.profile, commit, arguments.source_ref
         )
@@ -2549,6 +2662,7 @@ def main() -> None:
                     "artifact_manifest_digest": manifest_digest,
                     "builder_mode": "native-linux-amd64" if native else "emulated-fallback",
                     "builder_post": post_builder_snapshot,
+                    "created_at": invocation_created_at,
                 }
             }
             write_stage_receipt(
@@ -2564,7 +2678,12 @@ def main() -> None:
             raise PipelineError("build receipt artifact identity does not match this run")
         artifact_sha256 = build_outputs.get("artifact_sha256")
         artifact_manifest_digest = build_outputs.get("artifact_manifest_digest")
-        if not isinstance(artifact_sha256, str) or not isinstance(artifact_manifest_digest, str):
+        build_created_at = build_outputs.get("created_at")
+        if (
+            not isinstance(artifact_sha256, str)
+            or not isinstance(artifact_manifest_digest, str)
+            or not isinstance(build_created_at, str)
+        ):
             raise PipelineError("build receipt is missing artifact hashes")
         if (
             sha256(artifact) != artifact_sha256
@@ -2576,6 +2695,7 @@ def main() -> None:
             **build_inputs,
             "artifact_sha256": artifact_sha256,
             "artifact_manifest_digest": artifact_manifest_digest,
+            "build_created_at": build_created_at,
             "scan_db": scan_db,
         }
         scan_receipt = valid_stage_receipt(output_dir, "scan", scan_inputs) if arguments.resume else None
@@ -2589,6 +2709,9 @@ def main() -> None:
             )
             scan_outputs["artifact_sha256"] = artifact_sha256
             scan_outputs["artifact_manifest_digest"] = artifact_manifest_digest
+            scan_outputs["completed_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
             write_stage_receipt(output_dir, "scan", scan_inputs, scan_outputs)
             scan_receipt = {"outputs": scan_outputs}
         scan_outputs = scan_receipt.get("outputs") if isinstance(scan_receipt, dict) else None
@@ -2596,11 +2719,13 @@ def main() -> None:
             raise PipelineError("scan receipt outputs are invalid")
         expected_sbom_sha256 = scan_outputs.get("sbom_sha256")
         expected_scan_sha256 = scan_outputs.get("scan_sha256")
+        scan_completed_at = scan_outputs.get("completed_at")
         if (
             not isinstance(expected_sbom_sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", expected_sbom_sha256)
             or not isinstance(expected_scan_sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", expected_scan_sha256)
+            or not isinstance(scan_completed_at, str)
         ):
             raise PipelineError("scan receipt is missing stable SBOM/scan hashes")
         if scan_outputs.get("sbom_path") != str(output_dir / "enclave-sbom.spdx.json"):
@@ -2626,13 +2751,24 @@ def main() -> None:
             "image_config_sha256": image_config_sha256,
             "dockerfile_sha256": sha256(ROOT / "Dockerfile"),
             "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
-            "created_at": created_at,
+            "created_at": build_created_at,
             "signed": False,
             "builder_mode": "native-linux-amd64" if native else "emulated-fallback",
             "fallback": not native,
             "builder": build_inputs["builder"],
             "source_archive": "immutable-git-archive",
         }
+        evidence["completed_at"] = scan_completed_at
+        if evidence_path.exists() or evidence_path.is_symlink():
+            if not arguments.resume:
+                raise PipelineError("existing build evidence requires --resume")
+            validate_resume_evidence(
+                evidence_path,
+                evidence,
+                requested_stage=arguments.stage,
+            )
+        else:
+            write_evidence(evidence_path, evidence)
         if arguments.stage == "push":
             push_inputs = {
                 "build_inputs": build_inputs,
@@ -2640,14 +2776,26 @@ def main() -> None:
                 "artifact_sha256": artifact_sha256,
                 "artifact_manifest_digest": artifact_manifest_digest,
             }
+            push_receipt_exists = stage_receipt_file_exists(output_dir, "push")
+            evidence_receipt_exists = stage_receipt_file_exists(output_dir, "evidence")
+            final_evidence_output_exists = any(
+                path.exists() or path.is_symlink()
+                for path in (
+                    output_dir / "enclave-local-build-evidence.json",
+                    output_dir / "enclave-release.json",
+                )
+            )
+            if final_evidence_output_exists and not evidence_receipt_exists:
+                raise PipelineError("final evidence outputs exist without an immutable receipt")
             push_receipt = valid_stage_receipt(output_dir, "push", push_inputs) if arguments.resume else None
+            if push_receipt_exists and push_receipt is None:
+                raise PipelineError("existing push receipt is not exact and valid")
+            if evidence_receipt_exists and push_receipt is None:
+                raise PipelineError("evidence receipt exists without an exact push receipt")
             if push_receipt is not None:
                 push_outputs = push_receipt["outputs"]
                 assert isinstance(push_outputs, dict)
                 image_digest = str(push_outputs["image_digest"])
-                verify_registry_digest(
-                    image_uri, impersonated_account, image_digest
-                )
             else:
                 image_digest = authenticate_and_push(
                     image_uri, configuration, impersonated_account,
@@ -2661,7 +2809,6 @@ def main() -> None:
                     push_inputs,
                     {"image_digest": image_digest},
                 )
-            evidence["image_digest"] = image_digest
             evidence_inputs = {
                 **push_inputs,
                 "image_digest": image_digest,
@@ -2670,6 +2817,12 @@ def main() -> None:
                 "scan_sha256": expected_scan_sha256,
             }
             evidence_receipt = valid_stage_receipt(output_dir, "evidence", evidence_inputs) if arguments.resume else None
+            if evidence_receipt_exists and evidence_receipt is None:
+                raise PipelineError("existing final evidence receipt is not exact and valid")
+            if push_receipt is not None:
+                verify_registry_digest(
+                    image_uri, impersonated_account, image_digest
+                )
             if evidence_receipt is None:
                 create_release_evidence(
                     output_dir,
@@ -2681,7 +2834,7 @@ def main() -> None:
                     source_commit=commit,
                     image_uri=image_uri,
                     image_digest=image_digest,
-                    created_at=created_at,
+                    created_at=invocation_created_at,
                     expected_sbom_sha256=expected_sbom_sha256,
                     expected_scan_sha256=expected_scan_sha256,
                 )
@@ -2695,8 +2848,6 @@ def main() -> None:
                     evidence_outputs["metadata"] = str(metadata_path)
                     evidence_outputs["metadata_sha256"] = sha256(metadata_path)
                 write_stage_receipt(output_dir, "evidence", evidence_inputs, evidence_outputs)
-        evidence["completed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        write_evidence(output_dir / "build-evidence.json", evidence)
         print(f"unsigned build evidence written to {output_dir}")
     except PipelineError as error:
         print(f"local image pipeline: {error}", file=sys.stderr)

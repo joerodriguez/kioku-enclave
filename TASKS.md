@@ -35,7 +35,7 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
   wiring while preserving Cloud SQL, live media/recordings, KMS admission, shared TLS, the regional
   fleet, health checks, and provider identities. Apply the source-only state transition and finish
   it with an independently reviewed refreshed no-change plan.
-- [ ] After a homogeneous v0.9.9 rollout is proved, retire the five exact predecessor legacy-IAM
+- [ ] After a homogeneous v0.9.10 rollout is proved, retire the five exact predecessor legacy-IAM
   edges and the separately inventoried protected provider objects through reviewed, staged plans;
   never combine that retirement with the serving rollout.
 

@@ -121,6 +121,13 @@ to that source. The pipeline:
 7. promotes only those bytes and verifies the registry digest;
 8. emits canonical schema-11 release metadata and build evidence.
 
+`build-evidence.json` is frozen after build and scan, before any cloud authentication. The
+documented `push --resume` invocation reconstructs its build/scan timestamps from the immutable
+stage receipts and validates the exact canonical bytes; it never adds the registry digest or
+rewrites the summary. The digest is bound by the content-addressed push/final-evidence receipts and
+`enclave-local-build-evidence.json`. After a push receipt exists, that output directory cannot be
+resumed backward as a build.
+
 The release metadata binds source/tag/image digest, the live media bucket, KMS coordinates,
 PostgreSQL authority, required serving-schema verification, fleet connection budget, health/drain
 values, and shared TLS. The schema-verification claim is a fixed source invariant, not copied from

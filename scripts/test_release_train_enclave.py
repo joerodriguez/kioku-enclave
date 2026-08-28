@@ -6,6 +6,7 @@ import contextlib
 import base64
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -23,6 +24,46 @@ SPEC = importlib.util.spec_from_file_location("release_train_enclave", MODULE_PA
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+COORDINATOR_ARTIFACT_DIGEST_FIELDS = frozenset({
+    "artifact_digest",
+    "content_sha256",
+    "local_manifest_digest",
+    "remote_digest",
+    "push_repo_digest",
+    "dmg_sha256",
+    "final_dmg_sha256",
+    "ipa_sha256",
+    "image_digest",
+})
+
+
+def coordinator_witnesses_prepare_artifact(result: dict[str, object], artifact_root: Path) -> bool:
+    """Apply the coordinator's current artifact-witness admission rule."""
+    expected = result.get("artifact_digest")
+    if not isinstance(expected, str):
+        return False
+    for reference in result.get("artifact_files", []):
+        if not isinstance(reference, dict):
+            return False
+        path = artifact_root / str(reference.get("path", ""))
+        data = path.read_bytes()
+        if reference.get("digest") != "sha256:" + hashlib.sha256(data).hexdigest():
+            return False
+        if "sha256:" + hashlib.sha256(data).hexdigest() == expected:
+            return True
+        if path.suffix.lower() != ".json":
+            continue
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            continue
+        for field in COORDINATOR_ARTIFACT_DIGEST_FIELDS:
+            value = payload.get(field)
+            if isinstance(value, str):
+                normalized = value if value.startswith("sha256:") else "sha256:" + value
+                if normalized == expected:
+                    return True
+    return False
 
 
 class EnclaveAdapterTests(unittest.TestCase):
@@ -63,9 +104,135 @@ class EnclaveAdapterTests(unittest.TestCase):
                 "KIOKU_RELEASE_CONFIG_DIGEST": "sha256:" + hashlib.sha256(config.read_bytes()).hexdigest(),
             }, clear=False), mock.patch.object(MODULE, "_source_coordinates", return_value=("a" * 40, "b" * 40, "v1.2.3", "1.2.3")), mock.patch.object(MODULE, "_check_config_coordinate"), mock.patch.object(MODULE, "_pipeline"), mock.patch.object(MODULE, "_verify_frozen_source"), mock.patch.object(MODULE, "_native_child_env", return_value={}), mock.patch.object(MODULE, "_artifact", return_value=(artifact, hashlib.sha256(artifact.read_bytes()).hexdigest(), "sha256:" + "a" * 64)):
                 result = MODULE.prepare()
+                first_witness_bytes = (artifact.parent / MODULE.PREPARE_ARTIFACT_WITNESS).read_bytes()
+                resumed = MODULE.prepare()
             self.assertEqual(result["schema"], MODULE.SCHEMA)
             self.assertEqual(result["artifact_digest"], "sha256:" + "a" * 64)
-            self.assertEqual(result["artifact_files"], [{"path": "enclave-release/evidence/image.oci", "digest": "sha256:" + hashlib.sha256(b"oci fixture").hexdigest()}])
+            self.assertEqual(resumed, result)
+            witness = artifact.parent / MODULE.PREPARE_ARTIFACT_WITNESS
+            witness_bytes = witness.read_bytes()
+            witness_payload = json.loads(witness_bytes)
+            self.assertEqual(witness_bytes, first_witness_bytes)
+            self.assertEqual(witness_bytes, MODULE.canonical(witness_payload))
+            self.assertEqual(stat.S_IMODE(witness.stat().st_mode), 0o600)
+            self.assertEqual(witness_payload["local_manifest_digest"], result["artifact_digest"])
+            self.assertEqual(witness_payload["oci_archive_sha256"], "sha256:" + hashlib.sha256(b"oci fixture").hexdigest())
+            self.assertEqual(witness_payload["source_commit"], "a" * 40)
+            self.assertEqual(witness_payload["source_tree"], "b" * 40)
+            self.assertEqual(witness_payload["source_ref"], "v1.2.3")
+            self.assertEqual(witness_payload["version"], "1.2.3")
+            files = {item["path"]: item["digest"] for item in result["artifact_files"]}
+            self.assertEqual(files["enclave-release/evidence/image.oci"], "sha256:" + hashlib.sha256(b"oci fixture").hexdigest())
+            self.assertEqual(
+                files["enclave-release/evidence/" + MODULE.PREPARE_ARTIFACT_WITNESS],
+                "sha256:" + hashlib.sha256(witness_bytes).hexdigest(),
+            )
+            self.assertTrue(coordinator_witnesses_prepare_artifact(result, state))
+
+    def test_prepare_artifact_witness_refuses_tampered_existing_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            output.chmod(0o700)
+            arguments = {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "tag": "v1.2.3",
+                "version": "1.2.3",
+                "artifact_hash": "c" * 64,
+                "manifest_digest": "sha256:" + "d" * 64,
+            }
+            witness = MODULE._prepare_artifact_witness(output, **arguments)
+            original = witness.read_bytes()
+            self.assertEqual(MODULE._prepare_artifact_witness(output, **arguments), witness)
+            self.assertEqual(witness.read_bytes(), original)
+            witness.write_bytes(MODULE.canonical({"local_manifest_digest": "sha256:" + "e" * 64}))
+            witness.chmod(0o600)
+            with self.assertRaisesRegex(MODULE.AdapterError, "refusing to overwrite"):
+                MODULE._prepare_artifact_witness(output, **arguments)
+
+    def test_adr0033_prepare_publish_uses_forward_resumed_pipeline(self) -> None:
+        self.assertIn('_pipeline("build"', inspect.getsource(MODULE.prepare))
+        self.assertIn('_pipeline("push"', inspect.getsource(MODULE.publish))
+        config = Path("/private/operator.env")
+        output = Path("/private/enclave-release/evidence")
+        with mock.patch.object(
+            MODULE,
+            "_native_child_env",
+            side_effect=({"STAGE": "build"}, {"STAGE": "push"}),
+        ) as child_environment, mock.patch.object(MODULE, "_run") as run:
+            MODULE._pipeline("build", config, "v0.9.10", output)
+            MODULE._pipeline("push", config, "v0.9.10", output)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual([command[2] for command in commands], ["build", "push"])
+        for command in commands:
+            self.assertEqual(command[-2:], ("--apply", "--resume"))
+            self.assertEqual(command[command.index("--source-ref") + 1], "v0.9.10")
+            self.assertEqual(command[command.index("--output-dir") + 1], str(output))
+        self.assertEqual(
+            child_environment.call_args_list,
+            [mock.call(include_cloud=False), mock.call(include_cloud=True)],
+        )
+
+    def test_adr0033_prepare_publish_preserves_build_evidence_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "enclave-release" / "evidence"
+            output.mkdir(mode=0o700, parents=True)
+            config = root / "operator.env"
+            config.write_text("fixture\n", encoding="utf-8")
+            config.chmod(0o600)
+            artifact = output / "kioku-enclave.oci.tar"
+            artifact.write_bytes(b"oci fixture")
+            artifact.chmod(0o600)
+            evidence_path = output / "build-evidence.json"
+            evidence_bytes = b'{"schema_version":1,"source_commit":"' + b"a" * 40 + b'"}\n'
+            evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+            image_digest = "sha256:" + "d" * 64
+            stages: list[str] = []
+
+            def pipeline(stage: str, _config: Path, tag: str, actual_output: Path) -> None:
+                self.assertEqual(tag, "v0.9.10")
+                self.assertEqual(actual_output, output)
+                stages.append(stage)
+                if stage == "build":
+                    evidence_path.write_bytes(evidence_bytes)
+                    evidence_path.chmod(0o600)
+                else:
+                    self.assertEqual(hashlib.sha256(evidence_path.read_bytes()).hexdigest(), evidence_hash)
+
+            coordinates = ("a" * 40, "b" * 40, "v0.9.10", "0.9.10")
+            verified_tag = MODULE.VerifiedTag("v0.9.10", "c" * 40, "a" * 40)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(MODULE, "_source_coordinates", return_value=coordinates))
+                stack.enter_context(mock.patch.object(MODULE, "_config", return_value=config))
+                stack.enter_context(mock.patch.object(MODULE, "_check_config_coordinate"))
+                stack.enter_context(mock.patch.object(MODULE, "_output_dir", return_value=output))
+                stack.enter_context(mock.patch.object(MODULE, "_pipeline", side_effect=pipeline))
+                stack.enter_context(mock.patch.object(MODULE, "_verify_frozen_source"))
+                stack.enter_context(mock.patch.object(MODULE, "_artifact", return_value=(artifact, hashlib.sha256(artifact.read_bytes()).hexdigest(), image_digest)))
+                stack.enter_context(mock.patch.object(MODULE, "_artifact_files", return_value=[]))
+                stack.enter_context(mock.patch.object(MODULE, "_private_key", return_value=root / "private.pem"))
+                stack.enter_context(mock.patch.object(MODULE, "_public_key", return_value=(root / "public.pem", "e" * 64)))
+                stack.enter_context(mock.patch.object(MODULE, "_repository", return_value="example/kioku-enclave"))
+                stack.enter_context(mock.patch.object(MODULE, "_image_repository", return_value=("us-docker.pkg.dev/project/repo/image", "reader@example.com")))
+                stack.enter_context(mock.patch.object(MODULE, "_capture_verified_tag", return_value=verified_tag))
+                stack.enter_context(mock.patch.object(MODULE, "_revalidate_verified_tag"))
+                stack.enter_context(mock.patch.object(MODULE, "_receipt", return_value={"image_digest": image_digest}))
+                stack.enter_context(mock.patch.object(MODULE, "_coordinate", return_value=image_digest))
+                stack.enter_context(mock.patch.object(MODULE, "_sign_evidence"))
+                stack.enter_context(mock.patch.object(MODULE, "_immutable_release_snapshot", return_value=contextlib.nullcontext((output, {}))))
+                stack.enter_context(mock.patch.object(MODULE, "_verify_bundle", return_value={}))
+                stack.enter_context(mock.patch.object(MODULE, "_registry_digest", return_value=image_digest))
+                stack.enter_context(mock.patch.object(MODULE, "_confirmation"))
+                stack.enter_context(mock.patch.object(MODULE, "_destination", return_value="enclave-artifact-registry-release"))
+                stack.enter_context(mock.patch.object(MODULE, "_publish_release"))
+                MODULE.prepare()
+                MODULE.publish()
+
+            self.assertEqual(stages, ["build", "push"])
+            self.assertEqual(evidence_path.read_bytes(), evidence_bytes)
+            self.assertEqual(hashlib.sha256(evidence_path.read_bytes()).hexdigest(), evidence_hash)
 
     def test_confirmation_is_exactly_bound_to_version_and_digest(self) -> None:
         with mock.patch.dict(os.environ, {"KIOKU_RELEASE_CONFIRMATION": "PUBLISH ENCLAVE 1.2.3 sha256:" + "a" * 64}, clear=False):
