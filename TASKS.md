@@ -6,17 +6,17 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
 
 ## Runtime and persistence
 
-- [~] Make PostgreSQL the unconditional serving authority across startup, routes, workers,
+- [x] Make PostgreSQL the unconditional serving authority across startup, routes, workers,
   exports, episode/account deletion, restart recovery, search, and readiness.
-- [~] Delete the SQLite ControlStore/Store implementation, SQLite search/FTS/vector adapters,
+- [x] Delete the SQLite ControlStore/Store implementation, SQLite search/FTS/vector adapters,
   backend selection/fallback branches, archive-v3/WAL/checkpoint/witness runtime, and legacy-only
   tests after PostgreSQL parity is proved.
-- [~] Preserve domain repository ports and useful in-memory fakes; do not couple HTTP handlers or
+- [x] Preserve domain repository ports and useful in-memory fakes; do not couple HTTP handlers or
   provider adapters directly to `sqlx`.
-- [~] Keep GCS exclusively for live application-encrypted media and recording bytes, including
+- [x] Keep GCS exclusively for live application-encrypted media and recording bytes, including
   exact-generation access, conditional writes, object-bound authenticated context, and complete
   deletion inventory. Do not delete live media buckets or PostgreSQL state.
-- [ ] Confirm the final serving source has no reachable SQLite authority/fallback, no obsolete
+- [x] Confirm the final serving source has no reachable SQLite authority/fallback, no obsolete
   archive/WAL/witness runtime, and no unjustified `rusqlite` or SQLite extension dependency.
 
 ## Configuration, tooling, and infrastructure
@@ -29,23 +29,26 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
   scan, Ed25519 evidence, canonical release metadata, and incompatible scale-to-zero lane.
 - [x] Remove the dead image/runtime PostgreSQL schema-mode key; serving verifies schema
   unconditionally, while release evidence records that fixed source invariant directly.
-- [~] Reduce production configuration to PostgreSQL, shared TLS, KMS, live media/recordings,
+- [x] Reduce production configuration to PostgreSQL, shared TLS, KMS, live media/recordings,
   authentication, billing, inference, and outbound-provider inputs.
-- [ ] In the deployment repository, remove only resources and IAM proven exclusive to the retired
-  database-in-GCS/witness design. Preserve Cloud SQL, live media/recordings, KMS admission, shared
-  TLS, regional fleet, health checks, and provider identities. Finish any applied Terraform cleanup
-  with an independently reviewed no-change plan.
+- [x] In the deployment repository, remove retired authority selectors and unreachable infrastructure
+  wiring while preserving Cloud SQL, live media/recordings, KMS admission, shared TLS, the regional
+  fleet, health checks, and provider identities. Apply the source-only state transition and finish
+  it with an independently reviewed refreshed no-change plan.
+- [ ] After a homogeneous v0.9.9 rollout is proved, retire the five exact predecessor legacy-IAM
+  edges and the separately inventoried protected provider objects through reviewed, staged plans;
+  never combine that retirement with the serving rollout.
 
 ## Required verification before merge
 
-- [ ] Run focused Rust repository/worker/API tests continuously while source slices settle.
-- [ ] Run every checked-in Python and shell tooling contract.
-- [ ] Run `./scripts/agent-verify.sh full` against disposable PostgreSQL 17 and prove the harness
+- [x] Run focused Rust repository/worker/API tests continuously while source slices settle.
+- [x] Run every checked-in Python and shell tooling contract.
+- [x] Run `./scripts/agent-verify.sh full` against disposable PostgreSQL 17 and prove the harness
   cannot skip contracts when `KIOKU_REQUIRE_POSTGRES_CONTRACT=1`.
-- [ ] Prove real PostgreSQL tenant isolation, schema readiness, full-text/vector/time-zone queries,
+- [x] Prove real PostgreSQL tenant isolation, schema readiness, full-text/vector/time-zone queries,
   concurrent claims, expired-lease takeover, stale settlement refusal, provider ambiguity/no
   resend, restart enumeration, export, episode deletion, account deletion, and no resurrection.
-- [ ] Run clean formatting, locked tests, all-target Clippy, production-feature builds, RustSec,
+- [x] Run clean formatting, locked tests, all-target Clippy, production-feature builds, RustSec,
   SBOM generation, and vulnerability scanning; record the exact commands and results in the PR.
 - [ ] Rebase onto current `origin/main`, obtain review, and rebase-merge. Do not push directly to
   `main`.
