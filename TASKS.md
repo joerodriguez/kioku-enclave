@@ -50,7 +50,7 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
   resend, restart enumeration, export, episode deletion, account deletion, and no resurrection.
 - [x] Run clean formatting, locked tests, all-target Clippy, production-feature builds, RustSec,
   SBOM generation, and vulnerability scanning; record the exact commands and results in the PR.
-- [ ] Rebase onto current `origin/main`, obtain review, and rebase-merge. Do not push directly to
+- [x] Rebase onto current `origin/main`, obtain review, and rebase-merge. Do not push directly to
   `main`.
 
 ## Release and rollout, if the runtime digest changes
