@@ -6,11 +6,6 @@ __pycache__/
 # Claude Code local settings (IDE tooling, not project source)
 .claude/
 
-# Temporary SQLite files that might appear during development
-*.db
-*.db-shm
-*.db-wal
-
 # macOS metadata
 .DS_Store
 

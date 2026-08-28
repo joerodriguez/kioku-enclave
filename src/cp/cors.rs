@@ -12,7 +12,10 @@ pub async fn cors_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let allowed_origin = &state.config.web_origin;
+    cors_with_origin(&state.config.web_origin, req, next).await
+}
+
+async fn cors_with_origin(allowed_origin: &str, req: Request, next: Next) -> Response {
     let request_origin = req
         .headers()
         .get(header::ORIGIN)
@@ -66,73 +69,26 @@ pub async fn cors_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cp::control_store::ControlStore;
-    use crate::cp::{CpConfig, CpState};
-    use crate::store::Store;
     use axum::{middleware, routing::get, Router};
     use tower::ServiceExt;
 
+    async fn test_cors(
+        State(origin): State<Arc<String>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        cors_with_origin(origin.as_str(), request, next).await
+    }
+
     fn create_test_router(web_origin: &str) -> Router {
-        let config = Arc::new(CpConfig {
-            base_url: "http://localhost:8080".to_string(),
-            jwt_secrets: vec!["secret".to_string()],
-            google_desktop_client_id: "".to_string(),
-            google_ios_client_id: "".to_string(),
-            google_web_client_id: "".to_string(),
-            google_web_client_secret: "".to_string(),
-            apple_sign_in: None,
-            admin_user_ids: Vec::new(),
-            signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            scheduler_sa_email: None,
-            vertex_project: "".to_string(),
-            vertex_location: "".to_string(),
-            vertex_model: "".to_string(),
-            quota_utterances_per_day: 0,
-            quota_screenshots_per_day: 0,
-            quota_mcp_calls_per_day: 0,
-            quota_vertex_output_tokens_per_day: 524_288,
-            web_origin: web_origin.to_string(),
-            reviewer_auth: None,
-            billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
-        });
-
-        use crate::store::tests::{FakeGcs, FakeKms};
-        let kms = Arc::new(FakeKms);
-        let gcs = Arc::new(FakeGcs::new());
-        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
-        let control = Arc::new(ControlStore::new(kms, gcs));
-
-        let cp_state = Arc::new(CpState {
-            kms: Arc::clone(&store.kms),
-            durable_recording_storage_bound: store.durable_recording_storage_bound(),
-            store: Arc::clone(&store),
-            control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control, store),
-            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
-            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
-            config,
-            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
-            reviewer_verifier: None,
-            apple_provider: None,
-            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
-            reference_batch_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
-            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
-            mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
-            oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
-            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
-            email_transport: None,
-            push_transport: None,
-            embedding: None,
-            voice: None,
-        });
-
+        let origin = Arc::new(web_origin.to_string());
         Router::new()
             .route("/test", get(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
-                Arc::clone(&cp_state),
-                cors_middleware,
+                Arc::clone(&origin),
+                test_cors,
             ))
-            .with_state(cp_state)
+            .with_state(origin)
     }
 
     #[tokio::test]

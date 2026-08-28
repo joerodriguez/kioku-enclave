@@ -8,13 +8,13 @@ use crate::{
     cp::isotime,
     error::{EnclaveError, Result},
     persistence::{
-        CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
-        McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
-        MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
-        PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
-        PersonStatementView, PersonSummary, ScreenshotMediaLocator,
+        extract_speaker_filter, rrf_merge, CaptureStatus, EpisodeListPage, EpisodeListRequest,
+        McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedPage,
+        MemoryFeedRecord, MemoryFeedRequest, MemoryQueryRepository, PeopleListPage,
+        PeopleListRequest, PersonEvidencePage, PersonEvidenceView, PersonFactView, PersonNameView,
+        PersonProfile, PersonStatementPage, PersonStatementView, PersonSummary,
+        ScreenshotMediaLocator, SearchHit, SearchRequest,
     },
-    search::{extract_speaker_filter, rrf_merge, SearchHit, SearchRequest},
 };
 
 use super::PostgresPersistence;
@@ -1170,7 +1170,7 @@ impl MemoryQueryRepository for PostgresPersistence {
     ) -> Result<Value> {
         let effective_limit = request
             .limit
-            .clamp(1, crate::cp::mcp_query::MAX_MINIMIZED_PAGE_SIZE);
+            .clamp(1, crate::cp::mcp_safety::MAX_MINIMIZED_PAGE_SIZE);
         let from = bound(&request.from)?;
         let to = bound(&request.to)?;
         let rows = sqlx::query(
@@ -1233,8 +1233,8 @@ impl MemoryQueryRepository for PostgresPersistence {
     async fn mcp_context(&self, account_id: &str, request: &McpContextRequest) -> Result<Value> {
         let effective_limit = request
             .limit
-            .unwrap_or(crate::cp::mcp_query::DEFAULT_MINIMIZED_PAGE_SIZE)
-            .clamp(1, crate::cp::mcp_query::MAX_MINIMIZED_PAGE_SIZE);
+            .unwrap_or(crate::cp::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE)
+            .clamp(1, crate::cp::mcp_safety::MAX_MINIMIZED_PAGE_SIZE);
         let center_ms = isotime::parse_epoch_millis(&request.at)
             .ok_or_else(|| EnclaveError::InvalidRequest("invalid MCP context timestamp".into()))?;
         let window_ms = i64::try_from(request.window_seconds)
@@ -1308,8 +1308,8 @@ impl MemoryQueryRepository for PostgresPersistence {
     ) -> Result<Value> {
         let effective_limit = request
             .limit
-            .unwrap_or(crate::cp::mcp_query::DEFAULT_MINIMIZED_PAGE_SIZE)
-            .clamp(1, crate::cp::mcp_query::MAX_MINIMIZED_PAGE_SIZE);
+            .unwrap_or(crate::cp::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE)
+            .clamp(1, crate::cp::mcp_safety::MAX_MINIMIZED_PAGE_SIZE);
         let from_ms = isotime::parse_epoch_millis(&request.from)
             .ok_or_else(|| EnclaveError::InvalidRequest("invalid MCP range start".into()))?;
         let to_ms = isotime::parse_epoch_millis(&request.to)
@@ -1748,12 +1748,12 @@ impl MemoryQueryRepository for PostgresPersistence {
         public_id: &str,
     ) -> Result<Option<ScreenshotMediaLocator>> {
         let Some(asset_id) = public_id.strip_prefix("capture-v2:") else {
-            // The legacy multipart image namespace is intentionally not part
+            // The retired multipart image namespace is intentionally not part
             // of a fresh PostgreSQL deployment.
             return Ok(None);
         };
         let expected_object_key =
-            crate::store::canonical_capture_media_object_key(account_id, asset_id)?;
+            crate::gcs::canonical_capture_media_object_key(account_id, asset_id)?;
         let row = sqlx::query(
             "SELECT object_key,object_generation,object_backend,byte_length,sha256 \
                FROM media_objects WHERE account_id=$1 AND asset_id=$2 \

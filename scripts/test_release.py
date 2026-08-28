@@ -58,50 +58,16 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertIn('Artifact Registry did not resolve the signed image digest', RELEASE)
         self.assertIn('isImmutable', RELEASE)
 
-    def test_active_archive_wal_roll_is_quarantined_before_authority_or_publication(self) -> None:
-        gate = RELEASE.index('active archive-v3 WAL images cannot roll')
-        fetch = RELEASE.index('git --no-replace-objects fetch origin main')
-        evidence = RELEASE.index('scripts/verify_local_evidence_bundle.py')
-        tag = RELEASE.index('verify_tag_signer()')
-        registry = RELEASE.index('artifacts docker images describe')
-        push = RELEASE.index('git --no-replace-objects push origin "${TAG_OBJECT}:refs/tags/${TAG}"')
-        self.assertLess(gate, fetch)
-        self.assertLess(gate, evidence)
-        self.assertLess(gate, tag)
-        self.assertLess(gate, registry)
-        self.assertLess(gate, push)
-        self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE"', RELEASE)
-        # The quarantine is now a positive two-factor predicate, not a blanket
-        # refusal: an exact archive-v3-wal tag plus an operator acknowledgment
-        # naming that exact tag. Both remain before any network action.
-        self.assertIn('archive-v3-wal\\.[0-9]+$', RELEASE)
-        self.assertIn('KIOKU_CONFIRM_ARCHIVE_V3_ROLL', RELEASE)
-        ack = RELEASE.index('KIOKU_CONFIRM_ARCHIVE_V3_ROLL')
-        self.assertLess(ack, RELEASE.index('git --no-replace-objects fetch origin main'))
-
-    def test_fresh_roles_use_one_generated_current_tag_and_never_legacy_roll(self) -> None:
-        fixed_tag = 'ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"'
-        self.assertIn(fixed_tag, RELEASE)
-        self.assertIn('ADR0022_CURRENT_TAG=""', RELEASE)
-        self.assertNotIn("ADR0022_FRESH_FINAL_TAG", RELEASE)
-        self.assertNotIn("ADR0022_FRESH_SUCCESSOR_TAG", RELEASE)
-        self.assertNotIn("ADR0022_FRESH_FLEET_CONVERGENCE_TAG", RELEASE)
-        self.assertIn(
-            '"$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp]',
-            RELEASE,
-        )
-        role_gate = RELEASE.index("ADR-0022 fresh BOOTSTRAP tag must be exactly")
-        current_gate = RELEASE.index("Archive V3 release tag must match the generated current release")
-        sequence_gate = RELEASE.index("Archive V3 release is not the exact next published WAL sequence")
-        roll_refusal = RELEASE.index(
-            "ADR-0022 fresh releases roll only through the sealed deployment"
-        )
-        fetch = RELEASE.index("git --no-replace-objects fetch origin main")
-        self.assertLess(role_gate, fetch)
-        self.assertLess(current_gate, fetch)
-        self.assertGreater(sequence_gate, fetch)
-        self.assertLess(roll_refusal, fetch)
-        self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE"', RELEASE)
+    def test_release_metadata_uses_only_live_media_and_postgres_authority(self) -> None:
+        self.assertIn('"ENCLAVE_GCS_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE"', RELEASE)
+        self.assertIn("scripts/verify_local_evidence_bundle.py", RELEASE)
+        for obsolete in (
+            "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET",
+            "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+            "GENESIS_WAL_NATIVE",
+            "KIOKU_CONFIRM_ARCHIVE_V3_ROLL",
+        ):
+            self.assertNotIn(obsolete, RELEASE)
 
     def test_push_roll_binds_exact_deployment_source_before_network_and_roll(self) -> None:
         verifier_call = "scripts/verify_push_runtime_topology.py"
@@ -138,9 +104,9 @@ class LocalReleaseContracts(unittest.TestCase):
             encoding="utf-8"
         )
         for evidence in (
-            "0580e974fd6aa780f44f208e8f7ad6fd765d0fe4",
-            "8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5",
-            "infra/enclave.tf",
+            "REVIEWED_DEPLOYMENT",
+            'head="0580e974fd6aa780f44f208e8f7ad6fd765d0fe4"',
+            'digest="8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5"',
             "--untracked-files=all",
             "canonical_source_digest",
             "root_source_inventory",
@@ -151,6 +117,8 @@ class LocalReleaseContracts(unittest.TestCase):
             "refs/replace",
         ):
             self.assertIn(evidence, verifier)
+        self.assertNotIn("origin_main_seal", verifier)
+        self.assertNotIn("origin/main^{commit}", verifier)
         self.assertNotIn("re.compile", verifier)
 
     def test_evidence_has_only_hashes_for_local_build_inputs(self) -> None:

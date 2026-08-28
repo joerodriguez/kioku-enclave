@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{json, Value};
 
+pub(crate) const DEFAULT_MINIMIZED_PAGE_SIZE: usize = 10;
+pub(crate) const MAX_MINIMIZED_PAGE_SIZE: usize = 20;
+
 const REDACTED: &str = "[REDACTED: restricted data]";
 const MAX_MCP_STRING_BYTES: usize = 64 * 1024;
 

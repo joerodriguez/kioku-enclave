@@ -3,14 +3,12 @@ use sqlx::Row;
 
 use crate::{
     cp::{isotime, tokens},
-    episodes::{
-        merge_minute_summaries, merge_substance, merge_visual_evidence, normalized_substance,
-        normalized_visual_evidence,
-    },
     error::{EnclaveError, Result},
     persistence::{
-        EpisodeEmbeddingSource, EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode,
-        SummaryScreenshot, SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,
+        merge_minute_summaries, merge_substance, merge_visual_evidence, normalized_substance,
+        normalized_visual_evidence, EpisodeEmbeddingSource, EpisodeEmbeddingWrite,
+        MemoryFormationRepository, OpenEpisode, SummaryScreenshot, SummaryUtterance,
+        SummaryWindowClaim, SummaryWindowSettlement,
     },
 };
 

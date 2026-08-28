@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{episodes::EpisodeInput, error::Result};
+use crate::{error::Result, persistence::EpisodeInput};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryUtterance {

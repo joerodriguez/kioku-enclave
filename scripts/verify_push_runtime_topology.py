@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless rollout uses the reviewed singleton deployment source."""
+"""Fail closed unless maintenance rollout uses independently reviewed source."""
 
 from __future__ import annotations
 
@@ -27,9 +27,10 @@ class DeploymentSourceSeal:
         return f"push-runtime-source-seal-v1:{self.head}:{self.digest}"
 
 
-# This is intentionally an exact reviewed-source pin, not a Terraform parser.
-# Changing any deployment source requires a separate review that updates both
-# the commit and its canonical root-source inventory/digest here.
+# This is intentionally an exact reviewed-source pin, not a Terraform parser
+# and not a seal derived from a mutable local remote-tracking ref. Changing any
+# deployment source requires a separate enclave review that updates the commit,
+# canonical Terraform root-source inventory, and digest together.
 REVIEWED_DEPLOYMENT = DeploymentSourceSeal(
     head="0580e974fd6aa780f44f208e8f7ad6fd765d0fe4",
     inventory=(
@@ -220,7 +221,7 @@ def main() -> int:
         else:
             token = verify(args.deployment_repo)
     except (OSError, UnicodeError, ValueError) as error:
-        print(f"push runtime source-seal refusal: {error}", file=sys.stderr)
+        print(f"maintenance rollout source-seal refusal: {error}", file=sys.stderr)
         return 1
     print(token)
     return 0

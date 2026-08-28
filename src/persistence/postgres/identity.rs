@@ -64,7 +64,7 @@ impl IdentitySessionRepository for PostgresPersistence {
         .bind(account_id)
         .fetch_optional(self.pool())
         .await?;
-        Ok(status.as_deref().map(AccountStatus::from_legacy))
+        Ok(status.as_deref().map(AccountStatus::from_database))
     }
 
     async fn upsert_subject_account(

@@ -18,7 +18,7 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-TAG = "v1.2.3-archive-v3-wal.1"
+TAG = "v1.2.3"
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 CONFIG_HASH = "c" * 64

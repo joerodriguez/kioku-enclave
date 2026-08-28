@@ -647,10 +647,7 @@ async fn web_callback(State(state): State<Arc<CpState>>, body: String) -> Respon
     {
         Ok(user) => user,
         Err(EnclaveError::SignupLimited) => {
-            super::control_store::observe_signup_refused(
-                "apple",
-                state.config.signup_limit_per_day,
-            );
+            super::observe_signup_refused("apple", state.config.signup_limit_per_day);
             return oauth::signup_limited_page();
         }
         Err(_) => {
@@ -700,10 +697,7 @@ async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) ->
     {
         Ok(user) => user,
         Err(EnclaveError::SignupLimited) => {
-            super::control_store::observe_signup_refused(
-                "apple",
-                state.config.signup_limit_per_day,
-            );
+            super::observe_signup_refused("apple", state.config.signup_limit_per_day);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"error": "signup_limit_reached"})),
@@ -767,20 +761,6 @@ async fn session(
         }
         Err(_) => return server_error(),
     };
-    // Native Google clients authenticate this route with their Google ID
-    // token instead of traversing the OAuth code exchange. That middleware
-    // may have created the account and its active archive binding on this
-    // request, so this canonical session boundary must resume Genesis too.
-    // Browser OAuth already reaches the same idempotent trigger, while Apple
-    // native sessions also call it at issuance; duplicate calls are contained
-    // by the per-user single-flight and exact durable state machine.
-    if state.repositories.uses_legacy_state() {
-        crate::archive_v3_genesis_trigger::spawn_genesis_convergence(
-            Arc::clone(&state.control),
-            Arc::clone(&state.store),
-            &user.0,
-        );
-    }
     no_store_json(json!({
         "account_id": user.0,
         "email": session.account.email,

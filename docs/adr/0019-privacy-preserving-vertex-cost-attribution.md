@@ -13,8 +13,8 @@ response is not billed.
 
 ## Decision
 
-Before each Vertex request, create and durably flush an opaque `vtx_<random>` intent in
-the encrypted per-user SQLite database. If intent persistence fails, fail the operation
+Before each Vertex request, create and durably commit an opaque `vtx_<random>` intent in
+the tenant-qualified PostgreSQL usage ledger. If intent persistence fails, fail the operation
 before paid egress. Every call uses one of four billing operations:
 `audio_understanding`, `screen_understanding`, `episode_summarization`, or
 `episode_finalization`. The row contains only operation, requested/returned model,
@@ -69,7 +69,7 @@ asynchronous coverage delivery.
 
 - Exact attribution is possible when Vertex supplies coherent counters; missing and
   ambiguous cost remains explicitly visible rather than silently understated.
-- Per-user ledgers and pending outbox rows disappear with the encrypted user database on
+- Per-user ledgers and pending outbox rows are removed with the account's PostgreSQL rows on
   account deletion.
 - Backend pricing stays model/version/location/traffic aware and can change without an
   enclave release.

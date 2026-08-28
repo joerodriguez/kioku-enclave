@@ -82,8 +82,6 @@ pub(crate) struct CaptureCommit {
     pub(crate) object_key: Option<String>,
     pub(crate) object_generation: Option<i64>,
     /// PostgreSQL fleet-wide admission token for a canonical GCS upload.
-    /// The legacy adapter deliberately leaves this unset because its
-    /// process-local lifecycle barrier remains authoritative there.
     pub(crate) upload_token: Option<String>,
     pub(crate) media_authority: Option<RecordingMediaAuthorityDecision>,
     pub(crate) committed_at: String,
@@ -98,7 +96,6 @@ pub(crate) struct CaptureCommitResult {
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceBatchCommit {
     pub(crate) account_id: String,
-    pub(crate) batch_id: String,
     pub(crate) events: Vec<CaptureEventManifest>,
     pub(crate) manifest_digests: Vec<String>,
     pub(crate) committed_at: String,
@@ -129,8 +126,7 @@ pub(crate) trait CaptureRepository: Send + Sync {
     ) -> Result<CapturePreflight>;
 
     /// Reserve the right to publish one canonical GCS object while the
-    /// account is active. PostgreSQL returns a durable token; the legacy
-    /// adapter returns `None` and continues to use its local write barrier.
+    /// account is active. PostgreSQL returns a durable admission token.
     async fn reserve_media_upload(
         &self,
         account_id: &str,
@@ -142,14 +138,9 @@ pub(crate) trait CaptureRepository: Send + Sync {
 
     async fn media_dek_wrapped(&self, account_id: &str) -> Result<Option<String>>;
 
-    /// Install the first processing-media DEK and return the persisted winner.
-    /// `candidate_dek` is needed only by the legacy WAL binding proof.
-    async fn install_media_dek(
-        &self,
-        account_id: &str,
-        candidate_wrapped: &str,
-        candidate_dek: &crate::crypto::Dek,
-    ) -> Result<String>;
+    /// Install the first wrapped processing-media DEK and return the persisted
+    /// winner.
+    async fn install_media_dek(&self, account_id: &str, candidate_wrapped: &str) -> Result<String>;
 
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult>;
 

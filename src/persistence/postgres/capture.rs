@@ -569,12 +569,9 @@ async fn insert_event(
             EnclaveError::InvalidRequest("canonical media authority is required".into())
         })?;
         let expected_object_key = if authority.is_durable() {
-            crate::store::canonical_recording_media_object_key(
-                &command.account_id,
-                &media.asset_id,
-            )?
+            crate::gcs::canonical_recording_media_object_key(&command.account_id, &media.asset_id)?
         } else {
-            crate::store::canonical_capture_media_object_key(&command.account_id, &media.asset_id)?
+            crate::gcs::canonical_capture_media_object_key(&command.account_id, &media.asset_id)?
         };
         if object_key != expected_object_key {
             return Err(EnclaveError::InvalidRequest(
@@ -986,12 +983,7 @@ impl CaptureRepository for PostgresPersistence {
         .await?)
     }
 
-    async fn install_media_dek(
-        &self,
-        account_id: &str,
-        candidate_wrapped: &str,
-        _candidate_dek: &crate::crypto::Dek,
-    ) -> Result<String> {
+    async fn install_media_dek(&self, account_id: &str, candidate_wrapped: &str) -> Result<String> {
         if candidate_wrapped.is_empty() {
             return Err(EnclaveError::InvalidRequest(
                 "wrapped media DEK must not be empty".into(),

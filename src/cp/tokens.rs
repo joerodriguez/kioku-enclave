@@ -124,7 +124,7 @@ pub(crate) struct RecordingRetentionLeaseClaims {
 }
 
 fn valid_recording_retention_lease_claims(claims: &RecordingRetentionLeaseClaims) -> bool {
-    crate::store::validate_user_id(&claims.user_id).is_ok()
+    crate::gcs::validate_user_id(&claims.user_id).is_ok()
         && claims.lease_id.starts_with("lease_")
         && claims.lease_id.len() == 70
         && claims

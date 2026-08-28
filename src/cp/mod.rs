@@ -8,13 +8,12 @@
 //! release-digest-pinned enclave — not an un-attested proxy. The build is
 //! dependency-locked but is not yet claimed to be bit-for-bit reproducible.
 //!
-//! Identity and accounting live in [`control_store`] as an encrypted SQLite
-//! blob in GCS.
+//! Identity, accounting, work claims, and user-visible structured state live
+//! in PostgreSQL behind typed repository ports.
 
 pub mod apple;
 pub mod auth;
 pub mod billing;
-pub mod control_store;
 pub mod cors;
 pub mod delivery;
 pub mod dlp;
@@ -24,8 +23,6 @@ pub mod finalizer;
 pub mod identity;
 pub mod isotime;
 pub mod limits;
-pub mod mcp_projection;
-pub mod mcp_query;
 pub(crate) mod mcp_safety;
 pub mod media;
 pub mod media_planner;
@@ -36,11 +33,6 @@ pub mod playback;
 pub mod push;
 pub mod query;
 pub mod retention;
-pub mod reviewer;
-pub(crate) mod schema_epoch;
-// Retained for legacy-index migrations and focused regression tests after
-// local screenshot ingestion was retired.
-#[allow(dead_code)]
 pub mod screen_understanding;
 pub mod summarizer;
 pub mod sync;
@@ -50,7 +42,6 @@ pub mod voice_eval;
 pub mod voice_eval_assets;
 pub mod voice_eval_evidence;
 pub mod voice_eval_similarity;
-pub mod voice_lineage;
 pub mod voice_memory;
 pub mod voice_quality;
 pub mod webhook_worker;
@@ -59,10 +50,25 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::store::Store;
-
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The exact configured reviewer identity can create at most one account and
+/// must remain available when the public daily signup budget is exhausted.
+pub(super) const REVIEWER_SIGNUP_EXEMPT: i64 = i64::MAX;
+
+/// Content-free observation for a daily signup-budget refusal.
+pub(super) fn observe_signup_refused(provider: &'static str, budget: i64) {
+    tracing::warn!(
+        target: "kioku::signup",
+        metric_schema = "signup_v1",
+        provider,
+        outcome = "refused",
+        accounts_today = budget,
+        budget,
+        "signup refused by the daily budget"
+    );
+}
 
 pub(crate) fn bounded_http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -72,10 +78,7 @@ pub(crate) fn bounded_http_client() -> reqwest::Client {
         .expect("static control-plane HTTP client configuration")
 }
 
-/// Control-plane configuration, read from the (image-baked) environment.
-// Some fields (vertex_*, scheduler_sa_email) are consumed by the summarizer,
-// wired in a later commit of this same change.
-#[allow(dead_code)]
+/// Control-plane configuration, read from the image-baked environment.
 pub struct CpConfig {
     pub base_url: String,
     /// JWT signing secrets: current first, then rotation-fallback(s).
@@ -90,7 +93,6 @@ pub struct CpConfig {
     /// Stable UUIDs authorized for owner-only operational reporting. Sign-up is
     /// open to every verified identity; this list only gates owner reporting.
     pub admin_user_ids: Vec<String>,
-    pub scheduler_sa_email: Option<String>,
     pub vertex_project: String,
     pub vertex_location: String,
     pub vertex_model: String,
@@ -98,9 +100,6 @@ pub struct CpConfig {
     /// required: signup is open to any verified identity, so this is the only
     /// bound on account creation and it must not have a permissive default.
     pub signup_limit_per_day: i64,
-    pub quota_utterances_per_day: i64,
-    pub quota_screenshots_per_day: i64,
-    pub quota_mcp_calls_per_day: i64,
     pub quota_vertex_output_tokens_per_day: i64,
     pub web_origin: String,
     /// Optional exact-match Google Identity Platform account used only by the
@@ -382,16 +381,10 @@ impl CpConfig {
             google_web_client_secret,
             apple_sign_in,
             admin_user_ids,
-            scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
-                .ok()
-                .filter(|s| !s.is_empty()),
             vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
             vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
             vertex_model,
             signup_limit_per_day,
-            quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
-            quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
-            quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,
             quota_vertex_output_tokens_per_day: parse_i64(
                 "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
                 524_288,
@@ -435,15 +428,10 @@ pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
-/// Shared state for the control-plane HTTP surface. Holds the same `Arc<Store>`
-/// as the data plane so MCP/sync call the content handlers in-process.
-// mcp_limiter is consumed by the MCP routes, wired in a later commit.
-#[allow(dead_code)]
+/// Shared state for the control-plane HTTP surface.
 pub struct CpState {
     pub(crate) kms: Arc<dyn crate::crypto::KmsClient>,
     pub(crate) durable_recording_storage_bound: bool,
-    pub store: Arc<Store>,
-    pub control: Arc<control_store::ControlStore>,
     pub(crate) repositories: crate::persistence::RepositorySet,
     pub billing: Arc<dyn billing::BillingGateway>,
     pub recording_lease_gate: Arc<billing::RecordingLeaseGates>,
@@ -453,7 +441,6 @@ pub struct CpState {
     pub apple_provider: Option<Arc<apple::AppleIdentityProvider>>,
     pub sync_limiter: limits::RateLimiter,
     pub reference_batch_limiter: limits::RateLimiter,
-    pub reference_batch_concurrency: Arc<tokio::sync::Semaphore>,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,
     pub test_email_limiter: limits::RateLimiter,
@@ -462,91 +449,20 @@ pub struct CpState {
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
-    /// Python-free WeSpeaker voiceprint engine. The production image bakes the
-    /// pinned ONNX model; local tests may run without it.
-    pub voice: Option<Arc<voice_memory::VoiceEngine>>,
 }
 
-impl CpState {
-    /// ADR-0022 D4 — the generic unmigrated-domain gate for a future
-    /// background-worker domain. The current production registry is empty.
-    ///
-    /// `true` means `domain` still reaches its rows through the legacy
-    /// per-user store and this user's archive is WAL-authoritative, so the
-    /// caller must skip that domain. The skip is counted and logged here —
-    /// exactly once per call — so a deferral is inert but never silent: on a
-    /// `true` the caller makes no provider call, leases nothing, and writes
-    /// nothing. Call it once per pass, never once per inner iteration, or the
-    /// "exactly one counted skip per pass" contract breaks.
-    ///
-    /// Gate a newly deferred domain, not the worker: several workers
-    /// already route migrated domains through `wal_authoritative_read` /
-    /// `wal_authoritative_submit`, and gating one of those off would silently
-    /// disable live work.
-    #[allow(
-        dead_code,
-        reason = "the empty D4 registry keeps one reviewed fail-closed worker gate for a future explicitly named domain"
-    )]
-    pub(crate) fn wal_domain_skipped(&self, user_id: &str, domain: &'static str) -> bool {
-        if !self.repositories.uses_legacy_state() {
-            return false;
-        }
-        if !self.store.is_wal_authoritative(user_id) {
-            return false;
-        }
-        tracing::warn!(
-            user_id,
-            metric = crate::error::WAL_DOMAIN_UNMIGRATED_REASON,
-            domain,
-            "not migrated to WAL; skipping"
-        );
-        true
-    }
-
-    /// ADR-0022 D4 — the same generic gate on a request path. No current
-    /// production request owner calls it with a registered domain.
-    ///
-    /// `Some(error)` refuses with the distinguishable 503 that names the
-    /// domain; `None` means the legacy path is safe for this user. The
-    /// refusal is counted where it becomes a response, so this returns the
-    /// error rather than logging it here.
-    #[allow(
-        dead_code,
-        reason = "the empty D4 registry keeps one reviewed fail-closed request gate for a future explicitly named domain"
-    )]
-    pub(crate) fn wal_domain_refusal(
-        &self,
-        user_id: &str,
-        domain: &'static str,
-    ) -> Option<crate::error::EnclaveError> {
-        if !self.repositories.uses_legacy_state() {
-            return None;
-        }
-        self.store
-            .is_wal_authoritative(user_id)
-            .then(|| crate::error::EnclaveError::wal_domain_unmigrated(domain))
-    }
-}
-
-/// The stable machine-readable reason a failed routed read reports.
+/// The stable machine-readable reason a failed PostgreSQL-backed read reports.
 pub(crate) const ROUTED_READ_UNAVAILABLE_REASON: &str = "enclave_unavailable";
 
-/// ADR-0022 — **the failure-status rule for the read lane, stated once.**
+/// The failure-status rule for the PostgreSQL read lane, stated once.
 ///
-/// > A routed read (`Store::wal_authoritative_read`) that returns `Err` answers
-/// > **503 `enclave_unavailable`**.
-///
-/// A routed read fails for exactly one class of reason: the archive behind it
-/// could not be read. For a WAL-authoritative user that is a serving authority
-/// that is unregistered, quarantined, or mid-relaunch; for an unselected user
-/// it is the guarded legacy load failing. Both are transient and retryable, and
-/// 503 is the only status that says so. The three statuses it is deliberately
-/// NOT, each of which shipped as a defect on this lane:
+/// A repository read that fails transiently answers **503
+/// `enclave_unavailable`**. In particular, it must not answer:
 ///
 /// * **200** with an `error` key in the body. Every client that switches on the
 ///   status before the body reads that as data. `/api/search` did this.
-/// * **404**. That is an absence, and the archive is present and merely
-///   unreadable — it tells the caller their screenshot does not exist.
+/// * **404**. That is an absence and would tell the caller their screenshot
+///   does not exist when its authoritative row was merely unreadable.
 ///   `/api/screenshot-images/{id}/content` did this.
 /// * **500**. That is a fault: it invites a bug report instead of a retry, and
 ///   it makes a retryable read failure indistinguishable from genuinely
@@ -554,17 +470,15 @@ pub(crate) const ROUTED_READ_UNAVAILABLE_REASON: &str = "enclave_unavailable";
 ///   authentication failure), which keeps 500 on purpose. KMS transport and
 ///   provider outages are retryable and answer 503.
 ///
-/// The one exception, stated here so it cannot be mistaken for drift: a failure
-/// arm that ALSO covers a genuinely non-retryable failure keeps its own status
-/// and says why at the call site. In this lane that is
+/// A failure arm that also covers a genuinely non-retryable failure keeps its
+/// own status and documents why at the call site. In this lane that is
 /// `query.rs::rest_screenshot_image_content`'s malformed-key and decrypt arms,
 /// which stay 500 because malformed wrapping or a blob that will not
 /// authenticate is not fixed by retrying; its KMS HTTP/attestation failures
 /// use this 503 boundary instead.
 ///
-/// `sync.rs::export` is NOT such an exception: it keeps its distinct
-/// `export_failed` reason (a client contract) but answers it at 503, because
-/// the only thing behind it is the same routed read.
+/// `sync.rs::export` is not such an exception: it keeps its distinct
+/// `export_failed` reason (a client contract) but answers it at 503.
 pub(crate) fn routed_read_unavailable(
     context: &'static str,
     error: &crate::error::EnclaveError,
@@ -576,457 +490,6 @@ pub(crate) fn routed_read_unavailable(
         axum::response::Json(serde_json::json!({ "error": ROUTED_READ_UNAVAILABLE_REASON })),
     )
         .into_response()
-}
-
-/// Shared harness for the ADR-0022 D4 gate's tests.
-///
-/// Every gated worker lives in its own module, so its gate test must live
-/// there too; this keeps the *state* they all observe in one place, along with
-/// the tracing capture that proves "exactly one counted skip per pass".
-#[cfg(test)]
-pub(crate) mod wal_gate_test_support {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-
-    use super::{BillingEnforcementMode, CpConfig, CpState};
-    use crate::store::Store;
-
-    /// A `CpState` over fake KMS/GCS with no transports wired.
-    pub(crate) fn state() -> Arc<CpState> {
-        let kms = Arc::new(crate::store::tests::FakeKms);
-        let gcs = Arc::new(crate::store::tests::FakeGcs::new());
-        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
-        let control = Arc::new(super::control_store::ControlStore::new(kms, gcs));
-        state_over(store, control)
-    }
-
-    /// The same `CpState`, over a store and control store the caller already
-    /// owns. `answerable_wal_archive` needs this: its two halves have to be
-    /// the SAME handles the genesis convergence launched the serving
-    /// authority on, or the routed read finds no authority and the archive is
-    /// unreadable again.
-    pub(crate) fn state_over(
-        store: Arc<Store>,
-        control: Arc<super::control_store::ControlStore>,
-    ) -> Arc<CpState> {
-        let repositories =
-            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
-        Arc::new(CpState {
-            kms: Arc::clone(&store.kms),
-            durable_recording_storage_bound: store.durable_recording_storage_bound(),
-            store,
-            control,
-            repositories,
-            billing: Arc::new(super::billing::FakeBillingGateway),
-            recording_lease_gate: Arc::new(super::billing::RecordingLeaseGates::default()),
-            config: Arc::new(CpConfig {
-                base_url: "http://localhost:8080".into(),
-                jwt_secrets: vec!["test-secret".into()],
-                google_desktop_client_id: "desktop".into(),
-                google_ios_client_id: "ios".into(),
-                google_web_client_id: "web".into(),
-                google_web_client_secret: "secret".into(),
-                apple_sign_in: None,
-                admin_user_ids: Vec::new(),
-                signup_limit_per_day: super::control_store::TEST_SIGNUP_LIMIT,
-                scheduler_sa_email: None,
-                vertex_project: "project".into(),
-                vertex_location: "location".into(),
-                vertex_model: "model".into(),
-                quota_utterances_per_day: 1,
-                quota_screenshots_per_day: 1,
-                quota_mcp_calls_per_day: 1,
-                quota_vertex_output_tokens_per_day: 524_288,
-                web_origin: "http://localhost:3000".into(),
-                reviewer_auth: None,
-                billing_enforcement_mode: BillingEnforcementMode::Enforce,
-            }),
-            user_verifier: Arc::new(super::auth::UserIdTokenVerifier::new(vec![])),
-            reviewer_verifier: None,
-            apple_provider: None,
-            sync_limiter: super::limits::RateLimiter::new(10.0, 1.0),
-            reference_batch_limiter: super::limits::RateLimiter::new(10.0, 1.0),
-            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
-            mcp_limiter: super::limits::RateLimiter::new(10.0, 1.0),
-            oauth_limiter: super::limits::RateLimiter::new(10.0, 1.0),
-            test_email_limiter: super::limits::RateLimiter::new(3.0, 0.05),
-            email_transport: None,
-            push_transport: None,
-            embedding: None,
-            voice: None,
-        })
-    }
-
-    /// Give `user_id` the durable-terminal WAL-authority selection the gate
-    /// keys on. No serving authority is registered, which is deliberate: it
-    /// makes EVERY store touch fail, legacy or routed. A gated worker that
-    /// still returns `Ok` therefore provably touched no store at all — so it
-    /// left nothing leased and nothing half-written.
-    pub(crate) fn select_wal_authoritative(store: &Store, user_id: &str) {
-        store
-            .install_wal_authority_persistence(
-                super::control_store::WalAuthoritativePersistenceSelection::for_test(
-                    user_id,
-                    crate::archive_v3::ArchiveId::from_bytes([0x4d; 16]),
-                ),
-            )
-            .expect("the test selection installs once");
-        assert!(
-            store.is_wal_authoritative(user_id),
-            "the harness must actually select the user"
-        );
-    }
-
-    /// A selected user whose archive is REAL, READABLE and NOT EMPTY.
-    ///
-    /// This is the harness a LIFTED gate needs, and it is deliberately not
-    /// `select_wal_authoritative`. That helper installs the selection with no
-    /// serving authority precisely so every store touch fails — it can prove a
-    /// refusal and nothing else. A lifted gate has to be proven on the
-    /// opposite property: the read ANSWERS, with content. A test written on
-    /// `select_wal_authoritative` would pass just as happily on a route that
-    /// answers `200 {"episodes": []}`, which is the exact shape the D4
-    /// registry exists to keep off the wire.
-    ///
-    /// Everything here is durable and real: `converge_genesis_over` runs the
-    /// reviewed genesis driver to the `wal_authoritative` terminal and
-    /// launches the serving authority, and the rows arrive through
-    /// `wal_authoritative_submit` as the sealed `ReviewerFixturePlan` — the
-    /// same settle path `oauth.rs` uses in production. No row is written
-    /// through `with_user`, and none could be: a selected user has no such
-    /// lane.
-    ///
-    /// The fixture is the seed of convenience, not the justification. Each
-    /// lifted gate's justification is that the ordinary capture chain
-    /// (`CanonicalCaptureEventPlan` -> the media work claim -> the sealed
-    /// audio/screen result families -> `EpisodeWindowUpsertPlan`) writes the
-    /// same tables for every selected user; the fixture just gets rows into
-    /// them in one submit instead of five.
-    pub(crate) struct AnswerableArchive {
-        /// Held for the lifetime of the archive: dropping the substrate is the
-        /// harness's stand-in for process death and takes the serving
-        /// authority with it.
-        _substrate: crate::archive_v3_genesis_trigger::tests::GenesisSmokeSubstrate,
-        pub(crate) state: Arc<CpState>,
-        pub(crate) user_id: String,
-    }
-
-    impl AnswerableArchive {
-        /// Test-only handle for exact Control-save fault injection. The WAL
-        /// archive provider remains private, so this grants no archive write
-        /// shortcut and cannot make an unavailable archive look answerable.
-        pub(crate) fn control_gcs(&self) -> Arc<crate::store::tests::FakeGcs> {
-            self._substrate.control_gcs()
-        }
-    }
-
-    /// Converge genesis for `user_id` (which must be a UUID — the fixture plan
-    /// validates it), then seed the archive through the WAL lane.
-    ///
-    /// Asserts its own preconditions, so a test built on it cannot pass
-    /// vacuously if the selection, the authority launch, or the seed silently
-    /// stops happening.
-    pub(crate) async fn answerable_wal_archive(user_id: &str) -> AnswerableArchive {
-        use crate::archive_v3_genesis_trigger::tests::{converge_for_smoke, GenesisSmokeSubstrate};
-        use crate::archive_v3_genesis_trigger::GenesisConvergence;
-
-        let substrate = GenesisSmokeSubstrate::new();
-        let process = substrate.boot();
-        process
-            .control
-            .create_genesis_test_binding(user_id)
-            .await
-            .expect("the harness mints the archive binding the way sign-in does");
-        let outcome = converge_for_smoke(
-            &substrate.runtime(),
-            &process.control,
-            &process.store,
-            user_id,
-        )
-        .await
-        .expect("genesis convergence must reach the durable terminal");
-        assert_eq!(outcome, GenesisConvergence::Converged);
-        assert!(
-            process.store.is_wal_authoritative(user_id),
-            "the archive must be selected, or the lifted gate is not the thing under test"
-        );
-        assert!(
-            process.store.has_wal_serving_authority(user_id),
-            "the archive must be READABLE, or every assertion below would be \
-             indistinguishable from the unavailable-authority lane"
-        );
-
-        assert!(
-            super::reviewer::ensure_demo_archive(&process.store, user_id)
-                .await
-                .expect("the sealed fixture settles"),
-            "the seed must have written; a no-op seed makes every content \
-             assertion below vacuous"
-        );
-
-        let state = state_over(Arc::clone(&process.store), Arc::clone(&process.control));
-        AnswerableArchive {
-            _substrate: substrate,
-            state,
-            user_id: user_id.to_owned(),
-        }
-    }
-
-    /// Make `user_id`'s LEGACY archive unreadable, without selecting them.
-    ///
-    /// This is the second half of the read lane's failure story. `select_wal_
-    /// authoritative` covers a selected user, but a selected user is answered
-    /// by the D4 gate before the routed read is ever called — so on its own it
-    /// cannot see a failure arm hiding behind a gate. Both blockers found in
-    /// the read-lane review lived exactly there: `/api/search` answered 200
-    /// with an error body and `/api/screenshot-images/{id}/content` answered a
-    /// bare 404, and the gate hid both.
-    ///
-    /// An unselected user with a corrupt index blob takes the OTHER branch of
-    /// `wal_authoritative_read` — the guarded legacy load — and fails in it.
-    /// That is the shape of a real transient store fault, and no gate stands
-    /// in front of it.
-    ///
-    /// The helper proves its own sabotage before returning, so a test built on
-    /// it can never pass vacuously if the object naming or the load path
-    /// changes underneath it.
-    pub(crate) async fn make_legacy_archive_unreadable(store: &Store, user_id: &str) {
-        // Mirrors `store::gcs_object_name`, which is private. The assertion
-        // below is what keeps this honest.
-        let index = format!("indexes/{user_id}.db.enc");
-        store
-            .gcs
-            .put_object(
-                &index,
-                b"not an encrypted sqlite archive",
-                "not-base64!!",
-                0,
-            )
-            .await
-            .expect("the fake provider accepts the corrupt blob");
-        assert!(
-            !store.is_wal_authoritative(user_id),
-            "this lane must exercise the LEGACY branch, so the user must not be selected"
-        );
-        let probe = store.with_user(user_id, |_| Ok(())).await;
-        assert!(
-            probe.is_err(),
-            "the sabotage did not bite: {user_id}'s legacy archive still loads, so any test \
-             built on this helper would pass vacuously"
-        );
-    }
-
-    /// Every response key that would make a refusal look like data.
-    ///
-    /// A refusal must never present as a success, an empty collection, or an
-    /// absence — so it must not carry the shape the successful response has,
-    /// at any status.
-    pub(crate) const DATA_SHAPED_KEYS: &[&str] = &[
-        "episodes",
-        "episode_count",
-        "hidden_count",
-        "results",
-        "utterances",
-        "screenshots",
-        "screenshot_images",
-        "members",
-        "member_count",
-        "participant_details",
-        "records",
-        "next_before",
-        "tabs",
-        "counts",
-        "latest",
-        "total_utterances",
-        "total_screenshots",
-        "capture_events",
-        "capture_sessions",
-    ];
-
-    /// The read lane's one property: an archive that cannot be read is
-    /// answered with a non-2xx that carries no data.
-    ///
-    /// It deliberately does NOT pin a particular status or reason. Whether the
-    /// D4 gate answered (503 `wal_domain_unmigrated`, naming the domain) or
-    /// the routed read's own failure arm did (503 `enclave_unavailable`, or
-    /// `export_failed`), both are correct answers and the surface is free to
-    /// pick. What is never correct is a 2xx, or a body a client can mistake
-    /// for an empty archive.
-    pub(crate) async fn assert_refuses_without_data(
-        label: &str,
-        response: axum::response::Response,
-    ) {
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        assert!(
-            !status.is_success() && !status.is_redirection(),
-            "{label} answered {status} for an unreadable archive; a refusal must never present \
-             as a success"
-        );
-        // A 404 is an ABSENCE, and the archive is present and merely
-        // unreadable. `/api/screenshot-images/{id}/content` shipped exactly
-        // this: `Err(_) => NOT_FOUND`, byte-identical to its genuine-absence
-        // arm. "Non-2xx" alone does not catch it, which is the whole reason
-        // this assertion names it.
-        assert_ne!(
-            status,
-            axum::http::StatusCode::NOT_FOUND,
-            "{label} answered 404 for an unreadable archive; a refusal must never present as an \
-             absence"
-        );
-        assert!(
-            !content_type.starts_with("image/"),
-            "{label} answered {status} but shipped {content_type}: a refusal must never present \
-             as content"
-        );
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap_or_default();
-        // A bare status with no body is the other half of the same defect: it
-        // is unlogged, has no machine-readable reason, and a client cannot
-        // tell it from any other failure. Parsing is an assertion, not a
-        // convenience.
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            panic!(
-                "{label} answered {status} with no JSON body; a refusal must carry a \
-                 machine-readable reason: {:?}",
-                String::from_utf8_lossy(&bytes)
-            )
-        });
-        for key in DATA_SHAPED_KEYS {
-            assert!(
-                body.get(*key).is_none(),
-                "{label} answered {status} but carried a data-shaped `{key}`, which reads as an \
-                 empty archive: {body}"
-            );
-        }
-        assert!(
-            body.get("error")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|reason| !reason.is_empty()),
-            "{label} answered {status} with no `error` reason: {body}"
-        );
-    }
-
-    #[derive(Clone, Default)]
-    pub(crate) struct CapturedEvents(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedEvents {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedEvents {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl CapturedEvents {
-        pub(crate) fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).expect("events are utf-8")
-        }
-
-        /// How many counted D4 skips name `domain`. The contract is exactly
-        /// one per worker pass per user.
-        pub(crate) fn skips(&self, domain: &str) -> usize {
-            let metric = format!(
-                r#""metric":"{}""#,
-                crate::error::WAL_DOMAIN_UNMIGRATED_REASON
-            );
-            let domain = format!(r#""domain":"{domain}""#);
-            self.text()
-                .lines()
-                .filter(|line| line.contains(&metric) && line.contains(&domain))
-                .count()
-        }
-
-        /// Every counted D4 skip, whatever its domain.
-        pub(crate) fn total_skips(&self) -> usize {
-            let metric = format!(
-                r#""metric":"{}""#,
-                crate::error::WAL_DOMAIN_UNMIGRATED_REASON
-            );
-            self.text()
-                .lines()
-                .filter(|line| line.contains(&metric))
-                .count()
-        }
-    }
-
-    /// Capture tracing events for as long as the returned guard lives. The
-    /// default subscriber is thread-local and `#[tokio::test]` polls on the
-    /// calling thread, so an awaited worker pass is captured.
-    pub(crate) fn capture_events() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
-        let captured = CapturedEvents::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(captured.clone())
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (captured, guard)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::wal_gate_test_support::{capture_events, select_wal_authoritative, state};
-    use crate::error::EnclaveError;
-
-    const TEST_DEFERRED_DOMAIN: &str = "test.deferred";
-
-    #[test]
-    fn the_worker_gate_is_inert_until_the_user_is_selected_then_counts_one_skip() {
-        let state = state();
-        let domain = TEST_DEFERRED_DOMAIN;
-        let (captured, guard) = capture_events();
-        assert!(
-            !state.wal_domain_skipped("unselected-user", domain),
-            "an unselected user keeps the legacy path"
-        );
-        assert_eq!(captured.total_skips(), 0, "{}", captured.text());
-
-        select_wal_authoritative(&state.store, "selected-user");
-        assert!(state.wal_domain_skipped("selected-user", domain));
-        drop(guard);
-
-        assert_eq!(captured.skips(domain), 1, "{}", captured.text());
-        assert_eq!(captured.total_skips(), 1, "{}", captured.text());
-        assert!(
-            captured.text().contains(r#""user_id":"selected-user""#),
-            "the skip must name the user it deferred: {}",
-            captured.text()
-        );
-    }
-
-    #[test]
-    fn the_request_gate_refuses_the_named_domain_only_for_a_selected_user() {
-        let state = state();
-        let domain = TEST_DEFERRED_DOMAIN;
-        assert!(state
-            .wal_domain_refusal("unselected-user", domain)
-            .is_none());
-
-        select_wal_authoritative(&state.store, "selected-user");
-        let refusal = state
-            .wal_domain_refusal("selected-user", domain)
-            .expect("a selected user is refused");
-        assert!(matches!(
-            refusal,
-            EnclaveError::WalDomainUnmigrated(refused) if refused == domain
-        ));
-    }
 }
 
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.

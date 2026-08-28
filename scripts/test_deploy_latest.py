@@ -24,12 +24,12 @@ class DeployLatestTests(unittest.TestCase):
             tag_signing_key=Path("/private/release-key.pub"),
         )
         command = deploy_latest.pipeline_command(
-            arguments, "v0.8.37-archive-v3-wal.18"
+            arguments, "v0.9.7"
         )
         self.assertIn("--source-ref", command)
         self.assertEqual(
             command[command.index("--source-ref") + 1],
-            "v0.8.37-archive-v3-wal.18",
+            "v0.9.7",
         )
         self.assertIn("--apply", command)
         self.assertIn("--resume", command)

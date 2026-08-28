@@ -31,21 +31,7 @@ import time
 import tomllib
 import urllib.parse
 
-from adr0022_fresh_release import (
-    CANARY_CONFIG_KEY,
-    FreshReleaseError,
-    fresh_release_binding_from_configuration,
-    is_bootstrap_tag,
-    is_final_tag,
-)
-from archive_v3_release_tag import (
-    ReleaseTagError,
-    cargo_version,
-    read_remote_refs,
-    require_next_tag,
-)
 from select_build_configuration import (
-    FRESH_RELEASE_PROFILE_KEYS,
     OPTIONAL_PROFILE_GROUPS,
     PROFILE_KEYS,
     SERVICE_ACCOUNT_PATTERN,
@@ -58,8 +44,6 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_SBOM_PACKAGES = {
     "kioku-enclave",
     "jsonwebtoken",
-    "rusqlite",
-    "sqlite-vec",
     "onig",
 }
 SYFT_VERSION = "1.49.0"
@@ -97,6 +81,7 @@ DIRECT_CREDENTIAL_ENV = frozenset({
 })
 _CHILD_ENVIRONMENT: dict[str, str] | None = None
 _CLOUDSDK_CONFIG: str | None = None
+_AGENT_VERIFICATION_ENVIRONMENT: dict[str, str] = {}
 OPERATOR_CONFIG_KEYS = frozenset(
     (*SHARED_KEYS, "LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT")
     + tuple(
@@ -104,17 +89,6 @@ OPERATOR_CONFIG_KEYS = frozenset(
         for profile in ("PRODUCTION", "EVALUATION")
         for key in (*PROFILE_KEYS, *(key for group in OPTIONAL_PROFILE_GROUPS for key in group))
     )
-    + tuple(
-        f"{profile}_{key}"
-        for profile in ("PRODUCTION", "EVALUATION")
-        for key in (
-            "ARCHIVE_WITNESS_SHADOW_MODE",
-            "ARCHIVE_WITNESS_PROJECT_ID",
-            "ARCHIVE_WITNESS_PROJECT_NUMBER",
-            "ARCHIVE_WITNESS_DATABASE_ID",
-        )
-    )
-    + tuple(f"PRODUCTION_{key}" for key in FRESH_RELEASE_PROFILE_KEYS)
 )
 
 
@@ -618,7 +592,7 @@ def reviewed_cloud_config_directory(path_value: str) -> Path:
 
 def configure_direct_child_environment(stage: str) -> None:
     """Install the direct CLI's reviewed, stage-scoped child environment."""
-    global _CHILD_ENVIRONMENT, _CLOUDSDK_CONFIG
+    global _CHILD_ENVIRONMENT, _CLOUDSDK_CONFIG, _AGENT_VERIFICATION_ENVIRONMENT
     unexpected_git = sorted(
         name
         for name in os.environ
@@ -645,6 +619,34 @@ def configure_direct_child_environment(stage: str) -> None:
         name: value for name, value in os.environ.items() if name in DIRECT_ENV_BASE
     }
     child["GIT_NO_REPLACE_OBJECTS"] = "1"
+    _AGENT_VERIFICATION_ENVIRONMENT = {}
+    if stage in {"verify", "build", "push"}:
+        postgres_url = os.environ.get("KIOKU_TEST_POSTGRES_URL", "")
+        if postgres_url:
+            if not postgres_url.startswith(("postgres://", "postgresql://")):
+                raise PipelineError(
+                    "KIOKU_TEST_POSTGRES_URL must use the postgres or postgresql URL scheme"
+                )
+            if any(
+                ord(character) < 32 or ord(character) == 127
+                for character in postgres_url
+            ):
+                raise PipelineError("KIOKU_TEST_POSTGRES_URL contains a control character")
+            _AGENT_VERIFICATION_ENVIRONMENT["KIOKU_TEST_POSTGRES_URL"] = postgres_url
+        minimum_free_gib = os.environ.get("AGENT_VERIFY_MIN_FREE_GIB", "")
+        if minimum_free_gib:
+            if not re.fullmatch(r"[1-9][0-9]*", minimum_free_gib):
+                raise PipelineError(
+                    "AGENT_VERIFY_MIN_FREE_GIB must be a positive whole number of GiB"
+                )
+            _AGENT_VERIFICATION_ENVIRONMENT[
+                "AGENT_VERIFY_MIN_FREE_GIB"
+            ] = minimum_free_gib
+        # These verification inputs are deliberately excluded from the general
+        # child allowlist. Only the checked-in full Rust/PostgreSQL verification
+        # command receives them below; build, SBOM/scan, gcloud, Skopeo, and
+        # registry-promotion children never do. When no disk-floor override is
+        # supplied, agent-verify retains its checked-in 15-GiB default.
     if stage in {"preflight", "build", "push"}:
         docker_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_DOCKER_CONFIG", "")
         buildx_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_BUILDX_CONFIG", "")
@@ -851,8 +853,6 @@ def configured_environment_snapshot(
         profile,
         operator_config,
         source_ref=source_ref,
-        probe_config_path=ROOT / "config/archive-witness-probe.json",
-        shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
     )
     # Build/push identity must be separate from the identity embedded in the
     # image, which is only the enclave control-plane token subject.
@@ -1097,29 +1097,20 @@ def source_snapshot(commit: str, *, expected_archive_digest: str | None = None):
 
 
 def verify() -> None:
-    """Run every former CI test/format/lint/audit gate in the former order."""
-    contract_tests = (
-        "test_local_image_pipeline.py",
-        "test_adr0022_fresh_release.py",
-        "test_agent_verify.py",
-        "test_rust_build_lifecycle.py",
-        "test_bootstrap_local_operator_config.py",
-        "test_archive_witness_probe_config.py",
-        "test_archive_v3_shadow_runtime_config.py",
-        "test_select_build_configuration.py",
-        "test_verify_release_metadata.py",
-        "test_local_build_evidence.py",
-        "test_coordinator_advancement_receipt.py",
-        "test_release.py",
-        "test_repromote_signed_image.py",
-        "test_generate_capacity_fixture.py",
-        "test_run_archive_capacity_harness.py",
-        "test_run_archive_capacity_gate.py",
-        "test_verify_archive_v3_capacity_report.py",
+    """Run every checked-in local contract, Rust/PG gate, lint, and audit gate."""
+    # Discovery is deliberate: adding a test file cannot silently leave it out
+    # of the release gate. Each contract still runs in an isolated interpreter.
+    contract_tests = sorted((ROOT / "scripts").glob("test_*.py"))
+    if not contract_tests:
+        raise PipelineError("release verification found no Python contracts")
+    for path in contract_tests:
+        run([sys.executable, str(path)])
+    for path in sorted((ROOT / "scripts").glob("test_*.sh")):
+        run([str(path)])
+    run(
+        [str(ROOT / "scripts/agent-verify.sh"), "full"],
+        environment=_AGENT_VERIFICATION_ENVIRONMENT,
     )
-    for name in contract_tests:
-        run([sys.executable, str(ROOT / "scripts" / name)])
-    run([str(ROOT / "scripts/agent-verify.sh"), "full"])
     audit = cargo_audit_executable()
     audit_version = run([audit, "--version"], capture=True).stdout
     parse_exact_version(audit_version, "cargo-audit", CARGO_AUDIT_VERSION)
@@ -1198,7 +1189,11 @@ def signed_verification_receipt_valid(
 def release_tag(source_ref: str) -> str | None:
     if source_ref.startswith("refs/tags/"):
         source_ref = source_ref.removeprefix("refs/tags/")
-    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", source_ref):
+    if re.fullmatch(
+        r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\."
+        r"(?:0|[1-9][0-9]*)(?:[.-][0-9A-Za-z.-]+)?",
+        source_ref,
+    ):
         return source_ref
     return None
 
@@ -1248,9 +1243,7 @@ def runtime_config(configuration: dict[str, str], profile: str) -> dict[str, str
         "KMS_LOCATION": "ENCLAVE_KMS_LOCATION",
         "KMS_KEY_RING": "ENCLAVE_KMS_KEY_RING",
         "KMS_KEY": "ENCLAVE_KMS_KEY",
-        "GCS_BUCKET": "ENCLAVE_GCS_BUCKET",
         "GCS_MEDIA_BUCKET": "ENCLAVE_GCS_MEDIA_BUCKET",
-        "GCS_LEGACY_MEDIA_BUCKET": "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET",
         "RUN_SA_EMAIL": "ENCLAVE_RUN_SA_EMAIL",
         "ENCLAVE_AUDIENCE": "ENCLAVE_AUDIENCE",
         "ATTEST_STS_AUDIENCE": "ENCLAVE_ATTEST_STS_AUDIENCE",
@@ -1263,15 +1256,8 @@ def runtime_config(configuration: dict[str, str], profile: str) -> dict[str, str
         "WEB_ORIGIN",
         "BILLING_SERVICE_URL", "BILLING_SERVICE_AUDIENCE", "BILLING_ENFORCEMENT_MODE",
         "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_UID", "REVIEWER_AUTH_EMAIL", "VERTEX_PROJECT",
-        "VERTEX_LOCATION", "VERTEX_MODEL", "ENCLAVE_ACME", "ENCLAVE_ACME_DIRECTORY",
-        "ENCLAVE_ACME_CONTACT", "PERSISTENCE_BACKEND", "POSTGRES_SCHEMA_MODE",
+        "VERTEX_LOCATION", "VERTEX_MODEL",
         "POSTGRES_MAX_CONNECTIONS", "HEALTH_PORT", "DRAIN_TIMEOUT_SECONDS", "ENCLAVE_TLS",
-        "ARCHIVE_WITNESS_SHADOW_MODE", "ARCHIVE_WITNESS_PROJECT_ID",
-        "ARCHIVE_WITNESS_PROJECT_NUMBER", "ARCHIVE_WITNESS_DATABASE_ID", "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
-        "ARCHIVE_V3_ARCHIVE_BUCKET", "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
-        "ARCHIVE_V3_REGISTRY_KMS_VERSION", "ARCHIVE_V3_WITNESS_PROJECT_ID",
-        "ARCHIVE_V3_WITNESS_PROJECT_NUMBER", "ARCHIVE_V3_WITNESS_DATABASE_ID",
-        "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT", "GENESIS_WAL_NATIVE",
     ):
         mapping[name] = name
     values: dict[str, str] = {}
@@ -1820,9 +1806,8 @@ def create_release_evidence(
     voice_quality_gate = run(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
-    fresh_release = is_bootstrap_tag(tag) or is_final_tag(tag)
     metadata: dict[str, object] = {
-        "schema_version": 10 if fresh_release else 9,
+        "schema_version": 11,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -1833,37 +1818,24 @@ def create_release_evidence(
         "build_profile": "production",
         "voice_quality_gate": voice_quality_gate,
         "billing_enforcement_mode": configuration["BILLING_ENFORCEMENT_MODE"],
-        "gcs_bucket": configuration["ENCLAVE_GCS_BUCKET"],
         "gcs_media_bucket": configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
-        "gcs_legacy_media_bucket": configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
-        "archive_witness_shadow_mode": configuration["ARCHIVE_WITNESS_SHADOW_MODE"],
-        "archive_witness_project_id": configuration["ARCHIVE_WITNESS_PROJECT_ID"],
-        "archive_witness_project_number": configuration["ARCHIVE_WITNESS_PROJECT_NUMBER"],
-        "archive_witness_database_id": configuration["ARCHIVE_WITNESS_DATABASE_ID"],
-        "archive_v3_shadow_runtime_mode": configuration["ARCHIVE_V3_SHADOW_RUNTIME_MODE"],
-        "archive_v3_archive_bucket": configuration["ARCHIVE_V3_ARCHIVE_BUCKET"],
-        "archive_v3_archive_gcs_project_number": configuration["ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER"],
-        "archive_v3_registry_kms_version": configuration["ARCHIVE_V3_REGISTRY_KMS_VERSION"],
-        "archive_v3_witness_project_id": configuration["ARCHIVE_V3_WITNESS_PROJECT_ID"],
-        "archive_v3_witness_project_number": configuration["ARCHIVE_V3_WITNESS_PROJECT_NUMBER"],
-        "archive_v3_witness_database_id": configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"],
-        "archive_v3_archive_binding_commitment": configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"],
+        "kms_project": configuration["ENCLAVE_KMS_PROJECT"],
+        "kms_location": configuration["ENCLAVE_KMS_LOCATION"],
+        "kms_key_ring": configuration["ENCLAVE_KMS_KEY_RING"],
+        "kms_key": configuration["ENCLAVE_KMS_KEY"],
+        "persistence_authority": "postgres",
+        "postgres_schema_verification": "required",
+        "postgres_max_connections": configuration["POSTGRES_MAX_CONNECTIONS"],
+        "health_port": configuration["HEALTH_PORT"],
+        "drain_timeout_seconds": configuration["DRAIN_TIMEOUT_SECONDS"],
+        "tls_mode": "shared-secret-manager",
     }
-    if fresh_release:
-        try:
-            metadata.update(
-                fresh_release_binding_from_configuration(configuration, tag)
-            )
-        except FreshReleaseError as error:
-            raise PipelineError(str(error)) from error
     if metadata_path.exists():
         raise PipelineError("refusing to overwrite release metadata")
-    # Schema 10's producer order is part of the reviewed cross-repository
-    # contract. Schema 9 retains its historical canonical sorted encoding.
     encoded_metadata = (
         json.dumps(
             metadata,
-            sort_keys=not fresh_release,
+            sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
         )
@@ -1882,19 +1854,12 @@ def create_release_evidence(
         "--tag", tag,
         "--commit", source_commit,
         "--image-repository", image_uri.rsplit(":", 1)[0],
-        "--expected-gcs-bucket", configuration["ENCLAVE_GCS_BUCKET"],
         "--expected-gcs-media-bucket", configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
-        "--expected-gcs-legacy-media-bucket", configuration["ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"],
+        "--expected-kms-project", configuration["ENCLAVE_KMS_PROJECT"],
+        "--expected-kms-location", configuration["ENCLAVE_KMS_LOCATION"],
+        "--expected-kms-key-ring", configuration["ENCLAVE_KMS_KEY_RING"],
+        "--expected-kms-key", configuration["ENCLAVE_KMS_KEY"],
     ]
-    if fresh_release:
-        verify_command.extend(
-            [
-                "--expected-adr0022-canary-identity-preparation-sha256",
-                configuration[CANARY_CONFIG_KEY],
-                "--expected-adr0022-canary-admin-uuid",
-                configuration["ADMIN_USER_IDS"],
-            ]
-        )
     run(verify_command, capture=True)
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     gcloud_version_lines = [
@@ -2669,18 +2634,6 @@ def main() -> None:
             "source_archive": "immutable-git-archive",
         }
         if arguments.stage == "push":
-            if is_final_tag(arguments.source_ref):
-                try:
-                    require_next_tag(
-                        arguments.source_ref,
-                        cargo_version(ROOT),
-                        read_remote_refs("origin"),
-                        allow_existing=True,
-                    )
-                except ReleaseTagError as error:
-                    raise PipelineError(
-                        "Archive V3 image push is not the exact next published WAL release"
-                    ) from error
             push_inputs = {
                 "build_inputs": build_inputs,
                 "image_uri": image_uri,

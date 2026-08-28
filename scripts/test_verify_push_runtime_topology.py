@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic adversarial tests for the push rollout deployment-source seal."""
+"""Hermetic adversarial tests for the maintenance rollout source seal."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import unittest
 
 from verify_push_runtime_topology import (
     DeploymentSourceSeal,
+    REVIEWED_DEPLOYMENT,
     canonical_repository_path,
     canonical_source_digest,
     root_source_inventory,
@@ -20,14 +21,11 @@ from verify_push_runtime_topology import (
 
 
 VALID = """
-resource "google_compute_instance" "kioku_enclave" {
-  count = var.enable_enclave ? 1 : 0
-  name = "kioku-enclave"
-  network_interface {
-    network_ip = google_compute_address.enclave_internal.address
-    access_config { nat_ip = google_compute_address.enclave_public.address }
-  }
-  metadata = { tee-image-reference = var.enclave_image }
+resource "google_compute_region_instance_group_manager" "kioku_enclave" {
+  name               = "kioku-enclave"
+  base_instance_name = "kioku-enclave"
+  target_size        = 2
+  version { instance_template = google_compute_instance_template.enclave.id }
 }
 """
 
@@ -80,6 +78,31 @@ class PushRuntimeSourceSealTests(unittest.TestCase):
     def test_exact_clean_commit_inventory_and_digest_are_accepted(self) -> None:
         root, seal = self.fixture()
         self.assertEqual(verify(root, seal), seal.token())
+
+    def test_default_seal_is_compiled_reviewed_source_not_local_origin_main(self) -> None:
+        root, seal = self.fixture()
+        self.run_git(root, "update-ref", "refs/remotes/origin/main", seal.head)
+        with self.assertRaisesRegex(ValueError, "reviewed commit"):
+            verify(root)
+        self.assertEqual(
+            REVIEWED_DEPLOYMENT,
+            DeploymentSourceSeal(
+                head="0580e974fd6aa780f44f208e8f7ad6fd765d0fe4",
+                inventory=(
+                    "infra/backend.tf",
+                    "infra/billing.tf",
+                    "infra/cicd.tf",
+                    "infra/enclave.tf",
+                    "infra/main.tf",
+                    "infra/monitoring.tf",
+                    "infra/outputs.tf",
+                    "infra/secrets.tf",
+                    "infra/variables.tf",
+                    "infra/voice_evaluation.tf",
+                ),
+                digest="8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5",
+            ),
+        )
 
     def test_symlinked_leaf_and_ancestor_paths_are_refused_before_verification(
         self,
@@ -137,24 +160,24 @@ class PushRuntimeSourceSealTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bytes differ"):
             verify(root, seal)
 
-    def test_inline_comment_spoof_cannot_replace_reviewed_source(self) -> None:
+    def test_committed_source_mutation_cannot_replace_sealed_source(self) -> None:
         root, seal = self.fixture()
         spoof = VALID.replace(
-            "count = var.enable_enclave ? 1 : 0",
-            "count = 2 # count = var.enable_enclave ? 1 : 0",
+            "target_size        = 2",
+            "target_size        = 3",
         )
         (root / "infra" / "enclave.tf").write_text(spoof, encoding="utf-8")
-        self.commit(root, "inline comment spoof")
+        self.commit(root, "change fleet size")
         self.assert_refused(root, seal, "reviewed commit")
 
-    def test_instance_from_template_cannot_replace_reviewed_source(self) -> None:
+    def test_resource_kind_mutation_cannot_replace_sealed_source(self) -> None:
         root, seal = self.fixture()
         source = VALID.replace(
-            'resource "google_compute_instance" "kioku_enclave"',
-            'resource "google_compute_instance_from_template" "kioku_enclave"',
+            'resource "google_compute_region_instance_group_manager" "kioku_enclave"',
+            'resource "google_compute_instance_template" "kioku_enclave"',
         )
         (root / "infra" / "enclave.tf").write_text(source, encoding="utf-8")
-        self.commit(root, "instance from template")
+        self.commit(root, "change resource kind")
         self.assert_refused(root, seal, "reviewed commit")
 
     def test_module_path_outside_infra_cannot_extend_reviewed_source(self) -> None:
@@ -165,7 +188,7 @@ class PushRuntimeSourceSealTests(unittest.TestCase):
         )
         (root / "overlap").mkdir()
         (root / "overlap" / "main.tf").write_text(
-            'resource "google_compute_instance" "overlap" {}\n', encoding="utf-8"
+            'resource "google_compute_instance_template" "overlap" {}\n', encoding="utf-8"
         )
         self.commit(root, "outside module")
         self.assert_refused(root, seal, "reviewed commit")

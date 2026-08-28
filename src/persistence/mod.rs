@@ -1,20 +1,19 @@
 //! Backend-neutral application persistence boundaries.
 //!
 //! Product code depends on the typed ports exposed here, never on a database
-//! connection or SQL callback. The legacy adapter delegates to the existing
-//! SQLite/GCS stores or the PostgreSQL implementation selected once at startup.
+//! connection or SQL callback. PostgreSQL is the sole structured-state
+//! authority; GCS remains behind the media-object port for encrypted bytes.
 
 mod admission;
 mod billing;
 mod capture;
 mod delivery_outbox;
-mod disabled_legacy;
 mod entitlement;
+mod episode;
 mod episode_deletion;
 mod finalization;
 mod gcs_media;
 mod identity;
-mod legacy;
 mod lifecycle;
 mod media_object;
 mod media_processing;
@@ -32,7 +31,7 @@ use std::sync::Arc;
 
 pub(crate) use admission::{AdmissionRepository, FleetAdmissionLease};
 pub(crate) use billing::BillingRepository;
-pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics, VertexCoverageAnchor};
+pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics};
 pub(crate) use capture::{
     CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight, CaptureRepository,
     CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage,
@@ -43,8 +42,11 @@ pub(crate) use delivery_outbox::{
     FrozenPushDelivery, FrozenWebhookDelivery, PushDeliveryCandidate, PushDeliveryClaim,
     WebhookDeliveryCandidate, WebhookDeliveryClaim,
 };
-pub(crate) use disabled_legacy::DisabledLegacyGcs;
 pub(crate) use entitlement::{EntitlementRepository, VertexWorkClass};
+pub(crate) use episode::{
+    merge_minute_summaries, merge_substance, merge_visual_evidence, normalized_substance,
+    normalized_visual_evidence, EpisodeInput, EpisodePurge, MinuteBucket,
+};
 pub(crate) use episode_deletion::{
     EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart,
 };
@@ -71,7 +73,7 @@ pub(crate) use model_usage::{
     ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
 };
 pub(crate) use notification::NotificationRepository;
-pub use notification::{EpisodeEmailPreference, PushInstallation, WebhookSubscription};
+pub use notification::{PushInstallation, WebhookSubscription};
 pub(crate) use oauth::{
     AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
     OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
@@ -81,41 +83,32 @@ pub(crate) use playback::PlaybackRepository;
 pub(crate) use postgres::EXPECTED_SCHEMA_VERSION;
 pub(crate) use postgres::{PostgresPersistence, PostgresPoolConfig};
 pub(crate) use query::{
-    CaptureStatus, EpisodeListPage, EpisodeListRequest, McpContextRequest, McpTimeRangeRequest,
-    McpTranscriptSearchRequest, MemoryFeedPage, MemoryFeedRecord, MemoryFeedRequest,
-    MemoryQueryRepository, PeopleListPage, PeopleListRequest, PersonEvidencePage,
-    PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile, PersonStatementPage,
-    PersonStatementView, PersonSummary, ScreenshotMediaLocator,
+    extract_speaker_filter, rrf_merge, CaptureStatus, EpisodeListPage, EpisodeListRequest,
+    McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedPage,
+    MemoryFeedRecord, MemoryFeedRequest, MemoryQueryRepository, PeopleListPage, PeopleListRequest,
+    PersonEvidencePage, PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile,
+    PersonStatementPage, PersonStatementView, PersonSummary, ScreenshotMediaLocator, SearchHit,
+    SearchRequest,
 };
 pub(crate) use recording_retention::{
-    RecordingRetentionChangeRequest, RecordingRetentionRepository,
+    recording_retention_preview_fingerprint, recording_retention_request_fingerprint,
+    valid_retention_idempotency_key, RecordingKeyEpoch, RecordingRetentionChange,
+    RecordingRetentionChangeRequest, RecordingRetentionInventory, RecordingRetentionPolicy,
+    RecordingRetentionPreference, RecordingRetentionPreview, RecordingRetentionRepository,
+    RECORDING_RETENTION_CONSENT_VERSION,
 };
 pub(crate) use work::{
-    EmailControlCancellation, EmailFenceOutcome, EmailProviderOutcome, EmailSendFence,
-    EmailSendFenceDisposition, PushControlCancellation, PushFenceOutcome, PushProviderOutcome,
-    PushProviderReceipt, PushSendFence, PushSendFenceDisposition, WebhookControlCancellation,
-    WebhookFenceOutcome, WebhookProviderOutcome, WebhookSendFence, WebhookSendFenceDisposition,
-    WorkRepository,
+    EmailProviderOutcome, PushProviderOutcome, WebhookProviderOutcome, WorkRepository,
 };
-
-use self::legacy::{
-    LegacyAccountLifecycleRepository, LegacyBillingRepository, LegacyCaptureRepository,
-    LegacyEntitlementRepository, LegacyIdentitySessionRepository, LegacyMediaObjectStore,
-    LegacyMemoryQueryRepository, LegacyModelUsageRepository, LegacyNotificationRepository,
-    LegacyOAuthRepository, LegacyPlaybackRepository, LegacyRecordingRetentionRepository,
-    LegacyWorkRepository,
-};
-use crate::cp::control_store::ControlStore;
-use crate::store::Store;
 
 /// The persistence dependencies injected into application code.
 ///
-/// The complete set is selected once at startup; requests never fall back
-/// between authorities.
+/// The complete PostgreSQL-backed set is selected once at startup. Keeping
+/// these domain ports makes handlers and workers independently testable
+/// without exposing `sqlx` outside the adapter.
 #[derive(Clone)]
 pub(crate) struct RepositorySet {
-    legacy_state_authoritative: bool,
-    admission: Option<Arc<dyn AdmissionRepository>>,
+    admission: Arc<dyn AdmissionRepository>,
     identity_sessions: Arc<dyn IdentitySessionRepository>,
     lifecycle: Arc<dyn AccountLifecycleRepository>,
     billing: Arc<dyn BillingRepository>,
@@ -123,58 +116,26 @@ pub(crate) struct RepositorySet {
     oauth: Arc<dyn OAuthRepository>,
     playback: Arc<dyn PlaybackRepository>,
     entitlements: Arc<dyn EntitlementRepository>,
-    episode_deletions: Option<Arc<dyn EpisodeDeletionRepository>>,
-    deliveries: Option<Arc<dyn DeliveryRepository>>,
-    finalization: Option<Arc<dyn FinalizationRepository>>,
+    episode_deletions: Arc<dyn EpisodeDeletionRepository>,
+    deliveries: Arc<dyn DeliveryRepository>,
+    finalization: Arc<dyn FinalizationRepository>,
     notifications: Arc<dyn NotificationRepository>,
     recording_retention: Arc<dyn RecordingRetentionRepository>,
     memory_queries: Arc<dyn MemoryQueryRepository>,
     media_objects: Arc<dyn MediaObjectStore>,
-    media_processing: Option<Arc<dyn MediaProcessingRepository>>,
-    memory_formation: Option<Arc<dyn MemoryFormationRepository>>,
+    media_processing: Arc<dyn MediaProcessingRepository>,
+    memory_formation: Arc<dyn MemoryFormationRepository>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
 }
 
 impl RepositorySet {
-    pub(crate) fn legacy(control: Arc<ControlStore>, store: Arc<Store>) -> Self {
-        Self {
-            legacy_state_authoritative: true,
-            admission: None,
-            identity_sessions: Arc::new(LegacyIdentitySessionRepository::new(Arc::clone(&control))),
-            lifecycle: Arc::new(LegacyAccountLifecycleRepository::new(Arc::clone(&control))),
-            billing: Arc::new(LegacyBillingRepository::new(
-                Arc::clone(&control),
-                Arc::clone(&store),
-            )),
-            captures: Arc::new(LegacyCaptureRepository::new(Arc::clone(&store))),
-            oauth: Arc::new(LegacyOAuthRepository::new(Arc::clone(&control))),
-            playback: Arc::new(LegacyPlaybackRepository::new(Arc::clone(&store))),
-            entitlements: Arc::new(LegacyEntitlementRepository::new(Arc::clone(&control))),
-            episode_deletions: None,
-            deliveries: None,
-            finalization: None,
-            notifications: Arc::new(LegacyNotificationRepository::new(Arc::clone(&control))),
-            recording_retention: Arc::new(LegacyRecordingRetentionRepository::new(
-                Arc::clone(&control),
-                Arc::clone(&store),
-            )),
-            memory_queries: Arc::new(LegacyMemoryQueryRepository::new(Arc::clone(&store))),
-            media_objects: Arc::new(LegacyMediaObjectStore::new(Arc::clone(&store))),
-            media_processing: None,
-            memory_formation: None,
-            model_usage: Arc::new(LegacyModelUsageRepository::new(store)),
-            work: Arc::new(LegacyWorkRepository::new(control)),
-        }
-    }
-
     pub(crate) fn postgres(
         persistence: Arc<PostgresPersistence>,
         media_objects: Arc<dyn MediaObjectStore>,
     ) -> Self {
         Self {
-            legacy_state_authoritative: false,
-            admission: Some(Arc::clone(&persistence) as Arc<dyn AdmissionRepository>),
+            admission: Arc::clone(&persistence) as Arc<dyn AdmissionRepository>,
             identity_sessions: Arc::clone(&persistence) as Arc<dyn IdentitySessionRepository>,
             lifecycle: Arc::clone(&persistence) as Arc<dyn AccountLifecycleRepository>,
             billing: Arc::clone(&persistence) as Arc<dyn BillingRepository>,
@@ -182,15 +143,15 @@ impl RepositorySet {
             oauth: Arc::clone(&persistence) as Arc<dyn OAuthRepository>,
             playback: Arc::clone(&persistence) as Arc<dyn PlaybackRepository>,
             entitlements: Arc::clone(&persistence) as Arc<dyn EntitlementRepository>,
-            episode_deletions: Some(Arc::clone(&persistence) as Arc<dyn EpisodeDeletionRepository>),
-            deliveries: Some(Arc::clone(&persistence) as Arc<dyn DeliveryRepository>),
-            finalization: Some(Arc::clone(&persistence) as Arc<dyn FinalizationRepository>),
+            episode_deletions: Arc::clone(&persistence) as Arc<dyn EpisodeDeletionRepository>,
+            deliveries: Arc::clone(&persistence) as Arc<dyn DeliveryRepository>,
+            finalization: Arc::clone(&persistence) as Arc<dyn FinalizationRepository>,
             notifications: Arc::clone(&persistence) as Arc<dyn NotificationRepository>,
             recording_retention: Arc::clone(&persistence) as Arc<dyn RecordingRetentionRepository>,
             memory_queries: Arc::clone(&persistence) as Arc<dyn MemoryQueryRepository>,
             media_objects,
-            media_processing: Some(Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>),
-            memory_formation: Some(Arc::clone(&persistence) as Arc<dyn MemoryFormationRepository>),
+            media_processing: Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>,
+            memory_formation: Arc::clone(&persistence) as Arc<dyn MemoryFormationRepository>,
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
             work: persistence,
         }
@@ -200,16 +161,12 @@ impl RepositorySet {
         self.identity_sessions.as_ref()
     }
 
-    pub(crate) fn uses_legacy_state(&self) -> bool {
-        self.legacy_state_authoritative
+    pub(crate) fn admission(&self) -> &dyn AdmissionRepository {
+        self.admission.as_ref()
     }
 
-    pub(crate) fn admission(&self) -> Option<&dyn AdmissionRepository> {
-        self.admission.as_deref()
-    }
-
-    pub(crate) fn admission_arc(&self) -> Option<Arc<dyn AdmissionRepository>> {
-        self.admission.clone()
+    pub(crate) fn admission_arc(&self) -> Arc<dyn AdmissionRepository> {
+        Arc::clone(&self.admission)
     }
 
     pub(crate) fn lifecycle(&self) -> &dyn AccountLifecycleRepository {
@@ -236,16 +193,16 @@ impl RepositorySet {
         self.entitlements.as_ref()
     }
 
-    pub(crate) fn episode_deletions(&self) -> Option<&dyn EpisodeDeletionRepository> {
-        self.episode_deletions.as_deref()
+    pub(crate) fn episode_deletions(&self) -> &dyn EpisodeDeletionRepository {
+        self.episode_deletions.as_ref()
     }
 
-    pub(crate) fn deliveries(&self) -> Option<&dyn DeliveryRepository> {
-        self.deliveries.as_deref()
+    pub(crate) fn deliveries(&self) -> &dyn DeliveryRepository {
+        self.deliveries.as_ref()
     }
 
-    pub(crate) fn finalization(&self) -> Option<&dyn FinalizationRepository> {
-        self.finalization.as_deref()
+    pub(crate) fn finalization(&self) -> &dyn FinalizationRepository {
+        self.finalization.as_ref()
     }
 
     pub(crate) fn notifications(&self) -> &dyn NotificationRepository {
@@ -268,12 +225,12 @@ impl RepositorySet {
         Arc::clone(&self.media_objects)
     }
 
-    pub(crate) fn media_processing(&self) -> Option<&dyn MediaProcessingRepository> {
-        self.media_processing.as_deref()
+    pub(crate) fn media_processing(&self) -> &dyn MediaProcessingRepository {
+        self.media_processing.as_ref()
     }
 
-    pub(crate) fn memory_formation(&self) -> Option<&dyn MemoryFormationRepository> {
-        self.memory_formation.as_deref()
+    pub(crate) fn memory_formation(&self) -> &dyn MemoryFormationRepository {
+        self.memory_formation.as_ref()
     }
 
     pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {
@@ -282,84 +239,5 @@ impl RepositorySet {
 
     pub(crate) fn work(&self) -> &dyn WorkRepository {
         self.work.as_ref()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{AccountStatus, PushInstallation, RepositorySet, WebhookSubscription};
-    use crate::cp::control_store::{ControlStore, TEST_SIGNUP_LIMIT};
-    use crate::store::tests::{FakeGcs, FakeKms};
-
-    #[tokio::test]
-    async fn legacy_identity_port_preserves_signup_and_status_behavior() {
-        let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(FakeKms);
-        let gcs: Arc<dyn crate::store::GcsClient> = Arc::new(FakeGcs::new());
-        let control = Arc::new(ControlStore::new(Arc::clone(&kms), Arc::clone(&gcs)));
-        let store = Arc::new(crate::store::Store::new(kms, gcs));
-        let repositories = RepositorySet::legacy(control, store);
-
-        let account = repositories
-            .identity_sessions()
-            .upsert_subject_account(
-                "postgres-interface-subject",
-                "owner@example.com",
-                TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(account.email, "owner@example.com");
-        assert_eq!(
-            repositories
-                .identity_sessions()
-                .account_status(&account.id)
-                .await
-                .unwrap(),
-            Some(AccountStatus::Active)
-        );
-
-        let webhook = WebhookSubscription {
-            id: "11111111-1111-4111-8111-111111111111".into(),
-            user_id: account.id.clone(),
-            name: "Legacy contract".into(),
-            endpoint_url: "https://hooks.example/legacy".into(),
-            signing_secret: "secret".into(),
-            include_content: false,
-            enabled: true,
-            created_at: "2026-08-27T12:00:00.000Z".into(),
-        };
-        repositories
-            .notifications()
-            .create_webhook_subscription(webhook.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            repositories
-                .notifications()
-                .list_webhook_subscriptions(&account.id)
-                .await
-                .unwrap(),
-            vec![webhook]
-        );
-
-        let installation = PushInstallation {
-            id: "22222222-2222-4222-8222-222222222222".into(),
-            user_id: account.id.clone(),
-            platform: "ios".into(),
-            topic: "com.kioku.ios".into(),
-            environment: "sandbox".into(),
-            device_token: "a".repeat(64),
-            token_generation: 1,
-            enabled: true,
-        };
-        let installed = repositories
-            .notifications()
-            .upsert_push_installation(installation)
-            .await
-            .unwrap();
-        assert!(installed.token_generation > 0);
     }
 }

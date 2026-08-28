@@ -19,7 +19,7 @@ pub(crate) enum AccountStatus {
 }
 
 impl AccountStatus {
-    pub(super) fn from_legacy(value: &str) -> Self {
+    pub(super) fn from_database(value: &str) -> Self {
         match value {
             "active" => Self::Active,
             "deleting" => Self::Deleting,

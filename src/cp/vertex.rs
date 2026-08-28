@@ -12,7 +12,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::time::Instant;
-use tokio::sync::OwnedMutexGuard;
 
 use crate::error::{EnclaveError, Result};
 
@@ -25,32 +24,17 @@ pub(crate) const MAX_TEXT_OUTPUT_TOKENS: u32 = 8_192;
 pub(crate) const MAX_MEDIA_OUTPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 1_024;
 
-/// Serialize the complete user-specific Vertex lifecycle with account
-/// deletion. The active-account check deliberately happens after acquiring
-/// the fence, so a request queued behind deletion cannot recreate its index or
-/// send plaintext after the account has become inactive.
-async fn lock_active_user_lifecycle(
-    store: &crate::store::Store,
-    repositories: &crate::persistence::RepositorySet,
-    user_id: &str,
-) -> Result<Option<OwnedMutexGuard<()>>> {
-    let guard = if repositories.uses_legacy_state() {
-        Some(store.lock_user_lifecycle(user_id).await?)
-    } else {
-        None
-    };
-    if !super::limits::account_active(repositories, user_id).await? {
+async fn require_active_account(state: &CpState, user_id: &str) -> Result<()> {
+    if !super::limits::account_active(&state.repositories, user_id).await? {
         return Err(EnclaveError::Auth("account inactive".into()));
     }
-    Ok(guard)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VertexOperation {
     EpisodeSummary,
     EpisodeSummaryRepair,
-    SubstanceBackfill,
-    VisualEvidenceBackfill,
     FinalEpisodeAnalysis,
     AudioWindow,
     ScreenStoryboard,
@@ -59,10 +43,7 @@ pub enum VertexOperation {
 impl VertexOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::EpisodeSummary
-            | Self::EpisodeSummaryRepair
-            | Self::SubstanceBackfill
-            | Self::VisualEvidenceBackfill => "episode_summarization",
+            Self::EpisodeSummary | Self::EpisodeSummaryRepair => "episode_summarization",
             Self::FinalEpisodeAnalysis => "episode_finalization",
             Self::AudioWindow => "audio_understanding",
             Self::ScreenStoryboard => "screen_understanding",
@@ -114,11 +95,8 @@ pub(crate) struct VertexMetadata {
 
 pub struct TextGeneration {
     pub text: String,
-    #[allow(dead_code)] // retained for callers that need provider metadata
-    pub metadata: VertexMetadata,
-    /// The durable ADR-0022 F2 invocation identity ("vtx_…") this response
-    /// settled under; the finalization commit plan anchors on it.
-    #[allow(dead_code)]
+    /// Durable usage-ledger identity for the settled provider invocation. The
+    /// finalization commit plan anchors on this exact value.
     pub event_id: String,
 }
 
@@ -301,8 +279,7 @@ pub async fn generate_custom(
 ) -> Result<TextGeneration> {
     // Hold through the durable terminal usage write on every response/error
     // path. Account deletion waits here before it destroys the usage ledger.
-    let _lifecycle_guard =
-        lock_active_user_lifecycle(&state.store, &state.repositories, user_id).await?;
+    require_active_account(state, user_id).await?;
     let config = &state.config;
     let model = &config.vertex_model;
     if config.vertex_project.is_empty() {
@@ -333,10 +310,9 @@ pub async fn generate_custom(
         }
     });
 
-    // ADR-0022 F2: the caller anchor is a pure function of the assembled
-    // request, so a crash-retry of the same logical call derives the same
-    // invocation identity while a genuinely different request cannot adopt
-    // an old intent.
+    // The caller anchor is a pure function of the assembled request, so a
+    // crash-retry of the same logical call derives the same invocation identity
+    // while a genuinely different request cannot adopt an old intent.
     let caller_anchor: [u8; 32] = sha2::Sha256::digest(body.to_string().as_bytes()).into();
     let invocation =
         model_usage::begin_invocation(state, user_id, operation, model, &caller_anchor).await?;
@@ -401,7 +377,6 @@ pub async fn generate_custom(
     }
     Ok(TextGeneration {
         text,
-        metadata,
         event_id: invocation,
     })
 }
@@ -483,30 +458,11 @@ async fn send_media_request(
     body: Value,
     operation: VertexOperation,
     max_output_tokens: u32,
-    pinned_invocation: Option<String>,
 ) -> Result<MediaGeneration> {
-    // Both audio and storyboard calls share the same deletion fence as the
-    // text path; no user-specific Vertex egress bypasses this function.
-    let _lifecycle_guard =
-        lock_active_user_lifecycle(&state.store, &state.repositories, user_id).await?;
+    require_active_account(state, user_id).await?;
     let config = &state.config;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
-    }
-    // ADR-0022 slice 10e: a pinned invocation identity was already durably
-    // fixed by a sealed pre-provider attempt boundary (the screen-storyboard
-    // attempt plan records the exact `started` billing intent before any
-    // egress), so this path must not mint a second intent for the same paid
-    // call. The terminal usage settlements only route through the WAL lane
-    // for a selected user, so a pinned identity for an unselected user
-    // refuses here — before any provider traffic — instead of egressing
-    // without a durable billing intent.
-    if pinned_invocation.is_some()
-        && (!state.repositories.uses_legacy_state() || !state.store.is_wal_authoritative(user_id))
-    {
-        return Err(EnclaveError::Store(
-            "pinned media invocation requires a WAL-authoritative user".into(),
-        ));
     }
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(GENERATION_TIMEOUT_SECONDS))
@@ -517,19 +473,17 @@ async fn send_media_request(
         config.vertex_project, config.vertex_location, config.vertex_model
     );
     let caller_anchor: [u8; 32] = sha2::Sha256::digest(body.to_string().as_bytes()).into();
-    let invocation = match pinned_invocation {
-        Some(event_id) => event_id,
-        None => {
-            model_usage::begin_invocation(
-                state,
-                user_id,
-                operation,
-                &config.vertex_model,
-                &caller_anchor,
-            )
-            .await?
-        }
-    };
+    // The PostgreSQL intent is the provider-effect fence: account deletion
+    // refuses while this row remains started, and begin_invocation refuses an
+    // account that deletion has already closed.
+    let invocation = model_usage::begin_invocation(
+        state,
+        user_id,
+        operation,
+        &config.vertex_model,
+        &caller_anchor,
+    )
+    .await?;
     let started = Instant::now();
     let response = http.post(&url).bearer_auth(token).json(&body).send().await;
     let response = match response {
@@ -602,10 +556,6 @@ async fn send_media_request(
 /// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
 /// audio understanding API. The caller supplies a constrained JSON schema and
 /// validates the returned timestamps again before persistence.
-/// `pinned_invocation` carries an invocation identity a sealed ADR-0022
-/// pre-provider attempt boundary already durably fixed (its `started`
-/// billing intent is the durable intent); it is only accepted for a
-/// WAL-authoritative user and suppresses the F2 identity mint.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_media_custom(
     state: &CpState,
@@ -616,7 +566,6 @@ pub async fn generate_media_custom(
     media: &[u8],
     schema: Value,
     audio_timestamp: bool,
-    pinned_invocation: Option<String>,
 ) -> Result<MediaGeneration> {
     send_media_request(
         state,
@@ -624,17 +573,12 @@ pub async fn generate_media_custom(
         media_request_body(prompt, mime_type, media, schema, audio_timestamp),
         operation,
         MAX_MEDIA_OUTPUT_TOKENS,
-        pinned_invocation,
     )
     .await
 }
 
 /// Send a bounded storyboard with opaque frame identifiers. Callers must
 /// validate exact response coverage before projecting any result.
-/// `pinned_invocation` carries an invocation identity a sealed ADR-0022
-/// pre-provider attempt boundary already durably fixed (its `started`
-/// billing intent is the durable intent); it is only accepted for a
-/// WAL-authoritative user and suppresses the F2 identity mint.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_media_parts_custom(
     state: &CpState,
@@ -644,7 +588,6 @@ pub async fn generate_media_parts_custom(
     inputs: &[MediaInput<'_>],
     schema: Value,
     max_output_tokens: u32,
-    pinned_invocation: Option<String>,
 ) -> Result<MediaGeneration> {
     if inputs.is_empty() || inputs.len() > super::media_planner::MAX_SCREEN_FRAMES {
         return Err(EnclaveError::InvalidRequest(
@@ -662,7 +605,6 @@ pub async fn generate_media_parts_custom(
         media_parts_request_body(prompt, inputs, schema, false, max_output_tokens),
         operation,
         max_output_tokens,
-        pinned_invocation,
     )
     .await
 }
@@ -670,208 +612,6 @@ pub async fn generate_media_parts_custom(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn deletion_waits_for_paused_vertex_call_and_queued_call_never_egresses() {
-        use crate::store::tests::{FakeGcs, FakeKms};
-        use std::sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
-        };
-        use tokio::sync::Notify;
-
-        let kms = Arc::new(FakeKms);
-        let gcs = Arc::new(FakeGcs::new());
-        let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
-        let control = Arc::new(super::super::control_store::ControlStore::new(kms, gcs));
-        let user = control
-            .upsert_user(
-                "vertex-delete-fence",
-                "vertex@example.com",
-                crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .unwrap();
-
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let terminal_usage_persisted = Arc::new(AtomicBool::new(false));
-        let egresses = Arc::new(AtomicUsize::new(0));
-        let call_store = Arc::clone(&store);
-        let call_repositories =
-            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
-        let call_user = user.id.clone();
-        let call_started = Arc::clone(&started);
-        let call_release = Arc::clone(&release);
-        let call_terminal = Arc::clone(&terminal_usage_persisted);
-        let call_egresses = Arc::clone(&egresses);
-        let in_flight = tokio::spawn(async move {
-            let _guard =
-                lock_active_user_lifecycle(&call_store, &call_repositories, &call_user).await?;
-            call_egresses.fetch_add(1, Ordering::SeqCst);
-            call_started.notify_one();
-            call_release.notified().await;
-            // Models record_response/record_ambiguous completing before the
-            // central sender releases the lifecycle guard.
-            call_terminal.store(true, Ordering::SeqCst);
-            Ok::<_, EnclaveError>(())
-        });
-        started.notified().await;
-
-        control.begin_user_deletion(&user.id).await.unwrap();
-        let deleting_store = Arc::clone(&store);
-        let deleting_user = user.id.clone();
-        let deletion =
-            tokio::spawn(async move { deleting_store.delete_user(&deleting_user).await });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!deletion.is_finished());
-
-        let queued_store = Arc::clone(&store);
-        let queued_repositories =
-            crate::persistence::RepositorySet::legacy(Arc::clone(&control), Arc::clone(&store));
-        let queued_user = user.id.clone();
-        let queued_egresses = Arc::clone(&egresses);
-        let queued = tokio::spawn(async move {
-            let result =
-                lock_active_user_lifecycle(&queued_store, &queued_repositories, &queued_user).await;
-            if result.is_ok() {
-                queued_egresses.fetch_add(1, Ordering::SeqCst);
-            }
-            result.map(drop)
-        });
-
-        release.notify_one();
-        in_flight.await.unwrap().unwrap();
-        deletion.await.unwrap().unwrap();
-        assert!(matches!(queued.await.unwrap(), Err(EnclaveError::Auth(_))));
-        assert!(terminal_usage_persisted.load(Ordering::SeqCst));
-        assert_eq!(egresses.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn pinned_media_invocation_refuses_an_unselected_user_before_any_egress() {
-        use crate::store::tests::{FakeGcs, FakeKms};
-        use std::sync::Arc;
-
-        let kms = Arc::new(FakeKms);
-        let gcs = Arc::new(FakeGcs::new());
-        let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
-        let control = Arc::new(super::super::control_store::ControlStore::new(kms, gcs));
-        let user = control
-            .upsert_user(
-                "vertex-pinned-guard",
-                "pinned@example.com",
-                crate::cp::control_store::TEST_SIGNUP_LIMIT,
-            )
-            .await
-            .unwrap();
-        let state = CpState {
-            kms: Arc::clone(&store.kms),
-            durable_recording_storage_bound: store.durable_recording_storage_bound(),
-            store: Arc::clone(&store),
-            control: Arc::clone(&control),
-            repositories: crate::persistence::RepositorySet::legacy(control, store),
-            billing: Arc::new(super::super::billing::FakeBillingGateway),
-            recording_lease_gate: Arc::new(super::super::billing::RecordingLeaseGates::default()),
-            config: Arc::new(super::super::CpConfig {
-                base_url: "http://localhost:8080".into(),
-                jwt_secrets: vec!["test".into()],
-                google_desktop_client_id: "desktop".into(),
-                google_ios_client_id: "ios".into(),
-                google_web_client_id: "web".into(),
-                google_web_client_secret: "secret".into(),
-                admin_user_ids: vec![],
-                signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
-                scheduler_sa_email: None,
-                vertex_project: "project".into(),
-                vertex_location: "global".into(),
-                vertex_model: "gemini-3.5-flash".into(),
-                quota_utterances_per_day: 1,
-                quota_screenshots_per_day: 1,
-                quota_mcp_calls_per_day: 1,
-                quota_vertex_output_tokens_per_day: 1,
-                web_origin: "http://localhost:3000".into(),
-                reviewer_auth: None,
-                apple_sign_in: None,
-                billing_enforcement_mode: super::super::BillingEnforcementMode::Enforce,
-            }),
-            user_verifier: Arc::new(super::super::auth::UserIdTokenVerifier::new(vec![])),
-            reviewer_verifier: None,
-            apple_provider: None,
-            sync_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            reference_batch_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
-            mcp_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            oauth_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            test_email_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
-            email_transport: None,
-            push_transport: None,
-            embedding: None,
-            voice: None,
-        };
-
-        // A pinned identity claims a sealed attempt boundary already recorded
-        // the durable `started` billing intent. That is only true on the WAL
-        // lane, so an unselected user must refuse fail-closed BEFORE any
-        // provider traffic (this test has no network: reaching the token
-        // fetch would fail with a different error, not this exact refusal).
-        let frames = vec![MediaInput::new("frame-a", "image/jpeg", b"a")];
-        let error = match generate_media_parts_custom(
-            &state,
-            &user.id,
-            VertexOperation::ScreenStoryboard,
-            "inspect",
-            &frames,
-            json!({"type": "OBJECT"}),
-            MAX_SCREEN_OUTPUT_TOKENS,
-            Some(format!("vtx_{}", "a".repeat(64))),
-        )
-        .await
-        {
-            Ok(_) => panic!("pinned invocation for an unselected user unexpectedly succeeded"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(
-                error,
-                EnclaveError::Store(ref message)
-                    if message == "pinned media invocation requires a WAL-authoritative user"
-            ),
-            "expected the pinned-invocation refusal, got: {error:?}"
-        );
-
-        // ADR-0022 slice 11: the audio entrypoint shares the same fail-closed
-        // pinned-invocation gate (and therefore the same F2-mint suppression)
-        // before any provider traffic.
-        let error = match generate_media_custom(
-            &state,
-            &user.id,
-            VertexOperation::AudioWindow,
-            "transcribe",
-            "audio/wav",
-            b"a",
-            json!({"type": "OBJECT"}),
-            true,
-            Some(format!("vtx_{}", "a".repeat(64))),
-        )
-        .await
-        {
-            Ok(_) => {
-                panic!("pinned audio invocation for an unselected user unexpectedly succeeded")
-            }
-            Err(error) => error,
-        };
-        assert!(
-            matches!(
-                error,
-                EnclaveError::Store(ref message)
-                    if message == "pinned media invocation requires a WAL-authoritative user"
-            ),
-            "expected the pinned-invocation refusal, got: {error:?}"
-        );
-    }
 
     #[test]
     fn episode_schema_requires_recall_fields_and_visual_evidence() {

@@ -118,15 +118,6 @@ async fn refuse_active_media_uploads(
     Ok(())
 }
 
-fn deletion_status_for_reason(reason: &str) -> &'static str {
-    match reason {
-        "legacy_generation_unavailable"
-        | "legacy_snapshot_too_large"
-        | "archive_v3_manual_required" => "failed_retryable",
-        _ => "pending",
-    }
-}
-
 #[async_trait]
 impl AccountLifecycleRepository for PostgresPersistence {
     async fn account_deletion_operation(
@@ -257,7 +248,7 @@ impl AccountLifecycleRepository for PostgresPersistence {
                     updated_at=now() WHERE account_id=$1",
         )
         .bind(account_id)
-        .bind(deletion_status_for_reason(reason))
+        .bind("pending")
         .bind(reason)
         .bind(retry_after_seconds)
         .bind(hard_delete_millis)

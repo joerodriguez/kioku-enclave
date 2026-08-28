@@ -26,14 +26,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-from test_select_build_configuration import (  # noqa: E402
-    CANARY_ADMIN_UUID,
-    CANARY_IDENTITY_PREPARATION_SHA256,
-    environment,
-    fresh_bootstrap_environment,
-)
-import adr0022_fresh_release as fresh  # noqa: E402
-import verify_release_metadata  # noqa: E402
+from test_select_build_configuration import environment  # noqa: E402
 
 # The production verifier intentionally invokes this contract suite from a
 # live builder environment. Fixtures must never inherit those coordinates;
@@ -67,9 +60,7 @@ def load_pipeline():
     return module
 
 
-def write_config(
-    path: Path, *, mode: int = 0o600, genesis_wal_native: str = "off"
-) -> None:
+def write_config(path: Path, *, mode: int = 0o600) -> None:
     values = environment()
     values.pop("PATH", None)
     values.pop("GCP_WIF_PROVIDER", None)
@@ -77,7 +68,6 @@ def write_config(
     values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = (
         "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
     )
-    values["PRODUCTION_GENESIS_WAL_NATIVE"] = genesis_wal_native
     path.write_text(
         "\n".join(f"{name}={value}" for name, value in sorted(values.items())) + "\n",
         encoding="utf-8",
@@ -297,7 +287,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 directory = Path(temporary_directory)
                 config = directory / "operator.env"
                 output = directory / "evidence"
-                write_config(config, genesis_wal_native="off")
+                write_config(config)
                 sys.argv = [
                     str(SCRIPTS / "local_image_pipeline.py"),
                     "push",
@@ -306,7 +296,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "--output-dir",
                     str(output),
                     "--source-ref",
-                    "refs/tags/v1.2.3-archive-v3-wal.1",
+                    "refs/tags/v1.2.3",
                     "--apply",
                     "--allow-emulated-fallback",
                     "--confirm-emulated-release",
@@ -349,7 +339,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertFalse(any(argument.startswith("SOURCE_DATE_EPOCH=") for argument in build))
         self.assertIn("--secret", build)
         self.assertIn("id=kioku-config,src=", " ".join(build))
-        self.assertNotIn("GCS_LEGACY_MEDIA_BUCKET=", " ".join(build))
+        self.assertFalse(any("GCS_" in argument for argument in build))
         scan_index = next(index for index, command in enumerate(calls) if command and command[0] == "grype" and "sbom:" in command[1])
         auth_index = next(index for index, command in enumerate(calls) if command[:3] == ["gcloud", "--impersonate-service-account=local-builder@kioku-joerodriguez.iam.gserviceaccount.com", "auth"])
         login_index = next(index for index, command in enumerate(calls) if command[:1] == ["temporary-docker-login"])
@@ -495,121 +485,11 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn('"schema_version": 10 if fresh_release else 9', source)
+        self.assertIn('"schema_version": 11', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
         self.assertLess(source.index("verify_source_unchanged(arguments.source_ref, commit)"), source.index('if arguments.stage == "push":'))
-
-    def test_fresh_final_emits_exact_ordered_schema_ten_metadata(self) -> None:
-        pipeline = load_pipeline()
-        final_environment = fresh_bootstrap_environment()
-        final_environment["PRODUCTION_GENESIS_WAL_NATIVE"] = "on"
-        configuration = pipeline.selected_configuration(
-            "production",
-            final_environment,
-            source_ref=fresh.CURRENT_TAG,
-            probe_config_path=ROOT / "config/archive-witness-probe.json",
-            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
-        )
-        fixture_canary_sha256 = "c" * 64
-        fixture_canary_uuid = "12345678-1234-5678-9234-567812345678"
-        configuration[fresh.CANARY_CONFIG_KEY] = fixture_canary_sha256
-        configuration["ADMIN_USER_IDS"] = fixture_canary_uuid
-        runtime = pipeline.runtime_config(configuration, "production")
-        self.assertNotIn(fresh.CANARY_CONFIG_KEY, runtime)
-        self.assertEqual(runtime["ADMIN_USER_IDS"], fixture_canary_uuid)
-
-        def fake_run(command, *, capture=False, environment=None, pass_fds=()):
-            del capture, environment, pass_fds
-            git_command = command[2:] if command[:2] == ["git", "--no-replace-objects"] else []
-            if git_command[:2] == ["replace", "-l"]:
-                return SimpleNamespace(stdout="")
-            if git_command[:4] == ["rev-parse", "--path-format=absolute", "--git-path", "info/grafts"]:
-                return SimpleNamespace(stdout="/tmp/kioku-test-no-grafts\n")
-            if git_command[:3] == ["remote", "get-url", "origin"]:
-                return SimpleNamespace(
-                    stdout="https://github.com/joerodriguez/kioku-enclave.git\n"
-                )
-            if command[:2] == [
-                sys.executable,
-                str(SCRIPTS / "check_voice_release_gate.py"),
-            ]:
-                return SimpleNamespace(stdout="owner_only_unvalidated\n")
-            if command[:2] == [
-                sys.executable,
-                str(SCRIPTS / "verify_release_metadata.py"),
-            ]:
-                completed = subprocess.run(
-                    command, cwd=ROOT, text=True, capture_output=True, check=False
-                )
-                if completed.returncode:
-                    raise pipeline.PipelineError(completed.stderr)
-                return SimpleNamespace(stdout=completed.stdout)
-            if command[:2] == ["gcloud", "version"]:
-                return SimpleNamespace(stdout="Google Cloud SDK 580.0.0\n")
-            if command[:2] == ["docker", "buildx"]:
-                return SimpleNamespace(stdout="github.com/docker/buildx v0.36.1\n")
-            if command[0] in ("syft", "grype"):
-                return SimpleNamespace(stdout=f"{command[0]} 1.0\n")
-            if command[:2] == [
-                sys.executable,
-                str(SCRIPTS / "local_build_evidence.py"),
-            ]:
-                return SimpleNamespace(stdout="")
-            raise AssertionError(command)
-
-        original_run = pipeline.run
-        original_cloud_config = pipeline._CLOUDSDK_CONFIG
-        pipeline.run = fake_run
-        pipeline._CLOUDSDK_CONFIG = "/private/provider-free-test"
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                directory = Path(temporary)
-                config = directory / "operator.env"
-                config.write_text("fixture\n", encoding="utf-8")
-                pipeline.create_release_evidence(
-                    directory,
-                    config_path=config,
-                    configuration=configuration,
-                    config_sha256="d" * 64,
-                    source_archive_sha256="e" * 64,
-                    source_ref=fresh.CURRENT_TAG,
-                    source_commit="f" * 40,
-                    image_uri=f"{fresh.IMAGE_REPOSITORY}:{fresh.CURRENT_TAG}",
-                    image_digest="sha256:" + "1" * 64,
-                    created_at="2026-08-24T12:00:00Z",
-                    expected_sbom_sha256="2" * 64,
-                    expected_scan_sha256="3" * 64,
-                )
-                raw = (directory / "enclave-release.json").read_bytes()
-                metadata = verify_release_metadata.parse_metadata_bytes(raw)
-        finally:
-            pipeline.run = original_run
-            pipeline._CLOUDSDK_CONFIG = original_cloud_config
-
-        self.assertEqual(
-            raw,
-            (json.dumps(metadata, separators=(",", ":")) + "\n").encode(),
-        )
-        self.assertEqual(len(metadata), 50)
-        self.assertEqual(tuple(metadata), verify_release_metadata.SCHEMA_TEN_FIELDS)
-        self.assertEqual(metadata["schema_version"], 10)
-        self.assertEqual(metadata["source_ref"], fresh.CURRENT_TAG)
-        self.assertEqual(metadata["schema_epoch_head"], 2)
-        self.assertEqual(metadata["schema_epoch_target"], 1)
-        self.assertEqual(metadata["schema_epoch_minimum_servable"], 1)
-        self.assertEqual(metadata["production_genesis_wal_native"], "on")
-        self.assertEqual(
-            metadata["archive_v3_archive_binding_commitment"],
-            "",
-        )
-        self.assertEqual(metadata["signup_mode"], "positive")
-        self.assertEqual(
-            metadata["adr0022_canary_identity_preparation_sha256"],
-            fixture_canary_sha256,
-        )
-        self.assertEqual(metadata["adr0022_canary_admin_uuid"], fixture_canary_uuid)
 
     def test_runtime_config_is_allowlisted_and_docker_uses_ephemeral_secret(self) -> None:
         pipeline = load_pipeline()
@@ -618,12 +498,14 @@ class LocalImagePipelineTests(unittest.TestCase):
             "production",
             values,
             source_ref="main",
-            probe_config_path=ROOT / "config/archive-witness-probe.json",
-            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
         )
         runtime = pipeline.runtime_config(configuration, "production")
         self.assertEqual(runtime["KMS_PROJECT"], values["PRODUCTION_ENCLAVE_KMS_PROJECT"])
-        self.assertEqual(runtime["GCS_BUCKET"], values["PRODUCTION_ENCLAVE_GCS_BUCKET"])
+        self.assertEqual(
+            runtime["GCS_MEDIA_BUCKET"],
+            values["PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET"],
+        )
+        self.assertNotIn("POSTGRES_SCHEMA_MODE", runtime)
         self.assertNotIn("PROJECT_ID", runtime)
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("RUN --mount=type=secret,id=kioku-config,required", dockerfile)
@@ -651,83 +533,13 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(assembler_keys, rust_keys)
         self.assertEqual(len(assembler_keys), len(set(assembler_keys)))
         self.assertIn("for required in $allowed_keys; do", assembler_source)
-        # The ADR-0022 cutover gate is one of the baked keys, so it is covered
-        # by the attested digest and the assembler requires it like any other.
-        self.assertIn("GENESIS_WAL_NATIVE", rust_keys)
-        self.assertIn("GENESIS_WAL_NATIVE", assembler_keys)
-
-    def test_genesis_gate_is_baked_from_the_profile_and_never_from_the_environment(
-        self,
-    ) -> None:
-        pipeline = load_pipeline()
-        values = environment()
-        values.pop("PATH", None)
-        # An operator (or an attacker with the build shell) exporting the bare
-        # name must not reach the image: the selector only ever reads the
-        # profile-prefixed operator value, and the baked bytes are built from
-        # the selector result alone.
-        values["GENESIS_WAL_NATIVE"] = "on"
-        configuration = pipeline.selected_configuration(
-            "production",
-            values,
-            source_ref="main",
-            probe_config_path=ROOT / "config/archive-witness-probe.json",
-            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
-        )
-        self.assertEqual(configuration["GENESIS_WAL_NATIVE"], "off")
-        runtime = pipeline.runtime_config(configuration, "production")
-        self.assertIn("GENESIS_WAL_NATIVE", runtime)
-        self.assertEqual(runtime["GENESIS_WAL_NATIVE"], "off")
-        encoded = pipeline.runtime_config_bytes(configuration, "production")
-        self.assertIn(b"GENESIS_WAL_NATIVE=off\n", encoded)
-        self.assertNotIn(b"GENESIS_WAL_NATIVE=on\n", encoded)
-
-        def assemble(payload: bytes, name: str) -> subprocess.CompletedProcess[str]:
-            source = directory / f"{name}.env"
-            source.write_bytes(payload)
-            source.chmod(0o600)
-            return subprocess.run(
-                [
-                    str(SCRIPTS / "assemble_image_config.sh"),
-                    str(source),
-                    str(directory / f"{name}.out"),
-                    hashlib.sha256(payload).hexdigest(),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            accepted = assemble(encoded, "baked")
-            self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertIn(
-                b"GENESIS_WAL_NATIVE=off\n", (directory / "baked.out").read_bytes()
-            )
-
-            # Dropping the key entirely is refused at the image boundary, so a
-            # binary can never fall back to the process environment for it.
-            dropped = b"".join(
-                line
-                for line in encoded.splitlines(keepends=True)
-                if not line.startswith(b"GENESIS_WAL_NATIVE=")
-            )
-            self.assertNotEqual(assemble(dropped, "dropped").returncode, 0)
-            self.assertFalse((directory / "dropped.out").exists())
-
-            # A hand-authored secret cannot arm the gate on an image whose
-            # archive-v3 runtime is off, and cannot smuggle an empty or
-            # unknown value past the boundary either.
-            for label, replacement in (
-                ("armed", b"GENESIS_WAL_NATIVE=on\n"),
-                ("empty", b"GENESIS_WAL_NATIVE=\n"),
-                ("truthy", b"GENESIS_WAL_NATIVE=1\n"),
-            ):
-                with self.subTest(value=label):
-                    mutated = encoded.replace(b"GENESIS_WAL_NATIVE=off\n", replacement)
-                    self.assertNotEqual(assemble(mutated, label).returncode, 0)
-                    self.assertFalse((directory / f"{label}.out").exists())
+        for obsolete in (
+            "PERSISTENCE_BACKEND",
+            "POSTGRES_SCHEMA_MODE",
+            "GCS_BUCKET",
+            "GCS_LEGACY_MEDIA_BUCKET",
+        ):
+            self.assertNotIn(obsolete, assembler_keys)
 
     def test_baked_configuration_load_precedes_tokio_and_no_runtime_env_mutation(self) -> None:
         source = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
@@ -1281,8 +1093,6 @@ class LocalImagePipelineTests(unittest.TestCase):
             "production",
             values,
             source_ref="main",
-            probe_config_path=ROOT / "config/archive-witness-probe.json",
-            shadow_runtime_config_path=ROOT / "config/archive-v3-shadow-runtime.json",
         )
         encoded = pipeline.runtime_config_bytes(configuration, "production")
         expected = __import__("hashlib").sha256(encoded).hexdigest()
@@ -1302,9 +1112,8 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), encoded)
             self.assertEqual(__import__("stat").S_IMODE(output.stat().st_mode), 0o600)
 
-            # Zero is an intentional, hash-bound production value for the
-            # ADR-0022 closed-signup cutover image, not an omitted budget or
-            # an unlimited sentinel.
+            # Zero is an intentional, hash-bound closed-signup value, not an
+            # omitted budget or an unlimited sentinel.
             closed = encoded.replace(
                 b"SIGNUP_LIMIT_PER_DAY=25\n",
                 b"SIGNUP_LIMIT_PER_DAY=0\n",
@@ -1539,6 +1348,126 @@ class LocalImagePipelineTests(unittest.TestCase):
                 self.assertEqual(pipeline._CHILD_ENVIRONMENT["GIT_NO_REPLACE_OBJECTS"], "1")
                 self.assertNotIn("UNREVIEWED_SETTING", pipeline._CHILD_ENVIRONMENT)
                 self.assertNotIn("GH_TOKEN", pipeline._CHILD_ENVIRONMENT)
+
+    def test_verification_inputs_reach_only_full_postgres_verification(self) -> None:
+        pipeline = load_pipeline()
+        postgres_url = "postgresql://contract:test@127.0.0.1:5432/contract"
+        minimum_free_gib = "1"
+        recorded: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_subprocess_run(command, **kwargs):
+            child = dict(kwargs.get("env") or {})
+            recorded.append((list(command), child))
+            stdout = (
+                "cargo-audit-audit 0.22.2\n"
+                if command and command[0] == "/reviewed/cargo-audit"
+                and command[1:] == ["--version"]
+                else ""
+            )
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+        with patch.dict(
+            pipeline.os.environ,
+            {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": os.environ.get("HOME", ""),
+                "KIOKU_TEST_POSTGRES_URL": postgres_url,
+                "AGENT_VERIFY_MIN_FREE_GIB": minimum_free_gib,
+            },
+            clear=True,
+        ):
+            pipeline.configure_direct_child_environment("verify")
+            self.assertNotIn("KIOKU_TEST_POSTGRES_URL", pipeline._CHILD_ENVIRONMENT)
+            self.assertNotIn("AGENT_VERIFY_MIN_FREE_GIB", pipeline._CHILD_ENVIRONMENT)
+            with patch.object(
+                pipeline.shutil, "which", return_value="/reviewed/cargo-audit"
+            ), patch.object(pipeline.subprocess, "run", side_effect=fake_subprocess_run):
+                pipeline.verify()
+
+        full_command = [str(SCRIPTS / "agent-verify.sh"), "full"]
+        full_environments = [
+            child for command, child in recorded if command == full_command
+        ]
+        self.assertEqual(len(full_environments), 1)
+        self.assertEqual(
+            full_environments[0].get("KIOKU_TEST_POSTGRES_URL"), postgres_url
+        )
+        self.assertEqual(
+            full_environments[0].get("AGENT_VERIFY_MIN_FREE_GIB"), minimum_free_gib
+        )
+        self.assertTrue(
+            all(
+                "KIOKU_TEST_POSTGRES_URL" not in child
+                and "AGENT_VERIFY_MIN_FREE_GIB" not in child
+                for command, child in recorded
+                if command != full_command
+            )
+        )
+
+    def test_verification_inputs_never_reach_build_scan_or_cloud_children(self) -> None:
+        pipeline = load_pipeline()
+        postgres_url = "postgresql://contract:test@127.0.0.1:5432/contract"
+        recorded: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_subprocess_run(command, **kwargs):
+            recorded.append((list(command), dict(kwargs.get("env") or {})))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        pipeline._CHILD_ENVIRONMENT = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+        pipeline._CLOUDSDK_CONFIG = "/private/reviewed-gcloud"
+        pipeline._AGENT_VERIFICATION_ENVIRONMENT = {
+            "KIOKU_TEST_POSTGRES_URL": postgres_url,
+            "AGENT_VERIFY_MIN_FREE_GIB": "1",
+        }
+        commands = (
+            ["docker", "buildx", "build", "--help"],
+            ["syft", "--version"],
+            ["grype", "--version"],
+            ["skopeo", "--version"],
+        )
+        with patch.object(pipeline.subprocess, "run", side_effect=fake_subprocess_run):
+            for command in commands:
+                pipeline.run(command)
+            pipeline.run(
+                ["gcloud", "version"],
+                environment=pipeline.cloud_child_environment(),
+            )
+
+        self.assertEqual(len(recorded), len(commands) + 1)
+        self.assertTrue(
+            all(
+                "KIOKU_TEST_POSTGRES_URL" not in child
+                and "AGENT_VERIFY_MIN_FREE_GIB" not in child
+                for _, child in recorded
+            )
+        )
+
+    def test_verification_disk_floor_override_is_optional_and_fail_closed(self) -> None:
+        pipeline = load_pipeline()
+        base_environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+        }
+        with patch.dict(pipeline.os.environ, base_environment, clear=True):
+            pipeline.configure_direct_child_environment("verify")
+        self.assertNotIn(
+            "AGENT_VERIFY_MIN_FREE_GIB", pipeline._AGENT_VERIFICATION_ENVIRONMENT
+        )
+
+        for invalid_value in ("0", "-1", "1.5", " 1", "one"):
+            with self.subTest(invalid_value=invalid_value), patch.dict(
+                pipeline.os.environ,
+                base_environment | {"AGENT_VERIFY_MIN_FREE_GIB": invalid_value},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    pipeline.PipelineError, "positive whole number"
+                ):
+                    pipeline.configure_direct_child_environment("verify")
 
     def test_direct_child_environment_rejects_ambient_git_object_overrides(self) -> None:
         pipeline = load_pipeline()

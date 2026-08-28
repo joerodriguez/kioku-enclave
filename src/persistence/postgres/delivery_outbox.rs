@@ -513,6 +513,7 @@ impl DeliveryRepository for PostgresPersistence {
         .await?;
         let changed = sqlx::query(
             "UPDATE email_deliveries SET state='processing',attempt_count=$1,claim_token=$2, \
+                    completed_claim_token=NULL, \
                     claim_until=to_timestamp($3::double precision/1000.0), \
                     frozen_recipient_email=$4,frozen_include_content=$5,frozen_subject=$6, \
                     frozen_text_body=$7,frozen_html_body=$8,send_started_at=clock_timestamp(), \
@@ -884,6 +885,7 @@ impl DeliveryRepository for PostgresPersistence {
         .await?;
         let changed = sqlx::query(
             "UPDATE webhook_deliveries SET state='processing',attempt_count=$1,claim_token=$2, \
+                    completed_claim_token=NULL, \
                     claim_until=to_timestamp($3::double precision/1000.0),frozen_endpoint_url=$4, \
                     frozen_signing_secret=$5,frozen_include_content=$6,frozen_event_body=$7, \
                     send_started_at=clock_timestamp(),last_error=NULL,error_code=NULL,updated_at=now() \
@@ -1237,6 +1239,7 @@ impl DeliveryRepository for PostgresPersistence {
         .await?;
         let changed = sqlx::query(
             "UPDATE push_deliveries SET state='processing',attempt_count=$1,claim_token=$2, \
+                    completed_claim_token=NULL, \
                     claim_until=to_timestamp($3::double precision/1000.0),frozen_topic=$4, \
                     frozen_environment=$5,frozen_device_token=$6,frozen_token_generation=$7, \
                     send_started_at=clock_timestamp(),last_error=NULL,error_code=NULL,updated_at=now() \

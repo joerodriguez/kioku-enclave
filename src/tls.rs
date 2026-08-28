@@ -6,19 +6,18 @@
 //!
 //! ## What this module does
 //!
-//! - Serves the in-TEE key and certificate supplied by the ACME renewal path.
-//!   A minimal PEM parser also supports static debug/custom bootstrap input.
+//! - Serves the reviewed shared certificate and in-TEE key loaded from Secret
+//!   Manager. A minimal PEM parser also supports static debug input.
 //! - Builds a rustls [`ServerConfig`] using the ring provider (pure-Rust-friendly, no
 //!   OpenSSL — required for the musl FROM-scratch image).
 //! - Computes the leaf certificate's **SHA-256 fingerprint**. The public
 //!   attestation endpoint binds it into the token nonce so a verifier can compare
 //!   the live TLS leaf to the attested image (RA-TLS-style channel binding).
 //!
-//! ## ACME renewal (ADR-0003)
+//! ## Fleet certificate rotation
 //!
-//! Singleton legacy deployments can use [`crate::acme`] to obtain and renew a
-//! certificate in-enclave. Fleet deployments load one reviewed shared
-//! certificate generation from Secret Manager and roll to a renewed version;
+//! Fleet deployments load one reviewed shared certificate generation from
+//! Secret Manager and roll to a renewed version;
 //! every backend must present the same public identity behind the passthrough
 //! load balancer.
 //!
@@ -26,23 +25,20 @@
 //! audience, nonce, and expected image digest, then comparing the nonce with the
 //! certificate fingerprint observed on their TLS connection.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::{
     crypto::ring,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    server::{ClientHello, ResolvesServerCert},
-    sign::CertifiedKey,
     ServerConfig,
 };
 use tracing::info;
 
 use crate::error::{EnclaveError as Error, Result};
 
-/// A parsed certificate chain (leaf first) + private key, the unit the keystone
-/// serves and the ACME renewal path swaps in (ADR-0003).
+/// A parsed certificate chain (leaf first) plus its private key.
 pub struct CertKeyPair {
     chain_der: Vec<Vec<u8>>,
     key: PrivateKeyDer<'static>,
@@ -71,57 +67,28 @@ impl CertKeyPair {
         hex_lower(&Sha256::digest(&self.chain_der[0]))
     }
 
-    /// Build the rustls [`CertifiedKey`] (validates the key is usable by ring).
-    fn into_certified_key(self) -> Result<CertifiedKey> {
-        let signing_key = ring::sign::any_supported_type(&self.key)
-            .map_err(|e| Error::Config(format!("unsupported TLS private key: {e}")))?;
+    fn into_rustls_parts(self) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let certs: Vec<CertificateDer<'static>> = self
             .chain_der
             .into_iter()
             .map(CertificateDer::from)
             .collect();
-        Ok(CertifiedKey::new(certs, signing_key))
-    }
-}
-
-/// Cert resolver whose [`CertifiedKey`] can be replaced at runtime, so an ACME
-/// renewal swaps the served certificate without dropping connections or
-/// restarting the accept loop. Handshakes read the current key atomically.
-#[derive(Debug)]
-struct ActiveCertificate {
-    certified_key: Arc<CertifiedKey>,
-    fingerprint_hex: String,
-}
-
-#[derive(Debug)]
-struct SwappableCertResolver(RwLock<ActiveCertificate>);
-
-impl ResolvesServerCert for SwappableCertResolver {
-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(
-            self.0
-                .read()
-                .expect("cert resolver lock poisoned")
-                .certified_key
-                .clone(),
-        )
+        (certs, self.key)
     }
 }
 
 /// A built TLS server config plus the leaf cert fingerprint used for attestation binding.
 pub struct TlsKeystone {
     pub server_config: Arc<ServerConfig>,
-    resolver: Arc<SwappableCertResolver>,
+    fingerprint_hex: String,
 }
 
 impl TlsKeystone {
-    /// Build a keystone serving `pair`, with a resolver that supports live swaps.
+    /// Build an immutable keystone serving the shared certificate generation.
+    /// Certificate rotation is a reviewed fleet rollout.
     pub fn new(pair: CertKeyPair) -> Result<Self> {
         let fingerprint = pair.fingerprint_hex();
-        let resolver = Arc::new(SwappableCertResolver(RwLock::new(ActiveCertificate {
-            certified_key: Arc::new(pair.into_certified_key()?),
-            fingerprint_hex: fingerprint,
-        })));
+        let (certs, key) = pair.into_rustls_parts();
 
         // Explicit ring provider so we never depend on a process-default being installed,
         // and never link aws-lc / OpenSSL (musl FROM-scratch must stay pure-Rust-friendly).
@@ -129,40 +96,18 @@ impl TlsKeystone {
             .with_safe_default_protocol_versions()
             .map_err(|e| Error::Config(format!("rustls provider/protocol setup failed: {e}")))?
             .with_no_client_auth()
-            .with_cert_resolver(resolver.clone());
+            .with_single_cert(certs, key)
+            .map_err(|e| Error::Config(format!("unsupported TLS certificate or key: {e}")))?;
 
         Ok(TlsKeystone {
             server_config: Arc::new(server_config),
-            resolver,
+            fingerprint_hex: fingerprint,
         })
     }
 
-    /// Lowercase hex SHA-256 of the certificate currently served to new TLS
-    /// connections. This value changes atomically with the live certificate.
+    /// Lowercase hex SHA-256 of the certificate served by this process.
     pub fn fingerprint_hex(&self) -> String {
-        self.resolver
-            .0
-            .read()
-            .expect("cert resolver lock poisoned")
-            .fingerprint_hex
-            .clone()
-    }
-
-    /// Replace the served certificate (ACME renewal). In-flight and future
-    /// handshakes atomically pick up the new chain. Returns the new leaf
-    /// fingerprint (logged by the caller — never key material).
-    pub fn swap(&self, pair: CertKeyPair) -> Result<String> {
-        let fingerprint = pair.fingerprint_hex();
-        let certified = Arc::new(pair.into_certified_key()?);
-        *self
-            .resolver
-            .0
-            .write()
-            .expect("cert resolver lock poisoned") = ActiveCertificate {
-            certified_key: certified,
-            fingerprint_hex: fingerprint.clone(),
-        };
-        Ok(fingerprint)
+        self.fingerprint_hex.clone()
     }
 }
 
@@ -376,44 +321,5 @@ mod tests {
     fn disabled_by_default() {
         // ENCLAVE_TLS unset in the test environment → no keystone.
         assert!(!is_enabled());
-    }
-
-    /// A swap must atomically change what the resolver serves (the ACME renewal path).
-    #[test]
-    fn swap_replaces_served_cert() {
-        let initial_pair = generated_pair("initial.example");
-        let initial_fp = initial_pair.fingerprint_hex();
-        let ks = TlsKeystone::new(initial_pair).unwrap();
-        assert_eq!(ks.fingerprint_hex(), initial_fp);
-
-        // Fresh self-signed cert generated with rcgen (same crate the ACME path
-        // uses in-enclave via instant-acme).
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["renewed.example".into()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        let pair =
-            CertKeyPair::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap();
-        let new_fp = pair.fingerprint_hex();
-        assert_ne!(new_fp, initial_fp);
-
-        let swapped_fp = ks.swap(pair).unwrap();
-        assert_eq!(swapped_fp, new_fp);
-        assert_eq!(ks.fingerprint_hex(), new_fp);
-
-        // The resolver now hands out the new leaf.
-        let served = ks
-            .resolver
-            .0
-            .read()
-            .unwrap()
-            .certified_key
-            .cert
-            .first()
-            .unwrap()
-            .as_ref()
-            .to_vec();
-        assert_eq!(hex_lower(&Sha256::digest(&served)), new_fp);
     }
 }

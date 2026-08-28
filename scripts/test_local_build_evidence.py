@@ -20,13 +20,7 @@ EVIDENCE = ROOT / "scripts" / "local_build_evidence.py"
 RELEASE = ROOT / "scripts" / "release.sh"
 BUNDLE_VERIFIER = ROOT / "scripts" / "verify_local_evidence_bundle.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-from test_select_build_configuration import (  # noqa: E402
-    CANARY_ADMIN_UUID,
-    CANARY_IDENTITY_PREPARATION_SHA256,
-    environment,
-    fresh_bootstrap_environment,
-)
-import adr0022_fresh_release as fresh  # noqa: E402
+from test_select_build_configuration import environment  # noqa: E402
 VERIFIER_SPEC = importlib.util.spec_from_file_location(
     "verify_local_evidence_bundle_test", BUNDLE_VERIFIER
 )
@@ -35,7 +29,7 @@ VERIFIER_MODULE = importlib.util.module_from_spec(VERIFIER_SPEC)
 VERIFIER_SPEC.loader.exec_module(VERIFIER_MODULE)
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
-TAG = "v1.2.3-archive-v3-wal.1"
+TAG = "v1.2.3"
 
 
 class LocalEvidenceTests(unittest.TestCase):
@@ -46,13 +40,6 @@ class LocalEvidenceTests(unittest.TestCase):
         source_archive_sha256: str | None = None,
         expected_sbom_sha256: str | None = None,
         expected_scan_sha256: str | None = None,
-        buckets: tuple[str, str, str] = (
-            "kioku-production-indexes",
-            "kioku-production-media",
-            "kioku-production-indexes",
-        ),
-        fresh_bootstrap: bool = False,
-        metadata_canary_sha256: str | None = None,
     ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
         public = directory / "public.pem"
@@ -61,15 +48,10 @@ class LocalEvidenceTests(unittest.TestCase):
         subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True)
         public.chmod(0o644)
         config = directory / "local.env"
-        config_values = (
-            fresh_bootstrap_environment() if fresh_bootstrap else environment()
-        )
+        config_values = environment()
         config_values.pop("PATH", None)
         config_values.pop("GCP_WIF_PROVIDER", None)
         config_values.pop("GCP_SERVICE_ACCOUNT", None)
-        config_values["PRODUCTION_GENESIS_WAL_NATIVE"] = (
-            "on" if fresh_bootstrap else "off"
-        )
         config_values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
         config.write_text("\n".join(f"{key}={value}" for key, value in sorted(config_values.items())) + "\n", encoding="utf-8")
         config.chmod(0o600)
@@ -81,21 +63,11 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        tag = fresh.CURRENT_TAG if fresh_bootstrap else TAG
-        source_repository = (
-            fresh.SOURCE_REPOSITORY
-            if fresh_bootstrap
-            else "https://github.com/owner/repository"
-        )
-        image_uri = image_repository + (f":{tag}" if fresh_bootstrap else ":release")
-        if fresh_bootstrap:
-            buckets = (
-                fresh.EXPECTED_INTENT["index_bucket"],
-                fresh.EXPECTED_INTENT["media_bucket"],
-                fresh.EXPECTED_INTENT["legacy_media_bucket"],
-            )
+        tag = TAG
+        source_repository = "https://github.com/owner/repository"
+        image_uri = f"{image_repository}:{tag}"
         metadata_payload: dict[str, object] = {
-            "schema_version": 10 if fresh_bootstrap else 9,
+            "schema_version": 11,
             "source_repository": source_repository,
             "source_ref": tag, "source_commit": COMMIT,
             "image_uri": image_uri,
@@ -103,33 +75,23 @@ class LocalEvidenceTests(unittest.TestCase):
             "image_digest": DIGEST,
             "release_url": source_repository + "/releases/tag/" + tag,
             "build_profile": "production", "voice_quality_gate": "owner_only_unvalidated",
-            "billing_enforcement_mode": "shadow", "gcs_bucket": buckets[0],
-            "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
-            "archive_witness_shadow_mode": "off", "archive_witness_project_id": "",
-            "archive_witness_project_number": "", "archive_witness_database_id": "",
-            "archive_v3_shadow_runtime_mode": "durable-fleet-wal-v1",
-            "archive_v3_archive_bucket": fresh.EXPECTED_INTENT["archive_bucket"],
-            "archive_v3_archive_gcs_project_number": fresh.PROJECT_NUMBER,
-            "archive_v3_registry_kms_version": "1",
-            "archive_v3_witness_project_id": fresh.PROJECT_ID,
-            "archive_v3_witness_project_number": fresh.PROJECT_NUMBER,
-            "archive_v3_witness_database_id": fresh.EXPECTED_INTENT[
-                "witness_database_id"
-            ],
-            "archive_v3_archive_binding_commitment": "",
+            "billing_enforcement_mode": "shadow",
+            "gcs_media_bucket": "kioku-production-media",
+            "kms_project": "kioku-joerodriguez",
+            "kms_location": "us-central1",
+            "kms_key_ring": "kioku-production",
+            "kms_key": "production-kek",
+            "persistence_authority": "postgres",
+            "postgres_schema_verification": "required",
+            "postgres_max_connections": "12",
+            "health_port": "8081",
+            "drain_timeout_seconds": "105",
+            "tls_mode": "shared-secret-manager",
         }
-        if fresh_bootstrap:
-            metadata_payload.update(
-                fresh.final_release_binding(
-                    metadata_canary_sha256
-                    or CANARY_IDENTITY_PREPARATION_SHA256,
-                    CANARY_ADMIN_UUID,
-                )
-            )
         metadata.write_text(
             json.dumps(
                 metadata_payload,
-                sort_keys=not fresh_bootstrap,
+                sort_keys=True,
                 separators=(",", ":"),
             )
             + "\n",
@@ -218,9 +180,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--public-key", str(public), "--expected-public-key-sha256", fingerprint,
                 "--repository", "owner/repository", "--tag", TAG, "--commit", COMMIT,
                 "--image-repository", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
-                "--expected-gcs-bucket", "kioku-production-indexes",
                 "--expected-gcs-media-bucket", "kioku-production-media",
-                "--expected-gcs-legacy-media-bucket", "kioku-production-indexes",
                 "--config", str(directory / "local.env"),
             ]
             completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
@@ -238,12 +198,7 @@ class LocalEvidenceTests(unittest.TestCase):
             deployment_directory = directory / "deployment-contract"
             deployment_directory.mkdir()
             _, _, deployment_public, deployment_fingerprint = self.create_bundle(
-                deployment_directory,
-                buckets=(
-                    "kioku-joerodriguez-enclave-indexes",
-                    "kioku-joerodriguez-enclave-media",
-                    "kioku-joerodriguez-enclave-indexes",
-                ),
+                deployment_directory
             )
             deployment_contract = [
                 "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(deployment_directory),
@@ -251,6 +206,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--release-tag", TAG, "--source-commit", COMMIT,
                 "--image-digest-uri", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave@" + DIGEST,
                 "--image-digest", DIGEST,
+                "--config", str(deployment_directory / "local.env"),
             ]
             deployment_environment = os.environ | {
                 "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY": str(deployment_public),
@@ -262,74 +218,6 @@ class LocalEvidenceTests(unittest.TestCase):
             tampered = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("exact enclave-release.json bytes", tampered.stderr)
-
-    def test_bundle_verifier_cross_binds_fresh_schema_ten_to_private_config(self) -> None:
-        def verify_command(directory: Path, public: Path, fingerprint: str) -> list[str]:
-            return [
-                "python3", str(BUNDLE_VERIFIER),
-                "--evidence-dir", str(directory),
-                "--public-key", str(public),
-                "--expected-public-key-sha256", fingerprint,
-                "--repository", "joerodriguez/kioku-enclave",
-                "--tag", fresh.CURRENT_TAG,
-                "--commit", COMMIT,
-                "--image-repository", fresh.IMAGE_REPOSITORY,
-                "--config", str(directory / "local.env"),
-            ]
-
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            _, _, public, fingerprint = self.create_bundle(
-                directory, fresh_bootstrap=True
-            )
-            completed = subprocess.run(
-                verify_command(directory, public, fingerprint),
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            metadata = json.loads(completed.stdout)["metadata"]
-            self.assertEqual(metadata["schema_version"], 10)
-            self.assertEqual(
-                metadata["adr0022_canary_identity_preparation_sha256"],
-                CANARY_IDENTITY_PREPARATION_SHA256,
-            )
-            without_config = verify_command(directory, public, fingerprint)
-            del without_config[without_config.index("--config"):]
-            missing_config = subprocess.run(
-                without_config,
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-            )
-            self.assertNotEqual(missing_config.returncode, 0)
-            self.assertIn("requires the exact configuration", missing_config.stderr)
-            conflicting_bucket = subprocess.run(
-                verify_command(directory, public, fingerprint)
-                + ["--expected-gcs-bucket", "kioku-joerodriguez-enclave-indexes"],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-            )
-            self.assertNotEqual(conflicting_bucket.returncode, 0)
-            self.assertIn("differs from the signed configuration", conflicting_bucket.stderr)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            _, _, public, fingerprint = self.create_bundle(
-                directory,
-                fresh_bootstrap=True,
-                metadata_canary_sha256="d" * 64,
-            )
-            mismatched = subprocess.run(
-                verify_command(directory, public, fingerprint),
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-            )
-            self.assertNotEqual(mismatched.returncode, 0)
-            self.assertIn("generation/canary/schema binding is not exact", mismatched.stderr)
 
     def test_bundle_verifier_rejects_ambient_git_overrides_and_replacement_refs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -343,6 +231,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--repository", "owner/repository",
                 "--tag", TAG,
                 "--commit", COMMIT,
+                "--config", str(directory / "local.env"),
             ]
             overridden = subprocess.run(
                 command,
@@ -399,9 +288,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "--expected-public-key-sha256", "",
                 "--repository", "owner/repository", "--tag", TAG, "--commit", COMMIT,
                 "--image-repository", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
-                "--expected-gcs-bucket", "kioku-production-indexes",
                 "--expected-gcs-media-bucket", "kioku-production-media",
-                "--expected-gcs-legacy-media-bucket", "kioku-production-indexes",
                 "--config", str(directory / "local.env"), "--source-archive", str(archive),
             ]
             fingerprint = subprocess.run(
@@ -450,7 +337,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "printf '%s\\n' \"$*\" >> \"$FAKE_GH_LOG\"\n"
                 "if [[ \"$1\" == api ]]; then echo true; exit 0; fi\n"
                 f"if [[ \"$1 $2 $3\" == 'release view {TAG}' ]]; then\n"
-                "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":true,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
+                "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":false,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
                 "  echo 'release not found' >&2; exit 1\nfi\n"
                 "if [[ \"$1 $2\" == 'release create' ]]; then\n"
                 "  shift 3\n"
@@ -514,7 +401,7 @@ class LocalEvidenceTests(unittest.TestCase):
             )
             self.assertNotIn("workflow", gh_log)
             self.assertNotIn("dispatch", gh_log)
-            self.assertIn("--prerelease", gh_log)
+            self.assertNotIn("--prerelease", gh_log)
             create_line = next(line for line in gh_log.splitlines() if line.startswith("release create "))
             self.assertNotIn(str(directory / evidence.name), create_line)
             gcloud_log = (directory / "gcloud.log").read_text(encoding="utf-8")

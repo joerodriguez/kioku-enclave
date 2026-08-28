@@ -1,8 +1,118 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::search::{SearchHit, SearchRequest};
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SearchRequest {
+    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) speaker: Option<String>,
+    pub(crate) time_start: Option<String>,
+    pub(crate) time_end: Option<String>,
+    #[serde(default = "default_search_limit")]
+    pub(crate) limit: usize,
+    #[serde(default)]
+    pub(crate) offset: usize,
+    #[serde(default)]
+    pub(crate) kinds: Vec<String>,
+    pub(crate) query_embedding: Option<Vec<f32>>,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind")]
+pub(crate) enum SearchHit {
+    Utterance {
+        id: i64,
+        text: String,
+        speaker_label: String,
+        started_at: String,
+        start_offset_seconds: f64,
+        end_offset_seconds: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
+    },
+    Screenshot {
+        id: i64,
+        captured_at: String,
+        active_app: Option<String>,
+        window_title: Option<String>,
+        ocr_text: Option<String>,
+        url: Option<String>,
+        observation_status: Option<String>,
+        literal_description: Option<String>,
+        screen_state: Option<String>,
+        content_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
+    },
+    Episode {
+        id: i64,
+        started_at: String,
+        ended_at: String,
+        title: Option<String>,
+        summary: Option<String>,
+        minute_summaries: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snippet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
+    },
+}
+
+/// Pull a `speaker:Name` or `speaker:"Multi Word"` token out of a query.
+pub(crate) fn extract_speaker_filter(query: &str) -> (String, Option<String>) {
+    let lower = query.to_lowercase();
+    let Some(pos) = lower.find("speaker:") else {
+        return (query.to_string(), None);
+    };
+    let after = &query[pos + "speaker:".len()..];
+    let (speaker, rest) = if let Some(stripped) = after.strip_prefix('"') {
+        match stripped.find('"') {
+            Some(end) => (&stripped[..end], &stripped[end + 1..]),
+            None => (stripped, ""),
+        }
+    } else {
+        match after.find(char::is_whitespace) {
+            Some(end) => (&after[..end], &after[end..]),
+            None => (after, ""),
+        }
+    };
+    let cleaned = format!("{} {}", query[..pos].trim_end(), rest.trim())
+        .trim()
+        .to_string();
+    let speaker = speaker.trim();
+    if speaker.is_empty() {
+        (cleaned, None)
+    } else {
+        (cleaned, Some(speaker.to_string()))
+    }
+}
+
+/// Merge ranked candidate lists with reciprocal-rank fusion (k = 60).
+pub(crate) fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    const RRF_K: f64 = 60.0;
+    let mut scores = std::collections::HashMap::<i64, f64>::new();
+    for (rank, row_id) in fts_rows.iter().enumerate() {
+        *scores.entry(*row_id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    for (rank, (row_id, _)) in knn_rows.iter().enumerate() {
+        *scores.entry(*row_id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EpisodeListRequest {
@@ -35,9 +145,7 @@ pub(crate) struct CaptureStatus {
 /// Authoritative encrypted screenshot object resolved from structured state.
 ///
 /// Canonical capture objects require an exact current generation and the v2
-/// bound-blob envelope. `LegacyCompatible` exists only so the SQLite adapter
-/// can preserve the retired device-sync image endpoint while it remains a
-/// development/reference backend.
+/// bound-blob envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScreenshotMediaLocator {
     Canonical {
@@ -46,19 +154,6 @@ pub(crate) enum ScreenshotMediaLocator {
         byte_length: i64,
         sha256: String,
     },
-    LegacyCompatible {
-        object_key: String,
-    },
-}
-
-impl ScreenshotMediaLocator {
-    pub(crate) fn object_key(&self) -> &str {
-        match self {
-            Self::Canonical { object_key, .. } | Self::LegacyCompatible { object_key } => {
-                object_key
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

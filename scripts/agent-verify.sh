@@ -16,7 +16,8 @@ Modes:
   quick                 Check formatting and compile with `cargo check` (default).
   focused -- <filter> [args...]
                          Check formatting and run a focused `cargo test` selection.
-  full                  Check formatting, run the full test suite, and all-target Clippy.
+  full                  Check formatting, run the full test suite against a real
+                        PostgreSQL database, and run all-target Clippy.
 
 All Cargo commands use --locked. `focused` requires a non-option test filter so it
 cannot accidentally expand into the full suite. The disk preflight requires 15 GiB of
@@ -26,6 +27,9 @@ AGENT_VERIFY_SCCACHE_CACHE_SIZE to a whole number of GiB from 1G through 10G to 
 When the cache daemon starts, it receives every live linked-worktree root so
 otherwise-identical compiler inputs can be reused across their absolute paths.
 Verification exits instead of waiting when this worktree's build-artifact lock is held.
+Full mode requires KIOKU_TEST_POSTGRES_URL to name an already-provisioned disposable
+PostgreSQL database. It never starts Docker implicitly. The release owner is responsible
+for provisioning PostgreSQL 17 and destroying it after verification.
 EOF
 }
 
@@ -166,6 +170,22 @@ case "$mode" in
     fi
     ;;
 esac
+
+if [[ "$mode" == full ]]; then
+  postgres_url="${KIOKU_TEST_POSTGRES_URL:-}"
+  [[ -n "$postgres_url" ]] || fail \
+    "full verification requires KIOKU_TEST_POSTGRES_URL; provision disposable PostgreSQL 17 explicitly."
+  case "$postgres_url" in
+    postgres://*|postgresql://*) ;;
+    *) fail "KIOKU_TEST_POSTGRES_URL must use the postgres or postgresql URL scheme." ;;
+  esac
+  [[ "$postgres_url" != *$'\n'* && "$postgres_url" != *$'\r'* ]] || \
+    fail "KIOKU_TEST_POSTGRES_URL contains a control character."
+  # The Rust contract harness treats this as a no-skip assertion. Keeping the
+  # signal separate from the credential makes accidental environment loss
+  # visible instead of reporting a false-green release gate.
+  export KIOKU_REQUIRE_POSTGRES_CONTRACT=1
+fi
 
 cd "$REPO_ROOT"
 python3 "$SCRIPT_DIR/check_build_disk_space.py" --path "$REPO_ROOT" --min-free-gib "$MIN_FREE_GIB"

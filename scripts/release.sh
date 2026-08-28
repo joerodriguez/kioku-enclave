@@ -23,9 +23,6 @@ COORDINATOR_SIGNATURE=""
 COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
 COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 PUSH_DEPLOYMENT_SOURCE_SEAL=""
-ADR0022_FRESH_BOOTSTRAP_TAG="v0.8.35-adr0022-fresh-bootstrap.1"
-ADR0022_CURRENT_TAG=""
-ADR0022_CURRENT_VERSION=""
 RELEASE_CONFIG_SNAPSHOT=""
 SOURCE_ARCHIVE=""
 NOTES=""
@@ -113,9 +110,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "release tag must look like v1.2.3 or v1.2.3-rc.1"
-if [[ "$TAG" =~ [Aa][Dd][Rr]0022-[Ff][Rr][Ee][Ss][Hh]-[Bb][Oo][Oo][Tt][Ss][Tt][Rr][Aa][Pp] && "$TAG" != "$ADR0022_FRESH_BOOTSTRAP_TAG" ]]; then
-  die "ADR-0022 fresh BOOTSTRAP tag must be exactly $ADR0022_FRESH_BOOTSTRAP_TAG"
-fi
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repository must be OWNER/REPO"
 [[ -n "$EVIDENCE_DIR" && -d "$EVIDENCE_DIR" ]] || die "--evidence-dir must name an existing directory"
 [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || die "--config must name the local build configuration used for this image"
@@ -151,18 +145,6 @@ PY
 export GIT_NO_REPLACE_OBJECTS=1
 cd "$REPO_ROOT"
 reject_git_object_substitution
-ADR0022_CURRENT_FIELDS="$(python3 - <<'PY'
-from scripts.archive_v3_release_tag import load_current_release_receipt
-tag = load_current_release_receipt()[1]
-print(tag.name + "\x1f" + tag.version)
-PY
-)" || die "current Archive V3 release receipt is invalid"
-IFS=$'\x1f' read -r ADR0022_CURRENT_TAG ADR0022_CURRENT_VERSION <<< "$ADR0022_CURRENT_FIELDS"
-[[ -n "$ADR0022_CURRENT_TAG" && -n "$ADR0022_CURRENT_VERSION" ]] \
-  || die "current Archive V3 release receipt is incomplete"
-if [[ "$TAG" =~ ^v${ADR0022_CURRENT_VERSION//./\.}-[Aa][Rr][Cc][Hh][Ii][Vv][Ee]-[Vv]3-[Ww][Aa][Ll] && "$TAG" != "$ADR0022_CURRENT_TAG" ]]; then
-  die "Archive V3 release tag must match the generated current release $ADR0022_CURRENT_TAG"
-fi
 if [[ -z "$FROZEN_COMMIT" ]]; then
   [[ "$(git --no-replace-objects branch --show-current)" == main ]] || die "releases must be prepared from local main"
 else
@@ -198,39 +180,22 @@ finally:
 os.chmod(sys.argv[3], 0o600)
 keys = (
     "PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME",
-    "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET",
-    "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE",
-    "ARCHIVE_V3_SHADOW_RUNTIME_MODE", "GENESIS_WAL_NATIVE",
+    "ENCLAVE_GCS_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE",
 )
 print("\x1f".join((*[configuration[key] for key in keys], builder)))
 PY
 )" || die "local release configuration is invalid"
 CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
-IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE GENESIS_WAL_NATIVE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
+IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
-if [[ "$ROLL" == true && ( "$TAG" == "$ADR0022_FRESH_BOOTSTRAP_TAG" || "$TAG" == "$ADR0022_CURRENT_TAG" ) ]]; then
-  die "ADR-0022 fresh releases roll only through the sealed deployment direct-provider operation"
-elif [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
-  # Deployment compatibility for active archive-v3 images (docs/adr/
-  # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed
-  # by the pre-serving --run-archive-v3-phase1-canary subcommand and, since the
-  # J-b3b serving-activation slice, by serving startup's WAL serving-authority
-  # relaunch — an active-config image relaunches WAL authorities for every
-  # durable-terminal user before any listener binds, and an off-config image
-  # with such users refuses startup. Rolling an active-config image is therefore
-  # a real behavioral decision and stays two-factor: the tag must be an exact
-  # archive-v3 WAL release tag and the operator must acknowledge that exact tag
-  # out of band.
-  [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-archive-v3-wal\.[0-9]+$ ]] \
-    || die "active archive-v3 WAL images cannot roll: tag is not an exact archive-v3-wal release tag"
-  [[ "${KIOKU_CONFIRM_ARCHIVE_V3_ROLL:-}" == "$TAG" ]] \
-    || die "active archive-v3 WAL images cannot roll without KIOKU_CONFIRM_ARCHIVE_V3_ROLL naming the exact tag"
-fi
 
 if [[ "$ROLL" == true ]]; then
-  # APNs pacing and circuit state are process-local. Production therefore
-  # supports push only from the exact reviewed deployment commit and complete
-  # Terraform root-source seal. Discard the caller's path after one strict
+  # The incompatible maintenance lane remains bound to the exact independently
+  # reviewed deployment commit and complete Terraform root-source seal compiled
+  # into verify_push_runtime_topology.py. A mutable local origin/main ref is not
+  # an authority for changing that pin.
+  # Ordinary compatible releases use ADR-0041's staged horizontal rollout.
+  # Discard the caller's path after one strict
   # realpath check so neither a symlinked ancestor nor an escaping/symlinked
   # rollout script can redirect the final invocation. Bind the source and exact
   # tracked executable before origin refresh, publication, registry access, or
@@ -241,7 +206,7 @@ if [[ "$ROLL" == true ]]; then
   )" || die "deployment repository path must be canonical and symlink-free"
   PUSH_DEPLOYMENT_SOURCE_SEAL="$(
     python3 scripts/verify_push_runtime_topology.py "$DEPLOYMENT_REPO_PATH"
-  )" || die "push-capable rollout requires the reviewed single-runtime deployment source"
+  )" || die "maintenance rollout requires the exact independently reviewed deployment source"
   [[ -n "$PUSH_DEPLOYMENT_SOURCE_SEAL" ]] \
     || die "push deployment source verifier returned no seal"
 fi
@@ -250,11 +215,6 @@ fi
 # origin refresh so an ineligible roll performs no network or external action.
 git --no-replace-objects fetch origin main
 ORIGIN_MAIN="$(git --no-replace-objects rev-parse origin/main)"
-if [[ "$TAG" == "$ADR0022_CURRENT_TAG" ]]; then
-  python3 scripts/archive_v3_release_tag.py check \
-    --tag "$TAG" --remote origin --allow-existing >/dev/null \
-    || die "Archive V3 release is not the exact next published WAL sequence"
-fi
 if [[ -z "$FROZEN_COMMIT" ]]; then
   COMMIT="$(git --no-replace-objects rev-parse HEAD)"
   [[ "$COMMIT" == "$ORIGIN_MAIN" ]] || die "local main must exactly match origin/main"
@@ -379,9 +339,7 @@ EVIDENCE_BUNDLE="$(python3 scripts/verify_local_evidence_bundle.py \
   --expected-public-key-sha256 "$EVIDENCE_PUBLIC_KEY_SHA256" \
   --repository "$REPOSITORY" --tag "$TAG" --commit "$COMMIT" \
   --image-repository "$IMAGE_REPOSITORY" \
-  --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
   --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET" \
-  --expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" \
   --config "$CONFIG_FILE" \
   --source-archive "$SOURCE_ARCHIVE")"
 EVIDENCE_FIELDS="$(EVIDENCE_BUNDLE="$EVIDENCE_BUNDLE" python3 - <<'PY'

@@ -14,8 +14,6 @@ pub(crate) struct FinalizationEpisode {
     pub(crate) participants: Option<String>,
     pub(crate) languages: Option<String>,
     pub(crate) action_items: Option<String>,
-    #[allow(dead_code)]
-    pub(crate) model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +27,6 @@ pub(crate) struct FinalizationUtterance {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct FinalizationScreenshot {
     pub(crate) id: i64,
     pub(crate) captured_at: String,
@@ -49,11 +46,6 @@ pub(crate) struct FinalizationScreenshot {
     pub(crate) visible_windows: Value,
     pub(crate) browser_context: Value,
     pub(crate) visual_signals: Value,
-    pub(crate) literal_description: Option<String>,
-    pub(crate) activity_summary: Option<String>,
-    pub(crate) relevance_reason: Option<String>,
-    pub(crate) milestone_type: Option<String>,
-    pub(crate) key_rank: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

@@ -23,7 +23,7 @@ test ! -e "$tmp"
 test ! -L "$tmp"
 (set -C; : > "$tmp")
 
-allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_BUCKET GCS_MEDIA_BUCKET GCS_LEGACY_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL PERSISTENCE_BACKEND POSTGRES_SCHEMA_MODE POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT ARCHIVE_WITNESS_SHADOW_MODE ARCHIVE_WITNESS_PROJECT_ID ARCHIVE_WITNESS_PROJECT_NUMBER ARCHIVE_WITNESS_DATABASE_ID ARCHIVE_V3_SHADOW_RUNTIME_MODE ARCHIVE_V3_ARCHIVE_BUCKET ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER ARCHIVE_V3_REGISTRY_KMS_VERSION ARCHIVE_V3_WITNESS_PROJECT_ID ARCHIVE_V3_WITNESS_PROJECT_NUMBER ARCHIVE_V3_WITNESS_DATABASE_ID ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT GENESIS_WAL_NATIVE'
+allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS'
 allowed=" $allowed_keys "
 seen=' '
 while IFS='=' read -r name value || test -n "$name"; do
@@ -47,26 +47,21 @@ done
 value() { sed -n "s/^$1=//p" "$tmp"; }
 profile=$(value KIOKU_BUILD_PROFILE)
 test "$profile" = production || test "$profile" = evaluation
-for required in KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_BUCKET GCS_MEDIA_BUCKET \
-  GCS_LEGACY_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE \
+for required in KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET \
+  RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE \
   GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
   ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE \
-  BILLING_ENFORCEMENT_MODE VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL \
-  ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT; do
+  BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL \
+  VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL; do
   test -n "$(value "$required")"
 done
-test "$(value GCS_BUCKET)" = "$(value GCS_LEGACY_MEDIA_BUCKET)"
-test "$(value PERSISTENCE_BACKEND)" = postgres
-test "$(value POSTGRES_SCHEMA_MODE)" = verify
 test "$(value POSTGRES_MAX_CONNECTIONS)" = 12
 test "$(value HEALTH_PORT)" = 8081
 test "$(value DRAIN_TIMEOUT_SECONDS)" = 105
 test "$(value ENCLAVE_TLS)" = 1
-test "$(value ENCLAVE_ACME)" = 0
 case "$(value ADMIN_USER_IDS)" in *[!0-9A-Fa-f,-]*|'') exit 1 ;; esac
-# Non-negative decimal, no leading zero. Zero is the explicit reviewed
-# ADR-0022 cutover state: reserve_signup_conn treats it as closed, never as
-# unlimited. Empty, signed, and ambiguous leading-zero values still refuse.
+# Non-negative decimal, no leading zero. Zero closes signup; it is never read
+# as unlimited. Empty, signed, and ambiguous leading-zero values still refuse.
 case "$(value SIGNUP_LIMIT_PER_DAY)" in ''|*[!0-9]*|0[0-9]*) exit 1 ;; esac
 case "$(value RUN_SA_EMAIL)" in *@*.iam.gserviceaccount.com) ;; *) exit 1 ;; esac
 case "$(value ENCLAVE_AUDIENCE)" in https://*) ;; *) exit 1 ;; esac
@@ -81,15 +76,6 @@ case "$(value BILLING_ENFORCEMENT_MODE)" in shadow|enforce) ;; *) exit 1 ;; esac
 vertex_model=$(value VERTEX_MODEL)
 case "$vertex_model" in *[!A-Za-z0-9._:-]*|'') exit 1 ;; esac
 test "${#vertex_model}" -le 128
-case "$(value ARCHIVE_WITNESS_SHADOW_MODE)" in
-  off) test -z "$(value ARCHIVE_WITNESS_PROJECT_ID)$(value ARCHIVE_WITNESS_PROJECT_NUMBER)$(value ARCHIVE_WITNESS_DATABASE_ID)" ;;
-  probe-v1)
-    printf '%s\n' "$(value ARCHIVE_WITNESS_PROJECT_ID)" | grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
-    printf '%s\n' "$(value ARCHIVE_WITNESS_PROJECT_NUMBER)" | grep -Eq '^[1-9][0-9]{0,19}$'
-    printf '%s\n' "$(value ARCHIVE_WITNESS_DATABASE_ID)" | grep -Eq '^[a-z][a-z0-9-]{2,61}[a-z0-9]$'
-    ;;
-  *) exit 1 ;;
-esac
 apple_values="$(value APPLE_TEAM_ID)$(value APPLE_KEY_ID)$(value APPLE_IOS_CLIENT_ID)$(value APPLE_MACOS_CLIENT_ID)$(value APPLE_WEB_CLIENT_ID)"
 if test -n "$apple_values"; then
   test -n "$(value APPLE_TEAM_ID)" && test -n "$(value APPLE_KEY_ID)"
@@ -105,28 +91,6 @@ else
     test -n "$(value APNS_TEAM_ID)" && test -n "$(value APNS_PRODUCTION_KEY_ID)" && test -n "$(value APNS_SANDBOX_KEY_ID)"
   fi
 fi
-if test -x /build/validate_archive_v3_shadow_runtime_environment.sh; then
-  /build/validate_archive_v3_shadow_runtime_environment.sh \
-    "$(value ARCHIVE_V3_SHADOW_RUNTIME_MODE)" \
-    "$(value ARCHIVE_V3_ARCHIVE_BUCKET)" \
-    "$(value ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER)" \
-    "$(value ARCHIVE_V3_REGISTRY_KMS_VERSION)" \
-    "$(value ARCHIVE_V3_WITNESS_PROJECT_ID)" \
-    "$(value ARCHIVE_V3_WITNESS_PROJECT_NUMBER)" \
-    "$(value ARCHIVE_V3_WITNESS_DATABASE_ID)" \
-    "$(value ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT)"
-fi
-# The genesis cutover gate is baked, so it is covered by the attested digest
-# and cannot be set at launch. Only the two explicit words are an image shape;
-# an empty value is not, because a missing gate must never be read as "off" by
-# accident. `on` additionally requires the archive-v3 coordinates that genesis
-# mints through, mirroring require_genesis_config_agreement at this boundary
-# so a hand-authored secret cannot arm a gate the image cannot honour.
-case "$(value GENESIS_WAL_NATIVE)" in
-  off) ;;
-  on) test "$(value ARCHIVE_V3_SHADOW_RUNTIME_MODE)" != off ;;
-  *) exit 1 ;;
-esac
 
 test ! -e "$output"
 test ! -L "$output"

@@ -1,30 +1,35 @@
-# map.md — src/persistence/
+# `src/persistence/` map
 
-Backend-neutral, typed application persistence ports and their composition root.
-Product handlers and workers depend on these use-case interfaces rather than database
-connections, SQL callbacks, or whole-file persistence behavior.
+Typed application repository ports and their single production composition. Handlers and workers
+depend on these use-case interfaces rather than `sqlx`, SQL callbacks, or object-provider details.
+`RepositorySet::postgres` installs one complete PostgreSQL adapter set at startup; there is no
+legacy adapter, backend selector, fallback, dual write, or shadow read.
 
-| File | Role |
+| Path | Responsibility |
 |---|---|
-| `mod.rs` | `RepositorySet` composition root for the legacy and PostgreSQL implementations. Startup selects exactly one complete repository set without request-time fallback or dual authority. |
-| `admission.rs` | Backend-neutral fleet token-bucket and crash-recoverable concurrency-lease contract. |
-| `billing.rs` | Backend-neutral billing pseudonym, recording authorization/credit, coverage, and detach-outbox contract. |
-| `identity.rs` | Backend-neutral account/session and Apple-credential contract. |
-| `lifecycle.rs` | Backend-neutral account tombstone, deletion progress, Apple-revocation, and final identity cleanup contract. |
-| `oauth.rs` | Backend-neutral OAuth client, consent, authorization-code, and refresh-token transaction contract. |
-| `playback.rs` | Backend-neutral recording playback dataset and person-memory projection contract. |
-| `query.rs` | Backend-neutral tenant-scoped structured-memory search, episode pagination/detail projection, merged feed, and capture-freshness contract. |
-| `entitlement.rs` | Backend-neutral active-account, daily usage, and Vertex reservation contract. |
-| `episode_deletion.rs` | Backend-neutral two-step episode freeze, provider cleanup inventory, and durable purge receipt. |
-| `notification.rs` | Backend-neutral webhook, email-consent, and push-installation configuration contract with redacted secret-bearing types. |
-| `recording_retention.rs` | Backend-neutral preview/CAS policy, durable recording-key epoch, inventory, and downgrade-completion contract. |
-| `work.rs` | Backend-neutral fleet account enumeration, summarizer cursor, and durable email, webhook, and push disclosure-fence contracts; provider I/O occurs outside the repository transaction. |
-| [`legacy/`](legacy/map.md) | Private behavior-preserving adapters over the current encrypted SQLite/GCS stores. |
-| [`postgres/`](postgres/map.md) | Bounded SQLx pool plus PostgreSQL implementations of the extracted ports. |
-| `media_object.rs` / `gcs_media.rs` | Encrypted GCS object contract and provider implementation, including exact account and durable-recording purge. |
-| `disabled_legacy.rs` | Fail-closed GCS implementation installed behind unavoidable compatibility structs in PostgreSQL mode so an accidentally missed legacy call cannot read or mutate the retired SQLite authority. |
+| `mod.rs` | Port exports and `RepositorySet`, which composes PostgreSQL repositories with the live encrypted-media object port. |
+| `admission.rs` | Fleet token-bucket and crash-recoverable concurrency-lease contract. |
+| `billing.rs` | Billing pseudonym, recording authorization/credit, coverage, retained-account metrics, and detach-outbox contract. |
+| `capture.rs` | Atomic capture/reference preflight, commit, replay, session, and event-status contract. |
+| `delivery_outbox.rs` | Email, webhook, and push candidate/claim/frozen-request/settlement contract. |
+| `entitlement.rs` | Active-account checks and atomic daily quota/Vertex reservations. |
+| `episode.rs` | Pure episode merge/substance/visual-evidence domain rules shared by memory formation and deletion. |
+| `episode_deletion.rs` | Durable episode freeze, exact media cleanup inventory, structured purge, and replay receipt. |
+| `finalization.rs` | Claim and atomic recap/finalization/outbox settlement contract. |
+| `identity.rs` | Account/session and Apple-credential contract. |
+| `lifecycle.rs` | Account tombstone, no-resurrection deletion progress, provider revocation, and final cleanup contract. |
+| `media_object.rs` | Provider-neutral encrypted-media object operations, exact-generation reads, account/episode purge, and all-generation reconciliation. |
+| `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |
+| `media_processing.rs` | Media job claim, usage, screen/audio projection, voice evidence, retry, and settlement contract. |
+| `memory_formation.rs` | Summarizer window claim, open-memory projection, atomic cursor/episode settlement, and embedding contract. |
+| `model_usage.rs` | Vertex intent/outcome, billing batch claim, and coverage reconciliation contract. |
+| `notification.rs` | Webhook, email-consent, and push-installation configuration with redacted secret-bearing types. |
+| `oauth.rs` | OAuth client, consent, authorization-code, native-session, and refresh-token transaction contract. |
+| `playback.rs` | Recording playback dataset and person-memory availability projection contract. |
+| `query.rs` | Tenant-scoped full-text/vector search, MCP query projections, episode/feed/people/browser/screenshot reads, and capture status. |
+| `recording_retention.rs` | Retention preview/CAS, durable recording-key epoch, exact inventory, and downgrade completion. |
+| `work.rs` | Fleet active-account enumeration, summarizer cursor storage, and shared outbound-provider outcome validation. |
+| [`postgres/`](postgres/map.md) | The only structured-state implementation: bounded SQLx pool plus every repository adapter. |
 
-`PERSISTENCE_BACKEND` selects the legacy or PostgreSQL repository set once at startup.
-The legacy adapter remains a reference/development implementation, not a dual-write or
-fallback mechanism. PostgreSQL mode verifies the reviewed schema and uses encrypted GCS
-only through `MediaObjectStore` for large media bytes.
+The media port is intentionally separate from structured repositories so useful domain fakes can
+exercise handler/worker behavior without coupling to SQLx or making GCS an alternate database.
