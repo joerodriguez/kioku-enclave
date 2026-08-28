@@ -105,8 +105,8 @@ class LocalReleaseContracts(unittest.TestCase):
         )
         for evidence in (
             "REVIEWED_DEPLOYMENT",
-            'head="0580e974fd6aa780f44f208e8f7ad6fd765d0fe4"',
-            'digest="8e12937f582abe272e51f8f1d093d41ada431d5d636792123c1fab1baabab4d5"',
+            'head="b3f9b42d46f882c999f4fc4ffb7da86de9f7ecb2"',
+            'digest="e5a5ce05a48e1ebdb11b6adbf4c868bf592adf72c0982e7c76855f944e1a009b"',
             "--untracked-files=all",
             "canonical_source_digest",
             "root_source_inventory",
