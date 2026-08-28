@@ -2330,17 +2330,6 @@ async fn load_postgres_job_media(
     Ok(media)
 }
 
-fn postgres_media_attempt_id(claim: &MediaProcessingClaim) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"kioku.postgres.media-attempt.v1\0");
-    digest.update(claim.account_id.as_bytes());
-    digest.update([0]);
-    digest.update(claim.work_unit_id.as_bytes());
-    digest.update([0]);
-    digest.update(claim.claim_token.as_bytes());
-    format!("vtx_{:x}", digest.finalize())
-}
-
 fn postgres_media_usage(
     claim: &MediaProcessingClaim,
     generation: &vertex::MediaGeneration,
@@ -2423,7 +2412,6 @@ async fn process_postgres_work_unit(
         media.push(load_postgres_job_media(state, user_id, job).await?);
     }
     reserve_postgres_media_output(state, user_id, claim).await?;
-    let attempt_id = postgres_media_attempt_id(claim);
     let repository = state
         .repositories
         .media_processing()
@@ -2445,13 +2433,13 @@ async fn process_postgres_work_unit(
             &window,
             audio_schema(),
             true,
-            Some(attempt_id),
+            None,
         )
         .await?;
         super::model_usage::settle_response_required(
             state,
             user_id,
-            &postgres_media_attempt_id(claim),
+            &generation.event_id,
             &generation.metadata,
         )
         .await?;
@@ -2484,13 +2472,13 @@ async fn process_postgres_work_unit(
             &inputs,
             storyboard_schema(),
             vertex::MAX_SCREEN_OUTPUT_TOKENS,
-            Some(attempt_id),
+            None,
         )
         .await?;
         super::model_usage::settle_response_required(
             state,
             user_id,
-            &postgres_media_attempt_id(claim),
+            &generation.event_id,
             &generation.metadata,
         )
         .await?;
@@ -2950,6 +2938,7 @@ pub(crate) async fn settle_selected_screen_result_fixture(
         text: String::new(),
         metadata,
         latency_ms: 1,
+        event_id: receipt.event_id().to_owned(),
     };
     persist_actual_media_usage(state, user_id, &work, &generation).await?;
     let results = work
@@ -6790,6 +6779,37 @@ mod tests {
         assert_eq!(canonical_screen_state("email"), "unknown");
         assert_eq!(canonical_content_type("web_page"), "web_page");
         assert_eq!(canonical_content_type("browser"), "unknown");
+    }
+
+    #[test]
+    fn postgres_media_worker_uses_the_vertex_minted_usage_identity() {
+        // PostgreSQL has no sealed ADR-0022 attempt plan that pre-creates a
+        // vertex_usage_events row. Both media arms must therefore let the
+        // Vertex boundary durably mint the intent before egress (`None`) and
+        // re-drive settlement with the exact identity returned from that
+        // boundary. A claim-token-derived pinned id can never name that row.
+        let source = include_str!("media_worker.rs");
+        let start = source
+            .find(concat!("async fn process_postgres_", "work_unit"))
+            .unwrap();
+        let end = source
+            .find(concat!("async fn persist_actual_media_", "usage"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("generate_media_", "custom(")).count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("generate_media_parts_", "custom("))
+                .count(),
+            1
+        );
+        assert_eq!(route.matches("\n            None,\n").count(), 2);
+        assert_eq!(route.matches("&generation.event_id").count(), 2);
+        assert!(!route.contains("postgres_media_attempt_id"));
+        assert!(!route.contains("Some(attempt_id)"));
     }
 
     #[test]
