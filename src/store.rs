@@ -8914,21 +8914,21 @@ fn decode_soft_deleted_list_response(
     if status.is_success() {
         return decode_gcs_versions_page(body, "soft-deleted");
     }
-    // With this fixed request shape, the JSON API documents first-page
-    // invalidArgument as the response when the bucket has no soft-delete
-    // policy. Never apply the exception to continuation requests or any other
+    // With this fixed request shape, the JSON API returns a first-page 400 when
+    // the bucket has no soft-delete policy. GCS currently emits `invalid` in
+    // production while older fixtures and responses use `invalidArgument`.
+    // Never apply the exception to continuation requests or any other
     // status/reason, since those may indicate a bad cursor or request bug.
-    let policy_disabled = status == reqwest::StatusCode::BAD_REQUEST
-        && first_page
-        && serde_json::from_slice::<GcsErrorEnvelope>(body).is_ok_and(|envelope| {
-            envelope.error.code == 400
-                && !envelope.error.errors.is_empty()
-                && envelope
-                    .error
-                    .errors
-                    .iter()
-                    .all(|detail| detail.reason == "invalidArgument")
-        });
+    let policy_disabled =
+        status == reqwest::StatusCode::BAD_REQUEST
+            && first_page
+            && serde_json::from_slice::<GcsErrorEnvelope>(body).is_ok_and(|envelope| {
+                envelope.error.code == 400
+                    && !envelope.error.errors.is_empty()
+                    && envelope.error.errors.iter().all(|detail| {
+                        matches!(detail.reason.as_str(), "invalid" | "invalidArgument")
+                    })
+            });
     if policy_disabled {
         return Ok(GcsListVersionsResponse::default());
     }
@@ -16636,14 +16636,22 @@ pub(crate) mod tests {
 
     #[test]
     fn soft_delete_policy_disabled_400_is_empty_only_on_first_page() {
-        let body = br#"{"error":{"code":400,"errors":[{"reason":"invalidArgument"}]}}"#;
-        let first = decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, true)
+        for reason in ["invalid", "invalidArgument"] {
+            let body = format!(r#"{{"error":{{"code":400,"errors":[{{"reason":"{reason}"}}]}}}}"#);
+            let first = decode_soft_deleted_list_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                body.as_bytes(),
+                true,
+            )
             .unwrap();
-        assert!(first.versions.is_empty());
-        assert!(
-            decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, false,)
-                .is_err()
-        );
+            assert!(first.versions.is_empty());
+            assert!(decode_soft_deleted_list_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                body.as_bytes(),
+                false,
+            )
+            .is_err());
+        }
     }
 
     #[test]
