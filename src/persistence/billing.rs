@@ -43,6 +43,9 @@ pub(crate) trait BillingRepository: Send + Sync {
     async fn billing_account_id(&self, account_id: &str) -> Result<String>;
     async fn billing_account_id_for_deletion(&self, account_id: &str) -> Result<String>;
 
+    /// Resolve the active application identities represented on a validated
+    /// billing page. Retained rows for deleted or otherwise absent application
+    /// accounts are omitted; callers must never expose their pseudonyms.
     async fn active_identities_for_billing_accounts(
         &self,
         billing_account_ids: Vec<String>,

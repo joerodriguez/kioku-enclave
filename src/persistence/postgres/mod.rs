@@ -1348,7 +1348,23 @@ mod tests {
                 None => billing_account_id = Some(observed),
             }
         }
-        assert!(billing_account_id.unwrap().starts_with("acct_"));
+        let billing_account_id = billing_account_id.unwrap();
+        assert!(billing_account_id.starts_with("acct_"));
+        assert_eq!(
+            repositories
+                .billing()
+                .active_identities_for_billing_accounts(vec![
+                    billing_account_id.clone(),
+                    "acct_absent_from_application".into(),
+                ])
+                .await
+                .unwrap(),
+            vec![(
+                account_id.clone(),
+                "owner@example.com".into(),
+                billing_account_id,
+            )]
+        );
 
         let coverage = repositories
             .billing()

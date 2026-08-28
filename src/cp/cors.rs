@@ -30,7 +30,7 @@ pub async fn cors_middleware(
                     .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allowed_origin)
                     .header(
                         header::ACCESS_CONTROL_ALLOW_METHODS,
-                        "GET, POST, DELETE, OPTIONS",
+                        "GET, POST, PUT, DELETE, OPTIONS",
                     )
                     .header(
                         header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -158,7 +158,7 @@ mod tests {
             resp.headers()
                 .get(header::ACCESS_CONTROL_ALLOW_METHODS)
                 .unwrap(),
-            "GET, POST, DELETE, OPTIONS"
+            "GET, POST, PUT, DELETE, OPTIONS"
         );
         assert_eq!(
             resp.headers()
@@ -242,5 +242,32 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn put_allowed_in_preflight() {
+        let router = create_test_router("https://kiokuu.com");
+        let req = axum::http::Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/test")
+            .header(header::ORIGIN, "https://kiokuu.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,content-type",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|method| method.trim() == "PUT"));
     }
 }

@@ -187,7 +187,7 @@ impl BillingRepository for PostgresPersistence {
         let mut transaction = self.pool().begin().await?;
         let mut identities = Vec::with_capacity(billing_account_ids.len());
         for billing_account_id in billing_account_ids {
-            let row = sqlx::query(
+            let Some(row) = sqlx::query(
                 "SELECT a.id,a.email FROM billing_accounts b \
                  JOIN accounts a ON a.id=b.account_id \
                  WHERE b.billing_account_id=$1 AND a.status='active'",
@@ -195,9 +195,9 @@ impl BillingRepository for PostgresPersistence {
             .bind(&billing_account_id)
             .fetch_optional(&mut *transaction)
             .await?
-            .ok_or_else(|| {
-                EnclaveError::Config("billing margin row has no active application identity".into())
-            })?;
+            else {
+                continue;
+            };
             identities.push((
                 row.try_get("id")?,
                 row.try_get("email")?,

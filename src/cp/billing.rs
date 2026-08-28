@@ -1938,11 +1938,20 @@ async fn admin_margin(
         .await
     {
         Ok(report) => report,
-        Err(_) => return service_unavailable(),
+        Err(error) => {
+            warn!(error = %error, stage = "billing_report", "owner margin unavailable");
+            return service_unavailable();
+        }
     };
     let account_ids = match validated_margin_account_ids(&report, limit) {
         Some(account_ids) => account_ids,
-        None => return service_unavailable(),
+        None => {
+            warn!(
+                stage = "billing_report_validation",
+                "owner margin unavailable"
+            );
+            return service_unavailable();
+        }
     };
     let account_metrics = match state
         .repositories
@@ -1951,7 +1960,10 @@ async fn admin_margin(
         .await
     {
         Ok(metrics) => metrics,
-        Err(_) => return service_unavailable(),
+        Err(error) => {
+            warn!(error = %error, stage = "account_metrics", "owner margin unavailable");
+            return service_unavailable();
+        }
     };
     let account_metrics_as_of = super::isotime::format_epoch_millis(epoch_millis());
     let users = match state
@@ -1961,7 +1973,10 @@ async fn admin_margin(
         .await
     {
         Ok(users) => users,
-        Err(_) => return service_unavailable(),
+        Err(error) => {
+            warn!(error = %error, stage = "active_identity_mapping", "owner margin unavailable");
+            return service_unavailable();
+        }
     };
     let anchored_global_coverage_complete = match state
         .repositories
@@ -1970,7 +1985,10 @@ async fn admin_margin(
         .await
     {
         Ok(complete) => complete,
-        Err(_) => return service_unavailable(),
+        Err(error) => {
+            warn!(error = %error, stage = "vertex_coverage", "owner margin unavailable");
+            return service_unavailable();
+        }
     };
     let mut identities = Vec::with_capacity(users.len());
     for (user_id, email, account_id) in users {
@@ -1985,6 +2003,7 @@ async fn admin_margin(
     // from another. The upstream also validates the explicit month, so a
     // rollover during the request fails closed and the browser retries.
     if current_utc_month() != period {
+        warn!(stage = "utc_month_rollover", "owner margin unavailable");
         return service_unavailable();
     }
     no_store(
@@ -2470,8 +2489,11 @@ mod tests {
         let decorated = decorate_margin(
             serde_json::json!({
                 "generated_at":"2026-08-09T12:01:00.000Z",
-                "rows": [{"account_id":"acct_random","direct_vertex":{"complete":true,"estimated_total_usd_micros":1,
-                    "producer_coverage":{"freshness_max_seconds":300}}}],
+                "rows": [
+                    {"account_id":"acct_random","direct_vertex":{"complete":true,"estimated_total_usd_micros":1,
+                        "producer_coverage":{"freshness_max_seconds":300}}},
+                    {"account_id":"acct_deleted","must_not_leak":"deleted-billing-row"}
+                ],
                 "next_cursor": null
             }),
             &[MarginIdentity {
@@ -2497,6 +2519,13 @@ mod tests {
             "2026-08-09T12:01:01.000Z",
         );
         let account = &decorated["accounts"][0];
+        assert_eq!(decorated["accounts"].as_array().unwrap().len(), 1);
+        assert!(!serde_json::to_string(&decorated)
+            .unwrap()
+            .contains("deleted-billing-row"));
+        assert!(!serde_json::to_string(&decorated)
+            .unwrap()
+            .contains("acct_deleted"));
         assert_eq!(account["email"], "owner@example.com");
         assert!(account.get("account_id").is_none());
         assert_eq!(account["storage_bytes"], 123);

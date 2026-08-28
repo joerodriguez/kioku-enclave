@@ -21600,8 +21600,10 @@ impl ControlStore {
         .await
     }
 
-    /// Resolve only the pseudonymous accounts present on one validated admin
-    /// billing page. Missing, duplicate, or inactive mappings fail closed.
+    /// Resolve the active identities present on one validated admin billing
+    /// page. A deleted account can remain in a billing page until its durable
+    /// detach completes, so absent/inactive mappings are omitted. The admin
+    /// renderer must never expose their pseudonyms.
     pub async fn active_identities_for_billing_accounts(
         &self,
         account_ids: Vec<String>,
@@ -21614,14 +21616,12 @@ impl ControlStore {
             )?;
             let mut identities = Vec::with_capacity(account_ids.len());
             for account_id in account_ids {
-                let identity = statement
+                let Some(identity) = statement
                     .query_row([&account_id], |row| Ok((row.get(0)?, row.get(1)?)))
                     .optional()?
-                    .ok_or_else(|| {
-                        EnclaveError::Config(
-                            "billing margin row has no active enclave identity".into(),
-                        )
-                    })?;
+                else {
+                    continue;
+                };
                 identities.push((identity.0, identity.1, account_id));
             }
             Ok(identities)
