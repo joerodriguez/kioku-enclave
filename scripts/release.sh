@@ -41,7 +41,9 @@ an immutable GitHub Release. No remote state changes occur without --apply.
 
 Options:
   --apply                     Push the already-signed tag and publish the release.
-  --roll                      After publication, invoke the local deployment roll script.
+  --roll                      After publication, invoke the scale-to-zero maintenance roll
+                              for an incompatible release; compatible rolls are separate
+                              staged Terraform changes in the deployment repository.
   --deployment-repo PATH      Checked-out Kioku deployment repository (required by --roll).
   --frozen-commit SHA          Build a detached frozen commit approved by a signed coordinator receipt.
   --coordinator-advancement-receipt PATH

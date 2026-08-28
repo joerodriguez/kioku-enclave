@@ -113,11 +113,12 @@ When releasing a new version or deploying changes to production, follow these st
 2. **GCP Confidential Space Fleet Roll**:
    - A tag does not trigger a hosted build. Run `scripts/local_image_pipeline.py`
      on the reviewed Linux/amd64 builder, then sign and verify its evidence locally.
-   - Roll only through the monorepo's explicit staged Terraform deployment flow. It
-     drains and scales the old fleet to zero, proves no old instances remain, changes the
-     one KMS-authorized digest and instance-template version, then restores at least two
-     homogeneous members behind the passthrough load balancer. Do not substitute an
-     in-place metadata edit or ad hoc instance reset.
+   - Roll only through the monorepo's explicit staged Terraform deployment flow. For a
+     schema/API-compatible release, ADR-0041 separately preauthorizes exactly the reviewed
+     predecessor/candidate pair, rolls the regional MIG with zero unavailable members,
+     retires the predecessor, and restores steady one-digest authority. Incompatible
+     releases retain the scale-to-zero maintenance lane. Do not substitute an in-place
+     metadata edit or ad hoc instance reset.
    - Verify every MIG member reports `kioku-enclave starting version X.Y.Z`, PostgreSQL
      schema readiness, and the shared static TLS generation before reopening admission.
 
