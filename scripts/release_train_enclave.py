@@ -60,6 +60,7 @@ IMAGE_REPOSITORY = re.compile(
     r"[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*\Z"
 )
 GITHUB_REPOSITORY = "joerodriguez/kioku-enclave"
+PREPARE_ARTIFACT_WITNESS = "enclave-prepare-artifact-witness.json"
 _RELEASE_ASSET_NAMES = (
     "enclave-local-build-evidence.json",
     "enclave-local-build-evidence.sig",
@@ -777,6 +778,49 @@ def _artifact(output: Path, *, stage: str = "build") -> tuple[Path, str, str]:
     return artifact, artifact_hash, digest
 
 
+def _prepare_artifact_witness(
+    output: Path,
+    *,
+    commit: str,
+    tree: str,
+    tag: str,
+    version: str,
+    artifact_hash: str,
+    manifest_digest: str,
+) -> Path:
+    """Write the canonical coordinator witness for one validated OCI archive."""
+    if (
+        not COMMIT.fullmatch(commit)
+        or not COMMIT.fullmatch(tree)
+        or not TAG.fullmatch(tag)
+        or not VERSION.fullmatch(version)
+        or tag[1:] != version
+        or not HEX_HASH.fullmatch(artifact_hash)
+        or not DIGEST.fullmatch(manifest_digest)
+    ):
+        fail("prepare artifact witness coordinates are malformed")
+    path = output / PREPARE_ARTIFACT_WITNESS
+    encoded = canonical({
+        "schema": "kioku.enclave.prepare-artifact-witness.v1",
+        "source_commit": commit,
+        "source_ref": tag,
+        "source_tree": tree,
+        "version": version,
+        "oci_archive_sha256": "sha256:" + artifact_hash,
+        # This is a coordinator-recognized top-level field. It deliberately
+        # binds the candidate coordinate to the OCI inner manifest digest,
+        # while oci_archive_sha256 separately binds the archive bytes.
+        "local_manifest_digest": manifest_digest,
+    })
+    try:
+        _image_pipeline.write_immutable_file(path, encoded, "prepare artifact witness")
+        if _read_bound_file(path, label="prepare artifact witness") != encoded:
+            fail("prepare artifact witness changed after it was written")
+    except (OSError, PipelineError) as error:
+        fail(f"cannot bind prepare artifact witness: {error}")
+    return path
+
+
 def _destination() -> str:
     value = _env("KIOKU_RELEASE_DESTINATION")
     if value != "enclave-artifact-registry-release":
@@ -802,8 +846,17 @@ def prepare() -> Mapping[str, Any]:
     # later credential environment from the coordinator.
     _pipeline("build", config, tag, output)
     _verify_frozen_source(commit, tree)
-    artifact_path, _artifact_hash, digest = _artifact(output)
-    files = [artifact_path]
+    artifact_path, artifact_hash, digest = _artifact(output)
+    witness_path = _prepare_artifact_witness(
+        output,
+        commit=commit,
+        tree=tree,
+        tag=tag,
+        version=version,
+        artifact_hash=artifact_hash,
+        manifest_digest=digest,
+    )
+    files = [artifact_path, witness_path]
     for name in ("build-evidence.json", "enclave-sbom.spdx.json", "enclave-scan.json"):
         path = output / name
         if path.exists():

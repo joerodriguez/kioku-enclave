@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib.util
 import base64
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -130,11 +130,23 @@ class LocalImagePipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(pipeline.PipelineError, "must not be a symlink"):
                 pipeline.read_operator_config(config)
 
-    def test_push_scans_before_impersonated_authentication_and_writes_unsigned_evidence(self) -> None:
+    def test_documented_build_then_push_resume_preserves_build_evidence(self) -> None:
         pipeline = load_pipeline()
         calls: list[list[str]] = []
         manifest_bytes = b'{"schemaVersion":2}'
         digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+        scan_database_version = [42]
+        moments = iter(
+            datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+            + timedelta(seconds=30 * index)
+            for index in range(30)
+        )
+
+        class SequencedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = next(moments)
+                return value if tz is None else value.astimezone(tz)
 
         def write_fake_oci_archive(command: list[str]) -> None:
             output = next(value for value in command if value.startswith("type=oci,dest="))
@@ -203,7 +215,7 @@ class LocalImagePipelineTests(unittest.TestCase):
             if command[:2] == ["grype", "--version"]:
                 return SimpleNamespace(stdout="grype 0.116.0\n")
             if command[:3] == ["grype", "db", "status"]:
-                return SimpleNamespace(stdout=json.dumps({"version": 42, "valid": True, "checksum": "c" * 64, "source": "https://grype.anchore.io/databases/vulnerability-db/test", "built": datetime.now(timezone.utc).isoformat()}) + "\n")
+                return SimpleNamespace(stdout=json.dumps({"version": scan_database_version[0], "valid": True, "checksum": "c" * 64, "source": "https://grype.anchore.io/databases/vulnerability-db/test", "built": "2026-08-28T11:59:00+00:00"}) + "\n")
             if command[:2] == ["gcloud", "version"]:
                 return SimpleNamespace(
                     stdout="Google Cloud SDK 580.0.0\nbq 2.1.23\ngsutil 5.36\n"
@@ -263,9 +275,12 @@ class LocalImagePipelineTests(unittest.TestCase):
         original_archive_digest = pipeline.immutable_source_archive_digest
         original_subset_digest = pipeline.immutable_source_subset_digest
         original_create_evidence = pipeline.create_release_evidence
+        original_validate_resume_evidence = pipeline.validate_resume_evidence
+        original_datetime = pipeline.datetime
         original_argv = sys.argv
         pipeline.run = fake_run
         pipeline.verify = lambda: calls.append(["verify"])
+        pipeline.datetime = SequencedDateTime
         pipeline.source_snapshot = lambda commit, **kwargs: nullcontext(ROOT)
         pipeline.immutable_source_archive_digest = lambda commit: "d" * 64
         subset_digest_calls: list[tuple[str, ...]] = []
@@ -275,6 +290,10 @@ class LocalImagePipelineTests(unittest.TestCase):
             return "e" * 64 if paths == ("Cargo.toml", "Cargo.lock") else "f" * 64
 
         pipeline.immutable_source_subset_digest = fake_subset_digest
+        pipeline.validate_resume_evidence = lambda *args, **kwargs: (
+            calls.append(["validate-resume-evidence", kwargs["requested_stage"]]),
+            original_validate_resume_evidence(*args, **kwargs),
+        )[-1]
         pipeline.temporary_docker_login = (
             lambda registry, docker_config, access_token: (
                 calls.append(["temporary-docker-login", registry, str(docker_config), "token-redacted"]),
@@ -288,9 +307,8 @@ class LocalImagePipelineTests(unittest.TestCase):
                 config = directory / "operator.env"
                 output = directory / "evidence"
                 write_config(config)
-                sys.argv = [
+                common_arguments = [
                     str(SCRIPTS / "local_image_pipeline.py"),
-                    "push",
                     "--config",
                     str(config),
                     "--output-dir",
@@ -313,8 +331,242 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "CLOUDSDK_CONFIG": str(cloud_config),
                 }, clear=False):
                     pipeline.os.environ.pop("SSH_AUTH_SOCK", None)
+                    sys.argv = [common_arguments[0], "build", *common_arguments[1:]]
                     pipeline.main()
-                evidence = json.loads((output / "build-evidence.json").read_text())
+                    build_evidence = (output / "build-evidence.json").read_bytes()
+                    scan_outputs_before_resume = {
+                        name: (output / name).read_bytes()
+                        for name in ("enclave-sbom.spdx.json", "enclave-scan.json")
+                    }
+                    sys.argv = [common_arguments[0], "push", *common_arguments[1:], "--resume"]
+                    scan_database_version[0] = 43
+                    calls_before_scan_miss = len(calls)
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    scan_miss_calls = calls[calls_before_scan_miss:]
+                    self.assertEqual(
+                        {
+                            name: (output / name).read_bytes()
+                            for name in ("enclave-sbom.spdx.json", "enclave-scan.json")
+                        },
+                        scan_outputs_before_resume,
+                    )
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["syft"]
+                            and len(command) > 1
+                            and command[1] != "--version"
+                            for command in scan_miss_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["grype"]
+                            and len(command) > 1
+                            and command[1].startswith("sbom:")
+                            for command in scan_miss_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            command[0] == "gcloud"
+                            and command[-2:] == ["auth", "print-access-token"]
+                            for command in scan_miss_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in scan_miss_calls)
+                    )
+                    scan_database_version[0] = 42
+                    pipeline.main()
+                    evidence_path = output / "build-evidence.json"
+                    evidence = json.loads(evidence_path.read_text())
+                    self.assertEqual(evidence_path.read_bytes(), build_evidence)
+                    push_receipts = pipeline.stage_receipt_candidates(output, "push")
+                    self.assertEqual(len(push_receipts), 1)
+                    push_outputs = push_receipts[0]["outputs"]
+                    self.assertIsInstance(push_outputs, dict)
+                    self.assertEqual(push_outputs["image_digest"], digest)
+
+                    def output_snapshot() -> dict[str, tuple[bytes, str]]:
+                        return {
+                            path.name: (
+                                path.read_bytes(),
+                                hashlib.sha256(path.read_bytes()).hexdigest(),
+                            )
+                            for path in output.iterdir()
+                            if path.name != ".run.lock" and path.is_file()
+                        }
+
+                    outputs_before_second_resume = output_snapshot()
+                    calls_before_second_resume = len(calls)
+                    pipeline.main()
+                    second_resume_calls = calls[calls_before_second_resume:]
+                    self.assertEqual(output_snapshot(), outputs_before_second_resume)
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in second_resume_calls)
+                    )
+                    self.assertFalse(
+                        any(
+                            command[:2]
+                            == [sys.executable, str(SCRIPTS / "local_build_evidence.py")]
+                            for command in second_resume_calls
+                        )
+                    )
+                    impersonated_second_resume = [
+                        command
+                        for command in second_resume_calls
+                        if command[:1] == ["gcloud"]
+                        and len(command) > 1
+                        and command[1].startswith("--impersonate-service-account=")
+                    ]
+                    self.assertEqual(len(impersonated_second_resume), 1)
+                    self.assertIn("describe", impersonated_second_resume[0])
+
+                    manifest_path = output / "enclave-local-build-evidence.json"
+                    manifest_bytes = manifest_path.read_bytes()
+                    manifest_path.unlink()
+                    calls_before_invalid_evidence_receipt = len(calls)
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    invalid_evidence_calls = calls[calls_before_invalid_evidence_receipt:]
+                    self.assertFalse(manifest_path.exists())
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["gcloud"]
+                            and len(command) > 1
+                            and command[1].startswith("--impersonate-service-account=")
+                            for command in invalid_evidence_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in invalid_evidence_calls)
+                    )
+                    self.assertFalse(
+                        any(
+                            command[:2]
+                            == [sys.executable, str(SCRIPTS / "local_build_evidence.py")]
+                            for command in invalid_evidence_calls
+                        )
+                    )
+                    manifest_path.write_bytes(manifest_bytes)
+                    manifest_path.chmod(0o600)
+
+                    evidence_receipt_path = next(output.glob("evidence-receipt-*.json"))
+                    evidence_receipt_bytes = evidence_receipt_path.read_bytes()
+                    evidence_receipt_path.unlink()
+                    calls_before_orphan_final_outputs = len(calls)
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    orphan_final_calls = calls[calls_before_orphan_final_outputs:]
+                    self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["gcloud"]
+                            and len(command) > 1
+                            and command[1].startswith("--impersonate-service-account=")
+                            for command in orphan_final_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in orphan_final_calls)
+                    )
+                    self.assertFalse(
+                        any(
+                            command[:2]
+                            == [sys.executable, str(SCRIPTS / "local_build_evidence.py")]
+                            for command in orphan_final_calls
+                        )
+                    )
+                    evidence_receipt_path.write_bytes(evidence_receipt_bytes)
+                    evidence_receipt_path.chmod(0o600)
+
+                    push_receipt_path = next(output.glob("push-receipt-*.json"))
+                    push_receipt_bytes = push_receipt_path.read_bytes()
+                    push_receipt_path.write_bytes(push_receipt_bytes + b" ")
+                    calls_before_invalid_push_receipt = len(calls)
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    invalid_push_calls = calls[calls_before_invalid_push_receipt:]
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["gcloud"]
+                            and len(command) > 1
+                            and command[1].startswith("--impersonate-service-account=")
+                            for command in invalid_push_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in invalid_push_calls)
+                    )
+                    push_receipt_path.write_bytes(push_receipt_bytes)
+
+                    evidence_path.unlink()
+                    calls_before_missing_evidence = len(calls)
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    missing_evidence_calls = calls[calls_before_missing_evidence:]
+                    self.assertFalse(evidence_path.exists())
+                    self.assertFalse(
+                        any(
+                            command[:1] == ["gcloud"]
+                            and len(command) > 1
+                            and command[1].startswith("--impersonate-service-account=")
+                            for command in missing_evidence_calls
+                        )
+                    )
+                    self.assertFalse(
+                        any(command[:2] == ["skopeo", "copy"] for command in missing_evidence_calls)
+                    )
+                    evidence_path.write_bytes(build_evidence)
+                    evidence_path.chmod(0o600)
+
+                    for field, value in (
+                        ("created_at", "2026-08-28T12:00:01Z"),
+                        ("completed_at", "2026-08-28T12:01:01Z"),
+                    ):
+                        with self.subTest(field=field):
+                            timestamp_poisoned = dict(evidence, **{field: value})
+                            evidence_path.write_text(
+                                json.dumps(timestamp_poisoned, sort_keys=True, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
+                            calls_before_timestamp_poison = len(calls)
+                            with self.assertRaises(SystemExit) as raised:
+                                pipeline.main()
+                            self.assertEqual(raised.exception.code, 1)
+                            timestamp_poison_calls = calls[calls_before_timestamp_poison:]
+                            self.assertFalse(
+                                any(
+                                    command[:1] == ["gcloud"]
+                                    and len(command) > 1
+                                    and command[1].startswith("--impersonate-service-account=")
+                                    for command in timestamp_poison_calls
+                                )
+                            )
+                            self.assertFalse(
+                                any(
+                                    command[:2] == ["skopeo", "copy"]
+                                    for command in timestamp_poison_calls
+                                )
+                            )
+                            evidence_path.write_bytes(build_evidence)
+
+                    calls_before_poisoned_resume = len(calls)
+                    poisoned = dict(evidence, source_commit="9" * 40)
+                    evidence_path.write_text(
+                        json.dumps(poisoned, sort_keys=True, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(SystemExit) as raised:
+                        pipeline.main()
+                    self.assertEqual(raised.exception.code, 1)
+                    poisoned_resume_calls = calls[calls_before_poisoned_resume:]
         finally:
             pipeline.run = original_run
             pipeline.verify = original_verify
@@ -323,10 +575,26 @@ class LocalImagePipelineTests(unittest.TestCase):
             pipeline.immutable_source_archive_digest = original_archive_digest
             pipeline.immutable_source_subset_digest = original_subset_digest
             pipeline.create_release_evidence = original_create_evidence
+            pipeline.validate_resume_evidence = original_validate_resume_evidence
+            pipeline.datetime = original_datetime
             sys.argv = original_argv
 
         self.assertFalse(evidence["signed"])
-        self.assertEqual(evidence["image_digest"], digest)
+        self.assertNotIn("image_digest", evidence)
+        self.assertEqual(evidence["created_at"], "2026-08-28T12:00:00Z")
+        self.assertFalse(
+            any(
+                command[0] == "gcloud" and command[-2:] == ["auth", "print-access-token"]
+                for command in poisoned_resume_calls
+            )
+        )
+        self.assertFalse(
+            any(command[:2] == ["skopeo", "copy"] for command in poisoned_resume_calls)
+        )
+        self.assertEqual(
+            len([command for command in calls if command[:3] == ["docker", "buildx", "build"]]),
+            1,
+        )
         build = next(command for command in calls if command[:3] == ["docker", "buildx", "build"])
         self.assertIn("linux/amd64", build)
         self.assertIn("--output", build)
@@ -342,9 +610,11 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertFalse(any("GCS_" in argument for argument in build))
         scan_index = next(index for index, command in enumerate(calls) if command and command[0] == "grype" and "sbom:" in command[1])
         auth_index = next(index for index, command in enumerate(calls) if command[:3] == ["gcloud", "--impersonate-service-account=local-builder@kioku-joerodriguez.iam.gserviceaccount.com", "auth"])
+        validation_index = next(index for index, command in enumerate(calls) if command[:1] == ["validate-resume-evidence"])
         login_index = next(index for index, command in enumerate(calls) if command[:1] == ["temporary-docker-login"])
         push_index = next(index for index, command in enumerate(calls) if command[:2] == ["skopeo", "copy"])
         self.assertLess(scan_index, auth_index)
+        self.assertLess(validation_index, auth_index)
         self.assertLess(auth_index, login_index)
         self.assertLess(login_index, push_index)
         evidence_command = next(
@@ -353,6 +623,14 @@ class LocalImagePipelineTests(unittest.TestCase):
             if command[:2] == [sys.executable, str(SCRIPTS / "local_build_evidence.py")]
         )
         self.assertIn("gcloud=Google Cloud SDK 580.0.0", evidence_command)
+        self.assertEqual(
+            evidence_command[evidence_command.index("--created-at") + 1],
+            "2026-08-28T12:02:30Z",
+        )
+        self.assertEqual(
+            evidence_command[evidence_command.index("--image-digest") + 1],
+            digest,
+        )
         self.assertIn("--expected-sbom-sha256", evidence_command)
         self.assertIn("--expected-scan-sha256", evidence_command)
         self.assertFalse(any("\n" in argument for argument in evidence_command))
@@ -563,6 +841,29 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertRegex(receipt.name, r"^push-receipt-[0-9a-f]{64}\.json$")
             self.assertIsNotNone(pipeline.valid_stage_receipt(directory, "push", inputs))
             self.assertIsNone(pipeline.valid_stage_receipt(directory, "push", {**inputs, "source_commit": "d" * 40}))
+
+    def test_resume_direction_is_forward_only_after_push_receipt(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pipeline.write_stage_receipt(
+                directory,
+                "push",
+                {"source_commit": "a" * 40},
+                {"image_digest": "sha256:" + "c" * 64},
+            )
+            pipeline.validate_resume_direction(directory, "push")
+            with self.assertRaisesRegex(pipeline.PipelineError, "cannot resume build"):
+                pipeline.validate_resume_direction(directory, "build")
+        for stage in ("push", "evidence"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                malformed = directory / f"{stage}-receipt-{'f' * 64}.json"
+                malformed.write_text("not-json\n", encoding="utf-8")
+                malformed.chmod(0o600)
+                pipeline.validate_resume_direction(directory, "push")
+                with self.assertRaisesRegex(pipeline.PipelineError, "cannot resume build"):
+                    pipeline.validate_resume_direction(directory, "build")
 
     def test_receipt_symlink_and_lock_poisoning_are_rejected(self) -> None:
         pipeline = load_pipeline()
@@ -817,7 +1118,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 "cargo_lock_sha256": "f" * 64,
                 "builder_mode": "native-linux-amd64",
                 "fallback": False,
-                "image_digest": None,
+                "created_at": "2026-08-15T00:00:00Z",
                 "completed_at": "2026-08-15T00:00:00Z",
             }
             pipeline.write_evidence(path, evidence)
@@ -1013,6 +1314,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 "artifact_manifest_digest": digest,
                 "builder_mode": "native-linux-amd64",
                 "builder_post": after,
+                "created_at": "2026-08-28T12:00:00Z",
             }
             payload = {"inputs": {"builder": before}, "outputs": outputs}
             self.assertFalse(pipeline.validate_receipt_outputs(Path(temporary_directory), "build", payload))
@@ -1248,7 +1550,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 pipeline.os.environ["DOCKER_TLS_VERIFY"] = "1"
                 self.assertTrue(pipeline.native_linux_builder())
 
-    def test_multiple_matching_receipts_are_ambiguous(self) -> None:
+    def test_multiple_valid_push_receipts_with_different_inputs_are_ambiguous(self) -> None:
         pipeline = load_pipeline()
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = Path(temporary_directory)
@@ -1258,7 +1560,7 @@ class LocalImagePipelineTests(unittest.TestCase):
             second_payload = {
                 "schema_version": 1,
                 "stage": "push",
-                "inputs": {"source_commit": "a" * 40},
+                "inputs": {"source_commit": "b" * 40},
                 "outputs": {"image_digest": "sha256:" + "2" * 64},
             }
             encoded = (json.dumps(second_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -1268,6 +1570,40 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertNotEqual(first, second)
             with self.assertRaisesRegex(pipeline.PipelineError, "ambiguous"):
                 pipeline.valid_stage_receipt(output, "push", {"source_commit": "a" * 40})
+
+    def test_multiple_valid_evidence_receipts_with_different_inputs_are_ambiguous(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            manifest = output / "enclave-local-build-evidence.json"
+            metadata = output / "enclave-release.json"
+            for path in (manifest, metadata):
+                path.write_text("{}\n", encoding="utf-8")
+                path.chmod(0o600)
+            outputs = {
+                "manifest": str(manifest),
+                "manifest_sha256": pipeline.sha256(manifest),
+                "metadata": str(metadata),
+                "metadata_sha256": pipeline.sha256(metadata),
+            }
+            pipeline.write_stage_receipt(
+                output,
+                "evidence",
+                {"image_digest": "sha256:" + "1" * 64},
+                outputs,
+            )
+            pipeline.write_stage_receipt(
+                output,
+                "evidence",
+                {"image_digest": "sha256:" + "2" * 64},
+                outputs,
+            )
+            with self.assertRaisesRegex(pipeline.PipelineError, "ambiguous"):
+                pipeline.valid_stage_receipt(
+                    output,
+                    "evidence",
+                    {"image_digest": "sha256:" + "1" * 64},
+                )
 
     def test_scan_receipt_must_bind_the_build_artifact(self) -> None:
         pipeline = load_pipeline()
@@ -1281,6 +1617,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                 "inputs": {
                     "artifact_sha256": "a" * 64,
                     "artifact_manifest_digest": "sha256:" + "b" * 64,
+                    "build_created_at": "2026-08-28T12:00:00Z",
                 },
                 "outputs": {
                     "artifact_sha256": "c" * 64,
@@ -1289,6 +1626,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     "sbom_sha256": pipeline.sha256(output / "enclave-sbom.spdx.json"),
                     "scan_path": str(output / "enclave-scan.json"),
                     "scan_sha256": pipeline.sha256(output / "enclave-scan.json"),
+                    "completed_at": "2026-08-28T12:01:00Z",
                 },
             }
             self.assertFalse(pipeline.validate_receipt_outputs(output, "scan", payload))
