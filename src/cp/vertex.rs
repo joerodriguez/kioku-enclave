@@ -126,6 +126,10 @@ pub struct MediaGeneration {
     pub text: String,
     pub metadata: VertexMetadata,
     pub latency_ms: u64,
+    /// Durable usage-ledger identity minted before the provider request.
+    /// PostgreSQL workers re-drive terminal settlement against this exact
+    /// identity after a successful response.
+    pub event_id: String,
 }
 
 fn bounded_output_tokens(requested: u32) -> u32 {
@@ -498,8 +502,7 @@ async fn send_media_request(
     // refuses here — before any provider traffic — instead of egressing
     // without a durable billing intent.
     if pinned_invocation.is_some()
-        && state.repositories.uses_legacy_state()
-        && !state.store.is_wal_authoritative(user_id)
+        && (!state.repositories.uses_legacy_state() || !state.store.is_wal_authoritative(user_id))
     {
         return Err(EnclaveError::Store(
             "pinned media invocation requires a WAL-authoritative user".into(),
@@ -591,6 +594,7 @@ async fn send_media_request(
         text,
         metadata,
         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        event_id: invocation,
     })
 }
 
