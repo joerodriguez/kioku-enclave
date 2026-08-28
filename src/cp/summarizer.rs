@@ -65,7 +65,13 @@ const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
 const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
-const MAX_WINDOWS_PER_SWEEP: u32 = 1;
+/// Both an interactive finish trigger and the durable recurring backstop may
+/// inherit a cursor at the seven-day lookback floor. Walk enough proven-empty
+/// six-hour windows to reach the live tail in one bounded pass. The caller
+/// stops at the first result that may have invoked the model, so this bound
+/// never stacks multiple summarizer model calls for one user in one wakeup.
+const SPARSE_LOOKBACK_MAX_WINDOWS: u32 =
+    ((LOOKBACK_DAYS * 24 + MAX_WINDOW_HOURS - 1) / MAX_WINDOW_HOURS) as u32 + 1;
 const CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 2_048;
 /// First delay after a window is derived, paid for, and then refused at
 /// submit time. Deliberately longer than one [`SCHEDULER_INTERVAL_SECS`]
@@ -2145,9 +2151,11 @@ async fn fetch_open_episodes(
 
 /// Sweep all users (internal cron). Sequential to avoid Vertex rate-limit storms.
 ///
-/// Per user, keeps running windows while the cursor is making forward progress
-/// (bounded) so a cold-start backfill — up to 7 d ÷ 6 h = 28 windows — catches
-/// up within one tick instead of one window per 10-min tick (~5 h).
+/// The recurring backstop crosses only proven-empty windows and stops after
+/// the first non-empty/model outcome. This also repairs a settled session
+/// whose process-local finish hint was lost before a deploy or restart: the
+/// durable account cursor and capture evidence are rediscovered on the first
+/// scheduler tick without stacking model calls.
 pub async fn summarize_all(state: &CpState) {
     let ids = match state.repositories.work().active_account_ids().await {
         Ok(ids) => ids,
@@ -2167,23 +2175,28 @@ pub async fn summarize_all(state: &CpState) {
     let failing = FAILING.get_or_init(|| Mutex::new(HashMap::new()));
 
     for id in ids {
-        for _ in 0..MAX_WINDOWS_PER_SWEEP {
+        for _ in 0..SPARSE_LOOKBACK_MAX_WINDOWS {
             match summarize_user(state, &id).await {
-                // Cursor advanced (episodes emitted or empty span consumed) —
-                // there may be more backlog; keep going. NOT on "quota": that
-                // skip does not advance and retrying would hammer Vertex.
-                Ok(v)
-                    if v.get("to").is_some()
-                        || v.get("reason").and_then(|r| r.as_str()) == Some("no_new_records") =>
-                {
+                // Empty spans perform no model work and are safe to traverse
+                // in one bounded wakeup. Any non-empty success (`to`), hold,
+                // claim, quota response, or error stops this user's pass.
+                Ok(v) if should_cross_proven_empty_window(&v) => {
                     failing.lock().await.remove(&id);
                     // Every advanced window PUTs control.db.enc, and GCS
                     // rate-limits writes to one object to ~1/sec. Windows with
                     // records pace themselves via the LLM call, but empty
-                    // (no_new_records) windows complete in ms — observed live
-                    // as 429 Too Many Requests killing the sweep. Pace them.
-                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    // windows complete in ms. Preserve the established legacy
+                    // pacing; PostgreSQL cursor rows need no artificial wait.
+                    pace_legacy_cursor_write(state).await;
                     continue;
+                }
+                Ok(v) if v.get("to").is_some() => {
+                    failing.lock().await.remove(&id);
+                    // Preserve the legacy post-cursor-write pause before the
+                    // finalization tail can rewrite the same Control object.
+                    // PostgreSQL remains a no-op here.
+                    pace_legacy_cursor_write(state).await;
+                    break;
                 }
                 // A failed window that did not advance: count consecutive
                 // failures of the SAME window; skip past it once it's clearly
@@ -2221,8 +2234,12 @@ pub async fn summarize_all(state: &CpState) {
                         warn!(user_id = %id, error = %e, "failed to skip stuck window");
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(1200)).await;
-                    continue;
+                    // The failed call already spent this wakeup's one model
+                    // attempt. Pace its legacy cursor write before the
+                    // finalization tail, then leave later evidence for the
+                    // next scheduler tick.
+                    pace_legacy_cursor_write(state).await;
+                    break;
                 }
                 // Caught up ("skipped"), holding for the tail ("waiting"), or
                 // quota — done with this user for now.
@@ -2272,10 +2289,6 @@ async fn finalize_and_deliver_user(state: &CpState, id: &str) {
 /// 10-minute sweep remains the correctness backstop.
 static SESSION_SETTLED_KICKS: OnceLock<tokio::sync::mpsc::UnboundedSender<String>> =
     OnceLock::new();
-
-/// Suppress repeat kicks for the same user within this window (rapid
-/// stop/start, one kick per completed media work unit).
-const KICK_DEBOUNCE_SECS: u64 = 30;
 
 /// Hint that `user_id`'s live tail may have just settled (a session finished
 /// or its last media work completed). Cheap, non-blocking, and safe to call
@@ -2336,18 +2349,64 @@ async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
     }
 }
 
+fn should_cross_proven_empty_window(value: &Value) -> bool {
+    value.get("reason").and_then(Value::as_str) == Some("no_new_records")
+}
+
+async fn pace_legacy_cursor_write(state: &CpState) {
+    if state.repositories.memory_formation().is_none() {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+}
+
 async fn summarize_session_settled(state: &CpState, user_id: &str) {
     if !session_tail_is_settled(state, user_id).await {
         return;
     }
-    match summarize_user_window(state, user_id, SummarizeMode::SessionSettled).await {
-        Ok(_) => {}
-        Err(e) => {
-            warn!(user_id, error = %e, "session-settled summarize failed");
-            return;
+
+    // A new/stale cursor begins as far as seven days behind. Each ordinary
+    // run is deliberately capped at six hours, so a single finish kick used
+    // to advance one empty window and then wait for the 10-minute cron. In the
+    // worst case today's recording needed roughly 28 ticks (~4h40m) before it
+    // was even offered to the model. Empty-window advancement is already the
+    // safe path: it first checks the recoverable-media hold and refuses to
+    // move past unsettled evidence. Keep following only that explicit result;
+    // any model call, hold, claim, quota response, or error stops this trigger.
+    for _ in 0..SPARSE_LOOKBACK_MAX_WINDOWS {
+        match summarize_user_window(state, user_id, SummarizeMode::SessionSettled).await {
+            Ok(value) if should_cross_proven_empty_window(&value) => {
+                pace_legacy_cursor_write(state).await;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(user_id, error = %e, "session-settled summarize failed");
+                return;
+            }
         }
     }
     finalize_and_deliver_user(state, user_id).await;
+}
+
+/// Collapse only the kicks already waiting in the channel. Unlike a
+/// time-based debounce, this cannot discard the meaningful media-complete
+/// kick merely because an earlier session-finish hint found pending work.
+/// A kick arriving while formation is running remains queued for a fresh
+/// settled-gate check afterwards.
+fn coalesced_kick_batch(
+    first_user_id: String,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut users = Vec::new();
+    if seen.insert(first_user_id.clone()) {
+        users.push(first_user_id);
+    }
+    while let Ok(user_id) = receiver.try_recv() {
+        if seen.insert(user_id.clone()) {
+            users.push(user_id);
+        }
+    }
+    users
 }
 
 /// Spawn the internal summarizer cron (replaces Cloud Scheduler). Sweeps every
@@ -2357,20 +2416,17 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _ = SESSION_SETTLED_KICKS.set(sender);
     tokio::spawn(async move {
+        // Tokio's first interval tick is immediately ready. That first
+        // durable sweep is the restart recovery for completed sessions whose
+        // earlier process-local kick no longer exists.
         let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_INTERVAL_SECS));
-        let mut last_kick: HashMap<String, std::time::Instant> = HashMap::new();
         loop {
             tokio::select! {
                 _ = tick.tick() => summarize_all(&state).await,
-                Some(user_id) = receiver.recv() => {
-                    let debounced = last_kick.get(&user_id).is_some_and(|at| {
-                        at.elapsed() < Duration::from_secs(KICK_DEBOUNCE_SECS)
-                    });
-                    if debounced {
-                        continue;
+                Some(first_user_id) = receiver.recv() => {
+                    for user_id in coalesced_kick_batch(first_user_id, &mut receiver) {
+                        summarize_session_settled(&state, &user_id).await;
                     }
-                    last_kick.insert(user_id.clone(), std::time::Instant::now());
-                    summarize_session_settled(&state, &user_id).await;
                 }
             }
         }
@@ -2414,9 +2470,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_summarization_is_bounded_to_one_window_per_sweep() {
-        assert_eq!(MAX_WINDOWS_PER_SWEEP, 1);
+    fn automatic_summarization_crosses_sparse_history_without_stacking_model_work() {
+        assert!(
+            i64::from(SPARSE_LOOKBACK_MAX_WINDOWS) * MAX_WINDOW_HOURS > LOOKBACK_DAYS * 24,
+            "the first durable scheduler tick can rediscover today's evidence"
+        );
+        assert!(should_cross_proven_empty_window(&json!({
+            "skipped": true,
+            "reason": "no_new_records"
+        })));
+        assert!(!should_cross_proven_empty_window(&json!({
+            "episodes": 1,
+            "to": "2026-08-28T12:00:00.000Z"
+        })));
         assert_eq!(CLASSIFIER_MAX_OUTPUT_TOKENS, 2_048);
+    }
+
+    #[test]
+    fn session_settled_trigger_can_cross_the_complete_sparse_lookback() {
+        assert!(
+            i64::from(SPARSE_LOOKBACK_MAX_WINDOWS) * MAX_WINDOW_HOURS > LOOKBACK_DAYS * 24,
+            "one finish trigger must reach today's evidence from the oldest allowed cursor"
+        );
+    }
+
+    #[test]
+    fn session_settled_repeats_only_after_a_proven_empty_advance() {
+        assert!(should_cross_proven_empty_window(&json!({
+            "skipped": true,
+            "reason": "no_new_records"
+        })));
+        for terminal_for_this_trigger in [
+            json!({ "waiting": true }),
+            json!({ "skipped": true, "reason": "recoverable_media_pending" }),
+            json!({ "skipped": true, "reason": "summary_window_claimed" }),
+            json!({ "skipped": true, "reason": "quota" }),
+            json!({ "episodes": 1, "to": "2026-08-28T12:00:00.000Z" }),
+            json!({ "error": "model_call" }),
+        ] {
+            assert!(!should_cross_proven_empty_window(
+                &terminal_for_this_trigger
+            ));
+        }
+    }
+
+    #[test]
+    fn kick_coalescing_drops_queued_duplicates_but_not_a_later_kick() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        for user_id in ["alice", "alice", "bob", "alice"] {
+            sender.send(user_id.to_string()).unwrap();
+        }
+
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(
+            coalesced_kick_batch(first, &mut receiver),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+
+        // This models media completion arriving after an earlier finish hint
+        // was handled. It must form a new batch regardless of wall-clock gap.
+        sender.send("alice".to_string()).unwrap();
+        let later = receiver.try_recv().unwrap();
+        assert_eq!(
+            coalesced_kick_batch(later, &mut receiver),
+            vec!["alice".to_string()]
+        );
     }
 
     const MIN: i64 = 60 * 1000;

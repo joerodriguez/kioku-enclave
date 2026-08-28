@@ -883,6 +883,16 @@ pub(super) async fn validated_authorization_request(
 }
 
 async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery>) -> Response {
+    // The owned dashboard reaches this generic route for Google as well as the
+    // Apple-specific wrapper. Ensure its fixed client here so a fresh control
+    // store never depends on Apple sign-in having run first.
+    if q.client_id
+        .as_deref()
+        .is_some_and(uses_owned_web_sign_in_copy)
+        && ensure_first_party_web_client(&s).await.is_err()
+    {
+        return server_error();
+    }
     let state = match validated_authorization_request(&s, q).await {
         Ok(state) => state,
         Err(response) => return response,
