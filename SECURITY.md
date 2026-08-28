@@ -1967,8 +1967,10 @@ key-ring, and key binding whose resolved role contains direct or delegated KMS d
 this is required because inherited roles such as project Owner can otherwise decrypt even
 when the key-local policy contains no human member. A fail-closed rollout guard resolves
 predefined and custom role permissions and audits all three policy levels against the
-exact live digest. Changing code or baked configuration changes the image digest and loses
-the allow binding. The launch policy permits only `PORT`, so an operator cannot replace
+exact live digest set: one digest in steady state, or only the separately reviewed
+predecessor/candidate pair during a bounded compatible fleet roll. Changing code or baked
+configuration changes the image digest and loses the allow binding. The launch policy
+permits only `PORT`, so an operator cannot replace
 KMS coordinates, trusted callers, auth policy, TLS policy, or the legacy-blob gate through
 VM metadata.
 
@@ -1985,8 +1987,10 @@ every predefined and custom role; and reject both
 `cloudkms.cryptoKeyVersions.useToDecrypt` and
 `cloudkms.cryptoKeyVersions.useToDecryptViaDelegation` everywhere except the exact
 digest-scoped workload principal on the KEK. Confirm that
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` has exactly that one member—no `user:`,
-`group:`, or `serviceAccount:` member. The key-local check alone is insufficient.
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` has exactly the stage-authorized one or two
+digest-scoped workload members—no `user:`, `group:`, or `serviceAccount:` member. The
+key-local check alone is insufficient. A compatible roll is complete only after every MIG
+member runs the candidate and the predecessor member is removed.
 
 ### T2 — Compromised client token or legacy caller
 

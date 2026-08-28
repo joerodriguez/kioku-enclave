@@ -567,17 +567,21 @@ password nor signing secret is a Docker build argument or launch metadata value.
 production build arguments nor launch-policy overrides.
 
 Provider pacing, claims, circuit state, quotas, and request admission are durable and
-fleet-wide in PostgreSQL. A production roll requires `scripts/release.sh --roll` to match
-a reviewed deployment commit and the canonical inventory/digest of every Terraform root
-source. The pinned source defines the staged scale-to-zero regional MIG and reserved
-public address; the
+fleet-wide in PostgreSQL. Production image publication and deployment must match a reviewed
+deployment commit and the canonical inventory/digest of every Terraform root source. The
+pinned source defines the regional MIG, reserved public address, and a staged
+compatible-release lane that admits only the exact predecessor/candidate digest pair while
+replacing members with zero unavailable capacity. Incompatible releases retain the staged
+scale-to-zero lane; `scripts/release.sh --roll` invokes only that maintenance lane and is
+not the ordinary compatible-release path. The
 checkout must be clean, and the exact seal is bound before network access and
 rechecked at the roll boundary. Release invokes only the pinned tracked
 `scripts/local-operations.sh` and passes that seal through; the deployment owner
 recomputes it after acquiring the production-infrastructure lock and before GCP
 credentials, planning, or apply. Any deployment-source change requires a reviewed
-pin update. Release stages must prove zero old instances before changing the one
-KMS-authorized digest; ordinary serving then keeps at least two PostgreSQL-backed members.
+pin update. Compatible release stages must prove homogeneous candidate membership before
+retiring the predecessor digest; the maintenance lane must prove zero old instances before
+changing sole KMS authority. Ordinary serving keeps at least two PostgreSQL-backed members.
 
 ## Local verification and release evidence
 
