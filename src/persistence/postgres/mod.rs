@@ -374,6 +374,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{PostgresPersistence, PostgresPoolConfig};
+    use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
     use crate::gcs::FakeGcs;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
@@ -382,14 +383,15 @@ mod tests {
         RefreshTokenRotation,
     };
     use crate::persistence::{
-        CaptureCommit, CapturePreflight, CaptureSessionStage, EmailProviderOutcome,
-        EpisodeDeletionStart, EpisodeInput, EpisodeListRequest, FinalizationRequest,
-        FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery, FrozenPushDelivery,
-        FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest,
-        MediaProcessingClass, MediaScreenProjection, MediaUsageSettlement, MemoryFeedRequest,
-        PeopleListRequest, PushInstallation, PushProviderOutcome, RecordingRetentionChangeRequest,
-        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
-        WebhookProviderOutcome, WebhookSubscription,
+        AudioMediaSettlement, CaptureCommit, CapturePreflight, CaptureSessionStage,
+        EmailProviderOutcome, EpisodeDeletionStart, EpisodeInput, EpisodeListRequest,
+        FinalizationRequest, FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
+        FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
+        McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
+        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
+        PushProviderOutcome, RecordingRetentionChangeRequest, ScreenMediaSettlement,
+        ScreenshotMediaLocator, SummaryWindowSettlement, WebhookProviderOutcome,
+        WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
@@ -3093,5 +3095,205 @@ mod tests {
                 .await,
             Err(crate::error::EnclaveError::Auth(_))
         ));
+
+        // A short answer to a direct name question may identify that answer's
+        // speaker. A later speaker repeating or expanding the name must not
+        // create a second Person, even if the model incorrectly labels the
+        // expansion as that later speaker's self-identification.
+        let identity_account = repositories
+            .identity_sessions()
+            .upsert_subject_account(
+                "voice-name-regression-subject",
+                "voice-name-regression@example.com",
+                11,
+            )
+            .await
+            .unwrap();
+        let audio_manifest: crate::cp::media::CaptureEventManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "event_id": "voice-name-regression-event",
+                "device_id": "voice-name-regression-device",
+                "install_id": "voice-name-regression-install",
+                "capture_session_id": "voice-name-regression-session",
+                "stream_id": "voice-name-regression-stream",
+                "stream_kind": "mic",
+                "sequence": 0,
+                "source_wall_at": "2026-08-27T13:00:00.000Z",
+                "source_monotonic_ns": 1_000_u64,
+                "started_at": "2026-08-27T13:00:00.000Z",
+                "ended_at": "2026-08-27T13:00:05.000Z",
+                "timezone_id": "America/New_York",
+                "utc_offset_minutes": -240,
+                "clock_uncertainty_ms": 10,
+                "media": {
+                    "asset_id": "voice-name-regression-asset",
+                    "mime_type": "audio/mp4",
+                    "codec": "aac",
+                    "byte_length": 12,
+                    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "sample_rate": 48_000,
+                    "channels": 1,
+                    "frame_count": 240_000
+                },
+                "context": null,
+                "audio_role": "mixed"
+            }))
+            .unwrap();
+        audio_manifest.validate().unwrap();
+        let audio_digest = crate::cp::media::manifest_digest(&audio_manifest).unwrap();
+        let audio_object_key = crate::gcs::canonical_capture_media_object_key(
+            &identity_account.id,
+            &audio_manifest.media.as_ref().unwrap().asset_id,
+        )
+        .unwrap();
+        let audio_upload_token = repositories
+            .captures()
+            .reserve_media_upload(
+                &identity_account.id,
+                &audio_manifest.event_id,
+                &audio_manifest.media.as_ref().unwrap().asset_id,
+                &audio_object_key,
+                &audio_digest,
+            )
+            .await
+            .unwrap();
+        repositories
+            .captures()
+            .commit_event(CaptureCommit {
+                account_id: identity_account.id.clone(),
+                manifest: audio_manifest,
+                manifest_digest: audio_digest,
+                object_key: Some(audio_object_key),
+                object_generation: Some(1),
+                upload_token: audio_upload_token,
+                media_authority: Some(
+                    crate::cp::media::RecordingMediaAuthorityDecision::ProcessingWindow30d {
+                        capture_policy_revision: 0,
+                        decision_at: "2026-08-27T13:00:05.000Z".into(),
+                    },
+                ),
+                committed_at: "2026-08-27T13:00:05.000Z".into(),
+            })
+            .await
+            .unwrap();
+        let identity_media = repositories.media_processing();
+        let audio_claim = identity_media
+            .claim(
+                &identity_account.id,
+                MediaProcessingClass::Audio,
+                "2026-08-27T13:00:06.000Z",
+                300,
+                128,
+            )
+            .await
+            .unwrap()
+            .expect("audio identity regression claim");
+        identity_media
+            .record_reservation(&audio_claim, 4_096, "2026-08-27T13:00:06.000Z")
+            .await
+            .unwrap();
+        identity_media
+            .settle_usage(MediaUsageSettlement {
+                claim: audio_claim.clone(),
+                usage: serde_json::json!({
+                    "work_unit_id": audio_claim.work_unit_id,
+                    "reservation_state": "reserved",
+                    "actual_output_tokens": 64,
+                    "outcome": "model_returned"
+                }),
+            })
+            .await
+            .unwrap();
+        let turns = vec![
+            AudioTurn {
+                turn_id: "name-question".into(),
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_local_id: "joseph".into(),
+                text: "What is your name?".into(),
+                language: Some("en".into()),
+                speaker_name: None,
+                speaker_name_confidence: None,
+                speaker_name_evidence: None,
+                speaker_name_kind: None,
+                speaker_name_subject_turn_id: None,
+                speaker_name_target_turn_id: None,
+                person_facts: Vec::new(),
+                overlap: false,
+                quality_flags: Vec::new(),
+            },
+            AudioTurn {
+                turn_id: "name-answer".into(),
+                start_ms: 1_100,
+                end_ms: 1_900,
+                speaker_local_id: "sarah".into(),
+                text: "Sarah".into(),
+                language: Some("en".into()),
+                speaker_name: Some("Sarah".into()),
+                speaker_name_confidence: Some(0.99),
+                speaker_name_evidence: Some("Sarah".into()),
+                speaker_name_kind: Some("self_identification".into()),
+                speaker_name_subject_turn_id: Some("name-answer".into()),
+                speaker_name_target_turn_id: None,
+                person_facts: Vec::new(),
+                overlap: false,
+                quality_flags: Vec::new(),
+            },
+            AudioTurn {
+                turn_id: "name-expansion".into(),
+                start_ms: 2_000,
+                end_ms: 3_200,
+                speaker_local_id: "joseph".into(),
+                text: "Mrs. Sarah Babetski, including her last name".into(),
+                language: Some("en".into()),
+                speaker_name: Some("Sarah Babetski".into()),
+                speaker_name_confidence: Some(0.99),
+                speaker_name_evidence: Some("Mrs. Sarah Babetski, including her last name".into()),
+                speaker_name_kind: Some("self_identification".into()),
+                speaker_name_subject_turn_id: Some("name-expansion".into()),
+                speaker_name_target_turn_id: None,
+                person_facts: Vec::new(),
+                overlap: false,
+                quality_flags: Vec::new(),
+            },
+        ];
+        let audio_settlement = AudioMediaSettlement {
+            claim: audio_claim,
+            turns,
+        };
+        identity_media
+            .settle_audio(audio_settlement.clone())
+            .await
+            .unwrap();
+        identity_media.settle_audio(audio_settlement).await.unwrap();
+        let identity_people = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id,display_name FROM people WHERE account_id=$1 ORDER BY id",
+        )
+        .bind(&identity_account.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(identity_people.len(), 1);
+        assert_eq!(identity_people[0].1.as_deref(), Some("Sarah"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM person_name_claims WHERE account_id=$1",
+            )
+            .bind(&identity_account.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT person_id FROM speaker_observations \
+                 WHERE account_id=$1 AND turn_id='name-expansion'",
+        )
+        .bind(&identity_account.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .is_none());
     }
 }

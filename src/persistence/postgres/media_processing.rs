@@ -9,6 +9,7 @@ use crate::{
     cp::{isotime, media_planner},
     error::{EnclaveError, Result},
     persistence::{
+        is_supported_self_identification, names_form_refinement, prefer_claimed_display_name,
         AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
         MediaProcessingJob, MediaProcessingRepository, MediaUsageSettlement, ScreenMediaSettlement,
     },
@@ -17,7 +18,7 @@ use crate::{
 use super::{allocate_content_id, PostgresPersistence};
 
 const PROCESSOR_VERSION: i64 = 1;
-const PROMPT_VERSION: i64 = 2;
+const PROMPT_VERSION: i64 = 3;
 
 fn parse_time(value: &str, field: &str) -> Result<i64> {
     isotime::parse_epoch_millis(value)
@@ -588,6 +589,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             .collect::<HashSet<_>>()
             .len();
         let mut cluster_ids = HashMap::<String, i64>::new();
+        let mut resolved_people = HashMap::<String, (i64, String)>::new();
         for turn in &command.turns {
             let projected = media_planner::project_interval(&sources, turn.start_ms, turn.end_ms);
             let anchor = projected.first().expect("validated projection");
@@ -672,50 +674,97 @@ impl MediaProcessingRepository for PostgresPersistence {
             .execute(&mut *transaction)
             .await?;
 
-            let accepted_name = match (
-                turn.speaker_name_kind.as_deref(),
-                turn.speaker_name.as_deref(),
-                turn.speaker_name_confidence,
-                turn.speaker_name_subject_turn_id.as_deref(),
-            ) {
-                (Some("self_identification"), Some(name), Some(confidence), Some(subject))
-                    if subject == turn.turn_id && confidence >= 0.90 =>
-                {
-                    Some((name, confidence))
-                }
-                _ => None,
-            };
-            let mut person_id = None;
-            let mut speaker_label = "Unidentified voice".to_owned();
+            let inherited_person = resolved_people.get(&turn.speaker_local_id).cloned();
+            let accepted_name = is_supported_self_identification(turn, &command.turns)
+                .then(|| {
+                    turn.speaker_name
+                        .as_deref()
+                        .zip(turn.speaker_name_confidence)
+                })
+                .flatten()
+                .filter(|(name, _)| {
+                    inherited_person
+                        .as_ref()
+                        .is_none_or(|(_, display)| names_form_refinement(display, name))
+                });
+            let mut person_id = inherited_person.as_ref().map(|(id, _)| *id);
+            let mut speaker_label = inherited_person
+                .as_ref()
+                .map(|(_, display)| display.clone())
+                .unwrap_or_else(|| "Unidentified voice".to_owned());
             if let Some((name, confidence)) = accepted_name {
                 let normalized = normalize_name(name);
-                let existing = sqlx::query_scalar::<_, i64>(
-                    "SELECT person_id FROM person_name_claims \
-                     WHERE account_id=$1 AND normalized_name=$2 AND status='accepted' \
-                       AND person_id IS NOT NULL ORDER BY id DESC LIMIT 1",
-                )
-                .bind(account_id)
-                .bind(&normalized)
-                .fetch_optional(&mut *transaction)
-                .await?;
-                let id = match existing {
-                    Some(id) => id,
+                let (id, display_name) = match inherited_person {
+                    Some((id, current_display)) => {
+                        let display_name = if prefer_claimed_display_name(&current_display, name) {
+                            let refined = name.trim().to_owned();
+                            sqlx::query(
+                                "UPDATE people SET display_name=$3,normalized_name=$4,updated_at=now() \
+                                 WHERE account_id=$1 AND id=$2 AND status='identified'",
+                            )
+                            .bind(account_id)
+                            .bind(id)
+                            .bind(&refined)
+                            .bind(&normalized)
+                            .execute(&mut *transaction)
+                            .await?;
+                            sqlx::query(
+                                "UPDATE utterances u SET speaker_label=$3 \
+                                 FROM speaker_observations s \
+                                 WHERE u.account_id=$1 AND s.account_id=u.account_id \
+                                   AND s.id=u.speaker_observation_id AND s.cluster_id=$2",
+                            )
+                            .bind(account_id)
+                            .bind(cluster_id)
+                            .bind(&refined)
+                            .execute(&mut *transaction)
+                            .await?;
+                            refined
+                        } else {
+                            current_display
+                        };
+                        (id, display_name)
+                    }
                     None => {
-                        let id =
-                            allocate_content_id(&mut transaction, account_id, "person").await?;
-                        sqlx::query(
-                            "INSERT INTO people(account_id,id,display_name,normalized_name,status) \
-                             VALUES($1,$2,$3,$4,'identified')",
+                        let existing = sqlx::query_as::<_, (i64, String)>(
+                            "SELECT c.person_id,COALESCE(p.display_name,c.name) \
+                             FROM person_name_claims c JOIN people p \
+                               ON p.account_id=c.account_id AND p.id=c.person_id \
+                             WHERE c.account_id=$1 AND c.normalized_name=$2 \
+                               AND c.status='accepted' AND c.person_id IS NOT NULL \
+                               AND p.status='identified' \
+                             ORDER BY c.id DESC LIMIT 1",
                         )
                         .bind(account_id)
-                        .bind(id)
-                        .bind(name)
                         .bind(&normalized)
-                        .execute(&mut *transaction)
-                        .await?;
-                        id
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .filter(|(candidate_id, _)| {
+                            resolved_people
+                                .values()
+                                .all(|(assigned_id, _)| assigned_id != candidate_id)
+                        });
+                        if let Some(existing) = existing {
+                            existing
+                        } else {
+                            let id =
+                                allocate_content_id(&mut transaction, account_id, "person").await?;
+                            let display_name = name.trim().to_owned();
+                            sqlx::query(
+                                "INSERT INTO people(account_id,id,display_name,normalized_name,status) \
+                                 VALUES($1,$2,$3,$4,'identified')",
+                            )
+                            .bind(account_id)
+                            .bind(id)
+                            .bind(&display_name)
+                            .bind(&normalized)
+                            .execute(&mut *transaction)
+                            .await?;
+                            (id, display_name)
+                        }
                     }
                 };
+                resolved_people.insert(turn.speaker_local_id.clone(), (id, display_name.clone()));
                 let evidence_id =
                     allocate_content_id(&mut transaction, account_id, "identity_evidence").await?;
                 let evidence = json!({
@@ -783,7 +832,20 @@ impl MediaProcessingRepository for PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
                 person_id = Some(id);
-                speaker_label = name.to_owned();
+                speaker_label = display_name;
+            } else if let Some(id) = person_id {
+                // A work-unit speaker already resolved by stronger direct
+                // evidence remains that opaque person on sibling turns, but a
+                // rejected/conflicting name supplies no new direct edge.
+                sqlx::query(
+                    "UPDATE speaker_observations SET person_id=$3 \
+                     WHERE account_id=$1 AND id=$2 AND person_id IS NULL",
+                )
+                .bind(account_id)
+                .bind(speaker_observation_id)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
             }
             let utterance_id =
                 allocate_content_id(&mut transaction, account_id, "utterance").await?;
