@@ -20,13 +20,13 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `lifecycle.rs` | Account tombstone, no-resurrection deletion progress, provider revocation, and final cleanup contract. |
 | `media_object.rs` | Provider-neutral encrypted-media object operations, exact-generation reads, account/episode purge, and all-generation reconciliation. |
 | `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |
-| `media_processing.rs` | Media job claim, usage, screen/audio projection, voice evidence, retry, and settlement contract. |
-| `memory_formation.rs` | Summarizer window claim, open-memory projection, atomic cursor/episode settlement, and embedding contract. |
+| `media_processing.rs` | Media job claim, usage, screen/audio projection, owner-source classification, voice evidence, retry, and settlement contract. |
+| `memory_formation.rs` | Summarizer window claim, turn-timed source evidence, open-memory projection, atomic cursor/episode settlement, and embedding contract. |
 | `model_usage.rs` | Vertex intent/outcome, billing batch claim, and coverage reconciliation contract. |
 | `notification.rs` | Webhook, email-consent, and push-installation configuration with redacted secret-bearing types. |
 | `oauth.rs` | OAuth client, consent, authorization-code, native-session, and refresh-token transaction contract. |
 | `playback.rs` | Recording playback dataset and person-memory availability projection contract. |
-| `query.rs` | Tenant-scoped full-text/vector search, MCP query projections, episode/feed/people/browser/screenshot reads, and capture status. |
+| `query.rs` | Tenant-scoped full-text/vector search, MCP query projections, turn-timed and person-attributed episode members, feed/people/browser/screenshot reads, and capture status. |
 | `recording_retention.rs` | Retention preview/CAS, durable recording-key epoch, exact inventory, and downgrade completion. |
 | `work.rs` | Fleet active-account enumeration, summarizer cursor storage, and shared outbound-provider outcome validation. |
 | [`postgres/`](postgres/map.md) | The only structured-state implementation: bounded SQLx pool plus every repository adapter. |

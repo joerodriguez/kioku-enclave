@@ -848,10 +848,14 @@ fn project_manifest(dataset: &PlaybackDataset, window_start_ms: i64) -> Result<P
             utterance_id: utterance.utterance_id,
             speaker_observation_id: utterance.observation_id,
             person_id: utterance.person_id,
-            display_name: utterance
-                .display_name
-                .clone()
-                .unwrap_or_else(|| utterance.fallback_label.clone()),
+            display_name: if utterance.attribution_state.as_deref() == Some("owner_source_role") {
+                "Me".to_owned()
+            } else {
+                utterance
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| utterance.fallback_label.clone())
+            },
             attribution_state: utterance
                 .attribution_state
                 .clone()
@@ -1010,7 +1014,11 @@ pub(crate) fn projection_revision(
     let bytes: [u8; 8] = digest.finalize()[..8]
         .try_into()
         .expect("fixed digest prefix");
-    (i64::from_be_bytes(bytes) & i64::MAX).max(1)
+    // This value is serialized as a JSON number and then echoed by browser
+    // clients on segment requests. Keep it inside JavaScript's exact integer
+    // range so the authorization comparison cannot be changed by rounding.
+    const MAX_JSON_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+    (i64::from_be_bytes(bytes) & MAX_JSON_SAFE_INTEGER).max(1)
 }
 
 pub(crate) fn opaque_id(prefix: &str, components: &[&str]) -> String {
@@ -1356,6 +1364,21 @@ mod tests {
         )
         .is_err());
         assert!(decode_cursor_at(&key, "pb1_bad", "owner-a", 123, 456, now).is_err());
+    }
+
+    #[test]
+    fn projection_revisions_round_trip_through_javascript_numbers() {
+        let revision = projection_revision(
+            123,
+            "2026-08-27T12:00:00.000Z",
+            "2026-08-27T12:01:00.000Z",
+            &[authority("ready", false)],
+            &[],
+            &[],
+        );
+        assert!(revision > 0);
+        assert!(revision < (1_i64 << 53));
+        assert_eq!(revision as f64 as i64, revision);
     }
 
     #[test]

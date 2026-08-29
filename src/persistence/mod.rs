@@ -61,10 +61,10 @@ pub use lifecycle::AccountDeletionOperation;
 pub(crate) use lifecycle::AccountLifecycleRepository;
 pub(crate) use media_object::MediaObjectStore;
 pub(crate) use media_processing::{
-    is_supported_self_identification, names_form_refinement, prefer_claimed_display_name,
-    AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
-    MediaProcessingJob, MediaProcessingRepository, MediaScreenProjection, MediaUsageSettlement,
-    ScreenMediaSettlement,
+    is_owner_source_audio, is_supported_self_identification, names_form_refinement,
+    prefer_claimed_display_name, AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim,
+    MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository, MediaScreenProjection,
+    MediaUsageSettlement, ScreenMediaSettlement,
 };
 pub(crate) use memory_formation::{
     EpisodeEmbeddingSource, EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode,

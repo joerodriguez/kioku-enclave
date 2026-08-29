@@ -9,9 +9,10 @@ use crate::{
     cp::{isotime, media_planner},
     error::{EnclaveError, Result},
     persistence::{
-        is_supported_self_identification, names_form_refinement, prefer_claimed_display_name,
-        AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
-        MediaProcessingJob, MediaProcessingRepository, MediaUsageSettlement, ScreenMediaSettlement,
+        is_owner_source_audio, is_supported_self_identification, names_form_refinement,
+        prefer_claimed_display_name, AudioMediaSettlement, MediaPersonEvidence,
+        MediaProcessingClaim, MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository,
+        MediaUsageSettlement, ScreenMediaSettlement,
     },
 };
 
@@ -588,6 +589,10 @@ impl MediaProcessingRepository for PostgresPersistence {
             .map(|turn| turn.speaker_local_id.as_str())
             .collect::<HashSet<_>>()
             .len();
+        let owner_source_audio = is_owner_source_audio(
+            command.claim.jobs[0].audio_role.as_deref(),
+            distinct_speakers,
+        );
         let mut cluster_ids = HashMap::<String, i64>::new();
         let mut resolved_people = HashMap::<String, (i64, String)>::new();
         for turn in &command.turns {
@@ -598,10 +603,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             } else {
                 let id =
                     allocate_content_id(&mut transaction, account_id, "speaker_cluster").await?;
-                let initial = if command.claim.jobs[0].audio_role.as_deref()
-                    == Some("local_transmit")
-                    && distinct_speakers <= 1
-                {
+                let initial = if owner_source_audio {
                     "owner_transmit"
                 } else {
                     "request_local"
@@ -675,23 +677,28 @@ impl MediaProcessingRepository for PostgresPersistence {
             .await?;
 
             let inherited_person = resolved_people.get(&turn.speaker_local_id).cloned();
-            let accepted_name = is_supported_self_identification(turn, &command.turns)
-                .then(|| {
-                    turn.speaker_name
-                        .as_deref()
-                        .zip(turn.speaker_name_confidence)
-                })
-                .flatten()
-                .filter(|(name, _)| {
-                    inherited_person
-                        .as_ref()
-                        .is_none_or(|(_, display)| names_form_refinement(display, name))
-                });
+            let accepted_name = (!owner_source_audio
+                && is_supported_self_identification(turn, &command.turns))
+            .then(|| {
+                turn.speaker_name
+                    .as_deref()
+                    .zip(turn.speaker_name_confidence)
+            })
+            .flatten()
+            .filter(|(name, _)| {
+                inherited_person
+                    .as_ref()
+                    .is_none_or(|(_, display)| names_form_refinement(display, name))
+            });
             let mut person_id = inherited_person.as_ref().map(|(id, _)| *id);
-            let mut speaker_label = inherited_person
-                .as_ref()
-                .map(|(_, display)| display.clone())
-                .unwrap_or_else(|| "Unidentified voice".to_owned());
+            let mut speaker_label = if owner_source_audio {
+                "Me".to_owned()
+            } else {
+                inherited_person
+                    .as_ref()
+                    .map(|(_, display)| display.clone())
+                    .unwrap_or_else(|| "Unidentified voice".to_owned())
+            };
             if let Some((name, confidence)) = accepted_name {
                 let normalized = normalize_name(name);
                 let (id, display_name) = match inherited_person {

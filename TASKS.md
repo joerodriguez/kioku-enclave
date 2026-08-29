@@ -1,3 +1,18 @@
+# Memory playback and speaker projection repair
+
+- [x] Bound public playback revisions to JavaScript's exact integer range so an unchanged
+      browser manifest can authorize its segment instead of entering a permanent `409` loop.
+- [x] Project episode-member and summary-evidence utterances at their stored turn time rather
+      than repeating the enclosing audio segment's start time.
+- [x] Preserve a sole local-transmit speaker as owner source and render owner-source attribution
+      as **Me** without creating a duplicate self-named attendee.
+- [x] Add focused revision, owner-source, and PostgreSQL query-shape regressions.
+- [x] Pass the complete local gate against disposable PostgreSQL 17: 279 runnable Rust tests,
+      one intentional ignore, the real PostgreSQL contract, formatting, check, and Clippy.
+- [ ] Land and deploy the compatible enclave/web changes, then use a separately reviewed,
+      versioned episode repair for any already persisted false person binding; replay must not
+      mutate successful media work in place.
+
 # PostgreSQL-only structured-state cleanup (ADR-0042)
 
 Production has no users or legacy user data to migrate. This cleanup removes the retired

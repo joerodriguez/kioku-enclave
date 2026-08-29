@@ -258,14 +258,21 @@ impl MemoryFormationRepository for PostgresPersistence {
             ));
         }
         let utterances = sqlx::query(
-            "SELECT u.id,floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms,\
+            "SELECT u.id,floor(extract(epoch FROM coalesce(\
+                        o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')\
+                    ))*1000)::bigint AS started_at_ms,\
                     u.speaker_label,u.language,u.text \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               LEFT JOIN speaker_observations o \
+                 ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
               WHERE u.account_id=$1 \
-                AND s.started_at>=to_timestamp($2::double precision/1000.0) \
-                AND s.started_at<to_timestamp($3::double precision/1000.0) \
-              ORDER BY s.started_at,u.id LIMIT $4",
+                AND coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')) \
+                    >=to_timestamp($2::double precision/1000.0) \
+                AND coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')) \
+                    <to_timestamp($3::double precision/1000.0) \
+              ORDER BY coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')),u.id \
+              LIMIT $4",
         )
         .bind(account_id)
         .bind(from_ms)

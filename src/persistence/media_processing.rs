@@ -178,6 +178,13 @@ pub(crate) fn is_supported_self_identification(turn: &AudioTurn, turns: &[AudioT
         .is_some_and(|candidate| is_name_request(&candidate.text))
 }
 
+/// A single diarized speaker on an explicitly local-transmit source is the
+/// account owner by source provenance. A spoken name may describe that owner,
+/// but it must not turn the owner into a second attendee identity.
+pub(crate) fn is_owner_source_audio(audio_role: Option<&str>, distinct_speakers: usize) -> bool {
+    audio_role == Some("local_transmit") && distinct_speakers <= 1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaProcessingClass {
     Audio,
@@ -335,7 +342,8 @@ pub(crate) trait MediaProcessingRepository: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_supported_self_identification, names_form_refinement, prefer_claimed_display_name,
+        is_owner_source_audio, is_supported_self_identification, names_form_refinement,
+        prefer_claimed_display_name,
     };
     use crate::cp::media::AudioTurn;
 
@@ -436,5 +444,12 @@ mod tests {
         assert!(prefer_claimed_display_name("Sarah", "Sarah Babetski"));
         assert!(!prefer_claimed_display_name("Sarah Babetski", "Sarah"));
         assert!(!names_form_refinement("Sarah Jones", "Sarah Babetski"));
+    }
+
+    #[test]
+    fn single_local_transmit_speaker_is_the_owner_not_a_named_attendee() {
+        assert!(is_owner_source_audio(Some("local_transmit"), 1));
+        assert!(!is_owner_source_audio(Some("local_transmit"), 2));
+        assert!(!is_owner_source_audio(Some("mixed"), 1));
     }
 }

@@ -30,7 +30,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `media_worker.rs` | PostgreSQL-claimed media processing, KMS/GCS/Vertex work, result projection, voice work, bounded retry/resurrection, and retention cleanup. |
 | `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, and coverage reconciliation. |
 | `oauth.rs` | OAuth 2.1 discovery, dynamic registration, Google/Apple/reviewer PKCE consent/code flow, durable client-bound refresh rotation for native and local-device web sessions, and the native session facade. |
-| `playback.rs` | Owner-authorized recording timeline, playback projection, and exact encrypted-segment serving. |
+| `playback.rs` | Owner-authorized recording timeline, JavaScript-exact revision projection, owner-source display, and exact encrypted-segment serving. |
 | `push.rs` | APNs installation/handoff routes and PostgreSQL-claimed content-free ready notifications with credential-generation fences and no-resend ambiguity. |
 | `query.rs` | REST/MCP search, episodes, feed, people, browser evidence, screenshots, webhooks, and durable episode-deletion initiation/status behavior. |
 | `retention.rs` | Recording-retention preview/CAS, key epochs, downgrade reconciliation, and durable-recording policy routes. |

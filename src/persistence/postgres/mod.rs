@@ -2575,6 +2575,12 @@ mod tests {
             .unwrap();
         assert_eq!(evidence["member_count"], 2);
         assert_eq!(evidence["participant_details"][0]["display_name"], "Lynn");
+        assert_eq!(
+            evidence["members"][0]["started_at"],
+            "2026-08-27T12:00:00.000Z"
+        );
+        assert_eq!(evidence["members"][0]["display_name"], "Lynn");
+        assert_eq!(evidence["members"][0]["person_id"], 1);
         assert_eq!(evidence["members"][1]["cloud_image_id"], "img_contract");
         assert_eq!(
             evidence["members"][1]["activity_summary"],
