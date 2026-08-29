@@ -17,13 +17,13 @@ migrator applies the append-only files under `migrations/`.
 | `finalization.rs` | Finalization claims, source projection, and atomic recap/episode/outbox settlement. |
 | `identity.rs` | Accounts, provider identities, signup budget, Apple credentials/grants, and coherent session reads. |
 | `lifecycle.rs` | Account tombstones, deletion ownership/progress, revocation settlement, cascading purge, and no-resurrection checks. |
-| `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection, voice jobs, bounded retry/resurrection, and retention progress. |
-| `memory_formation.rs` | Summarizer windows, open-memory projections, episode/member writes, embeddings, and atomic durable cursor settlement. |
+| `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection with stable owner-source classification, voice jobs, bounded retry/resurrection, and retention progress. |
+| `memory_formation.rs` | Summarizer windows, turn-timed source projections, episode/member writes, embeddings, and atomic durable cursor settlement. |
 | `model_usage.rs` | Paid-model intents/outcomes, usage batch claims/delivery, and coverage reconciliation. |
 | `notification.rs` | Webhook destinations, email consent, push installations, and configuration/disclosure-fence serialization. |
 | `oauth.rs` | OAuth registration, consent, authorization codes, native sessions, and refresh-token rotation. |
 | `playback.rs` | Tenant-qualified recording timelines/segments and person-memory availability. |
-| `query.rs` | PostgreSQL full-text/pgvector retrieval, hybrid fusion, episodes/feed/people/evidence projections, MCP query shapes, and capture status. |
+| `query.rs` | PostgreSQL full-text/pgvector retrieval, hybrid fusion, turn-timed/person-attributed episode members, feed/people/evidence projections, MCP query shapes, and capture status. |
 | `recording_retention.rs` | Retention preview/CAS, key epochs, exact media inventory, and downgrade reconciliation. |
 | `work.rs` | Fleet active-account enumeration and PostgreSQL-backed summarizer cursor storage. |
 

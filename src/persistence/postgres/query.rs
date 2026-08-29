@@ -1553,11 +1553,27 @@ impl MemoryQueryRepository for PostgresPersistence {
     async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value> {
         let utterance_rows = sqlx::query(
             "SELECT u.id,u.speaker_label,u.language,u.text,u.source_key, \
-                    floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms \
+                    floor(extract(epoch FROM coalesce( \
+                        o.started_at, \
+                        s.started_at + (u.start_offset_seconds * interval '1 second') \
+                    ))*1000)::bigint AS started_at_ms, \
+                    floor(extract(epoch FROM coalesce( \
+                        o.ended_at, \
+                        s.started_at + (u.end_offset_seconds * interval '1 second') \
+                    ))*1000)::bigint AS ended_at_ms, \
+                    coalesce(o.person_id,c.person_id) AS person_id,p.display_name, \
+                    c.attribution_state \
                FROM episode_members m JOIN utterances u \
                  ON u.account_id=m.account_id AND u.id=m.record_id \
                JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               LEFT JOIN speaker_observations o \
+                 ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
+               LEFT JOIN speaker_clusters c \
+                 ON c.account_id=o.account_id AND c.id=o.cluster_id \
+               LEFT JOIN people p \
+                 ON p.account_id=u.account_id AND p.id=coalesce(o.person_id,c.person_id) \
+                AND p.status<>'quarantined' \
               WHERE m.account_id=$1 AND m.episode_id=$2 AND m.record_type='utterance'",
         )
         .bind(account_id)
@@ -1568,14 +1584,37 @@ impl MemoryQueryRepository for PostgresPersistence {
             .iter()
             .map(|row| {
                 let timestamp = required_timestamp(row, "started_at_ms")?;
+                let speaker_label: String = row.try_get("speaker_label")?;
+                let person_id: Option<i64> = row.try_get("person_id")?;
+                let person_name: Option<String> = row.try_get("display_name")?;
+                let attribution = row.try_get::<Option<String>, _>("attribution_state")?;
+                let display_name =
+                    if person_id.is_none() && attribution.as_deref() == Some("owner_transmit") {
+                        "Me".to_owned()
+                    } else {
+                        person_name.unwrap_or_else(|| speaker_label.clone())
+                    };
+                let attribution_kind = if person_id.is_some() {
+                    "direct_identity_evidence"
+                } else {
+                    match attribution.as_deref() {
+                        Some("owner_transmit") => "owner_source_role",
+                        Some("anonymous_profile") => "verified_voice",
+                        Some("request_local" | "unsegmented") => "context_inferred",
+                        _ => "unavailable",
+                    }
+                };
                 Ok((
                     timestamp.clone(),
                     json!({
                         "record_type": "utterance",
                         "record_id": row.try_get::<i64, _>("id")?,
                         "started_at": timestamp,
-                        "speaker_label": row.try_get::<String, _>("speaker_label")?,
-                        "attribution_kind": Value::Null,
+                        "ended_at": required_timestamp(row, "ended_at_ms")?,
+                        "speaker_label": speaker_label,
+                        "display_name": display_name,
+                        "person_id": person_id,
+                        "attribution_kind": attribution_kind,
                         "language": row.try_get::<Option<String>, _>("language")?,
                         "text": row.try_get::<String, _>("text")?,
                         "source_key": row.try_get::<Option<String>, _>("source_key")?,

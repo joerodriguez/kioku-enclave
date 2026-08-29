@@ -769,6 +769,13 @@ Separate reviewed releases must first advance TARGET and then MINIMUM_SERVABLE.
 
 ### Person conversations and memory playback
 
+`GET /api/episodes/{memory_id}/members` returns chronological evidence for the owner. An
+utterance's `started_at` / `ended_at` use its stored speaker-observation times, falling back to
+the source segment plus utterance offsets only when an observation is absent; rows in one source
+segment therefore do not inherit one repeated timestamp. Source-backed owner speech is labeled
+`Me`. Identified rows may add opaque `person_id`, `display_name`, and attribution kind without
+using display text as identity.
+
 `GET /api/v2/people/{person_id}/memories?limit=25&before_id=123` returns
 person-ID-attributed memories newest first. Each row includes the attributed
 utterance count, contributing recording count, truthful aggregate audio availability,
@@ -782,7 +789,9 @@ owner-only playback window. A window covers at most 15 minutes, 128 source segme
 recording, track, and segment IDs; a memory-relative wall-clock timeline; separate
 mic/system/iPhone tracks; transcript rows; source-span seek coordinates; availability;
 and a positive `projection_revision`. It never exposes a provider object name,
-generation, wrapped key, or media key. Pass only one of `at_ms` or the returned opaque
+generation, wrapped key, or media key. The revision is bounded to JavaScript's exact
+integer range so browser clients can echo it without numeric rounding. Pass only one of
+`at_ms` or the returned opaque
 `cursor`; the cursor is account, memory, revision, offset, issue-time, and expiry bound.
 
 `GET /api/v2/memories/{memory_id}/recordings/{recording_id}/segments/{segment_id}?projection_revision=7`
