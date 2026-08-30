@@ -225,6 +225,40 @@ def public_fingerprint_bytes(public_key: bytes) -> str:
     return hashlib.sha256(result.stdout).hexdigest()
 
 
+def write_private_temporary_bytes(directory: Path, name: str, value: bytes) -> Path:
+    """Write exact bytes to one private regular file for an OpenSSL child.
+
+    OpenSSL sizes one-shot Ed25519 input by statting the ``-in`` path. A pipe
+    alias such as ``/dev/stdin`` can therefore report zero or a racy buffered
+    length instead of the complete message.
+    """
+    path = directory / name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(value)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(value)
+            ):
+                fail("temporary OpenSSL input has unsafe ownership, type, mode, or length")
+    except OSError as error:
+        fail(f"cannot create temporary OpenSSL input: {error}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return path
+
+
 def verify_detached_bytes(manifest: bytes, signature: bytes, public_key: bytes) -> None:
     if not signature:
         fail("signature is missing or empty")
@@ -233,6 +267,7 @@ def verify_detached_bytes(manifest: bytes, signature: bytes, public_key: bytes) 
         directory.chmod(0o700)
         key_path = directory / "public.pem"
         signature_path = directory / "signature"
+        manifest_path = write_private_temporary_bytes(directory, "manifest", manifest)
         key_path.write_bytes(public_key)
         signature_path.write_bytes(signature)
         key_path.chmod(0o600)
@@ -242,15 +277,16 @@ def verify_detached_bytes(manifest: bytes, signature: bytes, public_key: bytes) 
                 [
                     "openssl", "pkeyutl", "-verify", "-rawin", "-pubin",
                     "-inkey", str(key_path), "-sigfile", str(signature_path),
-                    "-in", "/dev/stdin",
+                    "-in", str(manifest_path),
                 ],
-                input=manifest,
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except (OSError, subprocess.CalledProcessError) as error:
-            fail(f"OpenSSL signing operation failed: {error}")
+        except OSError as error:
+            fail(f"cannot execute OpenSSL signature verification: {error}")
+        except subprocess.CalledProcessError as error:
+            fail(f"OpenSSL signature verification failed with exit status {error.returncode}")
 
 
 def openssl(args: list[str]) -> None:
@@ -343,16 +379,18 @@ def sign(arguments: argparse.Namespace) -> None:
     if "ED25519" not in key_description.upper():
         fail("signing key must be an Ed25519 PEM key")
     with tempfile.TemporaryDirectory(prefix="kioku-evidence-sign-") as temporary:
-        key_path = Path(temporary) / "private.pem"
+        directory = Path(temporary)
+        directory.chmod(0o700)
+        key_path = directory / "private.pem"
+        manifest_path = write_private_temporary_bytes(directory, "manifest", manifest_bytes)
         key_path.write_bytes(private_key_bytes)
         key_path.chmod(0o600)
         try:
             signed = subprocess.run(
                 [
                     "openssl", "pkeyutl", "-sign", "-rawin", "-inkey",
-                    str(key_path), "-in", "/dev/stdin",
+                    str(key_path), "-in", str(manifest_path),
                 ],
-                input=manifest_bytes,
                 check=True,
                 capture_output=True,
             ).stdout
