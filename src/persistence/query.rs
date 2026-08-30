@@ -31,9 +31,20 @@ pub(crate) enum SearchHit {
         id: i64,
         text: String,
         speaker_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        person_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attribution_kind: Option<String>,
         started_at: String,
         start_offset_seconds: f64,
         end_offset_seconds: f64,
+        source_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        episode_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        episode_title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         score: Option<f64>,
     },
@@ -48,18 +59,34 @@ pub(crate) enum SearchHit {
         literal_description: Option<String>,
         screen_state: Option<String>,
         content_type: Option<String>,
+        source_at: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        episode_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        episode_title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        match_source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        match_text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         score: Option<f64>,
     },
     Episode {
         id: i64,
+        memory_id: i64,
         started_at: String,
         ended_at: String,
         title: Option<String>,
         summary: Option<String>,
         minute_summaries: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
+        final_brief: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         snippet: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        match_source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         score: Option<f64>,
     },
@@ -108,10 +135,27 @@ pub(crate) fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, 
     ranked.sort_by(|left, right| {
         right
             .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
     });
     ranked
+}
+
+#[cfg(test)]
+mod rrf_tests {
+    use super::rrf_merge;
+
+    #[test]
+    fn equal_scores_use_a_deterministic_id_tie_breaker() {
+        let ranked = rrf_merge(&[9], &[(4, 0.0)]);
+        assert_eq!(ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [4, 9]);
+    }
+
+    #[test]
+    fn evidence_in_both_lists_still_ranks_first() {
+        let ranked = rrf_merge(&[9, 4], &[(4, 0.1), (9, 0.2)]);
+        assert_eq!(ranked[0].0, 4);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +215,10 @@ pub(crate) struct MemoryFeedRecord {
     pub(crate) at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) person_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attribution_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

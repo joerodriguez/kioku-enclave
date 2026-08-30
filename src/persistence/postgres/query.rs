@@ -153,6 +153,15 @@ fn limit(value: usize) -> Result<i64> {
         .map_err(|_| EnclaveError::InvalidRequest("search limit is too large".into()))
 }
 
+fn candidate_limit(request: &SearchRequest) -> Result<i64> {
+    let value = request
+        .offset
+        .saturating_add(request.limit)
+        .saturating_mul(3)
+        .max(60);
+    limit(value)
+}
+
 fn vector_literal(values: &[f32]) -> Result<String> {
     if values.len() != 384 || values.iter().any(|value| !value.is_finite()) {
         return Err(EnclaveError::InvalidRequest(
@@ -183,24 +192,92 @@ fn timestamp(hit: &SearchHit) -> &str {
     }
 }
 
+fn search_hit_id(hit: &SearchHit) -> i64 {
+    match hit {
+        SearchHit::Utterance { id, .. }
+        | SearchHit::Screenshot { id, .. }
+        | SearchHit::Episode { id, .. } => *id,
+    }
+}
+
+fn order_hits(mut hits: Vec<SearchHit>, ids: &[i64]) -> Vec<SearchHit> {
+    let positions = ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (*id, position))
+        .collect::<HashMap<_, _>>();
+    hits.sort_by_key(|hit| {
+        positions
+            .get(&search_hit_id(hit))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    hits
+}
+
+fn finalize_search_order(
+    mut hits: Vec<SearchHit>,
+    branch_count: usize,
+    limit: usize,
+) -> Vec<SearchHit> {
+    if branch_count > 1 {
+        hits.sort_by(|left, right| timestamp(right).cmp(timestamp(left)));
+    }
+    hits.truncate(limit);
+    hits
+}
+
+fn json_array_from_text(raw: &str, name: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw)?;
+    if !value.is_array() {
+        return Err(EnclaveError::Store(format!(
+            "PostgreSQL {name} projection is not a JSON array"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_json_array(row: &sqlx::postgres::PgRow, name: &str) -> Result<Value> {
+    let raw = row
+        .try_get::<Option<String>, _>(name)?
+        .ok_or_else(|| EnclaveError::Store(format!("PostgreSQL final brief is missing {name}")))?;
+    json_array_from_text(&raw, name)
+}
+
+fn final_brief_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Value>> {
+    row.try_get::<Option<String>, _>("brief_overview")?
+        .map(|overview| {
+            Ok(json!({
+                "overview": overview,
+                "decisions": optional_json_array(row, "brief_decisions")?,
+                "action_items": optional_json_array(row, "brief_action_items")?,
+                "important_links": optional_json_array(row, "brief_important_links")?,
+                "open_questions": optional_json_array(row, "brief_open_questions")?,
+            }))
+        })
+        .transpose()
+}
+
 fn episode_from_row(
     row: &sqlx::postgres::PgRow,
     snippet: Option<String>,
+    match_source: Option<String>,
     score: Option<f64>,
 ) -> Result<SearchHit> {
-    let minute_summaries = row
-        .try_get::<String, _>("minute_summaries")
-        .ok()
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    let raw_minute_summaries: String = row.try_get("minute_summaries")?;
+    let minute_summaries = json_array_from_text(&raw_minute_summaries, "minute_summaries")?;
+    let id = row.try_get("id")?;
     Ok(SearchHit::Episode {
-        id: row.try_get("id")?,
+        id,
+        memory_id: id,
         started_at: required_timestamp(row, "started_at_ms")?,
         ended_at: required_timestamp(row, "ended_at_ms")?,
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
         minute_summaries,
+        final_brief: final_brief_from_row(row)?,
         snippet,
+        match_source,
         score,
     })
 }
@@ -210,9 +287,15 @@ fn utterance_from_row(row: &sqlx::postgres::PgRow, score: Option<f64>) -> Result
         id: row.try_get("id")?,
         text: row.try_get("text")?,
         speaker_label: row.try_get("speaker_label")?,
+        person_id: row.try_get("person_id")?,
+        attribution_kind: row.try_get("attribution_kind")?,
         started_at: required_timestamp(row, "started_at_ms")?,
         start_offset_seconds: row.try_get("start_offset_seconds")?,
         end_offset_seconds: row.try_get("end_offset_seconds")?,
+        source_at: required_timestamp(row, "source_at_ms")?,
+        memory_id: row.try_get("memory_id")?,
+        episode_id: row.try_get("episode_id")?,
+        episode_title: row.try_get("episode_title")?,
         score,
     })
 }
@@ -229,11 +312,154 @@ fn screenshot_from_row(row: &sqlx::postgres::PgRow, score: Option<f64>) -> Resul
         literal_description: row.try_get("literal_description")?,
         screen_state: row.try_get("screen_state")?,
         content_type: row.try_get("content_type")?,
+        source_at: required_timestamp(row, "source_at_ms")?,
+        memory_id: row.try_get("memory_id")?,
+        episode_id: row.try_get("episode_id")?,
+        episode_title: row.try_get("episode_title")?,
+        match_source: row.try_get("match_source")?,
+        match_text: row.try_get("match_text")?,
         score,
     })
 }
 
 impl PostgresPersistence {
+    async fn enrich_utterance_hits(
+        &self,
+        account_id: &str,
+        ids: &[i64],
+        scores: &HashMap<i64, f64>,
+    ) -> Result<Vec<SearchHit>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"WITH latest_episode AS (
+                   SELECT DISTINCT ON (m.account_id,m.record_id)
+                          m.account_id,m.record_id,e.id AS episode_id,e.title
+                     FROM episode_members m
+                     JOIN episodes e
+                       ON e.account_id=m.account_id AND e.id=m.episode_id
+                    WHERE m.account_id=$1 AND m.record_type='utterance'
+                      AND m.record_id=ANY($2) AND e.substance!='none'
+                    ORDER BY m.account_id,m.record_id,e.started_at DESC,e.id DESC
+               )
+               SELECT u.id,u.text,
+                      CASE WHEN c.attribution_state='owner_transmit' THEN 'Me'
+                           ELSE coalesce(p.display_name,u.speaker_label) END AS speaker_label,
+                      u.start_offset_seconds,u.end_offset_seconds,
+                      floor(extract(epoch FROM coalesce(
+                          o.started_at,
+                          s.started_at + u.start_offset_seconds * interval '1 second'
+                      ))*1000)::bigint AS started_at_ms,
+                      floor(extract(epoch FROM coalesce(
+                          o.started_at,
+                          s.started_at + u.start_offset_seconds * interval '1 second'
+                      ))*1000)::bigint AS source_at_ms,
+                      CASE WHEN c.attribution_state='owner_transmit' THEN NULL
+                           ELSE p.id END AS person_id,
+                      CASE
+                        WHEN c.attribution_state='owner_transmit' THEN 'owner_source_role'
+                        WHEN p.id IS NOT NULL THEN 'direct_identity_evidence'
+                        WHEN c.attribution_state='anonymous_profile' THEN 'verified_voice'
+                        WHEN c.attribution_state IN ('request_local','unsegmented') THEN 'context_inferred'
+                        ELSE NULL
+                      END AS attribution_kind,
+                      linked.episode_id AS memory_id,linked.episode_id,
+                      linked.title AS episode_title
+                 FROM utterances u
+                 JOIN audio_segments s
+                   ON s.account_id=u.account_id AND s.id=u.audio_segment_id
+                 LEFT JOIN speaker_observations o
+                   ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
+                 LEFT JOIN speaker_clusters c
+                   ON c.account_id=o.account_id AND c.id=o.cluster_id
+                 LEFT JOIN people p
+                   ON p.account_id=u.account_id
+                  AND p.id=coalesce(o.person_id,c.person_id)
+                  AND p.status='identified'
+                 LEFT JOIN latest_episode linked
+                   ON linked.account_id=u.account_id AND linked.record_id=u.id
+                WHERE u.account_id=$1 AND u.id=ANY($2)"#,
+        )
+        .bind(account_id)
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await?;
+        let hits = rows
+            .iter()
+            .map(|row| {
+                let id: i64 = row.try_get("id")?;
+                utterance_from_row(row, scores.get(&id).copied())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(order_hits(hits, ids))
+    }
+
+    async fn utterance_fts_ids(
+        &self,
+        account_id: &str,
+        request: &SearchRequest,
+        row_limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i64>> {
+        let from = bound(&request.time_start)?;
+        let to = bound(&request.time_end)?;
+        Ok(sqlx::query_scalar::<_, i64>(
+            r#"WITH q AS (
+                   SELECT websearch_to_tsquery('simple',$2) AS exact,
+                          to_tsquery('simple',coalesce((
+                              SELECT string_agg(quote_literal(term)||':*',' | ' ORDER BY term)
+                                FROM unnest(tsvector_to_array(to_tsvector('simple',$2))) AS terms(term)
+                               WHERE char_length(term)>1 AND term NOT IN
+                                     ('a','an','about','are','at','did','do','does','find','for',
+                                      'from','how','in','is','me','my','of','on','show','that','the',
+                                      'this','to','was','were','what','when','where','who','with')
+                          ),'')) AS broad
+               )
+               SELECT u.id
+                 FROM utterances u
+                 JOIN audio_segments s
+                   ON s.account_id=u.account_id AND s.id=u.audio_segment_id
+                 LEFT JOIN speaker_observations o
+                   ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
+                 LEFT JOIN speaker_clusters c
+                   ON c.account_id=o.account_id AND c.id=o.cluster_id
+                 LEFT JOIN people p
+                   ON p.account_id=u.account_id
+                  AND p.id=coalesce(o.person_id,c.person_id)
+                  AND p.status='identified'
+                 CROSS JOIN q
+                WHERE u.account_id=$1 AND u.search_document @@ q.broad
+                  AND ($3::bigint IS NULL OR
+                       coalesce(o.started_at,
+                           s.started_at + u.start_offset_seconds * interval '1 second')
+                         >=to_timestamp($3::double precision/1000.0))
+                  AND ($4::bigint IS NULL OR
+                       coalesce(o.started_at,
+                           s.started_at + u.start_offset_seconds * interval '1 second')
+                         <=to_timestamp($4::double precision/1000.0))
+                  AND ($5::text IS NULL OR lower(CASE
+                       WHEN c.attribution_state='owner_transmit' THEN 'Me'
+                       ELSE coalesce(p.display_name,u.speaker_label) END)=lower($5))
+                ORDER BY (u.search_document @@ q.exact) DESC,
+                         ts_rank_cd(u.search_document,q.exact) DESC,
+                         ts_rank_cd(u.search_document,q.broad) DESC,
+                         coalesce(o.started_at,
+                             s.started_at + u.start_offset_seconds * interval '1 second') DESC,
+                         u.id DESC
+                LIMIT $6 OFFSET $7"#,
+        )
+        .bind(account_id)
+        .bind(&request.query)
+        .bind(from)
+        .bind(to)
+        .bind(request.speaker.as_deref())
+        .bind(row_limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     async fn search_utterances(
         &self,
         account_id: &str,
@@ -248,15 +474,34 @@ impl PostgresPersistence {
             let Some(speaker) = request.speaker.as_deref() else {
                 return Ok(Vec::new());
             };
-            let rows = sqlx::query(
-                "SELECT u.id,u.text,u.speaker_label,u.start_offset_seconds,u.end_offset_seconds, \
-                        floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms \
-                   FROM utterances u JOIN audio_segments s \
-                     ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
-                  WHERE u.account_id=$1 AND lower(u.speaker_label)=lower($2) \
-                    AND ($3::bigint IS NULL OR s.started_at >= to_timestamp($3::double precision/1000.0)) \
-                    AND ($4::bigint IS NULL OR s.started_at <= to_timestamp($4::double precision/1000.0)) \
-                  ORDER BY s.started_at DESC LIMIT $5 OFFSET $6",
+            let ids = sqlx::query_scalar::<_, i64>(
+                r#"SELECT u.id
+                     FROM utterances u
+                     JOIN audio_segments s
+                       ON s.account_id=u.account_id AND s.id=u.audio_segment_id
+                     LEFT JOIN speaker_observations o
+                       ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
+                     LEFT JOIN speaker_clusters c
+                       ON c.account_id=o.account_id AND c.id=o.cluster_id
+                     LEFT JOIN people p
+                       ON p.account_id=u.account_id
+                      AND p.id=coalesce(o.person_id,c.person_id)
+                      AND p.status='identified'
+                    WHERE u.account_id=$1 AND lower(CASE
+                          WHEN c.attribution_state='owner_transmit' THEN 'Me'
+                          ELSE coalesce(p.display_name,u.speaker_label) END)=lower($2)
+                      AND ($3::bigint IS NULL OR
+                           coalesce(o.started_at,
+                               s.started_at + u.start_offset_seconds * interval '1 second')
+                             >=to_timestamp($3::double precision/1000.0))
+                      AND ($4::bigint IS NULL OR
+                           coalesce(o.started_at,
+                               s.started_at + u.start_offset_seconds * interval '1 second')
+                             <=to_timestamp($4::double precision/1000.0))
+                    ORDER BY coalesce(o.started_at,
+                                 s.started_at + u.start_offset_seconds * interval '1 second') DESC,
+                             u.id DESC
+                    LIMIT $5 OFFSET $6"#,
             )
             .bind(account_id)
             .bind(speaker)
@@ -266,60 +511,58 @@ impl PostgresPersistence {
             .bind(offset)
             .fetch_all(self.pool())
             .await?;
-            return rows
-                .iter()
-                .map(|row| utterance_from_row(row, None))
-                .collect();
+            return self
+                .enrich_utterance_hits(account_id, &ids, &HashMap::new())
+                .await;
         }
 
         let Some(embedding) = request.query_embedding.as_deref() else {
-            let rows = sqlx::query(
-                "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-                 SELECT u.id,u.text,u.speaker_label,u.start_offset_seconds,u.end_offset_seconds, \
-                        floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms \
-                   FROM utterances u JOIN audio_segments s \
-                     ON s.account_id=u.account_id AND s.id=u.audio_segment_id CROSS JOIN q \
-                  WHERE u.account_id=$1 AND u.search_document @@ q.value \
-                    AND ($3::bigint IS NULL OR s.started_at >= to_timestamp($3::double precision/1000.0)) \
-                    AND ($4::bigint IS NULL OR s.started_at <= to_timestamp($4::double precision/1000.0)) \
-                    AND ($5::text IS NULL OR lower(u.speaker_label)=lower($5)) \
-                  ORDER BY s.started_at DESC LIMIT $6 OFFSET $7",
-            )
-            .bind(account_id)
-            .bind(&request.query)
-            .bind(from)
-            .bind(to)
-            .bind(request.speaker.as_deref())
-            .bind(row_limit)
-            .bind(offset)
-            .fetch_all(self.pool())
-            .await?;
-            return rows
-                .iter()
-                .map(|row| utterance_from_row(row, None))
-                .collect();
+            let ids = self
+                .utterance_fts_ids(account_id, request, row_limit, offset)
+                .await?;
+            return self
+                .enrich_utterance_hits(account_id, &ids, &HashMap::new())
+                .await;
         };
 
-        let candidate_limit = i64::try_from((request.limit * 3).max(60))
-            .map_err(|_| EnclaveError::InvalidRequest("search limit is too large".into()))?;
-        let fts = sqlx::query_scalar::<_, i64>(
-            "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-             SELECT id FROM utterances,q WHERE account_id=$1 AND search_document @@ q.value \
-              ORDER BY ts_rank_cd(search_document,q.value) DESC,id LIMIT $3",
-        )
-        .bind(account_id)
-        .bind(&request.query)
-        .bind(candidate_limit)
-        .fetch_all(self.pool())
-        .await?;
+        let candidate_limit = candidate_limit(request)?;
+        let fts = self
+            .utterance_fts_ids(account_id, request, candidate_limit, 0)
+            .await?;
         let vector = vector_literal(embedding)?;
         let nearest = sqlx::query(
-            "SELECT id,(embedding <=> $2::vector)::double precision AS distance \
-               FROM utterances WHERE account_id=$1 AND embedding IS NOT NULL \
-              ORDER BY embedding <=> $2::vector,id LIMIT $3",
+            r#"SELECT u.id,(u.embedding <=> $2::vector)::double precision AS distance
+                 FROM utterances u
+                 JOIN audio_segments s
+                   ON s.account_id=u.account_id AND s.id=u.audio_segment_id
+                 LEFT JOIN speaker_observations o
+                   ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
+                 LEFT JOIN speaker_clusters c
+                   ON c.account_id=o.account_id AND c.id=o.cluster_id
+                 LEFT JOIN people p
+                   ON p.account_id=u.account_id
+                  AND p.id=coalesce(o.person_id,c.person_id)
+                  AND p.status='identified'
+                WHERE u.account_id=$1 AND u.embedding IS NOT NULL
+                  AND ($3::bigint IS NULL OR
+                       coalesce(o.started_at,
+                           s.started_at + u.start_offset_seconds * interval '1 second')
+                         >=to_timestamp($3::double precision/1000.0))
+                  AND ($4::bigint IS NULL OR
+                       coalesce(o.started_at,
+                           s.started_at + u.start_offset_seconds * interval '1 second')
+                         <=to_timestamp($4::double precision/1000.0))
+                  AND ($5::text IS NULL OR lower(CASE
+                       WHEN c.attribution_state='owner_transmit' THEN 'Me'
+                       ELSE coalesce(p.display_name,u.speaker_label) END)=lower($5))
+                ORDER BY u.embedding <=> $2::vector,u.id
+                LIMIT $6"#,
         )
         .bind(account_id)
         .bind(vector)
+        .bind(from)
+        .bind(to)
+        .bind(request.speaker.as_deref())
         .bind(candidate_limit)
         .fetch_all(self.pool())
         .await?
@@ -336,38 +579,210 @@ impl PostgresPersistence {
         }
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
         let scores: HashMap<i64, f64> = ranked.into_iter().collect();
-        let rows = sqlx::query(
-            "SELECT u.id,u.text,u.speaker_label,u.start_offset_seconds,u.end_offset_seconds, \
-                    floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms \
-               FROM utterances u JOIN audio_segments s \
-                 ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
-              WHERE u.account_id=$1 AND u.id=ANY($2) \
-                AND ($3::bigint IS NULL OR s.started_at >= to_timestamp($3::double precision/1000.0)) \
-                AND ($4::bigint IS NULL OR s.started_at <= to_timestamp($4::double precision/1000.0)) \
-                AND ($5::text IS NULL OR lower(u.speaker_label)=lower($5))",
+        self.enrich_utterance_hits(account_id, &ids, &scores).await
+    }
+
+    async fn screenshot_fts_ids(
+        &self,
+        account_id: &str,
+        request: &SearchRequest,
+        row_limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i64>> {
+        let from = bound(&request.time_start)?;
+        let to = bound(&request.time_end)?;
+        Ok(sqlx::query_scalar::<_, i64>(
+            r#"WITH q AS (
+                   SELECT websearch_to_tsquery('simple',$2) AS exact,
+                          to_tsquery('simple',coalesce((
+                              SELECT string_agg(quote_literal(term)||':*',' | ' ORDER BY term)
+                                FROM unnest(tsvector_to_array(to_tsvector('simple',$2))) AS terms(term)
+                               WHERE char_length(term)>1 AND term NOT IN
+                                     ('a','an','about','are','at','did','do','does','find','for',
+                                      'from','how','in','is','me','my','of','on','show','that','the',
+                                      'this','to','was','were','what','when','where','who','with')
+                          ),'')) AS broad
+               ), latest_episode AS (
+                   SELECT DISTINCT ON (m.account_id,m.record_id)
+                          m.account_id,m.record_id,e.id AS episode_id,e.title
+                     FROM episode_members m
+                     JOIN episodes e
+                       ON e.account_id=m.account_id AND e.id=m.episode_id
+                    WHERE m.account_id=$1 AND m.record_type='screenshot'
+                      AND e.substance!='none'
+                    ORDER BY m.account_id,m.record_id,e.started_at DESC,e.id DESC
+               ), searchable AS (
+                   SELECT s.id,s.captured_at,s.ocr_text,s.salient_ocr_text,
+                          s.active_app,s.window_title,s.url,
+                          concat_ws(' ',o.literal_description,o.visible_text_summary,
+                              o.screen_state,o.content_type,coalesce((
+                                  SELECT string_agg(item.value #>> '{}',' ' ORDER BY item.ordinality)
+                                    FROM jsonb_array_elements(CASE
+                                             WHEN jsonb_typeof(o.notable_items)='array'
+                                             THEN o.notable_items ELSE '[]'::jsonb END)
+                                         WITH ORDINALITY AS item(value,ordinality)
+                                   WHERE jsonb_typeof(item.value)='string'
+                              ),'')) AS observation_text,
+                          concat_ws(' ',i.activity_summary,i.relevance_reason,
+                              i.semantic_group,i.milestone_type) AS interpretation_text
+                     FROM screenshots s
+                     LEFT JOIN screen_observations o
+                       ON o.account_id=s.account_id AND o.screenshot_id=s.id
+                     LEFT JOIN latest_episode linked
+                       ON linked.account_id=s.account_id AND linked.record_id=s.id
+                     LEFT JOIN episode_screen_interpretations i
+                       ON i.account_id=s.account_id AND i.episode_id=linked.episode_id
+                      AND i.screenshot_id=s.id
+                    WHERE s.account_id=$1 AND NOT s.is_duplicate
+                      AND ($3::bigint IS NULL OR
+                           s.captured_at>=to_timestamp($3::double precision/1000.0))
+                      AND ($4::bigint IS NULL OR
+                           s.captured_at<=to_timestamp($4::double precision/1000.0))
+               ), vectors AS (
+                   SELECT searchable.*,
+                          to_tsvector('simple',concat_ws(' ',ocr_text,salient_ocr_text,
+                              active_app,window_title,url,observation_text,
+                              interpretation_text)) AS search_vector
+                     FROM searchable
+               )
+               SELECT v.id
+                 FROM vectors v CROSS JOIN q
+                WHERE v.search_vector @@ q.broad
+                ORDER BY (v.search_vector @@ q.exact) DESC,
+                         ts_rank_cd(v.search_vector,q.exact) DESC,
+                         ts_rank_cd(v.search_vector,q.broad) DESC,
+                         v.captured_at DESC,v.id DESC
+                LIMIT $5 OFFSET $6"#,
         )
         .bind(account_id)
-        .bind(ids)
+        .bind(&request.query)
         .bind(from)
         .bind(to)
-        .bind(request.speaker.as_deref())
+        .bind(row_limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    async fn enrich_screenshot_hits(
+        &self,
+        account_id: &str,
+        query: &str,
+        ids: &[i64],
+        scores: &HashMap<i64, f64>,
+    ) -> Result<Vec<SearchHit>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"WITH q AS (
+                   SELECT websearch_to_tsquery('simple',$2) AS exact,
+                          to_tsquery('simple',coalesce((
+                              SELECT string_agg(quote_literal(term)||':*',' | ' ORDER BY term)
+                                FROM unnest(tsvector_to_array(to_tsvector('simple',$2))) AS terms(term)
+                               WHERE char_length(term)>1 AND term NOT IN
+                                     ('a','an','about','are','at','did','do','does','find','for',
+                                      'from','how','in','is','me','my','of','on','show','that','the',
+                                      'this','to','was','were','what','when','where','who','with')
+                          ),'')) AS broad
+               ), latest_episode AS (
+                   SELECT DISTINCT ON (m.account_id,m.record_id)
+                          m.account_id,m.record_id,e.id AS episode_id,e.title
+                     FROM episode_members m
+                     JOIN episodes e
+                       ON e.account_id=m.account_id AND e.id=m.episode_id
+                    WHERE m.account_id=$1 AND m.record_type='screenshot'
+                      AND m.record_id=ANY($3) AND e.substance!='none'
+                    ORDER BY m.account_id,m.record_id,e.started_at DESC,e.id DESC
+               ), searchable AS (
+                   SELECT s.id,s.captured_at,s.active_app,s.window_title,s.ocr_text,
+                          s.salient_ocr_text,s.url,o.status AS observation_status,
+                          o.literal_description,o.screen_state,o.content_type,
+                          linked.episode_id AS memory_id,linked.episode_id,
+                          linked.title AS episode_title,
+                          concat_ws(' ',o.literal_description,o.visible_text_summary,
+                              o.screen_state,o.content_type,coalesce((
+                                  SELECT string_agg(item.value #>> '{}',' ' ORDER BY item.ordinality)
+                                    FROM jsonb_array_elements(CASE
+                                             WHEN jsonb_typeof(o.notable_items)='array'
+                                             THEN o.notable_items ELSE '[]'::jsonb END)
+                                         WITH ORDINALITY AS item(value,ordinality)
+                                   WHERE jsonb_typeof(item.value)='string'
+                              ),'')) AS observation_text,
+                          concat_ws(' ',i.activity_summary,i.relevance_reason,
+                              i.semantic_group,i.milestone_type) AS interpretation_text
+                     FROM screenshots s
+                     LEFT JOIN screen_observations o
+                       ON o.account_id=s.account_id AND o.screenshot_id=s.id
+                     LEFT JOIN latest_episode linked
+                       ON linked.account_id=s.account_id AND linked.record_id=s.id
+                     LEFT JOIN episode_screen_interpretations i
+                       ON i.account_id=s.account_id AND i.episode_id=linked.episode_id
+                      AND i.screenshot_id=s.id
+                    WHERE s.account_id=$1 AND s.id=ANY($3) AND NOT s.is_duplicate
+               ), vectors AS (
+                   SELECT searchable.*,
+                          to_tsvector('simple',coalesce(interpretation_text,'')) AS interpretation_vector,
+                          to_tsvector('simple',coalesce(observation_text,'')) AS observation_vector,
+                          to_tsvector('simple',coalesce(salient_ocr_text,'')) AS salient_ocr_vector,
+                          to_tsvector('simple',coalesce(window_title,'')) AS window_vector,
+                          to_tsvector('simple',coalesce(active_app,'')) AS app_vector,
+                          to_tsvector('simple',coalesce(url,'')) AS url_vector,
+                          to_tsvector('simple',coalesce(ocr_text,'')) AS ocr_vector
+                     FROM searchable
+               )
+               SELECT v.id,v.active_app,v.window_title,v.ocr_text,v.url,
+                      v.observation_status,v.literal_description,v.screen_state,v.content_type,
+                      floor(extract(epoch FROM v.captured_at)*1000)::bigint AS captured_at_ms,
+                      floor(extract(epoch FROM v.captured_at)*1000)::bigint AS source_at_ms,
+                      v.memory_id,v.episode_id,v.episode_title,
+                      coalesce(matched.source,'semantic') AS match_source,
+                      left(regexp_replace(CASE
+                          WHEN matched.value IS NOT NULL THEN
+                              ts_headline('simple',matched.value,q.broad,
+                                  'StartSel=[, StopSel=], MaxWords=24, MinWords=6, MaxFragments=1, FragmentDelimiter= … ')
+                          ELSE coalesce(nullif(v.interpretation_text,''),
+                                        nullif(v.observation_text,''),
+                                        nullif(v.salient_ocr_text,''),
+                                        nullif(v.window_title,''),
+                                        nullif(v.active_app,''),nullif(v.url,''),
+                                        nullif(v.ocr_text,''))
+                      END,'[[:space:]]+',' ','g'),400) AS match_text
+                 FROM vectors v CROSS JOIN q
+                 LEFT JOIN LATERAL (
+                     SELECT field.source,field.value
+                       FROM (VALUES
+                           ('episode_interpretation'::text,v.interpretation_text,70),
+                           ('screen_observation'::text,v.observation_text,60),
+                           ('salient_ocr'::text,v.salient_ocr_text,50),
+                           ('window_title'::text,v.window_title,40),
+                           ('active_app'::text,v.active_app,30),
+                           ('url'::text,v.url,20),
+                           ('ocr'::text,v.ocr_text,10)
+                       ) AS field(source,value,quality)
+                      WHERE nullif(btrim(field.value),'') IS NOT NULL
+                        AND to_tsvector('simple',field.value) @@ q.broad
+                      ORDER BY (to_tsvector('simple',field.value) @@ q.exact) DESC,
+                               ts_rank_cd(to_tsvector('simple',field.value),q.exact) DESC,
+                               ts_rank_cd(to_tsvector('simple',field.value),q.broad) DESC,
+                               field.quality DESC,field.source
+                      LIMIT 1
+                 ) matched ON true
+                WHERE v.id=ANY($3)"#,
+        )
+        .bind(account_id)
+        .bind(query)
+        .bind(ids)
         .fetch_all(self.pool())
         .await?;
-        let mut hits = rows
+        let hits = rows
             .iter()
             .map(|row| {
                 let id: i64 = row.try_get("id")?;
-                utterance_from_row(row, scores.get(&id).copied())
+                screenshot_from_row(row, scores.get(&id).copied())
             })
             .collect::<Result<Vec<_>>>()?;
-        hits.sort_by(|left, right| {
-            let score = |hit: &SearchHit| match hit {
-                SearchHit::Utterance { score, .. } => score.unwrap_or_default(),
-                _ => 0.0,
-            };
-            score(right).total_cmp(&score(left))
-        });
-        Ok(hits)
+        Ok(order_hits(hits, ids))
     }
 
     async fn search_screenshots(
@@ -384,54 +799,34 @@ impl PostgresPersistence {
         let offset = limit(request.offset)?;
 
         let Some(embedding) = request.query_embedding.as_deref() else {
-            let rows = sqlx::query(
-                "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-                 SELECT s.id,s.active_app,s.window_title,s.ocr_text,s.url, \
-                        o.status AS observation_status,o.literal_description,o.screen_state,o.content_type, \
-                        floor(extract(epoch FROM s.captured_at)*1000)::bigint AS captured_at_ms \
-                   FROM screenshots s LEFT JOIN screen_observations o \
-                     ON o.account_id=s.account_id AND o.screenshot_id=s.id CROSS JOIN q \
-                  WHERE s.account_id=$1 AND NOT s.is_duplicate \
-                    AND (s.search_document @@ q.value OR o.literal_description ILIKE '%'||$2||'%' \
-                         OR o.visible_text_summary ILIKE '%'||$2||'%' OR s.url ILIKE '%'||$2||'%') \
-                    AND ($3::bigint IS NULL OR s.captured_at >= to_timestamp($3::double precision/1000.0)) \
-                    AND ($4::bigint IS NULL OR s.captured_at <= to_timestamp($4::double precision/1000.0)) \
-                  ORDER BY s.captured_at DESC LIMIT $5 OFFSET $6",
-            )
-            .bind(account_id)
-            .bind(&request.query)
-            .bind(from)
-            .bind(to)
-            .bind(row_limit)
-            .bind(offset)
-            .fetch_all(self.pool())
-            .await?;
-            return rows
-                .iter()
-                .map(|row| screenshot_from_row(row, None))
-                .collect();
+            let ids = self
+                .screenshot_fts_ids(account_id, request, row_limit, offset)
+                .await?;
+            return self
+                .enrich_screenshot_hits(account_id, &request.query, &ids, &HashMap::new())
+                .await;
         };
 
-        let candidate_limit = i64::try_from((request.limit * 3).max(60))
-            .map_err(|_| EnclaveError::InvalidRequest("search limit is too large".into()))?;
-        let fts = sqlx::query_scalar::<_, i64>(
-            "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-             SELECT id FROM screenshots,q WHERE account_id=$1 AND search_document @@ q.value \
-              ORDER BY ts_rank_cd(search_document,q.value) DESC,id LIMIT $3",
-        )
-        .bind(account_id)
-        .bind(&request.query)
-        .bind(candidate_limit)
-        .fetch_all(self.pool())
-        .await?;
+        let candidate_limit = candidate_limit(request)?;
+        let fts = self
+            .screenshot_fts_ids(account_id, request, candidate_limit, 0)
+            .await?;
         let vector = vector_literal(embedding)?;
         let nearest = sqlx::query(
-            "SELECT id,(embedding <=> $2::vector)::double precision AS distance \
-               FROM screenshots WHERE account_id=$1 AND embedding IS NOT NULL \
-              ORDER BY embedding <=> $2::vector,id LIMIT $3",
+            r#"SELECT s.id,(s.embedding <=> $2::vector)::double precision AS distance
+                 FROM screenshots s
+                WHERE s.account_id=$1 AND s.embedding IS NOT NULL AND NOT s.is_duplicate
+                  AND ($3::bigint IS NULL OR
+                       s.captured_at>=to_timestamp($3::double precision/1000.0))
+                  AND ($4::bigint IS NULL OR
+                       s.captured_at<=to_timestamp($4::double precision/1000.0))
+                ORDER BY s.embedding <=> $2::vector,s.id
+                LIMIT $5"#,
         )
         .bind(account_id)
         .bind(vector)
+        .bind(from)
+        .bind(to)
         .bind(candidate_limit)
         .fetch_all(self.pool())
         .await?
@@ -443,42 +838,172 @@ impl PostgresPersistence {
             .skip(request.offset)
             .take(request.limit)
             .collect();
-        if ranked.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
-        let scores: HashMap<i64, f64> = ranked.into_iter().collect();
-        let rows = sqlx::query(
-            "SELECT s.id,s.active_app,s.window_title,s.ocr_text,s.url, \
-                    o.status AS observation_status,o.literal_description,o.screen_state,o.content_type, \
-                    floor(extract(epoch FROM s.captured_at)*1000)::bigint AS captured_at_ms \
-               FROM screenshots s LEFT JOIN screen_observations o \
-                 ON o.account_id=s.account_id AND o.screenshot_id=s.id \
-              WHERE s.account_id=$1 AND s.id=ANY($2) AND NOT s.is_duplicate \
-                AND ($3::bigint IS NULL OR s.captured_at >= to_timestamp($3::double precision/1000.0)) \
-                AND ($4::bigint IS NULL OR s.captured_at <= to_timestamp($4::double precision/1000.0))",
+        let ids = ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let scores = ranked.into_iter().collect::<HashMap<_, _>>();
+        self.enrich_screenshot_hits(account_id, &request.query, &ids, &scores)
+            .await
+    }
+
+    async fn episode_fts_ids(
+        &self,
+        account_id: &str,
+        request: &SearchRequest,
+        row_limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i64>> {
+        let from = bound(&request.time_start)?;
+        let to = bound(&request.time_end)?;
+        Ok(sqlx::query_scalar::<_, i64>(
+            r#"WITH q AS (
+                   SELECT websearch_to_tsquery('simple',$2) AS exact,
+                          to_tsquery('simple',coalesce((
+                              SELECT string_agg(quote_literal(term)||':*',' | ' ORDER BY term)
+                                FROM unnest(tsvector_to_array(to_tsvector('simple',$2))) AS terms(term)
+                               WHERE char_length(term)>1 AND term NOT IN
+                                     ('a','an','about','are','at','did','do','does','find','for',
+                                      'from','how','in','is','me','my','of','on','show','that','the',
+                                      'this','to','was','were','what','when','where','who','with')
+                          ),'')) AS broad
+               ), searchable AS (
+                   SELECT e.id,e.started_at,e.search_document AS memory_vector,
+                          concat_ws(' ',e.title,e.summary,e.minutes_text) AS memory_text,
+                          concat_ws(' ',fb.overview,coalesce((
+                              SELECT string_agg(value #>> '{}',' ' ORDER BY ordinal)
+                                FROM jsonb_path_query(
+                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions,
+                                    'strict $.** ? (@.type() == "string")')
+                                     WITH ORDINALITY AS strings(value,ordinal)
+                          ),'')) AS brief_text
+                     FROM episodes e
+                     LEFT JOIN episode_final_briefs fb
+                       ON fb.account_id=e.account_id AND fb.episode_id=e.id
+                    WHERE e.account_id=$1 AND e.substance!='none'
+                      AND ($3::bigint IS NULL OR
+                           e.started_at>=to_timestamp($3::double precision/1000.0))
+                      AND ($4::bigint IS NULL OR
+                           e.started_at<=to_timestamp($4::double precision/1000.0))
+                      AND ($5::text IS NULL OR EXISTS (
+                           SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value)
+                            WHERE lower(p.value)=lower($5)
+                               OR lower(p.value) LIKE lower($5)||' (%)'))
+               ), vectors AS (
+                   SELECT searchable.*,
+                          to_tsvector('simple',coalesce(brief_text,'')) AS brief_vector,
+                          memory_vector || to_tsvector('simple',coalesce(brief_text,'')) AS search_vector
+                     FROM searchable
+               )
+               SELECT v.id
+                 FROM vectors v CROSS JOIN q
+                WHERE v.search_vector @@ q.broad
+                ORDER BY (v.search_vector @@ q.exact) DESC,
+                         ts_rank_cd(v.search_vector,q.exact) DESC,
+                         ts_rank_cd(v.search_vector,q.broad) DESC,
+                         v.started_at DESC,v.id DESC
+                LIMIT $6 OFFSET $7"#,
         )
         .bind(account_id)
-        .bind(ids)
+        .bind(&request.query)
         .bind(from)
         .bind(to)
+        .bind(request.speaker.as_deref())
+        .bind(row_limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    async fn enrich_episode_hits(
+        &self,
+        account_id: &str,
+        query: &str,
+        ids: &[i64],
+        scores: &HashMap<i64, f64>,
+    ) -> Result<Vec<SearchHit>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"WITH q AS (
+                   SELECT websearch_to_tsquery('simple',$2) AS exact,
+                          to_tsquery('simple',coalesce((
+                              SELECT string_agg(quote_literal(term)||':*',' | ' ORDER BY term)
+                                FROM unnest(tsvector_to_array(to_tsvector('simple',$2))) AS terms(term)
+                               WHERE char_length(term)>1 AND term NOT IN
+                                     ('a','an','about','are','at','did','do','does','find','for',
+                                      'from','how','in','is','me','my','of','on','show','that','the',
+                                      'this','to','was','were','what','when','where','who','with')
+                          ),'')) AS broad
+               ), searchable AS (
+                   SELECT e.id,e.started_at,e.ended_at,e.title,e.summary,e.minute_summaries,
+                          e.search_document AS memory_vector,
+                          concat_ws(' ',e.title,e.summary,e.minutes_text) AS memory_text,
+                          fb.overview AS brief_overview,
+                          fb.decisions::text AS brief_decisions,
+                          fb.action_items::text AS brief_action_items,
+                          fb.important_links::text AS brief_important_links,
+                          fb.open_questions::text AS brief_open_questions,
+                          concat_ws(' ',fb.overview,coalesce((
+                              SELECT string_agg(value #>> '{}',' ' ORDER BY ordinal)
+                                FROM jsonb_path_query(
+                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions,
+                                    'strict $.** ? (@.type() == "string")')
+                                     WITH ORDINALITY AS strings(value,ordinal)
+                          ),'')) AS brief_text
+                     FROM episodes e
+                     LEFT JOIN episode_final_briefs fb
+                       ON fb.account_id=e.account_id AND fb.episode_id=e.id
+                    WHERE e.account_id=$1 AND e.id=ANY($3) AND e.substance!='none'
+               ), vectors AS (
+                   SELECT searchable.*,
+                          to_tsvector('simple',coalesce(brief_text,'')) AS brief_vector
+                     FROM searchable
+               )
+               SELECT v.id,v.title,v.summary,v.minute_summaries::text AS minute_summaries,
+                      floor(extract(epoch FROM v.started_at)*1000)::bigint AS started_at_ms,
+                      floor(extract(epoch FROM v.ended_at)*1000)::bigint AS ended_at_ms,
+                      v.brief_overview,v.brief_decisions,v.brief_action_items,
+                      v.brief_important_links,v.brief_open_questions,
+                      CASE WHEN btrim($2)='' THEN 'memory'
+                           ELSE coalesce(matched.source,'semantic') END AS match_source,
+                      CASE WHEN matched.value IS NULL THEN NULL
+                           ELSE left(ts_headline('simple',matched.value,q.broad,
+                               'StartSel=[, StopSel=], MaxWords=24, MinWords=6, MaxFragments=1, FragmentDelimiter= … '),500)
+                      END AS snippet
+                 FROM vectors v CROSS JOIN q
+                 LEFT JOIN LATERAL (
+                     SELECT field.source,field.value
+                       FROM (VALUES
+                           ('brief'::text,v.brief_text,20),
+                           ('memory'::text,v.memory_text,10)
+                       ) AS field(source,value,quality)
+                      WHERE nullif(btrim(field.value),'') IS NOT NULL
+                        AND to_tsvector('simple',field.value) @@ q.broad
+                      ORDER BY (to_tsvector('simple',field.value) @@ q.exact) DESC,
+                               ts_rank_cd(to_tsvector('simple',field.value),q.exact) DESC,
+                               ts_rank_cd(to_tsvector('simple',field.value),q.broad) DESC,
+                               field.quality DESC,field.source
+                      LIMIT 1
+                 ) matched ON true
+                WHERE v.id=ANY($3)"#,
+        )
+        .bind(account_id)
+        .bind(query)
+        .bind(ids)
         .fetch_all(self.pool())
         .await?;
-        let mut hits = rows
+        let hits = rows
             .iter()
             .map(|row| {
                 let id: i64 = row.try_get("id")?;
-                screenshot_from_row(row, scores.get(&id).copied())
+                episode_from_row(
+                    row,
+                    row.try_get("snippet")?,
+                    row.try_get("match_source")?,
+                    scores.get(&id).copied(),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        hits.sort_by(|left, right| {
-            let score = |hit: &SearchHit| match hit {
-                SearchHit::Screenshot { score, .. } => score.unwrap_or_default(),
-                _ => 0.0,
-            };
-            score(right).total_cmp(&score(left))
-        });
-        Ok(hits)
+        Ok(order_hits(hits, ids))
     }
 
     async fn search_episodes(
@@ -495,16 +1020,20 @@ impl PostgresPersistence {
             let Some(speaker) = request.speaker.as_deref() else {
                 return Ok(Vec::new());
             };
-            let rows = sqlx::query(
-                "SELECT e.id,e.title,e.summary,e.minute_summaries::text AS minute_summaries, \
-                        floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
-                        floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms \
-                   FROM episodes e WHERE e.account_id=$1 AND e.substance!='none' \
-                    AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value) \
-                                 WHERE lower(p.value)=lower($2) OR lower(p.value) LIKE lower($2)||' (%)') \
-                    AND ($3::bigint IS NULL OR e.started_at >= to_timestamp($3::double precision/1000.0)) \
-                    AND ($4::bigint IS NULL OR e.started_at <= to_timestamp($4::double precision/1000.0)) \
-                  ORDER BY e.started_at DESC LIMIT $5 OFFSET $6",
+            let ids = sqlx::query_scalar::<_, i64>(
+                r#"SELECT e.id
+                     FROM episodes e
+                    WHERE e.account_id=$1 AND e.substance!='none'
+                      AND EXISTS (
+                          SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value)
+                           WHERE lower(p.value)=lower($2)
+                              OR lower(p.value) LIKE lower($2)||' (%)')
+                      AND ($3::bigint IS NULL OR
+                           e.started_at>=to_timestamp($3::double precision/1000.0))
+                      AND ($4::bigint IS NULL OR
+                           e.started_at<=to_timestamp($4::double precision/1000.0))
+                    ORDER BY e.started_at DESC,e.id DESC
+                    LIMIT $5 OFFSET $6"#,
             )
             .bind(account_id)
             .bind(speaker)
@@ -514,125 +1043,66 @@ impl PostgresPersistence {
             .bind(offset)
             .fetch_all(self.pool())
             .await?;
-            return rows
-                .iter()
-                .map(|row| episode_from_row(row, None, None))
-                .collect();
+            return self
+                .enrich_episode_hits(account_id, "", &ids, &HashMap::new())
+                .await;
         }
 
         let Some(embedding) = request.query_embedding.as_deref() else {
-            let rows = sqlx::query(
-                "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-                 SELECT e.id,e.title,e.summary,e.minute_summaries::text AS minute_summaries, \
-                        floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
-                        floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
-                        ts_headline('simple',coalesce(e.title,'')||' '||coalesce(e.summary,'')||' '||coalesce(e.minutes_text,''),q.value, \
-                                    'StartSel=[, StopSel=], MaxWords=12, MinWords=6, FragmentDelimiter= … ') AS snippet \
-                   FROM episodes e CROSS JOIN q \
-                  WHERE e.account_id=$1 AND e.substance!='none' AND e.search_document @@ q.value \
-                    AND ($3::bigint IS NULL OR e.started_at >= to_timestamp($3::double precision/1000.0)) \
-                    AND ($4::bigint IS NULL OR e.started_at <= to_timestamp($4::double precision/1000.0)) \
-                    AND ($5::text IS NULL OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value) \
-                         WHERE lower(p.value)=lower($5) OR lower(p.value) LIKE lower($5)||' (%)')) \
-                  ORDER BY ts_rank_cd(e.search_document,q.value) DESC,e.id LIMIT $6 OFFSET $7",
-            )
-            .bind(account_id)
-            .bind(&request.query)
-            .bind(from)
-            .bind(to)
-            .bind(request.speaker.as_deref())
-            .bind(row_limit)
-            .bind(offset)
-            .fetch_all(self.pool())
-            .await?;
-            return rows
-                .iter()
-                .map(|row| episode_from_row(row, row.try_get("snippet")?, None))
-                .collect();
+            let ids = self
+                .episode_fts_ids(account_id, request, row_limit, offset)
+                .await?;
+            return self
+                .enrich_episode_hits(account_id, &request.query, &ids, &HashMap::new())
+                .await;
         };
 
-        let candidate_limit = i64::try_from((request.limit * 3).max(60))
-            .map_err(|_| EnclaveError::InvalidRequest("search limit is too large".into()))?;
-        let fts_rows = sqlx::query(
-            "WITH q AS (SELECT websearch_to_tsquery('simple',$2) AS value) \
-             SELECT id,ts_headline('simple',coalesce(title,'')||' '||coalesce(summary,'')||' '||coalesce(minutes_text,''),q.value, \
-                                   'StartSel=[, StopSel=], MaxWords=12, MinWords=6, FragmentDelimiter= … ') AS snippet \
-               FROM episodes,q WHERE account_id=$1 AND substance!='none' AND search_document @@ q.value \
-              ORDER BY ts_rank_cd(search_document,q.value) DESC,id LIMIT $3",
-        )
-        .bind(account_id)
-        .bind(&request.query)
-        .bind(candidate_limit)
-        .fetch_all(self.pool())
-        .await?;
-        let fts: Vec<i64> = fts_rows.iter().map(|row| row.get("id")).collect();
-        let snippets: HashMap<i64, String> = fts_rows
-            .iter()
-            .map(|row| (row.get("id"), row.get("snippet")))
-            .collect();
+        let candidate_limit = candidate_limit(request)?;
+        let fts = self
+            .episode_fts_ids(account_id, request, candidate_limit, 0)
+            .await?;
         let vector = vector_literal(embedding)?;
         let nearest = sqlx::query(
-            "SELECT id,(embedding <=> $2::vector)::double precision AS distance \
-               FROM episodes WHERE account_id=$1 AND substance!='none' AND embedding IS NOT NULL \
-              ORDER BY embedding <=> $2::vector,id LIMIT $3",
+            r#"SELECT e.id,(e.embedding <=> $2::vector)::double precision AS distance
+                 FROM episodes e
+                WHERE e.account_id=$1 AND e.substance!='none' AND e.embedding IS NOT NULL
+                  AND ($3::bigint IS NULL OR
+                       e.started_at>=to_timestamp($3::double precision/1000.0))
+                  AND ($4::bigint IS NULL OR
+                       e.started_at<=to_timestamp($4::double precision/1000.0))
+                  AND ($5::text IS NULL OR EXISTS (
+                       SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value)
+                        WHERE lower(p.value)=lower($5)
+                           OR lower(p.value) LIKE lower($5)||' (%)'))
+                ORDER BY e.embedding <=> $2::vector,e.id
+                LIMIT $6"#,
         )
         .bind(account_id)
         .bind(vector)
+        .bind(from)
+        .bind(to)
+        .bind(request.speaker.as_deref())
         .bind(candidate_limit)
         .fetch_all(self.pool())
         .await?
         .into_iter()
         .map(|row| Ok((row.try_get("id")?, row.try_get("distance")?)))
         .collect::<Result<Vec<(i64, f64)>>>()?;
-        let ranked: Vec<(i64, f64)> = rrf_merge(&fts, &nearest)
+        let ranked = rrf_merge(&fts, &nearest)
             .into_iter()
             .skip(request.offset)
             .take(request.limit)
-            .collect();
-        if ranked.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
-        let scores: HashMap<i64, f64> = ranked.into_iter().collect();
-        let rows = sqlx::query(
-            "SELECT e.id,e.title,e.summary,e.minute_summaries::text AS minute_summaries, \
-                    floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
-                    floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms \
-               FROM episodes e WHERE e.account_id=$1 AND e.id=ANY($2) AND e.substance!='none' \
-                AND ($3::bigint IS NULL OR e.started_at >= to_timestamp($3::double precision/1000.0)) \
-                AND ($4::bigint IS NULL OR e.started_at <= to_timestamp($4::double precision/1000.0)) \
-                AND ($5::text IS NULL OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(e.participants) AS p(value) \
-                     WHERE lower(p.value)=lower($5) OR lower(p.value) LIKE lower($5)||' (%)'))",
-        )
-        .bind(account_id)
-        .bind(ids)
-        .bind(from)
-        .bind(to)
-        .bind(request.speaker.as_deref())
-        .fetch_all(self.pool())
-        .await?;
-        let mut hits = rows
-            .iter()
-            .map(|row| {
-                let id: i64 = row.try_get("id")?;
-                episode_from_row(row, snippets.get(&id).cloned(), scores.get(&id).copied())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        hits.sort_by(|left, right| {
-            let score = |hit: &SearchHit| match hit {
-                SearchHit::Episode { score, .. } => score.unwrap_or_default(),
-                _ => 0.0,
-            };
-            score(right).total_cmp(&score(left))
-        });
-        Ok(hits)
+            .collect::<Vec<_>>();
+        let ids = ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let scores = ranked.into_iter().collect::<HashMap<_, _>>();
+        self.enrich_episode_hits(account_id, &request.query, &ids, &scores)
+            .await
     }
 }
 
 fn postgres_json_array(row: &sqlx::postgres::PgRow, name: &str) -> Result<Value> {
     let raw: String = row.try_get(name)?;
-    let value: Value = serde_json::from_str(&raw)?;
-    Ok(if value.is_array() { value } else { json!([]) })
+    json_array_from_text(&raw, name)
 }
 
 fn postgres_url_domain(value: &str) -> Option<String> {
@@ -650,6 +1120,42 @@ fn top_three(counts: Option<&HashMap<String, i64>>) -> Vec<String> {
         .take(3)
         .map(|(value, _)| value.clone())
         .collect()
+}
+
+fn participant_detail_from_row(row: &sqlx::postgres::PgRow) -> Result<Value> {
+    let participant_key: String = row.try_get("participant_key")?;
+    let attribution_kind: String = row.try_get("attribution_kind")?;
+    let person_name: Option<String> = row.try_get("display_name")?;
+    let claimed_name: Option<String> = row.try_get("source_claimed_name")?;
+    let slot = row.try_get::<Option<i64>, _>("slot_ordinal")?;
+    let owner = participant_key == "owner"
+        || matches!(
+            attribution_kind.as_str(),
+            "owner" | "owner_presentation" | "owner_source_role"
+        );
+    let display_name = if owner {
+        "Me".to_owned()
+    } else if let Some(name) = person_name {
+        name
+    } else if let Some(name) = claimed_name {
+        name
+    } else if let Some(slot) = slot {
+        let slot = i32::try_from(slot)
+            .map_err(|_| EnclaveError::Store("episode speaker slot is out of range".into()))?;
+        format!(
+            "Unknown speaker {}",
+            crate::cp::identity::format_slot_ordinal(slot)
+        )
+    } else {
+        "Unknown speaker".to_owned()
+    };
+    Ok(json!({
+        "participant_key": participant_key,
+        "display_name": display_name,
+        "person_id": if owner { None } else { row.try_get::<Option<i64>, _>("public_person_id")? },
+        "attribution_kind": attribution_kind,
+        "state": row.try_get::<String, _>("state")?,
+    }))
 }
 
 async fn require_identified_person(
@@ -741,7 +1247,8 @@ async fn postgres_person_statements(
                  JOIN episodes e ON e.account_id=m.account_id AND e.id=m.episode_id \
                  WHERE u.account_id=s.account_id \
                    AND u.source_key='cloud-v2:'||s.event_id||':'||s.turn_id \
-                 ORDER BY e.id DESC LIMIT 1) linked ON true \
+                   AND e.substance!='none' \
+                 ORDER BY e.started_at DESC,e.id DESC LIMIT 1) linked ON true \
           WHERE s.account_id=$1 AND s.person_id=$2 \
             AND ($3::bigint IS NULL OR s.id<$3) ORDER BY s.id DESC LIMIT $4",
     )
@@ -794,19 +1301,23 @@ impl MemoryQueryRepository for PostgresPersistence {
                     .any(|candidate| candidate.eq_ignore_ascii_case(kind))
         };
 
+        let wants_utterances = wants("utterance");
+        let wants_screenshots = wants("screenshot") && request.speaker.is_none();
+        let wants_episodes = wants("episode");
+        let branch_count = usize::from(wants_utterances)
+            + usize::from(wants_screenshots)
+            + usize::from(wants_episodes);
         let mut hits = Vec::new();
-        if wants("utterance") {
+        if wants_utterances {
             hits.extend(self.search_utterances(account_id, &request).await?);
         }
-        if wants("screenshot") && request.speaker.is_none() {
+        if wants_screenshots {
             hits.extend(self.search_screenshots(account_id, &request).await?);
         }
-        if wants("episode") {
+        if wants_episodes {
             hits.extend(self.search_episodes(account_id, &request).await?);
         }
-        hits.sort_by(|left, right| timestamp(right).cmp(timestamp(left)));
-        hits.truncate(request.limit);
-        Ok(hits)
+        Ok(finalize_search_order(hits, branch_count, request.limit))
     }
 
     async fn list_episodes(
@@ -923,6 +1434,35 @@ impl MemoryQueryRepository for PostgresPersistence {
             .iter()
             .filter_map(|episode| episode.get("id").and_then(Value::as_i64))
             .collect::<Vec<_>>();
+        let participant_rows = if ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query(
+                "SELECT p.episode_id,p.participant_key,p.attribution_kind,p.state, \
+                        CASE WHEN p.participant_key='owner' OR p.attribution_kind IN \
+                             ('owner','owner_presentation','owner_source_role') \
+                             THEN NULL ELSE pe.id END AS public_person_id, \
+                        pe.display_name,p.source_claimed_name,s.slot_ordinal \
+                   FROM episode_participants p LEFT JOIN people pe \
+                     ON pe.account_id=p.account_id AND pe.id=p.person_id \
+                    AND pe.status='identified' \
+                   LEFT JOIN episode_speaker_slots s \
+                     ON s.account_id=p.account_id AND s.id=p.speaker_slot_id \
+                  WHERE p.account_id=$1 AND p.episode_id=ANY($2) \
+                    AND p.state='active' ORDER BY p.episode_id,p.id",
+            )
+            .bind(account_id)
+            .bind(&ids)
+            .fetch_all(self.pool())
+            .await?
+        };
+        let mut participant_details: HashMap<i64, Vec<Value>> = HashMap::new();
+        for row in &participant_rows {
+            participant_details
+                .entry(row.try_get("episode_id")?)
+                .or_default()
+                .push(participant_detail_from_row(row)?);
+        }
         let facet_rows = if ids.is_empty() {
             Vec::new()
         } else {
@@ -969,6 +1509,8 @@ impl MemoryQueryRepository for PostgresPersistence {
             let id = episode.get("id").and_then(Value::as_i64).unwrap_or(-1);
             episode["top_apps"] = json!(top_three(app_counts.get(&id)));
             episode["top_domains"] = json!(top_three(domain_counts.get(&id)));
+            episode["participant_details"] =
+                json!(participant_details.remove(&id).unwrap_or_default());
         }
 
         let hidden_count = if request.include_low {
@@ -1028,10 +1570,25 @@ impl MemoryQueryRepository for PostgresPersistence {
         let to = bound(&request.to)?;
         let before = bound(&request.before)?;
         let utterance_rows = sqlx::query(
-            "SELECT u.id,u.speaker_label,u.text,u.source_key, \
+            "SELECT u.id,CASE WHEN c.attribution_state='owner_transmit' THEN 'Me' \
+                              ELSE coalesce(p.display_name,u.speaker_label) END AS speaker_label, \
+                    u.text,u.source_key, \
+                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
+                    CASE WHEN c.attribution_state='owner_transmit' THEN 'owner_source_role' \
+                         WHEN p.id IS NOT NULL THEN 'direct_identity_evidence' \
+                         WHEN c.attribution_state='anonymous_profile' THEN 'verified_voice' \
+                         WHEN c.attribution_state IN ('request_local','unsegmented') THEN 'context_inferred' \
+                         ELSE NULL END AS attribution_kind, \
                     floor(extract(epoch FROM (s.started_at + make_interval(secs => u.start_offset_seconds)))*1000)::bigint AS at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               LEFT JOIN speaker_observations o \
+                 ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
+               LEFT JOIN speaker_clusters c \
+                 ON c.account_id=o.account_id AND c.id=o.cluster_id \
+               LEFT JOIN people p \
+                 ON p.account_id=u.account_id AND p.id=coalesce(o.person_id,c.person_id) \
+                AND p.status='identified' \
               WHERE u.account_id=$1 \
                 AND ($2::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)>=to_timestamp($2::double precision/1000.0)) \
                 AND ($3::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)<=to_timestamp($3::double precision/1000.0)) \
@@ -1053,6 +1610,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                     id: row.try_get("id")?,
                     at: required_timestamp(row, "at_ms")?,
                     speaker_label: row.try_get("speaker_label")?,
+                    person_id: row.try_get("person_id")?,
+                    attribution_kind: row.try_get("attribution_kind")?,
                     text: row.try_get("text")?,
                     source_key: row.try_get("source_key")?,
                     active_app: None,
@@ -1110,6 +1669,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                 literal_description: row.try_get("literal_description")?,
                 screen_state: row.try_get("screen_state")?,
                 speaker_label: None,
+                person_id: None,
+                attribution_kind: None,
                 text: None,
                 episode_id: None,
             });
@@ -1128,11 +1689,14 @@ impl MemoryQueryRepository for PostgresPersistence {
             .map(|record| record.id)
             .collect::<Vec<_>>();
         let membership_rows = sqlx::query(
-            "SELECT record_type,record_id,max(episode_id)::bigint AS episode_id \
-               FROM episode_members WHERE account_id=$1 \
-                AND ((record_type='utterance' AND record_id=ANY($2)) \
-                  OR (record_type='screenshot' AND record_id=ANY($3))) \
-              GROUP BY record_type,record_id",
+            "SELECT DISTINCT ON (m.account_id,m.record_type,m.record_id) \
+                    m.record_type,m.record_id,e.id AS episode_id \
+               FROM episode_members m JOIN episodes e \
+                 ON e.account_id=m.account_id AND e.id=m.episode_id \
+              WHERE m.account_id=$1 AND e.substance!='none' \
+                AND ((m.record_type='utterance' AND m.record_id=ANY($2)) \
+                  OR (m.record_type='screenshot' AND m.record_id=ANY($3))) \
+              ORDER BY m.account_id,m.record_type,m.record_id,e.started_at DESC,e.id DESC",
         )
         .bind(account_id)
         .bind(&utterance_ids)
@@ -1666,7 +2230,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                         o.ended_at, \
                         s.started_at + (u.end_offset_seconds * interval '1 second') \
                     ))*1000)::bigint AS ended_at_ms, \
-                    coalesce(o.person_id,c.person_id) AS person_id,p.display_name, \
+                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
+                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.display_name END AS display_name, \
                     c.attribution_state \
                FROM episode_members m JOIN utterances u \
                  ON u.account_id=m.account_id AND u.id=m.record_id \
@@ -1678,7 +2243,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                  ON c.account_id=o.account_id AND c.id=o.cluster_id \
                LEFT JOIN people p \
                  ON p.account_id=u.account_id AND p.id=coalesce(o.person_id,c.person_id) \
-                AND p.status<>'quarantined' \
+                AND p.status='identified' \
               WHERE m.account_id=$1 AND m.episode_id=$2 AND m.record_type='utterance'",
         )
         .bind(account_id)
@@ -1827,10 +2392,14 @@ impl MemoryQueryRepository for PostgresPersistence {
             .collect::<Vec<_>>();
 
         let participant_rows = sqlx::query(
-            "SELECT p.participant_key,p.person_id,p.attribution_kind,p.state,pe.display_name, \
-                    p.source_claimed_name,s.slot_ordinal \
+            "SELECT p.participant_key,p.attribution_kind,p.state, \
+                    CASE WHEN p.participant_key='owner' OR p.attribution_kind IN \
+                         ('owner','owner_presentation','owner_source_role') \
+                         THEN NULL ELSE pe.id END AS public_person_id, \
+                    pe.display_name,p.source_claimed_name,s.slot_ordinal \
                FROM episode_participants p LEFT JOIN people pe \
                  ON pe.account_id=p.account_id AND pe.id=p.person_id \
+                AND pe.status='identified' \
                LEFT JOIN episode_speaker_slots s \
                  ON s.account_id=p.account_id AND s.id=p.speaker_slot_id \
               WHERE p.account_id=$1 AND p.episode_id=$2 AND p.state='active' ORDER BY p.id",
@@ -1841,41 +2410,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .await?;
         let participant_details = participant_rows
             .iter()
-            .map(|row| {
-                let participant_key: String = row.try_get("participant_key")?;
-                let attribution_kind: String = row.try_get("attribution_kind")?;
-                let person_name: Option<String> = row.try_get("display_name")?;
-                let claimed_name: Option<String> = row.try_get("source_claimed_name")?;
-                let slot = row.try_get::<Option<i64>, _>("slot_ordinal")?;
-                let display_name = if participant_key == "owner"
-                    || matches!(
-                        attribution_kind.as_str(),
-                        "owner" | "owner_presentation" | "owner_source_role"
-                    ) {
-                    "Me".to_owned()
-                } else if let Some(name) = person_name {
-                    name
-                } else if let Some(name) = claimed_name {
-                    name
-                } else if let Some(slot) = slot {
-                    let slot = i32::try_from(slot).map_err(|_| {
-                        EnclaveError::Store("episode speaker slot is out of range".into())
-                    })?;
-                    format!(
-                        "Unknown speaker {}",
-                        crate::cp::identity::format_slot_ordinal(slot)
-                    )
-                } else {
-                    "Unknown speaker".to_owned()
-                };
-                Ok(json!({
-                    "participant_key": participant_key,
-                    "display_name": display_name,
-                    "person_id": row.try_get::<Option<i64>, _>("person_id")?,
-                    "attribution_kind": attribution_kind,
-                    "state": row.try_get::<String, _>("state")?,
-                }))
-            })
+            .map(participant_detail_from_row)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(json!({
@@ -2184,5 +2719,39 @@ impl MemoryQueryRepository for PostgresPersistence {
         }
         require_identified_person(self, account_id, person_id).await?;
         postgres_person_statements(self, account_id, person_id, before_id, limit).await
+    }
+}
+
+#[cfg(test)]
+mod search_projection_tests {
+    use super::*;
+
+    fn episode_hit(id: i64, started_at: &str) -> SearchHit {
+        SearchHit::Episode {
+            id,
+            memory_id: id,
+            started_at: started_at.to_owned(),
+            ended_at: started_at.to_owned(),
+            title: None,
+            summary: None,
+            minute_summaries: json!([]),
+            final_brief: None,
+            snippet: None,
+            match_source: Some("memory".into()),
+            score: None,
+        }
+    }
+
+    #[test]
+    fn single_kind_search_preserves_relevance_order() {
+        let hits = vec![
+            episode_hit(1, "2026-01-01T00:00:00.000Z"),
+            episode_hit(2, "2026-02-01T00:00:00.000Z"),
+        ];
+        let ordered = finalize_search_order(hits, 1, 10);
+        assert_eq!(
+            ordered.iter().map(search_hit_id).collect::<Vec<_>>(),
+            [1, 2]
+        );
     }
 }

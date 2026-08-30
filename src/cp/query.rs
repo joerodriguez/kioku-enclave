@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Extension, Router,
@@ -32,8 +32,9 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const EPISODE_CURSOR_VERSION: u8 = 1;
 const MAX_EPISODE_CURSOR_CHARS: usize = 256;
 const MAX_EPISODE_CURSOR_TIMESTAMP_BYTES: usize = 64;
+const MAX_REST_SEARCH_QUERY_CHARS: usize = 1_024;
 
-/// The combined episode + utterance search behind `GET /api/search`.
+/// The cross-modal memory search behind `GET /api/search`.
 ///
 /// This returns a `Result` and its caller must keep it that way. It used to be
 /// `tool_search_transcripts`, which flattened every read failure into a bare
@@ -70,6 +71,11 @@ async fn query_transcripts_value(
     } else {
         embed_query(s, &query).await
     };
+    let search_mode = if query_embedding.is_some() {
+        "hybrid"
+    } else {
+        "full_text"
+    };
     let ep_req = SearchRequest {
         query: query.clone(),
         speaker: speaker.clone(),
@@ -81,13 +87,25 @@ async fn query_transcripts_value(
         query_embedding: query_embedding.clone(),
     };
     let utt_req = SearchRequest {
+        query: query.clone(),
+        speaker: speaker.clone(),
+        time_start: from.clone(),
+        time_end: to.clone(),
+        limit,
+        offset: 0,
+        kinds: vec!["utterance".into()],
+        query_embedding: query_embedding.clone(),
+    };
+    let screenshot_req = SearchRequest {
         query,
+        // A screen cannot establish who spoke. The repository therefore
+        // suppresses this branch for a `speaker:`-scoped search.
         speaker,
         time_start: from,
         time_end: to,
         limit,
         offset: 0,
-        kinds: vec!["utterance".into()],
+        kinds: vec!["screenshot".into()],
         query_embedding,
     };
     // A failed read must never be reported as "nothing found". An empty
@@ -97,19 +115,31 @@ async fn query_transcripts_value(
     // authority is unavailable). Propagating the error is what lets each
     // caller answer loudly in its own idiom.
     //
-    let episodes = s
-        .repositories
-        .memory_queries()
-        .search(user_id, &ep_req)
-        .await?;
-    let utterances = s
-        .repositories
-        .memory_queries()
-        .search(user_id, &utt_req)
-        .await?;
+    let repository = s.repositories.memory_queries();
+    let (episodes, utterances, screenshots) = tokio::try_join!(
+        repository.search(user_id, &ep_req),
+        repository.search(user_id, &utt_req),
+        repository.search(user_id, &screenshot_req),
+    )?;
+    cross_modal_search_response(&episodes, &utterances, &screenshots, search_mode)
+}
+
+fn cross_modal_search_response(
+    episodes: &[crate::persistence::SearchHit],
+    utterances: &[crate::persistence::SearchHit],
+    screenshots: &[crate::persistence::SearchHit],
+    search_mode: &str,
+) -> crate::error::Result<Value> {
+    let episodes = serde_json::to_value(episodes)?;
+    let utterances = serde_json::to_value(utterances)?;
+    let screenshots = serde_json::to_value(screenshots)?;
     Ok(json!({
-        "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
-        "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
+        // `episodes` and `results` are the original REST compatibility keys.
+        // Screens and the effective search mode are additive.
+        "episodes": episodes,
+        "results": utterances,
+        "screenshots": screenshots,
+        "search_mode": search_mode,
     }))
 }
 pub fn router() -> Router<Arc<CpState>> {
@@ -1008,17 +1038,29 @@ struct SearchParams {
     limit: Option<usize>,
 }
 
+fn normalize_rest_search_query(query: Option<&str>) -> std::result::Result<&str, &'static str> {
+    let query = query.ok_or("missing_query")?.trim();
+    if query.is_empty() {
+        return Err("empty_query");
+    }
+    if query.chars().count() > MAX_REST_SEARCH_QUERY_CHARS {
+        return Err("query_too_long");
+    }
+    Ok(query)
+}
+
 async fn rest_search(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
     Query(p): Query<SearchParams>,
 ) -> Response {
-    let Some(q) = p.q else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "missing_query"})),
-        )
-            .into_response();
+    let q = match normalize_rest_search_query(p.q.as_deref()) {
+        Ok(query) => query,
+        Err(error) => {
+            return private_no_store(
+                (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+            )
+        }
     };
     // PostgreSQL is authoritative for both episode and utterance results, so
     // an empty successful result is truthful for this account.
@@ -1031,9 +1073,20 @@ async fn rest_search(
     // status, so a client that switches on the status read a refusal as an
     // empty result set.
     match query_transcripts_value(&s, &user.0, &args).await {
-        Ok(data) => Json(data).into_response(),
-        Err(e) => super::routed_read_unavailable("api.search", &e),
+        Ok(data) => private_no_store(Json(data).into_response()),
+        Err(e) => private_no_store(super::routed_read_unavailable("api.search", &e)),
     }
+}
+
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 #[derive(Deserialize)]
@@ -1912,6 +1965,134 @@ async fn rest_test_episode_email(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod rest_search_contract_tests {
+    use axum::{response::IntoResponse, Json};
+    use serde_json::json;
+
+    use super::{
+        cross_modal_search_response, normalize_rest_search_query, private_no_store,
+        MAX_REST_SEARCH_QUERY_CHARS,
+    };
+    use crate::persistence::SearchHit;
+
+    #[test]
+    fn response_keeps_legacy_arrays_and_adds_exact_navigation() {
+        let episodes = vec![SearchHit::Episode {
+            id: 912,
+            memory_id: 912,
+            started_at: "2026-08-30T14:00:00.000Z".into(),
+            ended_at: "2026-08-30T14:30:00.000Z".into(),
+            title: Some("Launch review".into()),
+            summary: Some("Staged rollout".into()),
+            minute_summaries: json!([]),
+            final_brief: Some(json!({"overview": "Ship after review"})),
+            snippet: Some("Ship after review".into()),
+            match_source: Some("brief".into()),
+            score: Some(1.0),
+        }];
+        let utterances = vec![SearchHit::Utterance {
+            id: 3_104,
+            text: "Ship the staged rollout.".into(),
+            speaker_label: "Sam".into(),
+            person_id: Some(42),
+            attribution_kind: Some("direct_identity_evidence".into()),
+            started_at: "2026-08-30T14:13:00.000Z".into(),
+            start_offset_seconds: 8.0,
+            end_offset_seconds: 12.0,
+            source_at: "2026-08-30T14:13:08.000Z".into(),
+            memory_id: Some(912),
+            episode_id: Some(912),
+            episode_title: Some("Launch review".into()),
+            score: None,
+        }];
+        let screenshots = vec![SearchHit::Screenshot {
+            id: 2_208,
+            captured_at: "2026-08-30T14:15:11.000Z".into(),
+            active_app: Some("Safari".into()),
+            window_title: Some("Launch checklist".into()),
+            ocr_text: Some("Rollout 10%".into()),
+            url: Some("https://example.com/launch".into()),
+            observation_status: Some("ready".into()),
+            literal_description: None,
+            screen_state: None,
+            content_type: None,
+            source_at: "2026-08-30T14:15:11.000Z".into(),
+            memory_id: Some(912),
+            episode_id: Some(912),
+            episode_title: Some("Launch review".into()),
+            match_source: Some("window_title".into()),
+            match_text: Some("Launch checklist".into()),
+            score: None,
+        }];
+
+        let response =
+            cross_modal_search_response(&episodes, &utterances, &screenshots, "hybrid").unwrap();
+        assert_eq!(response["search_mode"], "hybrid");
+        assert_eq!(response["episodes"][0]["memory_id"], 912);
+        assert_eq!(response["results"][0]["episode_id"], 912);
+        assert_eq!(response["results"][0]["memory_id"], 912);
+        assert_eq!(response["results"][0]["person_id"], 42);
+        assert_eq!(
+            response["screenshots"][0]["source_at"],
+            "2026-08-30T14:15:11.000Z"
+        );
+        assert_eq!(response["screenshots"][0]["match_source"], "window_title");
+    }
+
+    #[test]
+    fn evidence_without_a_memory_omits_navigation_instead_of_inventing_it() {
+        let utterances = vec![SearchHit::Utterance {
+            id: 7,
+            text: "Still being organized".into(),
+            speaker_label: "Unknown speaker".into(),
+            person_id: None,
+            attribution_kind: None,
+            started_at: "2026-08-30T14:13:00.000Z".into(),
+            start_offset_seconds: 0.0,
+            end_offset_seconds: 1.0,
+            source_at: "2026-08-30T14:13:00.000Z".into(),
+            memory_id: None,
+            episode_id: None,
+            episode_title: None,
+            score: None,
+        }];
+        let response = cross_modal_search_response(&[], &utterances, &[], "full_text").unwrap();
+        assert!(response["episodes"].as_array().unwrap().is_empty());
+        assert!(response["screenshots"].as_array().unwrap().is_empty());
+        assert!(response["results"][0].get("memory_id").is_none());
+        assert!(response["results"][0].get("person_id").is_none());
+    }
+
+    #[test]
+    fn private_search_responses_forbid_shared_or_browser_caching() {
+        let response = private_no_store(Json(json!({"episodes": []})).into_response());
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "private, no-store, max-age=0"
+        );
+        assert_eq!(response.headers()[axum::http::header::PRAGMA], "no-cache");
+    }
+
+    #[test]
+    fn rest_query_is_trimmed_non_blank_and_bounded() {
+        assert_eq!(
+            normalize_rest_search_query(Some("  launch  ")),
+            Ok("launch")
+        );
+        assert_eq!(normalize_rest_search_query(None), Err("missing_query"));
+        assert_eq!(
+            normalize_rest_search_query(Some(" \n\t ")),
+            Err("empty_query")
+        );
+        let oversized = "x".repeat(MAX_REST_SEARCH_QUERY_CHARS + 1);
+        assert_eq!(
+            normalize_rest_search_query(Some(&oversized)),
+            Err("query_too_long")
+        );
     }
 }
 

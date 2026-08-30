@@ -2586,6 +2586,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Even a malformed legacy owner row carrying a person ID must remain
+        // inert at every public navigation surface.
+        sqlx::query(
+            "INSERT INTO episode_participants \
+             (account_id,id,episode_id,participant_key,person_id,attribution_kind) \
+             VALUES($1,2,1,'owner',1,'owner')",
+        )
+        .bind(&account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
              VALUES($1,1,'Ready','[]'::jsonb,'[\"Ship\"]'::jsonb,'[]'::jsonb,'[]'::jsonb) \
@@ -2598,6 +2609,131 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let enriched_embedding_sources = repositories
+            .memory_formation()
+            .episode_embedding_sources(&account_id, &[1])
+            .await
+            .unwrap();
+        assert_eq!(enriched_embedding_sources.len(), 1);
+        assert!(enriched_embedding_sources[0].text.contains("Ready"));
+        assert!(enriched_embedding_sources[0].text.contains("Ship"));
+        assert!(!enriched_embedding_sources[0].text.contains("action_items"));
+
+        let final_brief_hits = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    query: "Ship".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["episode".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        let final_brief_hits = serde_json::to_value(&final_brief_hits).unwrap();
+        assert_eq!(final_brief_hits[0]["memory_id"], 1);
+        assert_eq!(final_brief_hits[0]["match_source"], "brief");
+        assert_eq!(
+            final_brief_hits[0]["final_brief"]["action_items"][0],
+            "Ship"
+        );
+        let schema_key_hits = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    query: "action_items".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["episode".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(schema_key_hits.is_empty());
+
+        let linked_utterance_hits = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    query: "PostgreSQL".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["utterance".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        let linked_utterance_hits = serde_json::to_value(&linked_utterance_hits).unwrap();
+        assert_eq!(linked_utterance_hits[0]["person_id"], 1);
+        assert_eq!(linked_utterance_hits[0]["memory_id"], 1);
+        assert_eq!(linked_utterance_hits[0]["episode_id"], 1);
+        assert_eq!(
+            linked_utterance_hits[0]["source_at"],
+            "2026-08-27T12:00:00.000Z"
+        );
+        let pre_observation_hits = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    query: "PostgreSQL".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: Some("2026-08-27T11:59:59Z".into()),
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["utterance".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(pre_observation_hits.is_empty());
+
+        let interpretation_hits = repositories
+            .memory_queries()
+            .search(
+                &account_id,
+                &SearchRequest {
+                    query: "central evidence".into(),
+                    speaker: None,
+                    time_start: None,
+                    time_end: None,
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["screenshot".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        let interpretation_hits = serde_json::to_value(&interpretation_hits).unwrap();
+        assert_eq!(
+            interpretation_hits[0]["match_source"],
+            "episode_interpretation"
+        );
+        assert_eq!(interpretation_hits[0]["memory_id"], 1);
+        assert_eq!(interpretation_hits[0]["episode_id"], 1);
+        assert!(interpretation_hits[0]["match_text"]
+            .as_str()
+            .is_some_and(|text| text.contains("central") && text.chars().count() <= 400));
+
         let episode_page = repositories
             .memory_queries()
             .list_episodes(
@@ -2620,6 +2756,15 @@ mod tests {
         assert_eq!(episode_page.episodes[0]["member_count"], 2);
         assert_eq!(episode_page.episodes[0]["top_domains"][0], "example.com");
         assert_eq!(episode_page.episodes[0]["final_brief"]["overview"], "Ready");
+        assert_eq!(
+            episode_page.episodes[0]["participant_details"][0]["person_id"],
+            1
+        );
+        assert_eq!(
+            episode_page.episodes[0]["participant_details"][1]["display_name"],
+            "Me"
+        );
+        assert!(episode_page.episodes[0]["participant_details"][1]["person_id"].is_null());
         let evidence = repositories
             .memory_queries()
             .episode_members(&account_id, 1)
@@ -2627,6 +2772,9 @@ mod tests {
             .unwrap();
         assert_eq!(evidence["member_count"], 2);
         assert_eq!(evidence["participant_details"][0]["display_name"], "Lynn");
+        assert_eq!(evidence["participant_details"][0]["person_id"], 1);
+        assert_eq!(evidence["participant_details"][1]["display_name"], "Me");
+        assert!(evidence["participant_details"][1]["person_id"].is_null());
         assert_eq!(
             evidence["members"][0]["started_at"],
             "2026-08-27T12:00:00.000Z"
@@ -2688,6 +2836,7 @@ mod tests {
             .person_memories(&account_id, 1, None, 25, None)
             .await
             .unwrap();
+        assert_eq!(person_memories.person_id, 1);
         assert_eq!(person_memories.memories.len(), 1);
         assert_eq!(person_memories.memories[0].memory_id, 1);
         sqlx::query(
@@ -2739,6 +2888,11 @@ mod tests {
         assert_eq!(feed.records[0].episode_id, Some(1));
         assert_eq!(feed.records[1].kind, "utterance");
         assert_eq!(feed.records[1].episode_id, Some(1));
+        assert_eq!(feed.records[1].person_id, Some(1));
+        assert_eq!(
+            feed.records[1].attribution_kind.as_deref(),
+            Some("direct_identity_evidence")
+        );
         let browser = repositories
             .memory_queries()
             .browser_snapshot(&account_id, "capture-v2-browser:capture-contract-0")
@@ -3351,10 +3505,12 @@ mod tests {
                 active_app: Some(active_app),
                 window_title: Some(window_title),
                 url: Some(url),
+                match_source: Some(match_source),
                 ..
             }] if active_app == "Google Chrome"
                 && window_title == "Vendor renewal checklist"
                 && url == "https://example.com/renewal"
+                && match_source == "salient_ocr"
         ));
 
         let reviewer_french = repositories

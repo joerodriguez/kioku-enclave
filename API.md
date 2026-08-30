@@ -776,6 +776,79 @@ workers; a lost or ambiguous provider response is terminal and is never resent. 
 still requires the clean, release-verified deployment source seal and ADR-0041's staged
 zero-unavailable rollout with exact image/KMS/readiness readback.
 
+## Search the private memory archive
+
+`GET /api/search?q=launch&from=&to=&limit=50` is the authenticated product search.
+`q` is required, trimmed, non-blank, and capped at 1,024 characters; `from` and `to`
+are optional inclusive ISO-8601 bounds, and `limit` is capped at 50. The enclave uses
+its in-process query embedder when available and
+falls back to PostgreSQL full text without treating that fallback as an error.
+
+Successful responses retain the original `episodes` and `results` arrays and add
+screenshots plus the effective mode:
+
+```json
+{
+  "episodes": [{
+    "kind": "Episode",
+    "id": 912,
+    "memory_id": 912,
+    "title": "Launch review",
+    "snippet": "Sam assigned the rollout check...",
+    "match_source": "brief"
+  }],
+  "results": [{
+    "kind": "Utterance",
+    "id": 3104,
+    "text": "Ship the staged rollout.",
+    "speaker_label": "Sam",
+    "person_id": 42,
+    "memory_id": 912,
+    "episode_id": 912,
+    "episode_title": "Launch review",
+    "source_at": "2026-08-30T14:13:08.000Z"
+  }],
+  "screenshots": [{
+    "kind": "Screenshot",
+    "id": 2208,
+    "active_app": "Safari",
+    "window_title": "Launch checklist",
+    "ocr_text": "Rollout 10%",
+    "url": "https://example.com/launch",
+    "match_source": "window_title",
+    "match_text": "Launch checklist",
+    "memory_id": 912,
+    "episode_id": 912,
+    "episode_title": "Launch review",
+    "source_at": "2026-08-30T14:15:11.000Z"
+  }],
+  "search_mode": "hybrid"
+}
+```
+
+Memory matching covers title, summary, minute gists, vector similarity, and the
+human values in a structured final brief (overview, decisions, actions, links, and
+questions). Screenshot matching covers OCR, app/window/URL context, screen observations,
+and memory-specific screen interpretations. `match_source` and a bounded `match_text`
+explain screen hits, including semantic-only matches. Evidence in an existing memory
+carries both the stable `memory_id` and compatibility alias `episode_id`; evidence still
+being organized remains searchable but omits navigation fields. `person_id` is emitted
+only for an identified, non-owner person, so it always resolves as a safe People link.
+A valid response with three empty arrays is a real zero-match result; an unavailable
+PostgreSQL read returns non-2xx and must not be interpreted as an empty archive.
+Every search response, including an error, is marked `Cache-Control: private, no-store`
+and `Pragma: no-cache` because transcript and screen evidence is owner-private content.
+Newly finalized/refinalized memory vectors include only final-brief human string values;
+older vectors remain search-complete through the final-brief lexical branch until a
+separate bounded refresh is reviewed.
+
+`GET /api/episodes` keeps its existing `participants` name array and also returns
+`participant_details` on every memory row. Each detail includes display and
+attribution metadata; `person_id` is present only for an identified non-owner
+person and is otherwise `null`. The server loads these details in one
+tenant-qualified batch for the page, so archive name chips never infer identity
+from display-text equality.
+
 ## People learned automatically
 
 `GET /api/v2/people?after_id=0&limit=50&q=john` returns identified people in
@@ -816,6 +889,12 @@ Large histories are available without growing the profile response:
 positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
 person returns `404`. Unknown query fields return `400`.
 
+Utterance records from `GET /api/feed` use the same link rule as search and
+playback: additive `person_id` appears only when attribution resolves to an
+identified non-owner person. `attribution_kind` is included when known; owner,
+unknown, tentative, and quarantined identities remain text-only because they
+never receive a linkable person ID.
+
 ### Recording retention setting (staged)
 
 The cross-platform `recording_retention_v1` setting uses a two-step, revision-bound
@@ -851,7 +930,8 @@ segment therefore do not inherit one repeated timestamp. Source-backed owner spe
 using display text as identity.
 
 `GET /api/v2/people/{person_id}/memories?limit=25&before_id=123` returns
-person-ID-attributed memories newest first. Each row includes the attributed
+`{"person_id": 7, "memories": [...], "next_cursor": 98}` with memories
+attributed to that exact person ID, newest first. Each row includes the attributed
 utterance count, contributing recording count, truthful aggregate audio availability,
 and optional `playback_start_ms` / `playback_utterance_id` deep-link coordinates.
 `limit` is 1–100. The person must be identified; display-name equality is never used
