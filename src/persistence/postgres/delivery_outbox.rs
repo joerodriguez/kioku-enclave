@@ -67,7 +67,7 @@ fn episode_from_row(row: &sqlx::postgres::PgRow) -> Result<FinalizedEpisode> {
     })
 }
 
-async fn recover_expired_email_claims(
+pub(super) async fn recover_expired_email_claims(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> Result<()> {
@@ -120,7 +120,7 @@ async fn recover_expired_email_claims(
     Ok(())
 }
 
-async fn recover_expired_webhook_claims(
+pub(super) async fn recover_expired_webhook_claims(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> Result<()> {
@@ -173,7 +173,7 @@ async fn recover_expired_webhook_claims(
     Ok(())
 }
 
-async fn recover_expired_push_claims(
+pub(super) async fn recover_expired_push_claims(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> Result<()> {

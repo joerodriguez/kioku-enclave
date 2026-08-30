@@ -7,7 +7,13 @@ use crate::{
     persistence::{AccountDeletionOperation, AccountLifecycleRepository},
 };
 
-use super::{advisory_transaction_lock, PostgresPersistence};
+use super::{
+    advisory_transaction_lock,
+    delivery_outbox::{
+        recover_expired_email_claims, recover_expired_push_claims, recover_expired_webhook_claims,
+    },
+    PostgresPersistence,
+};
 
 fn optional_timestamp(row: &sqlx::postgres::PgRow, name: &str) -> Result<Option<String>> {
     Ok(row
@@ -92,9 +98,7 @@ async fn refuse_open_provider_fences(
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE account_id=$1) AS email, \
                 EXISTS(SELECT 1 FROM webhook_send_fences WHERE account_id=$1) AS webhook, \
-                EXISTS(SELECT 1 FROM push_send_fences WHERE account_id=$1) AS push, \
-                EXISTS(SELECT 1 FROM vertex_usage_events \
-                    WHERE account_id=$1 AND outcome='started') AS vertex",
+                EXISTS(SELECT 1 FROM push_send_fences WHERE account_id=$1) AS push",
     )
     .bind(account_id)
     .fetch_one(&mut **transaction)
@@ -114,11 +118,43 @@ async fn refuse_open_provider_fences(
             "account has an in-flight push send".into(),
         ));
     }
-    if row.try_get::<bool, _>("vertex")? {
+    Ok(())
+}
+
+async fn refuse_started_vertex_invocations(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    let started = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM vertex_usage_events \
+           WHERE account_id=$1 AND outcome='started')",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if started {
         return Err(EnclaveError::Conflict(
             "account has an in-flight Vertex invocation".into(),
         ));
     }
+    Ok(())
+}
+
+async fn recover_expired_provider_claims(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    // Account deletion owns the lifecycle admission lock before entering this
+    // helper, so no new claim for this account can appear. Match each normal
+    // claim path's secondary advisory lock before expiring its durable claim.
+    // A provider call that returns after expiry loses settlement authority and
+    // the disclosed request remains terminally ambiguous rather than resent.
+    advisory_transaction_lock(transaction, "email-preference", account_id).await?;
+    recover_expired_email_claims(transaction, account_id).await?;
+    advisory_transaction_lock(transaction, "webhook-registry", account_id).await?;
+    recover_expired_webhook_claims(transaction, account_id).await?;
+    advisory_transaction_lock(transaction, "push-registry", "global").await?;
+    recover_expired_push_claims(transaction, account_id).await?;
     Ok(())
 }
 
@@ -244,6 +280,21 @@ impl AccountLifecycleRepository for PostgresPersistence {
     async fn account_deletion_preflight_complete(&self, account_id: &str) -> Result<bool> {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id=$1")
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if !matches!(status.as_deref(), Some("deletion_requested" | "deleting")) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        // Provider configuration paths take their provider advisory lock
+        // before require_active_account locks this row. Follow the same order:
+        // lifecycle ownership makes the deletion state one-way, then provider
+        // locks drain/recover admitted work, and only then do we lock/recheck
+        // the account row. Taking the row first would deadlock with a config
+        // transaction that already owns one of these provider locks.
+        recover_expired_provider_claims(&mut transaction, account_id).await?;
         let status =
             sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")
                 .bind(account_id)
@@ -295,6 +346,11 @@ impl AccountLifecycleRepository for PostgresPersistence {
             .map(|row| row.try_get::<String, _>("status"))
             .transpose()?;
         refuse_open_provider_fences(&mut transaction, account_id).await?;
+        // Preflight deliberately lets the deletion-owned usage flush turn a
+        // begun invocation into a conservative ambiguous receipt. Preserve a
+        // second-line guard here so no caller can enter physical deletion
+        // without completing that flush first.
+        refuse_started_vertex_invocations(&mut transaction, account_id).await?;
         refuse_active_media_uploads(&mut transaction, account_id).await?;
         if !tombstoned && !matches!(status.as_deref(), Some("deletion_requested" | "deleting")) {
             transaction.commit().await?;
