@@ -483,6 +483,31 @@ fn project_array(value: &Value, fields: &[&str]) -> Value {
     )
 }
 
+fn project_array_with_aliases(value: &Value, fields: &[&str], aliases: &[(&str, &str)]) -> Value {
+    Value::Array(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let mut projected = project_fields(item, fields);
+                if let Some(projected) = projected.as_object_mut() {
+                    for (source, destination) in aliases {
+                        if !projected.contains_key(*destination) {
+                            if let Some(field_value) =
+                                item.get(*source).filter(|value| value.as_str().is_some())
+                            {
+                                projected.insert((*destination).to_string(), field_value.clone());
+                            }
+                        }
+                    }
+                }
+                projected
+            })
+            .collect(),
+    )
+}
+
 /// The REST/debugger surfaces keep operational fields used by Kioku itself.
 /// MCP responses deliberately expose only user-relevant evidence: no database
 /// ids, hashes, ranking scores, source keys, model confidence, or internal
@@ -497,28 +522,36 @@ fn project_mcp_result(name: &str, result: Value) -> Value {
                 &result["episodes"],
                 &["kind", "started_at", "ended_at", "title", "summary", "minute_summaries", "snippet"],
             ),
-            "results": project_array(
+            "results": project_array_with_aliases(
                 &result["results"],
                 &["kind", "text", "speaker_label", "started_at"],
+                &[("speaker", "speaker_label")],
             ),
         }),
         "search_screenshots" => json!({
             "results": project_array(
                 &result["results"],
-                &["kind", "captured_at", "active_app", "window_title", "ocr_text", "url",
-                  "observation_status", "literal_description", "screen_state", "content_type"],
+                &["kind", "captured_at", "active_app", "window_title", "ocr_text", "url"],
             ),
         }),
         "get_context" => json!({
-            "utterances": project_array(
+            "utterances": project_array_with_aliases(
                 &result["utterances"],
                 &["started_at", "ended_at", "speaker_label", "language", "text", "source_type"],
+                &[("speaker", "speaker_label")],
             ),
             "screenshots": project_array(
                 &result["screenshots"],
-                &["captured_at", "active_app", "window_title", "ocr_text", "url",
-                  "observation_status", "literal_description", "screen_state", "content_type"],
+                &["captured_at", "active_app", "window_title", "ocr_text", "url"],
             ),
+        }),
+        "summarize_time_range" => json!({
+            "from": result["from"],
+            "to": result["to"],
+            "counts": result["counts"],
+            "languages": result["languages"],
+            "apps_seen": result["apps_seen"],
+            "digest": project_array(&result["digest"], &["at", "speaker", "text"]),
         }),
         "list_episodes" => json!({
             "episode_count": result["episode_count"],
@@ -566,6 +599,14 @@ fn object_array_schema(properties: Value) -> Value {
     })
 }
 
+fn minimized_page_size(args: &Value, field: &str) -> usize {
+    args.get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(super::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE)
+        .clamp(1, super::mcp_safety::MAX_MINIMIZED_PAGE_SIZE)
+}
+
 fn tool_definitions() -> Value {
     json!([
         {
@@ -578,7 +619,7 @@ fn tool_definitions() -> Value {
                     "query": {"type": "string", "description": "Natural-language search query. A speaker filter may be included as speaker:Name."},
                     "from": {"type": "string", "description": "Optional inclusive RFC 3339 lower timestamp bound."},
                     "to": {"type": "string", "description": "Optional inclusive RFC 3339 upper timestamp bound."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "Maximum episode and utterance matches to return."}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": super::mcp_safety::MAX_MINIMIZED_PAGE_SIZE, "default": super::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE, "description": "Maximum episode and utterance matches to return."}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -672,7 +713,7 @@ fn tool_definitions() -> Value {
                     }))
                 },
                 "required": ["utterances", "screenshots"],
-                "additionalProperties": true
+                "additionalProperties": false
             },
             "annotations": read_only_annotations()
         },
@@ -685,7 +726,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "from": {"type": "string", "description": "Inclusive RFC 3339 start timestamp."},
                     "to": {"type": "string", "description": "Exclusive RFC 3339 end timestamp."},
-                    "max_items": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200, "description": "Maximum chronological utterance evidence items."}
+                    "max_items": {"type": "integer", "minimum": 1, "maximum": super::mcp_safety::MAX_MINIMIZED_PAGE_SIZE, "default": super::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE, "description": "Maximum chronological utterance evidence items."}
                 },
                 "required": ["from", "to"],
                 "additionalProperties": false
@@ -794,7 +835,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .to_string();
             let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
             let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let limit = minimized_page_size(args, "limit");
             s.repositories
                 .memory_queries()
                 .mcp_search_transcripts(
@@ -819,10 +860,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .get("window_seconds")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(300);
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
+            let limit = None;
             s.repositories
                 .memory_queries()
                 .mcp_context(
@@ -847,10 +885,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
+            let limit = Some(minimized_page_size(args, "max_items"));
             s.repositories
                 .memory_queries()
                 .mcp_time_range(
@@ -1877,6 +1912,300 @@ async fn rest_test_episode_email(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod mcp_contract_tests {
+    use serde_json::{json, Value};
+
+    use super::{project_mcp_result, tool_definitions};
+
+    fn schema_for<'a>(definitions: &'a Value, name: &str) -> &'a Value {
+        definitions
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| &tool["outputSchema"])
+            .expect("named output schema")
+    }
+
+    fn type_matches(value: &Value, expected: &str) -> bool {
+        match expected {
+            "array" => value.is_array(),
+            "boolean" => value.is_boolean(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "null" => value.is_null(),
+            "number" => value.is_number(),
+            "object" => value.is_object(),
+            "string" => value.is_string(),
+            _ => false,
+        }
+    }
+
+    fn assert_schema_valid(value: &Value, schema: &Value, path: &str) {
+        if let Some(expected) = schema.get("type") {
+            let valid = match expected {
+                Value::String(expected) => type_matches(value, expected),
+                Value::Array(expected) => expected
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|expected| type_matches(value, expected)),
+                _ => false,
+            };
+            assert!(valid, "{path}: {value} does not match type {expected}");
+        }
+
+        if let Some(object) = value.as_object() {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for key in required.iter().filter_map(Value::as_str) {
+                    assert!(
+                        object.contains_key(key),
+                        "{path}: missing required key {key}"
+                    );
+                }
+            }
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                let properties = properties.expect("closed object properties");
+                for key in object.keys() {
+                    assert!(properties.contains_key(key), "{path}: undeclared key {key}");
+                }
+            }
+            if let Some(properties) = properties {
+                for (key, child) in object {
+                    if let Some(child_schema) = properties.get(key) {
+                        assert_schema_valid(child, child_schema, &format!("{path}.{key}"));
+                    }
+                }
+            }
+        }
+
+        if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+            for (index, child) in values.iter().enumerate() {
+                assert_schema_valid(child, items, &format!("{path}[{index}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn successful_mcp_projections_match_every_advertised_output_schema() {
+        let definitions = tool_definitions();
+        let cases = [
+            (
+                "search_transcripts",
+                json!({
+                    "episodes": [{
+                        "id": 1,
+                        "kind": "episode",
+                        "started_at": "2026-07-22T09:00:00Z",
+                        "ended_at": "2026-07-22T09:35:00Z",
+                        "title": null,
+                        "summary": "Launch planning",
+                        "minute_summaries": [],
+                        "snippet": "August 19"
+                    }],
+                    "results": [{
+                        "id": 2,
+                        "kind": "utterance",
+                        "text": "Move the launch to August 19.",
+                        "speaker": "Maya",
+                        "started_at": "2026-07-22T09:01:30Z",
+                        "ended_at": "2026-07-22T09:01:44Z"
+                    }]
+                }),
+            ),
+            (
+                "search_screenshots",
+                json!({"results": [{
+                    "kind": "Screenshot",
+                    "captured_at": "2026-07-22T11:20:00Z",
+                    "active_app": "Google Chrome",
+                    "window_title": "Vendor renewal checklist",
+                    "ocr_text": "Renewal checklist",
+                    "url": "https://example.com/renewal",
+                    "observation_status": "observed",
+                    "literal_description": "internal",
+                    "screen_state": "internal",
+                    "content_type": "internal",
+                    "score": 1.0
+                }]}),
+            ),
+            (
+                "get_context",
+                json!({
+                    "summary_digest": "internal",
+                    "window_seconds": 300,
+                    "utterances": [{
+                        "id": 3,
+                        "text": "Alex owns the launch checklist.",
+                        "speaker": "Maya",
+                        "language": "en",
+                        "source_type": "mic",
+                        "started_at": "2026-07-22T09:01:58Z",
+                        "ended_at": "2026-07-22T09:02:14Z"
+                    }],
+                    "screenshots": [{
+                        "captured_at": "2026-07-22T09:02:00Z",
+                        "active_app": null,
+                        "window_title": null,
+                        "ocr_text": null,
+                        "url": null,
+                        "observation_status": "internal"
+                    }],
+                    "page_token": null
+                }),
+            ),
+            (
+                "summarize_time_range",
+                json!({
+                    "from": "2026-07-22T14:00:00Z",
+                    "to": "2026-07-22T15:00:00Z",
+                    "counts": {"utterances": 2, "screenshots": 0},
+                    "languages": ["en"],
+                    "apps_seen": [],
+                    "digest": [{
+                        "at": "2026-07-22T14:05:00Z",
+                        "speaker": "Camille",
+                        "text": "Use depuis.",
+                        "id": 4
+                    }],
+                    "internal_summary": "drop me"
+                }),
+            ),
+            (
+                "list_episodes",
+                json!({
+                    "episode_count": 1,
+                    "hidden_count": 0,
+                    "episodes": [{
+                        "id": 5,
+                        "started_at": "2026-07-22T09:00:00Z",
+                        "ended_at": "2026-07-22T09:35:00Z",
+                        "title": "Launch planning",
+                        "summary": null,
+                        "type": "meeting",
+                        "participants": ["Maya"],
+                        "languages": ["en"],
+                        "action_items": [],
+                        "minute_summaries": [],
+                        "utterance_count": 2,
+                        "screenshot_count": 0,
+                        "top_apps": [],
+                        "top_domains": [],
+                        "final_brief": null
+                    }]
+                }),
+            ),
+            (
+                "get_capture_status",
+                json!({
+                    "total_utterances": 6,
+                    "total_screenshots": 1,
+                    "episode_count": 4,
+                    "last_utterance_at": "2026-07-22T14:11:54Z",
+                    "last_screenshot_at": null
+                }),
+            ),
+        ];
+
+        for (name, raw) in cases {
+            let projected = project_mcp_result(name, raw);
+            assert_schema_valid(&projected, schema_for(&definitions, name), name);
+        }
+    }
+
+    #[test]
+    fn mcp_projection_is_exact_and_drops_internal_or_invalid_alias_fields() {
+        assert_eq!(
+            project_mcp_result(
+                "search_screenshots",
+                json!({"results": [{
+                    "kind": "Screenshot",
+                    "captured_at": "2026-07-22T11:20:00Z",
+                    "active_app": "Google Chrome",
+                    "window_title": "Vendor renewal checklist",
+                    "ocr_text": "Renewal checklist",
+                    "url": "https://example.com/renewal",
+                    "observation_status": "internal",
+                    "literal_description": "internal",
+                    "screen_state": "internal",
+                    "content_type": "internal"
+                }]}),
+            ),
+            json!({"results": [{
+                "kind": "Screenshot",
+                "captured_at": "2026-07-22T11:20:00Z",
+                "active_app": "Google Chrome",
+                "window_title": "Vendor renewal checklist",
+                "ocr_text": "Renewal checklist",
+                "url": "https://example.com/renewal"
+            }]})
+        );
+
+        let transcript = project_mcp_result(
+            "search_transcripts",
+            json!({"episodes": [], "results": [
+                {"text": "first", "speaker": "Maya", "started_at": "2026-07-22T09:00:00Z"},
+                {"text": "second", "speaker": null, "started_at": "2026-07-22T09:01:00Z"}
+            ]}),
+        );
+        assert_eq!(transcript["results"][0]["speaker_label"], "Maya");
+        assert!(transcript["results"][1].get("speaker_label").is_none());
+
+        assert_eq!(
+            project_mcp_result(
+                "summarize_time_range",
+                json!({
+                    "from": "2026-07-22T14:00:00Z",
+                    "to": "2026-07-22T15:00:00Z",
+                    "counts": {"utterances": 2, "screenshots": 0},
+                    "languages": ["en"],
+                    "apps_seen": [],
+                    "digest": [{"at": "2026-07-22T14:05:00Z", "speaker": "Camille", "text": "depuis", "id": 4}],
+                    "internal": true
+                }),
+            ),
+            json!({
+                "from": "2026-07-22T14:00:00Z",
+                "to": "2026-07-22T15:00:00Z",
+                "counts": {"utterances": 2, "screenshots": 0},
+                "languages": ["en"],
+                "apps_seen": [],
+                "digest": [{"at": "2026-07-22T14:05:00Z", "speaker": "Camille", "text": "depuis"}]
+            })
+        );
+    }
+
+    #[test]
+    fn public_mcp_limits_match_the_minimized_egress_policy() {
+        let definitions = tool_definitions();
+        let search = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "search_transcripts")
+            .unwrap();
+        let range = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "summarize_time_range")
+            .unwrap();
+        for input in [
+            &search["inputSchema"]["properties"]["limit"],
+            &range["inputSchema"]["properties"]["max_items"],
+        ] {
+            assert_eq!(
+                input["maximum"],
+                crate::cp::mcp_safety::MAX_MINIMIZED_PAGE_SIZE
+            );
+            assert_eq!(
+                input["default"],
+                crate::cp::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE
+            );
+        }
     }
 }
 
