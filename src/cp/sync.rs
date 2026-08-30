@@ -17,7 +17,7 @@ use crate::{
     persistence::{AccountDeletionOperation, AccountLifecycleRepository, AccountStatus},
 };
 
-use super::{auth::AuthUser, CpState};
+use super::{auth::AuthUser, CpState, ReviewerAuthConfig};
 
 const DELETION_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const DELETION_RECONCILE_BATCH_SIZE: usize = 64;
@@ -117,6 +117,9 @@ async fn delete_account(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
+    if let Some(response) = reviewer_deletion_guard(state.config.reviewer_auth.as_ref(), &user_id) {
+        return response;
+    }
     let account_status = match state
         .repositories
         .identity_sessions()
@@ -238,6 +241,30 @@ async fn delete_account(
             deletion_delete_response(operation)
         }
     }
+}
+
+fn reviewer_deletion_guard(
+    reviewer_auth: Option<&ReviewerAuthConfig>,
+    account_id: &str,
+) -> Option<Response> {
+    let protected = reviewer_auth.is_some_and(|reviewer| reviewer.account_id() == account_id);
+    if !protected {
+        return None;
+    }
+    tracing::warn!(
+        target: "kioku::reviewer",
+        metric_schema = "reviewer_account_v1",
+        stage = "account_deletion",
+        outcome = "refused",
+        "reviewer account deletion refused"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "reviewer_account_protected"})),
+        )
+            .into_response(),
+    )
 }
 
 async fn account_deletion_status(
@@ -730,6 +757,30 @@ mod tests {
         });
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+    }
+
+    #[tokio::test]
+    async fn configured_reviewer_deletion_is_refused_before_lifecycle_work() {
+        let reviewer = ReviewerAuthConfig {
+            api_key: "test-api-key".into(),
+            uid: "persistent-reviewer-uid".into(),
+            email: "reviewer@example.com".into(),
+        };
+        let reviewer_account_id = reviewer.account_id();
+        let response = reviewer_deletion_guard(Some(&reviewer), &reviewer_account_id)
+            .expect("the configured reviewer must be protected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "reviewer_account_protected");
+
+        assert!(
+            reviewer_deletion_guard(Some(&reviewer), "00000000-0000-4000-8000-000000000001")
+                .is_none()
+        );
+        assert!(reviewer_deletion_guard(None, &reviewer_account_id).is_none());
     }
 
     #[tokio::test]

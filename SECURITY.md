@@ -100,6 +100,12 @@ A crash may leave deletion incomplete, never falsely complete. A restarted repli
 continues durable deletion operations. Episode deletion uses the same no-resurrection and replay
 principles at episode scope.
 
+The preconfigured synthetic plugin-review account is an operational fixture rather than a user
+deletion canary. Its transactionally seeded `reviewer_fixtures` marker refuses account-deletion
+initialization before status, session, token, or content state changes. Destructive release tests
+must use a separate disposable identity; rotating reviewer credentials must not remove this guard
+from the currently configured fixture.
+
 ### Authentication and retired routes
 
 Google and Apple subjects are provider-namespaced; accounts are not linked merely by email. Native

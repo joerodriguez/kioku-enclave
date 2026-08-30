@@ -57,6 +57,14 @@ const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// must remain available when the public daily signup budget is exhausted.
 pub(super) const REVIEWER_SIGNUP_EXEMPT: i64 = i64::MAX;
 
+const REVIEWER_IDENTITY_SUBJECT_PREFIX: &str = "reviewer:identity-platform:";
+
+/// Domain-separate the preconfigured Identity Platform reviewer from ordinary
+/// Google subjects before deriving its durable account id.
+pub(crate) fn reviewer_identity_subject(uid: &str) -> String {
+    format!("{REVIEWER_IDENTITY_SUBJECT_PREFIX}{uid}")
+}
+
 /// Content-free observation for a daily signup-budget refusal.
 pub(super) fn observe_signup_refused(provider: &'static str, budget: i64) {
     tracing::warn!(
@@ -125,6 +133,14 @@ pub struct ReviewerAuthConfig {
     pub api_key: String,
     pub uid: String,
     pub email: String,
+}
+
+impl ReviewerAuthConfig {
+    /// The reviewer account id is deterministic, matching the identity upsert
+    /// path used by `/oauth/reviewer`.
+    pub(crate) fn account_id(&self) -> String {
+        tokens::derive_stable_uuid(&reviewer_identity_subject(&self.uid))
+    }
 }
 
 fn config_value(key: &str, test_default: &str) -> crate::error::Result<String> {
@@ -600,7 +616,21 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
 
 #[cfg(test)]
 mod configuration_tests {
-    use super::vertex_model_name_is_billing_safe;
+    use super::{reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig};
+
+    #[test]
+    fn reviewer_account_id_uses_the_exact_namespaced_identity_derivation() {
+        let config = ReviewerAuthConfig {
+            api_key: "test-api-key".into(),
+            uid: "reviewer_uid".into(),
+            email: "reviewer@example.com".into(),
+        };
+        assert_eq!(
+            reviewer_identity_subject(&config.uid),
+            "reviewer:identity-platform:reviewer_uid"
+        );
+        assert_eq!(config.account_id(), "dfc9a6b7-9e79-5b31-97b7-72ec53872984");
+    }
 
     #[test]
     fn vertex_model_grammar_matches_the_billing_contract() {

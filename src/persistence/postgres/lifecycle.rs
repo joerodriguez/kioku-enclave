@@ -96,6 +96,24 @@ async fn refuse_open_provider_fences(
     Ok(())
 }
 
+async fn refuse_reviewer_fixture_deletion(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+) -> Result<()> {
+    let protected = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM reviewer_fixtures WHERE account_id=$1)",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if protected {
+        return Err(EnclaveError::Conflict(
+            "reviewer fixture accounts cannot be deleted".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn refuse_active_media_uploads(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
@@ -134,6 +152,10 @@ impl AccountLifecycleRepository for PostgresPersistence {
     ) -> Result<Option<AccountDeletionOperation>> {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        // The reviewer fixture is a persistent operational identity, not a
+        // disposable deletion canary. Check its transactionally seeded marker
+        // before changing account status or revoking any session/token state.
+        refuse_reviewer_fixture_deletion(&mut transaction, account_id).await?;
         refuse_open_provider_fences(&mut transaction, account_id).await?;
 
         let account = sqlx::query("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")

@@ -379,8 +379,8 @@ mod tests {
     use crate::gcs::FakeGcs;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
-        AuthorizationCodeExchange, ConsentApproval, OAuthClientDefinition, PendingConsent,
-        RefreshTokenRotation,
+        AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, OAuthClientDefinition,
+        PendingConsent, RefreshTokenRotation,
     };
     use crate::persistence::{
         AudioMediaSettlement, CaptureCommit, CapturePreflight, CaptureSessionStage,
@@ -2939,11 +2939,16 @@ mod tests {
             0
         );
 
+        let reviewer_subject = crate::cp::reviewer_identity_subject("contract-reviewer-uid");
         let reviewer_account = repositories
             .identity_sessions()
-            .upsert_subject_account("reviewer-contract", "reviewer@example.com", 3)
+            .upsert_subject_account(&reviewer_subject, "reviewer@example.com", i64::MAX)
             .await
             .unwrap();
+        assert_eq!(
+            reviewer_account.id,
+            crate::cp::tokens::derive_stable_uuid(&reviewer_subject)
+        );
         assert!(repositories
             .memory_formation()
             .ensure_reviewer_fixture(&reviewer_account.id)
@@ -2963,6 +2968,50 @@ mod tests {
             .await
             .unwrap(),
             4
+        );
+        assert!(repositories
+            .oauth()
+            .store_direct_authorization_code(DirectAuthorizationCode {
+                authorization_code_hash: "reviewer-protected-code".into(),
+                account_id: reviewer_account.id.clone(),
+                client_id: client_id.into(),
+                ttl: Duration::from_secs(300),
+            })
+            .await
+            .unwrap());
+        assert!(matches!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&reviewer_account.id)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(message))
+                if message == "reviewer fixture accounts cannot be deleted"
+        ));
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_status(&reviewer_account.id)
+                .await
+                .unwrap(),
+            Some(AccountStatus::Active)
+        );
+        assert!(repositories
+            .lifecycle()
+            .account_deletion_operation(&reviewer_account.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM oauth_authorization_codes \
+                   WHERE account_id=$1 AND code_hash=$2",
+            )
+            .bind(&reviewer_account.id)
+            .bind("reviewer-protected-code")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
         );
 
         let billing_detach_id = repositories
@@ -3078,6 +3127,15 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, "physical_complete");
         assert_eq!(completed.reason, "content_deleted");
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_status(&reviewer_account.id)
+                .await
+                .unwrap(),
+            Some(AccountStatus::Active),
+            "ordinary account deletion must not affect the persistent reviewer"
+        );
         assert_eq!(
             repositories
                 .identity_sessions()
