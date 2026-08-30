@@ -11,7 +11,9 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import sys
 
 
@@ -27,6 +29,12 @@ VERIFIER_SPEC = importlib.util.spec_from_file_location(
 assert VERIFIER_SPEC and VERIFIER_SPEC.loader
 VERIFIER_MODULE = importlib.util.module_from_spec(VERIFIER_SPEC)
 VERIFIER_SPEC.loader.exec_module(VERIFIER_MODULE)
+EVIDENCE_SPEC = importlib.util.spec_from_file_location(
+    "local_build_evidence_test", EVIDENCE
+)
+assert EVIDENCE_SPEC and EVIDENCE_SPEC.loader
+EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
+EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
 COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 TAG = "v1.2.3"
@@ -132,6 +140,21 @@ class LocalEvidenceTests(unittest.TestCase):
     def test_openssl_signature_requires_the_pinned_external_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             evidence, signature, public, fingerprint = self.create_bundle(Path(temporary))
+            direct = subprocess.run(
+                [
+                    "openssl", "pkeyutl", "-verify", "-rawin", "-pubin",
+                    "-inkey", str(public), "-sigfile", str(signature),
+                    "-in", str(evidence),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                direct.returncode,
+                0,
+                "the detached signature must cover the exact manifest file bytes: "
+                + direct.stderr,
+            )
             completed = subprocess.run(
                 ["python3", str(EVIDENCE), "verify", "--manifest", str(evidence), "--signature", str(signature), "--public-key", str(public), "--expected-public-key-sha256", fingerprint],
                 cwd=ROOT, text=True, capture_output=True,
@@ -150,6 +173,62 @@ class LocalEvidenceTests(unittest.TestCase):
             )
             self.assertNotEqual(wrong.returncode, 0)
             self.assertIn("external trust anchor", wrong.stderr)
+
+    def test_ed25519_children_receive_exact_private_regular_manifest_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            evidence, _, public, _ = self.create_bundle(directory)
+            manifest = evidence.read_bytes()
+            observed_operations: list[str] = []
+
+            def fake_openssl(
+                command: list[str], **keywords: object
+            ) -> subprocess.CompletedProcess[bytes]:
+                if command[1:] == ["pkey", "-text", "-noout"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout=b"ED25519 private key\n", stderr=b""
+                    )
+                self.assertEqual(command[:2], ["openssl", "pkeyutl"])
+                operation = "sign" if "-sign" in command else "verify"
+                observed_operations.append(operation)
+                input_path = Path(command[command.index("-in") + 1])
+                self.assertNotEqual(input_path, Path("/dev/stdin"))
+                metadata = input_path.lstat()
+                self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                self.assertEqual(metadata.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+                self.assertEqual(input_path.read_bytes(), manifest)
+                self.assertNotIn("input", keywords)
+                output = b"s" * 64 if operation == "sign" else b""
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=output, stderr=b""
+                )
+
+            generated_signature = directory / "generated.sig"
+            with mock.patch.object(
+                EVIDENCE_MODULE.subprocess, "run", side_effect=fake_openssl
+            ):
+                EVIDENCE_MODULE.sign(
+                    SimpleNamespace(
+                        manifest=evidence,
+                        signature=generated_signature,
+                        private_key=directory / "private.pem",
+                    )
+                )
+                EVIDENCE_MODULE.verify_detached_bytes(
+                    manifest, generated_signature.read_bytes(), public.read_bytes()
+                )
+            self.assertEqual(observed_operations, ["sign", "verify"])
+
+    def test_verification_failure_is_labeled_as_verification(self) -> None:
+        failure = subprocess.CalledProcessError(1, ["openssl", "pkeyutl"])
+        with mock.patch.object(EVIDENCE_MODULE.subprocess, "run", side_effect=failure):
+            with self.assertRaisesRegex(
+                SystemExit, "OpenSSL signature verification failed with exit status 1"
+            ):
+                EVIDENCE_MODULE.verify_detached_bytes(
+                    b"manifest\n", b"s" * 64, b"public key\n"
+                )
 
     def test_group_readable_private_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
