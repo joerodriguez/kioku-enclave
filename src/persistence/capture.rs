@@ -21,7 +21,6 @@ pub(crate) enum CaptureSessionStage {
     Organizing,
     PreparingRecap,
     Ready,
-    NeedsAttention,
     NoMemory,
 }
 

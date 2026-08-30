@@ -739,6 +739,47 @@ async fn insert_event(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn capture_session_stage(
+    queued: i64,
+    processing: i64,
+    retry_wait: i64,
+    failed: i64,
+    has_ready_memory: bool,
+    has_memories: bool,
+    ended: bool,
+    summarized_past_end: bool,
+) -> CaptureSessionStage {
+    if queued + processing > 0 {
+        CaptureSessionStage::Processing
+    } else if has_ready_memory {
+        CaptureSessionStage::Ready
+    } else if retry_wait > 0 {
+        CaptureSessionStage::Processing
+    } else if has_memories {
+        CaptureSessionStage::PreparingRecap
+    } else if failed > 0 {
+        // Media failures are internal restartable work, not a user-repairable
+        // condition. Keep the session visibly processing while the summarizer
+        // cursor is held for automatic recovery; once that cursor has honestly
+        // passed an ended session without a memory, report the zero-result
+        // outcome instead of exposing worker state as an action item.
+        if ended && summarized_past_end {
+            CaptureSessionStage::NoMemory
+        } else {
+            CaptureSessionStage::Processing
+        }
+    } else if ended {
+        if summarized_past_end {
+            CaptureSessionStage::NoMemory
+        } else {
+            CaptureSessionStage::Organizing
+        }
+    } else {
+        CaptureSessionStage::Received
+    }
+}
+
 async fn postgres_session_status(
     persistence: &PostgresPersistence,
     account_id: &str,
@@ -860,25 +901,16 @@ async fn postgres_session_status(
     let summarized_past_end = ended_at_ms
         .zip(summarized_until_ms)
         .is_some_and(|(ended, cursor)| cursor > ended);
-    let stage = if queued + processing_count > 0 {
-        CaptureSessionStage::Processing
-    } else if has_ready_memory {
-        CaptureSessionStage::Ready
-    } else if retry_wait > 0 {
-        CaptureSessionStage::Processing
-    } else if !memories.is_empty() {
-        CaptureSessionStage::PreparingRecap
-    } else if failed > 0 {
-        CaptureSessionStage::NeedsAttention
-    } else if ended_at.is_some() {
-        if summarized_past_end {
-            CaptureSessionStage::NoMemory
-        } else {
-            CaptureSessionStage::Organizing
-        }
-    } else {
-        CaptureSessionStage::Received
-    };
+    let stage = capture_session_stage(
+        queued,
+        processing_count,
+        retry_wait,
+        failed,
+        has_ready_memory,
+        !memories.is_empty(),
+        ended_at.is_some(),
+        summarized_past_end,
+    );
     Ok(Some(CaptureSessionStatus {
         capture_session_id: session.try_get("id")?,
         device_id: session.try_get("device_id")?,
@@ -901,6 +933,32 @@ async fn postgres_session_status(
         },
         memories,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_session_stage;
+    use crate::persistence::capture::CaptureSessionStage;
+
+    #[test]
+    fn capture_session_failure_stays_automatic_until_honest_zero_result() {
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, true, false),
+            CaptureSessionStage::Processing
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, false, false),
+            CaptureSessionStage::Processing
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, true, true),
+            CaptureSessionStage::NoMemory
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, true, true, true, true),
+            CaptureSessionStage::Ready
+        );
+    }
 }
 
 #[async_trait]
