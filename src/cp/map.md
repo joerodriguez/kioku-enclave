@@ -13,7 +13,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 |---|---|
 | `mod.rs` | `CpConfig`, shared `CpState`, provider-neutral composition, bounded HTTP clients, Secret Manager access, and common content-free error behavior. |
 | `apple.rs` | Sign in with Apple native/browser verification, grant retention/revocation, and account linking through identity repositories. |
-| `auth.rs` | Kioku access-token and Google/Apple/reviewer identity middleware, active/deleting-account rules, route authorization, and bounded provider-auth evidence for destructive operations. |
+| `auth.rs` | Kioku access-token and Google/reviewer middleware plus the inert Identity Platform password verifier, active/deleting-account rules, route authorization, and bounded provider-auth evidence for destructive operations. |
 | `billing.rs` | Provider-neutral entitlement/recording admission, strict authenticated Apple StoreKit purchase binding, attempt-owned purchase reservation/read-only recovery forwarding that excludes concurrent devices and Paddle checkout, the one-way pre-deletion billing fence, offline usage reconciliation, pseudonymous billing delivery, and coverage reporting. |
 | `cors.rs` | Exact public-origin CORS policy. |
 | `delivery.rs` | Canonical finalized-memory delivery model and PostgreSQL-backed loader shared by outbound channels. |

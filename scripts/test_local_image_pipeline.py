@@ -1541,6 +1541,64 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(closed_result.returncode, 0, closed_result.stderr)
             self.assertEqual(closed_output.read_bytes(), closed)
 
+            enabled_password = encoded.replace(
+                b"PASSWORD_AUTH_MODE=off\n",
+                b"PASSWORD_AUTH_MODE=signup\n",
+            )
+            enabled_source = directory / "enabled-password.env"
+            enabled_source.write_bytes(enabled_password)
+            enabled_source.chmod(0o600)
+            enabled_result = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(enabled_source),
+                    str(directory / "enabled-password-output.env"),
+                    __import__("hashlib").sha256(enabled_password).hexdigest(),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(enabled_result.returncode, 0)
+
+            for empty_coordinate, nonempty_coordinate in (
+                (
+                    b"PASSWORD_AUTH_API_KEY=\n",
+                    b"PASSWORD_AUTH_API_KEY=public-test-api-key\n",
+                ),
+                (
+                    b"PASSWORD_AUTH_PROJECT_ID=\n",
+                    b"PASSWORD_AUTH_PROJECT_ID=test-project\n",
+                ),
+                (
+                    b"PASSWORD_AUTH_TENANT_ID=\n",
+                    b"PASSWORD_AUTH_TENANT_ID=test-tenant\n",
+                ),
+            ):
+                configured_password = encoded.replace(
+                    empty_coordinate,
+                    nonempty_coordinate,
+                )
+                self.assertNotEqual(configured_password, encoded)
+                coordinate = empty_coordinate.split(b"=", maxsplit=1)[0].decode(
+                    "ascii"
+                )
+                coordinate_source = directory / f"{coordinate.lower()}.env"
+                coordinate_source.write_bytes(configured_password)
+                coordinate_source.chmod(0o600)
+                coordinate_result = subprocess.run(
+                    [
+                        str(SCRIPTS / "assemble_image_config.sh"),
+                        str(coordinate_source),
+                        str(directory / f"{coordinate.lower()}-output.env"),
+                        __import__("hashlib").sha256(configured_password).hexdigest(),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(coordinate_result.returncode, 0)
+
             source.write_bytes(encoded + b"KIOKU_BUILD_PROFILE=attacker\n")
             rejected = subprocess.run(
                 [str(SCRIPTS / "assemble_image_config.sh"), str(source), str(directory / "second"), expected],

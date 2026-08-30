@@ -113,6 +113,10 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("HEALTH_PORT=8081\n", content)
         self.assertIn("DRAIN_TIMEOUT_SECONDS=105\n", content)
         self.assertIn("ENCLAVE_TLS=1\n", content)
+        self.assertIn("PASSWORD_AUTH_MODE=off\n", content)
+        self.assertIn("PASSWORD_AUTH_API_KEY=\n", content)
+        self.assertIn("PASSWORD_AUTH_PROJECT_ID=\n", content)
+        self.assertIn("PASSWORD_AUTH_TENANT_ID=\n", content)
         for obsolete in (
             "PERSISTENCE_BACKEND",
             "GCS_BUCKET",

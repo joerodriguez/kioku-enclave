@@ -264,6 +264,114 @@ impl IdentitySessionRepository for PostgresPersistence {
         })
     }
 
+    async fn upsert_password_account(
+        &self,
+        subject: &str,
+        email: &str,
+        signup_limit_per_day: i64,
+        allow_signup: bool,
+    ) -> Result<Account> {
+        let provider = "password";
+        let email = email.to_lowercase();
+        let stable_id = crate::cp::tokens::derive_provider_uuid(provider, subject);
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, provider, subject).await?;
+
+        if deleted_account_or_identity(&mut transaction, &stable_id, provider, subject).await? {
+            return Err(EnclaveError::Auth("account deleted".into()));
+        }
+
+        let existing = sqlx::query(
+            "SELECT a.id, a.email, a.status, a.primary_provider, a.primary_subject \
+               FROM auth_identities i \
+               JOIN accounts a ON a.id = i.account_id \
+              WHERE i.provider = $1 AND i.subject = $2 \
+              FOR UPDATE OF i, a",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(row) = existing {
+            let status: String = row.try_get("status")?;
+            if status != "active" {
+                return Err(EnclaveError::Auth("account inactive".into()));
+            }
+            let account_id: String = row.try_get("id")?;
+            let primary_provider: String = row.try_get("primary_provider")?;
+            let primary_subject: String = row.try_get("primary_subject")?;
+            let mut primary_email: String = row.try_get("email")?;
+            sqlx::query(
+                "UPDATE auth_identities \
+                    SET email = $1, last_seen_at = now() \
+                  WHERE provider = $2 AND subject = $3",
+            )
+            .bind(&email)
+            .bind(provider)
+            .bind(subject)
+            .execute(&mut *transaction)
+            .await?;
+            if primary_provider == provider && primary_subject == subject {
+                sqlx::query("UPDATE accounts SET email = $1, updated_at = now() WHERE id = $2")
+                    .bind(&email)
+                    .bind(&account_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                primary_email = email;
+            }
+            transaction.commit().await?;
+            return Ok(Account {
+                id: account_id,
+                email: primary_email,
+            });
+        }
+
+        // Login-only mode can authenticate an upstream Identity Platform user,
+        // but it must not silently turn that user into a Kioku account.
+        if !allow_signup {
+            return Err(EnclaveError::Auth("password signup disabled".into()));
+        }
+
+        let collision = sqlx::query(
+            "SELECT primary_provider, primary_subject, status \
+               FROM accounts WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&stable_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if collision.is_some() {
+            return Err(EnclaveError::Conflict("provider identity collision".into()));
+        }
+        reserve_signup(&mut transaction, signup_limit_per_day).await?;
+        sqlx::query(
+            "INSERT INTO accounts \
+                (id, email, status, primary_provider, primary_subject) \
+             VALUES ($1, $2, 'active', $3, $4)",
+        )
+        .bind(&stable_id)
+        .bind(&email)
+        .bind(provider)
+        .bind(subject)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO auth_identities (provider, subject, account_id, email) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(&stable_id)
+        .bind(&email)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Account {
+            id: stable_id,
+            email,
+        })
+    }
+
     async fn link_apple_identity(&self, account_id: &str, grant: AppleAccountGrant) -> Result<()> {
         let email = grant.email.to_lowercase();
         let mut transaction = self.pool().begin().await?;
@@ -339,6 +447,81 @@ impl IdentitySessionRepository for PostgresPersistence {
         .bind(account_id)
         .bind(&grant.client_id)
         .bind(&grant.refresh_token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn link_password_identity(
+        &self,
+        account_id: &str,
+        subject: &str,
+        email: &str,
+    ) -> Result<()> {
+        let provider = "password";
+        let email = email.to_lowercase();
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, provider, subject).await?;
+        advisory_transaction_lock(&mut transaction, "account", account_id).await?;
+
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id = $1 FOR UPDATE")
+                .bind(account_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if status.as_deref() != Some("active") {
+            return Err(EnclaveError::Auth("account inactive".into()));
+        }
+        let identity_deleted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM deleted_identities \
+                            WHERE provider = $1 AND subject = $2)",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if identity_deleted {
+            return Err(EnclaveError::Auth("identity deleted".into()));
+        }
+
+        let owner = sqlx::query_scalar::<_, String>(
+            "SELECT account_id FROM auth_identities \
+              WHERE provider = $1 AND subject = $2 FOR UPDATE",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if owner.as_deref().is_some_and(|owner| owner != account_id) {
+            return Err(EnclaveError::Conflict(
+                "password identity is linked to another account".into(),
+            ));
+        }
+        let other = sqlx::query_scalar::<_, String>(
+            "SELECT subject FROM auth_identities \
+              WHERE provider = $1 AND account_id = $2 FOR UPDATE",
+        )
+        .bind(provider)
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if other.as_deref().is_some_and(|linked| linked != subject) {
+            return Err(EnclaveError::Conflict(
+                "account already has a different password identity".into(),
+            ));
+        }
+
+        sqlx::query(
+            "INSERT INTO auth_identities (provider, subject, account_id, email) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (provider, subject) DO UPDATE \
+               SET email = EXCLUDED.email, last_seen_at = now()",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(account_id)
+        .bind(&email)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;

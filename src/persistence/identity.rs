@@ -75,7 +75,27 @@ pub(crate) trait IdentitySessionRepository: Send + Sync {
         signup_limit_per_day: i64,
     ) -> Result<Account>;
 
+    /// Resolve a verified password-provider subject, optionally creating its
+    /// canonical Kioku account. Email is descriptive metadata only: it is
+    /// never used to locate or merge an account.
+    async fn upsert_password_account(
+        &self,
+        subject: &str,
+        email: &str,
+        signup_limit_per_day: i64,
+        allow_signup: bool,
+    ) -> Result<Account>;
+
     async fn link_apple_identity(&self, account_id: &str, grant: AppleAccountGrant) -> Result<()>;
+
+    /// Attach a verified password-provider subject to the authenticated
+    /// account. This is the only supported cross-provider account merge path.
+    async fn link_password_identity(
+        &self,
+        account_id: &str,
+        subject: &str,
+        email: &str,
+    ) -> Result<()>;
 
     async fn account_session(&self, account_id: &str) -> Result<Option<AccountSession>>;
 }
