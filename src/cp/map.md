@@ -29,14 +29,14 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `media_planner.rs` | Deterministic bounded audio/screen processing work-unit planning. |
 | `media_worker.rs` | PostgreSQL-claimed media processing, KMS/GCS/Vertex work, result projection, voice work, bounded retry/resurrection, and retention cleanup. |
 | `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, and coverage reconciliation. |
-| `oauth.rs` | OAuth 2.1 discovery, dynamic registration, Google/Apple/reviewer PKCE consent/code flow, durable client-bound refresh rotation for native and local-device web sessions, and the native session facade. |
+| `oauth.rs` | OAuth 2.1 discovery, dynamic registration, Google/Apple/reviewer PKCE consent/code flow, content-free reviewer-stage diagnostics, durable client-bound refresh rotation for native and local-device web sessions, and the native session facade. |
 | `playback.rs` | Owner-authorized recording timeline, JavaScript-exact revision projection, owner-source display, and exact encrypted-segment serving. |
 | `push.rs` | APNs installation/handoff routes and PostgreSQL-claimed content-free ready notifications with credential-generation fences and no-resend ambiguity. |
 | `query.rs` | REST/MCP search, episodes, feed, people, browser evidence, screenshots, webhooks, and durable episode-deletion initiation/status behavior. |
 | `retention.rs` | Recording-retention preview/CAS, key epochs, downgrade reconciliation, and durable-recording policy routes. |
 | `screen_understanding.rs` | Bounded screen/storyboard result validation and projection. |
 | `summarizer.rs` | PostgreSQL-claimed incremental memory formation, bounded Vertex summarization, in-enclave embedding, and cursor settlement. Recurring and session-settled passes traverse only proven-empty sparse-history windows and stop at the first outcome that may have invoked the model; queued duplicate hints coalesce without suppressing a later media-complete edge. |
-| `sync.rs` | Compatibility tombstones plus current account export and restartable account-deletion status/routes. |
+| `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes. |
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
 | `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas and content-free usage metadata. |
 | `voice_memory.rs` | Pure-Rust audio decoding, fbank, and pinned WeSpeaker inference used by explicit voice-evaluation tooling. |

@@ -18,10 +18,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
 
-use crate::persistence::{
-    AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
-    OAuthClient, OAuthClientDefinition, OAuthClientRegistration, OAuthClientRegistrationRequest,
-    PendingConsent, RefreshTokenRotation,
+use crate::{
+    error::EnclaveError,
+    persistence::{
+        AuthorizationCodeExchange, ConsentApproval, DirectAuthorizationCode, NativeSessionRefresh,
+        OAuthClient, OAuthClientDefinition, OAuthClientRegistration,
+        OAuthClientRegistrationRequest, PendingConsent, RefreshTokenRotation,
+    },
 };
 
 use super::{tokens, CpState};
@@ -834,6 +837,33 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
 
 // ── Reviewer bridge ─────────────────────────────────────────────────────────────
 
+const REVIEWER_LOGIN_METRIC_SCHEMA: &str = "reviewer_login_v1";
+
+fn reviewer_error_class(error: &EnclaveError) -> &'static str {
+    match error {
+        EnclaveError::Auth(_) => "auth_refused",
+        EnclaveError::Conflict(_) => "conflict",
+        EnclaveError::SignupLimited => "signup_limited",
+        EnclaveError::Postgres(_) | EnclaveError::Store(_) => "repository_unavailable",
+        _ => "internal",
+    }
+}
+
+fn observe_reviewer_failure(stage: &'static str, reason: &'static str) {
+    warn!(
+        target: "kioku::reviewer",
+        metric_schema = REVIEWER_LOGIN_METRIC_SCHEMA,
+        stage,
+        outcome = "failed",
+        reason,
+        "reviewer login failed"
+    );
+}
+
+fn observe_reviewer_error(stage: &'static str, error: &EnclaveError) {
+    observe_reviewer_failure(stage, reviewer_error_class(error));
+}
+
 #[derive(Deserialize)]
 struct ReviewerLoginBody {
     id_token: Option<String>,
@@ -894,16 +924,19 @@ async fn reviewer_login(
     Json(body): Json<ReviewerLoginBody>,
 ) -> Response {
     if !reviewer_origin_allowed(&s, &headers) {
+        observe_reviewer_failure("origin", "refused");
         return StatusCode::FORBIDDEN.into_response();
     }
     let state = match validated_authorization_request(&s, body.authorization).await {
         Ok(state) => state,
         Err(mut response) => {
+            observe_reviewer_failure("authorization_request", "refused");
             attach_reviewer_cors(&s, &headers, &mut response);
             return response;
         }
     };
     let Some(id_token) = body.id_token else {
+        observe_reviewer_failure("request", "missing_id_token");
         return reviewer_json(
             &s,
             &headers,
@@ -912,6 +945,7 @@ async fn reviewer_login(
         );
     };
     let Some(verifier) = s.reviewer_verifier.as_ref() else {
+        observe_reviewer_failure("identity_verifier", "unavailable");
         return reviewer_json(
             &s,
             &headers,
@@ -921,19 +955,20 @@ async fn reviewer_login(
     };
     let (reviewer_uid, reviewer_email) = match verifier.verify(&id_token).await {
         Ok(identity) => identity,
-        Err(_) => {
+        Err(error) => {
+            observe_reviewer_error("identity_verification", &error);
             return reviewer_json(
                 &s,
                 &headers,
                 StatusCode::FORBIDDEN,
                 json!({"error": "review_access_denied"}),
-            )
+            );
         }
     };
 
     // Namespace the Identity Platform UID so it can never collide with a
     // consumer Google `sub` stored in the same legacy identity column.
-    let identity_subject = format!("reviewer:identity-platform:{reviewer_uid}");
+    let identity_subject = super::reviewer_identity_subject(&reviewer_uid);
     let user = match s
         .repositories
         .identity_sessions()
@@ -945,13 +980,14 @@ async fn reviewer_login(
         .await
     {
         Ok(user) => user,
-        Err(_) => {
+        Err(error) => {
+            observe_reviewer_error("account_upsert", &error);
             return reviewer_json(
                 &s,
                 &headers,
                 StatusCode::FORBIDDEN,
                 json!({"error": "review_access_denied"}),
-            )
+            );
         }
     };
     let fixture = s
@@ -959,7 +995,8 @@ async fn reviewer_login(
         .memory_formation()
         .ensure_reviewer_fixture(&user.id)
         .await;
-    if fixture.is_err() {
+    if let Err(error) = fixture {
+        observe_reviewer_error("fixture", &error);
         return reviewer_json(
             &s,
             &headers,
@@ -976,13 +1013,14 @@ async fn reviewer_login(
         &state.resource,
     ) {
         Ok(code) => code,
-        Err(_) => {
+        Err(error) => {
+            observe_reviewer_error("authorization_code_issue", &error);
             return reviewer_json(
                 &s,
                 &headers,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": "server_error"}),
-            )
+            );
         }
     };
     let stored = s
@@ -995,14 +1033,35 @@ async fn reviewer_login(
             ttl: Duration::from_secs(AUTH_CODE_TTL_SECS as u64),
         })
         .await;
-    if !matches!(stored, Ok(true)) {
-        return reviewer_json(
-            &s,
-            &headers,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "server_error"}),
-        );
+    match stored {
+        Ok(true) => {}
+        Ok(false) => {
+            observe_reviewer_failure("authorization_code_store", "rejected");
+            return reviewer_json(
+                &s,
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "server_error"}),
+            );
+        }
+        Err(error) => {
+            observe_reviewer_error("authorization_code_store", &error);
+            return reviewer_json(
+                &s,
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "server_error"}),
+            );
+        }
     }
+
+    tracing::info!(
+        target: "kioku::reviewer",
+        metric_schema = REVIEWER_LOGIN_METRIC_SCHEMA,
+        stage = "complete",
+        outcome = "succeeded",
+        "reviewer login succeeded"
+    );
 
     reviewer_json(
         &s,
@@ -1904,6 +1963,22 @@ mod tests {
         assert_eq!(
             redirect,
             "https://client.example/oauth/callback?existing=1&code=authorization+code&state=opaque+state"
+        );
+    }
+
+    #[test]
+    fn reviewer_error_observation_exposes_only_a_content_free_class() {
+        assert_eq!(
+            reviewer_error_class(&EnclaveError::Auth("sensitive identity detail".into())),
+            "auth_refused"
+        );
+        assert_eq!(
+            reviewer_error_class(&EnclaveError::Conflict("sensitive account detail".into())),
+            "conflict"
+        );
+        assert_eq!(
+            reviewer_error_class(&EnclaveError::Store("sensitive database detail".into())),
+            "repository_unavailable"
         );
     }
 

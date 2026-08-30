@@ -204,7 +204,9 @@ Ordinary compatible releases use the deployment repository's staged Terraform ow
    exact image/KMS/backend readback.
 5. Replace members with `max_unavailable=0`; maintain at least two ready zonal members.
 6. Exercise authenticated capture, search, export, deletion/restart, and content-free provider
-   no-op/effect probes through the public service.
+   no-op/effect probes through the public service. Account deletion must use a dedicated disposable
+   identity. The persistent plugin reviewer may run login/MCP/read canaries, but its token must
+   never be reused for `DELETE /api/account`.
 7. Require homogeneous candidate membership before retiring the predecessor digest.
 8. Retire predecessor KMS admission and verify no old member remains.
 9. Capture a final Terraform plan showing no changes.
@@ -212,6 +214,31 @@ Ordinary compatible releases use the deployment repository's staged Terraform ow
 Record exact source commit, signed tag, image digest, KMS principals/condition, PostgreSQL authority
 and schema, member names/zones/digests, readiness/liveness, monitor receipt, effect-safety probes,
 and final no-change plan.
+
+### Recover plugin-review access
+
+When the OpenAI submission portal already reports the production domain as verified, a `404` from
+a previously used domain-challenge path is not an active review blocker. Do not add or restore a
+challenge endpoint solely to recover reviewer access; repeat domain verification only if the portal
+no longer reports the domain as verified.
+
+Treat a rejected, non-editable submission as immutable. Complete all of these gates before
+resubmitting:
+
+1. Release and deploy a replacement reviewer identity and configuration; do not reuse a tombstoned
+   reviewer subject.
+2. Prove the replacement account can complete the production reviewer login and has an active,
+   deletion-protected fixture.
+3. Create a new submission draft, or obtain an editable revision of the rejected submission, while
+   preserving the live MCP, OAuth, and dynamic client-registration fields.
+4. Run **Scan Tools** against the deployed service so the editable submission receives a fresh
+   dynamic OAuth client registration rather than a client lost during a database cutover.
+5. Update the portal's testing-credential fields to the replacement reviewer identity. Keep the
+   password only in the portal and the approved credential store; never record it in source,
+   release evidence, logs, tickets, or this runbook.
+6. From the editable submission, complete the full reviewer path: credential sign-in, PKCE
+   authorization-code exchange, MCP connection, tool discovery, a read-only tool call, and refresh.
+   Resubmit only after every step succeeds against the exact production release.
 
 ## Incompatible maintenance rollout
 
