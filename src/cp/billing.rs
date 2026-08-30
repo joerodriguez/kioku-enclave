@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    extract::{Query, State},
+    extract::{rejection::JsonRejection, Query, State},
     http::{header::CACHE_CONTROL, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -31,6 +31,7 @@ use crate::persistence::{
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_APPLE_SIGNED_TRANSACTION_BYTES: usize = 128 * 1024;
 const ID_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 const RECORDING_LEASE_SECONDS: i64 = 60;
 // A source segment may begin just before a one-minute billing lease rolls and
@@ -167,6 +168,70 @@ pub struct CheckoutRequest {
     pub interval: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AppleAccountTokenResponse {
+    pub app_account_token: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AppleAccountTokenResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Wrapping Option makes the field itself mandatory while still
+        // accepting an explicit JSON null. An Option field directly on Wire
+        // would silently turn a missing key into None.
+        #[derive(Deserialize)]
+        struct RequiredNullableToken(Option<String>);
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            app_account_token: RequiredNullableToken,
+        }
+
+        let Wire {
+            app_account_token: RequiredNullableToken(app_account_token),
+        } = Wire::deserialize(deserializer)?;
+        if app_account_token
+            .as_deref()
+            .is_some_and(|value| !canonical_uuid_v4(value))
+        {
+            return Err(serde::de::Error::custom(
+                "app_account_token must be a canonical lowercase UUIDv4 or null",
+            ));
+        }
+        Ok(Self { app_account_token })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplePurchaseAttemptRequest {
+    pub purchase_attempt_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppleTransactionRequest {
+    pub signed_transaction_info: String,
+    pub app_account_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplePurchaseIntentAction {
+    Pending,
+    Release,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplePurchaseIntentRequest {
+    pub action: ApplePurchaseIntentAction,
+    pub purchase_attempt_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordingLeaseRequest {
@@ -198,12 +263,21 @@ pub struct DetachResponse {
     pub detached: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DeletionFenceResponse {
+    pub fenced: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
     #[error("external control plane unavailable")]
     Unavailable,
     #[error("external control plane rejected request with status {0}")]
     Rejected(u16),
+    #[error("external control plane rejected Apple billing request with status {status}")]
+    AppleRejected { status: u16, code: &'static str },
+    #[error("billing account deletion fence is already active")]
+    AccountDetaching,
     #[error("external control plane returned an invalid response")]
     InvalidResponse,
 }
@@ -221,6 +295,25 @@ pub trait BillingGateway: Send + Sync {
         request: &CheckoutRequest,
     ) -> Result<UrlResponse, BillingError>;
     async fn portal(&self, account_id: &str) -> Result<UrlResponse, BillingError>;
+    async fn apple_account_token(
+        &self,
+        account_id: &str,
+    ) -> Result<AppleAccountTokenResponse, BillingError>;
+    async fn start_apple_purchase_attempt(
+        &self,
+        account_id: &str,
+        request: &ApplePurchaseAttemptRequest,
+    ) -> Result<AppleAccountTokenResponse, BillingError>;
+    async fn submit_apple_transaction(
+        &self,
+        account_id: &str,
+        request: &AppleTransactionRequest,
+    ) -> Result<Value, BillingError>;
+    async fn update_apple_purchase_intent(
+        &self,
+        account_id: &str,
+        request: &ApplePurchaseIntentRequest,
+    ) -> Result<Value, BillingError>;
     async fn report_vertex_usage(
         &self,
         events: &[VertexUsageEvent],
@@ -236,6 +329,8 @@ pub trait BillingGateway: Send + Sync {
         after: Option<&str>,
     ) -> Result<Value, BillingError>;
     async fn detach(&self, account_id: &str) -> Result<DetachResponse, BillingError>;
+    async fn deletion_fence(&self, account_id: &str)
+        -> Result<DeletionFenceResponse, BillingError>;
 }
 
 pub struct HttpBillingGateway {
@@ -342,14 +437,44 @@ impl HttpBillingGateway {
             .await
             .map_err(|_| BillingError::Unavailable)?;
         let status = response.status();
+        let bytes = read_limited(response, MAX_RESPONSE_BYTES).await?;
         if !status.is_success() {
             return if status.is_server_error() {
                 Err(BillingError::Unavailable)
+            } else if status.as_u16() == 409
+                && supplied_error_code(&bytes).as_deref() == Some("account_detaching")
+            {
+                Err(BillingError::AccountDetaching)
             } else {
                 Err(BillingError::Rejected(status.as_u16()))
             };
         }
+        serde_json::from_slice(&bytes).map_err(|_| BillingError::InvalidResponse)
+    }
+
+    async fn send_apple<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, BillingError> {
+        let response = request
+            .bearer_auth(self.bearer_token().await?)
+            .send()
+            .await
+            .map_err(|_| BillingError::Unavailable)?;
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(BillingError::Unavailable);
+        }
         let bytes = read_limited(response, MAX_RESPONSE_BYTES).await?;
+        if !status.is_success() {
+            return match status.as_u16() {
+                400 | 409 | 410 | 422 => Err(BillingError::AppleRejected {
+                    status: status.as_u16(),
+                    code: bounded_apple_error_code(status.as_u16(), &bytes),
+                }),
+                value => Err(BillingError::Rejected(value)),
+            };
+        }
         serde_json::from_slice(&bytes).map_err(|_| BillingError::InvalidResponse)
     }
 }
@@ -403,6 +528,69 @@ impl BillingGateway for HttpBillingGateway {
                     urlencoding::encode(account_id)
                 ))
                 .json(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    async fn apple_account_token(
+        &self,
+        account_id: &str,
+    ) -> Result<AppleAccountTokenResponse, BillingError> {
+        self.send_apple(self.http.get(format!(
+            "{}/internal/v1/accounts/{}/apple/account-token",
+            self.base_url,
+            urlencoding::encode(account_id)
+        )))
+        .await
+    }
+
+    async fn start_apple_purchase_attempt(
+        &self,
+        account_id: &str,
+        request: &ApplePurchaseAttemptRequest,
+    ) -> Result<AppleAccountTokenResponse, BillingError> {
+        self.send_apple(
+            self.http
+                .post(format!(
+                    "{}/internal/v1/accounts/{}/apple/purchase-attempt",
+                    self.base_url,
+                    urlencoding::encode(account_id)
+                ))
+                .json(request),
+        )
+        .await
+    }
+
+    async fn submit_apple_transaction(
+        &self,
+        account_id: &str,
+        request: &AppleTransactionRequest,
+    ) -> Result<Value, BillingError> {
+        self.send_apple(
+            self.http
+                .post(format!(
+                    "{}/internal/v1/accounts/{}/apple/transactions",
+                    self.base_url,
+                    urlencoding::encode(account_id)
+                ))
+                .json(request),
+        )
+        .await
+    }
+
+    async fn update_apple_purchase_intent(
+        &self,
+        account_id: &str,
+        request: &ApplePurchaseIntentRequest,
+    ) -> Result<Value, BillingError> {
+        self.send_apple(
+            self.http
+                .post(format!(
+                    "{}/internal/v1/accounts/{}/apple/purchase-intent",
+                    self.base_url,
+                    urlencoding::encode(account_id)
+                ))
+                .json(request),
         )
         .await
     }
@@ -466,6 +654,22 @@ impl BillingGateway for HttpBillingGateway {
         )
         .await
     }
+
+    async fn deletion_fence(
+        &self,
+        account_id: &str,
+    ) -> Result<DeletionFenceResponse, BillingError> {
+        self.send_apple(
+            self.http
+                .post(format!(
+                    "{}/internal/v1/accounts/{}/deletion-fence",
+                    self.base_url,
+                    urlencoding::encode(account_id)
+                ))
+                .json(&serde_json::json!({})),
+        )
+        .await
+    }
 }
 
 fn required_env(name: &str, test_default: &str) -> Result<String, String> {
@@ -473,6 +677,38 @@ fn required_env(name: &str, test_default: &str) -> Result<String, String> {
         Ok(value) if !value.trim().is_empty() => Ok(value.trim_end_matches('/').to_string()),
         _ if crate::test_mode_enabled() => Ok(test_default.to_string()),
         _ => Err(format!("{name} must be set to a non-empty value")),
+    }
+}
+
+fn supplied_error_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| {
+                    error
+                        .as_str()
+                        .or_else(|| error.get("code").and_then(Value::as_str))
+                })
+                .map(str::to_owned)
+        })
+}
+
+fn bounded_apple_error_code(status: u16, body: &[u8]) -> &'static str {
+    let supplied = supplied_error_code(body);
+    match supplied.as_deref() {
+        Some("billing_provider_conflict") => "billing_provider_conflict",
+        Some("apple_purchase_intent_conflict") => "apple_purchase_intent_conflict",
+        Some("apple_account_token_mismatch") => "apple_account_token_mismatch",
+        Some("provider_reference_conflict") => "provider_reference_conflict",
+        Some("account_detaching") => "account_detaching",
+        Some("account_detached") => "account_detached",
+        Some("invalid_request") => "invalid_request",
+        Some("invalid_apple_transaction") => "invalid_apple_transaction",
+        Some("invalid_apple_signed_data") => "invalid_apple_signed_data",
+        _ if status == 409 => "billing_provider_conflict",
+        _ => "invalid_apple_transaction",
     }
 }
 
@@ -530,6 +766,22 @@ fn jwt_exp(token: &str) -> Result<u64, BillingError> {
 pub fn router() -> Router<std::sync::Arc<CpState>> {
     Router::new()
         .route("/api/billing", get(get_billing))
+        .route(
+            "/api/billing/apple/account-token",
+            get(get_apple_account_token),
+        )
+        .route(
+            "/api/billing/apple/purchase-attempt",
+            post(create_apple_purchase_attempt),
+        )
+        .route(
+            "/api/billing/apple/transactions",
+            post(submit_apple_transaction),
+        )
+        .route(
+            "/api/billing/apple/purchase-intent",
+            post(update_apple_purchase_intent),
+        )
         .route("/api/billing/recording-lease", post(create_recording_lease))
         .route(
             "/api/billing/offline-recording-usage",
@@ -568,6 +820,52 @@ fn checkout_conflict() -> Response {
     )
 }
 
+fn invalid_apple_request() -> Response {
+    no_store(
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":"invalid_apple_transaction"})),
+        )
+            .into_response(),
+    )
+}
+
+fn invalid_apple_purchase_intent_request() -> Response {
+    no_store(
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error":"invalid_request"})),
+        )
+            .into_response(),
+    )
+}
+
+fn apple_billing_error(error: BillingError) -> Response {
+    match error {
+        BillingError::AppleRejected { status: 409, code } => no_store(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":code})),
+            )
+                .into_response(),
+        ),
+        BillingError::AppleRejected {
+            status: 400 | 422,
+            code,
+        } => no_store(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error":code})),
+            )
+                .into_response(),
+        ),
+        BillingError::AppleRejected { status: 410, code } => {
+            no_store((StatusCode::GONE, Json(serde_json::json!({"error":code}))).into_response())
+        }
+        _ => service_unavailable(),
+    }
+}
+
 async fn get_billing(
     State(state): State<std::sync::Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -584,6 +882,133 @@ async fn get_billing(
     match state.billing.summary(&account_id).await {
         Ok(summary) => no_store(Json(summary).into_response()),
         Err(_) => service_unavailable(),
+    }
+}
+
+async fn get_apple_account_token(
+    State(state): State<std::sync::Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return service_unavailable(),
+    };
+    match state.billing.apple_account_token(&account_id).await {
+        Ok(response)
+            if response
+                .app_account_token
+                .as_deref()
+                .is_none_or(canonical_uuid_v4) =>
+        {
+            no_store(Json(response).into_response())
+        }
+        Ok(_) => service_unavailable(),
+        Err(error) => apple_billing_error(error),
+    }
+}
+
+async fn create_apple_purchase_attempt(
+    State(state): State<std::sync::Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    request: Result<Json<ApplePurchaseAttemptRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return invalid_apple_purchase_intent_request();
+    };
+    if !canonical_uuid_v4(&request.purchase_attempt_id) {
+        return invalid_apple_purchase_intent_request();
+    }
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return service_unavailable(),
+    };
+    match state
+        .billing
+        .start_apple_purchase_attempt(&account_id, &request)
+        .await
+    {
+        Ok(response)
+            if response
+                .app_account_token
+                .as_deref()
+                .is_some_and(canonical_uuid_v4) =>
+        {
+            no_store(Json(response).into_response())
+        }
+        Ok(_) => service_unavailable(),
+        Err(error) => apple_billing_error(error),
+    }
+}
+
+async fn submit_apple_transaction(
+    State(state): State<std::sync::Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    request: Result<Json<AppleTransactionRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return invalid_apple_request();
+    };
+    if !valid_apple_transaction(&request) {
+        return invalid_apple_request();
+    }
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return service_unavailable(),
+    };
+    match state
+        .billing
+        .submit_apple_transaction(&account_id, &request)
+        .await
+    {
+        Ok(summary) if summary.is_object() => no_store(Json(summary).into_response()),
+        Ok(_) => service_unavailable(),
+        Err(error) => apple_billing_error(error),
+    }
+}
+
+async fn update_apple_purchase_intent(
+    State(state): State<std::sync::Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    request: Result<Json<ApplePurchaseIntentRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return invalid_apple_purchase_intent_request();
+    };
+    if !canonical_uuid_v4(&request.purchase_attempt_id) {
+        return invalid_apple_purchase_intent_request();
+    }
+    let account_id = match state
+        .repositories
+        .billing()
+        .billing_account_id(&user.0)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return service_unavailable(),
+    };
+    match state
+        .billing
+        .update_apple_purchase_intent(&account_id, &request)
+        .await
+    {
+        Ok(summary) if summary.is_object() => no_store(Json(summary).into_response()),
+        Ok(_) => service_unavailable(),
+        Err(error) => apple_billing_error(error),
     }
 }
 
@@ -605,6 +1030,33 @@ fn uuid_v4(value: &str) -> bool {
             19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
             _ => byte.is_ascii_hexdigit(),
         })
+}
+
+fn canonical_uuid_v4(value: &str) -> bool {
+    uuid_v4(value) && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn valid_compact_jws(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_APPLE_SIGNED_TRANSACTION_BYTES {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(header), Some(payload), Some(signature), None)
+            if valid_part(header) && valid_part(payload) && valid_part(signature)
+    )
+}
+
+fn valid_apple_transaction(request: &AppleTransactionRequest) -> bool {
+    canonical_uuid_v4(&request.app_account_token)
+        && valid_compact_jws(&request.signed_transaction_info)
 }
 
 fn valid_recording_lease(request: &RecordingLeaseRequest) -> bool {
@@ -2156,6 +2608,164 @@ mod tests {
             after: None,
         }));
         assert!(serde_urlencoded::from_str::<MarginQuery>("period=2026-08").is_err());
+    }
+
+    #[test]
+    fn apple_purchase_contract_is_strict_and_bounded() {
+        let attempt_id = "123e4567-e89b-42d3-a456-426614174000";
+        assert_eq!(
+            serde_json::to_string(&ApplePurchaseAttemptRequest {
+                purchase_attempt_id: attempt_id.into(),
+            })
+            .unwrap(),
+            format!(r#"{{"purchase_attempt_id":"{attempt_id}"}}"#)
+        );
+        assert!(serde_json::from_str::<ApplePurchaseAttemptRequest>(
+            r#"{"purchase_attempt_id":"123e4567-e89b-42d3-a456-426614174000","account_id":"acct"}"#
+        )
+        .is_err());
+
+        let exact_limit = format!("a.{}.b", "a".repeat(MAX_APPLE_SIGNED_TRANSACTION_BYTES - 4));
+        assert_eq!(exact_limit.len(), MAX_APPLE_SIGNED_TRANSACTION_BYTES);
+        assert!(valid_compact_jws(&exact_limit));
+        let above_limit = format!("{exact_limit}a");
+        assert_eq!(above_limit.len(), MAX_APPLE_SIGNED_TRANSACTION_BYTES + 1);
+        assert!(!valid_compact_jws(&above_limit));
+
+        let valid = AppleTransactionRequest {
+            signed_transaction_info: "header.payload.signature".into(),
+            app_account_token: "123e4567-e89b-42d3-a456-426614174000".into(),
+        };
+        assert!(valid_apple_transaction(&valid));
+        assert!(!valid_apple_transaction(&AppleTransactionRequest {
+            signed_transaction_info: "header.payload".into(),
+            ..valid.clone()
+        }));
+        assert!(!valid_apple_transaction(&AppleTransactionRequest {
+            signed_transaction_info: "header.payload.signature=".into(),
+            ..valid.clone()
+        }));
+        assert!(!valid_apple_transaction(&AppleTransactionRequest {
+            app_account_token: "123E4567-E89B-42D3-A456-426614174000".into(),
+            ..valid
+        }));
+        assert!(
+            serde_json::from_value::<AppleTransactionRequest>(serde_json::json!({
+                "signed_transaction_info":"header.payload.signature",
+                "app_account_token":"123e4567-e89b-42d3-a456-426614174000",
+                "account_id":"forbidden"
+            }))
+            .is_err()
+        );
+
+        let pending = ApplePurchaseIntentRequest {
+            action: ApplePurchaseIntentAction::Pending,
+            purchase_attempt_id: attempt_id.into(),
+        };
+        let release = ApplePurchaseIntentRequest {
+            action: ApplePurchaseIntentAction::Release,
+            purchase_attempt_id: attempt_id.into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&pending).unwrap(),
+            format!(r#"{{"action":"pending","purchase_attempt_id":"{attempt_id}"}}"#)
+        );
+        assert_eq!(
+            serde_json::to_string(&release).unwrap(),
+            format!(r#"{{"action":"release","purchase_attempt_id":"{attempt_id}"}}"#)
+        );
+        assert!(serde_json::from_str::<ApplePurchaseIntentRequest>(
+            r#"{"action":"pending","purchase_attempt_id":"123e4567-e89b-42d3-a456-426614174000","account_id":"forbidden"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ApplePurchaseIntentRequest>(
+            r#"{"action":"abandon","purchase_attempt_id":"123e4567-e89b-42d3-a456-426614174000"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn apple_account_token_response_requires_one_exact_nullable_field() {
+        let token = "123e4567-e89b-42d3-a456-426614174000";
+        assert_eq!(
+            serde_json::from_str::<AppleAccountTokenResponse>(&format!(
+                r#"{{"app_account_token":"{token}"}}"#
+            ))
+            .unwrap(),
+            AppleAccountTokenResponse {
+                app_account_token: Some(token.into()),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<AppleAccountTokenResponse>(r#"{"app_account_token":null}"#)
+                .unwrap(),
+            AppleAccountTokenResponse {
+                app_account_token: None,
+            }
+        );
+        assert!(serde_json::from_str::<AppleAccountTokenResponse>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<AppleAccountTokenResponse>(
+            r#"{"app_account_token":null,"extra":true}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<AppleAccountTokenResponse>(r#"{"app_account_token":7}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<AppleAccountTokenResponse>(
+            r#"{"app_account_token":null,"app_account_token":null}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<AppleAccountTokenResponse>(
+            r#"{"app_account_token":"123E4567-E89B-42D3-A456-426614174000"}"#
+        )
+        .is_err());
+        assert_eq!(
+            apple_billing_error(BillingError::InvalidResponse).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn apple_rejections_are_sanitized_without_losing_retry_semantics() {
+        assert_eq!(
+            bounded_apple_error_code(
+                409,
+                br#"{"error":{"code":"apple_account_token_mismatch","message":"secret"}}"#
+            ),
+            "apple_account_token_mismatch"
+        );
+        assert_eq!(
+            bounded_apple_error_code(422, br#"{"error":"invalid_apple_signed_data"}"#),
+            "invalid_apple_signed_data"
+        );
+        assert_eq!(
+            bounded_apple_error_code(422, br#"{"error":{"code":"upstream_secret"}}"#),
+            "invalid_apple_transaction"
+        );
+        assert_eq!(
+            bounded_apple_error_code(
+                409,
+                br#"{"error":{"code":"apple_purchase_intent_conflict","message":"secret"}}"#
+            ),
+            "apple_purchase_intent_conflict"
+        );
+
+        let conflict = apple_billing_error(BillingError::AppleRejected {
+            status: 409,
+            code: "billing_provider_conflict",
+        });
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(conflict.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+
+        let invalid = apple_billing_error(BillingError::AppleRejected {
+            status: 422,
+            code: "invalid_apple_transaction",
+        });
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let unavailable = apple_billing_error(BillingError::Unavailable);
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

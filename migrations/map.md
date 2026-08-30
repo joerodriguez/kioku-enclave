@@ -53,3 +53,6 @@ migration lock; serving instances only verify `persistence_schema.version`.
 - `0024_fleet_admission.sql` adds fleet-wide token buckets and
   crash-recoverable concurrency leases so replica count cannot multiply
   request budgets.
+- `0025_account_deletion_request.sql` adds the durable `deletion_requested`
+  admission fence used while final usage and the one-way billing deletion
+  fence are reconciled, before identity/content deletion begins.

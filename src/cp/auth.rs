@@ -433,7 +433,12 @@ pub async fn require_auth(
             Ok(Some(status))
                 if status == AccountStatus::Active
                     || (deletion_status_access
-                        && matches!(status, AccountStatus::Deleting | AccountStatus::Deleted)) =>
+                        && matches!(
+                            status,
+                            AccountStatus::DeletionRequested
+                                | AccountStatus::Deleting
+                                | AccountStatus::Deleted
+                        )) =>
             {
                 req.extensions_mut().insert(AuthUser(user_id));
                 req.extensions_mut().insert(AuthEvidence {
@@ -467,7 +472,11 @@ pub async fn require_auth(
                     .account_status(&user_id)
                     .await
                 {
-                    Ok(Some(AccountStatus::Deleting | AccountStatus::Deleted)) => {
+                    Ok(Some(
+                        AccountStatus::DeletionRequested
+                        | AccountStatus::Deleting
+                        | AccountStatus::Deleted,
+                    )) => {
                         req.extensions_mut().insert(AuthUser(user_id));
                         req.extensions_mut().insert(evidence);
                         return next.run(req).await;

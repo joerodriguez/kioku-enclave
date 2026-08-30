@@ -423,6 +423,78 @@ network-transfer time. Requests without that header still require a current live
 recording lease. Missing delivery credit returns the same retryable
 `recording_lease_inactive` response and never persists the item.
 
+## Bind an App Store purchase
+
+`POST /api/billing/apple/purchase-attempt`
+
+```json
+{"purchase_attempt_id":"323e4567-e89b-42d3-a456-426614174000"}
+```
+
+Before StoreKit presents a purchase sheet, the authenticated client creates one
+lowercase UUIDv4 attempt identifier and submits that exact sole field. The billing
+service atomically gives that attempt exclusive ownership of the account's Apple
+purchase reservation and returns its stable random UUIDv4 `app_account_token`.
+Retrying the same attempt is idempotent; a different active attempt or a live
+subscription from another provider returns `409`. Invalid input returns `422`,
+dependency unavailability returns `503`, and every response is
+`Cache-Control: no-store`. The enclave always derives the account from the bearer
+session; callers cannot supply an account ID.
+
+`GET /api/billing/apple/account-token`
+
+This read-only recovery endpoint returns exactly
+`{"app_account_token":"<lowercase UUIDv4>"}` for an account that already has a
+token or `{"app_account_token":null}` when it never provisioned one. It never
+creates an account, token, or purchase reservation. Restore and transaction-update
+replay use this value to ignore StoreKit history belonging to another Kioku account.
+The enclave rejects a missing field, an extra field, a non-string/non-null value, or
+a noncanonical UUID from the billing dependency and returns `503` rather than
+silently treating malformed state as an unprovisioned account.
+Deletion-fenced accounts return `409`, detached accounts return `410`, and dependency
+unavailability returns `503`.
+
+`POST /api/billing/apple/transactions`
+
+```json
+{
+  "signed_transaction_info": "header.payload.signature",
+  "app_account_token": "123e4567-e89b-42d3-a456-426614174000"
+}
+```
+
+The body contains exactly Apple's compact signed transaction (at most 128 KiB)
+and the canonical lowercase UUIDv4 previously provisioned for the authenticated
+account. The enclave validates the bounded envelope and forwards it to the isolated
+billing service without logging either value. Only that service verifies Apple
+signatures and reconciles the provider-neutral entitlement. Success returns the
+complete current billing summary. Provider/account conflicts return `409`,
+invalid Apple evidence returns `422`, and verification dependency failures
+return `503`. A client must not finish its StoreKit transaction until this
+endpoint succeeds; restore retries verified current or unfinished transactions.
+
+`POST /api/billing/apple/purchase-intent`
+
+```json
+{
+  "action":"pending",
+  "purchase_attempt_id":"323e4567-e89b-42d3-a456-426614174000"
+}
+```
+
+The body must contain exactly `action: "pending"` or `action: "release"` plus the
+same lowercase UUIDv4 `purchase_attempt_id` that owns the reservation.
+After StoreKit returns `pending`, the client records `pending`; after an explicit
+StoreKit `userCancelled` result, it records `release`. The client never releases
+the reservation after a successful purchase, an unverified result, a binding
+failure, or an ambiguous network outcome. This preserves the Apple provider
+reservation across crashes and prevents a concurrent device or Paddle checkout
+from creating a second charge opportunity. Only the owning attempt can transition
+the state; an older or different attempt returns `409` and cannot release the
+current reservation. Success returns the complete current billing summary.
+Provider or purchase-intent conflicts return `409`, malformed bodies return `422`,
+dependency failures return `503`, and every response is `Cache-Control: no-store`.
+
 ## Reconcile offline recording time
 
 `POST /api/billing/offline-recording-usage`
@@ -908,11 +980,31 @@ States are `pending`, `failed_retryable`, and `physical_complete`; `deleted` is
 true only in `physical_complete`. The latter has no retry delay or provider
 deadline. `Retry-After` is supplied when a retry delay is known.
 
+The first successful local transaction creates the opaque operation and changes the
+account to a durable `deletion_requested` admission state. That state immediately
+blocks sign-in, capture, model invocation, worker/provider claims, checkout, and
+ordinary billing writes, but does not yet erase identity or content. Work admitted
+before that transaction is allowed to settle (and signed uploads to expire) behind the
+gate. Only after this local preflight is quiescent does the enclave resolve the
+canonical billing account, complete final usage settlement, and require the billing
+service to acknowledge its one-way deletion fence. If settlement or the remote fence is
+unavailable or its success response is lost, `DELETE /api/account` returns the durable
+`202` pending operation and the bounded reconciler retries the same idempotent fence.
+Only after acknowledgement does the operation transition into identity/content
+deletion. A local transition failure after fence success is therefore also recoverable
+from `deletion_requested`, rather than stranding an active account. A failure before
+the durable local request commits still returns
+`503 {"error":"deletion_init_failed"}`. The fence prevents checkout, entitlement
+projection, and late StoreKit approval from reactivating service; asynchronous
+provider cleanup/detach can then continue after physical account deletion without
+weakening the barrier.
+
 The status surface uses the caller's ordinary account authentication and does not
-introduce a separate polling credential. Deleting or deleted credentials are accepted
-only for these deletion routes. PostgreSQL and provider retention/transient cleanup
-failures remain pending or retryable for the bounded server-side reconciler; the API
-never reports physical completion while structured rows or owned media generations remain.
+introduce a separate polling credential. Deletion-requested, deleting, or deleted
+credentials are accepted only for these deletion routes. PostgreSQL and provider
+retention/transient cleanup failures remain pending or retryable for the bounded
+server-side reconciler; the API never reports physical completion while structured
+rows or owned media generations remain.
 
 ## Processing and privacy semantics
 

@@ -135,14 +135,70 @@ async fn delete_account(
     };
     if !matches!(
         account_status,
-        AccountStatus::Active | AccountStatus::Deleting | AccountStatus::Deleted
+        AccountStatus::Active
+            | AccountStatus::DeletionRequested
+            | AccountStatus::Deleting
+            | AccountStatus::Deleted
     ) {
         return account_unavailable();
     }
+    if account_status == AccountStatus::Deleted {
+        return match state
+            .repositories
+            .lifecycle()
+            .account_deletion_operation(&user_id)
+            .await
+        {
+            Ok(Some(operation)) => deletion_delete_response(operation),
+            _ => account_unavailable(),
+        };
+    }
 
-    // PostgreSQL acquires the account-lifecycle advisory lock, refuses every
-    // open provider fence/upload, closes authenticated admission, and records
-    // a durable operation in one transaction.
+    // First commit the local deletion request. This closes account admission
+    // without erasing identity/content and makes a lost billing-fence response
+    // discoverable by the reconciler.
+    let requested = match state
+        .repositories
+        .lifecycle()
+        .request_account_deletion(&user_id)
+        .await
+    {
+        Ok(Some(operation)) => operation,
+        Ok(None) => return account_unavailable(),
+        Err(error) => {
+            warn!(error = %error, "failed to persist account deletion request");
+            return deletion_init_failed();
+        }
+    };
+    if requested.status == "physical_complete"
+        || deletion_operation_requires_remediation(&requested)
+    {
+        return deletion_delete_response(requested);
+    }
+    match state
+        .repositories
+        .lifecycle()
+        .account_deletion_preflight_complete(&user_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return deletion_delete_response(requested),
+        Err(error) => {
+            warn!(error = %error, "account deletion preflight is unavailable");
+            return deletion_delete_response(requested);
+        }
+    }
+
+    // Final usage settlement happens only after new local work is gated and
+    // before the billing service's one-way deletion fence. Both remote steps
+    // are idempotent; any failure leaves the durable request pending.
+    if let Err(error) = state.settle_before_deletion(&user_id).await {
+        warn!(error = %error, "failed to settle and fence billing before deletion");
+        return deletion_delete_response(requested);
+    }
+
+    // Only after the billing fence is acknowledged does PostgreSQL transition
+    // the durable request into the existing identity/content deletion flow.
     let operation = match state
         .repositories
         .lifecycle()
@@ -150,34 +206,15 @@ async fn delete_account(
         .await
     {
         Ok(Some(operation)) => operation,
-        Ok(None) => return account_unavailable(),
+        Ok(None) => return deletion_delete_response(requested),
         Err(error) => {
             warn!(error = %error, "failed to initialize account deletion");
-            return deletion_init_failed();
+            return deletion_delete_response(requested);
         }
     };
     if operation.status == "physical_complete"
         || deletion_operation_requires_remediation(&operation)
     {
-        return deletion_delete_response(operation);
-    }
-
-    let account_id = match state
-        .repositories
-        .billing()
-        .billing_account_id_for_deletion(&user_id)
-        .await
-    {
-        Ok(account_id) => account_id,
-        Err(error) => {
-            warn!(error = %error, "failed to load deletion accounting identity");
-            return deletion_delete_response(operation);
-        }
-    };
-    if let Err(error) =
-        super::model_usage::settle_for_account_deletion(&state, &user_id, &account_id).await
-    {
-        warn!(error = %error, "failed to settle Vertex usage before deletion");
         return deletion_delete_response(operation);
     }
 
@@ -381,7 +418,26 @@ impl AccountDeletionAccounting for CpState {
             .billing()
             .billing_account_id_for_deletion(user_id)
             .await?;
-        super::model_usage::settle_for_account_deletion(self, user_id, &account_id).await
+        let settlement =
+            super::model_usage::settle_for_account_deletion(self, user_id, &account_id).await?;
+        let fence = self
+            .billing
+            .deletion_fence(&account_id)
+            .await
+            .map_err(|error| {
+                crate::error::EnclaveError::Config(format!(
+                    "billing deletion fence unavailable: {error}"
+                ))
+            })?;
+        if !fence.fenced {
+            return Err(crate::error::EnclaveError::Config(
+                "billing deletion fence returned an invalid response".into(),
+            ));
+        }
+        if settlement == super::model_usage::AccountDeletionSettlement::AlreadyFenced {
+            tracing::info!("billing deletion fence was already active during retry");
+        }
+        Ok(())
     }
 }
 
@@ -397,25 +453,44 @@ async fn reconcile_pending_account_deletions_with(
     let mut summary = DeletionReconcileSummary::default();
     for user_id in user_ids {
         summary.attempted += 1;
-        let operation = match lifecycle.begin_account_deletion(&user_id).await {
+        let requested = match lifecycle.request_account_deletion(&user_id).await {
             Ok(Some(operation)) => operation,
             Ok(None) | Err(_) => {
                 summary.failures += 1;
                 continue;
             }
         };
-        if operation.status == "physical_complete" {
+        if requested.status == "physical_complete" {
             summary.failures += 1;
             continue;
         }
-        if deletion_operation_requires_remediation(&operation) {
+        if deletion_operation_requires_remediation(&requested) {
             summary.failed_retryable += 1;
             continue;
         }
-        if accounting.settle_before_deletion(&user_id).await.is_err()
-            || revoke_apple_before_content_delete(lifecycle, apple_provider, &user_id)
-                .await
-                .is_err()
+        if !matches!(
+            lifecycle
+                .account_deletion_preflight_complete(&user_id)
+                .await,
+            Ok(true)
+        ) {
+            summary.pending += 1;
+            continue;
+        }
+        if accounting.settle_before_deletion(&user_id).await.is_err() {
+            summary.pending += 1;
+            continue;
+        }
+        let operation = match lifecycle.begin_account_deletion(&user_id).await {
+            Ok(Some(operation)) => operation,
+            Ok(None) | Err(_) => {
+                summary.pending += 1;
+                continue;
+            }
+        };
+        if revoke_apple_before_content_delete(lifecycle, apple_provider, &user_id)
+            .await
+            .is_err()
         {
             summary.pending += 1;
             continue;
@@ -564,6 +639,10 @@ mod tests {
         operation: AccountDeletionOperation,
         apple_credentials: Vec<(String, String)>,
         revoked_client_ids: Vec<String>,
+        request_calls: usize,
+        begin_calls: usize,
+        begin_failures_remaining: usize,
+        preflight_pending_once: bool,
     }
 
     struct FakeLifecycle {
@@ -579,18 +658,30 @@ mod tests {
                     operation: AccountDeletionOperation {
                         operation_id: "del_test".into(),
                         status: "pending".into(),
-                        reason: "content_deletion_in_progress".into(),
+                        reason: "billing_fence_in_progress".into(),
                         retry_after_seconds: Some(30),
                         hard_delete_time: None,
                     },
                     apple_credentials,
                     revoked_client_ids: Vec::new(),
+                    request_calls: 0,
+                    begin_calls: 0,
+                    begin_failures_remaining: 0,
+                    preflight_pending_once: false,
                 }),
             }
         }
 
         fn operation(&self) -> AccountDeletionOperation {
             self.state.lock().unwrap().operation.clone()
+        }
+
+        fn fail_next_begin(&self) {
+            self.state.lock().unwrap().begin_failures_remaining = 1;
+        }
+
+        fn hold_preflight_once(&self) {
+            self.state.lock().unwrap().preflight_pending_once = true;
         }
     }
 
@@ -604,11 +695,44 @@ mod tests {
             Ok(Some(self.operation()))
         }
 
+        async fn request_account_deletion(
+            &self,
+            account_id: &str,
+        ) -> EnclaveResult<Option<AccountDeletionOperation>> {
+            assert_eq!(account_id, self.user_id);
+            let mut state = self.state.lock().unwrap();
+            state.request_calls += 1;
+            Ok(Some(state.operation.clone()))
+        }
+
+        async fn account_deletion_preflight_complete(
+            &self,
+            account_id: &str,
+        ) -> EnclaveResult<bool> {
+            assert_eq!(account_id, self.user_id);
+            let mut state = self.state.lock().unwrap();
+            let ready = !state.preflight_pending_once;
+            state.preflight_pending_once = false;
+            Ok(ready)
+        }
+
         async fn begin_account_deletion(
             &self,
             account_id: &str,
         ) -> EnclaveResult<Option<AccountDeletionOperation>> {
-            self.account_deletion_operation(account_id).await
+            assert_eq!(account_id, self.user_id);
+            let mut state = self.state.lock().unwrap();
+            state.begin_calls += 1;
+            if state.begin_failures_remaining > 0 {
+                state.begin_failures_remaining -= 1;
+                return Err(EnclaveError::Store(
+                    "simulated lifecycle initialization failure".into(),
+                ));
+            }
+            if state.operation.reason == "billing_fence_in_progress" {
+                state.operation.reason = "content_deletion_in_progress".into();
+            }
+            Ok(Some(state.operation.clone()))
         }
 
         async fn update_account_deletion_status(
@@ -673,12 +797,18 @@ mod tests {
 
     struct FakeAccounting {
         calls: AtomicUsize,
+        fail_once: AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl AccountDeletionAccounting for FakeAccounting {
         async fn settle_before_deletion(&self, _user_id: &str) -> EnclaveResult<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_once.swap(false, Ordering::SeqCst) {
+                return Err(EnclaveError::Store(
+                    "simulated ambiguous billing-fence outcome".into(),
+                ));
+            }
             Ok(())
         }
     }
@@ -790,6 +920,7 @@ mod tests {
         let media = FakeMediaObjects::new(true);
         let accounting = FakeAccounting {
             calls: AtomicUsize::new(0),
+            fail_once: AtomicBool::new(false),
         };
 
         let first = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
@@ -845,6 +976,7 @@ mod tests {
         let media = FakeMediaObjects::new(false);
         let accounting = FakeAccounting {
             calls: AtomicUsize::new(0),
+            fail_once: AtomicBool::new(false),
         };
 
         let summary =
@@ -868,5 +1000,136 @@ mod tests {
             .unwrap()
             .revoked_client_ids
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deletion_reconciler_retries_a_lost_billing_fence_response_before_beginning() {
+        let user_id = "00000000-0000-4000-8000-000000000003";
+        let lifecycle = FakeLifecycle::new(user_id, Vec::new());
+        let media = FakeMediaObjects::new(false);
+        let accounting = FakeAccounting {
+            calls: AtomicUsize::new(0),
+            fail_once: AtomicBool::new(true),
+        };
+
+        let first = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            DeletionReconcileSummary {
+                attempted: 1,
+                pending: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        {
+            let state = lifecycle.state.lock().unwrap();
+            assert_eq!(state.operation.reason, "billing_fence_in_progress");
+            assert_eq!(state.request_calls, 1);
+            assert_eq!(state.begin_calls, 0);
+        }
+        assert_eq!(media.purge_calls.load(Ordering::SeqCst), 0);
+
+        let retry = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            DeletionReconcileSummary {
+                attempted: 1,
+                completed: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        assert_eq!(accounting.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(media.purge_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deletion_reconciler_waits_for_local_work_after_gating_new_admission() {
+        let user_id = "00000000-0000-4000-8000-000000000005";
+        let lifecycle = FakeLifecycle::new(user_id, Vec::new());
+        lifecycle.hold_preflight_once();
+        let media = FakeMediaObjects::new(false);
+        let accounting = FakeAccounting {
+            calls: AtomicUsize::new(0),
+            fail_once: AtomicBool::new(false),
+        };
+
+        let first = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            DeletionReconcileSummary {
+                attempted: 1,
+                pending: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        {
+            let state = lifecycle.state.lock().unwrap();
+            assert_eq!(state.request_calls, 1);
+            assert_eq!(state.begin_calls, 0);
+            assert_eq!(state.operation.reason, "billing_fence_in_progress");
+        }
+        assert_eq!(accounting.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(media.purge_calls.load(Ordering::SeqCst), 0);
+
+        let retry = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            DeletionReconcileSummary {
+                attempted: 1,
+                completed: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        assert_eq!(accounting.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(media.purge_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deletion_reconciler_recovers_when_begin_fails_after_the_billing_fence() {
+        let user_id = "00000000-0000-4000-8000-000000000004";
+        let lifecycle = FakeLifecycle::new(user_id, Vec::new());
+        lifecycle.fail_next_begin();
+        let media = FakeMediaObjects::new(false);
+        let accounting = FakeAccounting {
+            calls: AtomicUsize::new(0),
+            fail_once: AtomicBool::new(false),
+        };
+
+        let first = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            DeletionReconcileSummary {
+                attempted: 1,
+                pending: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        assert_eq!(lifecycle.operation().reason, "billing_fence_in_progress");
+        assert_eq!(media.purge_calls.load(Ordering::SeqCst), 0);
+
+        let retry = reconcile_pending_account_deletions_with(&lifecycle, &media, &accounting, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry,
+            DeletionReconcileSummary {
+                attempted: 1,
+                completed: 1,
+                ..DeletionReconcileSummary::default()
+            }
+        );
+        let state = lifecycle.state.lock().unwrap();
+        assert_eq!(state.begin_calls, 2);
+        assert_eq!(state.operation.status, "physical_complete");
     }
 }

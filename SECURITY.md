@@ -23,7 +23,12 @@ Explicit external trust:
 - Vertex processes bounded user content sent for transcription and analysis;
 - user-configured webhook destinations receive the fields the user enabled;
 - APNs receives content-free notification metadata;
-- the billing service receives content-free pseudonymous entitlement/usage events;
+- the billing service receives content-free pseudonymous entitlement/usage events and bounded
+  Apple-signed transaction evidence associated only with a random app-account token, plus a
+  content-free attempt-owned Apple purchase-intent state used to exclude concurrent devices and
+  Paddle checkout; account deletion first commits a local admission fence, then requires the
+  billing service's one-way fence before identity/content deletion, so a lost response is
+  recoverable and a late Apple approval cannot reactivate service;
 - GCP project, IAM, KMS, compute, Secret Manager, networking, and release control planes retain
   their documented administrative power.
 
@@ -86,19 +91,22 @@ PostgreSQL rows, including media inventory metadata. It does not fetch GCS objec
 media-byte export remains an activation blocker. It must not expose another account's row or
 misrepresent a failed read as partial success. Export failures are content-free.
 
-Account deletion first commits a durable tombstone that blocks sign-in, new work, retries, and
-resurrection. The deletion owner then:
+Account deletion first commits a durable `deletion_requested` tombstone that blocks sign-in, new
+work, retries, and resurrection without yet erasing identity or content. The deletion owner then:
 
-1. fences in-flight work and external effects;
-2. revokes retained provider grants where required;
-3. deletes exact current and noncurrent owned media generations;
-4. reconciles ambiguous object/provider responses by exact readback;
-5. transactionally finalizes removal of tenant-qualified PostgreSQL content and derived state;
-6. reports completion only after the media purge succeeds and PostgreSQL records completion.
+1. lets already-admitted uploads and provider effects settle or expire behind the admission fence;
+2. completes final usage settlement and idempotently establishes the remote billing deletion fence;
+3. transitions the durable local state to `deleting`;
+4. revokes retained provider grants where required;
+5. deletes exact current and noncurrent owned media generations;
+6. reconciles ambiguous object/provider responses by exact readback;
+7. transactionally finalizes removal of tenant-qualified PostgreSQL content and derived state;
+8. reports completion only after the media purge succeeds and PostgreSQL records completion.
 
-A crash may leave deletion incomplete, never falsely complete. A restarted replica discovers and
-continues durable deletion operations. Episode deletion uses the same no-resurrection and replay
-principles at episode scope.
+A crash or lost billing-fence success response may leave deletion incomplete, never falsely
+complete or locally active. A restarted replica discovers both `deletion_requested` and `deleting`
+operations, retries settlement/fencing idempotently, and continues. Episode deletion uses the same
+no-resurrection and replay principles at episode scope.
 
 The preconfigured synthetic plugin-review account is an operational fixture rather than a user
 deletion canary. Its transactionally seeded `reviewer_fixtures` marker refuses account-deletion

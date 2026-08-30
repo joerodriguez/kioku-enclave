@@ -416,6 +416,18 @@ fn billing_request_observation(
 ) -> Option<BillingRequestObservation> {
     let route = match (method, path) {
         (method, "/api/billing") if method == Method::GET => "billing_summary",
+        (method, "/api/billing/apple/account-token") if method == Method::GET => {
+            "apple_account_token"
+        }
+        (method, "/api/billing/apple/purchase-attempt") if method == Method::POST => {
+            "apple_purchase_attempt"
+        }
+        (method, "/api/billing/apple/transactions") if method == Method::POST => {
+            "apple_transaction_bind"
+        }
+        (method, "/api/billing/apple/purchase-intent") if method == Method::POST => {
+            "apple_purchase_intent"
+        }
         (method, "/api/billing/recording-lease") if method == Method::POST => "recording_lease",
         (method, "/api/billing/offline-recording-usage") if method == Method::POST => {
             "offline_recording_usage"
@@ -1491,6 +1503,62 @@ mod billing_request_observability_tests {
         );
         assert_eq!(
             billing_request_observation(
+                &Method::GET,
+                "/api/billing/apple/account-token",
+                StatusCode::CONFLICT,
+                82,
+            ),
+            Some(BillingRequestObservation {
+                route: "apple_account_token",
+                status: 409,
+                status_class: "4xx",
+                duration_ms: 82,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/apple/purchase-attempt",
+                StatusCode::CONFLICT,
+                31,
+            ),
+            Some(BillingRequestObservation {
+                route: "apple_purchase_attempt",
+                status: 409,
+                status_class: "4xx",
+                duration_ms: 31,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/apple/transactions",
+                StatusCode::OK,
+                93,
+            ),
+            Some(BillingRequestObservation {
+                route: "apple_transaction_bind",
+                status: 200,
+                status_class: "2xx",
+                duration_ms: 93,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/apple/purchase-intent",
+                StatusCode::CONFLICT,
+                47,
+            ),
+            Some(BillingRequestObservation {
+                route: "apple_purchase_intent",
+                status: 409,
+                status_class: "4xx",
+                duration_ms: 47,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
                 &Method::POST,
                 "/api/billing/offline-recording-usage",
                 StatusCode::OK,
@@ -1517,6 +1585,10 @@ mod billing_request_observability_tests {
             (Method::POST, "/api/billing"),
             (Method::GET, "/api/billing/recording-lease"),
             (Method::GET, "/api/billing/offline-recording-usage"),
+            (Method::POST, "/api/billing/apple/account-token"),
+            (Method::GET, "/api/billing/apple/purchase-attempt"),
+            (Method::GET, "/api/billing/apple/transactions"),
+            (Method::GET, "/api/billing/apple/purchase-intent"),
         ] {
             assert_eq!(
                 billing_request_observation(&method, path, StatusCode::METHOD_NOT_ALLOWED, 1),

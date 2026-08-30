@@ -30,7 +30,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 24;
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 25;
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -296,6 +296,14 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0024_fleet_admission.sql"))
                 .execute(&mut *transaction)
                 .await?;
+            version = 24;
+        }
+        if version == 24 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0025_account_deletion_request.sql"
+            ))
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.verify_schema().await
@@ -3134,7 +3142,7 @@ mod tests {
         assert!(matches!(
             repositories
                 .lifecycle()
-                .begin_account_deletion(&reviewer_account.id)
+                .request_account_deletion(&reviewer_account.id)
                 .await,
             Err(crate::error::EnclaveError::Conflict(message))
                 if message == "reviewer fixture accounts cannot be deleted"
@@ -3182,18 +3190,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            repositories
-                .lifecycle()
-                .begin_account_deletion(&account_id)
-                .await,
-            Err(crate::error::EnclaveError::Conflict(_))
-        ));
-        repositories
-            .model_usage()
-            .settle_ambiguous(&account_id, &deletion_race_invocation, None)
-            .await
-            .unwrap();
         let deletion_upload = repositories
             .captures()
             .reserve_media_upload(
@@ -3214,6 +3210,70 @@ mod tests {
                 .await,
             Err(crate::error::EnclaveError::Conflict(_))
         ));
+        let requested = repositories
+            .lifecycle()
+            .request_account_deletion(&account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requested.status, "pending");
+        assert_eq!(requested.reason, "billing_fence_in_progress");
+        assert_eq!(
+            repositories
+                .lifecycle()
+                .request_account_deletion(&account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            requested.operation_id
+        );
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_status(&account_id)
+                .await
+                .unwrap(),
+            Some(AccountStatus::DeletionRequested)
+        );
+        assert!(!repositories
+            .lifecycle()
+            .account_deletion_preflight_complete(&account_id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            repositories
+                .model_usage()
+                .begin_invocation(
+                    &account_id,
+                    VertexOperation::EpisodeSummary,
+                    "gemini-contract",
+                    "us-central1",
+                    &[0x92; 32],
+                )
+                .await,
+            Err(crate::error::EnclaveError::Auth(_))
+        ));
+        assert!(repositories
+            .captures()
+            .reserve_media_upload(
+                &account_id,
+                "post-deletion-request-event",
+                "post-deletion-request-asset",
+                &crate::gcs::canonical_capture_media_object_key(
+                    &account_id,
+                    "post-deletion-request-asset",
+                )
+                .unwrap(),
+                &"e".repeat(64),
+            )
+            .await
+            .is_err());
+        repositories
+            .model_usage()
+            .settle_ambiguous(&account_id, &deletion_race_invocation, None)
+            .await
+            .unwrap();
         sqlx::query(
             "UPDATE capture_upload_intents SET expires_at=now()-interval '1 second' \
               WHERE account_id=$1 AND event_id='deletion-race-event'",
@@ -3222,13 +3282,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        assert!(repositories
+            .lifecycle()
+            .account_deletion_preflight_complete(&account_id)
+            .await
+            .unwrap());
         let deletion = repositories
             .lifecycle()
             .begin_account_deletion(&account_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(deletion.status, "pending");
+        assert_eq!(deletion.operation_id, requested.operation_id);
+        assert_eq!(deletion.reason, "content_deletion_in_progress");
         assert_eq!(
             repositories
                 .lifecycle()

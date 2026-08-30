@@ -60,9 +60,9 @@ write, or SQLite reference implementation.
 - Provider calls occur only after durable admission/claim. Stale owners cannot settle; ambiguous
   outcomes are not resent automatically; deletion fences future disclosure.
 - Export returns selected current PostgreSQL rows and media metadata, not media bytes; byte-complete
-  export remains an activation blocker. Deletion tombstones first, prevents resurrection, erases
-  PostgreSQL rows plus exact current/noncurrent object generations, and reports completion only
-  after reconciliation.
+  export remains an activation blocker. Deletion first commits a recoverable local admission
+  tombstone, settles usage and the one-way billing fence, then erases PostgreSQL rows plus exact
+  current/noncurrent object generations and reports completion only after reconciliation.
 - Releases retain signed tags, immutable digest promotion, SBOM, vulnerability scan, independently
   pinned Ed25519 evidence, exact KMS admission, process-immutable shared TLS with fleet-roll
   rotation, schema verification, and ADR-0041's staged predecessor/candidate rollout receipts.

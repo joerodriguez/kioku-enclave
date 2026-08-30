@@ -35,6 +35,8 @@ fn deletion_operation_from_row(row: &sqlx::postgres::PgRow) -> Result<AccountDel
 const DELETION_OPERATION_SELECT: &str = "SELECT operation_id,status,reason,retry_after_seconds, \
             floor(extract(epoch FROM hard_delete_time) * 1000)::bigint AS hard_delete_time_ms \
        FROM account_deletion_operations WHERE account_id=$1";
+const DELETION_REQUEST_REASON: &str = "billing_fence_in_progress";
+const DELETION_PENDING_REASON: &str = "content_deletion_in_progress";
 
 async fn load_operation(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -57,6 +59,30 @@ async fn load_operation(
             .await?
     };
     row.as_ref().map(deletion_operation_from_row).transpose()
+}
+
+async fn ensure_deletion_operation(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    reason: &str,
+) -> Result<AccountDeletionOperation> {
+    let operation_id = format!("del_{}", crate::cp::tokens::random_token_hex());
+    sqlx::query(
+        "INSERT INTO account_deletion_operations \
+            (account_id,operation_id,status,reason,retry_after_seconds) \
+         VALUES ($1,$2,'pending',$3,30) \
+         ON CONFLICT (account_id) DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(operation_id)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await?;
+    load_operation(transaction, account_id, true)
+        .await?
+        .ok_or_else(|| {
+            EnclaveError::Store("failed to initialize account deletion operation".into())
+        })
 }
 
 async fn refuse_open_provider_fences(
@@ -146,18 +172,16 @@ impl AccountLifecycleRepository for PostgresPersistence {
         load_operation(&mut transaction, account_id, false).await
     }
 
-    async fn begin_account_deletion(
+    async fn request_account_deletion(
         &self,
         account_id: &str,
     ) -> Result<Option<AccountDeletionOperation>> {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
-        // The reviewer fixture is a persistent operational identity, not a
-        // disposable deletion canary. Check its transactionally seeded marker
-        // before changing account status or revoking any session/token state.
+        // Refuse the persistent reviewer before changing status or creating an
+        // operation. The account row lock serializes capture admission; the
+        // advisory lock serializes every provider-disclosure claim.
         refuse_reviewer_fixture_deletion(&mut transaction, account_id).await?;
-        refuse_open_provider_fences(&mut transaction, account_id).await?;
-
         let account = sqlx::query("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")
             .bind(account_id)
             .fetch_optional(&mut *transaction)
@@ -173,13 +197,111 @@ impl AccountLifecycleRepository for PostgresPersistence {
             .as_ref()
             .map(|row| row.try_get::<String, _>("status"))
             .transpose()?;
-        refuse_active_media_uploads(&mut transaction, account_id).await?;
-        if !tombstoned && !matches!(status.as_deref(), Some("active" | "deleting")) {
+        if tombstoned {
+            let operation = load_operation(&mut transaction, account_id, true).await?;
+            transaction.commit().await?;
+            return Ok(operation);
+        }
+        if !matches!(
+            status.as_deref(),
+            Some("active" | "deletion_requested" | "deleting")
+        ) {
             transaction.commit().await?;
             return Ok(None);
         }
 
+        // Once the account status changes, every new capture, model invocation,
+        // session refresh, and provider claim fails closed. Already-admitted
+        // work may finish; the separate preflight prevents the remote billing
+        // fence and identity/content deletion until it has settled.
+        let operation =
+            ensure_deletion_operation(&mut transaction, account_id, DELETION_REQUEST_REASON)
+                .await?;
+        if operation.status == "physical_complete" {
+            return Err(EnclaveError::Conflict(
+                "physically complete deletion operation still has an identity row".into(),
+            ));
+        }
         if status.as_deref() == Some("active") {
+            let changed = sqlx::query(
+                "UPDATE accounts SET status='deletion_requested',updated_at=now() \
+                 WHERE id=$1 AND status='active'",
+            )
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(EnclaveError::Conflict(
+                    "account deletion request lost its admission fence".into(),
+                ));
+            }
+        }
+        transaction.commit().await?;
+        Ok(Some(operation))
+    }
+
+    async fn account_deletion_preflight_complete(&self, account_id: &str) -> Result<bool> {
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")
+                .bind(account_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if !matches!(status.as_deref(), Some("deletion_requested" | "deleting")) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let provider_ready = match refuse_open_provider_fences(&mut transaction, account_id).await {
+            Ok(()) => true,
+            Err(EnclaveError::Conflict(_)) => false,
+            Err(error) => return Err(error),
+        };
+        let upload_ready = match refuse_active_media_uploads(&mut transaction, account_id).await {
+            Ok(()) => true,
+            Err(EnclaveError::Conflict(_)) => false,
+            Err(error) => return Err(error),
+        };
+        // Commit the bounded expired-upload cleanup even while another local
+        // prerequisite is still settling.
+        transaction.commit().await?;
+        Ok(provider_ready && upload_ready)
+    }
+
+    async fn begin_account_deletion(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountDeletionOperation>> {
+        let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        // The reviewer fixture is a persistent operational identity, not a
+        // disposable deletion canary. Check its transactionally seeded marker
+        // before changing account status or revoking any session/token state.
+        refuse_reviewer_fixture_deletion(&mut transaction, account_id).await?;
+        let account = sqlx::query("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let tombstoned = account.is_none()
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM deleted_accounts WHERE account_id=$1)",
+            )
+            .bind(account_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let status = account
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("status"))
+            .transpose()?;
+        refuse_open_provider_fences(&mut transaction, account_id).await?;
+        refuse_active_media_uploads(&mut transaction, account_id).await?;
+        if !tombstoned && !matches!(status.as_deref(), Some("deletion_requested" | "deleting")) {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+
+        if status.as_deref() == Some("deletion_requested") {
             sqlx::query("UPDATE accounts SET status='deleting',updated_at=now() WHERE id=$1")
                 .bind(account_id)
                 .execute(&mut *transaction)
@@ -218,22 +340,24 @@ impl AccountLifecycleRepository for PostgresPersistence {
             .await?;
         }
 
-        let operation_id = format!("del_{}", crate::cp::tokens::random_token_hex());
-        sqlx::query(
-            "INSERT INTO account_deletion_operations \
-                (account_id,operation_id,status,reason,retry_after_seconds) \
-             VALUES ($1,$2,'pending','content_deletion_in_progress',30) \
-             ON CONFLICT (account_id) DO NOTHING",
-        )
-        .bind(account_id)
-        .bind(operation_id)
-        .execute(&mut *transaction)
-        .await?;
-        let operation = load_operation(&mut transaction, account_id, true)
-            .await?
-            .ok_or_else(|| {
-                EnclaveError::Store("failed to initialize account deletion operation".into())
-            })?;
+        let mut operation =
+            ensure_deletion_operation(&mut transaction, account_id, DELETION_PENDING_REASON)
+                .await?;
+        if operation.reason == DELETION_REQUEST_REASON {
+            sqlx::query(
+                "UPDATE account_deletion_operations SET reason=$2,retry_after_seconds=30, \
+                        updated_at=now() WHERE account_id=$1 AND status='pending'",
+            )
+            .bind(account_id)
+            .bind(DELETION_PENDING_REASON)
+            .execute(&mut *transaction)
+            .await?;
+            operation = load_operation(&mut transaction, account_id, true)
+                .await?
+                .ok_or_else(|| {
+                    EnclaveError::Store("account deletion operation disappeared".into())
+                })?;
+        }
         if !tombstoned && operation.status == "physical_complete" {
             return Err(EnclaveError::Conflict(
                 "physically complete deletion operation still has an identity row".into(),
@@ -394,7 +518,8 @@ impl AccountLifecycleRepository for PostgresPersistence {
         Ok(sqlx::query_scalar::<_, String>(
             "SELECT a.id FROM accounts a \
              LEFT JOIN account_deletion_operations d ON d.account_id=a.id \
-             WHERE a.status='deleting' AND COALESCE(d.status,'pending')='pending' \
+             WHERE a.status IN ('deletion_requested','deleting') \
+               AND COALESCE(d.status,'pending')='pending' \
              ORDER BY COALESCE(d.updated_at,a.created_at),a.id LIMIT $1",
         )
         .bind(limit)

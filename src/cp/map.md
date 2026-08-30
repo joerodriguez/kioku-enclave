@@ -14,7 +14,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `mod.rs` | `CpConfig`, shared `CpState`, provider-neutral composition, bounded HTTP clients, Secret Manager access, and common content-free error behavior. |
 | `apple.rs` | Sign in with Apple native/browser verification, grant retention/revocation, and account linking through identity repositories. |
 | `auth.rs` | Kioku access-token and Google/Apple/reviewer identity middleware, active/deleting-account rules, route authorization, and bounded provider-auth evidence for destructive operations. |
-| `billing.rs` | Provider-neutral entitlement/recording admission, offline usage reconciliation, pseudonymous billing delivery, and coverage reporting. |
+| `billing.rs` | Provider-neutral entitlement/recording admission, strict authenticated Apple StoreKit purchase binding, attempt-owned purchase reservation/read-only recovery forwarding that excludes concurrent devices and Paddle checkout, the one-way pre-deletion billing fence, offline usage reconciliation, pseudonymous billing delivery, and coverage reporting. |
 | `cors.rs` | Exact public-origin CORS policy. |
 | `delivery.rs` | Canonical finalized-memory delivery model and PostgreSQL-backed loader shared by outbound channels. |
 | `dlp.rs` | Bounded sensitive-data classification/redaction helpers. |
@@ -28,7 +28,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `media.rs` | Cloud Capture ingestion, reference batching, exact live-media admission, encryption, and transactional receipt/session settlement. |
 | `media_planner.rs` | Deterministic bounded audio/screen processing work-unit planning. |
 | `media_worker.rs` | PostgreSQL-claimed media processing, KMS/GCS/Vertex work, result projection, voice work, bounded retry/resurrection, and retention cleanup. |
-| `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, and coverage reconciliation. |
+| `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, coverage reconciliation, and final pre-fence account-deletion settlement with idempotent already-fenced classification. |
 | `oauth.rs` | OAuth 2.1 discovery, dynamic registration, Google/Apple/reviewer PKCE consent/code flow, content-free reviewer-stage diagnostics, durable client-bound refresh rotation for native and local-device web sessions, and the native session facade. |
 | `playback.rs` | Owner-authorized recording timeline, JavaScript-exact revision projection, owner-source display, and exact encrypted-segment serving. |
 | `push.rs` | APNs installation/handoff routes and PostgreSQL-claimed content-free ready notifications with credential-generation fences and no-resend ambiguity. |
@@ -36,7 +36,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `retention.rs` | Recording-retention preview/CAS, key epochs, downgrade reconciliation, and durable-recording policy routes. |
 | `screen_understanding.rs` | Bounded screen/storyboard result validation and projection. |
 | `summarizer.rs` | PostgreSQL-claimed incremental memory formation, bounded Vertex summarization, in-enclave embedding, and cursor settlement. Recurring and session-settled passes traverse only proven-empty sparse-history windows and stop at the first outcome that may have invoked the model; queued duplicate hints coalesce without suppressing a later media-complete edge. |
-| `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes. |
+| `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes with a durable pre-billing-fence admission phase. |
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
 | `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas and content-free usage metadata. |
 | `voice_memory.rs` | Pure-Rust audio decoding, fbank, and pinned WeSpeaker inference used by explicit voice-evaluation tooling. |

@@ -250,11 +250,17 @@ async fn drain_coverage(state: &CpState, user_id: &str, account_id: &str) {
 }
 
 /// Flush all usage accounting before an account tombstone is finalized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountDeletionSettlement {
+    Complete,
+    AlreadyFenced,
+}
+
 pub async fn settle_for_account_deletion(
     state: &CpState,
     user_id: &str,
     account_id: &str,
-) -> Result<()> {
+) -> Result<AccountDeletionSettlement> {
     loop {
         let Some(batch) = state
             .repositories
@@ -265,15 +271,17 @@ pub async fn settle_for_account_deletion(
             break;
         };
         let events = batch.events;
-        let response = state
-            .billing
-            .report_vertex_usage(&events)
-            .await
-            .map_err(|_| {
-                crate::error::EnclaveError::Config(
+        let response = match state.billing.report_vertex_usage(&events).await {
+            Ok(response) => response,
+            Err(super::billing::BillingError::AccountDetaching) => {
+                return Ok(AccountDeletionSettlement::AlreadyFenced);
+            }
+            Err(_) => {
+                return Err(crate::error::EnclaveError::Config(
                     "Vertex usage settlement unavailable during deletion".into(),
-                )
-            })?;
+                ));
+            }
+        };
         if !response.accounts_for(events.len()) {
             return Err(crate::error::EnclaveError::Config(
                 "Vertex usage settlement incomplete during deletion".into(),
@@ -330,15 +338,17 @@ pub async fn settle_for_account_deletion(
                 "Vertex usage remains pending during deletion".into(),
             ));
         }
-        let response = state
-            .billing
-            .report_vertex_coverage(&anchored)
-            .await
-            .map_err(|_| {
-                crate::error::EnclaveError::Config(
+        let response = match state.billing.report_vertex_coverage(&anchored).await {
+            Ok(response) => response,
+            Err(super::billing::BillingError::AccountDetaching) => {
+                return Ok(AccountDeletionSettlement::AlreadyFenced);
+            }
+            Err(_) => {
+                return Err(crate::error::EnclaveError::Config(
                     "Vertex coverage settlement unavailable during deletion".into(),
-                )
-            })?;
+                ));
+            }
+        };
         if !response.acknowledged() {
             return Err(crate::error::EnclaveError::Config(
                 "Vertex coverage settlement incomplete during deletion".into(),
@@ -350,7 +360,7 @@ pub async fn settle_for_account_deletion(
             .complete_coverage(user_id, &claim_id, &anchored.period, anchored.sequence)
             .await?;
     }
-    Ok(())
+    Ok(AccountDeletionSettlement::Complete)
 }
 
 pub fn spawn_delivery_worker(state: Arc<CpState>) {

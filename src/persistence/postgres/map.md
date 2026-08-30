@@ -2,7 +2,7 @@
 
 The sole structured-state implementation. Every adapter shares one bounded SQLx PostgreSQL pool,
 uses tenant-qualified queries, database time for leases/deadlines, and explicit transactions for
-claims and settlement. Serving startup verifies schema version 24; only the explicit release
+claims and settlement. Serving startup verifies schema version 25; only the explicit release
 migrator applies the append-only files under `migrations/`.
 
 | File | Responsibility |
@@ -16,7 +16,7 @@ migrator applies the append-only files under `migrations/`.
 | `episode_deletion.rs` | Durable logical freeze, exact GCS inventory, provider-cleanup progress, structured purge, and replay receipt. |
 | `finalization.rs` | Finalization claims, source projection, and atomic recap/episode/outbox settlement. |
 | `identity.rs` | Accounts, provider identities, signup budget, Apple credentials/grants, and coherent session reads. |
-| `lifecycle.rs` | Account tombstones, deletion ownership/progress, transactionally marked reviewer-fixture refusal, revocation settlement, cascading purge, and no-resurrection checks. |
+| `lifecycle.rs` | Pre-fence account admission tombstones, deletion ownership/progress, transactionally marked reviewer-fixture refusal, revocation settlement, cascading purge, and no-resurrection checks. |
 | `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection with stable owner-source classification, voice jobs, bounded retry/resurrection, and retention progress. |
 | `memory_formation.rs` | Summarizer windows, turn-timed source projections, episode/member writes, embeddings, and atomic durable cursor settlement. |
 | `model_usage.rs` | Paid-model intents/outcomes, usage batch claims/delivery, and coverage reconciliation. |
