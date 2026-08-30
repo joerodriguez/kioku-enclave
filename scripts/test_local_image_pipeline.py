@@ -921,6 +921,108 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(identity["checksum"], f"sha256:{checksum}")
         self.assertEqual(identity["source"], status["from"])
 
+    def test_public_evidence_rejects_host_local_path_variants(self) -> None:
+        pipeline = load_pipeline()
+        leaked_values = (
+            "/Users/alice/private/evidence.json",
+            "/home/alice/private/evidence.json",
+            "/root/private/evidence.json",
+            r"C:\Users\alice\private\evidence.json",
+            r"\\fileserver\release\private\evidence.json",
+            "%2FUsers%2Falice%2Fprivate%2Fevidence.json",
+            "%2Froot%2Fprivate%2Fevidence.json",
+            "C%3A%5CUsers%5Calice%5Cprivate%5Cevidence.json",
+            "C-%5CUsers%5Calice%5Cprivate%5Cevidence.json",
+            "%5C%5Cfileserver%5Crelease%5Cprivate%5Cevidence.json",
+            "DocumentRoot-Image--Users-alice-private-evidence-json",
+            "DocumentRoot-Image--home-alice-private-evidence-json",
+            "DocumentRoot-Image--root-private-evidence-json",
+            "DocumentRoot-Image-C--Users-alice-private-evidence-json",
+            "DocumentRoot-Image---fileserver-release-private-evidence-json",
+            "/private/var/folders/ab/transient/evidence.json",
+            "%2Fprivate%2Ftmp%2Ftransient%2Fevidence.json",
+        )
+        for leaked in leaked_values:
+            with self.subTest(leaked=leaked), self.assertRaisesRegex(
+                pipeline.PipelineError, "host-local path"
+            ):
+                pipeline.assert_public_evidence_document({"nested": [leaked]}, "test asset")
+
+    def test_sbom_and_scan_publish_only_stable_source_coordinates(self) -> None:
+        pipeline = load_pipeline()
+        image_uri = "registry.example/kioku/enclave:v1.2.3"
+        original_run = pipeline.run
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **kwargs):
+            calls.append(command)
+            if command[0] == "syft":
+                output = next(value for value in command if value.startswith("spdx-json="))
+                Path(output.removeprefix("spdx-json=")).write_text(
+                    json.dumps(
+                        {
+                            "spdxVersion": "SPDX-2.3",
+                            "name": image_uri,
+                            "packages": [
+                                {
+                                    "name": name,
+                                    **(
+                                        {
+                                            "versionInfo": pipeline.tomllib.loads(
+                                                (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+                                            )["package"]["version"]
+                                        }
+                                        if name == "kioku-enclave"
+                                        else {}
+                                    ),
+                                }
+                                for name in pipeline.REQUIRED_SBOM_PACKAGES
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(stdout="", stderr="")
+            if command[0] == "grype":
+                return SimpleNamespace(
+                    stdout=json.dumps(
+                        {
+                            "matches": [],
+                            "source": {"target": {"userInput": image_uri}},
+                            "descriptor": {
+                                "configuration": {"db": {"cache-dir": "/Users/alice/.cache/grype"}},
+                                "db": {"status": {"path": "/home/alice/.cache/grype/vulnerability.db"}},
+                            },
+                        }
+                    )
+                    + "\n",
+                    stderr="",
+                )
+            raise AssertionError(command)
+
+        try:
+            pipeline.run = fake_run
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                output = Path(temporary_directory)
+                result = pipeline.sbom_and_scan(
+                    image_uri,
+                    output,
+                    artifact_ref="oci-archive:/Users/alice/private/kioku-enclave.oci.tar",
+                )
+                sbom = json.loads((output / "enclave-sbom.spdx.json").read_text(encoding="utf-8"))
+                scan = json.loads((output / "enclave-scan.json").read_text(encoding="utf-8"))
+                pipeline.assert_public_evidence_document(sbom, "SBOM")
+                pipeline.assert_public_evidence_document(scan, "scan")
+                self.assertNotIn("cache-dir", scan["descriptor"]["configuration"]["db"])
+                self.assertNotIn("path", scan["descriptor"]["db"]["status"])
+                self.assertRegex(result["sbom_sha256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(result["scan_sha256"], r"^[0-9a-f]{64}$")
+        finally:
+            pipeline.run = original_run
+
+        syft = next(command for command in calls if command[0] == "syft")
+        self.assertEqual(syft[syft.index("--source-name") + 1], image_uri)
+
     def test_source_snapshot_transport_timestamps_are_content_stable(self) -> None:
         pipeline = load_pipeline()
         with tempfile.TemporaryDirectory() as temporary_directory:
