@@ -59,6 +59,23 @@ NATIVE_DISK_PROBE_IMAGE = (
 CONFIG_NAME = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 BUILDER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+PUBLIC_EVIDENCE_HOST_PATH_PATTERNS = (
+    re.compile(r"/(?:Users|home)/[^/\s]+(?:/|\Z)", re.IGNORECASE),
+    re.compile(r"/root(?:/|\Z)", re.IGNORECASE),
+    re.compile(r"%2f(?:Users|home)%2f", re.IGNORECASE),
+    re.compile(r"%2froot(?:%2f|\Z)", re.IGNORECASE),
+    re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+", re.IGNORECASE),
+    re.compile(r"[A-Za-z]%3a(?:%5c|%2f)+Users(?:%5c|%2f)+", re.IGNORECASE),
+    re.compile(r"[A-Za-z]-%5cUsers%5c", re.IGNORECASE),
+    re.compile(r"\\\\[^\\/\s]+[\\/]+[^\\/\s]+"),
+    re.compile(r"%5c%5c[^%\s]+%5c[^%\s]+", re.IGNORECASE),
+    re.compile(r"DocumentRoot-Image--(?:Users|home)-", re.IGNORECASE),
+    re.compile(r"DocumentRoot-Image--root-", re.IGNORECASE),
+    re.compile(r"DocumentRoot-Image-[A-Za-z]-+Users-", re.IGNORECASE),
+    re.compile(r"DocumentRoot-Image---", re.IGNORECASE),
+    re.compile(r"/(?:private/)?(?:tmp|var/folders)/", re.IGNORECASE),
+    re.compile(r"%2f(?:private%2f)?(?:tmp|var%2ffolders)%2f", re.IGNORECASE),
+)
 CONFIG_SECRET_KEYS = frozenset({
     "auth", "auths", "clientsecret", "credhelpers", "credsstore",
     "identitytoken", "password", "registrytoken", "secret", "token", "username",
@@ -1546,6 +1563,41 @@ def source_repository() -> str:
     return value
 
 
+def assert_public_evidence_document(value: object, label: str) -> None:
+    """Refuse host-local paths in JSON that will become a public release asset."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if any(pattern.search(current) for pattern in PUBLIC_EVIDENCE_HOST_PATH_PATTERNS):
+                raise PipelineError(f"{label} contains a host-local path")
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
+def normalize_grype_scan_for_publication(scan: object) -> dict[str, object]:
+    """Remove machine-local cache coordinates from a pinned Grype JSON report."""
+    if not isinstance(scan, dict):
+        raise PipelineError("grype did not produce a JSON object")
+    descriptor = scan.get("descriptor")
+    if isinstance(descriptor, dict):
+        configuration = descriptor.get("configuration")
+        if isinstance(configuration, dict):
+            database = configuration.get("db")
+            if isinstance(database, dict):
+                database.pop("cache-dir", None)
+        database = descriptor.get("db")
+        if isinstance(database, dict):
+            status = database.get("status")
+            if isinstance(status, dict):
+                status.pop("path", None)
+    assert_public_evidence_document(scan, "vulnerability scan")
+    return scan
+
+
 def active_docker_host() -> str:
     """Return the endpoint for the same Docker context used by buildx."""
     host = run(
@@ -1576,7 +1628,7 @@ def sbom_and_scan(image_uri: str, output_dir: Path, *, artifact_ref: str | None 
         else None
     )
     run(
-        ["syft", scan_target, "-o", f"spdx-json={sbom_path}"],
+        ["syft", scan_target, "--source-name", image_uri, "-o", f"spdx-json={sbom_path}"],
         environment=syft_environment,
     )
     try:
@@ -1597,13 +1649,22 @@ def sbom_and_scan(image_uri: str, output_dir: Path, *, artifact_ref: str | None 
     ]
     if len(enclave_packages) != 1 or enclave_packages[0].get("versionInfo") != package_version:
         raise PipelineError("SBOM enclave version does not match the signed source candidate")
+    assert_public_evidence_document(sbom, "SBOM")
     harden_private_output(sbom_path, "SBOM output")
     # Capture only scan output, never selected configuration or credentials.
     scan = run(
         ["grype", f"sbom:{sbom_path}", "--only-fixed", "--fail-on", "high", "-o", "json"],
         capture=True,
     )
-    write_immutable_file(scan_path, scan.stdout.encode("utf-8"), "scan output")
+    try:
+        scan_document = normalize_grype_scan_for_publication(json.loads(scan.stdout))
+    except json.JSONDecodeError as error:
+        raise PipelineError("grype did not produce valid JSON") from error
+    write_immutable_file(
+        scan_path,
+        (json.dumps(scan_document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        "scan output",
+    )
     return {
         "sbom_path": str(sbom_path),
         "scan_path": str(scan_path),

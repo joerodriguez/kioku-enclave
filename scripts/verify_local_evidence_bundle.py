@@ -205,15 +205,24 @@ def main() -> None:
     try:
         metadata = verify_release_metadata.parse_metadata_bytes(metadata_bytes)
         sbom_document = json.loads(sbom_bytes)
-        json.loads(scan_bytes)
+        scan_document = json.loads(scan_bytes)
         operator_values = local_image_pipeline._parse_operator_config(config_bytes)
         configuration = local_image_pipeline.selected_configuration(
             "production", operator_values, source_ref=arguments.tag
         )
     except (UnicodeDecodeError, json.JSONDecodeError, local_image_pipeline.PipelineError, SystemExit):
         fail("evidence assets or selected production configuration are invalid")
-    if not isinstance(metadata, dict) or not isinstance(sbom_document, dict):
-        fail("metadata and SBOM must be JSON objects")
+    try:
+        local_image_pipeline.assert_public_evidence_document(sbom_document, "SBOM")
+        local_image_pipeline.assert_public_evidence_document(scan_document, "scan")
+    except local_image_pipeline.PipelineError:
+        fail("SBOM or scan contains a host-local path")
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(sbom_document, dict)
+        or not isinstance(scan_document, dict)
+    ):
+        fail("metadata, SBOM, and scan must be JSON objects")
     sbom_version = sbom_document.get("spdxVersion")
     if not isinstance(sbom_version, str) or not sbom_version.startswith("SPDX-"):
         fail("SBOM does not declare an SPDX version")

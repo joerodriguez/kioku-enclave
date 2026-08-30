@@ -48,6 +48,8 @@ class LocalEvidenceTests(unittest.TestCase):
         source_archive_sha256: str | None = None,
         expected_sbom_sha256: str | None = None,
         expected_scan_sha256: str | None = None,
+        sbom_payload: str = '{"spdxVersion":"SPDX-2.3"}\n',
+        scan_payload: str = '{"matches":[]}\n',
     ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
         public = directory / "public.pem"
@@ -64,10 +66,10 @@ class LocalEvidenceTests(unittest.TestCase):
         config.write_text("\n".join(f"{key}={value}" for key, value in sorted(config_values.items())) + "\n", encoding="utf-8")
         config.chmod(0o600)
         sbom = directory / "enclave-sbom.spdx.json"
-        sbom.write_text('{"spdxVersion":"SPDX-2.3"}\n', encoding="utf-8")
+        sbom.write_text(sbom_payload, encoding="utf-8")
         sbom.chmod(0o600)
         scan = directory / "enclave-scan.json"
-        scan.write_text('{"matches":[]}\n', encoding="utf-8")
+        scan.write_text(scan_payload, encoding="utf-8")
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
@@ -297,6 +299,61 @@ class LocalEvidenceTests(unittest.TestCase):
             tampered = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("exact enclave-release.json bytes", tampered.stderr)
+
+    def test_bundle_verifier_rejects_signed_host_local_paths(self) -> None:
+        for asset, payload in (
+            (
+                "sbom",
+                json.dumps(
+                    {
+                        "spdxVersion": "SPDX-2.3",
+                        "name": "/Users/alice/private/kioku-enclave.oci.tar",
+                    }
+                )
+                + "\n",
+            ),
+            (
+                "scan",
+                json.dumps(
+                    {
+                        "matches": [],
+                        "descriptor": {
+                            "configuration": {"db": {"cache-dir": "/home/alice/.cache/grype"}}
+                        },
+                    }
+                )
+                + "\n",
+            ),
+        ):
+            with self.subTest(asset=asset), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                arguments = {f"{asset}_payload": payload}
+                _, _, public, fingerprint = self.create_bundle(directory, **arguments)
+                completed = subprocess.run(
+                    [
+                        "python3",
+                        str(BUNDLE_VERIFIER),
+                        "--evidence-dir",
+                        str(directory),
+                        "--public-key",
+                        str(public),
+                        "--expected-public-key-sha256",
+                        fingerprint,
+                        "--repository",
+                        "owner/repository",
+                        "--tag",
+                        TAG,
+                        "--commit",
+                        COMMIT,
+                        "--config",
+                        str(directory / "local.env"),
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("host-local path", completed.stderr)
 
     def test_bundle_verifier_rejects_ambient_git_overrides_and_replacement_refs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
