@@ -1175,14 +1175,23 @@ impl MemoryQueryRepository for PostgresPersistence {
         let to = bound(&request.to)?;
         let rows = sqlx::query(
             "SELECT u.id,u.text,u.speaker_label, \
-                    floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms, \
-                    floor(extract(epoch FROM s.ended_at)*1000)::bigint AS ended_at_ms \
+                    floor(extract(epoch FROM (s.started_at + \
+                        u.start_offset_seconds * interval '1 second'))*1000)::bigint \
+                        AS started_at_ms, \
+                    floor(extract(epoch FROM (s.started_at + \
+                        u.end_offset_seconds * interval '1 second'))*1000)::bigint \
+                        AS ended_at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
               WHERE u.account_id=$1 AND strpos(lower(u.text),lower($2))>0 \
-                AND ($3::bigint IS NULL OR s.started_at>=to_timestamp($3::double precision/1000.0)) \
-                AND ($4::bigint IS NULL OR s.started_at<=to_timestamp($4::double precision/1000.0)) \
-              ORDER BY s.started_at DESC,u.id DESC LIMIT $5",
+                AND ($3::bigint IS NULL OR (s.started_at + \
+                    u.start_offset_seconds * interval '1 second') \
+                    >=to_timestamp($3::double precision/1000.0)) \
+                AND ($4::bigint IS NULL OR (s.started_at + \
+                    u.start_offset_seconds * interval '1 second') \
+                    <=to_timestamp($4::double precision/1000.0)) \
+              ORDER BY (s.started_at + u.start_offset_seconds * interval '1 second') DESC, \
+                       u.id DESC LIMIT $5",
         )
         .bind(account_id)
         .bind(&request.query)
@@ -1197,7 +1206,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                 Ok((
                     row.try_get::<i64, _>("id")?,
                     row.try_get::<String, _>("text")?,
-                    row.try_get::<Option<String>, _>("speaker_label")?,
+                    row.try_get::<String, _>("speaker_label")?,
                     required_timestamp(row, "started_at_ms")?,
                     required_timestamp(row, "ended_at_ms")?,
                 ))
@@ -1213,13 +1222,12 @@ impl MemoryQueryRepository for PostgresPersistence {
         .collect::<HashMap<_, _>>();
         let results = raw
             .into_iter()
-            .map(|(id, _, speaker, started_at, ended_at)| {
+            .map(|(id, _, speaker, started_at, _ended_at)| {
                 json!({
-                    "id": id,
+                    "kind": "utterance",
                     "text": redacted.get(&id).cloned().unwrap_or_default(),
-                    "speaker": speaker,
+                    "speaker_label": speaker,
                     "started_at": started_at,
-                    "ended_at": ended_at,
                 })
             })
             .collect::<Vec<_>>();
@@ -1243,20 +1251,27 @@ impl MemoryQueryRepository for PostgresPersistence {
             .ok_or_else(|| {
                 EnclaveError::InvalidRequest("MCP context window is too large".into())
             })?;
+        let half_window_ms = window_ms / 2;
         let rows = sqlx::query(
-            "SELECT u.id,u.text,u.speaker_label, \
-                    floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms, \
-                    floor(extract(epoch FROM s.ended_at)*1000)::bigint AS ended_at_ms \
+            "SELECT u.id,u.text,u.speaker_label,u.language,s.source_type, \
+                    floor(extract(epoch FROM (s.started_at + \
+                        u.start_offset_seconds * interval '1 second'))*1000)::bigint \
+                        AS started_at_ms, \
+                    floor(extract(epoch FROM (s.started_at + \
+                        u.end_offset_seconds * interval '1 second'))*1000)::bigint \
+                        AS ended_at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
               WHERE u.account_id=$1 \
-                AND abs(floor(extract(epoch FROM s.started_at)*1000)::bigint-$2)<=$3 \
-              ORDER BY abs(floor(extract(epoch FROM s.started_at)*1000)::bigint-$2),u.id \
+                AND abs(floor(extract(epoch FROM (s.started_at + \
+                    u.start_offset_seconds * interval '1 second'))*1000)::bigint-$2)<=$3 \
+              ORDER BY abs(floor(extract(epoch FROM (s.started_at + \
+                    u.start_offset_seconds * interval '1 second'))*1000)::bigint-$2),u.id \
               LIMIT $4",
         )
         .bind(account_id)
         .bind(center_ms)
-        .bind(window_ms)
+        .bind(half_window_ms)
         .bind(limit(effective_limit)?)
         .fetch_all(self.pool())
         .await?;
@@ -1266,7 +1281,9 @@ impl MemoryQueryRepository for PostgresPersistence {
                 Ok((
                     row.try_get::<i64, _>("id")?,
                     row.try_get::<String, _>("text")?,
-                    row.try_get::<Option<String>, _>("speaker_label")?,
+                    row.try_get::<String, _>("speaker_label")?,
+                    row.try_get::<Option<String>, _>("language")?,
+                    row.try_get::<String, _>("source_type")?,
                     required_timestamp(row, "started_at_ms")?,
                     required_timestamp(row, "ended_at_ms")?,
                 ))
@@ -1274,7 +1291,7 @@ impl MemoryQueryRepository for PostgresPersistence {
             .collect::<Result<Vec<_>>>()?;
         let redacted = crate::cp::dlp::redact_utterance_window(
             &raw.iter()
-                .map(|(id, text, _, _, _)| (*id, text.clone()))
+                .map(|(id, text, _, _, _, _, _)| (*id, text.clone()))
                 .collect::<Vec<_>>(),
         )
         .into_iter()
@@ -1282,21 +1299,25 @@ impl MemoryQueryRepository for PostgresPersistence {
         .collect::<HashMap<_, _>>();
         let utterances = raw
             .into_iter()
-            .map(|(id, _, speaker, started_at, ended_at)| {
-                json!({
-                    "id": id,
-                    "text": redacted.get(&id).cloned().unwrap_or_default(),
-                    "speaker": speaker,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                })
-            })
+            .map(
+                |(id, _, speaker, language, source_type, started_at, ended_at)| {
+                    json!({
+                        "text": redacted.get(&id).cloned().unwrap_or_default(),
+                        "speaker_label": speaker,
+                        "language": language,
+                        "source_type": source_type,
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                    })
+                },
+            )
             .collect::<Vec<_>>();
         let center = isotime::format_epoch_millis(center_ms);
         Ok(crate::cp::mcp_safety::sanitize_result(json!({
             "summary_digest": format!("Context around {}: {} safe items retrieved.", center, utterances.len()),
             "window_seconds": request.window_seconds,
             "utterances": utterances,
+            "screenshots": [],
             "page_token": None::<String>,
         })))
     }
@@ -1314,14 +1335,86 @@ impl MemoryQueryRepository for PostgresPersistence {
             .ok_or_else(|| EnclaveError::InvalidRequest("invalid MCP range start".into()))?;
         let to_ms = isotime::parse_epoch_millis(&request.to)
             .ok_or_else(|| EnclaveError::InvalidRequest("invalid MCP range end".into()))?;
+        if to_ms <= from_ms {
+            return Err(EnclaveError::InvalidRequest(
+                "MCP range end must be after its start".into(),
+            ));
+        }
+
+        let counts = sqlx::query(
+            "SELECT \
+                (SELECT count(*) FROM utterances u JOIN audio_segments s \
+                   ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+                  WHERE u.account_id=$1 \
+                    AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                        >=to_timestamp($2::double precision/1000.0) \
+                    AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                        <to_timestamp($3::double precision/1000.0)) AS utterance_count, \
+                (SELECT count(*) FROM screenshots c \
+                  WHERE c.account_id=$1 \
+                    AND c.captured_at>=to_timestamp($2::double precision/1000.0) \
+                    AND c.captured_at<to_timestamp($3::double precision/1000.0)) \
+                    AS screenshot_count",
+        )
+        .bind(account_id)
+        .bind(from_ms)
+        .bind(to_ms)
+        .fetch_one(self.pool())
+        .await?;
+        let utterance_count = counts.try_get::<i64, _>("utterance_count")?;
+        let screenshot_count = counts.try_get::<i64, _>("screenshot_count")?;
+
+        let language_rows = sqlx::query(
+            "SELECT DISTINCT u.language AS language \
+               FROM utterances u JOIN audio_segments s \
+                 ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+              WHERE u.account_id=$1 AND u.language IS NOT NULL AND btrim(u.language)<>'' \
+                AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                    >=to_timestamp($2::double precision/1000.0) \
+                AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                    <to_timestamp($3::double precision/1000.0) \
+              ORDER BY u.language",
+        )
+        .bind(account_id)
+        .bind(from_ms)
+        .bind(to_ms)
+        .fetch_all(self.pool())
+        .await?;
+        let languages = language_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("language").map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+
+        let app_rows = sqlx::query(
+            "SELECT DISTINCT c.active_app AS active_app FROM screenshots c \
+              WHERE c.account_id=$1 AND c.active_app IS NOT NULL AND btrim(c.active_app)<>'' \
+                AND c.captured_at>=to_timestamp($2::double precision/1000.0) \
+                AND c.captured_at<to_timestamp($3::double precision/1000.0) \
+              ORDER BY c.active_app",
+        )
+        .bind(account_id)
+        .bind(from_ms)
+        .bind(to_ms)
+        .fetch_all(self.pool())
+        .await?;
+        let apps_seen = app_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("active_app").map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+
         let rows = sqlx::query(
-            "SELECT id,title,summary, \
-                    floor(extract(epoch FROM started_at)*1000)::bigint AS started_at_ms, \
-                    floor(extract(epoch FROM ended_at)*1000)::bigint AS ended_at_ms \
-               FROM episodes WHERE account_id=$1 AND substance!='none' \
-                AND started_at<=to_timestamp($3::double precision/1000.0) \
-                AND ended_at>=to_timestamp($2::double precision/1000.0) \
-              ORDER BY started_at,id LIMIT $4",
+            "SELECT u.id,u.text,u.speaker_label, \
+                    floor(extract(epoch FROM (s.started_at + \
+                        u.start_offset_seconds * interval '1 second'))*1000)::bigint AS at_ms \
+               FROM utterances u JOIN audio_segments s \
+                 ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+              WHERE u.account_id=$1 \
+                AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                    >=to_timestamp($2::double precision/1000.0) \
+                AND (s.started_at + u.start_offset_seconds * interval '1 second') \
+                    <to_timestamp($3::double precision/1000.0) \
+              ORDER BY (s.started_at + u.start_offset_seconds * interval '1 second'),u.id \
+              LIMIT $4",
         )
         .bind(account_id)
         .bind(from_ms)
@@ -1329,35 +1422,47 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(limit(effective_limit)?)
         .fetch_all(self.pool())
         .await?;
-        let episodes = rows
+        let raw = rows
             .iter()
             .map(|row| {
-                let title = crate::cp::dlp::local_deterministic_redact(
-                    row.try_get::<Option<String>, _>("title")?
-                        .as_deref()
-                        .unwrap_or_default(),
-                );
-                let summary = crate::cp::dlp::local_deterministic_redact(
-                    row.try_get::<Option<String>, _>("summary")?
-                        .as_deref()
-                        .unwrap_or_default(),
-                );
-                Ok(json!({
-                    "id": row.try_get::<i64, _>("id")?.to_string(),
-                    "title": title.text,
-                    "summary": summary.text,
-                    "started_at": required_timestamp(row, "started_at_ms")?,
-                    "ended_at": required_timestamp(row, "ended_at_ms")?,
-                }))
+                Ok((
+                    row.try_get::<i64, _>("id")?,
+                    row.try_get::<String, _>("text")?,
+                    row.try_get::<String, _>("speaker_label")?,
+                    required_timestamp(row, "at_ms")?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let redacted = crate::cp::dlp::redact_utterance_window(
+            &raw.iter()
+                .map(|(id, text, _, _)| (*id, text.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|(id, value)| (id, value.text))
+        .collect::<HashMap<_, _>>();
+        let digest = raw
+            .into_iter()
+            .map(|(id, _, speaker, at)| {
+                json!({
+                    "at": at,
+                    "speaker": speaker,
+                    "text": redacted.get(&id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
         let from = isotime::format_epoch_millis(from_ms);
         let to = isotime::format_epoch_millis(to_ms);
         Ok(crate::cp::mcp_safety::sanitize_result(json!({
-            "time_range": { "from": from, "to": to },
-            "summary_digest": format!("Period from {} to {} contained {} safe episodes.", from, to, episodes.len()),
-            "has_more": episodes.len() >= effective_limit,
-            "episodes": episodes,
+            "from": from,
+            "to": to,
+            "counts": {
+                "utterances": utterance_count,
+                "screenshots": screenshot_count,
+            },
+            "languages": languages,
+            "apps_seen": apps_seen,
+            "digest": digest,
         })))
     }
 

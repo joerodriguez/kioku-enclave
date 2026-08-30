@@ -2710,7 +2710,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mcp_search["count"], 1);
-        assert_eq!(mcp_search["results"][0]["speaker"], "Lynn");
+        assert_eq!(mcp_search["results"][0]["kind"], "utterance");
+        assert_eq!(mcp_search["results"][0]["speaker_label"], "Lynn");
         assert!(!serde_json::to_string(&mcp_search)
             .unwrap()
             .contains("other tenant"));
@@ -2727,6 +2728,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mcp_context["utterances"].as_array().unwrap().len(), 1);
+        assert_eq!(mcp_context["utterances"][0]["speaker_label"], "Lynn");
+        assert_eq!(mcp_context["utterances"][0]["source_type"], "mic");
         let mcp_range = repositories
             .memory_queries()
             .mcp_time_range(
@@ -2739,7 +2742,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(mcp_range["episodes"].as_array().unwrap().len(), 1);
+        assert_eq!(mcp_range["counts"]["utterances"], 1);
+        assert_eq!(mcp_range["counts"]["screenshots"], 1);
+        assert_eq!(mcp_range["digest"].as_array().unwrap().len(), 1);
+        assert_eq!(mcp_range["digest"][0]["speaker"], "Lynn");
 
         let billing_account = repositories
             .billing()
@@ -2969,6 +2975,152 @@ mod tests {
             .unwrap(),
             4
         );
+
+        let reviewer_episodes = repositories
+            .memory_queries()
+            .list_episodes(
+                &reviewer_account.id,
+                &EpisodeListRequest {
+                    from: Some("2026-07-22T00:00:00Z".into()),
+                    to: Some("2026-07-22T12:00:00Z".into()),
+                    limit: 20,
+                    include_low: false,
+                    episode_id: None,
+                    before_started_at: None,
+                    before_id: None,
+                    probe_for_more: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reviewer_episodes.episodes.len(), 3);
+        let reviewer_titles = reviewer_episodes
+            .episodes
+            .iter()
+            .map(|episode| episode["title"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reviewer_titles,
+            vec![
+                "Vendor renewal page",
+                "Dashboard cache invalidation fix",
+                "Launch planning and QA decision",
+            ]
+        );
+        assert!(!serde_json::to_string(&reviewer_episodes.episodes)
+            .unwrap()
+            .contains("French lesson"));
+
+        let reviewer_launch = repositories
+            .memory_queries()
+            .mcp_search_transcripts(
+                &reviewer_account.id,
+                &McpTranscriptSearchRequest {
+                    query: "launch".into(),
+                    from: Some("2026-07-22T09:00:00Z".into()),
+                    to: Some("2026-07-22T09:35:00Z".into()),
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(reviewer_launch["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("August 19"))));
+        assert!(reviewer_launch["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["speaker_label"] == "Maya"));
+
+        let reviewer_context = repositories
+            .memory_queries()
+            .mcp_context(
+                &reviewer_account.id,
+                &McpContextRequest {
+                    at: "2026-07-22T09:01:30Z".into(),
+                    window_seconds: 300,
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        let context_utterances = reviewer_context["utterances"].as_array().unwrap();
+        assert_eq!(context_utterances.len(), 2);
+        assert_eq!(context_utterances[0]["speaker_label"], "Maya");
+        assert_eq!(context_utterances[0]["source_type"], "mic");
+        assert!(context_utterances[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("August 19"));
+        assert!(context_utterances[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("launch checklist"));
+
+        let renewal_hits = repositories
+            .memory_queries()
+            .search(
+                &reviewer_account.id,
+                &SearchRequest {
+                    query: "renewal".into(),
+                    speaker: None,
+                    time_start: Some("2026-07-22T11:00:00Z".into()),
+                    time_end: Some("2026-07-22T12:00:00Z".into()),
+                    limit: 10,
+                    offset: 0,
+                    kinds: vec!["screenshot".into()],
+                    query_embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            renewal_hits.as_slice(),
+            [SearchHit::Screenshot {
+                active_app: Some(active_app),
+                window_title: Some(window_title),
+                url: Some(url),
+                ..
+            }] if active_app == "Google Chrome"
+                && window_title == "Vendor renewal checklist"
+                && url == "https://example.com/renewal"
+        ));
+
+        let reviewer_french = repositories
+            .memory_queries()
+            .mcp_time_range(
+                &reviewer_account.id,
+                &McpTimeRangeRequest {
+                    from: "2026-07-22T14:00:00Z".into(),
+                    to: "2026-07-22T15:00:00Z".into(),
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reviewer_french["counts"]["utterances"], 2);
+        assert_eq!(reviewer_french["counts"]["screenshots"], 0);
+        assert_eq!(reviewer_french["languages"], serde_json::json!(["en"]));
+        assert_eq!(reviewer_french["apps_seen"], serde_json::json!([]));
+        let french_digest = reviewer_french["digest"].as_array().unwrap();
+        assert_eq!(french_digest.len(), 2);
+        assert!(french_digest[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("depuis"));
+        assert!(french_digest[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("pendant"));
+        assert!(french_digest
+            .windows(2)
+            .all(|pair| pair[0]["at"].as_str() < pair[1]["at"].as_str()));
+
         assert!(repositories
             .oauth()
             .store_direct_authorization_code(DirectAuthorizationCode {
