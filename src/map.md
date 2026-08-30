@@ -46,9 +46,9 @@ main.rs
 - GCS objects are application-encrypted and bound to the owning account, purpose, canonical name,
   and exact generation recorded in PostgreSQL. A bucket is never structured authority.
 - Export emits selected tenant-qualified PostgreSQL rows and media metadata, not GCS bytes; full
-  media-byte export remains an activation blocker. Deletion tombstones first, prevents
-  resurrection, removes PostgreSQL rows and current/noncurrent object generations, and reports
-  completion only after durable reconciliation.
+  media-byte export remains an activation blocker. Deletion first commits a recoverable admission
+  tombstone, settles usage and the billing fence, then removes PostgreSQL rows and
+  current/noncurrent object generations and reports completion only after durable reconciliation.
 - Production readiness requires PostgreSQL schema health and the process-immutable shared TLS
   generation. Liveness remains process-local so ADR-0041 can rotate certificates or replace fleet
   members with zero unavailable capacity.

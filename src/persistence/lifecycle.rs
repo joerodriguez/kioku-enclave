@@ -14,15 +14,27 @@ pub struct AccountDeletionOperation {
 
 /// Account tombstoning and identity cleanup shared by routes and workers.
 ///
-/// Content/media deletion happens between `begin_account_deletion` and
-/// `finalize_account_deletion`. Both boundary transitions are transactional,
-/// durable, and refuse while an exact provider disclosure fence is open.
+/// `request_account_deletion` first commits a durable admission fence without
+/// erasing identity or content. After usage settlement and the remote billing
+/// fence are acknowledged, content/media deletion happens between
+/// `begin_account_deletion` and `finalize_account_deletion`. Every boundary
+/// transition is transactional, durable, and refuses while an exact provider
+/// disclosure fence is open.
 #[async_trait]
 pub(crate) trait AccountLifecycleRepository: Send + Sync {
     async fn account_deletion_operation(
         &self,
         account_id: &str,
     ) -> Result<Option<AccountDeletionOperation>>;
+
+    async fn request_account_deletion(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountDeletionOperation>>;
+
+    /// True only after every locally admitted upload/provider effect has
+    /// settled behind the durable deletion-request admission fence.
+    async fn account_deletion_preflight_complete(&self, account_id: &str) -> Result<bool>;
 
     async fn begin_account_deletion(
         &self,

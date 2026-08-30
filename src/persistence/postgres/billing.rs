@@ -154,7 +154,7 @@ impl BillingRepository for PostgresPersistence {
             .await?
             .as_deref()
         {
-            Some("active") => {
+            Some("active" | "deletion_requested") => {
                 sqlx::query(
                     "INSERT INTO billing_accounts (account_id,billing_account_id) VALUES ($1,$2) \
                      ON CONFLICT (account_id) DO NOTHING",
@@ -281,7 +281,7 @@ impl BillingRepository for PostgresPersistence {
             account_status_for_update(&mut transaction, account_id)
                 .await?
                 .as_deref(),
-            Some("active" | "deleting")
+            Some("active" | "deletion_requested" | "deleting")
         ) {
             return Err(EnclaveError::Auth("account inactive".into()));
         }

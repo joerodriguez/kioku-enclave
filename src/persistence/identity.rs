@@ -13,6 +13,7 @@ pub(crate) struct Account {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountStatus {
     Active,
+    DeletionRequested,
     Deleting,
     Deleted,
     Unavailable,
@@ -22,6 +23,7 @@ impl AccountStatus {
     pub(super) fn from_database(value: &str) -> Self {
         match value {
             "active" => Self::Active,
+            "deletion_requested" => Self::DeletionRequested,
             "deleting" => Self::Deleting,
             "deleted" => Self::Deleted,
             _ => Self::Unavailable,

@@ -119,9 +119,9 @@ retired screenshot upload routes, and legacy `/v1/*` data routes authenticate be
 - Public errors, readiness failures, logs, and provider telemetry are content-free.
 - Export streams selected tenant-qualified PostgreSQL rows and media metadata as JSON from one
   repeatable-read transaction; it does not fetch GCS media bytes. Full media-byte export remains
-  an activation blocker. Account deletion durably tombstones the account, blocks resurrection,
-  fences workers/effects, removes exact current and noncurrent media generations, and reports
-  completion only after reconciliation.
+  an activation blocker. Account deletion first durably gates new work, then settles usage and
+  establishes the idempotent billing fence before identity/content deletion; it removes exact
+  current and noncurrent media generations and reports completion only after reconciliation.
 
 The KMS digest condition and reviewed IAM topology reduce standing decrypt authority, but a
 cloud-project control-plane administrator can still change IAM, compute, database, or KMS policy.
