@@ -16,7 +16,7 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `episode.rs` | Pure episode merge/substance/visual-evidence domain rules shared by memory formation and deletion. |
 | `episode_deletion.rs` | Durable episode freeze, exact media cleanup inventory, structured purge, and replay receipt. |
 | `finalization.rs` | Claim and atomic recap/finalization/outbox settlement contract. |
-| `identity.rs` | Account/session and Apple-credential contract. |
+| `identity.rs` | Provider-subject account/session resolution, explicit Apple/password linking, and Apple-credential contract; email is never an account join key. |
 | `lifecycle.rs` | Durable pre-fence deletion request, account tombstone/no-resurrection progress, deletion-owned expiry recovery for already-admitted provider disclosures, persistent reviewer-fixture protection, provider revocation, and final cleanup contract. |
 | `media_object.rs` | Provider-neutral encrypted-media object operations, exact-generation reads, account/episode purge, and all-generation reconciliation. |
 | `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |

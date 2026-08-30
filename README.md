@@ -176,6 +176,23 @@ The selector injects non-configurable fleet invariants:
 | `HEALTH_PORT` | `8081` |
 | `DRAIN_TIMEOUT_SECONDS` | `105` |
 | `ENCLAVE_TLS` | `1` |
+| `PASSWORD_AUTH_MODE` | `off` |
+| `PASSWORD_AUTH_API_KEY` | empty |
+| `PASSWORD_AUTH_PROJECT_ID` | empty |
+| `PASSWORD_AUTH_TENANT_ID` | empty |
+
+The off mode and three empty coordinates keep the general Identity Platform email/password
+foundation unreachable in production and evaluation release images. The current foundation is
+deliberately inert: it adds only configuration validation, identity verification, provider-qualified
+subjects, and persistence primitives—no password route, direct bearer path, or OAuth grant. The
+intended next stage is an exact-origin hosted Kioku PKCE bridge restricted to source-fixed
+first-party client IDs, with a durably access-only authorization code whose absolute access expiry
+cannot extend beyond 15 minutes from upstream verification. Activation additionally requires
+pre-account and pre-auth credential-abuse controls, automated Identity Platform user deletion, a
+scoped post-deletion status credential, safe account-linking UX, and verified web/iOS/macOS parity;
+the exact reviewer bridge remains a separate bounded exception. Any later durable password-origin
+refresh or MCP grant must carry project, tenant, UID, and original `auth_time` provenance and
+revalidate it upstream before every rotation.
 
 There is no backend, schema-mode, archive, witness, genesis, or legacy-media configuration. PostgreSQL
 credentials, the shared TLS generation, provider private keys, OAuth secrets, and signing secrets

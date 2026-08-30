@@ -173,6 +173,12 @@ def validate(configuration: dict[str, str], profile: str, source_ref: str) -> No
         raise SystemExit("BILLING_SERVICE_AUDIENCE must exactly match BILLING_SERVICE_URL")
     if configuration["BILLING_ENFORCEMENT_MODE"] not in ("shadow", "enforce"):
         raise SystemExit("BILLING_ENFORCEMENT_MODE must be either shadow or enforce")
+    if configuration["PASSWORD_AUTH_MODE"] != "off":
+        raise SystemExit("release images must keep general password authentication off")
+    if configuration["PASSWORD_AUTH_API_KEY"]:
+        raise SystemExit("release images must not bake a general password authentication API key")
+    if configuration["PASSWORD_AUTH_PROJECT_ID"] or configuration["PASSWORD_AUTH_TENANT_ID"]:
+        raise SystemExit("release images must not bake general password identity coordinates")
     if profile == "production" and not configuration.get("APNS_TEAM_ID"):
         raise SystemExit(
             "missing required production build configuration: PRODUCTION_APNS_TEAM_ID, "
@@ -209,6 +215,13 @@ def selected_configuration(
             "HEALTH_PORT": "8081",
             "DRAIN_TIMEOUT_SECONDS": "105",
             "ENCLAVE_TLS": "1",
+            # General password auth remains a source-reviewed release gate. It
+            # is intentionally not an operator/profile variable until the
+            # client-parity, upstream-abuse, and lifecycle gates are complete.
+            "PASSWORD_AUTH_MODE": "off",
+            "PASSWORD_AUTH_API_KEY": "",
+            "PASSWORD_AUTH_PROJECT_ID": "",
+            "PASSWORD_AUTH_TENANT_ID": "",
         }
     )
     validate(configuration, profile, source_ref)

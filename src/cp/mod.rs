@@ -113,7 +113,36 @@ pub struct CpConfig {
     /// Optional exact-match Google Identity Platform account used only by the
     /// public plugin-review login page. The password never enters this config.
     pub reviewer_auth: Option<ReviewerAuthConfig>,
+    /// General email/password login is independently gated from the persistent
+    /// reviewer bridge. Release images currently pin this to `Off`; the API key
+    /// is a public Identity Platform client identifier, never a user password.
+    pub password_auth: PasswordAuthConfig,
     pub billing_enforcement_mode: BillingEnforcementMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordAuthMode {
+    Off,
+    LoginOnly,
+    LoginAndSignup,
+}
+
+impl PasswordAuthMode {
+    pub fn login_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn signup_enabled(self) -> bool {
+        self == Self::LoginAndSignup
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasswordAuthConfig {
+    pub mode: PasswordAuthMode,
+    pub api_key: Option<String>,
+    pub project_id: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +200,85 @@ fn validate_https_origin(name: &str, value: &str) -> crate::error::Result<String
         )));
     }
     Ok(value.trim_end_matches('/').to_string())
+}
+
+fn identity_platform_api_key_valid(value: &str) -> bool {
+    (20..=256).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn identity_platform_project_id_valid(value: &str) -> bool {
+    (6..=30).contains(&value.len())
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            0 => byte.is_ascii_lowercase(),
+            index if index + 1 == value.len() => byte.is_ascii_lowercase() || byte.is_ascii_digit(),
+            _ => byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-',
+        })
+}
+
+fn identity_platform_tenant_id_valid(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn password_auth_config_from_values(
+    mode: &str,
+    api_key: &str,
+    project_id: &str,
+    tenant_id: &str,
+) -> crate::error::Result<PasswordAuthConfig> {
+    let mode = match mode.trim() {
+        "off" => PasswordAuthMode::Off,
+        "login" => PasswordAuthMode::LoginOnly,
+        "signup" => PasswordAuthMode::LoginAndSignup,
+        _ => {
+            return Err(crate::error::EnclaveError::Config(
+                "PASSWORD_AUTH_MODE must be off, login, or signup".into(),
+            ))
+        }
+    };
+    let api_key = api_key.trim();
+    let project_id = project_id.trim();
+    let tenant_id = tenant_id.trim();
+    if mode == PasswordAuthMode::Off {
+        if !api_key.is_empty() || !project_id.is_empty() || !tenant_id.is_empty() {
+            return Err(crate::error::EnclaveError::Config(
+                "password authentication coordinates must be empty while PASSWORD_AUTH_MODE is off"
+                    .into(),
+            ));
+        }
+        return Ok(PasswordAuthConfig {
+            mode,
+            api_key: None,
+            project_id: None,
+            tenant_id: None,
+        });
+    }
+    if !identity_platform_api_key_valid(api_key) {
+        return Err(crate::error::EnclaveError::Config(
+            "PASSWORD_AUTH_API_KEY has an invalid format".into(),
+        ));
+    }
+    if !identity_platform_project_id_valid(project_id) {
+        return Err(crate::error::EnclaveError::Config(
+            "PASSWORD_AUTH_PROJECT_ID has an invalid format".into(),
+        ));
+    }
+    if !tenant_id.is_empty() && !identity_platform_tenant_id_valid(tenant_id) {
+        return Err(crate::error::EnclaveError::Config(
+            "PASSWORD_AUTH_TENANT_ID has an invalid format".into(),
+        ));
+    }
+    Ok(PasswordAuthConfig {
+        mode,
+        api_key: Some(api_key.to_string()),
+        project_id: Some(project_id.to_string()),
+        tenant_id: (!tenant_id.is_empty()).then(|| tenant_id.to_string()),
+    })
 }
 
 impl CpConfig {
@@ -242,6 +350,25 @@ impl CpConfig {
         let web_origin = validate_https_origin(
             "WEB_ORIGIN",
             &config_value("WEB_ORIGIN", "http://localhost:3000")?,
+        )?;
+        let password_mode = std::env::var("PASSWORD_AUTH_MODE").unwrap_or_else(|_| "off".into());
+        let password_api_key = std::env::var("PASSWORD_AUTH_API_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let password_project_id = std::env::var("PASSWORD_AUTH_PROJECT_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let password_tenant_id = std::env::var("PASSWORD_AUTH_TENANT_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let password_auth = password_auth_config_from_values(
+            &password_mode,
+            &password_api_key,
+            &password_project_id,
+            &password_tenant_id,
         )?;
         let reviewer_values = [
             std::env::var("REVIEWER_AUTH_API_KEY")
@@ -407,6 +534,7 @@ impl CpConfig {
             )?,
             web_origin,
             reviewer_auth,
+            password_auth,
             billing_enforcement_mode,
         })
     }
@@ -616,7 +744,11 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
 
 #[cfg(test)]
 mod configuration_tests {
-    use super::{reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig};
+    use super::{
+        identity_platform_project_id_valid, identity_platform_tenant_id_valid,
+        password_auth_config_from_values, reviewer_identity_subject,
+        vertex_model_name_is_billing_safe, PasswordAuthMode, ReviewerAuthConfig,
+    };
 
     #[test]
     fn reviewer_account_id_uses_the_exact_namespaced_identity_derivation() {
@@ -641,5 +773,46 @@ mod configuration_tests {
         ));
         assert!(!vertex_model_name_is_billing_safe(&"m".repeat(129)));
         assert!(!vertex_model_name_is_billing_safe(""));
+    }
+
+    #[test]
+    fn password_identity_coordinates_have_bounded_image_safe_grammars() {
+        assert!(identity_platform_project_id_valid("kioku-public-auth"));
+        assert!(!identity_platform_project_id_valid("Kioku-public-auth"));
+        assert!(!identity_platform_project_id_valid("short"));
+        assert!(!identity_platform_project_id_valid("kioku-public-auth-"));
+        assert!(identity_platform_tenant_id_valid("public-auth.v1"));
+        assert!(!identity_platform_tenant_id_valid("tenant/escape"));
+        assert!(!identity_platform_tenant_id_valid(&"t".repeat(129)));
+    }
+
+    #[test]
+    fn password_auth_configuration_is_closed_by_default_and_atomic_when_enabled() {
+        let off = password_auth_config_from_values("off", "", "", "").unwrap();
+        assert_eq!(off.mode, PasswordAuthMode::Off);
+        assert!(off.api_key.is_none());
+        assert!(password_auth_config_from_values(
+            "off",
+            "abcdefghijklmnopqrstuvwxyz123456",
+            "",
+            ""
+        )
+        .is_err());
+        assert!(password_auth_config_from_values(
+            "login",
+            "abcdefghijklmnopqrstuvwxyz123456",
+            "",
+            ""
+        )
+        .is_err());
+        let enabled = password_auth_config_from_values(
+            "signup",
+            "abcdefghijklmnopqrstuvwxyz123456",
+            "kioku-public-auth",
+            "public-tenant",
+        )
+        .unwrap();
+        assert_eq!(enabled.mode, PasswordAuthMode::LoginAndSignup);
+        assert_eq!(enabled.tenant_id.as_deref(), Some("public-tenant"));
     }
 }

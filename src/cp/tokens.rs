@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_ids_preserve_google_and_domain_separate_apple() {
+    fn provider_ids_preserve_google_and_domain_separate_other_providers() {
         let subject = "same-provider-subject";
         assert_eq!(
             derive_provider_uuid("google", subject),
@@ -613,6 +613,14 @@ mod tests {
         assert_ne!(
             derive_provider_uuid("apple", subject),
             derive_provider_uuid("other", subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("password", subject),
+            derive_stable_uuid(subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("password", subject),
+            derive_provider_uuid("apple", subject)
         );
     }
 }

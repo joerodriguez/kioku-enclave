@@ -13,6 +13,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use base64::Engine as _;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::json;
@@ -30,7 +31,7 @@ const EXP_LEEWAY_SECS: u64 = 30;
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(300);
 const GOOGLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const REVIEWER_TOKEN_MAX_BYTES: usize = 8192;
+const IDENTITY_PLATFORM_TOKEN_MAX_BYTES: usize = 8192;
 
 /// The authenticated user id, attached to the request by [`require_auth`].
 #[derive(Clone)]
@@ -187,71 +188,97 @@ impl UserIdTokenVerifier {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReviewerIdentity {
+struct IdentityPlatformIdentity {
     local_id: String,
     email: String,
     #[serde(default)]
+    email_verified: bool,
+    #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    valid_since: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct ReviewerLookupResponse {
+struct IdentityPlatformLookupResponse {
     #[serde(default)]
-    users: Vec<ReviewerIdentity>,
+    users: Vec<IdentityPlatformIdentity>,
 }
 
-/// Verifies the short-lived Identity Platform token produced by
-/// `kiokuu.com/app/login`. Google performs the signature/account lookup; Kioku
-/// then enforces an exact preconfigured UID + email match.
-pub struct ReviewerIdentityVerifier {
+/// Performs the authenticated Identity Platform account lookup shared by the
+/// exact reviewer bridge and the separately gated general password provider.
+struct IdentityPlatformTokenLookup {
     http: reqwest::Client,
-    config: ReviewerAuthConfig,
+    api_key: String,
 }
 
-impl ReviewerIdentityVerifier {
-    pub fn new(config: ReviewerAuthConfig) -> Self {
+impl IdentityPlatformTokenLookup {
+    fn new(api_key: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .connect_timeout(GOOGLE_CONNECT_TIMEOUT)
                 .timeout(GOOGLE_REQUEST_TIMEOUT)
                 .build()
-                .expect("static reviewer identity HTTP client configuration"),
-            config,
+                .expect("static Identity Platform HTTP client configuration"),
+            api_key,
         }
     }
 
-    pub async fn verify(&self, token: &str) -> Result<(String, String)> {
-        if token.is_empty() || token.len() > REVIEWER_TOKEN_MAX_BYTES || !token.is_ascii() {
-            return Err(EnclaveError::Auth("invalid reviewer identity token".into()));
+    async fn lookup(&self, token: &str) -> Result<Vec<IdentityPlatformIdentity>> {
+        if token.is_empty() || token.len() > IDENTITY_PLATFORM_TOKEN_MAX_BYTES || !token.is_ascii()
+        {
+            return Err(EnclaveError::Auth("invalid identity token".into()));
         }
         let mut url =
             reqwest::Url::parse("https://identitytoolkit.googleapis.com/v1/accounts:lookup")
                 .expect("static Identity Platform lookup URL");
-        url.query_pairs_mut()
-            .append_pair("key", &self.config.api_key);
+        url.query_pairs_mut().append_pair("key", &self.api_key);
         let response = self
             .http
             .post(url)
             .json(&serde_json::json!({"idToken": token}))
             .send()
             .await
-            .map_err(|_| EnclaveError::Auth("review identity provider unavailable".into()))?;
+            .map_err(|_| EnclaveError::Auth("identity provider unavailable".into()))?;
         if !response.status().is_success() {
-            return Err(EnclaveError::Auth("review identity rejected".into()));
+            return Err(EnclaveError::Auth("identity rejected".into()));
         }
-        let lookup: ReviewerLookupResponse = response
+        let lookup: IdentityPlatformLookupResponse = response
             .json()
             .await
-            .map_err(|_| EnclaveError::Auth("invalid review identity response".into()))?;
-        exact_reviewer_identity(&self.config, lookup.users)
+            .map_err(|_| EnclaveError::Auth("invalid identity response".into()))?;
+        Ok(lookup.users)
+    }
+}
+
+/// Verifies the short-lived Identity Platform token produced by
+/// `kiokuu.com/app/login`. Google performs the signature/account lookup; Kioku
+/// then enforces an exact preconfigured UID + email match.
+pub struct ReviewerIdentityVerifier {
+    lookup: IdentityPlatformTokenLookup,
+    config: ReviewerAuthConfig,
+}
+
+impl ReviewerIdentityVerifier {
+    pub fn new(config: ReviewerAuthConfig) -> Self {
+        Self {
+            lookup: IdentityPlatformTokenLookup::new(config.api_key.clone()),
+            config,
+        }
+    }
+
+    pub async fn verify(&self, token: &str) -> Result<(String, String)> {
+        exact_reviewer_identity(&self.config, self.lookup.lookup(token).await?)
     }
 }
 
 fn exact_reviewer_identity(
     config: &ReviewerAuthConfig,
-    mut users: Vec<ReviewerIdentity>,
+    mut users: Vec<IdentityPlatformIdentity>,
 ) -> Result<(String, String)> {
     if users.len() != 1 {
         return Err(EnclaveError::Auth("review identity rejected".into()));
@@ -264,6 +291,150 @@ fn exact_reviewer_identity(
         return Err(EnclaveError::Auth("review identity rejected".into()));
     }
     Ok((user.local_id, user.email.to_lowercase()))
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordTokenClaims {
+    sub: String,
+    aud: String,
+    iss: String,
+    email: String,
+    #[serde(default)]
+    email_verified: bool,
+    #[serde(default)]
+    auth_time: Option<u64>,
+    firebase: PasswordFirebaseClaims,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordFirebaseClaims {
+    sign_in_provider: String,
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+fn password_token_claims(token: &str) -> Result<PasswordTokenClaims> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(EnclaveError::Auth("invalid password identity token".into()));
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+        .map_err(|_| EnclaveError::Auth("invalid password identity token".into()))?;
+    serde_json::from_slice(&payload)
+        .map_err(|_| EnclaveError::Auth("invalid password identity token".into()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedPasswordIdentity {
+    pub(crate) subject: String,
+    pub(crate) email: String,
+}
+
+fn exact_password_identity(
+    token: &str,
+    mut users: Vec<IdentityPlatformIdentity>,
+    expected_project_id: &str,
+    expected_tenant_id: Option<&str>,
+    excluded_uid: Option<&str>,
+) -> Result<VerifiedPasswordIdentity> {
+    if users.len() != 1 {
+        return Err(EnclaveError::Auth("password identity rejected".into()));
+    }
+    let user = users.pop().expect("one password identity");
+    let claims = password_token_claims(token)?;
+    let email = user.email.trim().to_lowercase();
+    let Some(valid_since) = user
+        .valid_since
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Err(EnclaveError::Auth("password identity rejected".into()));
+    };
+    let Some(authenticated_at) = claims.auth_time else {
+        return Err(EnclaveError::Auth("password identity rejected".into()));
+    };
+    if user.disabled
+        || !user.email_verified
+        || claims.firebase.sign_in_provider != "password"
+        || claims.aud != expected_project_id
+        || claims.iss != format!("https://securetoken.google.com/{expected_project_id}")
+        || claims.firebase.tenant.as_deref() != expected_tenant_id
+        || user.tenant_id.as_deref() != expected_tenant_id
+        || authenticated_at < valid_since
+        || !claims.email_verified
+        || claims.sub != user.local_id
+        || excluded_uid.is_some_and(|excluded| excluded == user.local_id)
+        || !claims.email.eq_ignore_ascii_case(&user.email)
+        || user.local_id.is_empty()
+        || user.local_id.len() > 128
+        || email.is_empty()
+        || email.len() > 254
+        || email.matches('@').count() != 1
+        || email
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(EnclaveError::Auth("password identity rejected".into()));
+    }
+    Ok(VerifiedPasswordIdentity {
+        subject: qualified_password_subject(
+            expected_project_id,
+            expected_tenant_id,
+            &user.local_id,
+        ),
+        email,
+    })
+}
+
+fn qualified_password_subject(project_id: &str, tenant_id: Option<&str>, uid: &str) -> String {
+    let encode =
+        |value: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+    format!(
+        "identity-platform:v1:{}:{}:{}",
+        encode(project_id),
+        encode(tenant_id.unwrap_or_default()),
+        encode(uid)
+    )
+}
+
+/// Verifies an email/password Identity Platform ID token. A successful lookup
+/// proves project membership/signature/expiry; the signed JWT claims are then
+/// cross-checked so a federated token from the same project cannot be treated
+/// as possession of the account password.
+pub struct PasswordIdentityVerifier {
+    lookup: IdentityPlatformTokenLookup,
+    project_id: String,
+    tenant_id: Option<String>,
+    excluded_uid: Option<String>,
+}
+
+impl PasswordIdentityVerifier {
+    pub fn new(
+        api_key: String,
+        project_id: String,
+        tenant_id: Option<String>,
+        excluded_uid: Option<String>,
+    ) -> Self {
+        Self {
+            lookup: IdentityPlatformTokenLookup::new(api_key),
+            project_id,
+            tenant_id,
+            excluded_uid,
+        }
+    }
+
+    pub async fn verify(&self, token: &str) -> Result<VerifiedPasswordIdentity> {
+        let users = self.lookup.lookup(token).await?;
+        exact_password_identity(
+            token,
+            users,
+            &self.project_id,
+            self.tenant_id.as_deref(),
+            self.excluded_uid.as_deref(),
+        )
+    }
 }
 
 fn parse_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -283,6 +454,83 @@ fn parse_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 mod reviewer_tests {
     use super::*;
 
+    fn identity(local_id: &str, email: &str) -> IdentityPlatformIdentity {
+        IdentityPlatformIdentity {
+            local_id: local_id.into(),
+            email: email.into(),
+            email_verified: true,
+            disabled: false,
+            tenant_id: None,
+            valid_since: Some("0".into()),
+        }
+    }
+
+    fn password_token_at(
+        subject: &str,
+        email: &str,
+        email_verified: bool,
+        sign_in_provider: &str,
+        auth_time: Option<u64>,
+    ) -> String {
+        password_token_for(
+            subject,
+            email,
+            email_verified,
+            sign_in_provider,
+            auth_time,
+            "kioku-public-auth",
+            "https://securetoken.google.com/kioku-public-auth",
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn password_token_for(
+        subject: &str,
+        email: &str,
+        email_verified: bool,
+        sign_in_provider: &str,
+        auth_time: Option<u64>,
+        audience: &str,
+        issuer: &str,
+        tenant: Option<&str>,
+    ) -> String {
+        let payload = serde_json::json!({
+            "sub": subject,
+            "aud": audience,
+            "iss": issuer,
+            "email": email,
+            "email_verified": email_verified,
+            "auth_time": auth_time,
+            "firebase": {"sign_in_provider": sign_in_provider, "tenant": tenant},
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize password claims"));
+        format!("header.{encoded}.signature")
+    }
+
+    fn password_token(
+        subject: &str,
+        email: &str,
+        email_verified: bool,
+        sign_in_provider: &str,
+    ) -> String {
+        password_token_at(subject, email, email_verified, sign_in_provider, Some(1))
+    }
+
+    fn exact_test_password(
+        token: &str,
+        users: Vec<IdentityPlatformIdentity>,
+    ) -> Result<VerifiedPasswordIdentity> {
+        exact_password_identity(
+            token,
+            users,
+            "kioku-public-auth",
+            None,
+            Some("reviewer_uid"),
+        )
+    }
+
     fn config() -> ReviewerAuthConfig {
         ReviewerAuthConfig {
             api_key: "public-api-key".into(),
@@ -295,11 +543,7 @@ mod reviewer_tests {
     fn reviewer_identity_requires_exact_enabled_account() {
         let accepted = exact_reviewer_identity(
             &config(),
-            vec![ReviewerIdentity {
-                local_id: "reviewer_uid".into(),
-                email: "Reviewer@Kiokuu.com".into(),
-                disabled: false,
-            }],
+            vec![identity("reviewer_uid", "Reviewer@Kiokuu.com")],
         )
         .unwrap();
         assert_eq!(
@@ -308,24 +552,155 @@ mod reviewer_tests {
         );
 
         for rejected in [
-            ReviewerIdentity {
-                local_id: "other".into(),
-                email: "reviewer@kiokuu.com".into(),
-                disabled: false,
-            },
-            ReviewerIdentity {
-                local_id: "reviewer_uid".into(),
-                email: "other@kiokuu.com".into(),
-                disabled: false,
-            },
-            ReviewerIdentity {
-                local_id: "reviewer_uid".into(),
-                email: "reviewer@kiokuu.com".into(),
+            identity("other", "reviewer@kiokuu.com"),
+            identity("reviewer_uid", "other@kiokuu.com"),
+            IdentityPlatformIdentity {
                 disabled: true,
+                ..identity("reviewer_uid", "reviewer@kiokuu.com")
             },
         ] {
             assert!(exact_reviewer_identity(&config(), vec![rejected]).is_err());
         }
+    }
+
+    #[test]
+    fn password_identity_requires_verified_password_provider_claims() {
+        let token = password_token("password_uid", "Person@Example.com", true, "password");
+        assert_eq!(
+            exact_test_password(&token, vec![identity("password_uid", "person@example.com")])
+                .unwrap(),
+            VerifiedPasswordIdentity {
+                subject: qualified_password_subject("kioku-public-auth", None, "password_uid"),
+                email: "person@example.com".into(),
+            }
+        );
+
+        let rejected_tokens = [
+            password_token("other", "person@example.com", true, "password"),
+            password_token("password_uid", "other@example.com", true, "password"),
+            password_token("password_uid", "person@example.com", false, "password"),
+            password_token("password_uid", "person@example.com", true, "google.com"),
+            "not-a-jwt".to_string(),
+        ];
+        for rejected in rejected_tokens {
+            assert!(exact_test_password(
+                &rejected,
+                vec![identity("password_uid", "person@example.com")]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn password_identity_rejects_unverified_disabled_or_ambiguous_lookup() {
+        let token = password_token("password_uid", "person@example.com", true, "password");
+        let mut unverified = identity("password_uid", "person@example.com");
+        unverified.email_verified = false;
+        let mut disabled = identity("password_uid", "person@example.com");
+        disabled.disabled = true;
+
+        assert!(exact_test_password(&token, vec![unverified]).is_err());
+        assert!(exact_test_password(&token, vec![disabled]).is_err());
+        assert!(exact_test_password(&token, Vec::new()).is_err());
+        assert!(exact_test_password(
+            &token,
+            vec![
+                identity("password_uid", "person@example.com"),
+                identity("other", "other@example.com"),
+            ]
+        )
+        .is_err());
+
+        let mut revoked = identity("password_uid", "person@example.com");
+        revoked.valid_since = Some("2".into());
+        assert!(exact_test_password(&token, vec![revoked]).is_err());
+        let mut exact_boundary = identity("password_uid", "person@example.com");
+        exact_boundary.valid_since = Some("1".into());
+        assert!(exact_test_password(&token, vec![exact_boundary]).is_ok());
+        for invalid_boundary in [
+            None,
+            Some("not-a-timestamp".into()),
+            Some("18446744073709551616".into()),
+        ] {
+            let mut invalid = identity("password_uid", "person@example.com");
+            invalid.valid_since = invalid_boundary;
+            assert!(exact_test_password(&token, vec![invalid]).is_err());
+        }
+        assert!(exact_test_password(
+            &password_token_at("password_uid", "person@example.com", true, "password", None,),
+            vec![identity("password_uid", "person@example.com")],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn password_identity_is_exactly_project_tenant_qualified_and_excludes_reviewer() {
+        let default_token = password_token("password_uid", "person@example.com", true, "password");
+        assert!(exact_password_identity(
+            &default_token,
+            vec![identity("password_uid", "person@example.com")],
+            "other-project",
+            None,
+            None,
+        )
+        .is_err());
+        let wrong_issuer = password_token_for(
+            "password_uid",
+            "person@example.com",
+            true,
+            "password",
+            Some(1),
+            "kioku-public-auth",
+            "https://securetoken.google.com/other-project",
+            None,
+        );
+        assert!(exact_test_password(
+            &wrong_issuer,
+            vec![identity("password_uid", "person@example.com")]
+        )
+        .is_err());
+        assert!(exact_test_password(
+            &password_token("reviewer_uid", "reviewer@kiokuu.com", true, "password"),
+            vec![identity("reviewer_uid", "reviewer@kiokuu.com")],
+        )
+        .is_err());
+
+        let tenant_token = password_token_for(
+            "password_uid",
+            "person@example.com",
+            true,
+            "password",
+            Some(1),
+            "kioku-public-auth",
+            "https://securetoken.google.com/kioku-public-auth",
+            Some("public-tenant"),
+        );
+        let mut tenant_user = identity("password_uid", "person@example.com");
+        tenant_user.tenant_id = Some("public-tenant".into());
+        let tenant_identity = exact_password_identity(
+            &tenant_token,
+            vec![tenant_user.clone()],
+            "kioku-public-auth",
+            Some("public-tenant"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            tenant_identity.subject,
+            qualified_password_subject("kioku-public-auth", Some("public-tenant"), "password_uid")
+        );
+        assert_ne!(
+            tenant_identity.subject,
+            qualified_password_subject("kioku-public-auth", None, "password_uid")
+        );
+        assert!(exact_password_identity(
+            &tenant_token,
+            vec![tenant_user],
+            "kioku-public-auth",
+            Some("other-tenant"),
+            None,
+        )
+        .is_err());
     }
 
     #[test]

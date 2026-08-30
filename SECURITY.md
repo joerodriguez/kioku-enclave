@@ -118,9 +118,35 @@ from the currently configured fixture.
 
 ### Authentication and retired routes
 
-Google and Apple subjects are provider-namespaced; accounts are not linked merely by email. Native
-Apple authorization requires the reviewed nonce flow. OAuth authorization uses PKCE, explicit
-consent, single-use codes, and client-bound refresh-token rotation.
+Google, Apple, and password subjects are provider-namespaced; accounts are not linked merely by
+email. Native Apple authorization requires the reviewed nonce flow. OAuth authorization uses PKCE,
+explicit consent, single-use codes, and client-bound refresh-token rotation.
+
+General password authentication is source-gated off in every release image. The current foundation
+has no password HTTP route, direct password-bearer path, or password-origin OAuth grant. Its inert
+verifier never receives a password: a future hosted browser flow will authenticate against Identity
+Platform and pass only the short-lived ID token. The verifier performs a fresh `accounts:lookup`,
+requires verified email, and cross-checks signed password-provider claims, the exact configured
+project/tenant and Secure Token issuer, and `auth_time >= validSince`. Its durable subject includes
+the project/tenant namespace and excludes the separately configured reviewer UID.
+
+Persistence can create a separate password-primary account under the ordinary signup budget or
+explicitly attach one verified password subject to an already authenticated account. Email is
+metadata only and is never a join key. Account deletion already copies every linked password identity
+to the no-resurrection tombstone set before removing Kioku data. No public linking operation exists
+yet; in particular, a refreshed-token `iat` is not accepted as proof of recent password entry.
+
+The next server stage must use the hosted Kioku PKCE flow so native apps never handle passwords or
+Identity Platform tokens. It must require the exact owned web origin, accept only source-fixed
+first-party OAuth client IDs after normal redirect validation, and bind both an access-only policy and
+an absolute verification-time-plus-15-minute expiry through durable consent/code state. The token
+endpoint must atomically consume that code without creating or returning a refresh token. Arbitrary
+DCR/MCP clients remain excluded. Any future durable password-origin refresh or MCP grant must carry
+project, tenant, UID, and original `auth_time` provenance and revalidate it upstream before every
+rotation. Automated Identity Platform user deletion, scoped post-deletion status credentials,
+pre-account and pre-auth abuse controls, full client verification/reset parity, and safe Apple/Google
+linking flows remain mandatory activation gates. The current source selector and image assembler
+refuse any release configuration that enables the feature.
 
 Every user-data route authenticates and authorizes the account before accessing persistence or a
 provider. Retired `/v1/*`, `/api/sync/batch`, and retired screenshot-upload routes preserve their

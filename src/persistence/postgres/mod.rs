@@ -511,6 +511,76 @@ mod tests {
             .unwrap()
             .is_none());
 
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .upsert_password_account(
+                    "password-separate-subject",
+                    "owner@example.com",
+                    2,
+                    false,
+                )
+                .await,
+            Err(crate::error::EnclaveError::Auth(_))
+        ));
+        let separate_password_account = repositories
+            .identity_sessions()
+            .upsert_password_account("password-separate-subject", "owner@example.com", 2, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            separate_password_account.id,
+            crate::cp::tokens::derive_provider_uuid("password", "password-separate-subject")
+        );
+        assert_ne!(
+            separate_password_account.id, account_id,
+            "equal email addresses must never merge provider identities"
+        );
+        let repeated_password_account = repositories
+            .identity_sessions()
+            .upsert_password_account("password-separate-subject", "OWNER@example.com", 1, false)
+            .await
+            .unwrap();
+        assert_eq!(repeated_password_account, separate_password_account);
+
+        repositories
+            .identity_sessions()
+            .link_password_identity(&account_id, "password-linked-subject", "owner@example.com")
+            .await
+            .unwrap();
+        let linked_password_login = repositories
+            .identity_sessions()
+            .upsert_password_account("password-linked-subject", "different@example.com", 1, false)
+            .await
+            .unwrap();
+        assert_eq!(linked_password_login.id, account_id);
+        assert_eq!(
+            linked_password_login.email, "owner@example.com",
+            "a linked provider must not rewrite the canonical account email"
+        );
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .link_password_identity(
+                    &separate_password_account.id,
+                    "password-linked-subject",
+                    "different@example.com",
+                )
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .link_password_identity(
+                    &account_id,
+                    "another-password-subject",
+                    "owner@example.com",
+                )
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
+
         let admission = repositories.admission();
         assert!(admission
             .consume_rate("contract-rate", &account_id, 2.0, 0.000_001)
@@ -1318,7 +1388,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(session.providers, vec!["apple", "google"]);
+        assert_eq!(session.providers, vec!["apple", "google", "password"]);
 
         let mut reservations = Vec::new();
         for _ in 0..8 {
@@ -4146,6 +4216,13 @@ mod tests {
             repositories
                 .identity_sessions()
                 .upsert_subject_account("concurrent-subject", "owner@example.com", 10)
+                .await,
+            Err(crate::error::EnclaveError::Auth(_))
+        ));
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .upsert_password_account("password-linked-subject", "owner@example.com", 10, false,)
                 .await,
             Err(crate::error::EnclaveError::Auth(_))
         ));
