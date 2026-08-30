@@ -381,6 +381,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use sqlx::Row;
+
     use super::{advisory_transaction_lock, PostgresPersistence, PostgresPoolConfig};
     use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
@@ -469,7 +471,10 @@ mod tests {
         let media_gcs: Arc<dyn crate::gcs::GcsClient> = Arc::new(FakeGcs::new());
         let media_objects: Arc<dyn MediaObjectStore> =
             Arc::new(GcsMediaObjectStore::new(media_gcs));
-        let repositories = Arc::new(RepositorySet::postgres(persistence, media_objects));
+        let repositories = Arc::new(RepositorySet::postgres(
+            Arc::clone(&persistence),
+            media_objects,
+        ));
 
         let mut signups = Vec::new();
         for _ in 0..16 {
@@ -2893,16 +2898,230 @@ mod tests {
             .unwrap();
         assert_eq!(coverage.len(), 1);
         assert_eq!(coverage[0].snapshot.pending_events, 0);
-        repositories
-            .model_usage()
-            .complete_coverage(
+        assert_eq!(coverage[0].snapshot.lost_events, 0);
+        let first_coverage = &coverage[0];
+        let accepted_anchor = repositories
+            .billing()
+            .reconcile_vertex_coverage(
                 &account_id,
-                &coverage[0].claim_id,
-                &coverage[0].snapshot.period,
-                coverage[0].snapshot.sequence,
+                &first_coverage.snapshot.period,
+                first_coverage.snapshot.sequence,
+                first_coverage.snapshot.pending_events,
+                first_coverage.snapshot.lost_events,
+                &first_coverage.snapshot.observed_at,
             )
             .await
             .unwrap();
+        assert_eq!(accepted_anchor.sequence, first_coverage.snapshot.sequence);
+        assert_eq!(accepted_anchor.pending_events, 0);
+        assert_eq!(accepted_anchor.lost_events, 0);
+
+        // Model a process loss after billing durably accepted coverage but
+        // before the worker persisted its acknowledgement. A new repository
+        // instance takes over the expired PostgreSQL claim and replays the
+        // exact snapshot without manufacturing a rollback loss.
+        assert_eq!(
+            sqlx::query(
+                "UPDATE vertex_usage_coverage
+                    SET delivery_claim_expires_at=CURRENT_TIMESTAMP - interval '1 second'
+                  WHERE account_id=$1 AND period=$2 AND delivery_claim_id=$3",
+            )
+            .bind(&account_id)
+            .bind(&first_coverage.snapshot.period)
+            .bind(&first_coverage.claim_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        let recovered_gcs: Arc<dyn crate::gcs::GcsClient> = Arc::new(FakeGcs::new());
+        let recovered_repositories = RepositorySet::postgres(
+            Arc::clone(&persistence),
+            Arc::new(GcsMediaObjectStore::new(recovered_gcs)),
+        );
+        let recovered_coverage = recovered_repositories
+            .model_usage()
+            .pending_coverage(&account_id, &billing_account)
+            .await
+            .unwrap();
+        assert_eq!(recovered_coverage.len(), 1);
+        assert_ne!(recovered_coverage[0].claim_id, first_coverage.claim_id);
+        assert_eq!(recovered_coverage[0].snapshot, first_coverage.snapshot);
+        let replayed_anchor = recovered_repositories
+            .billing()
+            .reconcile_vertex_coverage(
+                &account_id,
+                &recovered_coverage[0].snapshot.period,
+                recovered_coverage[0].snapshot.sequence,
+                recovered_coverage[0].snapshot.pending_events,
+                recovered_coverage[0].snapshot.lost_events,
+                &recovered_coverage[0].snapshot.observed_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed_anchor.sequence, first_coverage.snapshot.sequence);
+        assert_eq!(replayed_anchor.pending_events, 0);
+        assert_eq!(replayed_anchor.lost_events, 0);
+        recovered_repositories
+            .model_usage()
+            .complete_coverage(
+                &account_id,
+                &recovered_coverage[0].claim_id,
+                &recovered_coverage[0].snapshot.period,
+                recovered_coverage[0].snapshot.sequence,
+            )
+            .await
+            .unwrap();
+
+        let rollback_event = recovered_repositories
+            .model_usage()
+            .begin_invocation(
+                &account_id,
+                VertexOperation::EpisodeSummary,
+                "gemini-contract",
+                "us-central1",
+                &[8; 32],
+            )
+            .await
+            .unwrap();
+        recovered_repositories
+            .model_usage()
+            .settle_not_billed(&account_id, &rollback_event, 400)
+            .await
+            .unwrap();
+        let stale_coverage = recovered_repositories
+            .model_usage()
+            .pending_coverage(&account_id, &billing_account)
+            .await
+            .unwrap();
+        assert_eq!(stale_coverage.len(), 1);
+        assert_eq!(stale_coverage[0].snapshot.pending_events, 0);
+        assert_eq!(stale_coverage[0].snapshot.lost_events, 0);
+        let ahead_sequence = stale_coverage[0].snapshot.sequence.checked_add(1).unwrap();
+        let ahead_anchor = recovered_repositories
+            .billing()
+            .reconcile_vertex_coverage(
+                &account_id,
+                &stale_coverage[0].snapshot.period,
+                ahead_sequence,
+                0,
+                0,
+                &stale_coverage[0].snapshot.observed_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ahead_anchor.sequence, ahead_sequence);
+        assert_eq!(ahead_anchor.lost_events, 0);
+
+        // A genuinely stale producer predecessor must remain fail-closed. The
+        // authority advances it once and records one conservative loss; after
+        // that replacement is durable, another process can only replay the
+        // exact absolute value and may neither increment nor clear it.
+        let fail_closed_anchor = recovered_repositories
+            .billing()
+            .reconcile_vertex_coverage(
+                &account_id,
+                &stale_coverage[0].snapshot.period,
+                stale_coverage[0].snapshot.sequence,
+                stale_coverage[0].snapshot.pending_events,
+                stale_coverage[0].snapshot.lost_events,
+                &stale_coverage[0].snapshot.observed_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fail_closed_anchor.sequence, ahead_sequence + 1);
+        assert_eq!(fail_closed_anchor.pending_events, 0);
+        assert_eq!(fail_closed_anchor.lost_events, 1);
+        let fail_closed_snapshot = crate::cp::billing::VertexCoverageSnapshot {
+            account_id: stale_coverage[0].snapshot.account_id.clone(),
+            period: fail_closed_anchor.period,
+            sequence: fail_closed_anchor.sequence,
+            pending_events: fail_closed_anchor.pending_events,
+            lost_events: fail_closed_anchor.lost_events,
+            observed_at: fail_closed_anchor.observed_at,
+        };
+        recovered_repositories
+            .model_usage()
+            .persist_coverage_snapshot(
+                &account_id,
+                &stale_coverage[0].claim_id,
+                &stale_coverage[0].snapshot,
+                &fail_closed_snapshot,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query(
+                "UPDATE vertex_usage_coverage
+                    SET delivery_claim_expires_at=CURRENT_TIMESTAMP - interval '1 second'
+                  WHERE account_id=$1 AND period=$2 AND delivery_claim_id=$3",
+            )
+            .bind(&account_id)
+            .bind(&fail_closed_snapshot.period)
+            .bind(&stale_coverage[0].claim_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        let recovered_again = recovered_repositories
+            .model_usage()
+            .pending_coverage(&account_id, &billing_account)
+            .await
+            .unwrap();
+        assert_eq!(recovered_again.len(), 1);
+        assert_ne!(recovered_again[0].claim_id, stale_coverage[0].claim_id);
+        assert_eq!(recovered_again[0].snapshot, fail_closed_snapshot);
+        let stable_fail_closed_anchor = recovered_repositories
+            .billing()
+            .reconcile_vertex_coverage(
+                &account_id,
+                &recovered_again[0].snapshot.period,
+                recovered_again[0].snapshot.sequence,
+                recovered_again[0].snapshot.pending_events,
+                recovered_again[0].snapshot.lost_events,
+                &recovered_again[0].snapshot.observed_at,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stable_fail_closed_anchor.sequence,
+            fail_closed_snapshot.sequence
+        );
+        assert_eq!(stable_fail_closed_anchor.pending_events, 0);
+        assert_eq!(stable_fail_closed_anchor.lost_events, 1);
+        recovered_repositories
+            .model_usage()
+            .complete_coverage(
+                &account_id,
+                &recovered_again[0].claim_id,
+                &recovered_again[0].snapshot.period,
+                recovered_again[0].snapshot.sequence,
+            )
+            .await
+            .unwrap();
+        let final_coverage = sqlx::query(
+            "SELECT sequence,lost_events,delivery_state
+               FROM vertex_usage_coverage WHERE account_id=$1 AND period=$2",
+        )
+        .bind(&account_id)
+        .bind(&fail_closed_snapshot.period)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            final_coverage.try_get::<i64, _>("sequence").unwrap(),
+            i64::try_from(fail_closed_snapshot.sequence).unwrap()
+        );
+        assert_eq!(final_coverage.try_get::<i64, _>("lost_events").unwrap(), 1);
+        assert_eq!(
+            final_coverage
+                .try_get::<String, _>("delivery_state")
+                .unwrap(),
+            "delivered"
+        );
 
         let export = repositories
             .memory_queries()
