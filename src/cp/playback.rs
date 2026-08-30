@@ -338,6 +338,7 @@ pub(crate) struct PersonMemorySummary {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PersonMemoriesPage {
+    pub(crate) person_id: i64,
     pub(crate) memories: Vec<PersonMemorySummary>,
     pub(crate) next_cursor: Option<i64>,
 }
@@ -1406,6 +1407,19 @@ mod tests {
         assert_eq!(availability_from_counts(2, 0, 2, 0, 0), "pending");
         assert_eq!(availability_from_counts(2, 0, 0, 2, 0), "deleted");
         assert_eq!(availability_from_counts(2, 0, 0, 0, 2), "pruned");
+    }
+
+    #[test]
+    fn person_memory_pages_bind_the_exact_person_id() {
+        let value = serde_json::to_value(PersonMemoriesPage {
+            person_id: 42,
+            memories: Vec::new(),
+            next_cursor: None,
+        })
+        .unwrap();
+        assert_eq!(value["person_id"], 42);
+        assert_eq!(value["memories"], serde_json::json!([]));
+        assert!(value["next_cursor"].is_null());
     }
 
     #[test]

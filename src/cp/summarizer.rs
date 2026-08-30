@@ -914,9 +914,10 @@ async fn summarize_user_window(
 /// is bounded: one embed per upserted episode per summarizer window.
 ///
 /// Text is read back from the stored rows (title + exec summary + minute
-/// gists) so extensions embed the full §G.1-merged timeline, not just the new
-/// window. Best-effort: an absent engine or a failed embed leaves the episode
-/// FTS-only — it never fails the summarizer run.
+/// gists + the human string values in any settled final brief) so extensions
+/// embed the full memory projection, not just the new window. Best-effort: an
+/// absent engine or a failed embed leaves the episode FTS-only — it never
+/// fails the summarizer run.
 pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
     let Some(engine) = state.embedding.as_ref().cloned() else {
         return;

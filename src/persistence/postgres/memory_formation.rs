@@ -593,8 +593,15 @@ impl MemoryFormationRepository for PostgresPersistence {
         ids: &[i64],
     ) -> Result<Vec<EpisodeEmbeddingSource>> {
         let rows = sqlx::query(
-            "SELECT id,concat_ws(E'\\n',title,summary,minutes_text) AS text \
-               FROM episodes WHERE account_id=$1 AND id=ANY($2) ORDER BY id",
+            "SELECT e.id,concat_ws(E'\\n',e.title,e.summary,e.minutes_text,fb.overview, \
+                    (SELECT string_agg(value #>> '{}',E'\\n' ORDER BY ordinal) \
+                       FROM jsonb_path_query( \
+                         fb.decisions||fb.action_items||fb.important_links||fb.open_questions, \
+                         'strict $.** ? (@.type() == \"string\")' \
+                       ) WITH ORDINALITY AS strings(value,ordinal))) AS text \
+               FROM episodes e LEFT JOIN episode_final_briefs fb \
+                 ON fb.account_id=e.account_id AND fb.episode_id=e.id \
+              WHERE e.account_id=$1 AND e.id=ANY($2) ORDER BY e.id",
         )
         .bind(account_id)
         .bind(ids)

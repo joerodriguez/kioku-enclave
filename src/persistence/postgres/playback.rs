@@ -135,14 +135,15 @@ impl PlaybackRepository for PostgresPersistence {
                     floor(extract(epoch FROM o.ended_at)*1000)::bigint observation_ended_ms, \
                     floor(extract(epoch FROM s.started_at)*1000)::bigint segment_started_ms, \
                     u.start_offset_seconds,u.end_offset_seconds,u.text,u.speaker_label, \
-                    COALESCE(o.overlap,false) overlap,COALESCE(o.person_id,c.person_id) person_id, \
+                    COALESCE(o.overlap,false) overlap, \
+                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
                     p.display_name,c.attribution_state \
                FROM episode_members em \
                JOIN utterances u ON u.account_id=em.account_id AND em.record_type='utterance' AND u.id=em.record_id \
                JOIN audio_segments s ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
                LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id \
-               LEFT JOIN people p ON p.account_id=u.account_id AND p.id=COALESCE(o.person_id,c.person_id) AND p.status<>'quarantined' \
+               LEFT JOIN people p ON p.account_id=u.account_id AND p.id=COALESCE(o.person_id,c.person_id) AND p.status='identified' \
               WHERE em.account_id=$1 AND em.episode_id=$2 \
               ORDER BY COALESCE(o.started_at,s.started_at),u.id",
         )
@@ -332,6 +333,7 @@ impl PlaybackRepository for PostgresPersistence {
         let next_cursor = (memories.len() > limit).then(|| memories[limit - 1].memory_id);
         memories.truncate(limit);
         Ok(PersonMemoriesPage {
+            person_id,
             memories,
             next_cursor,
         })
