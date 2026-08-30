@@ -985,11 +985,16 @@ account to a durable `deletion_requested` admission state. That state immediatel
 blocks sign-in, capture, model invocation, worker/provider claims, checkout, and
 ordinary billing writes, but does not yet erase identity or content. Work admitted
 before that transaction is allowed to settle (and signed uploads to expire) behind the
-gate. Only after this local preflight is quiescent does the enclave resolve the
-canonical billing account, complete final usage settlement, and require the billing
-service to acknowledge its one-way deletion fence. If settlement or the remote fence is
-unavailable or its success response is lost, `DELETE /api/account` returns the durable
-`202` pending operation and the bounded reconciler retries the same idempotent fence.
+gate. Because ordinary workers enumerate only active accounts, the deletion reconciler
+also reclaims expired email, webhook, and push claims: a claim whose disclosure fence
+committed becomes terminally ambiguous and is never resent, its exact global provider
+lane is released, and a late worker cannot overwrite that settlement. Once this local
+preflight is quiescent, the enclave resolves the canonical billing account,
+conservatively records any still-`started` Vertex intent as ambiguous, completes final
+usage settlement, and requires the billing service to acknowledge its one-way deletion
+fence. If settlement or the remote fence is unavailable or its success response is lost,
+`DELETE /api/account` returns the durable `202` pending operation and the bounded
+reconciler retries the same idempotent fence.
 Only after acknowledgement does the operation transition into identity/content
 deletion. A local transition failure after fence success is therefore also recoverable
 from `deletion_requested`, rather than stranding an active account. A failure before

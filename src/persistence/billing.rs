@@ -40,6 +40,10 @@ pub struct RetainedAccountMetrics {
 
 #[async_trait]
 pub(crate) trait BillingRepository: Send + Sync {
+    /// Return an already-provisioned billing pseudonym without creating one.
+    /// Read-only recovery surfaces use this lookup so observing billing state
+    /// cannot itself provision a billing account.
+    async fn existing_billing_account_id(&self, account_id: &str) -> Result<Option<String>>;
     async fn billing_account_id(&self, account_id: &str) -> Result<String>;
     async fn billing_account_id_for_deletion(&self, account_id: &str) -> Result<String>;
 

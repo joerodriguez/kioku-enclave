@@ -892,23 +892,35 @@ async fn get_apple_account_token(
     let account_id = match state
         .repositories
         .billing()
-        .billing_account_id(&user.0)
+        .existing_billing_account_id(&user.0)
         .await
     {
-        Ok(value) => value,
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            // The external service is keyed only by this pseudonym. If no
+            // mapping exists, it cannot hold a token for the account; answer
+            // locally so this GET materializes state in neither service.
+            return valid_apple_account_token_response(AppleAccountTokenResponse {
+                app_account_token: None,
+            });
+        }
         Err(_) => return service_unavailable(),
     };
     match state.billing.apple_account_token(&account_id).await {
-        Ok(response)
-            if response
-                .app_account_token
-                .as_deref()
-                .is_none_or(canonical_uuid_v4) =>
-        {
-            no_store(Json(response).into_response())
-        }
-        Ok(_) => service_unavailable(),
+        Ok(response) => valid_apple_account_token_response(response),
         Err(error) => apple_billing_error(error),
+    }
+}
+
+fn valid_apple_account_token_response(response: AppleAccountTokenResponse) -> Response {
+    if response
+        .app_account_token
+        .as_deref()
+        .is_none_or(canonical_uuid_v4)
+    {
+        no_store(Json(response).into_response())
+    } else {
+        service_unavailable()
     }
 }
 
@@ -2684,9 +2696,23 @@ mod tests {
         .is_err());
     }
 
-    #[test]
-    fn apple_account_token_response_requires_one_exact_nullable_field() {
+    #[tokio::test]
+    async fn apple_account_token_response_requires_one_exact_nullable_field() {
         let token = "123e4567-e89b-42d3-a456-426614174000";
+        assert_eq!(
+            serde_json::to_string(&AppleAccountTokenResponse {
+                app_account_token: Some(token.into()),
+            })
+            .unwrap(),
+            format!(r#"{{"app_account_token":"{token}"}}"#)
+        );
+        assert_eq!(
+            serde_json::to_string(&AppleAccountTokenResponse {
+                app_account_token: None,
+            })
+            .unwrap(),
+            r#"{"app_account_token":null}"#
+        );
         assert_eq!(
             serde_json::from_str::<AppleAccountTokenResponse>(&format!(
                 r#"{{"app_account_token":"{token}"}}"#
@@ -2723,6 +2749,19 @@ mod tests {
         assert_eq!(
             apple_billing_error(BillingError::InvalidResponse).status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let response = valid_apple_account_token_response(AppleAccountTokenResponse {
+            app_account_token: None,
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1_024)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"app_account_token":null}"#
         );
     }
 

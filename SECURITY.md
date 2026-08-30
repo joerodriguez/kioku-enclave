@@ -94,8 +94,10 @@ misrepresent a failed read as partial success. Export failures are content-free.
 Account deletion first commits a durable `deletion_requested` tombstone that blocks sign-in, new
 work, retries, and resurrection without yet erasing identity or content. The deletion owner then:
 
-1. lets already-admitted uploads and provider effects settle or expire behind the admission fence;
-2. completes final usage settlement and idempotently establishes the remote billing deletion fence;
+1. lets already-admitted uploads and provider effects settle or expire behind the admission fence,
+   reclaiming expired outbound disclosure claims without resending them or retaining a global lane;
+2. conclusively marks any remaining begun Vertex intent ambiguous, completes final usage settlement,
+   and idempotently establishes the remote billing deletion fence;
 3. transitions the durable local state to `deleting`;
 4. revokes retained provider grants where required;
 5. deletes exact current and noncurrent owned media generations;

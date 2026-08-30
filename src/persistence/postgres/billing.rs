@@ -117,6 +117,15 @@ fn lease_row(row: &sqlx::postgres::PgRow, state: String) -> Result<RecordingLeas
 
 #[async_trait]
 impl BillingRepository for PostgresPersistence {
+    async fn existing_billing_account_id(&self, account_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT billing_account_id FROM billing_accounts WHERE account_id=$1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
     async fn billing_account_id(&self, account_id: &str) -> Result<String> {
         let proposed = format!("acct_{}", crate::cp::tokens::random_token_hex());
         let mut transaction = self.pool().begin().await?;

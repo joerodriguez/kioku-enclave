@@ -9,14 +9,14 @@ migrator applies the append-only files under `migrations/`.
 |---|---|
 | `mod.rs` | TLS PostgreSQL pool construction, UTC/statement-timeout policy, schema verification, explicit migration ladder/lock, and shared transaction helpers. |
 | `admission.rs` | Fleet token buckets and crash-recoverable concurrency leases. |
-| `billing.rs` | Billing pseudonyms, recording lease/credit receipts, coverage anchors, retained-account metrics, and detach work. |
+| `billing.rs` | Creating and lookup-only billing pseudonym resolution, recording lease/credit receipts, coverage anchors, retained-account metrics, and detach work. |
 | `capture.rs` | Atomic capture/reference admission, media metadata, receipts, event/session status, and replay. |
 | `delivery_outbox.rs` | Fleet-owned email, webhook, and push candidate selection, frozen requests, claims, expiry takeover, and exact settlement. |
 | `entitlement.rs` | Active-account checks and atomic daily quota/Vertex reservations. |
 | `episode_deletion.rs` | Durable logical freeze, exact GCS inventory, provider-cleanup progress, structured purge, and replay receipt. |
 | `finalization.rs` | Finalization claims, source projection, and atomic recap/episode/outbox settlement. |
 | `identity.rs` | Accounts, provider identities, signup budget, Apple credentials/grants, and coherent session reads. |
-| `lifecycle.rs` | Pre-fence account admission tombstones, deletion ownership/progress, transactionally marked reviewer-fixture refusal, revocation settlement, cascading purge, and no-resurrection checks. |
+| `lifecycle.rs` | Pre-fence account admission tombstones, deletion-owned recovery of expired outbound claims/global lanes, deletion ownership/progress, transactionally marked reviewer-fixture refusal, revocation settlement, cascading purge, and no-resurrection checks. |
 | `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection with stable owner-source classification, voice jobs, bounded retry/resurrection, and retention progress. |
 | `memory_formation.rs` | Summarizer windows, turn-timed source projections, episode/member writes, embeddings, and atomic durable cursor settlement. |
 | `model_usage.rs` | Paid-model intents/outcomes, usage batch claims/delivery, and coverage reconciliation. |

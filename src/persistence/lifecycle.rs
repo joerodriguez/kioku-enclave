@@ -32,8 +32,12 @@ pub(crate) trait AccountLifecycleRepository: Send + Sync {
         account_id: &str,
     ) -> Result<Option<AccountDeletionOperation>>;
 
-    /// True only after every locally admitted upload/provider effect has
-    /// settled behind the durable deletion-request admission fence.
+    /// True only after every locally admitted upload/provider disclosure has
+    /// settled behind the durable deletion-request admission fence. The
+    /// implementation reclaims expired outbound claims here because normal
+    /// active-account schedulers intentionally stop visiting this account.
+    /// Vertex starts are conclusively settled by the deletion-owned usage
+    /// flush that follows this local preflight.
     async fn account_deletion_preflight_complete(&self, account_id: &str) -> Result<bool>;
 
     async fn begin_account_deletion(

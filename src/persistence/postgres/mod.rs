@@ -381,7 +381,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{PostgresPersistence, PostgresPoolConfig};
+    use super::{advisory_transaction_lock, PostgresPersistence, PostgresPoolConfig};
     use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
     use crate::gcs::FakeGcs;
@@ -1339,6 +1339,25 @@ mod tests {
         assert_eq!(allowed, 2, "the protected audio budget is fleet-wide");
 
         let mut billing_lookups = Vec::new();
+        assert_eq!(
+            repositories
+                .billing()
+                .existing_billing_account_id(&account_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM billing_accounts WHERE account_id=$1"
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "lookup-only billing resolution must not provision a mapping"
+        );
         for _ in 0..8 {
             let repositories = Arc::clone(&repositories);
             let account_id = account_id.clone();
@@ -1360,6 +1379,26 @@ mod tests {
         }
         let billing_account_id = billing_account_id.unwrap();
         assert!(billing_account_id.starts_with("acct_"));
+        assert_eq!(
+            repositories
+                .billing()
+                .existing_billing_account_id(&account_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(billing_account_id.as_str())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM billing_accounts WHERE account_id=$1"
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "purchase-time billing resolution must still provision one stable mapping"
+        );
         assert_eq!(
             repositories
                 .billing()
@@ -3174,6 +3213,149 @@ mod tests {
             1
         );
 
+        // Re-create one admitted provider call in every global lane, then
+        // crash its worker after the durable disclosure fence commits. Once
+        // account deletion owns admission, the active-only scheduler will no
+        // longer visit these rows; deletion preflight must recover them.
+        let deletion_delivery_episode_id = 9_001_i64;
+        sqlx::query(
+            "INSERT INTO episodes( \
+                account_id,id,started_at,ended_at,type,title,participants,languages, \
+                finalized_at,finalization_version,finalization_status) \
+             VALUES($1,$2,clock_timestamp()-interval '2 minutes', \
+                    clock_timestamp()-interval '1 minute','meeting','Deletion crash fixture', \
+                    '[]'::jsonb,'[]'::jsonb,clock_timestamp(),1,'complete')",
+        )
+        .bind(&account_id)
+        .bind(deletion_delivery_episode_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_final_briefs( \
+                account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
+             VALUES($1,$2,'Deletion crash fixture','[]'::jsonb,'[]'::jsonb, \
+                    '[]'::jsonb,'[]'::jsonb)",
+        )
+        .bind(&account_id)
+        .bind(deletion_delivery_episode_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO email_deliveries( \
+                account_id,episode_id,delivery_version,delivery_id,include_content,state) \
+             VALUES($1,$2,1,'deliv_deletion_crash',true,'pending')",
+        )
+        .bind(&account_id)
+        .bind(deletion_delivery_episode_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries( \
+                account_id,episode_id,subscription_id,delivery_version,event_id,state) \
+             VALUES($1,$2,$3,1,'evt_deletion_crash','pending')",
+        )
+        .bind(&account_id)
+        .bind(deletion_delivery_episode_id)
+        .bind(&webhook.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deletion_push_binding = format!("p1:{}:{}", installed.id, installed.token_generation);
+        sqlx::query(
+            "INSERT INTO push_deliveries( \
+                account_id,episode_id,installation_binding,delivery_version,delivery_id, \
+                handoff_handle,collapse_id,state) \
+             VALUES($1,$2,$3,1,'push_deletion_crash','handoff_deletion_crash', \
+                    'collapse_deletion_crash','pending')",
+        )
+        .bind(&account_id)
+        .bind(deletion_delivery_episode_id)
+        .bind(&deletion_push_binding)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_send_lanes SET owner_token=NULL,lease_until=NULL, \
+                    next_send_at=clock_timestamp(),circuit_until=NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE webhook_subscriptions SET enabled=true WHERE account_id=$1 AND id=$2")
+            .bind(&account_id)
+            .bind(&webhook.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let deletion_email_candidate = repositories
+            .deliveries()
+            .next_email_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("email candidate before deletion admission closes");
+        let deletion_email_claim = repositories
+            .deliveries()
+            .claim_email(
+                &deletion_email_candidate,
+                FrozenEmailDelivery {
+                    recipient_email: deletion_email_candidate.recipient_email.clone(),
+                    include_content: deletion_email_candidate.include_content,
+                    subject: "Deletion crash contract".into(),
+                    text_body: "Deletion crash contract".into(),
+                    html_body: "<p>Deletion crash contract</p>".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("email claim before deletion admission closes");
+        let deletion_webhook_candidate = repositories
+            .deliveries()
+            .next_webhook_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("webhook candidate before deletion admission closes");
+        let deletion_webhook_claim = repositories
+            .deliveries()
+            .claim_webhook(
+                &deletion_webhook_candidate,
+                FrozenWebhookDelivery {
+                    endpoint_url: deletion_webhook_candidate.endpoint_url.clone(),
+                    signing_secret: deletion_webhook_candidate.signing_secret.clone(),
+                    include_content: deletion_webhook_candidate.include_content,
+                    event_body: "{\"deletion_crash\":true}".into(),
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("webhook claim before deletion admission closes");
+        let deletion_push_candidate = repositories
+            .deliveries()
+            .next_push_candidate(&account_id)
+            .await
+            .unwrap()
+            .expect("push candidate before deletion admission closes");
+        let deletion_push_claim = repositories
+            .deliveries()
+            .claim_push(
+                &deletion_push_candidate,
+                FrozenPushDelivery {
+                    topic: deletion_push_candidate.topic.clone(),
+                    environment: deletion_push_candidate.environment.clone(),
+                    device_token: deletion_push_candidate.device_token.clone(),
+                    token_generation: deletion_push_candidate.token_generation,
+                },
+                60,
+            )
+            .await
+            .unwrap()
+            .expect("push claim before deletion admission closes");
+
         let billing_detach_id = repositories
             .billing()
             .billing_account_id_for_deletion(&account_id)
@@ -3236,11 +3418,69 @@ mod tests {
                 .unwrap(),
             Some(AccountStatus::DeletionRequested)
         );
-        assert!(!repositories
-            .lifecycle()
-            .account_deletion_preflight_complete(&account_id)
+        // Reproduce each notification/deletion lock race deterministically.
+        // Real configuration mutations own one of these advisory locks before
+        // require_active_account locks the account row. Preflight must wait
+        // here without already owning that row, or the transactions deadlock.
+        for (namespace, value) in [
+            ("email-preference", account_id.clone()),
+            ("webhook-registry", account_id.clone()),
+            ("push-registry", "global".into()),
+        ] {
+            let mut config_transaction = pool.begin().await.unwrap();
+            advisory_transaction_lock(&mut config_transaction, namespace, &value)
+                .await
+                .unwrap();
+            let preflight_repositories = Arc::clone(&repositories);
+            let preflight_account_id = account_id.clone();
+            let preflight_task = tokio::spawn(async move {
+                preflight_repositories
+                    .lifecycle()
+                    .account_deletion_preflight_complete(&preflight_account_id)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let waiting = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks \
+                           WHERE locktype='advisory' AND NOT granted)",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .unwrap());
+            .expect("deletion preflight did not reach the held provider advisory lock");
+            let config_status = tokio::time::timeout(
+                Duration::from_millis(500),
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM accounts WHERE id=$1 FOR UPDATE",
+                )
+                .bind(&account_id)
+                .fetch_one(&mut *config_transaction),
+            )
+            .await
+            .expect("provider configuration row check deadlocked with deletion preflight")
+            .unwrap();
+            assert_eq!(config_status, "deletion_requested", "{namespace}");
+            config_transaction.rollback().await.unwrap();
+            assert!(!preflight_task.await.unwrap().unwrap(), "{namespace}");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM provider_send_lanes WHERE owner_token IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            3,
+            "unexpired calls retain their exact provider authority"
+        );
         assert!(matches!(
             repositories
                 .model_usage()
@@ -3269,11 +3509,36 @@ mod tests {
             )
             .await
             .is_err());
-        repositories
-            .model_usage()
-            .settle_ambiguous(&account_id, &deletion_race_invocation, None)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&deletion_email_claim.delivery_id)
+        .bind(&deletion_email_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE webhook_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND event_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&deletion_webhook_claim.event_id)
+        .bind(&deletion_webhook_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE push_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+              WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
+        )
+        .bind(&account_id)
+        .bind(&deletion_push_claim.delivery_id)
+        .bind(&deletion_push_claim.claim_token)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE capture_upload_intents SET expires_at=now()-interval '1 second' \
               WHERE account_id=$1 AND event_id='deletion-race-event'",
@@ -3287,6 +3552,138 @@ mod tests {
             .account_deletion_preflight_complete(&account_id)
             .await
             .unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&deletion_email_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "ambiguous"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM webhook_deliveries WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&deletion_webhook_claim.event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "ambiguous"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM push_deliveries WHERE account_id=$1 AND delivery_id=$2",
+            )
+            .bind(&account_id)
+            .bind(&deletion_push_claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "ambiguous"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT count(*) FROM email_send_fences WHERE account_id=$1) + \
+                        (SELECT count(*) FROM webhook_send_fences WHERE account_id=$1) + \
+                        (SELECT count(*) FROM push_send_fences WHERE account_id=$1)",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM provider_send_lanes WHERE owner_token IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "expired deletion-owned calls cannot globally wedge provider lanes"
+        );
+        assert!(matches!(
+            repositories
+                .lifecycle()
+                .begin_account_deletion(&account_id)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(message))
+                if message == "account has an in-flight Vertex invocation"
+        ));
+
+        // A provider response racing restart recovery is acknowledged only as
+        // an idempotent stale settlement; it cannot overwrite ambiguity or
+        // reacquire/release a successor's global lane.
+        repositories
+            .deliveries()
+            .settle_email(
+                &deletion_email_claim,
+                EmailProviderOutcome::Accepted {
+                    status: 202,
+                    provider_message_id: "late-after-deletion".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        repositories
+            .deliveries()
+            .settle_webhook(
+                &deletion_webhook_claim,
+                WebhookProviderOutcome::Sent { status: 204 },
+                None,
+            )
+            .await
+            .unwrap();
+        repositories
+            .deliveries()
+            .settle_push(
+                &deletion_push_claim,
+                PushProviderOutcome::Accepted { status: 200 },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT count(*) FROM email_deliveries \
+                            WHERE account_id=$1 AND state='ambiguous') + \
+                        (SELECT count(*) FROM webhook_deliveries \
+                            WHERE account_id=$1 AND state='ambiguous') + \
+                        (SELECT count(*) FROM push_deliveries \
+                            WHERE account_id=$1 AND state='ambiguous')",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            3
+        );
+
+        let deletion_usage = repositories
+            .model_usage()
+            .pending_events(&account_id, &billing_detach_id, true)
+            .await
+            .unwrap()
+            .expect("deletion-owned Vertex start must become deliverable");
+        assert!(deletion_usage.events.iter().any(|event| {
+            event.event_id == deletion_race_invocation && event.outcome == "ambiguous"
+        }));
+        let deletion_usage_ids = deletion_usage
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>();
+        repositories
+            .model_usage()
+            .complete_delivery(&account_id, &deletion_usage.claim_id, &deletion_usage_ids)
+            .await
+            .unwrap();
         let deletion = repositories
             .lifecycle()
             .begin_account_deletion(&account_id)
