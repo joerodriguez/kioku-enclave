@@ -18,6 +18,7 @@ mod lifecycle;
 mod media_object;
 mod media_processing;
 mod memory_formation;
+mod memory_reconciliation;
 mod model_usage;
 mod notification;
 mod oauth;
@@ -51,8 +52,8 @@ pub(crate) use episode_deletion::{
     EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart,
 };
 pub(crate) use finalization::{
-    FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationRequest,
-    FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
+    FinalizationClaim, FinalizationClaimRequest, FinalizationEpisode, FinalizationRepository,
+    FinalizationRequest, FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
     FinalizationUtterance,
 };
 pub(crate) use gcs_media::GcsMediaObjectStore;
@@ -70,6 +71,13 @@ pub(crate) use memory_formation::{
     EpisodeEmbeddingSource, EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode,
     SummaryScreenshot, SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,
 };
+pub(crate) use memory_reconciliation::{
+    reconciliation_outputs_commitment, MemoryHandleResolution, MemoryHandleState,
+    MemoryReconciliationRepository, ReconciledMemoryWrite, ReconciliationClaim,
+    ReconciliationDraft, ReconciliationEvidenceAtom, ReconciliationPublish,
+    ReconciliationPublishResult, ReconciliationSnapshot, ReconciliationStageWrite,
+    StagedReconciliation,
+};
 pub(crate) use model_usage::{
     ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
 };
@@ -81,8 +89,10 @@ pub(crate) use oauth::{
     OAuthRepository, PendingConsent, RefreshTokenRotation,
 };
 pub(crate) use playback::PlaybackRepository;
-pub(crate) use postgres::EXPECTED_SCHEMA_VERSION;
-pub(crate) use postgres::{PostgresPersistence, PostgresPoolConfig};
+pub(crate) use postgres::{
+    verify_schema_finalization_authorization, PostgresPersistence, PostgresPoolConfig,
+    SchemaFinalizationReceipt, SchemaFinalizationSignature, VerifiedSchemaFinalizationReceipt,
+};
 pub(crate) use query::{
     extract_speaker_filter, rrf_merge, CaptureStatus, EpisodeListPage, EpisodeListRequest,
     McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedPage,
@@ -126,6 +136,7 @@ pub(crate) struct RepositorySet {
     media_objects: Arc<dyn MediaObjectStore>,
     media_processing: Arc<dyn MediaProcessingRepository>,
     memory_formation: Arc<dyn MemoryFormationRepository>,
+    memory_reconciliation: Arc<dyn MemoryReconciliationRepository>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
 }
@@ -153,6 +164,8 @@ impl RepositorySet {
             media_objects,
             media_processing: Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>,
             memory_formation: Arc::clone(&persistence) as Arc<dyn MemoryFormationRepository>,
+            memory_reconciliation: Arc::clone(&persistence)
+                as Arc<dyn MemoryReconciliationRepository>,
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
             work: persistence,
         }
@@ -232,6 +245,10 @@ impl RepositorySet {
 
     pub(crate) fn memory_formation(&self) -> &dyn MemoryFormationRepository {
         self.memory_formation.as_ref()
+    }
+
+    pub(crate) fn memory_reconciliation(&self) -> &dyn MemoryReconciliationRepository {
+        self.memory_reconciliation.as_ref()
     }
 
     pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {

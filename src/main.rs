@@ -118,6 +118,10 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "VERTEX_PROJECT",
     "VERTEX_LOCATION",
     "VERTEX_MODEL",
+    "VERTEX_RECONCILIATION_MODEL",
+    "MEMORY_RECONCILIATION_WRITER_ENABLED",
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64",
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
     "POSTGRES_MAX_CONNECTIONS",
     "HEALTH_PORT",
     "DRAIN_TIMEOUT_SECONDS",
@@ -677,10 +681,7 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let postgres_migration_only = std::env::args().nth(1).as_deref() == Some("--migrate-postgres");
-    if !postgres_migration_only {
-        load_baked_image_configuration();
-    }
+    load_baked_image_configuration();
     // Do not let Tokio create worker threads before the image-baked security
     // configuration has been parsed and installed. The Tokio main attribute
     // constructs the runtime before entering the
@@ -1108,6 +1109,14 @@ async fn async_main() {
         .verify_schema()
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL is not release-ready: {error}"));
+    if cp_config.memory_reconciliation_writer_enabled {
+        postgres
+            .verify_reconciliation_writer_schema()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("memory reconciliation writer is not release-ready: {error}")
+            });
+    }
     let media_objects: Arc<dyn persistence::MediaObjectStore> = Arc::new(
         persistence::GcsMediaObjectStore::new(Arc::clone(&application_media_gcs)),
     );
@@ -1257,15 +1266,89 @@ async fn async_main() {
     }
 }
 
-/// One-shot release role used by the private Cloud Run migration job.
-///
-/// It deliberately runs before image configuration, KMS, GCS, provider, model,
-/// listener, and worker construction. The job can therefore hold only the two
-/// PostgreSQL secret grants and cannot accidentally become a serving runtime.
-async fn migrate_postgres_release_schema() {
-    if std::env::var("POSTGRES_MIGRATION_CONFIRM").as_deref() != Ok("empty-production-adr0040") {
-        panic!("POSTGRES_MIGRATION_CONFIRM must authorize the ADR-0040 empty-database release");
+const MEMORY_RECONCILIATION_EXPAND_CONFIRM: &str = "memory-reconciliation-v26-expand";
+const MEMORY_RECONCILIATION_FINALIZE_CONFIRM: &str = "memory-reconciliation-v26-finalize";
+const POSTGRES_FINALIZATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_RECEIPT";
+const POSTGRES_FINALIZATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_SIGNATURE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostgresMigrationReleasePhase {
+    ExpandMemoryReconciliation,
+    FinalizeMemoryReconciliation,
+}
+
+fn postgres_migration_release_phase(
+    confirmation: Option<&str>,
+) -> Result<PostgresMigrationReleasePhase, &'static str> {
+    match confirmation {
+        Some(MEMORY_RECONCILIATION_EXPAND_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::ExpandMemoryReconciliation)
+        }
+        Some(MEMORY_RECONCILIATION_FINALIZE_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::FinalizeMemoryReconciliation)
+        }
+        _ => {
+            Err("POSTGRES_MIGRATION_CONFIRM must authorize the exact reviewed schema release phase")
+        }
     }
+}
+
+fn postgres_schema_finalization_receipt(
+    raw_receipt: Option<&str>,
+    raw_signature: Option<&str>,
+) -> Result<persistence::VerifiedSchemaFinalizationReceipt, String> {
+    let raw_receipt = raw_receipt.ok_or_else(|| {
+        format!("{POSTGRES_FINALIZATION_RECEIPT_ENV} is required for schema finalization")
+    })?;
+    let receipt: persistence::SchemaFinalizationReceipt = serde_json::from_str(raw_receipt)
+        .map_err(|error| {
+            format!(
+                "{POSTGRES_FINALIZATION_RECEIPT_ENV} must contain the strict fleet receipt: {error}"
+            )
+        })?;
+    let raw_signature = raw_signature.ok_or_else(|| {
+        format!("{POSTGRES_FINALIZATION_SIGNATURE_ENV} is required for schema finalization")
+    })?;
+    let signature = persistence::SchemaFinalizationSignature::from_base64(raw_signature)
+        .map_err(|error| format!("{POSTGRES_FINALIZATION_SIGNATURE_ENV} is invalid: {error}"))?;
+    let authorization =
+        persistence::verify_schema_finalization_authorization(receipt, signature)
+            .map_err(|error| format!("schema finalization authorization is invalid: {error}"))?;
+    if !authorization.has_exact_canonical_transport(raw_receipt) {
+        return Err(format!(
+            "{POSTGRES_FINALIZATION_RECEIPT_ENV} must be the exact canonical signed bytes"
+        ));
+    }
+    Ok(authorization)
+}
+
+/// Dedicated release role used by the private Cloud Run migration job.
+///
+/// It deliberately runs after the same fixed baked configuration loader used
+/// by serving (the Ed25519 trust anchor is public image identity), but before
+/// KMS, GCS, provider, model, listener, and worker construction. The job can
+/// therefore hold only PostgreSQL credentials plus the detached receipt and
+/// signature and cannot choose its verification key or become a serving runtime.
+/// The expand and finalize confirmations are distinct so a marker advance can
+/// never be inferred from successful DDL or performed before fleet inventory.
+async fn migrate_postgres_release_schema() {
+    let confirmation = std::env::var("POSTGRES_MIGRATION_CONFIRM").ok();
+    let phase = postgres_migration_release_phase(confirmation.as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
+    let finalization_receipt = match phase {
+        PostgresMigrationReleasePhase::FinalizeMemoryReconciliation => {
+            let raw_receipt = std::env::var(POSTGRES_FINALIZATION_RECEIPT_ENV).ok();
+            let raw_signature = std::env::var(POSTGRES_FINALIZATION_SIGNATURE_ENV).ok();
+            Some(
+                postgres_schema_finalization_receipt(
+                    raw_receipt.as_deref(),
+                    raw_signature.as_deref(),
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+            )
+        }
+        PostgresMigrationReleasePhase::ExpandMemoryReconciliation => None,
+    };
     let database_url = std::env::var("POSTGRES_DATABASE_URL")
         .expect("POSTGRES_DATABASE_URL is required by --migrate-postgres");
     let root_ca_pem = std::env::var("POSTGRES_ROOT_CA_PEM")
@@ -1280,22 +1363,84 @@ async fn migrate_postgres_release_schema() {
     })
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
-    persistence
-        .migrate()
-        .await
-        .unwrap_or_else(|error| panic!("PostgreSQL migration failed: {error}"));
-    let account_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM accounts")
-        .fetch_one(persistence.pool())
-        .await
-        .unwrap_or_else(|error| panic!("PostgreSQL empty-production check failed: {error}"));
-    assert_eq!(
-        account_count, 0,
-        "ADR-0040 initial migration refuses a database containing production accounts"
-    );
+    let result = match phase {
+        PostgresMigrationReleasePhase::ExpandMemoryReconciliation => {
+            persistence
+                .expand_memory_reconciliation_release_schema()
+                .await
+        }
+        PostgresMigrationReleasePhase::FinalizeMemoryReconciliation => {
+            persistence
+                .finalize_memory_reconciliation_release_schema(
+                    finalization_receipt.as_ref().expect(
+                        "finalization authorization was verified before PostgreSQL connection",
+                    ),
+                )
+                .await
+        }
+    }
+    .unwrap_or_else(|error| panic!("PostgreSQL migration phase failed: {error}"));
     println!(
-        "ADR-0040 PostgreSQL schema version {} installed and verified empty",
-        persistence::EXPECTED_SCHEMA_VERSION
+        "{}",
+        serde_json::to_string(&result).expect("PostgreSQL schema-release result must serialize")
     );
+}
+
+#[cfg(test)]
+mod postgres_migration_release_tests {
+    use super::{
+        postgres_migration_release_phase, postgres_schema_finalization_receipt,
+        PostgresMigrationReleasePhase, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
+        MEMORY_RECONCILIATION_FINALIZE_CONFIRM,
+    };
+
+    #[test]
+    fn populated_schema_release_requires_an_exact_phase_confirmation() {
+        assert_eq!(
+            postgres_migration_release_phase(Some(MEMORY_RECONCILIATION_EXPAND_CONFIRM)).unwrap(),
+            PostgresMigrationReleasePhase::ExpandMemoryReconciliation
+        );
+        assert_eq!(
+            postgres_migration_release_phase(Some(MEMORY_RECONCILIATION_FINALIZE_CONFIRM)).unwrap(),
+            PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
+        );
+        for refused in [
+            None,
+            Some(""),
+            Some("empty-production-adr0040"),
+            Some("memory-reconciliation-v26"),
+        ] {
+            assert!(postgres_migration_release_phase(refused).is_err());
+        }
+    }
+
+    #[test]
+    fn finalization_requires_strict_receipt_and_detached_signature_inputs() {
+        assert!(postgres_schema_finalization_receipt(None, None).is_err());
+        assert!(postgres_schema_finalization_receipt(Some("{}"), None).is_err());
+        let receipt = serde_json::json!({
+            "contract": "kioku.postgresql.schema-finalization",
+            "contract_version": 1,
+            "release_version": 26,
+            "expand_contract_sha256": format!("sha256:{}", "0".repeat(64)),
+            "candidate_image_digest": format!("sha256:{}", "1".repeat(64)),
+            "fleet_evidence_sha256": format!("sha256:{}", "2".repeat(64)),
+            "observed_at": "2026-08-30T12:00:00.000Z",
+            "expires_at": "2026-08-30T12:10:00.000Z",
+            "candidate_instances": 2,
+            "predecessor_instances": 0,
+            "unavailable_instances": 0,
+            "writer_enabled": false
+        });
+        assert!(postgres_schema_finalization_receipt(Some(&receipt.to_string()), None).is_err());
+        let mut with_unknown = receipt;
+        with_unknown["unreviewed"] = serde_json::json!(true);
+        assert!(postgres_schema_finalization_receipt(
+            Some(&with_unknown.to_string()),
+            Some("not-base64")
+        )
+        .is_err());
+    }
 }
 /// that connection.
 async fn serve_tls<F>(

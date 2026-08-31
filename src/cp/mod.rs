@@ -32,6 +32,7 @@ pub mod oauth;
 pub mod playback;
 pub mod push;
 pub mod query;
+pub mod reconciler;
 pub mod retention;
 pub mod screen_understanding;
 pub mod summarizer;
@@ -104,6 +105,16 @@ pub struct CpConfig {
     pub vertex_project: String,
     pub vertex_location: String,
     pub vertex_model: String,
+    /// Exact optional operator request, retained separately from the resolved
+    /// model for rollout evidence.
+    pub vertex_reconciliation_model_requested: Option<String>,
+    /// Optional stronger model used only for settled memory-topology
+    /// reconciliation. Keeping this separate lets operators qualify the
+    /// writer without changing the latency-sensitive summarizer model.
+    pub vertex_reconciliation_model: String,
+    /// The topology writer is deliberately dark by default. PostgreSQL still
+    /// owns all claims when enabled; this flag is only a rollout gate.
+    pub memory_reconciliation_writer_enabled: bool,
     /// Service-wide ceiling on new accounts per UTC day. Image-baked and
     /// required: signup is open to any verified identity, so this is the only
     /// bound on account creation and it must not have a permissive default.
@@ -171,6 +182,33 @@ fn validate_https_origin(name: &str, value: &str) -> crate::error::Result<String
         )));
     }
     Ok(value.trim_end_matches('/').to_string())
+}
+
+fn reconciliation_writer_enabled_from_config(value: Option<&str>) -> crate::error::Result<bool> {
+    match value.unwrap_or_default() {
+        "" | "false" => Ok(false),
+        "true" => Err(crate::error::EnclaveError::Config(
+            "memory reconciliation writer activation requires a durable fleet-wide activation protocol and is unavailable in this release".into(),
+        )),
+        _ => Err(crate::error::EnclaveError::Config(
+            "MEMORY_RECONCILIATION_WRITER_ENABLED must be false or empty".into(),
+        )),
+    }
+}
+
+fn reconciliation_model_from_config(
+    requested: Option<String>,
+    fallback: &str,
+) -> crate::error::Result<(Option<String>, String)> {
+    let requested = requested.filter(|value| !value.trim().is_empty());
+    let resolved = requested.clone().unwrap_or_else(|| fallback.to_string());
+    if !vertex_model_name_is_billing_safe(&resolved) {
+        return Err(crate::error::EnclaveError::Config(
+            "VERTEX_RECONCILIATION_MODEL must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'"
+                .into(),
+        ));
+    }
+    Ok((requested, resolved))
 }
 
 impl CpConfig {
@@ -360,6 +398,14 @@ impl CpConfig {
                 "VERTEX_MODEL must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'".into(),
             ));
         }
+        let (vertex_reconciliation_model_requested, vertex_reconciliation_model) =
+            reconciliation_model_from_config(
+                std::env::var("VERTEX_RECONCILIATION_MODEL").ok(),
+                &vertex_model,
+            )?;
+        let reconciliation_writer_raw = std::env::var("MEMORY_RECONCILIATION_WRITER_ENABLED").ok();
+        let memory_reconciliation_writer_enabled =
+            reconciliation_writer_enabled_from_config(reconciliation_writer_raw.as_deref())?;
         let billing_enforcement_mode = match std::env::var("BILLING_ENFORCEMENT_MODE")
             .unwrap_or_else(|_| {
                 if crate::test_mode_enabled() {
@@ -400,6 +446,9 @@ impl CpConfig {
             vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
             vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
             vertex_model,
+            vertex_reconciliation_model_requested,
+            vertex_reconciliation_model,
+            memory_reconciliation_writer_enabled,
             signup_limit_per_day,
             quota_vertex_output_tokens_per_day: parse_i64(
                 "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
@@ -616,7 +665,32 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
 
 #[cfg(test)]
 mod configuration_tests {
-    use super::{reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig};
+    use super::{
+        reconciliation_model_from_config, reconciliation_writer_enabled_from_config,
+        reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig,
+    };
+
+    #[test]
+    fn memory_reconciliation_writer_is_hard_dark_until_fleet_activation_exists() {
+        assert!(!reconciliation_writer_enabled_from_config(None).unwrap());
+        assert!(!reconciliation_writer_enabled_from_config(Some("")).unwrap());
+        assert!(!reconciliation_writer_enabled_from_config(Some("false")).unwrap());
+        assert!(reconciliation_writer_enabled_from_config(Some("true")).is_err());
+        assert!(reconciliation_writer_enabled_from_config(Some("1")).is_err());
+    }
+
+    #[test]
+    fn reconciliation_model_preserves_requested_and_resolved_provenance() {
+        let (requested, resolved) = reconciliation_model_from_config(None, "gemini-fast").unwrap();
+        assert_eq!(requested, None);
+        assert_eq!(resolved, "gemini-fast");
+
+        let (requested, resolved) =
+            reconciliation_model_from_config(Some("gemini-strong".into()), "gemini-fast").unwrap();
+        assert_eq!(requested.as_deref(), Some("gemini-strong"));
+        assert_eq!(resolved, "gemini-strong");
+        assert!(reconciliation_model_from_config(Some("bad model".into()), "gemini-fast").is_err());
+    }
 
     #[test]
     fn reviewer_account_id_uses_the_exact_namespaced_identity_derivation() {

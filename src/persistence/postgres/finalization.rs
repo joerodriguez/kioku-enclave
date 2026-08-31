@@ -8,8 +8,8 @@ use crate::{
     cp::{isotime, tokens},
     error::{EnclaveError, Result},
     persistence::{
-        FinalizationClaim, FinalizationEpisode, FinalizationRepository, FinalizationRequest,
-        FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
+        FinalizationClaim, FinalizationClaimRequest, FinalizationEpisode, FinalizationRepository,
+        FinalizationRequest, FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
     },
 };
 
@@ -61,6 +61,7 @@ impl FinalizationRepository for PostgresPersistence {
         account_id: &str,
         episode_id: i64,
         finalization_version: i64,
+        require_reconciled: bool,
     ) -> Result<FinalizationRequest> {
         if finalization_version <= 0 {
             return Err(EnclaveError::InvalidRequest(
@@ -69,7 +70,7 @@ impl FinalizationRepository for PostgresPersistence {
         }
         let mut transaction = self.pool().begin().await?;
         let row = sqlx::query(
-            "SELECT substance,finalized_at IS NOT NULL AS finalized,\
+            "SELECT substance,structure_state,finalized_at IS NOT NULL AS finalized,\
                     coalesce(finalization_version,0) AS version,finalization_status \
                FROM episodes WHERE account_id=$1 AND id=$2 FOR UPDATE",
         )
@@ -82,6 +83,10 @@ impl FinalizationRepository for PostgresPersistence {
             return Ok(FinalizationRequest::NotFound);
         };
         let status: String = row.try_get("finalization_status")?;
+        if require_reconciled && row.try_get::<String, _>("structure_state")? != "reconciled" {
+            transaction.rollback().await?;
+            return Ok(FinalizationRequest::AwaitingReconciliation);
+        }
         if row.try_get::<String, _>("substance")? == "none" {
             transaction.rollback().await?;
             return Ok(FinalizationRequest::LowSignal);
@@ -112,13 +117,17 @@ impl FinalizationRepository for PostgresPersistence {
 
     async fn claim_finalization(
         &self,
-        account_id: &str,
-        target_episode_id: Option<i64>,
-        now: &str,
-        horizon_before: &str,
-        finalization_version: i64,
-        lease_seconds: i64,
+        request: FinalizationClaimRequest<'_>,
     ) -> Result<Option<FinalizationClaim>> {
+        let FinalizationClaimRequest {
+            account_id,
+            target_episode_id,
+            now,
+            horizon_before,
+            finalization_version,
+            lease_seconds,
+            require_reconciled,
+        } = request;
         let now_ms = timestamp(now, "finalization claim time")?;
         let horizon_ms = timestamp(horizon_before, "finalization horizon")?;
         if finalization_version <= 0 || !(1..=3_600).contains(&lease_seconds) {
@@ -133,6 +142,7 @@ impl FinalizationRepository for PostgresPersistence {
                 SELECT e.id FROM episodes e JOIN accounts a ON a.id=e.account_id \
                  WHERE e.account_id=$1 AND a.status='active' AND e.substance!='none' \
                    AND e.finalization_status!='deleting' \
+                   AND (NOT $8::bool OR e.structure_state='reconciled') \
                    AND ($2::bigint IS NULL OR e.id=$2) \
                    AND e.ended_at<to_timestamp($3::double precision/1000.0) \
                    AND a.summarized_until>=e.ended_at+interval '4 hours' \
@@ -156,6 +166,8 @@ impl FinalizationRepository for PostgresPersistence {
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
                     e.type,e.title,e.summary,e.participants::text AS participants,\
                     e.languages::text AS languages,e.action_items::text AS action_items,\
+                    e.structure_state,e.minute_summaries::text AS stored_minute_summaries,\
+                    e.minutes_text,\
                     e.identity_revision,e.finalization_attempt_count",
         )
         .bind(account_id)
@@ -169,6 +181,7 @@ impl FinalizationRepository for PostgresPersistence {
                 EnclaveError::InvalidRequest("finalization lease is invalid".into())
             })?,
         ))?)
+        .bind(require_reconciled)
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(row) = row else {
@@ -188,6 +201,9 @@ impl FinalizationRepository for PostgresPersistence {
             participants: row.try_get("participants")?,
             languages: row.try_get("languages")?,
             action_items: row.try_get("action_items")?,
+            structure_state: row.try_get("structure_state")?,
+            minute_summaries: json_value(row.try_get("stored_minute_summaries")?),
+            minutes_text: row.try_get("minutes_text")?,
         };
         let input_identity_revision: i64 = row.try_get("identity_revision")?;
         let attempt_count: i64 = row.try_get("finalization_attempt_count")?;

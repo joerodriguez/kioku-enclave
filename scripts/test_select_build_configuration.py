@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +14,14 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
+SCHEMA_FINALIZATION_PUBLIC_KEY_DER = bytes.fromhex(
+    "302a300506032b6570032100"
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+)
+EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER = bytes.fromhex(
+    "302a300506032b6570032100"
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+)
 
 CONFIGURATION = {
     "ENCLAVE_KMS_PROJECT": "kioku-joerodriguez",
@@ -38,6 +48,12 @@ CONFIGURATION = {
     "VERTEX_PROJECT": "kioku-joerodriguez",
     "VERTEX_LOCATION": "global",
     "VERTEX_MODEL": "gemini-3.5-flash",
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64": base64.b64encode(
+        SCHEMA_FINALIZATION_PUBLIC_KEY_DER
+    ).decode("ascii"),
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256": hashlib.sha256(
+        SCHEMA_FINALIZATION_PUBLIC_KEY_DER
+    ).hexdigest(),
 }
 
 APPLE_CONFIGURATION = {
@@ -69,6 +85,12 @@ def environment() -> dict[str, str]:
     result["PRODUCTION_ENCLAVE_KMS_KEY_RING"] = "kioku-production"
     result["PRODUCTION_ENCLAVE_KMS_KEY"] = "production-kek"
     result["PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET"] = "kioku-production-media"
+    result["EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64"] = base64.b64encode(
+        EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER
+    ).decode("ascii")
+    result["EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"] = hashlib.sha256(
+        EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER
+    ).hexdigest()
     for key, value in APNS_CONFIGURATION.items():
         result[f"PRODUCTION_{key}"] = value
     return result
@@ -113,6 +135,10 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("HEALTH_PORT=8081\n", content)
         self.assertIn("DRAIN_TIMEOUT_SECONDS=105\n", content)
         self.assertIn("ENCLAVE_TLS=1\n", content)
+        self.assertIn("VERTEX_RECONCILIATION_MODEL=\n", content)
+        self.assertIn("MEMORY_RECONCILIATION_WRITER_ENABLED=\n", content)
+        self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64=", content)
+        self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256=", content)
         for obsolete in (
             "PERSISTENCE_BACKEND",
             "GCS_BUCKET",
@@ -127,6 +153,16 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
         self.assertIn("ENCLAVE_GCS_MEDIA_BUCKET=kioku-eval-media\n", evaluation_content)
         self.assertNotIn("kioku-production-media", evaluation_content)
+        self.assertIn(
+            "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64="
+            + base64.b64encode(EVALUATION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER).decode("ascii")
+            + "\n",
+            evaluation_content,
+        )
+        self.assertNotIn(
+            base64.b64encode(SCHEMA_FINALIZATION_PUBLIC_KEY_DER).decode("ascii"),
+            evaluation_content,
+        )
 
     def test_missing_value_never_falls_back_between_profiles(self) -> None:
         values = environment()
@@ -135,6 +171,49 @@ class SelectorTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET", completed.stderr)
         self.assertEqual(content, "")
+
+    def test_reconciliation_settings_are_optional_and_fail_closed(self) -> None:
+        values = environment()
+        values["PRODUCTION_VERTEX_RECONCILIATION_MODEL"] = "gemini-strong:preview"
+        values["PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED"] = "false"
+        accepted, content, _ = self.run_selector("production", values)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn(
+            "VERTEX_RECONCILIATION_MODEL=gemini-strong:preview\n", content
+        )
+        self.assertIn("MEMORY_RECONCILIATION_WRITER_ENABLED=false\n", content)
+
+        for key, value in (
+            ("PRODUCTION_VERTEX_RECONCILIATION_MODEL", "bad model"),
+            ("PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED", "true"),
+            ("PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED", "yes"),
+        ):
+            with self.subTest(key=key):
+                rejected_values = environment()
+                rejected_values[key] = value
+                rejected, rejected_content, _ = self.run_selector(
+                    "production", rejected_values
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(rejected_content, "")
+
+    def test_schema_finalization_anchor_is_required_and_fingerprint_bound(self) -> None:
+        values = environment()
+        del values["PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64"]
+        missing, content, _ = self.run_selector("production", values)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(content, "")
+
+        for key, value in (
+            ("PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64", "not-base64"),
+            ("PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256", "0" * 64),
+        ):
+            with self.subTest(key=key):
+                mismatched = environment()
+                mismatched[key] = value
+                rejected, content, _ = self.run_selector("production", mismatched)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(content, "")
 
     def test_apple_is_optional_atomic_and_production_apns_is_required(self) -> None:
         values = environment()

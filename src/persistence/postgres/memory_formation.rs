@@ -16,6 +16,33 @@ use super::{
     advisory_transaction_lock, allocate_content_id, duration_seconds, PostgresPersistence,
 };
 
+const OPEN_EPISODES_SQL: &str =
+    "SELECT e.id,floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms,\
+            floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
+            e.type,e.title,e.summary,e.participants::text AS participants,\
+            e.action_items::text AS action_items,e.minutes_text,\
+            count(*) FILTER (WHERE m.record_type='utterance')::bigint AS utterance_count,\
+            count(*) FILTER (WHERE m.record_type='screenshot')::bigint AS screenshot_count \
+       FROM episodes e JOIN memory_handles h \
+         ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active' \
+       LEFT JOIN episode_members m \
+         ON m.account_id=e.account_id AND m.episode_id=e.id \
+      WHERE e.account_id=$1 AND e.structure_state='draft' AND e.finalized_at IS NULL \
+        AND e.finalization_claim_token IS NULL \
+        AND e.finalization_status NOT IN ('processing','deleting') \
+        AND e.ended_at>=to_timestamp($2::double precision/1000.0) \
+        AND e.started_at<=to_timestamp($3::double precision/1000.0) \
+      GROUP BY e.account_id,e.id ORDER BY e.ended_at,e.id LIMIT $4";
+
+const EXTENDABLE_EPISODE_SQL: &str =
+    "SELECT e.id,e.minute_summaries::text AS minutes,e.substance,e.visual_evidence \
+       FROM episodes e JOIN memory_handles h \
+         ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active' \
+      WHERE e.account_id=$1 AND e.id=$2 AND e.structure_state='draft' \
+        AND e.finalized_at IS NULL AND e.finalization_claim_token IS NULL \
+        AND e.finalization_status NOT IN ('processing','deleting') \
+      FOR UPDATE OF e,h";
+
 fn timestamp(value: &str, field: &str) -> Result<i64> {
     isotime::parse_epoch_millis(value)
         .ok_or_else(|| EnclaveError::InvalidRequest(format!("{field} is invalid")))
@@ -332,26 +359,13 @@ impl MemoryFormationRepository for PostgresPersistence {
     ) -> Result<Vec<OpenEpisode>> {
         let from_ms = timestamp(from, "open episode start")?;
         let to_ms = timestamp(to, "open episode end")?;
-        let rows = sqlx::query(
-            "SELECT e.id,floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms,\
-                    floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
-                    e.type,e.title,e.summary,e.participants::text AS participants,\
-                    e.action_items::text AS action_items,e.minutes_text,\
-                    count(*) FILTER (WHERE m.record_type='utterance')::bigint AS utterance_count,\
-                    count(*) FILTER (WHERE m.record_type='screenshot')::bigint AS screenshot_count \
-               FROM episodes e LEFT JOIN episode_members m \
-                 ON m.account_id=e.account_id AND m.episode_id=e.id \
-              WHERE e.account_id=$1 \
-                AND e.ended_at>=to_timestamp($2::double precision/1000.0) \
-                AND e.started_at<=to_timestamp($3::double precision/1000.0) \
-              GROUP BY e.account_id,e.id ORDER BY e.ended_at,e.id LIMIT $4",
-        )
-        .bind(account_id)
-        .bind(from_ms)
-        .bind(to_ms)
-        .bind(limit)
-        .fetch_all(self.pool())
-        .await?;
+        let rows = sqlx::query(OPEN_EPISODES_SQL)
+            .bind(account_id)
+            .bind(from_ms)
+            .bind(to_ms)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(OpenEpisode {
@@ -375,6 +389,17 @@ impl MemoryFormationRepository for PostgresPersistence {
 
     async fn settle_summary_window(&self, settlement: SummaryWindowSettlement) -> Result<Vec<i64>> {
         let mut transaction = self.pool().begin().await?;
+        // The model may have selected an open draft before reconciliation
+        // published. Share the account-local topology lock so the state check
+        // below observes either the complete old topology or the complete new
+        // one. A stale episode reference then allocates a fresh draft instead
+        // of reopening a reconciled (or already finalized) memory.
+        advisory_transaction_lock(
+            &mut transaction,
+            "memory-reconciliation",
+            &settlement.claim.account_id,
+        )
+        .await?;
         let claimed = sqlx::query_scalar::<_, bool>(
             "SELECT true FROM summary_window_claims WHERE account_id=$1 \
               AND claim_token=$2 AND state='processing' FOR UPDATE",
@@ -424,14 +449,11 @@ impl MemoryFormationRepository for PostgresPersistence {
         let mut ids = Vec::with_capacity(settlement.episodes.len());
         for episode in &settlement.episodes {
             let existing = if let Some(id) = episode.id {
-                sqlx::query(
-                    "SELECT id,minute_summaries::text AS minutes,substance,visual_evidence \
-                       FROM episodes WHERE account_id=$1 AND id=$2 FOR UPDATE",
-                )
-                .bind(&settlement.claim.account_id)
-                .bind(id)
-                .fetch_optional(&mut *transaction)
-                .await?
+                sqlx::query(EXTENDABLE_EPISODE_SQL)
+                    .bind(&settlement.claim.account_id)
+                    .bind(id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
             } else {
                 None
             };
@@ -651,5 +673,30 @@ impl MemoryFormationRepository for PostgresPersistence {
         .bind(recent_after_ms)
         .fetch_one(self.pool())
         .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXTENDABLE_EPISODE_SQL, OPEN_EPISODES_SQL};
+
+    fn requires_active_unfinalized_draft(query: &str) {
+        assert!(query.contains("JOIN memory_handles h"));
+        assert!(query.contains("h.state='active'"));
+        assert!(query.contains("structure_state='draft'"));
+        assert!(query.contains("finalized_at IS NULL"));
+        assert!(query.contains("finalization_claim_token IS NULL"));
+        assert!(query.contains("finalization_status NOT IN ('processing','deleting')"));
+    }
+
+    #[test]
+    fn open_episode_projection_exposes_only_extendable_drafts() {
+        requires_active_unfinalized_draft(OPEN_EPISODES_SQL);
+    }
+
+    #[test]
+    fn stale_episode_reference_cannot_reopen_reconciled_memory() {
+        requires_active_unfinalized_draft(EXTENDABLE_EPISODE_SQL);
+        assert!(EXTENDABLE_EPISODE_SQL.contains("FOR UPDATE OF e,h"));
     }
 }

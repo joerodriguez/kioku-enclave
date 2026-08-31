@@ -394,6 +394,11 @@ async fn memory_playback_manifest(
         return bad_request("invalid playback window");
     }
     let user_id = user.0;
+    let mut expected_revision =
+        match active_playback_revision_or_response(&state, &user_id, memory_id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
     if !manifest_limiter()
         .consume_scoped(&state.repositories, "playback-manifest", &user_id)
         .await
@@ -404,24 +409,43 @@ async fn memory_playback_manifest(
         Ok(value) => value,
         Err(error) => return super::routed_read_unavailable("api.memory_playback", &error),
     };
-    let result = match state
-        .repositories
-        .playback()
-        .dataset(&user_id, memory_id, durable_read.as_ref())
-        .await
-    {
-        Ok(Some(dataset)) => playback_window_start(&dataset, &query)
-            .and_then(|window_start| project_manifest(&dataset, window_start))
-            .map(Some),
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(Some(manifest)) => no_store_json(manifest),
-        Ok(None) => not_found(),
-        Err(EnclaveError::InvalidRequest(_)) => bad_request("invalid playback cursor"),
-        Err(error) => super::routed_read_unavailable("api.memory_playback", &error),
+    for attempt in 0..super::query::MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        let result = match state
+            .repositories
+            .playback()
+            .dataset(&user_id, memory_id, durable_read.as_ref())
+            .await
+        {
+            Ok(Some(dataset)) => playback_window_start(&dataset, &query)
+                .and_then(|window_start| project_manifest(&dataset, window_start))
+                .map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        let observed_revision =
+            match active_playback_revision_or_response(&state, &user_id, memory_id).await {
+                Ok(revision) => revision,
+                Err(response) => return response,
+            };
+        match super::query::memory_revision_decision(
+            attempt,
+            observed_revision == expected_revision,
+        ) {
+            super::query::MemoryRevisionDecision::Stable => {
+                return match result {
+                    Ok(Some(manifest)) => no_store_json(manifest),
+                    Ok(None) => not_found(),
+                    Err(EnclaveError::InvalidRequest(_)) => bad_request("invalid playback cursor"),
+                    Err(error) => super::routed_read_unavailable("api.memory_playback", &error),
+                }
+            }
+            super::query::MemoryRevisionDecision::Retry => {
+                expected_revision = observed_revision;
+            }
+            super::query::MemoryRevisionDecision::Exhausted => return playback_topology_changed(),
+        }
     }
+    unreachable!("memory topology retry loop has a positive fixed bound")
 }
 
 async fn memory_playback_segment(
@@ -442,6 +466,11 @@ async fn memory_playback_segment(
     }
 
     let user_id = user.0;
+    let mut expected_revision =
+        match active_playback_revision_or_response(&state, &user_id, memory_id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
     if !segment_limiter()
         .consume_scoped(&state.repositories, "playback-segment", &user_id)
         .await
@@ -455,64 +484,88 @@ async fn memory_playback_segment(
     let lookup_user = user_id.clone();
     let requested_recording = recording_id.clone();
     let requested_segment = segment_id.clone();
-    let lookup = match state
-        .repositories
-        .playback()
-        .dataset(&user_id, memory_id, durable_read.as_ref())
-        .await
-    {
-        Ok(Some(dataset)) => {
-            if dataset.projection_revision != query.projection_revision {
-                Err(EnclaveError::Conflict(
-                    "playback projection revision changed".into(),
-                ))
-            } else {
-                let segment = dataset
-                    .segments
-                    .into_iter()
-                    .find(|candidate| {
-                        candidate.recording_id == requested_recording
-                            && candidate.segment_id == requested_segment
-                    })
-                    .filter(SegmentAuthority::readable);
-                let wrapped_dek = if segment
-                    .as_ref()
-                    .is_some_and(|segment| segment.retention_decision == "processing_window_30d")
-                {
-                    match state
-                        .repositories
-                        .captures()
-                        .media_dek_wrapped(&user_id)
-                        .await
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return super::routed_read_unavailable(
-                                "api.playback_segment.lookup",
-                                &error,
-                            )
-                        }
+    let (authority, wrapped_dek) = 'attempts: {
+        for attempt in 0..super::query::MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+            let lookup = match state
+                .repositories
+                .playback()
+                .dataset(&user_id, memory_id, durable_read.as_ref())
+                .await
+            {
+                Ok(Some(dataset)) => {
+                    if dataset.projection_revision != query.projection_revision {
+                        Err(EnclaveError::Conflict(
+                            "playback projection revision changed".into(),
+                        ))
+                    } else {
+                        let segment = dataset
+                            .segments
+                            .into_iter()
+                            .find(|candidate| {
+                                candidate.recording_id == requested_recording
+                                    && candidate.segment_id == requested_segment
+                            })
+                            .filter(SegmentAuthority::readable);
+                        let wrapped_dek = if segment.as_ref().is_some_and(|segment| {
+                            segment.retention_decision == "processing_window_30d"
+                        }) {
+                            match state
+                                .repositories
+                                .captures()
+                                .media_dek_wrapped(&user_id)
+                                .await
+                            {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    return super::routed_read_unavailable(
+                                        "api.playback_segment.lookup",
+                                        &error,
+                                    )
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        Ok(segment.map(|segment| (segment, wrapped_dek)))
                     }
-                } else {
-                    None
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            };
+            let observed_revision =
+                match active_playback_revision_or_response(&state, &user_id, memory_id).await {
+                    Ok(revision) => revision,
+                    Err(response) => return response,
                 };
-                Ok(segment.map(|segment| (segment, wrapped_dek)))
+            match super::query::memory_revision_decision(
+                attempt,
+                observed_revision == expected_revision,
+            ) {
+                super::query::MemoryRevisionDecision::Stable => match lookup {
+                    Ok(Some(value)) => break 'attempts value,
+                    Ok(None) => return not_found(),
+                    Err(EnclaveError::Conflict(_)) => {
+                        return no_store_error(
+                            StatusCode::CONFLICT,
+                            json!({"error": "playback_revision_changed"}),
+                        )
+                    }
+                    Err(error) => {
+                        return super::routed_read_unavailable(
+                            "api.playback_segment.lookup",
+                            &error,
+                        )
+                    }
+                },
+                super::query::MemoryRevisionDecision::Retry => {
+                    expected_revision = observed_revision;
+                }
+                super::query::MemoryRevisionDecision::Exhausted => {
+                    return playback_topology_changed()
+                }
             }
         }
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
-    };
-
-    let (authority, wrapped_dek) = match lookup {
-        Ok(Some(value)) => value,
-        Ok(None) => return not_found(),
-        Err(EnclaveError::Conflict(_)) => {
-            return no_store_error(
-                StatusCode::CONFLICT,
-                json!({"error": "playback_revision_changed"}),
-            )
-        }
-        Err(error) => return super::routed_read_unavailable("api.playback_segment.lookup", &error),
+        unreachable!("memory topology retry loop has a positive fixed bound")
     };
     let object_key = authority.object_key.as_deref().unwrap_or_default();
     let asset_id = authority.asset_id.as_deref().unwrap_or_default();
@@ -1251,6 +1304,34 @@ fn bad_request(message: &'static str) -> Response {
     no_store_error(StatusCode::BAD_REQUEST, json!({"error": message}))
 }
 
+async fn active_playback_revision_or_response(
+    state: &CpState,
+    account_id: &str,
+    memory_id: i64,
+) -> std::result::Result<i64, Response> {
+    match super::query::exact_memory_handle(state, account_id, memory_id).await {
+        Ok(super::query::ExactMemoryHandle::Active { archive_revision }) => Ok(archive_revision),
+        Ok(super::query::ExactMemoryHandle::Reorganized(mut resolution)) => {
+            resolution["error"] = json!("memory_reorganized");
+            Err(no_store_error(StatusCode::CONFLICT, resolution))
+        }
+        Err(EnclaveError::NotFound) => Err(not_found()),
+        Err(EnclaveError::InvalidRequest(_)) => Err(bad_request("memory_id must be positive")),
+        Err(EnclaveError::Conflict(_)) => Err(playback_topology_changed()),
+        Err(error) => Err(super::routed_read_unavailable(
+            "api.playback_memory_resolution",
+            &error,
+        )),
+    }
+}
+
+fn playback_topology_changed() -> Response {
+    no_store_error(
+        StatusCode::CONFLICT,
+        json!({"error": "memory_revision_changed"}),
+    )
+}
+
 fn not_found() -> Response {
     no_store_error(StatusCode::NOT_FOUND, json!({"error": "not_found"}))
 }
@@ -1318,6 +1399,16 @@ mod tests {
             timeline_start_ms: 0,
             timeline_end_ms: 60_000,
         }
+    }
+
+    #[test]
+    fn exhausted_topology_races_are_typed_and_never_cacheable() {
+        let response = playback_topology_changed();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store, max-age=0"
+        );
     }
 
     #[test]

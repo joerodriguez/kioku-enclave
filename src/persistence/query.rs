@@ -175,6 +175,9 @@ pub(crate) struct EpisodeListPage {
     pub(crate) episodes: Vec<Value>,
     pub(crate) hidden_count: i64,
     pub(crate) has_more: bool,
+    /// Account-local memory topology epoch captured in the same PostgreSQL
+    /// snapshot as the rows and facets on this page.
+    pub(crate) archive_revision: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

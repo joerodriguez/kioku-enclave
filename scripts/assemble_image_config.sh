@@ -18,15 +18,19 @@ input_sha256=$(sha256sum "$input" | awk '{print $1}')
 test "$input_sha256" = "$expected_sha256"
 umask 077
 tmp="${output}.tmp"
-trap 'rm -f "$tmp"' EXIT HUP INT TERM
+key_tmp="${tmp}.schema-finalization-key"
+trap 'rm -f "$tmp" "$key_tmp"' EXIT HUP INT TERM
 test ! -e "$tmp"
 test ! -L "$tmp"
 (set -C; : > "$tmp")
 
-allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS'
+allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL VERTEX_RECONCILIATION_MODEL MEMORY_RECONCILIATION_WRITER_ENABLED SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64 SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256 POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS'
 allowed=" $allowed_keys "
 seen=' '
-while IFS='=' read -r name value || test -n "$name"; do
+while IFS= read -r line || test -n "$line"; do
+  case "$line" in *=*) ;; *) exit 1 ;; esac
+  name=${line%%=*}
+  value=${line#*=}
   case "$name" in
     ''|*[!A-Z0-9_]*|[0-9]*) exit 1 ;;
   esac
@@ -76,6 +80,21 @@ case "$(value BILLING_ENFORCEMENT_MODE)" in shadow|enforce) ;; *) exit 1 ;; esac
 vertex_model=$(value VERTEX_MODEL)
 case "$vertex_model" in *[!A-Za-z0-9._:-]*|'') exit 1 ;; esac
 test "${#vertex_model}" -le 128
+reconciliation_model=$(value VERTEX_RECONCILIATION_MODEL)
+case "$reconciliation_model" in *[!A-Za-z0-9._:-]*) exit 1 ;; esac
+test "${#reconciliation_model}" -le 128
+case "$(value MEMORY_RECONCILIATION_WRITER_ENABLED)" in ''|false) ;; *) exit 1 ;; esac
+schema_public_key=$(value SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64)
+case "$schema_public_key" in MCowBQYDK2VwAyEA*) ;; *) exit 1 ;; esac
+case "$schema_public_key" in *[!A-Za-z0-9+/=]*|'') exit 1 ;; esac
+test ! -e "$key_tmp"
+printf '%s' "$schema_public_key" | base64 -d > "$key_tmp"
+test "$(wc -c < "$key_tmp" | tr -d ' ')" = 44
+test "$(base64 < "$key_tmp" | tr -d '\n')" = "$schema_public_key"
+schema_key_sha256=$(value SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256)
+case "$schema_key_sha256" in *[!0-9a-f]*|'') exit 1 ;; esac
+test "${#schema_key_sha256}" -eq 64
+test "$(sha256sum "$key_tmp" | awk '{print $1}')" = "$schema_key_sha256"
 apple_values="$(value APPLE_TEAM_ID)$(value APPLE_KEY_ID)$(value APPLE_IOS_CLIENT_ID)$(value APPLE_MACOS_CLIENT_ID)$(value APPLE_WEB_CLIENT_ID)"
 if test -n "$apple_values"; then
   test -n "$(value APPLE_TEAM_ID)" && test -n "$(value APPLE_KEY_ID)"
@@ -101,4 +120,5 @@ rm -f "$tmp"
 test -f "$output"
 test ! -L "$output"
 test "$(sha256sum "$output" | awk '{print $1}')" = "$expected_sha256"
+rm -f "$key_tmp"
 trap - EXIT HUP INT TERM

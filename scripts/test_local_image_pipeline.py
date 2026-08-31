@@ -785,6 +785,10 @@ class LocalImagePipelineTests(unittest.TestCase):
         )
         self.assertNotIn("POSTGRES_SCHEMA_MODE", runtime)
         self.assertNotIn("PROJECT_ID", runtime)
+        self.assertEqual(
+            runtime["SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"],
+            values["PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"],
+        )
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("RUN --mount=type=secret,id=kioku-config,required", dockerfile)
         self.assertNotIn("ENV KMS_PROJECT=${KMS_PROJECT}", dockerfile)
@@ -811,6 +815,9 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(assembler_keys, rust_keys)
         self.assertEqual(len(assembler_keys), len(set(assembler_keys)))
         self.assertIn("for required in $allowed_keys; do", assembler_source)
+        self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64", assembler_keys)
+        self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256", assembler_keys)
+        self.assertIn('sha256sum "$key_tmp"', assembler_source)
         for obsolete in (
             "PERSISTENCE_BACKEND",
             "POSTGRES_SCHEMA_MODE",
@@ -1541,6 +1548,29 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(closed_result.returncode, 0, closed_result.stderr)
             self.assertEqual(closed_output.read_bytes(), closed)
 
+            # A process-local true flag is unsafe during a mixed-fleet rollout.
+            # The image boundary stays hard-dark until a durable activation
+            # receipt observed by both old and new processes is implemented.
+            enabled_writer = encoded.replace(
+                b"MEMORY_RECONCILIATION_WRITER_ENABLED=\n",
+                b"MEMORY_RECONCILIATION_WRITER_ENABLED=true\n",
+            )
+            self.assertNotEqual(enabled_writer, encoded)
+            enabled_writer_source = directory / "enabled-writer.env"
+            enabled_writer_source.write_bytes(enabled_writer)
+            enabled_writer_source.chmod(0o600)
+            enabled_writer_result = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(enabled_writer_source),
+                    str(directory / "enabled-writer-output"),
+                    __import__("hashlib").sha256(enabled_writer).hexdigest(),
+                ],
+                check=False,
+            )
+            self.assertNotEqual(enabled_writer_result.returncode, 0)
+            self.assertFalse((directory / "enabled-writer-output").exists())
+
             source.write_bytes(encoded + b"KIOKU_BUILD_PROFILE=attacker\n")
             rejected = subprocess.run(
                 [str(SCRIPTS / "assemble_image_config.sh"), str(source), str(directory / "second"), expected],
@@ -1570,6 +1600,28 @@ class LocalImagePipelineTests(unittest.TestCase):
             )
             self.assertNotEqual(missing.returncode, 0)
             self.assertFalse((directory / "missing-output").exists())
+
+            malformed_anchor_source = directory / "malformed-anchor.env"
+            malformed_anchor = b"".join(
+                b"SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64=AAAA\n"
+                if line.startswith(b"SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64=")
+                else line
+                for line in encoded.splitlines(keepends=True)
+            )
+            malformed_anchor_source.write_bytes(malformed_anchor)
+            malformed_anchor_source.chmod(0o600)
+            malformed_anchor_output = directory / "malformed-anchor-output"
+            malformed_anchor_result = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(malformed_anchor_source),
+                    str(malformed_anchor_output),
+                    __import__("hashlib").sha256(malformed_anchor).hexdigest(),
+                ],
+                check=False,
+            )
+            self.assertNotEqual(malformed_anchor_result.returncode, 0)
+            self.assertFalse(malformed_anchor_output.exists())
 
     def test_build_source_must_be_clean_and_release_tag_must_equal_head(self) -> None:
         pipeline = load_pipeline()

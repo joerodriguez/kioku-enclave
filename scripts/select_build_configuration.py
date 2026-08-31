@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -37,6 +40,8 @@ PROFILE_KEYS = (
     "VERTEX_PROJECT",
     "VERTEX_LOCATION",
     "VERTEX_MODEL",
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64",
+    "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
 )
 
 OPTIONAL_PROFILE_GROUPS = (
@@ -48,6 +53,8 @@ OPTIONAL_PROFILE_GROUPS = (
         "APPLE_WEB_CLIENT_ID",
     ),
     ("APNS_TEAM_ID", "APNS_PRODUCTION_KEY_ID", "APNS_SANDBOX_KEY_ID"),
+    ("VERTEX_RECONCILIATION_MODEL",),
+    ("MEMORY_RECONCILIATION_WRITER_ENABLED",),
 )
 
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
@@ -61,6 +68,7 @@ RELEASE_TAG_PATTERN = (
     r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)(?:[.-][0-9A-Za-z.-]+)?"
 )
+ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 def require_value(environment: dict[str, str], name: str) -> str:
@@ -144,6 +152,47 @@ def validate(configuration: dict[str, str], profile: str, source_ref: str) -> No
         r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]",
     )
     require_pattern(configuration, "VERTEX_MODEL", r"[A-Za-z0-9._:-]{1,128}")
+    if configuration.get("VERTEX_RECONCILIATION_MODEL"):
+        require_pattern(
+            configuration,
+            "VERTEX_RECONCILIATION_MODEL",
+            r"[A-Za-z0-9._:-]{1,128}",
+        )
+    if configuration.get("MEMORY_RECONCILIATION_WRITER_ENABLED") not in (
+        "",
+        "false",
+    ):
+        raise SystemExit(
+            "MEMORY_RECONCILIATION_WRITER_ENABLED must be false or empty; "
+            "fleet-wide writer activation is not available in this release"
+        )
+    public_key_text = configuration["SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64"]
+    try:
+        public_key_der = base64.b64decode(public_key_text, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise SystemExit(
+            "invalid format for build configuration: "
+            "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64"
+        ) from error
+    if (
+        base64.b64encode(public_key_der).decode("ascii") != public_key_text
+        or len(public_key_der) != len(ED25519_SPKI_PREFIX) + 32
+        or not public_key_der.startswith(ED25519_SPKI_PREFIX)
+    ):
+        raise SystemExit(
+            "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64 must encode one Ed25519 SPKI DER key"
+        )
+    require_pattern(
+        configuration,
+        "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
+        r"[0-9a-f]{64}",
+    )
+    if hashlib.sha256(public_key_der).hexdigest() != configuration[
+        "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"
+    ]:
+        raise SystemExit(
+            "schema finalization public key does not match its baked SHA-256 fingerprint"
+        )
     for name in (
         "ENCLAVE_AUDIENCE",
         "BASE_URL",

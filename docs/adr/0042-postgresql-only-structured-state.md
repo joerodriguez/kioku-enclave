@@ -40,7 +40,16 @@ The enclave will:
 5. keep PostgreSQL migrations append-only and run them only through the digest-pinned dedicated
    migrator; serving processes verify the required schema and never migrate it at startup; expose
    no operator-selectable schema mode; and record required verification as a fixed signed-release
-   evidence claim rather than copying it from image configuration; and
+   evidence claim rather than copying it from image configuration. A reviewed additive migration
+   may use a fixed two-phase expand/finalize receipt. Its expand is an online, resumable sequence:
+   a concurrent uniqueness guard and compatibility triggers precede bounded keyset backfills,
+   populated-table indexes are concurrent, and no table lock spans the release. Readiness binds
+   the predecessor/successor marker to the exact embedded contract hash and catalog. Finalization
+   advances that marker only while persisting a fresh, strict ADR-0041 homogeneous-candidate,
+   zero-unavailable, writer-dark fleet receipt and its detached Ed25519 signature. The verifier
+   uses only the public key/fingerprint selected into the immutable image profile; serving and
+   writer admission reverify the persisted canonical bytes, signature, and exact per-step catalog
+   evidence; and
 6. require the full local release gate to use an explicitly provisioned real PostgreSQL 17
    database and fail rather than skip its contracts. The gate must not silently depend on Docker.
 
@@ -58,8 +67,15 @@ built for the removed state. Removed configuration cannot re-enable it.
   recording/playback activation remains blocked until all owned media bytes are included. Account
   and episode deletion remain restartable, erase PostgreSQL state plus exact live-media
   generations, and do not report completion early or permit resurrection.
-- Readiness requires PostgreSQL connectivity and exact schema compatibility. Liveness remains
-  process-local; draining removes readiness before bounded shutdown.
+- Readiness requires PostgreSQL connectivity and exact schema compatibility. Compatibility means
+  either the finalized version or one source-reviewed predecessor/successor expand receipt whose
+  durable contract hash and physical catalog match the candidate; it is never an environment-
+  selected range. Memory-reconciliation topology publication remains hard-dark in this release:
+  a finalized schema and its writer-dark fleet receipt are necessary but deliberately
+  insufficient to enable the writer. A later reviewed release must add one durable fleet-wide
+  activation receipt observed by dark and enabled processes and fence in-flight legacy
+  finalizers before activation. Liveness remains process-local; draining removes readiness
+  before bounded shutdown.
 - Process-immutable shared TLS, KMS image admission, signed tags, immutable digest promotion, SBOM,
   vulnerability scan, evidence signatures, and ADR-0041's predecessor/candidate zero-unavailable
   rollout remain release requirements. Certificate rotation occurs through that staged fleet
@@ -70,7 +86,10 @@ built for the removed state. Removed configuration cannot re-enable it.
 
 ## Verification
 
-The PostgreSQL contract suite must cover schema readiness, tenant isolation, timestamp/time-zone
+The PostgreSQL contract suite must cover schema readiness, interrupted/retried bounded backfill,
+concurrent-index cleanup, compatibility-trigger races, populated expand before marker mutation,
+predecessor readiness throughout the mixed-fleet window, strict fleet-receipt refusal, and writer
+refusal before finalization, plus tenant isolation, timestamp/time-zone
 queries, full-text and vector search, concurrent and expired-lease claims, stale settlement
 refusal, provider ambiguity/no-resend, restart enumeration, export, episode deletion, account
 deletion, media cleanup, and no resurrection. Repository fakes continue to cover domain-only

@@ -39,11 +39,16 @@ hyper = { version = "1.10", default-features = false, features = ["server", "htt
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
 hmac = "0.12"
+# Detached schema-finalization receipts use the same audited ring Ed25519 path
+# as the image's rustls stack. The public SPKI trust anchor is image-baked;
+# private signing material never enters the enclave image.
+ring = { version = "0.17.14", default-features = false }
 # PostgreSQL production persistence (ADR-0040). Runtime queries are checked by
 # the shared repository contracts against real PostgreSQL; no compile-time
 # DATABASE_URL or OpenSSL dependency is required. Reviewed schema files are
-# embedded for the dedicated release migrator, while serving startup only
-# verifies the installed schema version.
+# embedded for the dedicated online/resumable release migrator, while serving
+# startup verifies the marker, exact contract/catalog receipt, and—before a
+# feature writer starts—the persisted fleet-finalization evidence.
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
 
 # Serialisation
