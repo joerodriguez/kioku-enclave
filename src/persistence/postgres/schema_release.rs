@@ -1,8 +1,9 @@
 //! Online, resumable PostgreSQL schema-26 release protocol.
 //!
-//! The v25 predecessor reads only `persistence_schema.version`, so every
-//! additive step leaves that value at 25. A v26 reader accepts the schema only
-//! after the exact embedded contract is durably receipted as 25/26. The writer
+//! The production v24 predecessor reads only `persistence_schema.version`, so
+//! every additive step—including the schema-25 account-status expansion—leaves
+//! that value at 24. A v26 reader accepts the schema only after the exact
+//! embedded contract is durably receipted as 24/26. The writer
 //! additionally requires a strict, persisted zero-unavailable fleet receipt
 //! and the finalized 26/26 marker.
 
@@ -49,6 +50,8 @@ const CAPTURE_SESSIONS_INDEX_SQL: &str =
     include_str!("../../../migrations/0026_memory_reconciliation_capture_sessions_index.sql");
 const CAPTURE_EVENTS_INDEX_SQL: &str =
     include_str!("../../../migrations/0026_memory_reconciliation_capture_events_index.sql");
+const ACCOUNT_DELETION_COMPATIBILITY_SQL: &str =
+    include_str!("../../../migrations/0026_account_deletion_compatibility.sql");
 
 // Each populated-table DDL statement is executed and committed independently
 // with a short lock timeout. NOT VALID checks protect all new writes without a
@@ -114,7 +117,7 @@ BEGIN
            AND pg_get_constraintdef(oid) =
                'CHECK ((operation = ANY (ARRAY[''audio_understanding''::text, ''screen_understanding''::text, ''episode_summarization''::text, ''episode_finalization''::text])))'
     ) THEN
-        RAISE EXCEPTION 'schema-25 Vertex operation constraint is not the validated predecessor contract'
+        RAISE EXCEPTION 'schema-24 Vertex operation constraint is not the validated predecessor contract'
             USING ERRCODE='55000';
     END IF;
     ALTER TABLE vertex_usage_events
@@ -127,6 +130,7 @@ $$;
 "#;
 
 const STEP_LEGACY_MEMBERSHIP_GUARD: &str = "legacy_membership_guard";
+const STEP_ACCOUNT_DELETION_COMPATIBILITY: &str = "account_deletion_compatibility";
 const STEP_COLD_OBJECTS: &str = "cold_objects";
 const STEP_ACCOUNTS_COMPATIBILITY: &str = "accounts_compatibility";
 const STEP_EPISODES_COMPATIBILITY: &str = "episodes_compatibility";
@@ -134,8 +138,9 @@ const STEP_MEMBERS_COMPATIBILITY: &str = "members_compatibility";
 const STEP_VERTEX_OPERATION: &str = "vertex_operation";
 const STEP_CAPTURE_SESSIONS_INDEX: &str = "capture_sessions_index";
 const STEP_CAPTURE_EVENTS_INDEX: &str = "capture_events_index";
-const RELEASE_STEP_MANIFEST: &str = "legacy_membership_guard\ncold_objects\naccounts_compatibility\nepisodes_compatibility\nmembers_compatibility\nvertex_operation\ncapture_sessions_index\ncapture_events_index\n";
+const RELEASE_STEP_MANIFEST: &str = "account_deletion_compatibility\nlegacy_membership_guard\ncold_objects\naccounts_compatibility\nepisodes_compatibility\nmembers_compatibility\nvertex_operation\ncapture_sessions_index\ncapture_events_index\n";
 const RELEASE_STEP_NAMES: &[&str] = &[
+    STEP_ACCOUNT_DELETION_COMPATIBILITY,
     STEP_LEGACY_MEMBERSHIP_GUARD,
     STEP_COLD_OBJECTS,
     STEP_ACCOUNTS_COMPATIBILITY,
@@ -145,6 +150,7 @@ const RELEASE_STEP_NAMES: &[&str] = &[
     STEP_CAPTURE_SESSIONS_INDEX,
     STEP_CAPTURE_EVENTS_INDEX,
 ];
+const ACCOUNT_DELETION_COMPATIBILITY_DDL: &[&str] = &[ACCOUNT_DELETION_COMPATIBILITY_SQL];
 const LEGACY_MEMBERSHIP_GUARD_DDL: &[&str] = &[LEGACY_MEMBERSHIP_INDEX_SQL];
 const COLD_OBJECTS_DDL: &[&str] = &[COLD_OBJECTS_SQL];
 const ACCOUNTS_COMPATIBILITY_DDL: &[&str] = &[ACCOUNTS_ARCHIVE_TRIGGER_SQL];
@@ -182,7 +188,8 @@ WITH relation_targets AS (
             ($1='cold_objects' AND (
                 relation.relname LIKE 'memory\_%' ESCAPE '\'
                 OR relation.relname LIKE 'active\_episode\_members%' ESCAPE '\'))
-         OR ($1='accounts_compatibility' AND relation.relname='accounts')
+         OR ($1 IN ('account_deletion_compatibility','accounts_compatibility')
+             AND relation.relname='accounts')
          OR ($1='episodes_compatibility' AND relation.relname='episodes')
          OR ($1='members_compatibility' AND relation.relname='episode_members')
          OR ($1='vertex_operation' AND relation.relname='vertex_usage_events')
@@ -218,8 +225,10 @@ WITH relation_targets AS (
                      constraint_state.condeferred::text,
                      pg_get_constraintdef(constraint_state.oid,true))
       FROM relation_targets target
-      JOIN pg_constraint constraint_state ON constraint_state.conrelid=target.oid
+     JOIN pg_constraint constraint_state ON constraint_state.conrelid=target.oid
      WHERE $1='cold_objects'
+        OR ($1='account_deletion_compatibility'
+            AND constraint_state.conname='accounts_status_check')
         OR ($1='episodes_compatibility'
             AND constraint_state.conname LIKE 'episodes_structure_state_%')
         OR ($1='vertex_operation'
@@ -388,10 +397,11 @@ AND NOT EXISTS(
             'retire_deleted_memory'))
 "#;
 
-const CONTRACT_MANIFEST_VERSION: &str = "kioku-postgresql-memory-reconciliation-v26-online-v2";
+const CONTRACT_MANIFEST_VERSION: &str = "kioku-postgresql-memory-reconciliation-v26-online-v3";
 const CONTRACT_PARTS: &[&str] = &[
     CONTRACT_MANIFEST_VERSION,
     RELEASE_LEDGER_SQL,
+    ACCOUNT_DELETION_COMPATIBILITY_SQL,
     COLD_OBJECTS_SQL,
     EPISODES_ADD_STRUCTURE_STATE_SQL,
     EPISODES_STRUCTURE_DEFAULT_SQL,
@@ -525,6 +535,7 @@ fn contract_digest() -> Vec<u8> {
 
 fn step_sql_parts(step_name: &str) -> Option<&'static [&'static str]> {
     match step_name {
+        STEP_ACCOUNT_DELETION_COMPATIBILITY => Some(ACCOUNT_DELETION_COMPATIBILITY_DDL),
         STEP_LEGACY_MEMBERSHIP_GUARD => Some(LEGACY_MEMBERSHIP_GUARD_DDL),
         STEP_COLD_OBJECTS => Some(COLD_OBJECTS_DDL),
         STEP_ACCOUNTS_COMPATIBILITY => Some(ACCOUNTS_COMPATIBILITY_DDL),
@@ -1732,7 +1743,7 @@ async fn verify_release_row(
 
 impl PostgresPersistence {
     /// Install or resume the complete v26 expand while leaving the predecessor
-    /// marker at 25. Each invocation has a fixed batch budget; `ExpandInProgress`
+    /// marker at 24. Each invocation has a fixed batch budget; `ExpandInProgress`
     /// is a successful durable checkpoint and the same command resumes it.
     pub(crate) async fn expand_memory_reconciliation_release_schema(
         &self,
@@ -1798,7 +1809,7 @@ impl PostgresPersistence {
             } => {}
             state => {
                 return Err(EnclaveError::Config(format!(
-                    "memory reconciliation expand requires pristine or receipted schema 25; found {}/{}",
+                    "memory reconciliation expand requires pristine or receipted schema 24; found {}/{}",
                     state.version,
                     state
                         .expanded_through_version
@@ -1817,7 +1828,12 @@ impl PostgresPersistence {
             )));
         }
 
-        // The first product-table action is the legacy uniqueness guard. Its
+        // Install the additive schema-25 account status value as part of this
+        // receipted expand without advancing the marker that the live v24
+        // predecessor checks. The step first proves the exact v24 constraint.
+        execute_receipted_ddl(connection, STEP_ACCOUNT_DELETION_COMPATIBILITY).await?;
+
+        // The next product-table action is the legacy uniqueness guard. Its
         // concurrent build is followed by an exact catalog snapshot and a
         // durable step receipt; an interrupted valid build is receipted only
         // after its entire normalized definition matches this binary.
@@ -1837,7 +1853,7 @@ impl PostgresPersistence {
         execute_receipted_ddl(connection, STEP_EPISODES_COMPATIBILITY).await?;
         execute_receipted_ddl(connection, STEP_MEMBERS_COMPATIBILITY).await?;
 
-        // The v25 check proves every existing operation belongs to the v26
+        // The v24 check proves every existing operation belongs to the v26
         // superset. Adding the successor NOT VALID check protects new writes;
         // the old validated constraint is then swapped in one bounded metadata
         // transaction without a validation scan.
@@ -1900,7 +1916,7 @@ impl PostgresPersistence {
         let serving_state = classify_serving_schema(expanded)?;
         if serving_state != ServingSchemaState::ExpandedTransition {
             return Err(EnclaveError::Store(
-                "v26 expand did not publish the 25/26 compatibility marker".into(),
+                "v26 expand did not publish the 24/26 compatibility marker".into(),
             ));
         }
         verify_release_row(connection, serving_state).await?;
@@ -1913,7 +1929,7 @@ impl PostgresPersistence {
 
     /// Finalize only when the caller supplies a fresh strict ADR-0041 fleet
     /// receipt. The receipt and marker flip commit atomically; a literal phase
-    /// confirmation without this evidence can never advance schema 25.
+    /// confirmation without this evidence can never advance schema 24.
     pub(crate) async fn finalize_memory_reconciliation_release_schema(
         &self,
         authorization: &VerifiedSchemaFinalizationReceipt,
@@ -1968,7 +1984,7 @@ impl PostgresPersistence {
             })
         {
             return Err(EnclaveError::Config(format!(
-                "memory reconciliation finalize requires receipted 25/26 expand; found {}/{}",
+                "memory reconciliation finalize requires receipted 24/26 expand; found {}/{}",
                 initial.version,
                 initial
                     .expanded_through_version
@@ -2046,7 +2062,7 @@ impl PostgresPersistence {
         Ok(())
     }
 
-    /// A receipted 25/26 expand is reader-compatible with a live v25 fleet but
+    /// A receipted 24/26 expand is reader-compatible with a live v24 fleet but
     /// can never authorize topology publication. The writer requires a 26/26
     /// marker and a strict persisted fleet receipt whose canonical hash verifies.
     pub(crate) async fn verify_reconciliation_writer_schema(&self) -> Result<()> {

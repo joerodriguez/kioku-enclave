@@ -2,7 +2,7 @@
 
 The sole structured-state implementation. Every adapter shares one bounded SQLx PostgreSQL pool,
 uses tenant-qualified queries, database time for leases/deadlines, and explicit transactions for
-claims and settlement. Serving startup accepts finalized schema 26 or the exact receipted 25/26
+claims and settlement. Serving startup accepts finalized schema 26 or the exact receipted 24/26
 expand during the ADR-0041 mixed-fleet window. Topology publication remains hard-dark even after
 finalization until a later release adds a durable fleet-wide activation receipt and mixed-process
 finalizer fence. Only the explicit release migrator applies the append-only files under `migrations/`.
@@ -10,7 +10,7 @@ finalizer fence. Only the explicit release migrator applies the append-only file
 | File | Responsibility |
 |---|---|
 | `mod.rs` | TLS PostgreSQL pool construction, UTC/statement-timeout policy, schema marker primitives, disposable test ladder, and shared transaction helpers. |
-| `schema_release.rs` | Session-locked online v26 release: collision-refusing receipted DDL, exact per-step catalog evidence, concurrent guards/indexes, compatibility-trigger barrier, resumable keyset backfill, baked-anchor Ed25519 fleet authorization, and serving/writer re-verification. |
+| `schema_release.rs` | Session-locked online v24-to-v26 release: marker-preserving account-status expansion, collision-refusing receipted DDL, exact per-step catalog evidence, concurrent guards/indexes, compatibility-trigger barrier, resumable keyset backfill, baked-anchor Ed25519 fleet authorization, and serving/writer re-verification. |
 | `admission.rs` | Fleet token buckets and crash-recoverable concurrency leases. |
 | `billing.rs` | Creating and lookup-only billing pseudonym resolution, recording lease/credit receipts, coverage anchors, retained-account metrics, and detach work. |
 | `capture.rs` | Atomic capture/reference admission, media metadata, receipts, event/session status, and replay. |
