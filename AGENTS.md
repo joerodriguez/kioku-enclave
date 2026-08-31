@@ -90,7 +90,8 @@ Match git history: short scoped subjects like `feat(episodes): …`, `ci: …`, 
 Per CONTRIBUTING.md: include a clear description of what changed and why, and for
 security-sensitive changes (auth, crypto, attestation) explain the **threat-model
 impact**. Run the appropriate local verification above before opening a PR; the
-local signed evidence is the exhaustive merge/release gate.
+reviewed local verification evidence is the exhaustive merge gate. Separately signed
+build evidence remains a release gate owned by the authorized release session.
 
 ### Delivery ownership
 
