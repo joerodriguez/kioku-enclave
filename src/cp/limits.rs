@@ -84,18 +84,6 @@ pub async fn account_active(repositories: &RepositorySet, user_id: &str) -> Resu
     repositories.entitlements().account_active(user_id).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::capture_event_limiter;
-
-    #[test]
-    fn capture_event_admission_matches_the_paid_minute_credit_rate() {
-        let limiter = capture_event_limiter();
-        assert_eq!(limiter.capacity, 120.0);
-        assert_eq!(limiter.refill_per_sec, 2.0);
-    }
-}
-
 /// Atomically reserve a bounded Vertex output ceiling from both the global
 /// daily hard cap and the work class's protected allocation. Class borrowing
 /// is deliberately disabled until source-settled state can be proven; this is
@@ -111,4 +99,16 @@ pub async fn reserve_vertex_output_tokens_for_class(
         .entitlements()
         .reserve_vertex_output_tokens_for_class(user_id, class, requested, daily_limit)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_event_limiter;
+
+    #[test]
+    fn capture_event_admission_matches_the_paid_minute_credit_rate() {
+        let limiter = capture_event_limiter();
+        assert_eq!(limiter.capacity, 120.0);
+        assert_eq!(limiter.refill_per_sec, 2.0);
+    }
 }
