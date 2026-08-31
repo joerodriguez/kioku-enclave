@@ -122,11 +122,13 @@ human approval make merge impossible, leave a recoverable branch/PR and report t
 blocker instead of silently stopping at local edits.
 
 Merging is not releasing. Do not perform a release-only version bump, create a tag,
-build or publish an image/release, run a schema migration or fleet roll, mutate GCP, or
-deploy production unless the user explicitly asks for release or deployment in that
-session. After merge, hand the reviewed source refs and verification evidence to the
-separately authorized release session. Required source version changes may remain part
-of the implementation PR; they do not authorize publication.
+build or publish a production/release image, run a schema migration or fleet roll,
+mutate GCP, or deploy production unless the user explicitly asks for release or
+deployment in that session. Ephemeral debug-only local test images remain ordinary
+verification, but they must not carry production credentials or provider coordinates.
+After merge, hand the reviewed source refs and verification evidence to the separately
+authorized release session. Required source version changes may remain part of the
+implementation PR; they do not authorize publication.
 
 Default branch is `main`.
 
