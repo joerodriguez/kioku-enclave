@@ -664,12 +664,13 @@ def configure_direct_child_environment(stage: str) -> None:
         # command receives them below; build, SBOM/scan, gcloud, Skopeo, and
         # registry-promotion children never do. When no disk-floor override is
         # supplied, agent-verify retains its checked-in 15-GiB default.
-    if stage in {"preflight", "build", "push"}:
-        docker_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_DOCKER_CONFIG", "")
-        buildx_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_BUILDX_CONFIG", "")
+    docker_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_DOCKER_CONFIG", "")
+    buildx_config_value = os.environ.get("KIOKU_RELEASE_NATIVE_BUILDX_CONFIG", "")
+    native_config_present = bool(docker_config_value or buildx_config_value)
+    if stage in {"preflight", "build", "push"} or native_config_present:
         if not docker_config_value or not buildx_config_value:
             raise PipelineError(
-                "direct build stages require dedicated KIOKU_RELEASE_NATIVE_DOCKER_CONFIG "
+                "native builder selection requires dedicated KIOKU_RELEASE_NATIVE_DOCKER_CONFIG "
                 "and KIOKU_RELEASE_NATIVE_BUILDX_CONFIG directories"
             )
         docker_config = reviewed_private_config_directory(docker_config_value, "native Docker config directory")
