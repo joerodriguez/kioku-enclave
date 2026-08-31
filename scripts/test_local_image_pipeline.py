@@ -1844,6 +1844,43 @@ class LocalImagePipelineTests(unittest.TestCase):
             )
         )
 
+    def test_verify_preflight_receives_configured_native_builder_selection(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docker_config = root / "docker"
+            buildx_config = root / "buildx"
+            docker_config.mkdir(mode=0o700)
+            buildx_config.mkdir(mode=0o700)
+            environment = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(root),
+                "KIOKU_RELEASE_NATIVE_DOCKER_CONFIG": str(docker_config),
+                "KIOKU_RELEASE_NATIVE_BUILDX_CONFIG": str(buildx_config),
+                "KIOKU_NATIVE_BUILDER_NAME": "reviewed-builder",
+                "KIOKU_NATIVE_BUILDER_ID": "builder-id",
+                "DOCKER_HOST": "unix:///var/run/reviewed.sock",
+            }
+            with patch.dict(pipeline.os.environ, environment, clear=True):
+                pipeline.configure_direct_child_environment("verify")
+
+            self.assertEqual(
+                pipeline._CHILD_ENVIRONMENT["DOCKER_CONFIG"],
+                str(docker_config.resolve()),
+            )
+            self.assertEqual(
+                pipeline._CHILD_ENVIRONMENT["BUILDX_CONFIG"],
+                str(buildx_config.resolve()),
+            )
+            self.assertEqual(
+                pipeline._CHILD_ENVIRONMENT["KIOKU_NATIVE_BUILDER_NAME"],
+                "reviewed-builder",
+            )
+            self.assertEqual(
+                pipeline._CHILD_ENVIRONMENT["DOCKER_HOST"],
+                "unix:///var/run/reviewed.sock",
+            )
+
     def test_verification_inputs_never_reach_build_scan_or_cloud_children(self) -> None:
         pipeline = load_pipeline()
         postgres_url = "postgresql://contract:test@127.0.0.1:5432/contract"
