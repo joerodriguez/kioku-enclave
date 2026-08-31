@@ -92,11 +92,46 @@ security-sensitive changes (auth, crypto, attestation) explain the **threat-mode
 impact**. Run the appropriate local verification above before opening a PR; the
 local signed evidence is the exhaustive merge/release gate.
 
-Only commit/push when the user asks. Default branch is `main`.
+### Delivery ownership
+
+For a user request that authorizes implementation changes, the default definition of
+done is a merged pull request, not uncommitted code in a worktree. Unless the user
+explicitly narrows the request (for example, analysis only, no commit, or stop before
+merge), the implementing session owns the complete delivery loop:
+
+1. Use the task's existing authoritative branch/worktree. Otherwise refresh the
+   canonical repository with `git fetch origin`, then create a unique guarded
+   implementation worktree from current `origin/main`; never mix in, stash, discard, or
+   rewrite unrelated dirty changes.
+2. Implement the change and run the strongest relevant local verification above.
+   Required gates must pass. Record the exact commands, outcomes, and any boundary that
+   cannot be exercised locally.
+3. Review the complete diff. For non-trivial, cross-boundary, or security-sensitive
+   work, obtain a fresh independent review from another agent or human, record the
+   findings/resolution in the PR without representing it as a GitHub approval, and
+   resolve its findings before merge.
+4. Commit only task-owned changes, push the branch, open a PR with a clear summary,
+   threat-model/release impact where relevant, and non-secret verification evidence.
+5. Stay with the PR through conflicts, review feedback, and gate failures; merge through
+   the normal rebase path, confirm the PR is merged, and report its URL and merge SHA.
+
+Implementation authorization includes commit, push, PR creation, and merge; do not pause
+to ask again for those routine delivery steps. If credentials, permissions, or a required
+human approval make merge impossible, leave a recoverable branch/PR and report the exact
+blocker instead of silently stopping at local edits.
+
+Merging is not releasing. Do not perform a release-only version bump, create a tag,
+build or publish an image/release, run a schema migration or fleet roll, mutate GCP, or
+deploy production unless the user explicitly asks for release or deployment in that
+session. After merge, hand the reviewed source refs and verification evidence to the
+separately authorized release session. Required source version changes may remain part
+of the implementation PR; they do not authorize publication.
+
+Default branch is `main`.
 
 **STRICT PR RULE: NEVER PUSH DIRECTLY TO `main`**. All changes — including features, bug fixes, documentation, and version bumps — MUST be committed on a branch and submitted via Pull Request. Never push directly to `main`.
 
-- **Zero-Click PR & Auto-Merge Queue Workflow**: To land changes cleanly without manual UI clicking, agents create PRs and enable CLI auto-merge:
+- **Zero-click reviewed PR workflow**: To land changes cleanly without manual UI clicking, agents create and merge PRs with the CLI:
   ```bash
   git checkout -b feat/feature-name
   git commit -m "feat(scope): detailed description"
@@ -104,7 +139,8 @@ Only commit/push when the user asks. Default branch is `main`.
   gh pr create --fill --base main
   gh pr merge --rebase
   ```
-  Do not merge until a reviewer has checked the local verification evidence.
+  Do not merge until the required local verification passes and the independent review
+  requirement above is satisfied.
   Continue to avoid `--admin`; disabling hosted checks does not authorize bypassing
   branch, review, or signed-commit protections.
 
