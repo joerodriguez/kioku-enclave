@@ -1134,7 +1134,7 @@ async fn async_main() {
             .as_ref()
             .map(|config| Arc::new(cp::auth::ReviewerIdentityVerifier::new(config.clone()))),
         apple_provider,
-        sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
+        capture_event_limiter: cp::limits::capture_event_limiter(),
         reference_batch_limiter: cp::limits::RateLimiter::new(20.0, 2.0),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),

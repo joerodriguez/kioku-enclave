@@ -1494,7 +1494,7 @@ async fn upload_capture_event(
     // screenshots and reference pointers and advance acknowledgements only
     // across contiguous committed sequences.
     if !state
-        .sync_limiter
+        .capture_event_limiter
         .consume_scoped(&state.repositories, "capture-event", &user_id)
         .await
     {

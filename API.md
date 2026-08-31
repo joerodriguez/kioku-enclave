@@ -404,12 +404,22 @@ A newly accepted reference returns `201` with
 Clients durably spool a canonical manifest and media before upload, and spool a
 reference manifest only after its canonical dependency is durable. Replay in
 ascending stream sequence and never upload a reference until its canonical has
-been acknowledged. Delete a local spool item only when its sequence is at or below
-`committed_through_sequence`. Retry network failures and HTTP 5xx with bounded
-exponential backoff plus jitter. Respect HTTP `429` and its `retry_after`
-seconds. Do not retry malformed requests (HTTP 400) without correcting them;
-the one defined exception is `screen_reference_rebase_required`, which is
-corrected by a single canonical retry at the same stream sequence.
+been acknowledged. A current full receipt acknowledges the exact `event_id`,
+`asset_id`, disposition, and processing state after durable commit; clients may
+delete that exact local item even when `committed_through_sequence` remains behind
+because a restored PostgreSQL authority does not contain the stream's earlier
+prefix. A legacy watermark-only receipt acknowledges only items whose sequence is
+at or below that watermark. The equivalent exact batch tuple acknowledges every
+event bound into its deterministic `batch_id`; the watermark remains useful resume
+state but is not an additional deletion precondition after an exact receipt.
+Retry network failures and HTTP 5xx with bounded exponential backoff plus jitter.
+Respect HTTP `429` and its `retry_after` seconds. Per-account individual capture-event
+admission permits a one-minute 120-event burst and refills at two events per second,
+matching the event credits granted by one recorded minute; durable event and byte
+credits remain the ultimate bound. Do not retry malformed requests (HTTP 400)
+without correcting them; the one defined exception is
+`screen_reference_rebase_required`, which is corrected by a single canonical retry
+at the same stream sequence.
 
 The Mac's encrypted outbox adds the fixed header
 `Kioku-Delivery-Mode: encrypted-outbox-v1`. Each newly billed live minute and

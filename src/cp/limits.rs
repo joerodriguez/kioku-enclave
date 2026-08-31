@@ -43,6 +43,15 @@ impl RateLimiter {
     }
 }
 
+/// Canonical media and individual-reference admission must keep pace with the
+/// 120 event credits granted by each recorded minute. The one-minute bucket
+/// absorbs reconnect bursts while the two-event-per-second refill sustains the
+/// maximum credited live production rate; durable event and byte credits remain
+/// the account's ultimate admission bound.
+pub fn capture_event_limiter() -> RateLimiter {
+    RateLimiter::new(120.0, 2.0)
+}
+
 pub(crate) struct ConcurrencyPermit {
     _lease: FleetAdmissionLease,
 }
@@ -73,6 +82,18 @@ pub(crate) async fn try_acquire_concurrency(
 /// denied so a stale access token cannot recreate content after deletion.
 pub async fn account_active(repositories: &RepositorySet, user_id: &str) -> Result<bool> {
     repositories.entitlements().account_active(user_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_event_limiter;
+
+    #[test]
+    fn capture_event_admission_matches_the_paid_minute_credit_rate() {
+        let limiter = capture_event_limiter();
+        assert_eq!(limiter.capacity, 120.0);
+        assert_eq!(limiter.refill_per_sec, 2.0);
+    }
 }
 
 /// Atomically reserve a bounded Vertex output ceiling from both the global
