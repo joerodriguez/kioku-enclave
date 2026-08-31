@@ -2,8 +2,10 @@
 
 Serving processes never run DDL. A reviewed candidate image supplies the private
 `--migrate-postgres` role, and `POSTGRES_MIGRATION_CONFIRM` authorizes exactly one phase.
-Migration 0026 uses a two-phase ADR-0041 expand/finalize sequence because the current v25
-predecessor requires the durable `persistence_schema.version` marker to remain 25.
+Migration 0026 uses a two-phase ADR-0041 expand/finalize sequence because the production v24
+predecessor requires the durable `persistence_schema.version` marker to remain 24. The expand
+also installs migration 0025's additive account-status constraint as an exact receipted step,
+without publishing its standalone version-marker advance.
 
 ## Memory-reconciliation v26
 
@@ -13,13 +15,14 @@ predecessor requires the durable `persistence_schema.version` marker to remain 2
    `POSTGRES_MIGRATION_CONFIRM=memory-reconciliation-v26-expand`. The job owns a session advisory
    lock, but never holds a table lock across the release. An exact-absence preflight runs before
    the first mutation. The runner bootstraps its release/step ledger atomically, then builds the
-   legacy source-owner uniqueness guard concurrently. An ambiguous archive fails before any
+   additive account-deletion status constraint after proving the exact v24 predecessor catalog,
+   then builds the legacy source-owner uniqueness guard concurrently. An ambiguous archive fails before any
    backfill or compatibility projection; the runner removes an interrupted invalid index so a
    repaired retry can continue.
 3. Rerun that exact expand command while its machine-readable JSON status is
    `expand_in_progress`. Metadata changes use independent transactions with a two-second lock
    timeout. Compatibility triggers are catalog-verified before any cursor advances; they cover
-   v25 writes while accounts, episodes/handles, structure state, and membership are copied in
+   v24 writes while accounts, episodes/handles, structure state, and membership are copied in
    bounded keyset batches. Every short DDL transaction commits an embedded-DDL SHA-256 and an
    exact catalog-evidence SHA-256 in the same transaction. Cold objects reject name collisions;
    interrupted concurrent indexes are accepted only after their complete normalized definition
@@ -29,13 +32,13 @@ predecessor requires the durable `persistence_schema.version` marker to remain 2
 4. Stop rerunning only when the JSON status is `expanded` or `already_expanded`. The runner has
    then verified the exact embedded contract hash, required catalog objects and valid indexes,
    and both directions of every backfilled projection. Its final short transaction records
-   `expanded_through_version=26` and release phase `expanded` while leaving `version=25`.
-5. Prove the populated archive was preserved, the expansion receipt is exactly `25/26`, and
-   every predecessor member remains ready. A v25 process continues to read version 25; the
+   `expanded_through_version=26` and release phase `expanded` while leaving `version=24`.
+5. Prove the populated archive was preserved, the expansion receipt is exactly `24/26`, and
+   every predecessor member remains ready. A v24 process continues to read version 24; the
    v26 candidate accepts only the matching release-row contract hash and physical catalog, but
    keeps its writer dark.
 6. Perform ADR-0041 preauthorization and rolling replacement. Preserve both reviewed KMS
-   digest members and do not finalize while any v25 predecessor is serving or may return.
+   digest members and do not finalize while any v24 predecessor is serving or may return.
 7. The selected production/evaluation image profile must contain the public, non-secret
    `SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64` (canonical standard base64 of one Ed25519 SPKI DER
    key) and `SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256` (64 lowercase hex characters over those exact
@@ -82,7 +85,7 @@ predecessor requires the durable `persistence_schema.version` marker to remain 2
    the baked-key fingerprint, and a `clock_timestamp()` finalization time while atomically
    advancing `version` to 26. Serving and writer admission reparse, recanonicalize, rehash, and
    reverify the persisted signature. The phase literal alone cannot finalize. This is the
-   rollback boundary for the v25 predecessor.
+   rollback boundary for the v24 predecessor.
 9. Complete predecessor retirement and steady-state verification. Reconciliation writer
    activation requires a separate durable fleet-wide activation protocol observed by both dark
    and enabled processes. This release deliberately rejects a true writer setting even at

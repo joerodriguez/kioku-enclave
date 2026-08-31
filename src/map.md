@@ -39,7 +39,7 @@ main.rs
 
 - HTTP handlers and workers depend on repository ports, not `sqlx` connections or database-file
   operations.
-- Serving members verify finalized PostgreSQL schema or an exact candidate-compatible expand;
+- Serving members verify finalized PostgreSQL schema or an exact candidate-compatible v24-to-v26 expand;
   only the explicit one-shot migrator runs append-only DDL. Memory-reconciliation publication is
   hard-dark in this release; a future durable fleet-wide activation receipt must fence both dark
   and enabled finalizers before the writer can be admitted.

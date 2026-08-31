@@ -57,6 +57,9 @@ receipted expand declared compatible by the candidate.
 - `0025_account_deletion_request.sql` adds the durable `deletion_requested`
   admission fence used while final usage and the one-way billing deletion
   fence are reconciled, before identity/content deletion begins.
+- `0026_account_deletion_compatibility.sql` installs the same additive status
+  constraint as a receipted v26 expand step while deliberately retaining the
+  live production predecessor's schema-24 marker.
 - `0026_memory_reconciliation_episode_members_unique_index.sql` installs the
   mandatory legacy source-owner guard with `CREATE UNIQUE INDEX CONCURRENTLY`.
   Ambiguous ownership fails before any other v26 object; interrupted invalid

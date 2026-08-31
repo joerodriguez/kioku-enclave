@@ -40,7 +40,7 @@ pub(crate) use schema_release::{
 };
 
 pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 26;
-const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 25;
+const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InstalledSchemaState {
@@ -387,14 +387,6 @@ impl PostgresPersistence {
             sqlx::raw_sql(include_str!("../../../migrations/0024_fleet_admission.sql"))
                 .execute(&mut *transaction)
                 .await?;
-            version = 24;
-        }
-        if version == 24 {
-            sqlx::raw_sql(include_str!(
-                "../../../migrations/0025_account_deletion_request.sql"
-            ))
-            .execute(&mut *transaction)
-            .await?;
         }
         transaction.commit().await?;
         if target_version == EXPECTED_SCHEMA_VERSION {
@@ -434,7 +426,7 @@ impl PostgresPersistence {
                 })
             {
                 return Err(EnclaveError::Store(
-                    "PostgreSQL predecessor migration did not stop at pristine schema 25".into(),
+                    "PostgreSQL predecessor migration did not stop at pristine schema 24".into(),
                 ));
             }
             Ok(())
@@ -562,7 +554,7 @@ mod tests {
             // A fresh real-PostgreSQL contract proves the populated production
             // release shape rather than jumping directly from an empty database
             // to finalized v26. The legacy row must survive expand/backfill, the
-            // marker must remain 25 for predecessor readiness, and the writer
+            // marker must remain 24 for predecessor readiness, and the writer
             // must stay fenced until the separate finalize phase.
             persistence
                 .migrate_to_memory_reconciliation_predecessor()
@@ -607,8 +599,37 @@ mod tests {
                 .fetch_one(persistence.pool())
                 .await
                 .unwrap(),
-                (25, true, false, "installing".into()),
-                "failed ownership guard must retain only the resumable release ledger while leaving the predecessor marker and product catalog untouched"
+                (24, true, false, "installing".into()),
+                "failed ownership guard must retain the receipted account-status expansion and resumable release ledger while leaving the predecessor marker untouched"
+            );
+            assert!(sqlx::query_scalar::<_, String>(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                  WHERE conrelid='accounts'::regclass AND conname='accounts_status_check'"
+            )
+            .fetch_one(persistence.pool())
+            .await
+            .unwrap()
+            .contains("deletion_requested"));
+            sqlx::query(
+                "UPDATE accounts SET status='deletion_requested' \
+                  WHERE id='schema-release-contract'",
+            )
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE accounts SET status='active' WHERE id='schema-release-contract'")
+                .execute(persistence.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM persistence_schema WHERE singleton=true"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                24,
+                "the receipted account-status expansion must remain writable without advancing the v24 predecessor marker"
             );
             sqlx::query("DELETE FROM episodes WHERE account_id='schema-release-contract' AND id=2")
                 .execute(persistence.pool())
@@ -631,7 +652,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(drifted_vertex_constraint.to_string().contains(
-                "schema-25 Vertex operation constraint is not the validated predecessor contract"
+                "schema-24 Vertex operation constraint is not the validated predecessor contract"
             ));
             assert_eq!(
                 sqlx::query_as::<_, (i64, Option<i64>, i64)>(
@@ -645,7 +666,7 @@ mod tests {
                 .fetch_one(persistence.pool())
                 .await
                 .unwrap(),
-                (25, None, 0),
+                (24, None, 0),
                 "a drifted predecessor constraint must not advance or receipt the Vertex step"
             );
             sqlx::raw_sql(
@@ -678,7 +699,7 @@ mod tests {
                 .fetch_one(persistence.pool())
                 .await
                 .unwrap(),
-                (25, None, "backfilling".into()),
+                (24, None, "backfilling".into()),
                 "an interrupted bounded expand must retain predecessor readiness"
             );
             assert_eq!(
@@ -695,7 +716,7 @@ mod tests {
             .fetch_one(persistence.pool())
             .await
             .unwrap();
-            assert_eq!(marker, (25, Some(26)));
+            assert_eq!(marker, (24, Some(26)));
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
                     "SELECT version FROM persistence_schema WHERE singleton=true"
@@ -703,8 +724,8 @@ mod tests {
                 .fetch_one(persistence.pool())
                 .await
                 .unwrap(),
-                25,
-                "the v25 predecessor must continue to observe its exact marker"
+                24,
+                "the v24 predecessor must continue to observe its exact marker"
             );
             assert_eq!(
                 sqlx::query_as::<_, (String, String, i64)>(
@@ -744,7 +765,7 @@ mod tests {
                 .fetch_one(persistence.pool())
                 .await
                 .unwrap(),
-                25,
+                24,
                 "invalid fleet evidence must not mutate the predecessor marker"
             );
             let fleet_authorization = super::schema_release::test_finalization_authorization();
@@ -843,6 +864,8 @@ mod tests {
 
     #[test]
     fn memory_reconciliation_release_is_online_receipted_then_marker_finalized() {
+        let account_deletion =
+            include_str!("../../../migrations/0026_account_deletion_compatibility.sql");
         let cold_objects = include_str!("../../../migrations/0026_memory_reconciliation.sql");
         let unique_guard = include_str!(
             "../../../migrations/0026_memory_reconciliation_episode_members_unique_index.sql"
@@ -858,6 +881,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(unique_guard.contains("CREATE UNIQUE INDEX CONCURRENTLY"));
+        assert!(account_deletion.contains("schema-24 account status constraint"));
+        assert!(account_deletion.contains("deletion_requested"));
+        assert!(!account_deletion.contains("UPDATE persistence_schema"));
         assert!(capture_sessions.contains("CREATE INDEX CONCURRENTLY"));
         assert!(!normalized_cold_objects.contains("UPDATE episodes"));
         assert!(!normalized_cold_objects
