@@ -935,32 +935,6 @@ async fn postgres_session_status(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::capture_session_stage;
-    use crate::persistence::capture::CaptureSessionStage;
-
-    #[test]
-    fn capture_session_failure_stays_automatic_until_honest_zero_result() {
-        assert_eq!(
-            capture_session_stage(0, 0, 0, 1, false, false, true, false),
-            CaptureSessionStage::Processing
-        );
-        assert_eq!(
-            capture_session_stage(0, 0, 0, 1, false, false, false, false),
-            CaptureSessionStage::Processing
-        );
-        assert_eq!(
-            capture_session_stage(0, 0, 0, 1, false, false, true, true),
-            CaptureSessionStage::NoMemory
-        );
-        assert_eq!(
-            capture_session_stage(0, 0, 0, 1, true, true, true, true),
-            CaptureSessionStage::Ready
-        );
-    }
-}
-
 #[async_trait]
 impl CaptureRepository for PostgresPersistence {
     async fn preflight_event(
@@ -1228,5 +1202,31 @@ impl CaptureRepository for PostgresPersistence {
             return Ok(None);
         }
         postgres_session_status(self, account_id, capture_session_id, None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_session_stage;
+    use crate::persistence::capture::CaptureSessionStage;
+
+    #[test]
+    fn capture_session_failure_stays_automatic_until_honest_zero_result() {
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, true, false),
+            CaptureSessionStage::Processing
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, false, false),
+            CaptureSessionStage::Processing
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, false, false, true, true),
+            CaptureSessionStage::NoMemory
+        );
+        assert_eq!(
+            capture_session_stage(0, 0, 0, 1, true, true, true, true),
+            CaptureSessionStage::Ready
+        );
     }
 }
