@@ -14,6 +14,9 @@ pub(crate) struct FinalizationEpisode {
     pub(crate) participants: Option<String>,
     pub(crate) languages: Option<String>,
     pub(crate) action_items: Option<String>,
+    pub(crate) structure_state: String,
+    pub(crate) minute_summaries: Value,
+    pub(crate) minutes_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,9 +111,21 @@ pub(crate) struct FinalizationSettlement {
 pub(crate) enum FinalizationRequest {
     NotFound,
     LowSignal,
+    AwaitingReconciliation,
     AlreadyComplete { status: String },
     AlreadyQueued { status: String },
     Queued,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinalizationClaimRequest<'a> {
+    pub(crate) account_id: &'a str,
+    pub(crate) target_episode_id: Option<i64>,
+    pub(crate) now: &'a str,
+    pub(crate) horizon_before: &'a str,
+    pub(crate) finalization_version: i64,
+    pub(crate) lease_seconds: i64,
+    pub(crate) require_reconciled: bool,
 }
 
 #[async_trait]
@@ -123,16 +138,12 @@ pub(crate) trait FinalizationRepository: Send + Sync {
         account_id: &str,
         episode_id: i64,
         finalization_version: i64,
+        require_reconciled: bool,
     ) -> Result<FinalizationRequest>;
 
     async fn claim_finalization(
         &self,
-        account_id: &str,
-        target_episode_id: Option<i64>,
-        now: &str,
-        horizon_before: &str,
-        finalization_version: i64,
-        lease_seconds: i64,
+        request: FinalizationClaimRequest<'_>,
     ) -> Result<Option<FinalizationClaim>>;
 
     async fn defer_finalization(

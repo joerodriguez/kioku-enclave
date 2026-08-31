@@ -178,6 +178,8 @@ class BootstrapLocalOperatorConfigTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertIn("PRODUCTION_ENCLAVE_KMS_PROJECT=", content)
             self.assertIn("PRODUCTION_ADMIN_USER_IDS=", content)
+            self.assertIn("PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64=", content)
+            self.assertIn("PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256=", content)
             self.assertIn("LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT=local-builder@", content)
             self.assertNotIn("\nKMS_PROJECT=", "\n" + content)
             with self.assertRaisesRegex(module.BootstrapError, "overwrite"):

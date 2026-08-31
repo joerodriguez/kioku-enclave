@@ -4,8 +4,10 @@
 //! (cloud-platform scope), same pattern as the GCS/KMS clients.
 //!
 //! Only the Gemini path is implemented; `VERTEX_MODEL` defaults to the current
-//! Gemini 3.5 Flash deployment. These calls send bounded assembled text,
-//! decrypted audio windows, and screen storyboards to Vertex outside the TEE.
+//! Gemini 3.5 Flash deployment, while settled reconciliation may route to a
+//! separately qualified `VERTEX_RECONCILIATION_MODEL`. These calls send
+//! bounded assembled text, decrypted audio windows, and screen storyboards to
+//! Vertex outside the TEE.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
@@ -35,6 +37,7 @@ async fn require_active_account(state: &CpState, user_id: &str) -> Result<()> {
 pub enum VertexOperation {
     EpisodeSummary,
     EpisodeSummaryRepair,
+    EpisodeReconciliation,
     FinalEpisodeAnalysis,
     AudioWindow,
     ScreenStoryboard,
@@ -44,6 +47,7 @@ impl VertexOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::EpisodeSummary | Self::EpisodeSummaryRepair => "episode_summarization",
+            Self::EpisodeReconciliation => "episode_reconciliation",
             Self::FinalEpisodeAnalysis => "episode_finalization",
             Self::AudioWindow => "audio_understanding",
             Self::ScreenStoryboard => "screen_understanding",
@@ -98,6 +102,15 @@ pub struct TextGeneration {
     /// Durable usage-ledger identity for the settled provider invocation. The
     /// finalization commit plan anchors on this exact value.
     pub event_id: String,
+}
+
+pub struct CustomTextGenerationRequest<'a> {
+    pub operation: VertexOperation,
+    pub system: &'a str,
+    pub user_message: &'a str,
+    pub schema: Value,
+    pub max_output_tokens: u32,
+    pub model: &'a str,
 }
 
 pub struct MediaGeneration {
@@ -277,11 +290,40 @@ pub async fn generate_custom(
     schema: Value,
     max_output_tokens: u32,
 ) -> Result<TextGeneration> {
+    generate_custom_with_model(
+        state,
+        user_id,
+        CustomTextGenerationRequest {
+            operation,
+            system,
+            user_message,
+            schema,
+            max_output_tokens,
+            model: &state.config.vertex_model,
+        },
+    )
+    .await
+}
+
+/// Variant of [`generate_custom`] for workers with a separately qualified
+/// model. The selected model remains part of the durable usage identity.
+pub async fn generate_custom_with_model(
+    state: &CpState,
+    user_id: &str,
+    request: CustomTextGenerationRequest<'_>,
+) -> Result<TextGeneration> {
+    let CustomTextGenerationRequest {
+        operation,
+        system,
+        user_message,
+        schema,
+        max_output_tokens,
+        model,
+    } = request;
     // Hold through the durable terminal usage write on every response/error
     // path. Account deletion waits here before it destroys the usage ledger.
     require_active_account(state, user_id).await?;
     let config = &state.config;
-    let model = &config.vertex_model;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }

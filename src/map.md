@@ -23,7 +23,7 @@ main.rs
 
 | Path | Responsibility |
 |---|---|
-| `main.rs` | PostgreSQL-only composition root, dedicated migrator role, baked configuration, KMS/media construction, shared TLS, REST/MCP/OAuth routing, worker startup, readiness/liveness, and bounded drain. |
+| `main.rs` | PostgreSQL-only composition root, phase-confirmed expand/finalize migrator role, baked configuration, KMS/media construction, shared TLS, REST/MCP/OAuth routing, worker startup, readiness/liveness, and bounded drain. |
 | `attestation.rs` | Bounded Confidential Space launcher protocol, internal attestation-derived STS/KMS credential path, and separately audience-bound public attestation tokens. |
 | `auth.rs` | Google service-account ID-token verification retained for authenticated `410 Gone` compatibility routes. |
 | [`cp/`](cp/map.md) | Product API, OAuth, capture, query, MCP, retention, export/deletion, inference, and horizontally coordinated workers. |
@@ -39,8 +39,10 @@ main.rs
 
 - HTTP handlers and workers depend on repository ports, not `sqlx` connections or database-file
   operations.
-- Serving members verify the expected PostgreSQL schema; only the explicit one-shot migrator runs
-  append-only DDL.
+- Serving members verify finalized PostgreSQL schema or an exact candidate-compatible expand;
+  only the explicit one-shot migrator runs append-only DDL. Memory-reconciliation publication is
+  hard-dark in this release; a future durable fleet-wide activation receipt must fence both dark
+  and enabled finalizers before the writer can be admitted.
 - Fleet-wide claims, leases, reservations, and compare-and-set settlement precede provider effects.
   Stale workers cannot settle and ambiguous provider results are never blindly resent.
 - GCS objects are application-encrypted and bound to the owning account, purpose, canonical name,
@@ -49,6 +51,8 @@ main.rs
   media-byte export remains an activation blocker. Deletion first commits a recoverable admission
   tombstone, settles usage and the billing fence, then removes PostgreSQL rows and
   current/noncurrent object generations and reports completion only after durable reconciliation.
-- Production readiness requires PostgreSQL schema health and the process-immutable shared TLS
-  generation. Liveness remains process-local so ADR-0041 can rotate certificates or replace fleet
-  members with zero unavailable capacity.
+- Production readiness requires the exact PostgreSQL schema marker, embedded-contract receipt and
+  physical catalog plus the process-immutable shared TLS generation. Reconciliation writing also
+  requires the persisted, hash-verified homogeneous-fleet finalization receipt. Liveness remains
+  process-local so ADR-0041 can rotate certificates or replace fleet members with zero unavailable
+  capacity.

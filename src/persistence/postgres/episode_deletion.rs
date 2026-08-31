@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-use super::PostgresPersistence;
+use super::{advisory_transaction_lock, PostgresPersistence};
 
 fn event_id(source_key: &str) -> Option<&str> {
     let value = source_key.strip_prefix("cloud-v2:")?;
@@ -38,6 +38,28 @@ impl EpisodeDeletionRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        // Serialize deletion with reconciliation claim admission. A live
+        // processing lease is the durable fence proving that provider egress
+        // may be in flight; deletion waits for the account lock, then refuses
+        // until that bounded lease is released or expires. Conversely, once
+        // deletion marks the episode, the claim-side snapshot revalidation
+        // fails before any provider request can begin.
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
+        let reconciliation_in_flight = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM memory_reconciliation_jobs \
+              WHERE account_id=$1 AND state='processing' \
+                AND claim_until>CURRENT_TIMESTAMP \
+                AND predecessor_episode_ids @> ARRAY[$2]::bigint[])",
+        )
+        .bind(account_id)
+        .bind(episode_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if reconciliation_in_flight {
+            return Err(EnclaveError::Conflict(
+                "episode reconciliation is in flight".into(),
+            ));
+        }
         if let Some(row) = sqlx::query(
             "SELECT state,purge::text AS purge,media_object_keys::text AS media \
                FROM episode_deletions WHERE account_id=$1 AND episode_id=$2 FOR UPDATE",

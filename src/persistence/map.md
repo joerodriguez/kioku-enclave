@@ -22,6 +22,7 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |
 | `media_processing.rs` | Media job claim, usage, screen/audio projection, owner-source classification, voice evidence, retry, and settlement contract. |
 | `memory_formation.rs` | Summarizer window claim, turn-timed source evidence, open-memory projection, atomic cursor/episode settlement, and embedding-source contract over memory text plus final-brief human values. |
+| `memory_reconciliation.rs` | Source-settled cohort snapshots, fleet leases, durable staged partitions, atomic active-topology publication, and content-free handle resolution contract. |
 | `model_usage.rs` | Vertex intent/outcome, billing batch claim, and coverage reconciliation contract. |
 | `notification.rs` | Webhook, email-consent, and push-installation configuration with redacted secret-bearing types. |
 | `oauth.rs` | OAuth client, consent, authorization-code, native-session, and refresh-token transaction contract. |

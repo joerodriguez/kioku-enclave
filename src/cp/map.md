@@ -20,7 +20,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `dlp.rs` | Bounded sensitive-data classification/redaction helpers. |
 | `email_renderer.rs` | Pure text/HTML email rendering, escaping, and link safety. |
 | `email_worker.rs` | PostgreSQL-claimed Resend delivery with frozen requests, bounded retry, disclosure fences, ambiguity no-resend, and horizontally safe settlement. |
-| `finalizer.rs` | Restartable final-memory/recap worker and atomic creation of email, webhook, and APNs outbox rows. |
+| `finalizer.rs` | Restartable final-memory/recap worker, gated by settled memory reconciliation before any finalization claim. Qualified reconciled rows reuse their validated compact timeline while regenerating grounded briefs and screen semantics from raw evidence; settlement also atomically creates email, webhook, and APNs outbox rows. |
 | `identity.rs` | Identity facade and account/session projections. |
 | `isotime.rs` | RFC 3339 UTC parsing, formatting, and arithmetic. |
 | `limits.rs` | Volatile request rate limiting plus PostgreSQL fleet admission, quota, concurrency, and Vertex reservation use. |
@@ -33,12 +33,13 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `playback.rs` | Owner-authorized recording timeline, JavaScript-exact revision projection, owner-source display, exact encrypted-segment serving, and numeric-cursor pages of memories attributed to an exact identified person ID. |
 | `push.rs` | APNs installation/handoff routes and PostgreSQL-claimed content-free ready notifications with credential-generation fences and no-resend ambiguity. |
 | `query.rs` | REST/MCP query surfaces, including additive cross-modal REST search over memories, final briefs, transcripts, and screenshots with stable memory/person navigation; episodes, feed, people, browser evidence, screenshots, webhooks, and durable episode-deletion initiation/status behavior. |
+| `reconciler.rs` | Pure settled-memory partition planner plus PostgreSQL-claimed worker orchestration. It validates one exhaustive bounded partition, reuses durable staged model results, preserves exact one-to-one IDs, and remains writer-disabled until explicitly qualified. |
 | `retention.rs` | Recording-retention preview/CAS, key epochs, downgrade reconciliation, and durable-recording policy routes. |
 | `screen_understanding.rs` | Bounded screen/storyboard result validation and projection. |
 | `summarizer.rs` | PostgreSQL-claimed incremental memory formation, bounded Vertex summarization, in-enclave embedding of the complete memory/final-brief human projection, and cursor settlement. Recurring and session-settled passes traverse only proven-empty sparse-history windows and stop at the first outcome that may have invoked the model; queued duplicate hints coalesce without suppressing a later media-complete edge. |
 | `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes with deletion-owned outbound-claim recovery and a durable pre-billing-fence admission phase. |
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
-| `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas and content-free usage metadata. |
+| `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas, content-free usage metadata, and explicit model routing for separately qualified reconciliation. |
 | `voice_memory.rs` | Pure-Rust audio decoding, fbank, and pinned WeSpeaker inference used by explicit voice-evaluation tooling. |
 | `voice_quality.rs` | Versioned enrollment/matching quality policy and robust representative selection. |
 | `voice_eval.rs` | Public voice/identity/diarization scoring contract and real-corpus release classification. |

@@ -24,7 +24,29 @@ const EXPORT_TABLES: &[(&str, &str, &str)] = &[
     ("screenshots", "screenshots", "id"),
     ("screenshot_images", "screenshot_images", "id"),
     ("episodes", "episodes", "id"),
+    (
+        "episode_members",
+        "episode_members",
+        "episode_id,record_type,record_id",
+    ),
     ("episode_final_briefs", "episode_final_briefs", "episode_id"),
+    ("memory_archive_state", "memory_archive_state", "account_id"),
+    ("memory_handles", "memory_handles", "episode_id"),
+    (
+        "memory_reconciliations",
+        "memory_reconciliations",
+        "committed_at,id",
+    ),
+    (
+        "memory_lineage_edges",
+        "memory_lineage_edges",
+        "predecessor_episode_id,ordinal",
+    ),
+    (
+        "memory_reconciliation_sources",
+        "memory_reconciliation_sources",
+        "reconciliation_id,record_type,record_id",
+    ),
     ("capture_sessions", "capture_sessions", "created_at,id"),
     ("capture_streams", "capture_streams", "created_at,id"),
     ("capture_events", "capture_events", "started_at,event_id"),
@@ -1339,6 +1361,20 @@ impl MemoryQueryRepository for PostgresPersistence {
             ));
         }
         let fetch_limit = request.limit + i64::from(request.probe_for_more);
+        // A topology publish may replace several episode rows at once. Keep
+        // the page, its screenshot facets, low-signal count, and the revision
+        // fence on one repeatable PostgreSQL snapshot so clients can safely
+        // discard a continuation fetched from a different archive epoch.
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let archive_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT coalesce((SELECT revision FROM memory_archive_state WHERE account_id=$1),0)",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
         let rows = sqlx::query(
             "SELECT e.id,e.title,e.summary,e.type,e.participants::text AS participants, \
                     e.languages::text AS languages,e.action_items::text AS action_items, \
@@ -1373,7 +1409,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(before)
         .bind(request.before_id)
         .bind(fetch_limit)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
 
         let mut episodes = Vec::with_capacity(rows.len());
@@ -1453,7 +1489,7 @@ impl MemoryQueryRepository for PostgresPersistence {
             )
             .bind(account_id)
             .bind(&ids)
-            .fetch_all(self.pool())
+            .fetch_all(&mut *transaction)
             .await?
         };
         let mut participant_details: HashMap<i64, Vec<Value>> = HashMap::new();
@@ -1475,7 +1511,7 @@ impl MemoryQueryRepository for PostgresPersistence {
             )
             .bind(account_id)
             .bind(&ids)
-            .fetch_all(self.pool())
+            .fetch_all(&mut *transaction)
             .await?
         };
         let mut app_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
@@ -1524,13 +1560,15 @@ impl MemoryQueryRepository for PostgresPersistence {
             .bind(account_id)
             .bind(from)
             .bind(to)
-            .fetch_one(self.pool())
+            .fetch_one(&mut *transaction)
             .await?
         };
+        transaction.commit().await?;
         Ok(EpisodeListPage {
             episodes,
             hidden_count,
             has_more,
+            archive_revision,
         })
     }
 

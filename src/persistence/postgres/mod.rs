@@ -14,12 +14,14 @@ mod identity;
 mod lifecycle;
 mod media_processing;
 mod memory_formation;
+mod memory_reconciliation;
 mod model_usage;
 mod notification;
 mod oauth;
 mod playback;
 mod query;
 mod recording_retention;
+mod schema_release;
 mod work;
 
 use std::str::FromStr;
@@ -30,7 +32,49 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
-pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 25;
+#[cfg(test)]
+use schema_release::SchemaReleaseStatus;
+pub(crate) use schema_release::{
+    verify_schema_finalization_authorization, SchemaFinalizationReceipt,
+    SchemaFinalizationSignature, VerifiedSchemaFinalizationReceipt,
+};
+
+pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 26;
+const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InstalledSchemaState {
+    version: i64,
+    expanded_through_version: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServingSchemaState {
+    ExpandedTransition,
+    Finalized,
+}
+
+fn classify_serving_schema(state: InstalledSchemaState) -> Result<ServingSchemaState> {
+    match (state.version, state.expanded_through_version) {
+        (MEMORY_RECONCILIATION_EXPAND_FROM_VERSION, Some(EXPECTED_SCHEMA_VERSION)) => {
+            Ok(ServingSchemaState::ExpandedTransition)
+        }
+        (EXPECTED_SCHEMA_VERSION, Some(EXPECTED_SCHEMA_VERSION)) => {
+            Ok(ServingSchemaState::Finalized)
+        }
+        _ => Err(EnclaveError::Config(format!(
+            "PostgreSQL schema marker {}/{} is not compatible with finalized version {} or its receipted {}/{} expand",
+            state.version,
+            state
+                .expanded_through_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "none".into()),
+            EXPECTED_SCHEMA_VERSION,
+            MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+            EXPECTED_SCHEMA_VERSION,
+        ))),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
@@ -45,6 +89,32 @@ pub(crate) struct PostgresPoolConfig {
     pub(crate) max_connections: u32,
     pub(crate) acquire_timeout: Duration,
     pub(crate) statement_timeout: Duration,
+}
+
+fn installed_schema_state_from_row(row: &sqlx::postgres::PgRow) -> Result<InstalledSchemaState> {
+    Ok(InstalledSchemaState {
+        version: row.try_get("version")?,
+        expanded_through_version: row.try_get("expanded_through_version")?,
+    })
+}
+
+async fn transaction_schema_state(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<InstalledSchemaState> {
+    let row = sqlx::query(
+        "SELECT version, \
+                (to_jsonb(schema_marker)->>'expanded_through_version')::bigint \
+                    AS expanded_through_version \
+           FROM persistence_schema schema_marker WHERE singleton=true",
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.as_ref()
+        .map(installed_schema_state_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            EnclaveError::Config("PostgreSQL persistence schema marker is missing".into())
+        })
 }
 
 impl PostgresPersistence {
@@ -104,9 +174,30 @@ impl PostgresPersistence {
         &self.pool
     }
 
-    /// Apply reviewed migrations from an explicit release operation.
-    /// Serving startup calls `verify_schema`, never this method.
+    /// Build a complete disposable contract database. Production releases use
+    /// the separately confirmed expand/finalize methods below; serving startup
+    /// calls `verify_schema` and never either mutation path.
+    #[cfg(test)]
     pub(crate) async fn migrate(&self) -> Result<()> {
+        self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await
+    }
+
+    #[cfg(test)]
+    async fn migrate_to_memory_reconciliation_predecessor(&self) -> Result<()> {
+        self.migrate_to_version(MEMORY_RECONCILIATION_EXPAND_FROM_VERSION)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn migrate_to_version(&self, target_version: i64) -> Result<()> {
+        if !matches!(
+            target_version,
+            MEMORY_RECONCILIATION_EXPAND_FROM_VERSION | EXPECTED_SCHEMA_VERSION
+        ) {
+            return Err(EnclaveError::Config(format!(
+                "unsupported PostgreSQL migration target {target_version}"
+            )));
+        }
         let mut transaction = self.pool.begin().await?;
         advisory_transaction_lock(&mut transaction, "schema", "adr-0040").await?;
         let installed = sqlx::query_scalar::<_, bool>(
@@ -306,25 +397,48 @@ impl PostgresPersistence {
             .await?;
         }
         transaction.commit().await?;
-        self.verify_schema().await
-    }
-
-    pub(crate) async fn verify_schema(&self) -> Result<()> {
-        let row = sqlx::query("SELECT version FROM persistence_schema WHERE singleton = true")
-            .fetch_optional(&self.pool)
+        if target_version == EXPECTED_SCHEMA_VERSION {
+            loop {
+                let result = self.expand_memory_reconciliation_release_schema().await?;
+                match result.status {
+                    SchemaReleaseStatus::ExpandInProgress => continue,
+                    SchemaReleaseStatus::Expanded | SchemaReleaseStatus::AlreadyExpanded => {
+                        let authorization = schema_release::test_finalization_authorization();
+                        self.finalize_memory_reconciliation_release_schema(&authorization)
+                            .await?;
+                        break;
+                    }
+                    SchemaReleaseStatus::AlreadyFinalized => break,
+                    SchemaReleaseStatus::Finalized => {
+                        return Err(EnclaveError::Store(
+                            "expand returned an impossible finalized result".into(),
+                        ));
+                    }
+                }
+            }
+            self.verify_schema().await
+        } else {
+            let row = sqlx::query(
+                "SELECT version, \
+                        (to_jsonb(schema_marker)->>'expanded_through_version')::bigint \
+                            AS expanded_through_version \
+                   FROM persistence_schema schema_marker WHERE singleton=true",
+            )
+            .fetch_one(&self.pool)
             .await?;
-        let Some(row) = row else {
-            return Err(EnclaveError::Config(
-                "PostgreSQL persistence schema marker is missing".into(),
-            ));
-        };
-        let version: i64 = row.try_get("version")?;
-        if version != EXPECTED_SCHEMA_VERSION {
-            return Err(EnclaveError::Config(format!(
-                "PostgreSQL schema version {version} does not match expected {EXPECTED_SCHEMA_VERSION}"
-            )));
+            let state = installed_schema_state_from_row(&row)?;
+            if state
+                != (InstalledSchemaState {
+                    version: MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+                    expanded_through_version: None,
+                })
+            {
+                return Err(EnclaveError::Store(
+                    "PostgreSQL predecessor migration did not stop at pristine schema 25".into(),
+                ));
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -381,9 +495,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use sha2::{Digest, Sha256};
     use sqlx::Row;
 
-    use super::{advisory_transaction_lock, PostgresPersistence, PostgresPoolConfig};
+    use super::{
+        advisory_transaction_lock, classify_serving_schema, InstalledSchemaState,
+        PostgresPersistence, PostgresPoolConfig, SchemaReleaseStatus, ServingSchemaState,
+        EXPECTED_SCHEMA_VERSION, MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+    };
     use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
     use crate::gcs::FakeGcs;
@@ -398,10 +517,11 @@ mod tests {
         FinalizationRequest, FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
         FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
         McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
-        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
-        PushProviderOutcome, RecordingRetentionChangeRequest, ScreenMediaSettlement,
-        ScreenshotMediaLocator, SummaryWindowSettlement, WebhookProviderOutcome,
-        WebhookSubscription,
+        MediaUsageSettlement, MemoryFeedRequest, MemoryHandleState, PeopleListRequest,
+        PushInstallation, PushProviderOutcome, ReconciledMemoryWrite, ReconciliationPublish,
+        ReconciliationPublishResult, ReconciliationStageWrite, RecordingRetentionChangeRequest,
+        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
+        WebhookProviderOutcome, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
@@ -430,7 +550,225 @@ mod tests {
         })
         .await
         .unwrap();
-        persistence.migrate().await.unwrap();
+        let schema_was_installed = sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('public.persistence_schema') IS NOT NULL",
+        )
+        .fetch_one(persistence.pool())
+        .await
+        .unwrap();
+        if schema_was_installed {
+            persistence.migrate().await.unwrap();
+        } else {
+            // A fresh real-PostgreSQL contract proves the populated production
+            // release shape rather than jumping directly from an empty database
+            // to finalized v26. The legacy row must survive expand/backfill, the
+            // marker must remain 25 for predecessor readiness, and the writer
+            // must stay fenced until the separate finalize phase.
+            persistence
+                .migrate_to_memory_reconciliation_predecessor()
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+                 VALUES('schema-release-contract','schema-release@example.com','google','schema-release-subject'); \
+                 INSERT INTO screenshots(account_id,id,captured_at,ocr_text,source_key) \
+                 VALUES('schema-release-contract',1,'2026-08-30T12:00:00Z','legacy source','schema-release-shot'); \
+                 INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,finalized_at,updated_at) \
+                 VALUES('schema-release-contract',1,'2026-08-30T12:00:00Z','2026-08-30T12:01:00Z', \
+                        'work','Legacy memory','Preserved across expand','2026-08-30T12:02:00Z',now()), \
+                       ('schema-release-contract',2,'2026-08-30T12:03:00Z','2026-08-30T12:04:00Z', \
+                        'work','Ambiguous legacy duplicate','Preflight must refuse this row',NULL,now()); \
+                 INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+                 VALUES('schema-release-contract',1,'screenshot',1), \
+                       ('schema-release-contract',2,'screenshot',1);",
+            )
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+            let refused = persistence
+                .expand_memory_reconciliation_release_schema()
+                .await
+                .unwrap_err();
+            assert!(refused
+                .to_string()
+                .contains("repair any source assigned to more than one legacy episode"));
+            assert_eq!(
+                sqlx::query_as::<_, (i64, bool, bool, String)>(
+                    "SELECT version, \
+                            EXISTS(SELECT 1 FROM information_schema.columns \
+                                    WHERE table_schema=current_schema() \
+                                      AND table_name='persistence_schema' \
+                                      AND column_name='expanded_through_version'), \
+                            to_regclass('public.memory_handles') IS NOT NULL, \
+                            (SELECT phase FROM persistence_schema_releases \
+                              WHERE release_version=26) \
+                       FROM persistence_schema WHERE singleton=true"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                (25, true, false, "installing".into()),
+                "failed ownership guard must retain only the resumable release ledger while leaving the predecessor marker and product catalog untouched"
+            );
+            sqlx::query("DELETE FROM episodes WHERE account_id='schema-release-contract' AND id=2")
+                .execute(persistence.pool())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "ALTER TABLE vertex_usage_events \
+                     DROP CONSTRAINT vertex_usage_events_operation_check; \
+                 ALTER TABLE vertex_usage_events \
+                     ADD CONSTRAINT vertex_usage_events_operation_check \
+                     CHECK (operation IN ( \
+                         'audio_understanding','screen_understanding', \
+                         'episode_summarization','episode_finalization','unexpected_operation'));",
+            )
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+            let drifted_vertex_constraint = persistence
+                .expand_memory_reconciliation_release_schema()
+                .await
+                .unwrap_err();
+            assert!(drifted_vertex_constraint.to_string().contains(
+                "schema-25 Vertex operation constraint is not the validated predecessor contract"
+            ));
+            assert_eq!(
+                sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+                    "SELECT marker.version,marker.expanded_through_version, \
+                            count(step.step_name) FILTER (WHERE step.step_name='vertex_operation') \
+                       FROM persistence_schema marker \
+                       LEFT JOIN persistence_schema_release_steps step ON true \
+                      WHERE marker.singleton=true \
+                      GROUP BY marker.version,marker.expanded_through_version"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                (25, None, 0),
+                "a drifted predecessor constraint must not advance or receipt the Vertex step"
+            );
+            sqlx::raw_sql(
+                "ALTER TABLE vertex_usage_events \
+                     DROP CONSTRAINT vertex_usage_events_operation_check; \
+                 ALTER TABLE vertex_usage_events \
+                     ADD CONSTRAINT vertex_usage_events_operation_check \
+                     CHECK (operation IN ( \
+                         'audio_understanding','screen_understanding', \
+                         'episode_summarization','episode_finalization'));",
+            )
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                persistence
+                    .expand_memory_reconciliation_release_schema_with_batch_budget(1)
+                    .await
+                    .unwrap()
+                    .status,
+                SchemaReleaseStatus::ExpandInProgress
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (i64, Option<i64>, String)>(
+                    "SELECT marker.version,marker.expanded_through_version,release.phase \
+                       FROM persistence_schema marker \
+                       JOIN persistence_schema_releases release ON release.release_version=26 \
+                      WHERE marker.singleton=true"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                (25, None, "backfilling".into()),
+                "an interrupted bounded expand must retain predecessor readiness"
+            );
+            assert_eq!(
+                persistence
+                    .expand_memory_reconciliation_release_schema()
+                    .await
+                    .unwrap()
+                    .status,
+                SchemaReleaseStatus::Expanded
+            );
+            let marker = sqlx::query_as::<_, (i64, Option<i64>)>(
+                "SELECT version,expanded_through_version FROM persistence_schema WHERE singleton=true",
+            )
+            .fetch_one(persistence.pool())
+            .await
+            .unwrap();
+            assert_eq!(marker, (25, Some(26)));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM persistence_schema WHERE singleton=true"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                25,
+                "the v25 predecessor must continue to observe its exact marker"
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (String, String, i64)>(
+                    "SELECT episode.structure_state,handle.state,count(member.record_id) \
+                       FROM episodes episode \
+                       JOIN memory_handles handle ON handle.account_id=episode.account_id AND handle.episode_id=episode.id \
+                       LEFT JOIN active_episode_members member ON member.account_id=episode.account_id AND member.episode_id=episode.id \
+                      WHERE episode.account_id='schema-release-contract' AND episode.id=1 \
+                      GROUP BY episode.structure_state,handle.state"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                ("reconciled".into(), "active".into(), 1)
+            );
+            persistence.verify_schema().await.unwrap();
+            assert!(persistence
+                .verify_reconciliation_writer_schema()
+                .await
+                .is_err());
+            let mut invalid_fleet_receipt = super::schema_release::test_finalization_receipt();
+            invalid_fleet_receipt.predecessor_instances = 1;
+            assert!(
+                super::schema_release::test_verify_finalization_receipt(invalid_fleet_receipt)
+                    .is_err()
+            );
+            assert!(
+                super::schema_release::test_reject_tampered_finalization_signature(
+                    super::schema_release::test_finalization_receipt()
+                )
+                .is_err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM persistence_schema WHERE singleton=true"
+                )
+                .fetch_one(persistence.pool())
+                .await
+                .unwrap(),
+                25,
+                "invalid fleet evidence must not mutate the predecessor marker"
+            );
+            let fleet_authorization = super::schema_release::test_finalization_authorization();
+            assert_eq!(
+                persistence
+                    .finalize_memory_reconciliation_release_schema(&fleet_authorization)
+                    .await
+                    .unwrap()
+                    .status,
+                SchemaReleaseStatus::Finalized
+            );
+            persistence
+                .verify_reconciliation_writer_schema()
+                .await
+                .unwrap();
+            assert_eq!(
+                persistence
+                    .finalize_memory_reconciliation_release_schema(&fleet_authorization)
+                    .await
+                    .unwrap()
+                    .status,
+                SchemaReleaseStatus::AlreadyFinalized
+            );
+        }
         persistence.verify_schema().await.unwrap();
         // Reset every business table so this contract proves a database can be
         // reused across repeated local/full-suite runs. A hand-maintained list
@@ -445,7 +783,9 @@ mod tests {
                  INTO tables_to_reset
                  FROM pg_tables
                 WHERE schemaname = 'public'
-                  AND tablename NOT IN ('_sqlx_migrations', 'persistence_schema');
+                  AND tablename NOT IN ( \
+                      '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
+                      'persistence_schema_release_steps');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;
@@ -461,6 +801,81 @@ mod tests {
         Some(persistence)
     }
 
+    #[test]
+    fn serving_accepts_only_the_receipted_expand_or_finalized_schema() {
+        assert_eq!(
+            classify_serving_schema(InstalledSchemaState {
+                version: MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+                expanded_through_version: Some(EXPECTED_SCHEMA_VERSION),
+            })
+            .unwrap(),
+            ServingSchemaState::ExpandedTransition
+        );
+        assert_eq!(
+            classify_serving_schema(InstalledSchemaState {
+                version: EXPECTED_SCHEMA_VERSION,
+                expanded_through_version: Some(EXPECTED_SCHEMA_VERSION),
+            })
+            .unwrap(),
+            ServingSchemaState::Finalized
+        );
+        for refused in [
+            InstalledSchemaState {
+                version: MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+                expanded_through_version: None,
+            },
+            InstalledSchemaState {
+                version: EXPECTED_SCHEMA_VERSION,
+                expanded_through_version: None,
+            },
+            InstalledSchemaState {
+                version: MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+                expanded_through_version: Some(EXPECTED_SCHEMA_VERSION + 1),
+            },
+            InstalledSchemaState {
+                version: EXPECTED_SCHEMA_VERSION + 1,
+                expanded_through_version: Some(EXPECTED_SCHEMA_VERSION + 1),
+            },
+        ] {
+            assert!(classify_serving_schema(refused).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_reconciliation_release_is_online_receipted_then_marker_finalized() {
+        let cold_objects = include_str!("../../../migrations/0026_memory_reconciliation.sql");
+        let unique_guard = include_str!(
+            "../../../migrations/0026_memory_reconciliation_episode_members_unique_index.sql"
+        );
+        let capture_sessions = include_str!(
+            "../../../migrations/0026_memory_reconciliation_capture_sessions_index.sql"
+        );
+        let expand =
+            include_str!("../../../migrations/0026_memory_reconciliation_expand_receipt.sql");
+        let finalize = include_str!("../../../migrations/0026_memory_reconciliation_finalize.sql");
+        let normalized_cold_objects = cold_objects
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(unique_guard.contains("CREATE UNIQUE INDEX CONCURRENTLY"));
+        assert!(capture_sessions.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(!normalized_cold_objects.contains("UPDATE episodes"));
+        assert!(!normalized_cold_objects
+            .contains("INSERT INTO memory_handles(account_id,episode_id,state) SELECT"));
+        assert!(!cold_objects.contains("IF NOT EXISTS"));
+        assert!(!cold_objects.contains("CREATE OR REPLACE"));
+        assert!(expand.contains("SET expanded_through_version=26"));
+        assert!(!expand.contains("SET version=26"));
+        assert!(finalize.contains("finalization_receipt=$1::jsonb"));
+        assert!(finalize.contains("finalization_receipt_sha256=$2"));
+        assert!(finalize.contains("finalization_receipt_signature=$3"));
+        assert!(finalize.contains("finalization_receipt_key_sha256=$4"));
+        assert!(finalize.contains("clock_timestamp()+interval '60 seconds'"));
+        assert!(finalize.contains("SET version=26"));
+        assert!(!finalize.contains("CREATE TABLE"));
+        assert!(!finalize.contains("ALTER TABLE"));
+    }
+
     #[tokio::test]
     async fn postgres_control_plane_contract() {
         let Some(persistence) = test_persistence().await else {
@@ -468,6 +883,39 @@ mod tests {
         };
         let persistence = Arc::new(persistence);
         let pool = persistence.pool().clone();
+
+        // Migration 0026 must stop rather than arbitrarily assign a raw source
+        // that legacy data linked to two memories. Exercise its PostgreSQL
+        // exception contract against a temporary legacy-shaped projection.
+        let mut duplicate_preflight = pool.begin().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE episode_members( \
+                 account_id text NOT NULL,episode_id bigint NOT NULL, \
+                 record_type text NOT NULL,record_id bigint NOT NULL) ON COMMIT DROP; \
+             INSERT INTO episode_members VALUES \
+                 ('duplicate-contract',1,'screenshot',7), \
+                 ('duplicate-contract',2,'screenshot',7);",
+        )
+        .execute(&mut *duplicate_preflight)
+        .await
+        .unwrap();
+        let duplicate_error = sqlx::raw_sql(
+            "CREATE UNIQUE INDEX duplicate_contract_source_guard \
+             ON episode_members(account_id,record_type,record_id)",
+        )
+        .execute(&mut *duplicate_preflight)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            duplicate_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .map(|code| code.into_owned())
+                .as_deref(),
+            Some("23505")
+        );
+        duplicate_preflight.rollback().await.unwrap();
+
         let media_gcs: Arc<dyn crate::gcs::GcsClient> = Arc::new(FakeGcs::new());
         let media_objects: Arc<dyn MediaObjectStore> =
             Arc::new(GcsMediaObjectStore::new(media_gcs));
@@ -1104,6 +1552,198 @@ mod tests {
             memory.settle_summary_window(settlement).await.unwrap(),
             episode_ids
         );
+
+        // Exercise the complete PostgreSQL reconciliation protocol on a
+        // separate tenant: two drafts thirty minutes apart become one active
+        // successor, the paid/validated mutation is staged before publication,
+        // and both old handles remain durable redirects while disappearing
+        // from ordinary discovery.
+        let reconciliation_account_id = "reconciliation-contract-account".to_owned();
+        sqlx::query(
+            "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+             VALUES($1,'reconciliation@example.com','google','reconciliation-contract-subject')",
+        )
+        .bind(&reconciliation_account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO screenshots(account_id,id,captured_at,active_app,ocr_text,source_key) \
+             VALUES($1,1,'2026-08-27T10:00:00Z','Notes','first topic','reconciliation-shot-1'), \
+                   ($1,2,'2026-08-27T10:30:00Z','Notes','continued topic','reconciliation-shot-2')",
+        )
+        .bind(&reconciliation_account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,substance,visual_evidence,updated_at) \
+             VALUES($1,1,'2026-08-27T10:00:00Z','2026-08-27T10:01:00Z','work','Draft one','First half','normal','useful',now()), \
+                   ($1,2,'2026-08-27T10:30:00Z','2026-08-27T10:31:00Z','work','Draft two','Second half','normal','useful',now())",
+        )
+        .bind(&reconciliation_account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+             VALUES($1,1,'screenshot',1),($1,2,'screenshot',2)",
+        )
+        .bind(&reconciliation_account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_id_counters(account_id,entity_kind,next_id) VALUES($1,'episodes',3) \
+             ON CONFLICT(account_id,entity_kind) DO UPDATE SET next_id=greatest(content_id_counters.next_id,3)",
+        )
+        .bind(&reconciliation_account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reconciliation = repositories.memory_reconciliation();
+        let snapshot = reconciliation
+            .next_source_settled_cohort(
+                &reconciliation_account_id,
+                "2026-08-27T20:00:00.000Z",
+                32,
+                4_000,
+            )
+            .await
+            .unwrap()
+            .expect("source-settled reconciliation cohort");
+        assert_eq!(snapshot.predecessor_episode_ids, vec![1, 2]);
+        let claim = reconciliation
+            .claim_reconciliation(&snapshot, "2026-08-27T20:00:01.000Z", 900)
+            .await
+            .unwrap()
+            .expect("reconciliation claim");
+        let partition = serde_json::json!({
+            "memories": [{
+                "predecessor_episode_ids": [1, 2],
+                "member_source_ids": ["screenshot:1", "screenshot:2"]
+            }]
+        });
+        let result_commitment = Sha256::digest(serde_json::to_vec(&partition).unwrap()).to_vec();
+        let staged = reconciliation
+            .stage_reconciliation(
+                &claim,
+                ReconciliationStageWrite {
+                    normalized_partition: partition,
+                    result_commitment: result_commitment.clone(),
+                    planned_outputs: vec![ReconciledMemoryWrite {
+                        output_ordinal: 0,
+                        retained_episode_id: None,
+                        predecessor_episode_ids: vec![1, 2],
+                        started_at: "2026-08-27T10:00:00.000Z".into(),
+                        ended_at: "2026-08-27T10:31:00.000Z".into(),
+                        episode_type: Some("work".into()),
+                        title: "Combined topic".into(),
+                        summary: Some("Both recordings covered one objective.".into()),
+                        participants: Vec::new(),
+                        languages: Vec::new(),
+                        action_items: Vec::new(),
+                        model: Some("conservative-v1".into()),
+                        minute_summaries: serde_json::json!([]),
+                        minutes_text: None,
+                        substance: "normal".into(),
+                        visual_evidence: "useful".into(),
+                        member_source_ids: vec!["screenshot:1".into(), "screenshot:2".into()],
+                    }],
+                    model: "conservative-v1".into(),
+                    vertex_event_id: None,
+                    reconciliation_version: 1,
+                    prompt_version: 1,
+                    partition_schema_version: 1,
+                    validator_version: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.planned_outputs[0].title, "Combined topic");
+        let published = reconciliation
+            .publish_reconciliation(ReconciliationPublish {
+                claim,
+                reconciliation_id: "rec-postgres-contract-merge".into(),
+                cohort_started_at: snapshot.cohort_started_at.clone(),
+                cohort_ended_at: snapshot.cohort_ended_at.clone(),
+                result_commitment,
+            })
+            .await
+            .unwrap();
+        let successor_ids = match published {
+            ReconciliationPublishResult::Published {
+                successor_episode_ids,
+                archive_revision,
+            } => {
+                assert_eq!(archive_revision, 1);
+                successor_episode_ids
+            }
+            ReconciliationPublishResult::Replayed { .. } => {
+                panic!("first reconciliation publication unexpectedly replayed")
+            }
+        };
+        assert_eq!(successor_ids, vec![3]);
+        for predecessor in [1_i64, 2_i64] {
+            let resolution = reconciliation
+                .resolve_memory_handle(&reconciliation_account_id, predecessor, 32)
+                .await
+                .unwrap();
+            assert_eq!(resolution.state, MemoryHandleState::Superseded);
+            assert_eq!(resolution.active_episode_ids, vec![3]);
+            assert_eq!(resolution.archive_revision, 1);
+        }
+        let active_resolution = reconciliation
+            .resolve_memory_handle(&reconciliation_account_id, 3, 32)
+            .await
+            .unwrap();
+        assert_eq!(active_resolution.state, MemoryHandleState::Active);
+        let reconciled_page = repositories
+            .memory_queries()
+            .list_episodes(
+                &reconciliation_account_id,
+                &EpisodeListRequest {
+                    from: None,
+                    to: None,
+                    limit: 10,
+                    include_low: true,
+                    episode_id: None,
+                    before_started_at: None,
+                    before_id: None,
+                    probe_for_more: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciled_page.archive_revision, 1);
+        assert_eq!(reconciled_page.episodes.len(), 1);
+        assert_eq!(reconciled_page.episodes[0]["id"], 3);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM memory_reconciliation_stages WHERE account_id=$1",
+            )
+            .bind(&reconciliation_account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM memory_reconciliation_jobs WHERE account_id=$1",
+            )
+            .bind(&reconciliation_account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "complete"
+        );
+        sqlx::query("DELETE FROM accounts WHERE id=$1")
+            .bind(&reconciliation_account_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         assert!(memory
             .claim_summary_window(
                 &account_id,
@@ -1153,14 +1793,14 @@ mod tests {
         let finalization = repositories.finalization();
         assert_eq!(
             finalization
-                .request_finalization(&account_id, episode_ids[0], 5)
+                .request_finalization(&account_id, episode_ids[0], 5, false)
                 .await
                 .unwrap(),
             FinalizationRequest::Queued
         );
         assert_eq!(
             finalization
-                .request_finalization(&account_id, episode_ids[0], 5)
+                .request_finalization(&account_id, episode_ids[0], 5, false)
                 .await
                 .unwrap(),
             FinalizationRequest::AlreadyQueued {
@@ -1168,26 +1808,28 @@ mod tests {
             }
         );
         let finalization_claim = finalization
-            .claim_finalization(
-                &account_id,
-                Some(episode_ids[0]),
-                "2026-08-27T20:00:00.000Z",
-                "2026-08-27T16:00:00.000Z",
-                5,
-                900,
-            )
+            .claim_finalization(crate::persistence::FinalizationClaimRequest {
+                account_id: &account_id,
+                target_episode_id: Some(episode_ids[0]),
+                now: "2026-08-27T20:00:00.000Z",
+                horizon_before: "2026-08-27T16:00:00.000Z",
+                finalization_version: 5,
+                lease_seconds: 900,
+                require_reconciled: false,
+            })
             .await
             .unwrap()
             .expect("finalization claim");
         assert!(finalization
-            .claim_finalization(
-                &account_id,
-                Some(episode_ids[0]),
-                "2026-08-27T20:00:01.000Z",
-                "2026-08-27T16:00:00.000Z",
-                5,
-                900,
-            )
+            .claim_finalization(crate::persistence::FinalizationClaimRequest {
+                account_id: &account_id,
+                target_episode_id: Some(episode_ids[0]),
+                now: "2026-08-27T20:00:01.000Z",
+                horizon_before: "2026-08-27T16:00:00.000Z",
+                finalization_version: 5,
+                lease_seconds: 900,
+                require_reconciled: false,
+            })
             .await
             .unwrap()
             .is_none());
@@ -4110,6 +4752,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.operation_id, deletion.operation_id);
+
+        // Account deletion must own every reconciliation row, including paid
+        // staged plaintext and committed content-free lineage. These fixtures
+        // intentionally survive until the account row is deleted so the real
+        // PostgreSQL cascade graph is exercised instead of a hand-maintained
+        // pre-delete cleanup list.
+        let staged_source_fingerprint = vec![0x31_u8; 32];
+        let staged_topology_fingerprint = vec![0x32_u8; 32];
+        let staged_result_commitment = vec![0x33_u8; 32];
+        let staged_outputs_commitment = vec![0x34_u8; 32];
+        let committed_source_fingerprint = vec![0x41_u8; 32];
+        let committed_topology_fingerprint = vec![0x42_u8; 32];
+        let committed_result_commitment = vec![0x43_u8; 32];
+        let predecessor_handle_id = 9_100_001_i64;
+        let successor_handle_id = 9_100_002_i64;
+        let mut reconciliation_fixture = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO memory_reconciliation_jobs(\
+                 account_id,source_fingerprint,topology_fingerprint,\
+                 predecessor_episode_ids,cohort_started_at,cohort_ended_at,state) \
+             VALUES($1,$2,$3,$4,'2026-08-27T10:00:00Z','2026-08-27T10:05:00Z','pending')",
+        )
+        .bind(&account_id)
+        .bind(&staged_source_fingerprint)
+        .bind(&staged_topology_fingerprint)
+        .bind(vec![predecessor_handle_id])
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_reconciliation_stages(\
+                 account_id,source_fingerprint,topology_fingerprint,predecessor_episode_ids,\
+                 normalized_partition,result_commitment,planned_outputs,planned_outputs_commitment,\
+                 model,reconciliation_version,\
+                 prompt_version,partition_schema_version,validator_version) \
+             VALUES($1,$2,$3,$4,$5::jsonb,$6,'[]'::jsonb,$7,'contract-model',1,1,1,1)",
+        )
+        .bind(&account_id)
+        .bind(&staged_source_fingerprint)
+        .bind(&staged_topology_fingerprint)
+        .bind(vec![predecessor_handle_id])
+        .bind("{\"memories\":[]}")
+        .bind(&staged_result_commitment)
+        .bind(&staged_outputs_commitment)
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_reconciliations(\
+                 account_id,id,reconciliation_version,model,prompt_version,\
+                 cohort_started_at,cohort_ended_at,source_fingerprint,topology_fingerprint,\
+                 result_commitment,archive_revision) \
+             VALUES($1,'rec-account-delete-contract',1,'contract-model',1,\
+                    '2026-08-27T11:00:00Z','2026-08-27T11:05:00Z',$2,$3,$4,1)",
+        )
+        .bind(&account_id)
+        .bind(&committed_source_fingerprint)
+        .bind(&committed_topology_fingerprint)
+        .bind(&committed_result_commitment)
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_handles(\
+                 account_id,episode_id,state,origin_relation,reconciliation_id,retired_at) \
+             VALUES($1,$2,'superseded','merge','rec-account-delete-contract',now()),\
+                   ($1,$3,'active',NULL,NULL,NULL)",
+        )
+        .bind(&account_id)
+        .bind(predecessor_handle_id)
+        .bind(successor_handle_id)
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_lineage_edges(\
+                 account_id,reconciliation_id,predecessor_episode_id,successor_episode_id,ordinal) \
+             VALUES($1,'rec-account-delete-contract',$2,$3,0)",
+        )
+        .bind(&account_id)
+        .bind(predecessor_handle_id)
+        .bind(successor_handle_id)
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO memory_reconciliation_sources(\
+                 account_id,reconciliation_id,record_type,record_id,successor_episode_id) \
+             VALUES($1,'rec-account-delete-contract','screenshot',9100003,$2)",
+        )
+        .bind(&account_id)
+        .bind(successor_handle_id)
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        reconciliation_fixture.commit().await.unwrap();
+
         let completed = repositories
             .lifecycle()
             .finalize_account_deletion(&account_id)
@@ -4133,6 +4872,39 @@ mod tests {
                 .await
                 .unwrap(),
             Some(AccountStatus::Deleted)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM memory_reconciliation_stages WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "staged reconciliation content must cascade with the account"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM memory_lineage_edges WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "memory lineage must cascade with the account"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM memory_reconciliation_sources WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "reconciliation source projections must cascade with the account"
         );
         assert_eq!(
             repositories

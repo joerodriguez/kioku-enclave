@@ -33,6 +33,7 @@ const EPISODE_CURSOR_VERSION: u8 = 1;
 const MAX_EPISODE_CURSOR_CHARS: usize = 256;
 const MAX_EPISODE_CURSOR_TIMESTAMP_BYTES: usize = 64;
 const MAX_REST_SEARCH_QUERY_CHARS: usize = 1_024;
+pub(crate) const MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS: usize = 3;
 
 /// The cross-modal memory search behind `GET /api/search`.
 ///
@@ -152,6 +153,10 @@ pub fn router() -> Router<Arc<CpState>> {
             get(rest_episode).delete(rest_episode_delete),
         )
         .route("/api/episodes/{id}/members", get(rest_episode_members))
+        .route(
+            "/api/episodes/{id}/resolution",
+            get(rest_episode_resolution),
+        )
         .route(
             "/api/browser-snapshots/{source_key}",
             get(rest_browser_snapshot),
@@ -473,6 +478,7 @@ async fn query_episodes_rows_value(
     let mut value = json!({
         "episode_count": page.episodes.len(),
         "hidden_count": page.hidden_count,
+        "archive_revision": page.archive_revision,
         "episodes": page.episodes,
     });
     if probe_for_more {
@@ -1146,6 +1152,247 @@ struct EpisodeParams {
     include_low: Option<String>,
 }
 
+const MAX_MEMORY_RESOLUTION_LEAVES: i64 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemoryRevisionDecision {
+    Stable,
+    Retry,
+    Exhausted,
+}
+
+pub(crate) fn memory_revision_decision(
+    attempt: usize,
+    revision_is_stable: bool,
+) -> MemoryRevisionDecision {
+    if revision_is_stable {
+        MemoryRevisionDecision::Stable
+    } else if attempt + 1 < MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        MemoryRevisionDecision::Retry
+    } else {
+        MemoryRevisionDecision::Exhausted
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExactMemoryHandle {
+    Active { archive_revision: i64 },
+    Reorganized(Value),
+}
+
+async fn resolve_memory_handle_snapshot(
+    state: &CpState,
+    account_id: &str,
+    episode_id: i64,
+) -> crate::error::Result<crate::persistence::MemoryHandleResolution> {
+    use crate::persistence::MemoryHandleState;
+
+    if episode_id <= 0 {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "episode id must be positive".into(),
+        ));
+    }
+    let resolution = state
+        .repositories
+        .memory_reconciliation()
+        .resolve_memory_handle(account_id, episode_id, MAX_MEMORY_RESOLUTION_LEAVES)
+        .await?;
+    if resolution.requested_episode_id != episode_id || resolution.archive_revision < 0 {
+        return Err(crate::error::EnclaveError::Store(
+            "memory handle resolution is malformed".into(),
+        ));
+    }
+    if resolution.state == MemoryHandleState::Active
+        && resolution.active_episode_ids.as_slice() != [episode_id]
+    {
+        return Err(crate::error::EnclaveError::Store(
+            "active memory handle has invalid cardinality".into(),
+        ));
+    }
+    Ok(resolution)
+}
+
+fn memory_resolution_payload(
+    resolution: crate::persistence::MemoryHandleResolution,
+    memories: Vec<Value>,
+) -> crate::error::Result<Value> {
+    use crate::persistence::MemoryHandleState;
+
+    let (kind, canonical_episode_id) = match resolution.state {
+        MemoryHandleState::Active => ("active", Some(resolution.requested_episode_id)),
+        MemoryHandleState::Superseded if memories.len() == 1 => {
+            ("redirect", resolution.active_episode_ids.first().copied())
+        }
+        MemoryHandleState::Superseded if memories.len() > 1 => ("handoff", None),
+        MemoryHandleState::Superseded | MemoryHandleState::Retired => ("retired", None),
+    };
+    Ok(json!({
+        "requested_episode_id": resolution.requested_episode_id,
+        "kind": kind,
+        "archive_revision": resolution.archive_revision,
+        "canonical_episode_id": canonical_episode_id,
+        "memories": memories,
+        "origin_relation": resolution.origin_relation,
+    }))
+}
+
+/// Hydrate a content-free memory handle with ordinary active memory cards.
+/// The handle repository owns lineage and cardinality; this layer deliberately
+/// reuses the normal episode projection so web and native clients do not issue
+/// one speculative request per split child.
+pub(crate) async fn memory_resolution_value(
+    state: &CpState,
+    account_id: &str,
+    episode_id: i64,
+) -> crate::error::Result<Value> {
+    for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        let resolution = resolve_memory_handle_snapshot(state, account_id, episode_id).await?;
+        let mut memories = Vec::with_capacity(resolution.active_episode_ids.len());
+        let mut one_revision = true;
+        let mut missing_active_episode = false;
+        for active_id in &resolution.active_episode_ids {
+            let value =
+                query_episodes_value(state, account_id, None, None, 1, true, Some(*active_id))
+                    .await?;
+            let page_revision = value
+                .get("archive_revision")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    crate::error::EnclaveError::Store(
+                        "memory projection omitted its archive revision".into(),
+                    )
+                })?;
+            if page_revision != resolution.archive_revision {
+                one_revision = false;
+                break;
+            }
+            match value
+                .get("episodes")
+                .and_then(Value::as_array)
+                .and_then(|episodes| episodes.first())
+                .cloned()
+            {
+                Some(memory) => memories.push(memory),
+                None => {
+                    missing_active_episode = true;
+                    break;
+                }
+            }
+        }
+
+        let confirmed = if one_revision {
+            Some(resolve_memory_handle_snapshot(state, account_id, episode_id).await?)
+        } else {
+            None
+        };
+        let revision_is_stable = confirmed.as_ref().is_some_and(|value| value == &resolution);
+        match memory_revision_decision(attempt, one_revision && revision_is_stable) {
+            MemoryRevisionDecision::Stable if missing_active_episode => {
+                return Err(crate::error::EnclaveError::Store(
+                    "active memory handle has no readable episode".into(),
+                ));
+            }
+            MemoryRevisionDecision::Stable => {
+                return memory_resolution_payload(resolution, memories);
+            }
+            MemoryRevisionDecision::Retry => continue,
+            MemoryRevisionDecision::Exhausted => {
+                return Err(crate::error::EnclaveError::Conflict(
+                    "memory topology changed during resolution".into(),
+                ));
+            }
+        }
+    }
+    unreachable!("memory topology retry loop has a positive fixed bound")
+}
+
+pub(crate) async fn exact_memory_handle(
+    state: &CpState,
+    account_id: &str,
+    episode_id: i64,
+) -> crate::error::Result<ExactMemoryHandle> {
+    use crate::persistence::MemoryHandleState;
+
+    let resolution = resolve_memory_handle_snapshot(state, account_id, episode_id).await?;
+    if resolution.state == MemoryHandleState::Active {
+        return Ok(ExactMemoryHandle::Active {
+            archive_revision: resolution.archive_revision,
+        });
+    }
+    let value = memory_resolution_value(state, account_id, episode_id).await?;
+    Ok(ExactMemoryHandle::Reorganized(value))
+}
+
+fn memory_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "episode_not_found"})),
+    )
+        .into_response()
+}
+
+fn invalid_memory_id_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid_episode_id"})),
+    )
+        .into_response()
+}
+
+fn memory_reorganized_response(mut resolution: Value) -> Response {
+    resolution["error"] = json!("memory_reorganized");
+    (StatusCode::CONFLICT, Json(resolution)).into_response()
+}
+
+fn memory_revision_changed_response(episode_id: i64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "memory_revision_changed",
+            "episode_id": episode_id,
+        })),
+    )
+        .into_response()
+}
+
+async fn active_memory_revision_or_response(
+    state: &CpState,
+    account_id: &str,
+    episode_id: i64,
+) -> Result<i64, Response> {
+    match exact_memory_handle(state, account_id, episode_id).await {
+        Ok(ExactMemoryHandle::Active { archive_revision }) => Ok(archive_revision),
+        Ok(ExactMemoryHandle::Reorganized(resolution)) => {
+            Err(memory_reorganized_response(resolution))
+        }
+        Err(crate::error::EnclaveError::NotFound) => Err(memory_not_found_response()),
+        Err(crate::error::EnclaveError::InvalidRequest(_)) => Err(invalid_memory_id_response()),
+        Err(crate::error::EnclaveError::Conflict(_)) => {
+            Err(memory_revision_changed_response(episode_id))
+        }
+        Err(error) => Err(super::routed_read_unavailable(
+            "api.memory_resolution",
+            &error,
+        )),
+    }
+}
+
+async fn rest_episode_resolution(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(episode_id): Path<i64>,
+) -> Response {
+    match memory_resolution_value(&state, &user.0, episode_id).await {
+        Ok(resolution) => Json(resolution).into_response(),
+        Err(crate::error::EnclaveError::NotFound) => memory_not_found_response(),
+        Err(crate::error::EnclaveError::InvalidRequest(_)) => invalid_memory_id_response(),
+        Err(crate::error::EnclaveError::Conflict(_)) => {
+            memory_revision_changed_response(episode_id)
+        }
+        Err(error) => super::routed_read_unavailable("api.memory_resolution", &error),
+    }
+}
+
 /// GET /api/episodes/{id} — fetch one episode without depending on its
 /// position in the newest-first list. The default visibility matches browse:
 /// substance=none is indistinguishable from an absent row unless the caller
@@ -1157,25 +1404,55 @@ async fn rest_episode(
     Query(p): Query<EpisodeParams>,
 ) -> Response {
     let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
-    // The `NotFound` arm below stays a 404 and is not funnelled into the
-    // unavailable-read 503: an id that is
-    // absent from readable state is a different fact from state that
-    // could not be read, and only the second is retryable.
-    match query_episodes_value(&s, &user.0, None, None, 1, include_low, Some(id)).await {
-        Ok(data) => match data
-            .get("episodes")
-            .and_then(Value::as_array)
-            .and_then(|episodes| episodes.first())
-        {
-            Some(episode) => Json(episode.clone()).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "episode_not_found"})),
-            )
-                .into_response(),
-        },
-        Err(e) => super::routed_read_unavailable("api.episode", &e),
+    for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        let expected_revision = match active_memory_revision_or_response(&s, &user.0, id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
+        // The `NotFound` result below stays a 404 and is not funnelled into
+        // the unavailable-read 503: an id that is absent from readable state
+        // is different from state that could not be read. Re-resolving after
+        // the row snapshot distinguishes that absence from a concurrent
+        // topology replacement.
+        let data =
+            match query_episodes_value(&s, &user.0, None, None, 1, include_low, Some(id)).await {
+                Ok(data) => data,
+                Err(error) => return super::routed_read_unavailable("api.episode", &error),
+            };
+        let read_revision = match data.get("archive_revision").and_then(Value::as_i64) {
+            Some(revision) => revision,
+            None => {
+                return super::routed_read_unavailable(
+                    "api.episode",
+                    &crate::error::EnclaveError::Store(
+                        "episode projection omitted its archive revision".into(),
+                    ),
+                )
+            }
+        };
+        let observed_revision = match active_memory_revision_or_response(&s, &user.0, id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
+        match memory_revision_decision(
+            attempt,
+            read_revision == expected_revision && observed_revision == expected_revision,
+        ) {
+            MemoryRevisionDecision::Stable => {
+                return match data
+                    .get("episodes")
+                    .and_then(Value::as_array)
+                    .and_then(|episodes| episodes.first())
+                {
+                    Some(episode) => Json(episode.clone()).into_response(),
+                    None => memory_not_found_response(),
+                };
+            }
+            MemoryRevisionDecision::Retry => continue,
+            MemoryRevisionDecision::Exhausted => return memory_revision_changed_response(id),
+        }
     }
+    unreachable!("memory topology retry loop has a positive fixed bound")
 }
 
 /// DELETE /api/episodes/{id} — purge an episode AND its member raw records
@@ -1201,26 +1478,57 @@ async fn rest_episode_delete(
     Path(episode_id): Path<i64>,
 ) -> Response {
     let repository = state.repositories.episode_deletions();
-    let plan = match repository.begin_episode_deletion(&user.0, episode_id).await {
-        Ok(crate::persistence::EpisodeDeletionStart::NotFound) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "episode_not_found"})),
-            )
-                .into_response();
+    let plan = 'attempts: {
+        for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+            let expected_revision =
+                match active_memory_revision_or_response(&state, &user.0, episode_id).await {
+                    Ok(revision) => revision,
+                    Err(response) => return response,
+                };
+            match repository.begin_episode_deletion(&user.0, episode_id).await {
+                Ok(crate::persistence::EpisodeDeletionStart::NotFound) => {
+                    let observed_revision =
+                        match active_memory_revision_or_response(&state, &user.0, episode_id).await
+                        {
+                            Ok(revision) => revision,
+                            // A superseded handle becomes a typed 409; an absent
+                            // handle is the true 404. Neither is flattened into a
+                            // generic deletion miss.
+                            Err(response) => return response,
+                        };
+                    match memory_revision_decision(attempt, observed_revision == expected_revision)
+                    {
+                        MemoryRevisionDecision::Retry => continue,
+                        MemoryRevisionDecision::Exhausted => {
+                            return memory_revision_changed_response(episode_id)
+                        }
+                        MemoryRevisionDecision::Stable => {
+                            return super::routed_read_unavailable(
+                                "api.episode_delete",
+                                &crate::error::EnclaveError::Store(
+                                    "active memory has no deletable episode".into(),
+                                ),
+                            )
+                        }
+                    }
+                }
+                Ok(crate::persistence::EpisodeDeletionStart::Complete(purge)) => {
+                    return episode_purge_response(episode_id, purge)
+                }
+                Ok(crate::persistence::EpisodeDeletionStart::Pending(plan)) => {
+                    break 'attempts plan
+                }
+                Err(error) => {
+                    tracing::error!(%error, episode_id, "episode deletion preparation failed");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "enclave_unavailable"})),
+                    )
+                        .into_response();
+                }
+            }
         }
-        Ok(crate::persistence::EpisodeDeletionStart::Complete(purge)) => {
-            return episode_purge_response(episode_id, purge);
-        }
-        Ok(crate::persistence::EpisodeDeletionStart::Pending(plan)) => plan,
-        Err(error) => {
-            tracing::error!(%error, episode_id, "episode deletion preparation failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "enclave_unavailable"})),
-            )
-                .into_response();
-        }
+        unreachable!("memory topology retry loop has a positive fixed bound")
     };
     match advance_episode_deletion(
         state.repositories.episode_deletions(),
@@ -1312,15 +1620,31 @@ async fn rest_episode_members(
     // PostgreSQL owns every table that decides the answer. LEFT JOINed identity
     // and image tables only widen a member row; they cannot create or suppress
     // one.
-    let result = s
-        .repositories
-        .memory_queries()
-        .episode_members(&user.0, id)
-        .await;
-    match result {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => super::routed_read_unavailable("api.episode_members", &e),
+    for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        let expected_revision = match active_memory_revision_or_response(&s, &user.0, id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
+        let value = match s
+            .repositories
+            .memory_queries()
+            .episode_members(&user.0, id)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return super::routed_read_unavailable("api.episode_members", &error),
+        };
+        let observed_revision = match active_memory_revision_or_response(&s, &user.0, id).await {
+            Ok(revision) => revision,
+            Err(response) => return response,
+        };
+        match memory_revision_decision(attempt, observed_revision == expected_revision) {
+            MemoryRevisionDecision::Stable => return Json(value).into_response(),
+            MemoryRevisionDecision::Retry => continue,
+            MemoryRevisionDecision::Exhausted => return memory_revision_changed_response(id),
+        }
     }
+    unreachable!("memory topology retry loop has a positive fixed bound")
 }
 
 async fn rest_browser_snapshot(
@@ -1345,70 +1669,117 @@ async fn rest_episode_finalize(
     Extension(user): Extension<AuthUser>,
     Path(episode_id): Path<i64>,
 ) -> Response {
-    let outcome = state
-        .repositories
-        .finalization()
-        .request_finalization(
-            &user.0,
-            episode_id,
-            i64::from(super::finalizer::FINALIZATION_VERSION),
-        )
-        .await;
-    match outcome {
-        Ok(crate::persistence::FinalizationRequest::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "episode_not_found"})),
-        )
-            .into_response(),
-        Ok(crate::persistence::FinalizationRequest::LowSignal) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "low_signal_episode"})),
-        )
-            .into_response(),
-        Ok(crate::persistence::FinalizationRequest::AlreadyComplete { status }) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "already_complete", "status": status})),
-        )
-            .into_response(),
-        Ok(crate::persistence::FinalizationRequest::AlreadyQueued { status }) => (
-            StatusCode::ACCEPTED,
-            Json(json!({"queued": true, "episode_id": episode_id, "status": status})),
-        )
-            .into_response(),
-        Ok(crate::persistence::FinalizationRequest::Queued) => {
-            let worker_state = Arc::clone(&state);
-            let worker_user = user.0;
-            tokio::spawn(async move {
-                if let Err(error) =
-                    super::finalizer::finalize_user_episode(&worker_state, &worker_user, episode_id)
-                        .await
-                {
-                    tracing::warn!(
-                        %error,
-                        episode_id,
-                        "scoped episode finalization failed"
-                    );
+    for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
+        let expected_revision =
+            match active_memory_revision_or_response(&state, &user.0, episode_id).await {
+                Ok(revision) => revision,
+                Err(response) => return response,
+            };
+        let outcome = state
+            .repositories
+            .finalization()
+            .request_finalization(
+                &user.0,
+                episode_id,
+                i64::from(super::finalizer::FINALIZATION_VERSION),
+                state.config.memory_reconciliation_writer_enabled,
+            )
+            .await;
+        match outcome {
+            Ok(crate::persistence::FinalizationRequest::NotFound) => {
+                let observed_revision =
+                    match active_memory_revision_or_response(&state, &user.0, episode_id).await {
+                        Ok(revision) => revision,
+                        // Reconciliation won the race: return the hydrated
+                        // handoff as 409. Only an absent handle is a true 404.
+                        Err(response) => return response,
+                    };
+                match memory_revision_decision(attempt, observed_revision == expected_revision) {
+                    MemoryRevisionDecision::Retry => continue,
+                    MemoryRevisionDecision::Exhausted => {
+                        return memory_revision_changed_response(episode_id)
+                    }
+                    MemoryRevisionDecision::Stable => {
+                        return super::routed_read_unavailable(
+                            "api.episode_finalize",
+                            &crate::error::EnclaveError::Store(
+                                "active memory has no finalizable episode".into(),
+                            ),
+                        )
+                    }
                 }
-            });
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "queued": true,
-                    "episode_id": episode_id,
-                    "status": "queued",
-                })),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            tracing::warn!(%error, episode_id, "failed to queue episode finalization");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "enclave_unavailable"})),
-            )
-                .into_response()
+            }
+            Ok(crate::persistence::FinalizationRequest::LowSignal) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "low_signal_episode"})),
+                )
+                    .into_response()
+            }
+            Ok(crate::persistence::FinalizationRequest::AwaitingReconciliation) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "queued": false,
+                        "episode_id": episode_id,
+                        "status": "awaiting_reconciliation"
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(crate::persistence::FinalizationRequest::AlreadyComplete { status }) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "already_complete", "status": status})),
+                )
+                    .into_response()
+            }
+            Ok(crate::persistence::FinalizationRequest::AlreadyQueued { status }) => {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"queued": true, "episode_id": episode_id, "status": status})),
+                )
+                    .into_response()
+            }
+            Ok(crate::persistence::FinalizationRequest::Queued) => {
+                let worker_state = Arc::clone(&state);
+                let worker_user = user.0;
+                tokio::spawn(async move {
+                    if let Err(error) = super::finalizer::finalize_user_episode(
+                        &worker_state,
+                        &worker_user,
+                        episode_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            episode_id,
+                            "scoped episode finalization failed"
+                        );
+                    }
+                });
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "queued": true,
+                        "episode_id": episode_id,
+                        "status": "queued",
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::warn!(%error, episode_id, "failed to queue episode finalization");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "enclave_unavailable"})),
+                )
+                    .into_response();
+            }
         }
     }
+    unreachable!("memory topology retry loop has a positive fixed bound")
 }
 
 async fn rest_feed(
@@ -1965,6 +2336,49 @@ async fn rest_test_episode_email(
             })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod memory_topology_read_tests {
+    use axum::http::StatusCode;
+
+    use super::{
+        invalid_memory_id_response, memory_revision_changed_response, memory_revision_decision,
+        MemoryRevisionDecision, MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS,
+    };
+
+    #[test]
+    fn active_revision_churn_retries_only_to_the_fixed_bound() {
+        assert_eq!(MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS, 3);
+        assert_eq!(
+            memory_revision_decision(0, false),
+            MemoryRevisionDecision::Retry
+        );
+        assert_eq!(
+            memory_revision_decision(1, false),
+            MemoryRevisionDecision::Retry
+        );
+        assert_eq!(
+            memory_revision_decision(2, false),
+            MemoryRevisionDecision::Exhausted
+        );
+        assert_eq!(
+            memory_revision_decision(2, true),
+            MemoryRevisionDecision::Stable
+        );
+    }
+
+    #[test]
+    fn invalid_ids_and_exhausted_races_are_typed_client_responses() {
+        assert_eq!(
+            invalid_memory_id_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            memory_revision_changed_response(7).status(),
+            StatusCode::CONFLICT
+        );
     }
 }
 

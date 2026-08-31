@@ -1,8 +1,9 @@
 # PostgreSQL migrations
 
 Reviewed, append-only schema migrations for the ADR-0040/ADR-0042 PostgreSQL-only
-structured-state authority. A dedicated release operation applies these files under SQLx's
-migration lock; serving instances only verify `persistence_schema.version`.
+structured-state authority. A dedicated release operation applies these files under the
+PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
+receipted expand declared compatible by the candidate.
 
 - `0001_identity_oauth.sql` creates the account, identity, Apple credential,
   signup-budget, OAuth client/consent/code, and refresh-token foundation.
@@ -56,3 +57,27 @@ migration lock; serving instances only verify `persistence_schema.version`.
 - `0025_account_deletion_request.sql` adds the durable `deletion_requested`
   admission fence used while final usage and the one-way billing deletion
   fence are reconciled, before identity/content deletion begins.
+- `0026_memory_reconciliation_episode_members_unique_index.sql` installs the
+  mandatory legacy source-owner guard with `CREATE UNIQUE INDEX CONCURRENTLY`.
+  Ambiguous ownership fails before any other v26 object; interrupted invalid
+  builds are removed by the runner before a repaired retry.
+- `0026_memory_reconciliation_release_ledger.sql` adds the one-row compatibility
+  marker field plus exact-contract phase/cursor/fleet-authorization and
+  per-step DDL/catalog-hash ledgers in one collision-refusing bounded metadata
+  transaction.
+- `0026_memory_reconciliation.sql` adds only new tenant-qualified source-settled
+  reconciliation tables, functions, and indexes: leases, JSONB staged results,
+  active-only membership, content-free handles and lineage, archive revisions,
+  and atomic publication. It contains no backfill or index on a populated table.
+- `0026_memory_reconciliation_capture_sessions_index.sql` and
+  `0026_memory_reconciliation_capture_events_index.sql` install the two
+  populated capture-horizon indexes concurrently and outside a transaction.
+- `0026_memory_reconciliation_expand_receipt.sql` atomically records the exact
+  completed contract as `expanded_through_version=26` and phase `expanded` while
+  deliberately leaving version 25 for predecessor readiness.
+- `0026_memory_reconciliation_finalize.sql` performs no DDL or backfill. It
+  requires a 60-second database-time margin, atomically persists canonical
+  strict fleet evidence, its SHA-256, detached Ed25519 signature, baked-key
+  fingerprint, and `clock_timestamp()` receipt, then flips only
+  `persistence_schema.version` to 26. A confirmation literal alone cannot
+  finalize.
