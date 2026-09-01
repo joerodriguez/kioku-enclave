@@ -13,24 +13,26 @@ use super::{
     vertex::{VertexMetadata, VertexOperation, VertexUsage},
     CpState,
 };
-use crate::error::Result;
+use crate::{error::Result, persistence::VertexInvocationAttempt};
 
-pub async fn begin_invocation(
+pub(crate) async fn begin_invocation_attempt(
     state: &CpState,
     user_id: &str,
     operation: VertexOperation,
     requested_model: &str,
     caller_anchor: &[u8; 32],
-) -> Result<String> {
+    attempt_identity: &[u8; 32],
+) -> Result<VertexInvocationAttempt> {
     state
         .repositories
         .model_usage()
-        .begin_invocation(
+        .begin_invocation_attempt(
             user_id,
             operation,
             requested_model,
             &state.config.vertex_location,
             caller_anchor,
+            attempt_identity,
         )
         .await
 }
@@ -80,6 +82,19 @@ pub async fn record_ambiguous(
     }
 }
 
+pub(crate) async fn settle_ambiguous_required(
+    state: &CpState,
+    user_id: &str,
+    event_id: &str,
+    http_status: Option<u16>,
+) -> Result<()> {
+    state
+        .repositories
+        .model_usage()
+        .settle_ambiguous(user_id, event_id, http_status)
+        .await
+}
+
 pub async fn record_not_billed(state: &CpState, user_id: &str, event_id: &str, http_status: u16) {
     if let Err(error) = state
         .repositories
@@ -89,6 +104,31 @@ pub async fn record_not_billed(state: &CpState, user_id: &str, event_id: &str, h
     {
         warn!(error = %error, "not-billed Vertex usage persistence deferred");
     }
+}
+
+pub(crate) async fn settle_not_billed_required(
+    state: &CpState,
+    user_id: &str,
+    event_id: &str,
+    http_status: u16,
+) -> Result<()> {
+    state
+        .repositories
+        .model_usage()
+        .settle_not_billed(user_id, event_id, http_status)
+        .await
+}
+
+pub(crate) async fn settle_pre_egress_not_billed_required(
+    state: &CpState,
+    user_id: &str,
+    event_id: &str,
+) -> Result<()> {
+    state
+        .repositories
+        .model_usage()
+        .settle_pre_egress_not_billed(user_id, event_id)
+        .await
 }
 
 pub(crate) fn normalized_billable_response(

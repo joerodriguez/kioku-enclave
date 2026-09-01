@@ -19,6 +19,7 @@ SAFE_AMBIENT_GIT_ENV = frozenset({"GIT_NO_REPLACE_OBJECTS", "GIT_PAGER"})
 sys.path.insert(0, str(SCRIPTS))
 import local_build_evidence  # noqa: E402
 import local_image_pipeline  # noqa: E402
+import select_build_configuration  # noqa: E402
 import verify_release_metadata  # noqa: E402
 
 
@@ -124,6 +125,13 @@ def metadata_arguments(
         expected_kms_location=configuration["ENCLAVE_KMS_LOCATION"],
         expected_kms_key_ring=configuration["ENCLAVE_KMS_KEY_RING"],
         expected_kms_key=configuration["ENCLAVE_KMS_KEY"],
+        expected_vertex_reconciliation_model=configuration.get(
+            "VERTEX_RECONCILIATION_MODEL", ""
+        ),
+        expected_vertex_location=configuration["VERTEX_LOCATION"],
+        expected_reconciliation_producer_contract_sha256=configuration.get(
+            "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256", ""
+        ),
     )
 
 
@@ -147,6 +155,11 @@ def main() -> None:
     parser.add_argument("--image-repository")
     parser.add_argument("--expected-gcs-media-bucket")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--allow-frozen-v0-9-16-schema-11-state",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--source-archive",
         type=Path,
@@ -202,14 +215,31 @@ def main() -> None:
         if sha256_bytes(archive_bytes) != evidence["source_archive_sha256"]:
             fail("signed evidence source archive hash differs from the immutable source")
 
+    if arguments.allow_frozen_v0_9_16_schema_11_state and arguments.tag != "v0.9.16":
+        fail("schema-11 state verification is restricted to frozen v0.9.16")
     try:
-        metadata = verify_release_metadata.parse_metadata_bytes(metadata_bytes)
+        if arguments.allow_frozen_v0_9_16_schema_11_state:
+            metadata = verify_release_metadata.parse_frozen_v0_9_16_metadata_bytes(
+                metadata_bytes
+            )
+            operator_values = (
+                select_build_configuration.parse_frozen_v0_9_16_operator_configuration(
+                    config_bytes
+                )
+            )
+            configuration = (
+                select_build_configuration.selected_frozen_v0_9_16_configuration(
+                    "production", operator_values, source_ref=arguments.tag
+                )
+            )
+        else:
+            metadata = verify_release_metadata.parse_metadata_bytes(metadata_bytes)
+            operator_values = local_image_pipeline._parse_operator_config(config_bytes)
+            configuration = local_image_pipeline.selected_configuration(
+                "production", operator_values, source_ref=arguments.tag
+            )
         sbom_document = json.loads(sbom_bytes)
         scan_document = json.loads(scan_bytes)
-        operator_values = local_image_pipeline._parse_operator_config(config_bytes)
-        configuration = local_image_pipeline.selected_configuration(
-            "production", operator_values, source_ref=arguments.tag
-        )
     except (UnicodeDecodeError, json.JSONDecodeError, local_image_pipeline.PipelineError, SystemExit):
         fail("evidence assets or selected production configuration are invalid")
     try:
@@ -226,8 +256,17 @@ def main() -> None:
     sbom_version = sbom_document.get("spdxVersion")
     if not isinstance(sbom_version, str) or not sbom_version.startswith("SPDX-"):
         fail("SBOM does not declare an SPDX version")
-    verifier_arguments = metadata_arguments(arguments, metadata, configuration)
-    verify_release_metadata.validate(verifier_arguments, metadata)
+    verifier_arguments = metadata_arguments(
+        arguments,
+        metadata,
+        configuration,
+    )
+    if arguments.allow_frozen_v0_9_16_schema_11_state:
+        verify_release_metadata.validate_frozen_v0_9_16_state(
+            verifier_arguments, metadata
+        )
+    else:
+        verify_release_metadata.validate(verifier_arguments, metadata)
 
     for field in (
         "source_repository",

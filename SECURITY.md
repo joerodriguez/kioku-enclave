@@ -68,6 +68,73 @@ The release and PostgreSQL contract suites must exercise two-replica contention,
 lost-success recovery, no-resend ambiguity, cancellation, deletion/configuration races, and
 outcome-save recovery.
 
+### Forward-only memory-reconciliation activation
+
+Topology reconciliation is governed by append-only PostgreSQL v27 authority, not by a process-local
+feature flag. The immutable image carries an explicit model, Vertex location, and compiled
+producer-contract digest. Startup and every readiness check dynamically compare those values with
+the verified signed database phase. Reconciliation is dormant in `Installed`, `Draining`, and
+`Paused`; only `Active` grants repository authority for claims, provider egress, durable stages,
+and publication. Legacy finalization remains available during the potentially long `Installed`
+compatibility window, is fenced in `Draining`/`Paused`, and after `Active` is limited to reconciled
+successors.
+
+The standard rollout uses one immutable activation-capable image. Its built-in migrator installs
+and backfills v27, then the normal deployment process makes that same image homogeneous while the
+database remains `Installed`. Fresh signed receipts advance `Draining` and `Active`. The selected
+configuration, image assembler, and schema-12 metadata bind model/location/producer identity but
+contain no writer Boolean or tag-specific capability rule.
+A v27 install is transactionally refused while any v26 episode-deletion receipt is pending, or
+while a completed v26 receipt names orphan events whose stream/sequence/digest coordinates were not
+retained. The new exact source-family/tombstone authority cannot infer provider effects or recreate
+those coordinates. Operators must finish pending work; a completed blocker requires authoritative
+backup restoration/reconstruction or remaining inactive. Synthetic tombstones and lowered
+committed watermarks are not remediation.
+Every v27-capable writer takes the shared activation release advisory lock before even probing for
+the contract; install and signed transitions hold its exclusive counterpart through commit. This
+makes the absence decision atomic with schema-26-safe DML and makes a writer that resumes after
+install observe and obey the tombstone/deletion contract. The install-time episode-deletion table
+lock and exact preflight remain defense in depth.
+A strict signed `Draining` receipt binds the immutable candidate-fleet digest, a nonempty
+homogeneous candidate fleet with zero predecessors/unavailable members, compatible client evidence, scope,
+generation, model/location/producer contract, v26 receipt, v27 catalog, and database-fresh expiry.
+The append-only event stores that digest independently of the receipt JSON. Draining-to-Active,
+Active-to-Paused, and Paused-to-Active must preserve it exactly; only a fresh
+Paused-to-Draining proof may establish a different homogeneous fleet digest for the next cycle.
+The same transaction attaches exact catalog-verified guards that refuse scoped legacy draft claims,
+late settlements, and pending-deletion source reassignment. It initializes bounded, resumable source
+refresh and claim-drain ledgers; `Active` revalidates those receipts and exact zero scoped draft
+claims before atomically publishing marker 27.
+
+Canary assignment is explicit and sticky; the only non-explicit scope is exactly 100 percent. A
+later generation may grow but never shrink prior scope. `Paused` stops new assignments, plaintext
+provider disclosure, stage publication, and topology publication, but does not remove guards,
+unassign accounts, admit an incompatible replica, or reopen legacy finalization. A held PostgreSQL
+activation-key lock spans final egress authorization through provider settlement and durable stage
+persistence, so pause either wins before disclosure or waits for the already-authorized attempt to
+finish its fenced transaction.
+
+Finalization holds the same activation/account fence through HTTP and the exact terminal model-usage
+write, then releases it before parsing and final episode settlement to avoid a cross-transaction
+lock cycle. A signed Draining transition may therefore revoke the claim and discard an already paid
+terminal result, but the stale result cannot settle and the assigned draft cannot obtain another
+legacy finalizer attempt. This intentional availability/cost tradeoff never permits disclosure after
+revocation and does not introduce a second response-stage schema.
+
+Per-session formation revisions, provisional finish receipts, exact quiet/contiguous seal
+generations, append-only reopen events, and deletion-sequence tombstones bind every reconciliation
+claim and publish to current source evidence. Episode deletion takes the activation fence and
+account reconciliation lock, refuses live summary/formation/finalization/reconciliation claims,
+persists the exact canonical/reference family before object deletion, tombstones accepted
+sequences, and refreshes affected formation receipts. Exact erased-event replay receives only its
+content-free acknowledgement; altered content or coordinate reuse cannot resurrect evidence.
+Dense sessions are consumed through durable, revision-bound formation pages: each paid page freezes
+the exact bounded Vertex request and persists its attempt identity before disclosure, while
+confirmed-not-billed recovery is the only operation that advances an attempt. Oversized connected
+components use bounded, providerless discovery and independent verification passes whose exact
+ordered count and commitment must agree before KEEP publication; process-local truncation can never
+mark formation or topology complete.
+
 ### Large-media encryption and object identity
 
 Raw audio, screenshot evidence, and other large objects are stored only as context-bound
@@ -248,7 +315,8 @@ The exhaustive release gate must include:
 - a non-skippable real PostgreSQL 17 contract run;
 - RustSec audit, SBOM generation, and fixed-policy vulnerability scan;
 - exact OCI archive quarantine and registry digest readback;
-- canonical schema-11 metadata binding required serving-schema verification and detached evidence
+- canonical schema-12 metadata binding required serving-schema verification, explicit
+  reconciliation model/location, compiled producer digest, and detached evidence
   signature verification.
 
 Compatible runtime releases follow ADR-0041: predecessor/candidate KMS admission, staged canary,

@@ -119,7 +119,7 @@ to that source. The pipeline:
 5. creates the SPDX SBOM and vulnerability scan before cloud authentication;
 6. copies the scanned OCI bytes into a private unlinked read-only quarantine;
 7. promotes only those bytes and verifies the registry digest;
-8. emits canonical schema-11 release metadata and build evidence.
+8. emits canonical schema-12 release metadata and build evidence.
 
 `build-evidence.json` is frozen after build and scan, before any cloud authentication. The
 documented `push --resume` invocation reconstructs its build/scan timestamps from the immutable
@@ -130,9 +130,83 @@ resumed backward as a build.
 
 The release metadata binds source/tag/image digest, the live media bucket, KMS coordinates,
 PostgreSQL authority, required serving-schema verification, fleet connection budget, health/drain
-values, and shared TLS. The schema-verification claim is a fixed source invariant, not copied from
-operator configuration.
+values, shared TLS, explicit reconciliation model/location, and compiled producer-contract SHA-256. Image assembly independently recomputes
+that contract and rejects a supplied label mismatch. The schema-verification claim is a fixed source
+invariant, not copied from operator configuration.
 Earlier metadata that described removed storage authority is ineligible for new promotion.
+
+## Permanently activate memory reconciliation
+
+Use one ordinary signed release image and the existing release, migration, and staged deployment
+processes. There is no activation-specific Python/Terraform operator, second tag, alternate binary,
+or runtime feature flag.
+
+1. Build, verify, sign, and publish the normal immutable release. Its schema-12 evidence must bind
+   the exact reconciliation model, Vertex location, and compiled producer digest. Do not roll it
+   yet; first audit `episode_deletions` while the predecessor fleet still serves schema 26. Finish
+   every `pending` receipt. The v27 install also refuses a `complete` v26 receipt whose
+   `orphan_event_ids` array is nonempty: v26 did not retain the deleted event's stream, sequence,
+   and manifest-digest coordinates. Diagnose both blockers without content using:
+
+   ```sql
+   SELECT account_id,episode_id,state
+     FROM episode_deletions
+    WHERE state='pending'
+       OR (state='complete' AND jsonb_array_length(orphan_event_ids)>0)
+    ORDER BY account_id,episode_id;
+   ```
+
+   A pending receipt may be resumed normally. For a completed blocker, restore/reconstruct the exact
+   coordinates from an authoritative backup under a separately reviewed remediation, or remain
+   inactive. Never invent tombstones or lower a committed stream watermark. Once the query is
+   empty, run this release image through the standard dedicated migration job with
+   `POSTGRES_MIGRATION_CONFIRM=memory-reconciliation-v27-install`. Repeat
+   `memory-reconciliation-v27-backfill` until the content-free result reports the bounded formation
+   backfill complete. The durable phase is now `Installed`, marker 26 remains visible, and the
+   predecessor stays schema-compatible throughout this step.
+
+   The installer serializes with every v27-capable writer using the exclusive activation release
+   advisory lock before it probes or creates objects, and also locks `episode_deletions` before the
+   legacy-receipt checks. Writers take the shared counterpart before their absence probe. Do not
+   replace either fence with an operator-side quiet-period assumption.
+2. Roll the same release image through the standard zero-unavailable staged deployment while the
+   durable phase remains `Installed`. Prove every serving member is ready, homogeneous on the exact
+   immutable digest, and no predecessor workload or KMS admission remains. The image is
+   activation-capable but cannot claim, disclose, stage, or publish reconciliation work in this
+   phase; legacy finalization remains available during this compatibility window.
+3. Supply the strict canonical signed receipt and detached signature only to the execution-scoped
+   migrator environment as `POSTGRES_MIGRATION_ACTIVATION_RECEIPT` and
+   `POSTGRES_MIGRATION_ACTIVATION_SIGNATURE`. The receipt bytes include exactly one trailing LF.
+   Run `memory-reconciliation-v27-drain`; the receipt must prove predecessor and unavailable counts
+   are zero and the candidate fleet is nonempty and homogeneous. PostgreSQL durably records its
+   exact image digest; `draining -> active`, `active -> paused`, and `paused -> active` receipts
+   must preserve it. PostgreSQL attaches all six
+   exact finalization, pending-owner, paged-deletion, media-work, and formation-claim guards in
+   this transaction while marker 26 remains visible, then initializes resumable source-refresh and
+   legacy-claim-drain ledgers.
+4. Repeat `memory-reconciliation-v27-backfill` until both generation-bound ledgers are complete.
+   A runtime whose model/location/producer does not match the signed authority is unready from
+   `Draining` onward, and the frozen predecessor verifier refuses the added guards.
+   An episode-finalization request already authorized before the transition may finish HTTP and its
+   terminal usage write while Draining waits on the database fence. The subsequent bounded claim
+   drain may discard that paid result before parsing; the stale claim must fail settlement and the
+   assigned draft must never enter the legacy finalizer again.
+5. With a fresh `draining -> active` receipt, run `memory-reconciliation-v27-activate`. PostgreSQL
+   rechecks zero scoped draft claims and complete ledgers, persists the signed generation, and
+   advances marker 27 atomically. Repository authority dynamically enables egress only after this
+   commit.
+6. For a kill switch, use a fresh signed `active -> paused` receipt and
+   `memory-reconciliation-v27-pause`. Pause remains operable with truthful unavailable-fleet
+   evidence, but every assigned or historically selected account stays reconciliation-only. Resume
+   requires an unchanged signed scope/producer, or use `paused -> draining` for a monotonic scope or
+   producer expansion and freshly proved homogeneous candidate digest before a later
+   `draining -> active`.
+
+Never persist activation receipts or signatures in Terraform, image metadata, or a release
+artifact. Status and health output remain content-free; retain the exact signed receipt, detached
+signature, fleet evidence, migration result, and immutable image evidence in the existing release
+audit boundary. Run every phase through the standard release/migration/deployment procedure; do not
+introduce an activation-only deployment operator.
 
 Sign or verify the canonical evidence:
 

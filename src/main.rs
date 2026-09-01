@@ -119,7 +119,7 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "VERTEX_LOCATION",
     "VERTEX_MODEL",
     "VERTEX_RECONCILIATION_MODEL",
-    "MEMORY_RECONCILIATION_WRITER_ENABLED",
+    "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256",
     "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64",
     "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
     "POSTGRES_MAX_CONNECTIONS",
@@ -187,6 +187,7 @@ fn load_baked_image_configuration() {
 }
 
 use crate::gcs::GcpGcsClient;
+use crate::persistence::MemoryReconciliationActivationRepository;
 
 async fn resolve_resend_api_key<F, Fut>(
     test_mode: bool,
@@ -261,6 +262,9 @@ fn resolve_apns_identifiers(
 pub struct AppState {
     postgres: Arc<persistence::PostgresPersistence>,
     serving_lifecycle: Arc<ServingLifecycle>,
+    vertex_reconciliation_model: Option<String>,
+    vertex_location: String,
+    reconciliation_producer_contract_sha256: Option<[u8; 32]>,
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
@@ -532,7 +536,25 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    let ready = state.postgres.verify_schema().await.is_ok();
+    let schema_ready = state
+        .postgres
+        .verify_reconciliation_runtime_schema(
+            state.vertex_reconciliation_model.as_deref(),
+            &state.vertex_location,
+            state.reconciliation_producer_contract_sha256.as_ref(),
+        )
+        .await
+        .is_ok();
+    let activation = if schema_ready {
+        state
+            .postgres
+            .memory_reconciliation_activation_status()
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let ready = schema_ready && activation.is_some();
     let status = if ready {
         StatusCode::OK
     } else {
@@ -544,6 +566,12 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
             "ok": ready,
             "service": "kioku-enclave",
             "persistence_backend": "postgres",
+            "memory_reconciliation_activation": activation.map(|activation| json!({
+                "phase": activation.phase.as_str(),
+                "generation": activation.generation,
+                "formation_backfill_complete": activation.formation_backfill_complete,
+                "finalization_claim_drain_complete": activation.finalization_claim_drain_complete,
+            })),
         })),
     )
         .into_response()
@@ -681,6 +709,18 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--print-memory-reconciliation-producer-contract") {
+        if args.len() != 4 {
+            panic!(
+                "--print-memory-reconciliation-producer-contract requires exact model and location arguments"
+            );
+        }
+        let contract = cp::reconciler::producer_contract_sha256_label(&args[2], &args[3])
+            .unwrap_or_else(|error| panic!("invalid reconciliation producer contract: {error}"));
+        println!("{contract}");
+        return;
+    }
     load_baked_image_configuration();
     // Do not let Tokio create worker threads before the image-baked security
     // configuration has been parsed and installed. The Tokio main attribute
@@ -1109,14 +1149,39 @@ async fn async_main() {
         .verify_schema()
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL is not release-ready: {error}"));
-    if cp_config.memory_reconciliation_writer_enabled {
-        postgres
-            .verify_reconciliation_writer_schema()
-            .await
-            .unwrap_or_else(|error| {
-                panic!("memory reconciliation writer is not release-ready: {error}")
-            });
-    }
+    let reconciliation_producer_contract = cp_config
+        .vertex_reconciliation_model_requested
+        .as_deref()
+        .map(|reconciliation_model| {
+            let digest = cp::reconciler::producer_contract_commitment(
+                reconciliation_model,
+                &cp_config.vertex_location,
+            )
+            .unwrap_or_else(|error| panic!("invalid reconciliation producer contract: {error}"));
+            let label = cp::reconciler::producer_contract_sha256_label(
+                reconciliation_model,
+                &cp_config.vertex_location,
+            )
+            .unwrap_or_else(|error| panic!("invalid reconciliation producer contract: {error}"));
+            if cp_config
+                .memory_reconciliation_producer_contract_sha256
+                .as_deref()
+                != Some(label.as_str())
+            {
+                panic!("baked memory reconciliation producer contract does not match this binary");
+            }
+            digest
+        });
+    postgres
+        .verify_reconciliation_runtime_schema(
+            cp_config.vertex_reconciliation_model_requested.as_deref(),
+            &cp_config.vertex_location,
+            reconciliation_producer_contract.as_ref(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("memory reconciliation runtime is not release-ready: {error}")
+        });
     let media_objects: Arc<dyn persistence::MediaObjectStore> = Arc::new(
         persistence::GcsMediaObjectStore::new(Arc::clone(&application_media_gcs)),
     );
@@ -1125,6 +1190,9 @@ async fn async_main() {
     let state = Arc::new(AppState {
         postgres: Arc::clone(&postgres),
         serving_lifecycle: Arc::clone(&serving_lifecycle),
+        vertex_reconciliation_model: cp_config.vertex_reconciliation_model_requested.clone(),
+        vertex_location: cp_config.vertex_location.clone(),
+        reconciliation_producer_contract_sha256: reconciliation_producer_contract,
         id_token_verifier,
         attestation_cache: attestation_cache.clone(),
         tls_keystone: keystone.clone(),
@@ -1268,13 +1336,40 @@ async fn async_main() {
 
 const MEMORY_RECONCILIATION_EXPAND_CONFIRM: &str = "memory-reconciliation-v26-expand";
 const MEMORY_RECONCILIATION_FINALIZE_CONFIRM: &str = "memory-reconciliation-v26-finalize";
+const MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM: &str = "memory-reconciliation-v27-install";
+const MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM: &str =
+    "memory-reconciliation-v27-backfill";
+const MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM: &str = "memory-reconciliation-v27-drain";
+const MEMORY_RECONCILIATION_ACTIVATE_CONFIRM: &str = "memory-reconciliation-v27-activate";
+const MEMORY_RECONCILIATION_PAUSE_CONFIRM: &str = "memory-reconciliation-v27-pause";
+const MEMORY_RECONCILIATION_RESUME_CONFIRM: &str = "memory-reconciliation-v27-resume";
 const POSTGRES_FINALIZATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_RECEIPT";
 const POSTGRES_FINALIZATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_SIGNATURE";
+const POSTGRES_ACTIVATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_RECEIPT";
+const POSTGRES_ACTIVATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_SIGNATURE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
     ExpandMemoryReconciliation,
     FinalizeMemoryReconciliation,
+    InstallMemoryReconciliationActivation,
+    AdvanceMemoryReconciliationActivationBackfill,
+    DrainMemoryReconciliationActivation,
+    ActivateMemoryReconciliation,
+    PauseMemoryReconciliation,
+    ResumeMemoryReconciliation,
+}
+
+impl PostgresMigrationReleasePhase {
+    fn requires_activation_receipt(self) -> bool {
+        matches!(
+            self,
+            Self::DrainMemoryReconciliationActivation
+                | Self::ActivateMemoryReconciliation
+                | Self::PauseMemoryReconciliation
+                | Self::ResumeMemoryReconciliation
+        )
+    }
 }
 
 fn postgres_migration_release_phase(
@@ -1287,10 +1382,82 @@ fn postgres_migration_release_phase(
         Some(MEMORY_RECONCILIATION_FINALIZE_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::FinalizeMemoryReconciliation)
         }
+        Some(MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation)
+        }
+        Some(MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::AdvanceMemoryReconciliationActivationBackfill)
+        }
+        Some(MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation)
+        }
+        Some(MEMORY_RECONCILIATION_ACTIVATE_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::ActivateMemoryReconciliation)
+        }
+        Some(MEMORY_RECONCILIATION_PAUSE_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::PauseMemoryReconciliation)
+        }
+        Some(MEMORY_RECONCILIATION_RESUME_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::ResumeMemoryReconciliation)
+        }
         _ => {
             Err("POSTGRES_MIGRATION_CONFIRM must authorize the exact reviewed schema release phase")
         }
     }
+}
+
+fn postgres_memory_reconciliation_activation_receipt(
+    raw_receipt: Option<&str>,
+    raw_signature: Option<&str>,
+    phase: PostgresMigrationReleasePhase,
+) -> Result<persistence::VerifiedMemoryReconciliationActivationReceipt, String> {
+    let raw_receipt = raw_receipt.ok_or_else(|| {
+        format!("{POSTGRES_ACTIVATION_RECEIPT_ENV} is required for an activation transition")
+    })?;
+    let receipt: persistence::MemoryReconciliationActivationReceipt =
+        serde_json::from_str(raw_receipt).map_err(|error| {
+            format!(
+            "{POSTGRES_ACTIVATION_RECEIPT_ENV} must contain the strict activation receipt: {error}"
+        )
+        })?;
+    let expected_transition = match phase {
+        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation => {
+            receipt.requested_phase == "draining"
+                && matches!(receipt.previous_phase.as_str(), "installed" | "paused")
+        }
+        PostgresMigrationReleasePhase::ActivateMemoryReconciliation => {
+            receipt.previous_phase == "draining" && receipt.requested_phase == "active"
+        }
+        PostgresMigrationReleasePhase::PauseMemoryReconciliation => {
+            receipt.previous_phase == "active" && receipt.requested_phase == "paused"
+        }
+        PostgresMigrationReleasePhase::ResumeMemoryReconciliation => {
+            receipt.previous_phase == "paused" && receipt.requested_phase == "active"
+        }
+        _ => false,
+    };
+    if !expected_transition {
+        return Err(format!(
+            "{POSTGRES_ACTIVATION_RECEIPT_ENV} does not authorize the confirmed transition"
+        ));
+    }
+    let raw_signature = raw_signature.ok_or_else(|| {
+        format!("{POSTGRES_ACTIVATION_SIGNATURE_ENV} is required for an activation transition")
+    })?;
+    let signature =
+        persistence::MemoryReconciliationActivationSignature::from_base64(raw_signature)
+            .map_err(|error| format!("{POSTGRES_ACTIVATION_SIGNATURE_ENV} is invalid: {error}"))?;
+    let authorization =
+        persistence::verify_memory_reconciliation_activation_authorization(receipt, signature)
+            .map_err(|error| {
+                format!("memory reconciliation activation authorization is invalid: {error}")
+            })?;
+    if !authorization.has_exact_canonical_transport(raw_receipt) {
+        return Err(format!(
+            "{POSTGRES_ACTIVATION_RECEIPT_ENV} must be the exact canonical signed bytes"
+        ));
+    }
+    Ok(authorization)
 }
 
 fn postgres_schema_finalization_receipt(
@@ -1348,6 +1515,21 @@ async fn migrate_postgres_release_schema() {
             )
         }
         PostgresMigrationReleasePhase::ExpandMemoryReconciliation => None,
+        _ => None,
+    };
+    let activation_receipt = if phase.requires_activation_receipt() {
+        let raw_receipt = std::env::var(POSTGRES_ACTIVATION_RECEIPT_ENV).ok();
+        let raw_signature = std::env::var(POSTGRES_ACTIVATION_SIGNATURE_ENV).ok();
+        Some(
+            postgres_memory_reconciliation_activation_receipt(
+                raw_receipt.as_deref(),
+                raw_signature.as_deref(),
+                phase,
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
+        )
+    } else {
+        None
     };
     let database_url = std::env::var("POSTGRES_DATABASE_URL")
         .expect("POSTGRES_DATABASE_URL is required by --migrate-postgres");
@@ -1364,20 +1546,37 @@ async fn migrate_postgres_release_schema() {
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
     let result = match phase {
-        PostgresMigrationReleasePhase::ExpandMemoryReconciliation => {
-            persistence
-                .expand_memory_reconciliation_release_schema()
-                .await
-        }
-        PostgresMigrationReleasePhase::FinalizeMemoryReconciliation => {
-            persistence
-                .finalize_memory_reconciliation_release_schema(
-                    finalization_receipt.as_ref().expect(
-                        "finalization authorization was verified before PostgreSQL connection",
-                    ),
-                )
-                .await
-        }
+        PostgresMigrationReleasePhase::ExpandMemoryReconciliation => persistence
+            .expand_memory_reconciliation_release_schema()
+            .await
+            .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::FinalizeMemoryReconciliation => persistence
+            .finalize_memory_reconciliation_release_schema(
+                finalization_receipt
+                    .as_ref()
+                    .expect("finalization authorization was verified before PostgreSQL connection"),
+            )
+            .await
+            .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation => persistence
+            .install_memory_reconciliation_activation_schema()
+            .await
+            .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::AdvanceMemoryReconciliationActivationBackfill => persistence
+            .advance_memory_reconciliation_activation_backfill()
+            .await
+            .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation
+        | PostgresMigrationReleasePhase::ActivateMemoryReconciliation
+        | PostgresMigrationReleasePhase::PauseMemoryReconciliation
+        | PostgresMigrationReleasePhase::ResumeMemoryReconciliation => persistence
+            .transition_memory_reconciliation_activation(
+                activation_receipt
+                    .as_ref()
+                    .expect("activation authorization was verified before PostgreSQL connection"),
+            )
+            .await
+            .map(|result| serde_json::to_value(result).expect("release result must serialize")),
     }
     .unwrap_or_else(|error| panic!("PostgreSQL migration phase failed: {error}"));
     println!(
@@ -1389,9 +1588,13 @@ async fn migrate_postgres_release_schema() {
 #[cfg(test)]
 mod postgres_migration_release_tests {
     use super::{
-        postgres_migration_release_phase, postgres_schema_finalization_receipt,
-        PostgresMigrationReleasePhase, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
-        MEMORY_RECONCILIATION_FINALIZE_CONFIRM,
+        postgres_memory_reconciliation_activation_receipt, postgres_migration_release_phase,
+        postgres_schema_finalization_receipt, PostgresMigrationReleasePhase,
+        MEMORY_RECONCILIATION_ACTIVATE_CONFIRM, MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
+        MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
+        MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
+        MEMORY_RECONCILIATION_FINALIZE_CONFIRM, MEMORY_RECONCILIATION_PAUSE_CONFIRM,
+        MEMORY_RECONCILIATION_RESUME_CONFIRM,
     };
 
     #[test]
@@ -1404,6 +1607,37 @@ mod postgres_migration_release_tests {
             postgres_migration_release_phase(Some(MEMORY_RECONCILIATION_FINALIZE_CONFIRM)).unwrap(),
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
+        for (confirmation, expected) in [
+            (
+                MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
+                PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation,
+            ),
+            (
+                MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
+                PostgresMigrationReleasePhase::AdvanceMemoryReconciliationActivationBackfill,
+            ),
+            (
+                MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
+                PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation,
+            ),
+            (
+                MEMORY_RECONCILIATION_ACTIVATE_CONFIRM,
+                PostgresMigrationReleasePhase::ActivateMemoryReconciliation,
+            ),
+            (
+                MEMORY_RECONCILIATION_PAUSE_CONFIRM,
+                PostgresMigrationReleasePhase::PauseMemoryReconciliation,
+            ),
+            (
+                MEMORY_RECONCILIATION_RESUME_CONFIRM,
+                PostgresMigrationReleasePhase::ResumeMemoryReconciliation,
+            ),
+        ] {
+            assert_eq!(
+                postgres_migration_release_phase(Some(confirmation)).unwrap(),
+                expected
+            );
+        }
         for refused in [
             None,
             Some(""),
@@ -1412,6 +1646,30 @@ mod postgres_migration_release_tests {
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }
+    }
+
+    #[test]
+    fn activation_transition_requires_the_exact_confirmation_domain() {
+        for phase in [
+            PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation,
+            PostgresMigrationReleasePhase::ActivateMemoryReconciliation,
+            PostgresMigrationReleasePhase::PauseMemoryReconciliation,
+            PostgresMigrationReleasePhase::ResumeMemoryReconciliation,
+        ] {
+            assert!(postgres_memory_reconciliation_activation_receipt(None, None, phase).is_err());
+            assert!(postgres_memory_reconciliation_activation_receipt(
+                Some("{}"),
+                Some("not-base64"),
+                phase,
+            )
+            .is_err());
+        }
+        assert!(postgres_memory_reconciliation_activation_receipt(
+            Some("{}"),
+            Some("not-base64"),
+            PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1755,6 +2013,9 @@ mod retired_route_tests {
         let state = Arc::new(AppState {
             postgres: Arc::new(persistence::PostgresPersistence::disconnected_test_instance()),
             serving_lifecycle: Arc::new(ServingLifecycle::default()),
+            vertex_reconciliation_model: None,
+            vertex_location: "us-central1".into(),
+            reconciliation_producer_contract_sha256: None,
             id_token_verifier: Arc::new(auth::IdTokenVerifier::new(
                 "test-audience".into(),
                 "caller@example.com".into(),

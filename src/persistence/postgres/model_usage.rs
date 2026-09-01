@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
@@ -10,34 +9,18 @@ use crate::{
         vertex::{VertexMetadata, VertexOperation},
     },
     error::{EnclaveError, Result},
-    persistence::{ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository},
+    persistence::{
+        vertex_attempt_event_id, ClaimedVertexCoverage, ClaimedVertexUsageBatch,
+        ModelUsageRepository, VertexInvocationAdmission, VertexInvocationAttempt,
+    },
 };
 
 use super::{advisory_transaction_lock, PostgresPersistence};
 
+pub(super) use crate::persistence::vertex_invocation_fingerprint as invocation_fingerprint;
+
 const OUTBOX_BATCH: i64 = 100;
 const CLAIM_SECONDS: f64 = 120.0;
-
-fn invocation_fingerprint(
-    account_id: &str,
-    operation: VertexOperation,
-    requested_model: &str,
-    location: &str,
-    caller_anchor: &[u8; 32],
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"kioku.vertex-invocation.v1\0");
-    digest.update(account_id.as_bytes());
-    digest.update([0]);
-    digest.update(format!("{operation:?}").as_bytes());
-    digest.update([0]);
-    digest.update(requested_model.as_bytes());
-    digest.update([0]);
-    digest.update(location.as_bytes());
-    digest.update([0]);
-    digest.update(caller_anchor);
-    digest.finalize().into()
-}
 
 fn event_id(fingerprint: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -50,7 +33,22 @@ fn event_id(fingerprint: &[u8; 32]) -> String {
     value
 }
 
-async fn refresh_coverage(
+fn replay_admission(outcome: &str) -> Result<VertexInvocationAdmission> {
+    match outcome {
+        "not_billed" => Ok(VertexInvocationAdmission::ConfirmedNotBilled),
+        // A started row may have crossed the provider boundary before its
+        // owner was lost. Metered/usage-missing rows prove that it did. The
+        // response body is not in this ledger, so none can authorize egress.
+        "started" | "metered" | "usage_missing" | "ambiguous" => {
+            Ok(VertexInvocationAdmission::AmbiguousTerminal)
+        }
+        _ => Err(EnclaveError::Store(
+            "Vertex invocation has an invalid durable outcome".into(),
+        )),
+    }
+}
+
+pub(super) async fn refresh_coverage(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> Result<()> {
@@ -142,7 +140,7 @@ async fn settle_simple_outcome(
     let mut transaction = persistence.pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE vertex_usage_events
-            SET outcome=$3,delivery_state=$4,http_status=$5,updated_at=CURRENT_TIMESTAMP
+            SET outcome=$3,delivery_state=$4,http_status=$5,updated_at=clock_timestamp()
           WHERE account_id=$1 AND event_id=$2 AND outcome='started'",
     )
     .bind(account_id)
@@ -154,17 +152,36 @@ async fn settle_simple_outcome(
     .await?
     .rows_affected();
     if changed == 0 {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM vertex_usage_events WHERE account_id=$1 AND event_id=$2)",
+        let exact = sqlx::query_scalar::<_, bool>(
+            "SELECT outcome=$3 AND delivery_state=$4 \
+                    AND http_status IS NOT DISTINCT FROM $5 \
+                    AND returned_model IS NULL AND traffic_type='on_demand' \
+                    AND prompt_tokens IS NULL AND input_text_tokens IS NULL \
+                    AND input_audio_tokens IS NULL AND input_image_tokens IS NULL \
+                    AND cached_input_tokens IS NULL AND cached_input_text_tokens IS NULL \
+                    AND cached_input_audio_tokens IS NULL AND cached_input_image_tokens IS NULL \
+                    AND output_text_tokens IS NULL AND thought_tokens IS NULL AND total_tokens IS NULL \
+               FROM vertex_usage_events WHERE account_id=$1 AND event_id=$2",
         )
         .bind(account_id)
         .bind(event_id)
-        .fetch_one(&mut *transaction)
+        .bind(outcome)
+        .bind(delivery_state)
+        .bind(http_status.map(i32::from))
+        .fetch_optional(&mut *transaction)
         .await?;
-        if !exists {
-            return Err(EnclaveError::Store(
-                "Vertex invocation intent does not exist".into(),
-            ));
+        match exact {
+            None => {
+                return Err(EnclaveError::Store(
+                    "Vertex invocation intent does not exist".into(),
+                ))
+            }
+            Some(false) => {
+                return Err(EnclaveError::Conflict(
+                    "Vertex invocation already has a different terminal outcome".into(),
+                ))
+            }
+            Some(true) => {}
         }
     }
     refresh_coverage(&mut transaction, account_id).await?;
@@ -239,6 +256,99 @@ impl ModelUsageRepository for PostgresPersistence {
         Ok(event_id)
     }
 
+    async fn begin_invocation_attempt(
+        &self,
+        account_id: &str,
+        operation: VertexOperation,
+        requested_model: &str,
+        location: &str,
+        caller_anchor: &[u8; 32],
+        attempt_identity: &[u8; 32],
+    ) -> Result<VertexInvocationAttempt> {
+        let requested_model = requested_model.chars().take(256).collect::<String>();
+        let location = location.chars().take(128).collect::<String>();
+        let request_fingerprint = invocation_fingerprint(
+            account_id,
+            operation,
+            &requested_model,
+            &location,
+            caller_anchor,
+        );
+        // The event key is derived only from the caller-owned durable attempt
+        // identity. A replay with changed request bytes therefore collides
+        // with this row and fails the fingerprint comparison below instead of
+        // silently minting a second provider authorization.
+        let event_id = vertex_attempt_event_id(attempt_identity);
+        let mut transaction = self.pool.begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND status='active')",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !active {
+            return Err(EnclaveError::Auth("account inactive".into()));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO vertex_usage_events
+                 (account_id,event_id,request_fingerprint,operation,requested_model,location,outcome)
+             VALUES($1,$2,$3,$4,$5,$6,'started')
+             ON CONFLICT(account_id,event_id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(&event_id)
+        .bind(request_fingerprint.as_slice())
+        .bind(operation.as_str())
+        .bind(&requested_model)
+        .bind(&location)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let admission = if inserted == 1 {
+            refresh_coverage(&mut transaction, account_id).await?;
+            VertexInvocationAdmission::Send
+        } else {
+            let row = sqlx::query(
+                "SELECT request_fingerprint,outcome FROM vertex_usage_events
+                  WHERE account_id=$1 AND event_id=$2 FOR UPDATE",
+            )
+            .bind(account_id)
+            .bind(&event_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let stored: Vec<u8> = row.try_get("request_fingerprint")?;
+            if stored.as_slice() != request_fingerprint {
+                return Err(EnclaveError::Conflict(
+                    "Vertex invocation attempt id was reused with different input".into(),
+                ));
+            }
+            let outcome: String = row.try_get("outcome")?;
+            let admission = replay_admission(&outcome)?;
+            if outcome == "started" {
+                // Re-entry means the previous owner was lost after intent
+                // durability. Whether it crossed egress is unknowable, so
+                // make ambiguity terminal before returning to the caller.
+                sqlx::query(
+                    "UPDATE vertex_usage_events
+                        SET outcome='ambiguous',updated_at=CURRENT_TIMESTAMP
+                      WHERE account_id=$1 AND event_id=$2 AND outcome='started'",
+                )
+                .bind(account_id)
+                .bind(&event_id)
+                .execute(&mut *transaction)
+                .await?;
+                refresh_coverage(&mut transaction, account_id).await?;
+            }
+            admission
+        };
+        transaction.commit().await?;
+        Ok(VertexInvocationAttempt {
+            event_id,
+            admission,
+        })
+    }
+
     async fn settle_response(
         &self,
         account_id: &str,
@@ -264,7 +374,7 @@ impl ModelUsageRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(event_id)
-        .bind(model)
+        .bind(model.as_deref())
         .bind(normalized_traffic_type(metadata.traffic_type.as_deref()))
         .bind(to_i64(usage.prompt_tokens))
         .bind(to_i64(usage.input_text_tokens))
@@ -282,17 +392,53 @@ impl ModelUsageRepository for PostgresPersistence {
         .await?
         .rows_affected();
         if changed == 0 {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM vertex_usage_events WHERE account_id=$1 AND event_id=$2)",
+            let exact = sqlx::query_scalar::<_, bool>(
+                "SELECT outcome=$3 AND http_status=200 \
+                        AND returned_model IS NOT DISTINCT FROM $4 \
+                        AND traffic_type IS NOT DISTINCT FROM $5 \
+                        AND prompt_tokens IS NOT DISTINCT FROM $6 \
+                        AND input_text_tokens IS NOT DISTINCT FROM $7 \
+                        AND input_audio_tokens IS NOT DISTINCT FROM $8 \
+                        AND input_image_tokens IS NOT DISTINCT FROM $9 \
+                        AND cached_input_tokens IS NOT DISTINCT FROM $10 \
+                        AND cached_input_text_tokens IS NOT DISTINCT FROM $11 \
+                        AND cached_input_audio_tokens IS NOT DISTINCT FROM $12 \
+                        AND cached_input_image_tokens IS NOT DISTINCT FROM $13 \
+                        AND output_text_tokens IS NOT DISTINCT FROM $14 \
+                        AND thought_tokens IS NOT DISTINCT FROM $15 \
+                        AND total_tokens IS NOT DISTINCT FROM $16 \
+                   FROM vertex_usage_events WHERE account_id=$1 AND event_id=$2",
             )
             .bind(account_id)
             .bind(event_id)
-            .fetch_one(&mut *transaction)
+            .bind(outcome)
+            .bind(model.as_deref())
+            .bind(normalized_traffic_type(metadata.traffic_type.as_deref()))
+            .bind(to_i64(usage.prompt_tokens))
+            .bind(to_i64(usage.input_text_tokens))
+            .bind(to_i64(usage.input_audio_tokens))
+            .bind(to_i64(usage.input_image_tokens))
+            .bind(to_i64(usage.cached_input_tokens))
+            .bind(to_i64(usage.cached_input_text_tokens))
+            .bind(to_i64(usage.cached_input_audio_tokens))
+            .bind(to_i64(usage.cached_input_image_tokens))
+            .bind(to_i64(usage.output_tokens))
+            .bind(to_i64(usage.thought_tokens))
+            .bind(to_i64(usage.total_tokens))
+            .fetch_optional(&mut *transaction)
             .await?;
-            if !exists {
-                return Err(EnclaveError::Store(
-                    "Vertex invocation intent does not exist".into(),
-                ));
+            match exact {
+                None => {
+                    return Err(EnclaveError::Store(
+                        "Vertex invocation intent does not exist".into(),
+                    ))
+                }
+                Some(false) => {
+                    return Err(EnclaveError::Conflict(
+                        "Vertex invocation already has different response metadata".into(),
+                    ))
+                }
+                Some(true) => {}
             }
         }
         refresh_coverage(&mut transaction, account_id).await?;
@@ -332,6 +478,10 @@ impl ModelUsageRepository for PostgresPersistence {
             Some(http_status),
         )
         .await
+    }
+
+    async fn settle_pre_egress_not_billed(&self, account_id: &str, event_id: &str) -> Result<()> {
+        settle_simple_outcome(self, account_id, event_id, "not_billed", "delivered", None).await
     }
 
     async fn pending_events(
@@ -709,5 +859,82 @@ impl ModelUsageRepository for PostgresPersistence {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_attempt_ids_are_unique_without_weakening_the_request_commitment() {
+        let request = invocation_fingerprint(
+            "account",
+            VertexOperation::EpisodeReconciliation,
+            "gemini-model",
+            "us-central1",
+            &[0x51; 32],
+        );
+        let replay = invocation_fingerprint(
+            "account",
+            VertexOperation::EpisodeReconciliation,
+            "gemini-model",
+            "us-central1",
+            &[0x51; 32],
+        );
+        assert_eq!(request, replay);
+
+        let first = vertex_attempt_event_id(&[0; 32]);
+        let first_replay = vertex_attempt_event_id(&[0; 32]);
+        let confirmed_retry = vertex_attempt_event_id(&[1; 32]);
+        assert_eq!(first, first_replay, "a lost owner must replay its fence");
+        assert_ne!(
+            first, confirmed_retry,
+            "an intentional retry needs a distinct billable event"
+        );
+        assert_eq!(first.len(), 68);
+        assert_eq!(confirmed_retry.len(), 68);
+
+        let changed_request = invocation_fingerprint(
+            "account",
+            VertexOperation::EpisodeReconciliation,
+            "gemini-model",
+            "us-central1",
+            &[0x52; 32],
+        );
+        assert_ne!(request, changed_request);
+        assert_eq!(
+            vertex_attempt_event_id(&[0; 32]),
+            first,
+            "changed request bytes must hit the same attempt row and be rejected by its fingerprint"
+        );
+    }
+
+    #[test]
+    fn only_a_confirmed_not_billed_replay_can_advance_to_a_retry() {
+        assert_eq!(
+            replay_admission("not_billed").unwrap(),
+            VertexInvocationAdmission::ConfirmedNotBilled
+        );
+        for outcome in ["started", "metered", "usage_missing", "ambiguous"] {
+            assert_eq!(
+                replay_admission(outcome).unwrap(),
+                VertexInvocationAdmission::AmbiguousTerminal,
+                "{outcome} cannot authorize a duplicate send"
+            );
+        }
+        assert!(replay_admission("future_unknown_outcome").is_err());
+    }
+
+    #[test]
+    fn late_settlement_requires_exact_terminal_metadata() {
+        let adapter = include_str!("model_usage.rs");
+        assert!(adapter.contains("outcome=$3 AND delivery_state=$4"));
+        assert!(adapter.contains("already has a different terminal outcome"));
+        assert!(adapter.contains("returned_model IS NOT DISTINCT FROM $4"));
+        assert!(adapter.contains("total_tokens IS NOT DISTINCT FROM $16"));
+        assert!(adapter.contains("already has different response metadata"));
+        assert!(adapter.contains("SET outcome='ambiguous'"));
+        assert!(adapter.contains("WHERE account_id=$1 AND event_id=$2 AND outcome='started'"));
     }
 }

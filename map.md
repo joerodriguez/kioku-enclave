@@ -25,6 +25,18 @@ serving members verify the required schema unconditionally and expose no schema-
 compare-and-set settlement make worker effects safe across replicas. Readiness checks PostgreSQL
 schema and shared TLS state, while liveness remains process-local for safe replacement.
 
+Memory reconciliation has a forward-only PostgreSQL activation state machine. The standard
+activation-capable image is dormant in `Installed`; signed `Draining` attaches database guards and
+completes bounded
+source/claim ledgers; `Active` enables repository-authorized egress; `Paused` stops egress without
+restoring legacy finalization. Immutable image evidence binds the exact
+model/location/compiled producer contract, and readiness refuses an incompatible rollback once
+draining begins. A shared/exclusive transaction advisory lock makes activation absence probes atomic
+with v27 installation and transitions; revision-bound formation pages and independently verified
+providerless neighborhood scans keep dense sessions/components live without truncating evidence.
+One normal signed release image performs install/backfill and then rolls homogeneously while the
+database remains `Installed`; there is no tag split, local writer switch, or alternate binary.
+
 Media ciphertext uses per-user KMS-wrapped keys and authenticated context binding its account,
 purpose, logical object, and exact GCS generation. Structured export reports PostgreSQL rows and
 media inventory metadata but not GCS bytes; deletion uses that authority to remove exact owned
@@ -59,6 +71,10 @@ write, or SQLite reference implementation.
   alternate backend, prove concurrency, type, search, deletion, and restart behavior.
 - Provider calls occur only after durable admission/claim. Stale owners cannot settle; ambiguous
   outcomes are not resent automatically; deletion fences future disclosure.
+- Memory reconciliation additionally holds the activation database fence across final source
+  revalidation, provider use, and durable staging. Sticky explicit/100-percent scope, source-seal
+  generations, formation fingerprints, deletion tombstones, and phase-aware database triggers
+  prevent pause, deletion, or an old process from reopening a legacy topology lane.
 - Export returns selected current PostgreSQL rows and media metadata, not media bytes; byte-complete
   export remains an activation blocker. Deletion first commits a recoverable local admission
   tombstone, settles usage and the one-way billing fence, then erases PostgreSQL rows plus exact

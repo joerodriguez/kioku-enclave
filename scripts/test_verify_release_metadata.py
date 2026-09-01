@@ -22,7 +22,7 @@ DIGEST = "sha256:" + "b" * 64
 
 def metadata() -> dict[str, object]:
     return {
-        "schema_version": 11,
+        "schema_version": 12,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": TAG,
         "source_commit": COMMIT,
@@ -33,6 +33,9 @@ def metadata() -> dict[str, object]:
         "build_profile": "production",
         "voice_quality_gate": "owner_only_unvalidated",
         "billing_enforcement_mode": "shadow",
+        "vertex_reconciliation_model": "gemini-reconciliation-v1",
+        "vertex_location": "us-central1",
+        "reconciliation_producer_contract_sha256": "sha256:" + "c" * 64,
         "gcs_media_bucket": "kioku-production-media",
         "kms_project": "kioku-joerodriguez",
         "kms_location": "us-central1",
@@ -58,6 +61,9 @@ def arguments() -> argparse.Namespace:
         expected_kms_location="us-central1",
         expected_kms_key_ring="kioku-production",
         expected_kms_key="production-kek",
+        expected_vertex_reconciliation_model="gemini-reconciliation-v1",
+        expected_vertex_location="us-central1",
+        expected_reconciliation_producer_contract_sha256="sha256:" + "c" * 64,
     )
 
 
@@ -71,11 +77,40 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(verifier.parse_metadata_bytes(encoded), document)
 
     def test_legacy_schemas_and_authority_fields_are_ineligible(self) -> None:
-        for schema in (4, 7, 8, 9, 10):
+        for schema in (4, 7, 8, 9, 10, 11):
             document = metadata()
             document["schema_version"] = schema
-            with self.assertRaisesRegex(SystemExit, "schema_version must be 11"):
+            with self.assertRaisesRegex(SystemExit, "schema_version must be 12"):
                 verifier.validate_shape(document)
+
+    def test_frozen_v0_9_16_state_shape_cannot_follow_current_schema_growth(self) -> None:
+        document = metadata()
+        document["schema_version"] = 11
+        document["source_ref"] = "v0.9.16"
+        document["image_uri"] = f"{IMAGE_REPOSITORY}:v0.9.16"
+        document["release_url"] = (
+            "https://github.com/owner/repository/releases/tag/v0.9.16"
+        )
+        for field in (
+            "vertex_reconciliation_model",
+            "vertex_location",
+            "reconciliation_producer_contract_sha256",
+        ):
+            document.pop(field)
+        encoded = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        parsed = verifier.parse_frozen_v0_9_16_metadata_bytes(encoded)
+        frozen_arguments = arguments()
+        frozen_arguments.tag = "v0.9.16"
+        verifier.validate_frozen_v0_9_16_state(frozen_arguments, parsed)
+
+        document["future_schema_field"] = "must-not-expand-frozen-v11"
+        changed = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        with self.assertRaisesRegex(SystemExit, "missing or unexpected"):
+            verifier.parse_frozen_v0_9_16_metadata_bytes(changed)
         for extra in (
             "gcs_bucket",
             "gcs_legacy_media_bucket",
@@ -117,6 +152,24 @@ class ReleaseMetadataTests(unittest.TestCase):
                 document[field] = value
                 with self.assertRaisesRegex(SystemExit, "reviewed serving invariant"):
                     verifier.validate(arguments(), document)
+
+    def test_reconciliation_image_identity_is_exact_and_typed(self) -> None:
+        mutations = {
+            "vertex_reconciliation_model": "",
+            "vertex_location": "US-CENTRAL1",
+            "reconciliation_producer_contract_sha256": "sha256:" + "D" * 64,
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                document = metadata()
+                document[field] = value
+                with self.assertRaises(SystemExit):
+                    verifier.validate(arguments(), document)
+
+        document = metadata()
+        document["memory_reconciliation_writer_enabled"] = False
+        with self.assertRaisesRegex(SystemExit, "missing or unexpected"):
+            verifier.validate_shape(document)
 
     def test_duplicate_noncanonical_and_control_string_documents_fail(self) -> None:
         document = metadata()

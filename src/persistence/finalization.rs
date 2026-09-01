@@ -121,11 +121,19 @@ pub(crate) enum FinalizationRequest {
 pub(crate) struct FinalizationClaimRequest<'a> {
     pub(crate) account_id: &'a str,
     pub(crate) target_episode_id: Option<i64>,
-    pub(crate) now: &'a str,
-    pub(crate) horizon_before: &'a str,
+    /// Database-relative quiet period required before an episode may be
+    /// claimed. PostgreSQL derives the cutoff from `clock_timestamp()` after
+    /// acquiring the activation fence; callers never supply scheduling time.
+    pub(crate) quiet_horizon_seconds: i64,
     pub(crate) finalization_version: i64,
     pub(crate) lease_seconds: i64,
-    pub(crate) require_reconciled: bool,
+}
+
+/// Database-backed fence held from the last authoritative finalization-claim
+/// check through provider egress and durable usage settlement.
+#[async_trait]
+pub(crate) trait FinalizationEgressGuard: Send {
+    async fn release(self: Box<Self>) -> Result<()>;
 }
 
 #[async_trait]
@@ -138,7 +146,6 @@ pub(crate) trait FinalizationRepository: Send + Sync {
         account_id: &str,
         episode_id: i64,
         finalization_version: i64,
-        require_reconciled: bool,
     ) -> Result<FinalizationRequest>;
 
     async fn claim_finalization(
@@ -146,13 +153,17 @@ pub(crate) trait FinalizationRepository: Send + Sync {
         request: FinalizationClaimRequest<'_>,
     ) -> Result<Option<FinalizationClaim>>;
 
+    async fn acquire_finalization_egress_guard(
+        &self,
+        claim: &FinalizationClaim,
+    ) -> Result<Option<Box<dyn FinalizationEgressGuard>>>;
+
     async fn defer_finalization(
         &self,
         claim: &FinalizationClaim,
         status: &str,
         error_code: Option<&str>,
-        retry_at: Option<&str>,
-        deferred_at: &str,
+        retry_delay_seconds: Option<i64>,
         count_attempt: bool,
     ) -> Result<()>;
 

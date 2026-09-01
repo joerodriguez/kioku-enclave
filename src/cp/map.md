@@ -33,10 +33,10 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `playback.rs` | Owner-authorized recording timeline, JavaScript-exact revision projection, owner-source display, exact encrypted-segment serving, and numeric-cursor pages of memories attributed to an exact identified person ID. |
 | `push.rs` | APNs installation/handoff routes and PostgreSQL-claimed content-free ready notifications with credential-generation fences and no-resend ambiguity. |
 | `query.rs` | REST/MCP query surfaces, including additive cross-modal REST search over memories, final briefs, transcripts, and screenshots with stable memory/person navigation; episodes, feed, people, browser evidence, screenshots, webhooks, and durable episode-deletion initiation/status behavior. |
-| `reconciler.rs` | Pure settled-memory partition planner plus PostgreSQL-claimed worker orchestration. It validates one exhaustive bounded partition, reuses durable staged model results, preserves exact one-to-one IDs, and remains writer-disabled until explicitly qualified. |
+| `reconciler.rs` | Pure settled-memory partition planner plus PostgreSQL-claimed worker orchestration. It validates one exhaustive bounded partition, reuses durable staged model results, advances oversized connected components through bounded providerless verified scans, preserves exact one-to-one IDs, and obtains all runtime authority from the durable activation phase. |
 | `retention.rs` | Recording-retention preview/CAS, key epochs, downgrade reconciliation, and durable-recording policy routes. |
 | `screen_understanding.rs` | Bounded screen/storyboard result validation and projection. |
-| `summarizer.rs` | PostgreSQL-claimed incremental memory formation, bounded Vertex summarization, in-enclave embedding of the complete memory/final-brief human projection, and cursor settlement. Recurring and session-settled passes traverse only proven-empty sparse-history windows and stop at the first outcome that may have invoked the model; queued duplicate hints coalesce without suppressing a later media-complete edge. |
+| `summarizer.rs` | PostgreSQL-claimed incremental memory formation, including a cursor-behind exact-session revision lane for late/offline evidence, durable bounded evidence pages with frozen provider requests and stable no-resend attempt identities, zero-provider accounted/no-memory settlement, in-enclave embedding of the complete memory/final-brief human projection, and cursor settlement. Recurring passes traverse only proven-empty sparse-history windows and stop at the first outcome that may have invoked the model; queued duplicate hints coalesce without suppressing a later media-complete edge. |
 | `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes with deletion-owned outbound-claim recovery and a durable pre-billing-fence admission phase. |
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
 | `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas, content-free usage metadata, and explicit model routing for separately qualified reconciliation. |
@@ -51,7 +51,13 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 ## Worker and API invariants
 
 - Claim acquisition, expiry takeover, cancellation, and settlement use database time and exact
-  compare-and-set predecessors; no database lock is held across provider I/O.
+  compare-and-set predecessors. Ordinary providers hold no database lock across I/O; reconciliation
+  deliberately holds its activation/account/source guard transaction through the provider call and
+  durable stage so a concurrent pause or source mutation cannot overtake authorized disclosure.
+- Finalization durably admits usage before its last database egress check, then holds the
+  activation/account/episode guard through HTTP and terminal usage. Draining may revoke the claim
+  before later parsing and settlement, intentionally discarding that terminal result rather than
+  permitting a stale draft to settle or send again.
 - Account/destination deletion prevents new disclosure, conflicts with a currently frozen send,
   and cannot be bypassed by a stale worker.
 - Query absence remains distinguishable from PostgreSQL/provider unavailability and malformed

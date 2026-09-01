@@ -122,11 +122,49 @@ pub(crate) fn merge_visual_evidence(
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+fn source_key_delivery_complete_default() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EpisodePurge {
     pub deleted_utterances: usize,
     pub deleted_screenshots: usize,
     pub deleted_segments: usize,
     pub utterance_source_keys: Vec<String>,
     pub screenshot_source_keys: Vec<String>,
+    #[serde(default)]
+    pub source_key_cursor: Option<String>,
+    #[serde(default = "source_key_delivery_complete_default")]
+    pub source_key_delivery_complete: bool,
+}
+
+impl Default for EpisodePurge {
+    fn default() -> Self {
+        Self {
+            deleted_utterances: 0,
+            deleted_screenshots: 0,
+            deleted_segments: 0,
+            utterance_source_keys: Vec::new(),
+            screenshot_source_keys: Vec::new(),
+            source_key_cursor: None,
+            source_key_delivery_complete: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EpisodePurge;
+
+    #[test]
+    fn legacy_terminal_purge_defaults_to_completed_source_key_delivery() {
+        let purge: EpisodePurge = serde_json::from_str(
+            r#"{"deleted_utterances":1,"deleted_screenshots":2,"deleted_segments":1,
+                "utterance_source_keys":["u"],"screenshot_source_keys":["s"]}"#,
+        )
+        .expect("legacy purge JSON");
+        assert!(purge.source_key_delivery_complete);
+        assert!(purge.source_key_cursor.is_none());
+    }
 }

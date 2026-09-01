@@ -19,7 +19,10 @@ use crate::{
     },
 };
 
-use super::{advisory_transaction_lock, PostgresPersistence};
+use super::{
+    activation::lock_activation_contract_key_share_if_installed, advisory_transaction_lock,
+    PostgresPersistence,
+};
 
 fn timestamp(value: &str, field: &str) -> Result<i64> {
     isotime::parse_epoch_millis(value).ok_or_else(|| {
@@ -32,6 +35,241 @@ fn disposition(value: MediaDisposition) -> &'static str {
         MediaDisposition::Canonical => "canonical",
         MediaDisposition::Reference => "reference",
     }
+}
+
+fn stream_kind(value: media::StreamKind) -> &'static str {
+    match value {
+        media::StreamKind::Mic => "mic",
+        media::StreamKind::SystemAudio => "system_audio",
+        media::StreamKind::MacScreen => "mac_screen",
+        media::StreamKind::IosMic => "ios_mic",
+        media::StreamKind::IosImportedScreenshot => "ios_imported_screenshot",
+        media::StreamKind::IosSharedPage => "ios_shared_page",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamAdmission {
+    Open,
+    ProvisionalFinish,
+    SealedGapFill,
+    LateSealReopen,
+}
+
+fn stream_admission(
+    session_ended: bool,
+    provisional_finish_authorized: bool,
+    late_seal_reopen_authorized: bool,
+    sealed_sequence: Option<i64>,
+    sequence: i64,
+    session_finished: bool,
+) -> Result<StreamAdmission> {
+    if !session_ended {
+        if sealed_sequence.is_some() {
+            return Err(EnclaveError::Store(
+                "open capture session contains a sealed stream".into(),
+            ));
+        }
+        return Ok(StreamAdmission::Open);
+    }
+    let Some(sealed_sequence) = sealed_sequence else {
+        if provisional_finish_authorized {
+            return Ok(StreamAdmission::ProvisionalFinish);
+        }
+        return Err(EnclaveError::Conflict(
+            "ended capture session has no authorized provisional finish request".into(),
+        ));
+    };
+    if sequence > sealed_sequence && late_seal_reopen_authorized {
+        return Ok(StreamAdmission::LateSealReopen);
+    }
+    if session_finished || sequence > sealed_sequence {
+        return Err(EnclaveError::Conflict(
+            "capture event exceeds the sealed stream boundary".into(),
+        ));
+    }
+    Ok(StreamAdmission::SealedGapFill)
+}
+
+#[derive(Debug)]
+struct SealReopen {
+    generation: i64,
+    sealed_stream_count: usize,
+}
+
+async fn capture_formation_contract_installed(connection: &mut sqlx::PgConnection) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('capture_formation_receipts') IS NOT NULL")
+            .fetch_one(connection)
+            .await?,
+    )
+}
+
+fn provisional_finish_state_authorized(
+    phase: Option<&str>,
+    receipt_exists: bool,
+    finish_requested: bool,
+    seal_finalized: bool,
+) -> bool {
+    !seal_finalized
+        && (phase == Some("installed")
+            || finish_requested
+            || (receipt_exists && matches!(phase, Some("draining" | "active" | "paused"))))
+}
+
+/// Schema 26 has no durable finish-request companion, so an ended session
+/// with no seals remains provisionally writable during the dark binary-first
+/// rollout. The v27 `installed` phase preserves that mixed-fleet behavior for
+/// old Mac 0.8.42's trailing screenshot. Once predecessor drain begins,
+/// historical `ended_at` is trusted finish intent. An existing unfinalized
+/// receipt therefore remains provisionally writable across the signed
+/// transition even before the bounded recurring importer has copied
+/// `ended_at` into `finish_requested_at`; otherwise a legitimate offline
+/// outbox item can race the importer and receive a 409.
+async fn provisional_finish_authorized(
+    connection: &mut sqlx::PgConnection,
+    account_id: &str,
+    capture_session_id: &str,
+) -> Result<bool> {
+    if !capture_formation_contract_installed(connection).await? {
+        return Ok(true);
+    }
+    let state = sqlx::query(
+        "SELECT (SELECT phase FROM persistence_feature_activation_events \
+                   WHERE feature='episode_topology_reconciliation' \
+                   ORDER BY generation DESC LIMIT 1) AS phase, \
+                receipt.account_id IS NOT NULL AS receipt_exists, \
+                receipt.finish_requested_at IS NOT NULL AS finish_requested, \
+                receipt.seal_finalized_at IS NOT NULL AS seal_finalized \
+           FROM (VALUES(1)) singleton(value) \
+           LEFT JOIN capture_formation_receipts receipt \
+             ON receipt.account_id=$1 AND receipt.capture_session_id=$2",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_one(connection)
+    .await?;
+    Ok(provisional_finish_state_authorized(
+        state.try_get::<Option<String>, _>("phase")?.as_deref(),
+        state.try_get("receipt_exists")?,
+        state.try_get("finish_requested")?,
+        state.try_get("seal_finalized")?,
+    ))
+}
+
+/// Return the append-only proof for the currently finalized seal. A non-null
+/// stream boundary without this receipt/event pair is legacy or inconsistent
+/// state and must not be reopened by the activation-capable writer.
+async fn current_finalized_seal(
+    connection: &mut sqlx::PgConnection,
+    account_id: &str,
+    capture_session_id: &str,
+) -> Result<Option<SealReopen>> {
+    if !capture_formation_contract_installed(connection).await? {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT receipt.seal_generation \
+           FROM capture_formation_receipts receipt \
+           JOIN capture_formation_seal_events event \
+             ON event.account_id=receipt.account_id \
+            AND event.capture_session_id=receipt.capture_session_id \
+            AND event.seal_generation=receipt.seal_generation \
+            AND event.event_kind='seal' \
+          WHERE receipt.account_id=$1 AND receipt.capture_session_id=$2 \
+            AND receipt.seal_finalized_at IS NOT NULL \
+            AND receipt.seal_generation>=1 \
+            AND event.stream_maxima_sha256= \
+                capture_formation_stream_maxima_sha256(receipt.account_id, \
+                                                       receipt.capture_session_id) \
+            AND NOT EXISTS(SELECT 1 FROM capture_formation_seal_events reopen \
+                 WHERE reopen.account_id=receipt.account_id \
+                   AND reopen.capture_session_id=receipt.capture_session_id \
+                   AND reopen.seal_generation=receipt.seal_generation \
+                   AND reopen.event_kind='reopen')",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .fetch_optional(connection)
+    .await?;
+    row.map(|row| {
+        Ok(SealReopen {
+            generation: row.try_get("seal_generation")?,
+            sealed_stream_count: 0,
+        })
+    })
+    .transpose()
+}
+
+async fn validate_new_event_admission(
+    connection: &mut sqlx::PgConnection,
+    account_id: &str,
+    manifest: &CaptureEventManifest,
+) -> Result<()> {
+    let session = sqlx::query(
+        "SELECT device_id,install_id,ended_at IS NOT NULL AS ended \
+           FROM capture_sessions WHERE account_id=$1 AND id=$2",
+    )
+    .bind(account_id)
+    .bind(&manifest.capture_session_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(session) = session else {
+        return Ok(());
+    };
+    if session.try_get::<String, _>("device_id")? != manifest.device_id
+        || session.try_get::<String, _>("install_id")? != manifest.install_id
+    {
+        return Err(EnclaveError::Conflict(
+            "capture session ID was reused across devices or installs".into(),
+        ));
+    }
+    let ended: bool = session.try_get("ended")?;
+    let provisional_finish_authorized = if ended {
+        provisional_finish_authorized(connection, account_id, &manifest.capture_session_id).await?
+    } else {
+        false
+    };
+    let late_seal_reopen_authorized = if ended {
+        current_finalized_seal(connection, account_id, &manifest.capture_session_id)
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+    let stream = sqlx::query(
+        "SELECT capture_session_id,device_id,stream_kind,sealed_sequence \
+           FROM capture_streams WHERE account_id=$1 AND id=$2",
+    )
+    .bind(account_id)
+    .bind(&manifest.stream_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(stream) = stream else {
+        if ended && !provisional_finish_authorized && !late_seal_reopen_authorized {
+            return Err(EnclaveError::Conflict(
+                "ended capture session does not admit a new stream".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if stream.try_get::<String, _>("capture_session_id")? != manifest.capture_session_id
+        || stream.try_get::<String, _>("device_id")? != manifest.device_id
+        || stream.try_get::<String, _>("stream_kind")? != stream_kind(manifest.stream_kind)
+    {
+        return Err(EnclaveError::Conflict(
+            "capture stream ID was reused with a different scope".into(),
+        ));
+    }
+    stream_admission(
+        ended,
+        provisional_finish_authorized,
+        late_seal_reopen_authorized,
+        stream.try_get("sealed_sequence")?,
+        manifest.sequence,
+        manifest.session_finished.unwrap_or(false),
+    )?;
+    Ok(())
 }
 
 async fn require_active_account(
@@ -68,6 +306,19 @@ async fn stream_ack(
     .ok_or(EnclaveError::NotFound)
 }
 
+fn exact_deleted_event_replay(
+    stored_stream_id: &str,
+    stored_sequence: i64,
+    stored_manifest_digest: &str,
+    replay_stream_id: &str,
+    replay_sequence: i64,
+    replay_manifest_digest: &str,
+) -> bool {
+    stored_stream_id == replay_stream_id
+        && stored_sequence == replay_sequence
+        && stored_manifest_digest == replay_manifest_digest
+}
+
 async fn preflight(
     connection: &mut sqlx::PgConnection,
     account_id: &str,
@@ -86,6 +337,45 @@ async fn preflight(
     .fetch_optional(&mut *connection)
     .await?;
     let Some(row) = row else {
+        let deleted = if capture_formation_contract_installed(connection).await? {
+            sqlx::query(
+                "SELECT stream_id,sequence,original_manifest_digest \
+                   FROM capture_formation_deleted_sequences \
+                  WHERE account_id=$1 AND event_id=$2",
+            )
+            .bind(account_id)
+            .bind(&manifest.event_id)
+            .fetch_optional(&mut *connection)
+            .await?
+        } else {
+            None
+        };
+        if let Some(deleted) = deleted {
+            let stored_stream_id: String = deleted.try_get("stream_id")?;
+            let stored_sequence: i64 = deleted.try_get("sequence")?;
+            let stored_manifest_digest: String = deleted.try_get("original_manifest_digest")?;
+            if !exact_deleted_event_replay(
+                &stored_stream_id,
+                stored_sequence,
+                &stored_manifest_digest,
+                &manifest.stream_id,
+                manifest.sequence,
+                manifest_digest,
+            ) {
+                return Err(EnclaveError::Conflict(
+                    "idempotency conflict for erased capture event".into(),
+                ));
+            }
+            return Ok(CapturePreflight::Duplicate {
+                committed_through_sequence: stream_ack(
+                    &mut *connection,
+                    account_id,
+                    &stored_stream_id,
+                )
+                .await?,
+            });
+        }
+        validate_new_event_admission(connection, account_id, manifest).await?;
         return Ok(CapturePreflight::New);
     };
     let existing_digest: String = row.try_get("manifest_digest")?;
@@ -124,84 +414,361 @@ async fn upsert_session_and_stream(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     manifest: &CaptureEventManifest,
-    committed_at_ms: i64,
-) -> Result<()> {
+) -> Result<Option<SealReopen>> {
     let started_at_ms = timestamp(&manifest.started_at, "started_at")?;
     let ended_at_ms = timestamp(&manifest.ended_at, "ended_at")?;
-    let row = sqlx::query(
-        "INSERT INTO capture_sessions \
-         (account_id,id,device_id,install_id,started_at,last_event_at,schema_version,ended_at,created_at) \
-         VALUES ($1,$2,$3,$4,to_timestamp($5::double precision/1000.0), \
-                 to_timestamp($6::double precision/1000.0),2, \
-                 CASE WHEN $7 THEN to_timestamp($6::double precision/1000.0) ELSE NULL END, \
-                 to_timestamp($8::double precision/1000.0)) \
-         ON CONFLICT (account_id,id) DO UPDATE SET \
-             last_event_at=GREATEST(capture_sessions.last_event_at,excluded.last_event_at), \
-             ended_at=CASE WHEN $7 THEN COALESCE(capture_sessions.ended_at,excluded.ended_at) \
-                           ELSE capture_sessions.ended_at END \
-         WHERE capture_sessions.device_id=excluded.device_id \
-           AND capture_sessions.install_id=excluded.install_id \
-         RETURNING device_id,install_id",
+    let session = sqlx::query(
+        "SELECT device_id,install_id,ended_at IS NOT NULL AS ended \
+           FROM capture_sessions WHERE account_id=$1 AND id=$2 FOR UPDATE",
     )
     .bind(account_id)
     .bind(&manifest.capture_session_id)
-    .bind(&manifest.device_id)
-    .bind(&manifest.install_id)
-    .bind(started_at_ms)
-    .bind(ended_at_ms)
-    .bind(manifest.session_finished.unwrap_or(false))
-    .bind(committed_at_ms)
     .fetch_optional(&mut **transaction)
     .await?;
-    if row.is_none() {
-        return Err(EnclaveError::Conflict(
-            "capture session ID was reused across devices or installs".into(),
+    let session_ended = if let Some(session) = session {
+        if session.try_get::<String, _>("device_id")? != manifest.device_id
+            || session.try_get::<String, _>("install_id")? != manifest.install_id
+        {
+            return Err(EnclaveError::Conflict(
+                "capture session ID was reused across devices or installs".into(),
+            ));
+        }
+        let ended = session.try_get("ended")?;
+        sqlx::query(
+            "UPDATE capture_sessions SET last_event_at=greatest(last_event_at, \
+                    to_timestamp($3::double precision/1000.0)) \
+              WHERE account_id=$1 AND id=$2",
+        )
+        .bind(account_id)
+        .bind(&manifest.capture_session_id)
+        .bind(ended_at_ms)
+        .execute(&mut **transaction)
+        .await?;
+        ended
+    } else {
+        sqlx::query(
+            "INSERT INTO capture_sessions \
+             (account_id,id,device_id,install_id,started_at,last_event_at,schema_version,created_at) \
+             VALUES ($1,$2,$3,$4,to_timestamp($5::double precision/1000.0), \
+                     to_timestamp($6::double precision/1000.0),2,clock_timestamp())",
+        )
+        .bind(account_id)
+        .bind(&manifest.capture_session_id)
+        .bind(&manifest.device_id)
+        .bind(&manifest.install_id)
+        .bind(started_at_ms)
+        .bind(ended_at_ms)
+        .execute(&mut **transaction)
+        .await?;
+        false
+    };
+
+    let provisional_finish_authorized = if session_ended {
+        provisional_finish_authorized(transaction, account_id, &manifest.capture_session_id).await?
+    } else {
+        false
+    };
+    let finalized_seal = if session_ended {
+        current_finalized_seal(transaction, account_id, &manifest.capture_session_id).await?
+    } else {
+        None
+    };
+    let stream = sqlx::query(
+        "SELECT capture_session_id,device_id,stream_kind,sealed_sequence \
+           FROM capture_streams WHERE account_id=$1 AND id=$2 FOR UPDATE",
+    )
+    .bind(account_id)
+    .bind(&manifest.stream_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let stream_exists = stream.is_some();
+    let sealed_sequence = if let Some(stream) = stream.as_ref() {
+        if stream.try_get::<String, _>("capture_session_id")? != manifest.capture_session_id
+            || stream.try_get::<String, _>("device_id")? != manifest.device_id
+            || stream.try_get::<String, _>("stream_kind")? != stream_kind(manifest.stream_kind)
+        {
+            return Err(EnclaveError::Conflict(
+                "capture stream ID was reused with a different scope".into(),
+            ));
+        }
+        stream.try_get("sealed_sequence")?
+    } else {
+        if session_ended && !provisional_finish_authorized && finalized_seal.is_none() {
+            return Err(EnclaveError::Conflict(
+                "ended capture session does not admit a new stream".into(),
+            ));
+        }
+        None
+    };
+    let admission = if !stream_exists && session_ended && finalized_seal.is_some() {
+        StreamAdmission::LateSealReopen
+    } else {
+        stream_admission(
+            session_ended,
+            provisional_finish_authorized,
+            finalized_seal.is_some(),
+            sealed_sequence,
+            manifest.sequence,
+            manifest.session_finished.unwrap_or(false),
+        )?
+    };
+
+    let seal_reopen = if admission == StreamAdmission::LateSealReopen {
+        let finalized_seal = finalized_seal.ok_or_else(|| {
+            EnclaveError::Conflict("capture seal reopen lost its audit authority".into())
+        })?;
+        let sealed_streams = sqlx::query(
+            "SELECT stream.id,stream.sealed_sequence,stream.committed_through_sequence, \
+                    capture_formation_stream_accepted_max(stream.account_id,stream.id) \
+                        AS maximum_sequence, \
+                    capture_formation_stream_contiguous_through(stream.account_id,stream.id) \
+                        AS contiguous_through \
+               FROM capture_streams stream \
+              WHERE stream.account_id=$1 AND stream.capture_session_id=$2 \
+              ORDER BY stream.id FOR UPDATE",
+        )
+        .bind(account_id)
+        .bind(&manifest.capture_session_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        if sealed_streams.is_empty()
+            || sealed_streams.iter().any(|stream| {
+                let sealed = stream.try_get::<Option<i64>, _>("sealed_sequence");
+                let committed = stream.try_get::<i64, _>("committed_through_sequence");
+                let maximum = stream.try_get::<Option<i64>, _>("maximum_sequence");
+                let contiguous = stream.try_get::<Option<i64>, _>("contiguous_through");
+                !matches!((sealed, committed, maximum, contiguous),
+                    (Ok(Some(sealed)), Ok(committed), Ok(Some(maximum)), Ok(Some(contiguous)))
+                        if sealed == committed && sealed == maximum && sealed == contiguous)
+            })
+        {
+            return Err(EnclaveError::Conflict(
+                "capture seal reopen found an inexact current stream boundary".into(),
+            ));
+        }
+        Some(SealReopen {
+            generation: finalized_seal.generation,
+            sealed_stream_count: sealed_streams.len(),
+        })
+    } else {
+        None
+    };
+
+    if !stream_exists {
+        sqlx::query(
+            "INSERT INTO capture_streams \
+             (account_id,id,capture_session_id,device_id,stream_kind,created_at) \
+             VALUES ($1,$2,$3,$4,$5,clock_timestamp())",
+        )
+        .bind(account_id)
+        .bind(&manifest.stream_id)
+        .bind(&manifest.capture_session_id)
+        .bind(&manifest.device_id)
+        .bind(stream_kind(manifest.stream_kind))
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(seal_reopen)
+}
+
+async fn record_provisional_finish(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    capture_session_id: &str,
+    ended_at_ms: Option<i64>,
+    provenance: &str,
+) -> Result<()> {
+    if !matches!(
+        provenance,
+        "event_finish_v1" | "finish_endpoint_v1" | "legacy_client_refinish_v1"
+    ) {
+        return Err(EnclaveError::Store(
+            "capture finish provenance is invalid".into(),
         ));
     }
-
-    sqlx::query(
-        "INSERT INTO capture_streams \
-         (account_id,id,capture_session_id,device_id,stream_kind,created_at) \
-         VALUES ($1,$2,$3,$4,$5,to_timestamp($6::double precision/1000.0)) \
-         ON CONFLICT (account_id,id) DO NOTHING",
+    let has_stream = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM capture_streams \
+          WHERE account_id=$1 AND capture_session_id=$2)",
     )
     .bind(account_id)
-    .bind(&manifest.stream_id)
-    .bind(&manifest.capture_session_id)
-    .bind(&manifest.device_id)
-    .bind(match manifest.stream_kind {
-        media::StreamKind::Mic => "mic",
-        media::StreamKind::SystemAudio => "system_audio",
-        media::StreamKind::MacScreen => "mac_screen",
-        media::StreamKind::IosMic => "ios_mic",
-        media::StreamKind::IosImportedScreenshot => "ios_imported_screenshot",
-        media::StreamKind::IosSharedPage => "ios_shared_page",
-    })
-    .bind(committed_at_ms)
-    .execute(&mut **transaction)
-    .await?;
-    let scope = sqlx::query(
-        "SELECT capture_session_id,device_id,stream_kind FROM capture_streams \
-         WHERE account_id=$1 AND id=$2",
-    )
-    .bind(account_id)
-    .bind(&manifest.stream_id)
+    .bind(capture_session_id)
     .fetch_one(&mut **transaction)
     .await?;
-    let expected_kind = match manifest.stream_kind {
-        media::StreamKind::Mic => "mic",
-        media::StreamKind::SystemAudio => "system_audio",
-        media::StreamKind::MacScreen => "mac_screen",
-        media::StreamKind::IosMic => "ios_mic",
-        media::StreamKind::IosImportedScreenshot => "ios_imported_screenshot",
-        media::StreamKind::IosSharedPage => "ios_shared_page",
-    };
-    if scope.try_get::<String, _>("capture_session_id")? != manifest.capture_session_id
-        || scope.try_get::<String, _>("device_id")? != manifest.device_id
-        || scope.try_get::<String, _>("stream_kind")? != expected_kind
-    {
+    if !has_stream {
+        return Err(EnclaveError::Store(
+            "capture session cannot finish without streams".into(),
+        ));
+    }
+    let changed = sqlx::query(
+        "UPDATE capture_sessions SET ended_at=coalesce(ended_at,CASE WHEN $3::bigint IS NULL \
+                    THEN clock_timestamp() ELSE to_timestamp($3::double precision/1000.0) END) \
+          WHERE account_id=$1 AND id=$2",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .bind(ended_at_ms)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(EnclaveError::NotFound);
+    }
+    if !capture_formation_contract_installed(transaction).await? {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO capture_formation_receipts( \
+             account_id,capture_session_id,source_revision,completed_revision,state, \
+             finish_requested_at,finish_request_provenance,updated_at) \
+         SELECT $1,$2,1,0,'pending', \
+                CASE WHEN $3='legacy_client_refinish_v1' THEN session.ended_at \
+                     ELSE clock_timestamp() END,$3,clock_timestamp() \
+           FROM capture_sessions session \
+          WHERE session.account_id=$1 AND session.id=$2 AND session.ended_at IS NOT NULL \
+         ON CONFLICT(account_id,capture_session_id) DO UPDATE SET \
+             finish_requested_at=coalesce(capture_formation_receipts.finish_requested_at, \
+                                          excluded.finish_requested_at), \
+             finish_request_provenance=coalesce(capture_formation_receipts.finish_request_provenance, \
+                                                excluded.finish_request_provenance), \
+             updated_at=clock_timestamp()",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .bind(provenance)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Mark exact capture-session formation work dirty when the additive v27
+/// contract is installed. The activation-capable binary is deployed dark on
+/// schema 26 first, so absence is an intentional no-op covered by the v27
+/// install backfill; once present, every new accepted/materialized source
+/// invalidates any older claim and reopens the session revision. The caller
+/// must already hold the activation contract key-share fence followed by the
+/// account reconciliation advisory lock.
+pub(super) async fn mark_capture_formation_dirty(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    capture_session_ids: &[String],
+) -> Result<()> {
+    let installed = sqlx::query_scalar::<_, bool>(
+        "SELECT to_regclass('capture_formation_receipts') IS NOT NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !installed {
+        return Ok(());
+    }
+    let session_ids = capture_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    for capture_session_id in session_ids {
+        sqlx::query(
+            "INSERT INTO capture_formation_receipts( \
+                 account_id,capture_session_id,source_revision,completed_revision,state,updated_at) \
+             VALUES($1,$2,1,0,'pending',clock_timestamp()) \
+             ON CONFLICT(account_id,capture_session_id) DO UPDATE SET \
+                 source_revision=capture_formation_receipts.source_revision+1,state='pending', \
+                 claimed_revision=NULL,claim_token=NULL,claim_until=NULL,next_attempt_at=NULL, \
+                 claimed_source_fingerprint=NULL,completed_outcome=NULL, \
+                 completed_claim_token=NULL,completed_source_fingerprint=NULL, \
+                 completed_at=NULL,last_error_code=NULL, \
+                 updated_at=clock_timestamp()",
+        )
+        .bind(account_id)
+        .bind(capture_session_id)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE capture_formation_pages page SET state='invalidated',claim_token=NULL, \
+                    claim_until=NULL,provider_request=NULL,provider_request_sha256=NULL, \
+                    staged_response=NULL,staged_response_sha256=NULL, \
+                    staged_vertex_event_id=NULL,last_error_code='source_revision_invalidated', \
+                    updated_at=clock_timestamp() \
+              WHERE page.account_id=$1 AND page.capture_session_id=$2 \
+                AND page.source_revision<(SELECT source_revision FROM capture_formation_receipts \
+                      WHERE account_id=$1 AND capture_session_id=$2) \
+                AND page.state<>'complete'",
+        )
+        .bind(account_id)
+        .bind(capture_session_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    super::memory_formation::invalidate_reconciliation_neighborhood_scan(transaction, account_id)
+        .await?;
+    Ok(())
+}
+
+async fn record_capture_seal_reopen(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    capture_session_id: &str,
+    trigger_event_id: &str,
+    reopen: &SealReopen,
+) -> Result<()> {
+    if reopen.generation < 1 || reopen.sealed_stream_count == 0 {
+        return Err(EnclaveError::Store(
+            "capture seal reopen proof is malformed".into(),
+        ));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO capture_formation_seal_events( \
+             account_id,capture_session_id,seal_generation,source_revision,event_kind, \
+             stream_maxima_sha256,provenance,trigger_event_id,recorded_at) \
+         SELECT receipt.account_id,receipt.capture_session_id,receipt.seal_generation, \
+                receipt.source_revision,'reopen', \
+                capture_formation_stream_maxima_sha256(receipt.account_id, \
+                                                       receipt.capture_session_id), \
+                'late_source_reopen_v1',$4,clock_timestamp() \
+           FROM capture_formation_receipts receipt \
+          WHERE receipt.account_id=$1 AND receipt.capture_session_id=$2 \
+            AND receipt.seal_generation=$3 AND receipt.seal_finalized_at IS NOT NULL",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .bind(reopen.generation)
+    .bind(trigger_event_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if inserted != 1 {
         return Err(EnclaveError::Conflict(
-            "capture stream ID was reused with a different scope".into(),
+            "capture seal reopen lost its append-only audit claim".into(),
+        ));
+    }
+    let cleared = sqlx::query(
+        "UPDATE capture_streams SET sealed_sequence=NULL \
+          WHERE account_id=$1 AND capture_session_id=$2 AND sealed_sequence IS NOT NULL",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if usize::try_from(cleared).ok() != Some(reopen.sealed_stream_count) {
+        return Err(EnclaveError::Conflict(
+            "capture seal reopen did not clear every prior stream boundary".into(),
+        ));
+    }
+    let changed = sqlx::query(
+        "UPDATE capture_formation_receipts \
+            SET seal_finalized_at=NULL,seal_finalization_provenance=NULL, \
+                updated_at=clock_timestamp() \
+          WHERE account_id=$1 AND capture_session_id=$2 \
+            AND seal_generation=$3 AND seal_finalized_at IS NOT NULL",
+    )
+    .bind(account_id)
+    .bind(capture_session_id)
+    .bind(reopen.generation)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "capture seal reopen lost its current receipt".into(),
         ));
     }
     Ok(())
@@ -308,24 +875,55 @@ async fn advance_ack(
     account_id: &str,
     stream_id: &str,
 ) -> Result<i64> {
-    let current = stream_ack(&mut **transaction, account_id, stream_id).await?;
-    let sequences = sqlx::query_scalar::<_, i64>(
-        "SELECT sequence FROM capture_events \
-         WHERE account_id=$1 AND stream_id=$2 AND sequence>$3 ORDER BY sequence",
+    let row = sqlx::query(
+        "SELECT committed_through_sequence,sealed_sequence FROM capture_streams \
+          WHERE account_id=$1 AND id=$2 FOR UPDATE",
     )
     .bind(account_id)
     .bind(stream_id)
-    .bind(current)
-    .fetch_all(&mut **transaction)
-    .await?;
-    let mut advanced = current;
-    for sequence in sequences {
-        if sequence == advanced + 1 {
-            advanced = sequence;
-        } else if sequence > advanced + 1 {
-            break;
-        }
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(EnclaveError::NotFound)?;
+    let current: i64 = row.try_get("committed_through_sequence")?;
+    let sealed_sequence: Option<i64> = row.try_get("sealed_sequence")?;
+    if sealed_sequence.is_some_and(|sealed| current > sealed) {
+        return Err(EnclaveError::Store(
+            "capture acknowledgement exceeds its sealed stream boundary".into(),
+        ));
     }
+    let sequences = if capture_formation_contract_installed(transaction).await? {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT accepted.sequence FROM ( \
+                 SELECT sequence FROM capture_events \
+                  WHERE account_id=$1 AND stream_id=$2 \
+                 UNION \
+                 SELECT sequence FROM capture_formation_deleted_sequences \
+                  WHERE account_id=$1 AND stream_id=$2 \
+             ) accepted \
+             WHERE accepted.sequence>$3 \
+               AND ($4::bigint IS NULL OR accepted.sequence<=$4) \
+             ORDER BY accepted.sequence",
+        )
+        .bind(account_id)
+        .bind(stream_id)
+        .bind(current)
+        .bind(sealed_sequence)
+        .fetch_all(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT sequence FROM capture_events \
+             WHERE account_id=$1 AND stream_id=$2 AND sequence>$3 \
+               AND ($4::bigint IS NULL OR sequence<=$4) ORDER BY sequence",
+        )
+        .bind(account_id)
+        .bind(stream_id)
+        .bind(current)
+        .bind(sealed_sequence)
+        .fetch_all(&mut **transaction)
+        .await?
+    };
+    let advanced = contiguous_ack(current, sequences);
     if advanced > current {
         sqlx::query(
             "UPDATE capture_streams SET committed_through_sequence=$3 \
@@ -338,6 +936,18 @@ async fn advance_ack(
         .await?;
     }
     Ok(advanced)
+}
+
+fn contiguous_ack(current: i64, sequences: impl IntoIterator<Item = i64>) -> i64 {
+    let mut advanced = current;
+    for sequence in sequences {
+        if sequence == advanced + 1 {
+            advanced = sequence;
+        } else if sequence > advanced + 1 {
+            break;
+        }
+    }
+    advanced
 }
 
 async fn insert_event(
@@ -401,17 +1011,33 @@ async fn insert_event(
         MediaDisposition::Reference => {}
     }
     let committed_at_ms = timestamp(&command.committed_at, "committed_at")?;
-    upsert_session_and_stream(transaction, &command.account_id, manifest, committed_at_ms).await?;
-    let sequence_used = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM capture_events \
-         WHERE account_id=$1 AND device_id=$2 AND stream_id=$3 AND sequence=$4)",
-    )
-    .bind(&command.account_id)
-    .bind(&manifest.device_id)
-    .bind(&manifest.stream_id)
-    .bind(manifest.sequence)
-    .fetch_one(&mut **transaction)
-    .await?;
+    let seal_reopen = upsert_session_and_stream(transaction, &command.account_id, manifest).await?;
+    let sequence_used = if capture_formation_contract_installed(transaction).await? {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM capture_events \
+                  WHERE account_id=$1 AND stream_id=$2 AND sequence=$3 \
+                 UNION ALL \
+                 SELECT 1 FROM capture_formation_deleted_sequences \
+                  WHERE account_id=$1 AND stream_id=$2 AND sequence=$3)",
+        )
+        .bind(&command.account_id)
+        .bind(&manifest.stream_id)
+        .bind(manifest.sequence)
+        .fetch_one(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM capture_events \
+             WHERE account_id=$1 AND device_id=$2 AND stream_id=$3 AND sequence=$4)",
+        )
+        .bind(&command.account_id)
+        .bind(&manifest.device_id)
+        .bind(&manifest.stream_id)
+        .bind(manifest.sequence)
+        .fetch_one(&mut **transaction)
+        .await?
+    };
     if sequence_used {
         return Err(EnclaveError::Conflict(
             "idempotency conflict for stream sequence".into(),
@@ -440,6 +1066,20 @@ async fn insert_event(
             ) {
                 return Err(EnclaveError::CaptureReference(
                     CaptureReferenceFailureReason::ContextFingerprintMismatch,
+                ));
+            }
+            let pending_deletion = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM episode_deletions deletion \
+                  WHERE deletion.account_id=$1 AND deletion.state='pending' \
+                    AND deletion.orphan_event_ids ? $2)",
+            )
+            .bind(&command.account_id)
+            .bind(&reference.canonical_event_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if pending_deletion {
+                return Err(EnclaveError::Conflict(
+                    "capture reference target is pending episode deletion".into(),
                 ));
             }
             let canonical = sqlx::query(
@@ -511,7 +1151,7 @@ async fn insert_event(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9::double precision/1000.0),$10, \
                  to_timestamp($11::double precision/1000.0),to_timestamp($12::double precision/1000.0), \
                  $13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30, \
-                 to_timestamp($31::double precision/1000.0))",
+                 clock_timestamp())",
     )
     .bind(&command.account_id)
     .bind(&manifest.event_id)
@@ -550,7 +1190,6 @@ async fn insert_event(
     .bind(manifest.audio_role.as_deref())
     .bind(manifest.audio_route.as_deref())
     .bind(manifest.route_epoch.map(|value| value as i64))
-    .bind(committed_at_ms)
     .execute(&mut **transaction)
     .await?;
 
@@ -679,13 +1318,12 @@ async fn insert_event(
         sqlx::query(
             "INSERT INTO media_processing_jobs \
              (account_id,event_id,job_kind,input_revision,processor_version,state,updated_at) \
-             VALUES ($1,$2,$3,$4,1,'pending',to_timestamp($5::double precision/1000.0))",
+             VALUES ($1,$2,$3,$4,1,'pending',clock_timestamp())",
         )
         .bind(&command.account_id)
         .bind(&manifest.event_id)
         .bind(job_kind)
         .bind(&command.manifest_digest)
-        .bind(committed_at_ms)
         .execute(&mut **transaction)
         .await?;
         sqlx::query(
@@ -728,14 +1366,48 @@ async fn insert_event(
         }
     }
 
-    Ok(CaptureCommitResult {
-        duplicate: false,
-        committed_through_sequence: advance_ack(
+    let mut committed_through_sequence =
+        advance_ack(transaction, &command.account_id, &manifest.stream_id).await?;
+    mark_capture_formation_dirty(
+        transaction,
+        &command.account_id,
+        std::slice::from_ref(&manifest.capture_session_id),
+    )
+    .await?;
+    if let Some(seal_reopen) = seal_reopen.as_ref() {
+        record_capture_seal_reopen(
             transaction,
             &command.account_id,
-            &manifest.stream_id,
+            &manifest.capture_session_id,
+            &manifest.event_id,
+            seal_reopen,
         )
-        .await?,
+        .await?;
+        // The first acknowledgement is deliberately evaluated against the
+        // still-current seal so the append-only reopen event commits the exact
+        // old-boundary/new-source mismatch. Once that proof clears the current
+        // seals, advance again so a contiguous late event is immediately and
+        // durably acknowledged.
+        committed_through_sequence =
+            advance_ack(transaction, &command.account_id, &manifest.stream_id).await?;
+    }
+    if manifest.session_finished == Some(true) {
+        // A finish marker is a durable request, not an immediate immutable
+        // boundary. Mac 0.8.42 can still have an in-flight screenshot after
+        // its final audio event; the bounded quiet sealer closes all streams
+        // only after that compatibility grace has proven complete.
+        record_provisional_finish(
+            transaction,
+            &command.account_id,
+            &manifest.capture_session_id,
+            Some(timestamp(&manifest.ended_at, "ended_at")?),
+            "event_finish_v1",
+        )
+        .await?;
+    }
+    Ok(CaptureCommitResult {
+        duplicate: false,
+        committed_through_sequence,
     })
 }
 
@@ -1043,6 +1715,13 @@ impl CaptureRepository for PostgresPersistence {
 
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult> {
         let mut transaction = self.pool().begin().await?;
+        lock_activation_contract_key_share_if_installed(&mut transaction).await?;
+        advisory_transaction_lock(
+            &mut transaction,
+            "memory-reconciliation",
+            &command.account_id,
+        )
+        .await?;
         require_active_account(&mut transaction, &command.account_id).await?;
         let result = insert_event(&mut transaction, &command).await?;
         if result.duplicate {
@@ -1072,6 +1751,13 @@ impl CaptureRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        lock_activation_contract_key_share_if_installed(&mut transaction).await?;
+        advisory_transaction_lock(
+            &mut transaction,
+            "memory-reconciliation",
+            &command.account_id,
+        )
+        .await?;
         require_active_account(&mut transaction, &command.account_id).await?;
         let mut new_count = 0usize;
         let mut duplicate_count = 0usize;
@@ -1189,25 +1875,59 @@ impl CaptureRepository for PostgresPersistence {
         account_id: &str,
         capture_session_id: &str,
     ) -> Result<Option<CaptureSessionStatus>> {
-        let changed = sqlx::query(
-            "UPDATE capture_sessions SET ended_at=coalesce(ended_at,now()) \
-             WHERE account_id=$1 AND id=$2",
+        let mut transaction = self.pool().begin().await?;
+        lock_activation_contract_key_share_if_installed(&mut transaction).await?;
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
+        let ended = sqlx::query_scalar::<_, bool>(
+            "SELECT ended_at IS NOT NULL FROM capture_sessions \
+              WHERE account_id=$1 AND id=$2 FOR UPDATE",
         )
         .bind(account_id)
         .bind(capture_session_id)
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        if changed == 0 {
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(ended) = ended else {
+            transaction.rollback().await?;
             return Ok(None);
-        }
+        };
+        let provenance = if ended
+            && capture_formation_contract_installed(&mut transaction).await?
+            && !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM capture_formation_receipts \
+                  WHERE account_id=$1 AND capture_session_id=$2 \
+                    AND finish_requested_at IS NOT NULL)",
+            )
+            .bind(account_id)
+            .bind(capture_session_id)
+            .fetch_one(&mut *transaction)
+            .await?
+        {
+            // An explicit request makes old ended-session intent durable even
+            // when legacy streams already contain exact pre-v27 boundaries.
+            // The quiet sealer still appends the first auditable generation.
+            "legacy_client_refinish_v1"
+        } else {
+            "finish_endpoint_v1"
+        };
+        record_provisional_finish(
+            &mut transaction,
+            account_id,
+            capture_session_id,
+            None,
+            provenance,
+        )
+        .await?;
+        transaction.commit().await?;
         postgres_session_status(self, account_id, capture_session_id, None).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::capture_session_stage;
+    use super::{
+        capture_session_stage, contiguous_ack, exact_deleted_event_replay,
+        provisional_finish_state_authorized, stream_admission, StreamAdmission,
+    };
     use crate::persistence::capture::CaptureSessionStage;
 
     #[test]
@@ -1228,5 +1948,204 @@ mod tests {
             capture_session_stage(0, 0, 0, 1, true, true, true, true),
             CaptureSessionStage::Ready
         );
+    }
+
+    #[test]
+    fn provisional_finish_accepts_late_sources_until_exact_seal() {
+        assert_eq!(
+            stream_admission(false, false, false, None, 0, false).unwrap(),
+            StreamAdmission::Open
+        );
+        assert_eq!(
+            stream_admission(true, true, false, None, 99, false).unwrap(),
+            StreamAdmission::ProvisionalFinish
+        );
+        assert_eq!(
+            stream_admission(true, true, false, None, 100, true).unwrap(),
+            StreamAdmission::ProvisionalFinish,
+            "a repeated finish marker remains provisional before quiet sealing"
+        );
+        assert!(stream_admission(true, false, false, None, 0, false).is_err());
+    }
+
+    #[test]
+    fn signed_draining_transition_does_not_race_legacy_finish_import() {
+        assert!(provisional_finish_state_authorized(
+            Some("installed"),
+            false,
+            false,
+            false
+        ));
+        for phase in ["draining", "active", "paused"] {
+            assert!(provisional_finish_state_authorized(
+                Some(phase),
+                true,
+                false,
+                false
+            ));
+        }
+        assert!(!provisional_finish_state_authorized(
+            Some("draining"),
+            false,
+            false,
+            false
+        ));
+        assert!(!provisional_finish_state_authorized(
+            Some("draining"),
+            true,
+            false,
+            true
+        ));
+        assert!(!provisional_finish_state_authorized(
+            Some("installed"),
+            true,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn exact_seal_allows_only_bounded_gap_fill() {
+        assert_eq!(
+            stream_admission(true, false, false, Some(4), 3, false).unwrap(),
+            StreamAdmission::SealedGapFill
+        );
+        assert_eq!(
+            stream_admission(true, false, false, Some(4), 4, false).unwrap(),
+            StreamAdmission::SealedGapFill
+        );
+        assert!(stream_admission(true, false, false, Some(4), 5, false).is_err());
+        assert!(stream_admission(true, false, false, Some(4), 4, true).is_err());
+        assert!(stream_admission(false, false, false, Some(0), 0, false).is_err());
+    }
+
+    #[test]
+    fn audited_final_seal_reopens_only_for_a_novel_later_sequence() {
+        assert_eq!(
+            stream_admission(true, false, true, Some(4), 5, false).unwrap(),
+            StreamAdmission::LateSealReopen
+        );
+        assert!(stream_admission(true, false, false, Some(4), 5, false).is_err());
+        assert_eq!(
+            stream_admission(true, false, true, Some(4), 4, false).unwrap(),
+            StreamAdmission::SealedGapFill,
+            "duplicates are resolved before admission and sequence reuse remains a conflict"
+        );
+    }
+
+    #[test]
+    fn late_reopen_rechecks_ack_after_clearing_the_old_boundary() {
+        assert_eq!(contiguous_ack(4, []), 4, "the old seal caps the first pass");
+        assert_eq!(
+            contiguous_ack(4, [5]),
+            5,
+            "the post-reopen pass immediately acknowledges a lone late event"
+        );
+        let source = include_str!("capture.rs");
+        let insert = source
+            .split("async fn insert_event(")
+            .nth(1)
+            .unwrap()
+            .split("fn capture_session_stage(")
+            .next()
+            .unwrap();
+        assert!(insert.contains("route_epoch,received_at"));
+        assert!(insert.contains("clock_timestamp())"));
+        assert!(!insert.contains("CURRENT_TIMESTAMP)"));
+        let audit = insert.find("record_capture_seal_reopen(").unwrap();
+        let after_audit = &insert[audit..];
+        assert!(after_audit.contains("advance_ack(transaction"));
+
+        let reopen = source
+            .split("async fn record_capture_seal_reopen(")
+            .nth(1)
+            .unwrap()
+            .split("async fn insert_browser_observation(")
+            .next()
+            .unwrap();
+        let appended = reopen
+            .find("INSERT INTO capture_formation_seal_events")
+            .unwrap();
+        let streams_cleared = reopen
+            .find("UPDATE capture_streams SET sealed_sequence=NULL")
+            .unwrap();
+        let readiness_cleared = reopen.find("SET seal_finalized_at=NULL").unwrap();
+        assert!(appended < streams_cleared && streams_cleared < readiness_cleared);
+        assert!(reopen.contains("trigger_event_id"));
+        assert!(reopen.contains("capture_formation_stream_maxima_sha256"));
+    }
+
+    #[test]
+    fn exact_deleted_replay_is_duplicate_but_scope_or_digest_reuse_conflicts() {
+        assert!(exact_deleted_event_replay(
+            "stream-1", 7, "digest-1", "stream-1", 7, "digest-1"
+        ));
+        for replay in [
+            ("stream-2", 7, "digest-1"),
+            ("stream-1", 8, "digest-1"),
+            ("stream-1", 7, "digest-2"),
+        ] {
+            assert!(!exact_deleted_event_replay(
+                "stream-1", 7, "digest-1", replay.0, replay.1, replay.2
+            ));
+        }
+
+        let source = include_str!("capture.rs");
+        let preflight = source
+            .split("async fn preflight(")
+            .nth(1)
+            .unwrap()
+            .split("async fn upsert_session_and_stream(")
+            .next()
+            .unwrap();
+        assert!(preflight.contains("capture_formation_deleted_sequences"));
+        assert!(preflight.contains("original_manifest_digest"));
+        assert!(preflight.contains("exact_deleted_event_replay"));
+        assert!(preflight.contains("CapturePreflight::Duplicate"));
+        assert!(preflight.contains("idempotency conflict for erased capture event"));
+
+        let batch = source
+            .split("async fn commit_reference_batch(")
+            .nth(1)
+            .unwrap()
+            .split("async fn stream_ack(")
+            .next()
+            .unwrap();
+        assert!(batch.contains("insert_event("));
+        assert!(batch.contains("if result.duplicate"));
+        assert!(batch.contains("duplicate_count += 1"));
+
+        let ack = source
+            .split("async fn advance_ack(")
+            .nth(1)
+            .unwrap()
+            .split("fn contiguous_ack(")
+            .next()
+            .unwrap();
+        assert!(ack.contains("UNION"));
+        assert!(ack.contains("capture_formation_deleted_sequences"));
+
+        let insert = source
+            .split("async fn insert_event(")
+            .nth(1)
+            .unwrap()
+            .split("fn capture_session_stage(")
+            .next()
+            .unwrap();
+        assert!(insert.contains("capture_formation_deleted_sequences"));
+        assert!(insert.contains("idempotency conflict for stream sequence"));
+        assert!(insert.contains("deletion.state='pending'"));
+        assert!(insert.contains("deletion.orphan_event_ids ? $2"));
+        assert!(insert.contains("capture reference target is pending episode deletion"));
+
+        let reopen = source
+            .split("async fn upsert_session_and_stream(")
+            .nth(1)
+            .unwrap()
+            .split("async fn record_provisional_finish(")
+            .next()
+            .unwrap();
+        assert!(reopen.contains("capture_formation_stream_accepted_max"));
+        assert!(reopen.contains("capture_formation_stream_contiguous_through"));
     }
 }

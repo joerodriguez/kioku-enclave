@@ -921,8 +921,22 @@ def _sign_evidence(output: Path) -> None:
     _regular(signature, private=True)
 
 
-def _verify_bundle(output: Path, config: Path, commit: str, tag: str, digest: str, *, image_repository: str) -> dict[str, Any]:
+def _verify_bundle(
+    output: Path,
+    config: Path,
+    commit: str,
+    tag: str,
+    digest: str,
+    *,
+    image_repository: str,
+    allow_frozen_v0_9_16_schema_11_state: bool = False,
+) -> dict[str, Any]:
     public, fingerprint = _public_key()
+    legacy_arguments = (
+        ("--allow-frozen-v0-9-16-schema-11-state",)
+        if allow_frozen_v0_9_16_schema_11_state
+        else ()
+    )
     result = _run(
         (
             sys.executable,
@@ -947,6 +961,7 @@ def _verify_bundle(output: Path, config: Path, commit: str, tag: str, digest: st
             digest,
             "--config",
             str(config),
+            *legacy_arguments,
         ),
         cwd=ROOT,
         timeout=120,
@@ -1445,7 +1460,15 @@ def state(destination: str) -> Mapping[str, Any]:
     digest = metadata.get("image_digest")
     if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
         fail("release metadata has no immutable image digest")
-    _verify_bundle(evidence_dir, config, commit, tag, digest, image_repository=image_repository)
+    _verify_bundle(
+        evidence_dir,
+        config,
+        commit,
+        tag,
+        digest,
+        image_repository=image_repository,
+        allow_frozen_v0_9_16_schema_11_state=tag == "v0.9.16",
+    )
     registry_digest = _registry_digest(image_repository, tag, registry_reader)
     if registry_digest != digest:
         fail("Artifact Registry and immutable GitHub evidence disagree")

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{cp::media::AudioTurn, error::Result};
 
@@ -242,6 +243,64 @@ pub(crate) struct MediaProcessingClaim {
     pub(crate) claim_token: String,
     pub(crate) claim_until: String,
     pub(crate) jobs: Vec<MediaProcessingJob>,
+    /// Caller-owned durable attempt number. It advances only after an exact
+    /// prior attempt is durably confirmed not billed.
+    pub(crate) provider_attempt_number: i64,
+    /// A provider response staged by a prior owner. Reclaim must replay these
+    /// exact bytes and must never send the request again.
+    pub(crate) staged_response: Option<MediaProviderStagedResponse>,
+}
+
+pub(crate) const MAX_MEDIA_PROVIDER_ATTEMPTS: i64 = 16;
+pub(crate) const MAX_MEDIA_PROVIDER_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_MEDIA_PROVIDER_JOURNAL_BYTES: usize = 768 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MediaProviderAttempt {
+    pub(crate) number: i64,
+    pub(crate) identity_sha256: [u8; 32],
+    pub(crate) request_sha256: [u8; 32],
+    pub(crate) event_id: String,
+    pub(crate) requested_model: String,
+    pub(crate) location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MediaProviderStagedResponse {
+    pub(crate) attempt: MediaProviderAttempt,
+    pub(crate) http_status: u16,
+    pub(crate) response_sha256: [u8; 32],
+    pub(crate) response_bytes: Vec<u8>,
+    pub(crate) latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaFailureDisposition {
+    /// Failure is proven to precede provider egress.
+    RetryableBeforeEgress,
+    /// Provider explicitly rejected the request before inference/billing.
+    RetryableNotBilled,
+    /// The request may have reached the provider and cannot be resent.
+    AmbiguousTerminal,
+    /// Exact staged response bytes were invalid and cannot be regenerated.
+    ConfirmedInvalid,
+}
+
+pub(crate) fn media_provider_attempt_identity(
+    account_id: &str,
+    work_unit_id: &str,
+    number: i64,
+    request_sha256: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.media-provider-attempt.v1\0");
+    digest.update(account_id.as_bytes());
+    digest.update([0]);
+    digest.update(work_unit_id.as_bytes());
+    digest.update([0]);
+    digest.update(number.to_be_bytes());
+    digest.update(request_sha256);
+    digest.finalize().into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,18 +325,28 @@ pub(crate) struct MediaScreenProjection {
 #[derive(Debug, Clone)]
 pub(crate) struct MediaUsageSettlement {
     pub(crate) claim: MediaProcessingClaim,
+    pub(crate) provider_attempt: MediaProviderAttempt,
     pub(crate) usage: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MediaFailurePolicy {
+    pub(crate) max_attempts: i64,
+    pub(crate) budget_retry_seconds: i64,
+    pub(crate) resurrection_window_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct AudioMediaSettlement {
     pub(crate) claim: MediaProcessingClaim,
+    pub(crate) provider_attempt: MediaProviderAttempt,
     pub(crate) turns: Vec<AudioTurn>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScreenMediaSettlement {
     pub(crate) claim: MediaProcessingClaim,
+    pub(crate) provider_attempt: MediaProviderAttempt,
     pub(crate) results: Vec<MediaScreenProjection>,
 }
 
@@ -296,11 +365,20 @@ pub(crate) trait MediaProcessingRepository: Send + Sync {
 
     async fn candidate_name_vocabulary(&self, account_id: &str) -> Result<Vec<String>>;
 
-    async fn record_reservation(
+    /// Final local egress fence. This must be the last awaited operation
+    /// before the prepared HTTP request is sent.
+    async fn authorize_provider_attempt(
         &self,
         claim: &MediaProcessingClaim,
         reserved_output_tokens: i64,
-        reserved_at: &str,
+        attempt: &MediaProviderAttempt,
+    ) -> Result<()>;
+
+    /// Stage the exact bounded provider response before parsing or projection.
+    async fn stage_provider_response(
+        &self,
+        claim: &MediaProcessingClaim,
+        response: &MediaProviderStagedResponse,
     ) -> Result<()>;
 
     async fn settle_usage(&self, command: MediaUsageSettlement) -> Result<()>;
@@ -312,11 +390,11 @@ pub(crate) trait MediaProcessingRepository: Send + Sync {
     async fn settle_failure(
         &self,
         claim: &MediaProcessingClaim,
+        provider_attempt: Option<&MediaProviderAttempt>,
+        disposition: MediaFailureDisposition,
         error_code: &str,
         failed_at: &str,
-        max_attempts: i64,
-        budget_retry_seconds: i64,
-        resurrection_window_seconds: i64,
+        policy: MediaFailurePolicy,
     ) -> Result<()>;
 
     async fn resurrect_recent_failures(

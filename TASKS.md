@@ -70,7 +70,7 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
 
 ## Release and rollout, if the runtime digest changes
 
-- [ ] Publish from a signed standard `vMAJOR.MINOR.PATCH` tag with schema-11 metadata and exact
+- [ ] Publish from a signed standard `vMAJOR.MINOR.PATCH` tag with schema-12 metadata and exact
   source/image/config/SBOM/scan/evidence bindings.
 - [ ] Follow ADR-0041's staged zero-unavailable regional rollout: predecessor/candidate KMS
   admission, canary, PostgreSQL schema and shared-TLS readiness, authenticated API and content-free
