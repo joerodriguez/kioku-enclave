@@ -5,6 +5,7 @@
 
 mod activation;
 mod admission;
+mod aggregate_audit;
 mod billing;
 mod capture;
 mod delivery_outbox;
@@ -33,6 +34,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::{EnclaveError, Result};
 
+pub(crate) use aggregate_audit::{parse_postgres_audit_since, AggregateAuditFailure};
 #[cfg(test)]
 use schema_release::SchemaReleaseStatus;
 pub(crate) use schema_release::{
@@ -5277,5 +5279,6 @@ mod tests {
         .is_none());
 
         super::activation::test_real_pg_activation_contract(&persistence).await;
+        super::aggregate_audit::test_real_pg_aggregate_audit(&persistence).await;
     }
 }
