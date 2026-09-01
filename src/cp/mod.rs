@@ -200,6 +200,19 @@ fn reconciliation_model_from_config(
     Ok((requested, resolved))
 }
 
+fn reviewed_vertex_output_tokens_per_day_from_config(value: &str) -> crate::error::Result<i64> {
+    let canonical = !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && !value.starts_with('0');
+    let parsed = canonical.then(|| value.parse::<i64>().ok()).flatten();
+    if parsed != Some(limits::REVIEWED_VERTEX_OUTPUT_TOKENS_PER_DAY) {
+        return Err(crate::error::EnclaveError::Config(
+            "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY must be the reviewed canonical daily limit".into(),
+        ));
+    }
+    Ok(limits::REVIEWED_VERTEX_OUTPUT_TOKENS_PER_DAY)
+}
+
 impl CpConfig {
     pub fn from_env(
         jwt_secrets: Vec<String>,
@@ -252,15 +265,6 @@ impl CpConfig {
                 "Google web client secret is empty".into(),
             ));
         }
-
-        let parse_i64 = |k: &str, d: i64| -> crate::error::Result<i64> {
-            match std::env::var(k) {
-                Ok(value) => value.parse::<i64>().ok().filter(|v| *v > 0).ok_or_else(|| {
-                    crate::error::EnclaveError::Config(format!("{k} must be a positive integer"))
-                }),
-                Err(_) => Ok(d),
-            }
-        };
 
         let base_url = validate_https_origin(
             "BASE_URL",
@@ -459,9 +463,8 @@ impl CpConfig {
             vertex_reconciliation_model,
             memory_reconciliation_producer_contract_sha256,
             signup_limit_per_day,
-            quota_vertex_output_tokens_per_day: parse_i64(
-                "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
-                524_288,
+            quota_vertex_output_tokens_per_day: reviewed_vertex_output_tokens_per_day_from_config(
+                &config_value("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY", "2621440")?,
             )?,
             web_origin,
             reviewer_auth,
@@ -675,8 +678,8 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
 #[cfg(test)]
 mod configuration_tests {
     use super::{
-        reconciliation_model_from_config, reviewer_identity_subject,
-        vertex_model_name_is_billing_safe, ReviewerAuthConfig,
+        reconciliation_model_from_config, reviewed_vertex_output_tokens_per_day_from_config,
+        reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig,
     };
 
     #[test]
@@ -715,5 +718,30 @@ mod configuration_tests {
         ));
         assert!(!vertex_model_name_is_billing_safe(&"m".repeat(129)));
         assert!(!vertex_model_name_is_billing_safe(""));
+    }
+
+    #[test]
+    fn vertex_daily_quota_is_exact_canonical_and_fail_closed() {
+        assert_eq!(
+            reviewed_vertex_output_tokens_per_day_from_config("2621440").unwrap(),
+            super::limits::REVIEWED_VERTEX_OUTPUT_TOKENS_PER_DAY
+        );
+        for malformed in [
+            "",
+            "0",
+            "02621440",
+            "+2621440",
+            "2621440 ",
+            " 2621440",
+            "2621440.0",
+            "1310720",
+            "2621441",
+            "9223372036854775808",
+        ] {
+            assert!(
+                reviewed_vertex_output_tokens_per_day_from_config(malformed).is_err(),
+                "accepted malformed or unreviewed quota {malformed:?}"
+            );
+        }
     }
 }

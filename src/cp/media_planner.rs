@@ -70,7 +70,12 @@ pub fn plan_first(candidates: &[PlanningEvent]) -> WorkPlan {
             || candidate.capture_session_id != first.capture_session_id
             || candidate.stream_id != first.stream_id
         {
-            break;
+            // The repository orders all pending jobs in the class globally.
+            // Mic and system-audio events therefore interleave even though a
+            // provider work unit may contain only one stream. Preserve the
+            // globally oldest head, but look past unrelated streams/sessions
+            // so they cannot fragment that head stream into one-event calls.
+            continue;
         }
         let accepted = match first.class {
             WorkClass::Audio => {
@@ -236,6 +241,7 @@ pub fn simulate_three_hours(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashSet};
 
     fn event(
         id: i64,
@@ -280,8 +286,9 @@ mod tests {
         candidates[1].started_ms = 60_000;
         assert_eq!(plan_first(&candidates).member_job_ids, vec![1, 2, 3, 4, 5]);
 
-        candidates[1].stream_id = "other".into();
-        assert_eq!(plan_first(&candidates).member_job_ids, vec![1]);
+        let mut interleaved = candidates.clone();
+        interleaved.insert(1, event(7, WorkClass::Audio, "other", 0, 30_000, 90_000));
+        assert_eq!(plan_first(&interleaved).member_job_ids, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -384,5 +391,91 @@ mod tests {
         assert_eq!(fixture.reference_model_calls, 0);
         assert!(fixture.reserved_audio_tokens <= 262_144);
         assert!(fixture.reserved_screen_tokens <= 131_072);
+    }
+
+    fn dual_track_three_hour_events(event_ms: i64) -> Vec<PlanningEvent> {
+        const DURATION_MS: i64 = 3 * 60 * 60 * 1_000;
+        assert!((1..=75_000).contains(&event_ms));
+        let mut events = Vec::new();
+        let mut job_id = 1_i64;
+        for stream in ["mic", "system_audio"] {
+            let mut started_ms = 0_i64;
+            let mut sequence = 0_i64;
+            while started_ms < DURATION_MS {
+                let ended_ms = (started_ms + event_ms).min(DURATION_MS);
+                events.push(PlanningEvent {
+                    job_id,
+                    event_id: format!("{stream}-{sequence}"),
+                    class: WorkClass::Audio,
+                    capture_session_id: "default-mac-three-hour-session".into(),
+                    stream_id: stream.into(),
+                    sequence,
+                    started_ms,
+                    ended_ms,
+                    // Shipping AAC is 64 kbit/s. This exact byte estimate is
+                    // deliberately conservative enough to exercise the real
+                    // 20 MiB planner bound without becoming the active limit.
+                    byte_length: (ended_ms - started_ms) * 8,
+                    pixel_count: 0,
+                    route_key: match stream {
+                        "mic" => "mic:aac:default-route",
+                        "system_audio" => "system_audio:aac:system-output",
+                        _ => unreachable!(),
+                    }
+                    .into(),
+                });
+                job_id += 1;
+                sequence += 1;
+                started_ms = ended_ms;
+            }
+        }
+        // Deliberately reverse the input: `plan_first` must impose the same
+        // global order the PostgreSQL claim supplies.
+        events.reverse();
+        events
+    }
+
+    fn plan_all_audio_windows(mut pending: Vec<PlanningEvent>) -> BTreeMap<String, i64> {
+        let mut calls_by_stream = BTreeMap::new();
+        while !pending.is_empty() {
+            let plan = plan_first(&pending);
+            assert!(!plan.member_job_ids.is_empty());
+            let members = plan.member_job_ids.iter().copied().collect::<HashSet<_>>();
+            let member_streams = pending
+                .iter()
+                .filter(|event| members.contains(&event.job_id))
+                .map(|event| event.stream_id.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(member_streams.len(), 1, "a work unit crossed audio streams");
+            let stream = (*member_streams.iter().next().unwrap()).to_string();
+            *calls_by_stream.entry(stream).or_insert(0) += 1;
+            pending.retain(|event| !members.contains(&event.job_id));
+        }
+        calls_by_stream
+    }
+
+    #[test]
+    fn default_mac_dual_track_three_hour_fixture_coalesces_interleaved_streams() {
+        let minute_segments = plan_all_audio_windows(dual_track_three_hour_events(60_000));
+        assert_eq!(minute_segments.get("mic"), Some(&36));
+        assert_eq!(minute_segments.get("system_audio"), Some(&36));
+        assert_eq!(minute_segments.values().sum::<i64>(), 72);
+
+        // The shipping soft cap is 40 seconds. Seven adjacent segments fit a
+        // five-minute window, so 270 segments become 39 calls per track.
+        let shipping_soft_cap = plan_all_audio_windows(dual_track_three_hour_events(40_000));
+        assert_eq!(shipping_soft_cap.get("mic"), Some(&39));
+        assert_eq!(shipping_soft_cap.get("system_audio"), Some(&39));
+        assert_eq!(shipping_soft_cap.values().sum::<i64>(), 78);
+
+        // For arbitrary adjacent shipping segments no longer than 75 seconds,
+        // every non-tail five-minute window covers more than 225 seconds: the
+        // next rejected segment is at most 75 seconds. Thus each track needs at
+        // most ceil(3h / 225s) = 48 calls, or 96 calls for both default tracks.
+        let per_track_conservative_bound = (3 * 60 * 60 * 1_000 + (MAX_AUDIO_WINDOW_MS - 75_000)
+            - 1)
+            / (MAX_AUDIO_WINDOW_MS - 75_000);
+        assert_eq!(per_track_conservative_bound, 48);
+        assert!(shipping_soft_cap.values().sum::<i64>() <= 2 * per_track_conservative_bound);
     }
 }

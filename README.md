@@ -180,6 +180,7 @@ The selector injects non-configurable fleet invariants:
 | `HEALTH_PORT` | `8081` |
 | `DRAIN_TIMEOUT_SECONDS` | `105` |
 | `ENCLAVE_TLS` | `1` |
+| `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | `2621440` |
 
 There is no backend, schema-mode, archive, witness, genesis, or legacy-media configuration. PostgreSQL
 credentials, the shared TLS generation, provider private keys, OAuth secrets, and signing secrets
@@ -189,9 +190,12 @@ come from their fixed runtime secret boundaries and are never Docker arguments.
 
 `scripts/deploy_latest.py` derives `vMAJOR.MINOR.PATCH` from `Cargo.toml`, requires a clean source
 equal to `origin/main`, and creates or verifies a signed annotated tag. The pipeline emits
-canonical schema-12 release metadata binding source, image digest, live media bucket, KMS
+canonical schema-13 release metadata binding source, image digest, live media bucket, KMS
 coordinates, unconditional PostgreSQL schema verification, readiness/drain invariants, shared TLS,
-the explicit reconciliation model/location and compiled producer-contract digest.
+the explicit reconciliation model/location and compiled producer-contract digest, and the exact
+per-account UTC-calendar-day Vertex output quota with non-borrowing 50/25/25
+audio/screen/derived class shares. The exact v0.9.18 predecessor remains readable only through its
+frozen schema-12 state-verification path; schema 12 is never accepted for a new release.
 
 Memory-reconciliation activation uses one ordinary immutable release image. That image carries the
 exact model, location, and producer digest and can run the built-in PostgreSQL migration phases, but

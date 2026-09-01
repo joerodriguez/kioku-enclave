@@ -132,6 +132,9 @@ def metadata_arguments(
         expected_reconciliation_producer_contract_sha256=configuration.get(
             "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256", ""
         ),
+        expected_quota_vertex_output_tokens_per_day=configuration.get(
+            "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY", ""
+        ),
     )
 
 
@@ -157,6 +160,11 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--allow-frozen-v0-9-16-schema-11-state",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--allow-frozen-v0-9-18-schema-12-state",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -217,6 +225,13 @@ def main() -> None:
 
     if arguments.allow_frozen_v0_9_16_schema_11_state and arguments.tag != "v0.9.16":
         fail("schema-11 state verification is restricted to frozen v0.9.16")
+    if arguments.allow_frozen_v0_9_18_schema_12_state and arguments.tag != "v0.9.18":
+        fail("schema-12 state verification is restricted to frozen v0.9.18")
+    if (
+        arguments.allow_frozen_v0_9_16_schema_11_state
+        and arguments.allow_frozen_v0_9_18_schema_12_state
+    ):
+        fail("only one frozen state schema may be selected")
     try:
         if arguments.allow_frozen_v0_9_16_schema_11_state:
             metadata = verify_release_metadata.parse_frozen_v0_9_16_metadata_bytes(
@@ -229,6 +244,20 @@ def main() -> None:
             )
             configuration = (
                 select_build_configuration.selected_frozen_v0_9_16_configuration(
+                    "production", operator_values, source_ref=arguments.tag
+                )
+            )
+        elif arguments.allow_frozen_v0_9_18_schema_12_state:
+            metadata = verify_release_metadata.parse_frozen_v0_9_18_metadata_bytes(
+                metadata_bytes
+            )
+            operator_values = (
+                select_build_configuration.parse_frozen_v0_9_18_operator_configuration(
+                    config_bytes
+                )
+            )
+            configuration = (
+                select_build_configuration.selected_frozen_v0_9_18_configuration(
                     "production", operator_values, source_ref=arguments.tag
                 )
             )
@@ -263,6 +292,10 @@ def main() -> None:
     )
     if arguments.allow_frozen_v0_9_16_schema_11_state:
         verify_release_metadata.validate_frozen_v0_9_16_state(
+            verifier_arguments, metadata
+        )
+    elif arguments.allow_frozen_v0_9_18_schema_12_state:
+        verify_release_metadata.validate_frozen_v0_9_18_state(
             verifier_arguments, metadata
         )
     else:

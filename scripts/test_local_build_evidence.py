@@ -50,7 +50,7 @@ class LocalEvidenceTests(unittest.TestCase):
         expected_scan_sha256: str | None = None,
         sbom_payload: str = '{"spdxVersion":"SPDX-2.3"}\n',
         scan_payload: str = '{"matches":[]}\n',
-        metadata_schema: int = 12,
+        metadata_schema: int = 13,
         tag: str = TAG,
     ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
@@ -114,13 +114,23 @@ class LocalEvidenceTests(unittest.TestCase):
             "drain_timeout_seconds": "105",
             "tls_mode": "shared-secret-manager",
         }
-        if metadata_schema == 12:
+        if metadata_schema in (12, 13):
             metadata_payload.update(
                 {
                     "vertex_reconciliation_model": "gemini-reconciliation-v1",
                     "vertex_location": "global",
                     "reconciliation_producer_contract_sha256": "sha256:"
                     + "c" * 64,
+                }
+            )
+        if metadata_schema == 13:
+            metadata_payload.update(
+                {
+                    "quota_vertex_output_tokens_per_day": "2621440",
+                    "quota_vertex_output_reset_policy": "per-account-utc-calendar-day",
+                    "quota_vertex_output_class_shares": (
+                        "non-borrowing-percent:audio=50,screen=25,derived=25"
+                    ),
                 }
             )
         metadata.write_text(
@@ -385,6 +395,54 @@ class LocalEvidenceTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("restricted to frozen v0.9.16", rejected.stderr)
+
+    def test_frozen_v0_9_18_bundle_is_schema_twelve_state_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = self.create_bundle(
+                directory, metadata_schema=12, tag="v0.9.18"
+            )
+            command = [
+                "python3",
+                str(BUNDLE_VERIFIER),
+                "--evidence-dir",
+                str(directory),
+                "--public-key",
+                str(public),
+                "--expected-public-key-sha256",
+                fingerprint,
+                "--repository",
+                "owner/repository",
+                "--tag",
+                "v0.9.18",
+                "--commit",
+                COMMIT,
+                "--image-repository",
+                "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
+                "--config",
+                str(directory / "local.env"),
+            ]
+            current = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(current.returncode, 0)
+            frozen = subprocess.run(
+                [*command, "--allow-frozen-v0-9-18-schema-12-state"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(frozen.returncode, 0, frozen.stderr)
+            self.assertEqual(json.loads(frozen.stdout)["metadata"]["schema_version"], 12)
+
+            wrong_tag = list(command)
+            wrong_tag[wrong_tag.index("v0.9.18")] = "v0.9.19"
+            rejected = subprocess.run(
+                [*wrong_tag, "--allow-frozen-v0-9-18-schema-12-state"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("restricted to frozen v0.9.18", rejected.stderr)
 
     def test_bundle_verifier_rejects_signed_host_local_paths(self) -> None:
         for asset, payload in (

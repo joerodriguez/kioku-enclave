@@ -144,6 +144,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("HEALTH_PORT=8081\n", content)
         self.assertIn("DRAIN_TIMEOUT_SECONDS=105\n", content)
         self.assertIn("ENCLAVE_TLS=1\n", content)
+        self.assertIn("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=2621440\n", content)
         self.assertIn("VERTEX_RECONCILIATION_MODEL=gemini-reconciliation-v1\n", content)
         self.assertIn(
             "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256=sha256:" + "a" * 64 + "\n",
@@ -176,6 +177,18 @@ class SelectorTests(unittest.TestCase):
             base64.b64encode(SCHEMA_FINALIZATION_PUBLIC_KEY_DER).decode("ascii"),
             evaluation_content,
         )
+        self.assertIn(
+            "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=2621440\n", evaluation_content
+        )
+
+        attempted_override = environment()
+        attempted_override["PRODUCTION_QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY"] = "1310720"
+        selected_override, override_content, _ = self.run_selector(
+            "production", attempted_override
+        )
+        self.assertEqual(selected_override.returncode, 0, selected_override.stderr)
+        self.assertIn("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=2621440\n", override_content)
+        self.assertNotIn("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=1310720", override_content)
 
     def test_missing_value_never_falls_back_between_profiles(self) -> None:
         values = environment()
@@ -284,6 +297,32 @@ class SelectorTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             SELECTOR_MODULE.selected_configuration(
                 "production", parsed, source_ref="v0.9.16"
+            )
+
+    def test_frozen_v0_9_18_selector_excludes_the_new_quota_key(self) -> None:
+        values = environment()
+        raw = (
+            "\n".join(
+                f"{name}={value}"
+                for name, value in sorted(values.items())
+                if name != "PATH"
+            )
+            + "\n"
+        ).encode("utf-8")
+        parsed = SELECTOR_MODULE.parse_frozen_v0_9_18_operator_configuration(raw)
+        selected = SELECTOR_MODULE.selected_frozen_v0_9_18_configuration(
+            "production", parsed, source_ref="v0.9.18"
+        )
+        self.assertNotIn("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY", selected)
+        self.assertEqual(selected["VERTEX_RECONCILIATION_MODEL"], "gemini-reconciliation-v1")
+
+        with self.assertRaisesRegex(SystemExit, "exact v0.9.18 tag"):
+            SELECTOR_MODULE.selected_frozen_v0_9_18_configuration(
+                "production", parsed, source_ref="v0.9.19"
+            )
+        with self.assertRaisesRegex(SystemExit, "unknown operator configuration"):
+            SELECTOR_MODULE.parse_frozen_v0_9_18_operator_configuration(
+                raw + b"PRODUCTION_QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=2621440\n"
             )
 
     def test_schema_finalization_anchor_is_required_and_fingerprint_bound(self) -> None:

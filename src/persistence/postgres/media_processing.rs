@@ -308,6 +308,113 @@ fn vertex_operation_for_class(class: MediaProcessingClass) -> VertexOperation {
     }
 }
 
+struct PersistedMediaWorkPlan {
+    work_unit_id: String,
+    started_ms: i64,
+    ended_ms: i64,
+    member_job_ids: Vec<i64>,
+}
+
+/// A job can be bound to only one durable work unit. Reclaim that exact
+/// membership before applying current planner policy so an image upgrade (or
+/// a late adjacent event) cannot expand an already-frozen provider identity.
+async fn persisted_media_work_for_head(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    head_job_id: i64,
+    class: MediaProcessingClass,
+) -> Result<Option<PersistedMediaWorkPlan>> {
+    let rows = sqlx::query(
+        "SELECT work.id,work.work_class,work.processor_version,work.state, \
+                floor(extract(epoch FROM work.started_at)*1000)::bigint AS started_at_ms, \
+                floor(extract(epoch FROM work.ended_at)*1000)::bigint AS ended_at_ms, \
+                member.job_id,member.ordinal \
+           FROM media_work_members head \
+           JOIN media_work_units work \
+             ON work.account_id=head.account_id AND work.id=head.work_unit_id \
+           JOIN media_work_members member \
+             ON member.account_id=work.account_id AND member.work_unit_id=work.id \
+          WHERE head.account_id=$1 AND head.job_id=$2 \
+          ORDER BY member.ordinal",
+    )
+    .bind(account_id)
+    .bind(head_job_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let work_unit_id: String = first.try_get("id")?;
+    let started_ms: i64 = first.try_get("started_at_ms")?;
+    let ended_ms: i64 = first.try_get("ended_at_ms")?;
+    if first.try_get::<String, _>("work_class")? != class.as_str()
+        || first.try_get::<i64, _>("processor_version")? != PROCESSOR_VERSION
+        || !matches!(
+            first.try_get::<String, _>("state")?.as_str(),
+            "planned" | "processing" | "retry_wait"
+        )
+        || started_ms >= ended_ms
+        || rows.iter().enumerate().any(|(ordinal, row)| {
+            row.try_get::<String, _>("id").ok().as_deref() != Some(work_unit_id.as_str())
+                || row.try_get::<i64, _>("ordinal").ok() != Some(ordinal as i64)
+        })
+    {
+        return Err(EnclaveError::Store(
+            "persisted media work membership is invalid".into(),
+        ));
+    }
+    let member_job_ids = rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("job_id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if member_job_ids.first() != Some(&head_job_id) {
+        return Err(EnclaveError::Store(
+            "persisted media work does not retain its head".into(),
+        ));
+    }
+    Ok(Some(PersistedMediaWorkPlan {
+        work_unit_id,
+        started_ms,
+        ended_ms,
+        member_job_ids,
+    }))
+}
+
+async fn eligible_media_jobs_for_exact_work(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    member_job_ids: &[i64],
+    class: MediaProcessingClass,
+) -> Result<Vec<MediaProcessingJob>> {
+    let rows = sqlx::query(
+        "SELECT j.id,j.event_id,j.job_kind,m.object_key,m.object_generation,m.mime_type,m.codec, \
+                m.byte_length,m.sample_rate,m.channels,m.width,m.height,m.sha256, \
+                floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
+                floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
+                e.stream_kind,e.capture_session_id,e.stream_id,e.sequence, \
+                e.context_json::text AS context_json,e.audio_role,e.audio_route,e.route_epoch \
+           FROM media_processing_jobs j \
+           JOIN capture_events e ON e.account_id=j.account_id AND e.event_id=j.event_id \
+           JOIN media_objects m ON m.account_id=j.account_id AND m.event_id=j.event_id \
+          WHERE j.account_id=$1 AND j.id=ANY($2::bigint[]) \
+            AND j.processor_version=$3 AND j.job_kind=$4 AND (j.state='pending' OR \
+                (j.state='retry_wait' AND j.updated_at<=clock_timestamp()) OR \
+                (j.state='processing' AND j.lease_until<=clock_timestamp())) \
+            AND NOT EXISTS(SELECT 1 FROM episode_deletions deletion \
+                 WHERE deletion.account_id=e.account_id AND deletion.state='pending' \
+                   AND (deletion.orphan_event_ids ? e.event_id OR deletion.orphan_event_ids ? \
+                        coalesce(e.canonical_event_id,e.event_id))) \
+          ORDER BY array_position($2::bigint[],j.id)",
+    )
+    .bind(account_id)
+    .bind(member_job_ids)
+    .bind(PROCESSOR_VERSION)
+    .bind(class.job_kind())
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.iter().map(job_from_row).collect()
+}
+
 async fn require_exact_vertex_usage_attempt(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
@@ -727,9 +834,40 @@ impl MediaProcessingRepository for PostgresPersistence {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let plan = media_planner::plan_first(&candidates);
-        if plan.member_job_ids.is_empty() {
-            sqlx::query(
+        let head_job_id = media_planner::plan_first(&candidates).head_job_id;
+        let persisted =
+            persisted_media_work_for_head(&mut transaction, account_id, head_job_id, class).await?;
+        let (selected, work_unit_id, plan_started_ms, plan_ended_ms) = if let Some(persisted) =
+            persisted
+        {
+            let selected = eligible_media_jobs_for_exact_work(
+                &mut transaction,
+                account_id,
+                &persisted.member_job_ids,
+                class,
+            )
+            .await?;
+            if selected.len() != persisted.member_job_ids.len()
+                || selected
+                    .iter()
+                    .zip(&persisted.member_job_ids)
+                    .any(|(job, expected_id)| job.id != *expected_id)
+                || work_unit_id(class, &selected) != persisted.work_unit_id
+            {
+                return Err(EnclaveError::Conflict(
+                    "persisted media work is not exactly reclaimable".into(),
+                ));
+            }
+            (
+                selected,
+                persisted.work_unit_id,
+                persisted.started_ms,
+                persisted.ended_ms,
+            )
+        } else {
+            let plan = media_planner::plan_first(&candidates);
+            if plan.member_job_ids.is_empty() {
+                sqlx::query(
                 "UPDATE media_processing_jobs SET state='failed_terminal',error_code='unplannable_media', \
                         lease_owner=NULL,lease_token=NULL,lease_until=NULL, \
                         updated_at=clock_timestamp() \
@@ -740,7 +878,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             .bind(plan.head_job_id)
             .execute(&mut *transaction)
             .await?;
-            sqlx::query(
+                sqlx::query(
                 "UPDATE media_objects SET processing_state='failed' WHERE account_id=$1 AND event_id=( \
                     SELECT event_id FROM media_processing_jobs WHERE account_id=$1 AND id=$2)",
             )
@@ -748,15 +886,17 @@ impl MediaProcessingRepository for PostgresPersistence {
             .bind(plan.head_job_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
-            return Ok(None);
-        }
-        let member_ids = plan.member_job_ids.iter().copied().collect::<HashSet<_>>();
-        let selected = jobs
-            .into_iter()
-            .filter(|job| member_ids.contains(&job.id))
-            .collect::<Vec<_>>();
-        let work_unit_id = work_unit_id(class, &selected);
+                transaction.commit().await?;
+                return Ok(None);
+            }
+            let member_ids = plan.member_job_ids.iter().copied().collect::<HashSet<_>>();
+            let selected = jobs
+                .into_iter()
+                .filter(|job| member_ids.contains(&job.id))
+                .collect::<Vec<_>>();
+            let work_unit_id = work_unit_id(class, &selected);
+            (selected, work_unit_id, plan.started_ms, plan.ended_ms)
+        };
         let claim_token = crate::cp::tokens::random_token_hex();
         let reserved_output_tokens = match class {
             MediaProcessingClass::Audio => 4_096_i64,
@@ -781,8 +921,8 @@ impl MediaProcessingRepository for PostgresPersistence {
         .bind(&work_unit_id)
         .bind(class.as_str())
         .bind(PROCESSOR_VERSION)
-        .bind(plan.started_ms)
-        .bind(plan.ended_ms)
+        .bind(plan_started_ms)
+        .bind(plan_ended_ms)
         .bind(reserved_output_tokens)
         .bind(serde_json::to_string(&planned_usage)?)
         .execute(&mut *transaction)
@@ -843,8 +983,8 @@ impl MediaProcessingRepository for PostgresPersistence {
             .bind(&job.event_id)
             .bind(job.id)
             .bind(ordinal as i64)
-            .bind(started_ms - plan.started_ms)
-            .bind(ended_ms - plan.started_ms)
+            .bind(started_ms - plan_started_ms)
+            .bind(ended_ms - plan_started_ms)
             .execute(&mut *transaction)
             .await?;
         }
@@ -2520,6 +2660,274 @@ async fn test_insert_screen_work_fixture(
 }
 
 #[cfg(test)]
+async fn test_insert_audio_job_fixture(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    event_id: &str,
+    stream_id: &str,
+    stream_kind: &str,
+    sequence: i64,
+    start_offset_seconds: i64,
+) -> Result<()> {
+    let asset_id = format!("asset-{event_id}");
+    let (audio_role, audio_route) = match stream_kind {
+        "mic" => ("ambient", "builtin_mic"),
+        "system_audio" => ("remote_received", "system_output"),
+        _ => {
+            return Err(EnclaveError::Config(
+                "audio fixture stream kind is invalid".into(),
+            ))
+        }
+    };
+    sqlx::query(
+        "INSERT INTO capture_events( \
+             account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind, \
+             sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id, \
+             utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,context_json, \
+             audio_role,audio_route,route_epoch,media_disposition,dedupe_version,received_at) \
+         VALUES($1,$2,'planner-device','planner-install','planner-session',$3,$4,$5, \
+                clock_timestamp()-make_interval(secs=>$6),$5::text, \
+                clock_timestamp()-make_interval(secs=>$6), \
+                clock_timestamp()-make_interval(secs=>$6-60), \
+                'UTC',0,0,$7,repeat('a',64),'{}',$8,$9,0,'canonical',1,clock_timestamp())",
+    )
+    .bind(account_id)
+    .bind(event_id)
+    .bind(stream_id)
+    .bind(stream_kind)
+    .bind(sequence)
+    .bind(start_offset_seconds)
+    .bind(&asset_id)
+    .bind(audio_role)
+    .bind(audio_route)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_objects( \
+             account_id,asset_id,event_id,object_key,object_generation,object_backend,mime_type, \
+             codec,byte_length,sha256,sample_rate,channels,processing_state) \
+         VALUES($1,$2,$3,'media/'||$3,1,'current','audio/mp4','aac',480000, \
+                repeat('b',64),48000,1,'queued')",
+    )
+    .bind(account_id)
+    .bind(&asset_id)
+    .bind(event_id)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_processing_jobs( \
+             account_id,event_id,job_kind,input_revision,processor_version,state) \
+         VALUES($1,$2,'gemini_audio','planner-input-'||$2,1,'pending')",
+    )
+    .bind(account_id)
+    .bind(event_id)
+    .execute(persistence.pool())
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+async fn test_persisted_media_work_upgrade_contract(
+    persistence: &PostgresPersistence,
+) -> Result<()> {
+    const ACCOUNT: &str = "media-planner-upgrade-contract";
+    sqlx::query(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         VALUES($1,'planner-upgrade@example.com','google','planner-upgrade-subject')",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO capture_sessions( \
+             account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
+         VALUES($1,'planner-session','planner-device','planner-install', \
+                clock_timestamp()-interval '11 minutes', \
+                clock_timestamp()-interval '7 minutes',clock_timestamp(),2)",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO capture_streams( \
+             account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) \
+         VALUES($1,'planner-mic','planner-session','planner-device','mic',2), \
+               ($1,'planner-system','planner-session','planner-device','system_audio',2)",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+
+    // Freeze the exact one-member identity an older image could have created
+    // before any interleaved later work was visible.
+    test_insert_audio_job_fixture(
+        persistence,
+        ACCOUNT,
+        "planner-mic-0",
+        "planner-mic",
+        "mic",
+        0,
+        600,
+    )
+    .await?;
+    let frozen = persistence
+        .claim(
+            ACCOUNT,
+            MediaProcessingClass::Audio,
+            "2099-01-01T00:00:00.000Z",
+            300,
+            128,
+        )
+        .await?
+        .ok_or_else(|| EnclaveError::Store("one-member media fixture was not claimable".into()))?;
+    if frozen.jobs.len() != 1 || frozen.jobs[0].event_id != "planner-mic-0" {
+        return Err(EnclaveError::Store(
+            "one-member media fixture did not freeze its exact head".into(),
+        ));
+    }
+    persistence
+        .settle_failure(
+            &frozen,
+            None,
+            MediaFailureDisposition::RetryableBeforeEgress,
+            "vertex_daily_budget",
+            "2099-01-01T00:00:00.000Z",
+            MediaFailurePolicy {
+                max_attempts: 3,
+                budget_retry_seconds: 6 * 60 * 60,
+                resurrection_window_seconds: 7 * 24 * 60 * 60,
+            },
+        )
+        .await?;
+    let retry_remains_delayed = sqlx::query_scalar::<_, bool>(
+        "SELECT bool_and(job.updated_at>clock_timestamp()+interval '5 hours') \
+           FROM media_processing_jobs job \
+           JOIN media_work_members member \
+             ON member.account_id=job.account_id AND member.job_id=job.id \
+          WHERE job.account_id=$1 AND member.work_unit_id=$2",
+    )
+    .bind(ACCOUNT)
+    .bind(&frozen.work_unit_id)
+    .fetch_one(persistence.pool())
+    .await?;
+    if !retry_remains_delayed {
+        return Err(EnclaveError::Store(
+            "daily-budget retry did not retain its six-hour timestamp".into(),
+        ));
+    }
+
+    for (event_id, stream_id, stream_kind, sequence, offset) in [
+        ("planner-system-0", "planner-system", "system_audio", 0, 600),
+        ("planner-mic-1", "planner-mic", "mic", 1, 540),
+        ("planner-system-1", "planner-system", "system_audio", 1, 540),
+        ("planner-mic-2", "planner-mic", "mic", 2, 480),
+        ("planner-system-2", "planner-system", "system_audio", 2, 480),
+    ] {
+        test_insert_audio_job_fixture(
+            persistence,
+            ACCOUNT,
+            event_id,
+            stream_id,
+            stream_kind,
+            sequence,
+            offset,
+        )
+        .await?;
+    }
+    // Raising the baked limit does not rewrite the existing six-hour retry;
+    // the fixture makes it due explicitly before exercising reclaim.
+    sqlx::query(
+        "UPDATE media_processing_jobs SET updated_at=clock_timestamp()-interval '1 second' \
+          WHERE account_id=$1 AND id=ANY(SELECT job_id FROM media_work_members \
+            WHERE account_id=$1 AND work_unit_id=$2)",
+    )
+    .bind(ACCOUNT)
+    .bind(&frozen.work_unit_id)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_work_units SET updated_at=clock_timestamp()-interval '1 second' \
+          WHERE account_id=$1 AND id=$2",
+    )
+    .bind(ACCOUNT)
+    .bind(&frozen.work_unit_id)
+    .execute(persistence.pool())
+    .await?;
+
+    let reclaimed = persistence
+        .claim(
+            ACCOUNT,
+            MediaProcessingClass::Audio,
+            "2000-01-01T00:00:00.000Z",
+            300,
+            128,
+        )
+        .await?
+        .ok_or_else(|| EnclaveError::Store("persisted media work was not reclaimable".into()))?;
+    if reclaimed.work_unit_id != frozen.work_unit_id
+        || reclaimed.jobs.len() != 1
+        || reclaimed.jobs[0].event_id != "planner-mic-0"
+    {
+        return Err(EnclaveError::Store(
+            "upgrade reclaim expanded an already-persisted media work unit".into(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE media_processing_jobs SET state='succeeded',lease_owner=NULL,lease_token=NULL, \
+                lease_until=NULL,updated_at=clock_timestamp() \
+          WHERE account_id=$1 AND lease_token=$2",
+    )
+    .bind(ACCOUNT)
+    .bind(&reclaimed.claim_token)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_work_units SET state='succeeded',claim_token=NULL,claim_until=NULL, \
+                updated_at=clock_timestamp() \
+          WHERE account_id=$1 AND id=$2 AND claim_token=$3",
+    )
+    .bind(ACCOUNT)
+    .bind(&reclaimed.work_unit_id)
+    .bind(&reclaimed.claim_token)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_objects SET processing_state='ready' \
+          WHERE account_id=$1 AND event_id='planner-mic-0'",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+
+    let regrouped = persistence
+        .claim(
+            ACCOUNT,
+            MediaProcessingClass::Audio,
+            "2000-01-01T00:00:00.000Z",
+            300,
+            128,
+        )
+        .await?
+        .ok_or_else(|| EnclaveError::Store("unbound interleaved work was not claimable".into()))?;
+    if regrouped.jobs.len() != 3
+        || regrouped
+            .jobs
+            .iter()
+            .any(|job| job.stream_id != "planner-system")
+    {
+        return Err(EnclaveError::Store(
+            "new media work did not group one stream across interleaved rows".into(),
+        ));
+    }
+    sqlx::query("DELETE FROM accounts WHERE id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn test_expire_media_claim(
     persistence: &PostgresPersistence,
     claim: &MediaProcessingClaim,
@@ -2638,6 +3046,7 @@ pub(super) async fn test_stage_media_provider_success(
 pub(super) async fn test_real_pg_media_provider_deletion_contract(
     persistence: &PostgresPersistence,
 ) -> Result<()> {
+    test_persisted_media_work_upgrade_contract(persistence).await?;
     use crate::{
         cp::vertex::{VertexMetadata, VertexOperation},
         persistence::{

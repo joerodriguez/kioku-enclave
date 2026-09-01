@@ -1279,6 +1279,7 @@ def runtime_config(configuration: dict[str, str], profile: str) -> dict[str, str
         "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64",
         "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
         "POSTGRES_MAX_CONNECTIONS", "HEALTH_PORT", "DRAIN_TIMEOUT_SECONDS", "ENCLAVE_TLS",
+        "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
     ):
         mapping[name] = name
     values: dict[str, str] = {}
@@ -1987,7 +1988,7 @@ def create_release_evidence(
             "release evidence requires an explicit reconciliation model and compiled producer contract"
         )
     metadata: dict[str, object] = {
-        "schema_version": 12,
+        "schema_version": 13,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -2012,6 +2013,13 @@ def create_release_evidence(
         "health_port": configuration["HEALTH_PORT"],
         "drain_timeout_seconds": configuration["DRAIN_TIMEOUT_SECONDS"],
         "tls_mode": "shared-secret-manager",
+        "quota_vertex_output_tokens_per_day": configuration[
+            "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY"
+        ],
+        "quota_vertex_output_reset_policy": "per-account-utc-calendar-day",
+        "quota_vertex_output_class_shares": (
+            "non-borrowing-percent:audio=50,screen=25,derived=25"
+        ),
     }
     if metadata_path.exists():
         raise PipelineError("refusing to overwrite release metadata")
@@ -2045,6 +2053,8 @@ def create_release_evidence(
         "--expected-vertex-reconciliation-model", reconciliation_model,
         "--expected-vertex-location", configuration["VERTEX_LOCATION"],
         "--expected-reconciliation-producer-contract-sha256", producer_contract,
+        "--expected-quota-vertex-output-tokens-per-day",
+        configuration["QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY"],
     ]
     run(verify_command, capture=True)
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
