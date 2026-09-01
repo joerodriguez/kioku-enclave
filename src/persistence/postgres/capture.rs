@@ -1762,7 +1762,12 @@ impl CaptureRepository for PostgresPersistence {
         let mut new_count = 0usize;
         let mut duplicate_count = 0usize;
         let mut committed_through_sequence = -1;
-        for (manifest, digest) in command.events.iter().zip(&command.manifest_digests) {
+        for (index, (manifest, digest)) in command
+            .events
+            .iter()
+            .zip(&command.manifest_digests)
+            .enumerate()
+        {
             let result = insert_event(
                 &mut transaction,
                 &CaptureCommit {
@@ -1776,7 +1781,8 @@ impl CaptureRepository for PostgresPersistence {
                     committed_at: command.committed_at.clone(),
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| error.for_capture_reference_batch_item(index, manifest.sequence))?;
             committed_through_sequence = result.committed_through_sequence;
             if result.duplicate {
                 duplicate_count += 1;

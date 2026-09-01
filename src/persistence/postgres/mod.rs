@@ -508,7 +508,7 @@ mod tests {
     };
     use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
-    use crate::error::EnclaveError;
+    use crate::error::{CaptureReferenceFailureReason, EnclaveError};
     use crate::gcs::FakeGcs;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
@@ -522,9 +522,9 @@ mod tests {
         FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
         McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
         MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
-        PushProviderOutcome, RecordingRetentionChangeRequest, ScreenMediaSettlement,
-        ScreenshotMediaLocator, SummaryWindowSettlement, VertexInvocationAdmission,
-        WebhookProviderOutcome, WebhookSubscription,
+        PushProviderOutcome, RecordingRetentionChangeRequest, ReferenceBatchCommit,
+        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
+        VertexInvocationAdmission, WebhookProviderOutcome, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
     use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
@@ -1362,6 +1362,57 @@ mod tests {
             dedupe_version: 1,
         });
         let reference_digest = crate::cp::media::manifest_digest(&reference).unwrap();
+
+        let mut first_batch_reference = reference.clone();
+        first_batch_reference.event_id = "capture-contract-batch-1".into();
+        let mut invalid_second_reference = reference.clone();
+        invalid_second_reference.event_id = "capture-contract-batch-2".into();
+        invalid_second_reference.sequence = 2;
+        invalid_second_reference.source_monotonic_ns = 3000;
+        invalid_second_reference
+            .reference
+            .as_mut()
+            .unwrap()
+            .canonical_event_id = "capture-contract-missing-canonical".into();
+        let first_batch_digest = crate::cp::media::manifest_digest(&first_batch_reference).unwrap();
+        let invalid_second_digest =
+            crate::cp::media::manifest_digest(&invalid_second_reference).unwrap();
+        let batch_error = repositories
+            .captures()
+            .commit_reference_batch(ReferenceBatchCommit {
+                account_id: account_id.clone(),
+                events: vec![first_batch_reference, invalid_second_reference],
+                manifest_digests: vec![first_batch_digest, invalid_second_digest],
+                committed_at: "2026-08-27T12:00:03.500Z".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            batch_error,
+            EnclaveError::CaptureReferenceBatch {
+                reason: CaptureReferenceFailureReason::CanonicalUnavailable,
+                index: 1,
+                sequence: 2,
+            }
+        ));
+        for event_id in ["capture-contract-batch-1", "capture-contract-batch-2"] {
+            assert!(repositories
+                .captures()
+                .event_status(&account_id, event_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            repositories
+                .captures()
+                .stream_ack(&account_id, "screen-contract")
+                .await
+                .unwrap(),
+            0,
+            "the invalid second item must roll back the valid first item"
+        );
+
         let referenced = repositories
             .captures()
             .commit_event(CaptureCommit {
