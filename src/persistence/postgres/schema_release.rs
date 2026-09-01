@@ -360,6 +360,55 @@ SELECT
                 WHERE table_schema=current_schema()
                   AND table_name='persistence_schema'
                   AND column_name='expanded_through_version')
+AND to_regclass('public.persistence_schema_releases') IS NULL
+AND to_regclass('public.persistence_schema_release_steps') IS NULL
+AND NOT EXISTS(
+    SELECT 1 FROM pg_class relation
+    JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+    WHERE namespace.nspname=current_schema()
+      AND (relation.relname LIKE 'memory\_%' ESCAPE '\'
+        OR relation.relname LIKE 'active\_episode\_members%' ESCAPE '\'
+        OR relation.relname LIKE 'episode_members_memory_source_%'
+        OR relation.relname LIKE 'capture_sessions_reconciliation_%'
+        OR relation.relname LIKE 'capture_events_reconciliation_%'))
+AND NOT EXISTS(
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema=current_schema() AND table_name='episodes'
+       AND column_name='structure_state')
+AND NOT EXISTS(
+    SELECT 1 FROM pg_constraint constraint_state
+     WHERE (constraint_state.conrelid='episodes'::regclass
+            AND constraint_state.conname LIKE 'episodes_structure_state_%')
+        OR (constraint_state.conrelid='vertex_usage_events'::regclass
+            AND constraint_state.conname='vertex_usage_events_operation_check_v26'))
+AND NOT EXISTS(
+    SELECT 1 FROM pg_trigger trigger_state
+     WHERE NOT trigger_state.tgisinternal
+       AND trigger_state.tgname IN (
+            'accounts_install_memory_archive','episodes_maintain_structure_state',
+            'episodes_install_active_memory_handle','episodes_retire_deleted_memory',
+            'episode_members_project_active'))
+AND NOT EXISTS(
+    SELECT 1 FROM pg_proc function_state
+    JOIN pg_namespace namespace ON namespace.oid=function_state.pronamespace
+    WHERE namespace.nspname=current_schema()
+      AND function_state.proname IN (
+            'install_memory_archive_for_account','install_active_memory_handle',
+            'maintain_episode_structure_state','project_active_episode_member',
+            'retire_deleted_memory'))
+"#;
+
+// The real-PG activation contract runs in a disposable sibling schema after
+// the main contract has populated `public`. Its test-only admission check must
+// therefore scope every collision to that disposable schema. This string is
+// deliberately not a member of the frozen production CONTRACT_PARTS.
+#[cfg(test)]
+const ISOLATED_TEST_PRISTINE_V26_PREFLIGHT_SQL: &str = r#"
+SELECT
+    NOT EXISTS(SELECT 1 FROM information_schema.columns
+                WHERE table_schema=current_schema()
+                  AND table_name='persistence_schema'
+                  AND column_name='expanded_through_version')
 AND to_regclass(format('%I.%I',current_schema(),'persistence_schema_releases')) IS NULL
 AND to_regclass(format('%I.%I',current_schema(),'persistence_schema_release_steps')) IS NULL
 AND NOT EXISTS(
@@ -402,6 +451,11 @@ AND NOT EXISTS(
 "#;
 
 const CONTRACT_MANIFEST_VERSION: &str = "kioku-postgresql-memory-reconciliation-v26-online-v3";
+// This is the immutable contract published by v0.9.16 and persisted in the
+// production schema-26 release ledger. Later readers must remain byte-exact.
+#[cfg(test)]
+const FROZEN_V26_CONTRACT_SHA256: &str =
+    "sha256:86209b864b975a6cb70d1f3520853d45880e8952f862bd67f27d9048b6acb232";
 const CONTRACT_PARTS: &[&str] = &[
     CONTRACT_MANIFEST_VERSION,
     RELEASE_LEDGER_SQL,
@@ -1295,6 +1349,25 @@ async fn verify_existing_release_ledger(
     verify_existing_release_ledger_mode(connection, expected_contract, false).await
 }
 
+async fn pristine_v26_preflight(connection: &mut PgConnection) -> Result<bool> {
+    #[cfg(test)]
+    {
+        let schema = sqlx::query_scalar::<_, String>("SELECT current_schema()")
+            .fetch_one(&mut *connection)
+            .await?;
+        if schema.starts_with("kioku_activation_") {
+            return Ok(
+                sqlx::query_scalar::<_, bool>(ISOLATED_TEST_PRISTINE_V26_PREFLIGHT_SQL)
+                    .fetch_one(&mut *connection)
+                    .await?,
+            );
+        }
+    }
+    Ok(sqlx::query_scalar::<_, bool>(PRISTINE_V26_PREFLIGHT_SQL)
+        .fetch_one(connection)
+        .await?)
+}
+
 async fn bootstrap_or_verify_release_ledger(
     connection: &mut PgConnection,
     expected_contract: &[u8],
@@ -1311,9 +1384,7 @@ async fn bootstrap_or_verify_release_ledger(
     .fetch_one(&mut *connection)
     .await?;
     if state == (false, false, false) {
-        let pristine = sqlx::query_scalar::<_, bool>(PRISTINE_V26_PREFLIGHT_SQL)
-            .fetch_one(&mut *connection)
-            .await?;
+        let pristine = pristine_v26_preflight(connection).await?;
         if !pristine {
             return Err(EnclaveError::Config(
                 "v26 catalog names are not pristine before release-ledger bootstrap".into(),
@@ -2676,6 +2747,7 @@ mod tests {
     #[test]
     fn schema_contract_hash_binds_every_release_fragment() {
         assert_eq!(contract_digest().len(), 32);
+        assert_eq!(sha256_label(&contract_digest()), FROZEN_V26_CONTRACT_SHA256);
         assert!(CONTRACT_PARTS.contains(&LEGACY_MEMBERSHIP_INDEX_SQL));
         assert!(CONTRACT_PARTS.contains(&CAPTURE_SESSIONS_INDEX_SQL));
         assert!(CONTRACT_PARTS.contains(&EXPAND_RECEIPT_SQL));
