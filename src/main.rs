@@ -736,6 +736,17 @@ fn main() {
 
 async fn async_main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--audit-postgres-aggregates") {
+        let result = audit_postgres_aggregates(&args).await;
+        match result {
+            Ok(report) => println!("{report}"),
+            Err(error) => {
+                eprintln!("{{\"error\":\"{}\"}}", error.as_str());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--migrate-postgres") {
         migrate_postgres_release_schema().await;
         return;
@@ -1332,6 +1343,78 @@ async fn async_main() {
                 .expect("server error");
         }
         None => panic!("production startup refused: in-enclave TLS is not configured"),
+    }
+}
+
+async fn audit_postgres_aggregates(
+    args: &[String],
+) -> Result<String, persistence::AggregateAuditFailure> {
+    validate_postgres_aggregate_audit_arguments(args)?;
+    let since = std::env::var("POSTGRES_AUDIT_SINCE")
+        .map_err(|_| persistence::AggregateAuditFailure::MissingConfiguration)?;
+    persistence::parse_postgres_audit_since(&since)?;
+    let database_url = std::env::var("POSTGRES_DATABASE_URL")
+        .map_err(|_| persistence::AggregateAuditFailure::MissingConfiguration)?;
+    let root_ca_pem = std::env::var("POSTGRES_ROOT_CA_PEM")
+        .ok()
+        .map(String::into_bytes);
+    let persistence = persistence::PostgresPersistence::connect(persistence::PostgresPoolConfig {
+        database_url,
+        root_ca_pem,
+        max_connections: 1,
+        acquire_timeout: std::time::Duration::from_secs(10),
+        statement_timeout: std::time::Duration::from_secs(15),
+    })
+    .await
+    .map_err(|_| persistence::AggregateAuditFailure::PostgresUnavailable)?;
+    let report = persistence.aggregate_audit(&since).await?;
+    serde_json::to_string(&report).map_err(|_| persistence::AggregateAuditFailure::AuditFailed)
+}
+
+fn validate_postgres_aggregate_audit_arguments(
+    args: &[String],
+) -> Result<(), persistence::AggregateAuditFailure> {
+    if args.len() == 2 && args[1] == "--audit-postgres-aggregates" {
+        Ok(())
+    } else {
+        Err(persistence::AggregateAuditFailure::InvalidArguments)
+    }
+}
+
+#[cfg(test)]
+mod postgres_aggregate_audit_cli_tests {
+    use super::validate_postgres_aggregate_audit_arguments;
+    use crate::persistence::AggregateAuditFailure;
+
+    #[test]
+    fn audit_cli_has_one_exact_flag_and_no_arbitrary_input_surface() {
+        assert_eq!(
+            validate_postgres_aggregate_audit_arguments(&[
+                "kioku-enclave".into(),
+                "--audit-postgres-aggregates".into(),
+            ]),
+            Ok(())
+        );
+        for refused in [
+            vec!["kioku-enclave".into()],
+            vec!["kioku-enclave".into(), "--audit-postgres-aggregate".into()],
+            vec![
+                "kioku-enclave".into(),
+                "--audit-postgres-aggregates".into(),
+                "SELECT 1".into(),
+            ],
+            vec![
+                "kioku-enclave".into(),
+                "--audit-postgres-aggregates".into(),
+                "--account".into(),
+                "example".into(),
+            ],
+        ] {
+            assert_eq!(
+                validate_postgres_aggregate_audit_arguments(&refused),
+                Err(AggregateAuditFailure::InvalidArguments)
+            );
+        }
     }
 }
 

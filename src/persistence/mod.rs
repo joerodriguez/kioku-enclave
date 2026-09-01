@@ -107,11 +107,12 @@ pub(crate) use oauth::{
 };
 pub(crate) use playback::PlaybackRepository;
 pub(crate) use postgres::{
-    verify_memory_reconciliation_activation_authorization,
-    verify_schema_finalization_authorization, MemoryReconciliationActivationReceipt,
-    MemoryReconciliationActivationSignature, PostgresPersistence, PostgresPoolConfig,
-    SchemaFinalizationReceipt, SchemaFinalizationSignature,
-    VerifiedMemoryReconciliationActivationReceipt, VerifiedSchemaFinalizationReceipt,
+    parse_postgres_audit_since, verify_memory_reconciliation_activation_authorization,
+    verify_schema_finalization_authorization, AggregateAuditFailure,
+    MemoryReconciliationActivationReceipt, MemoryReconciliationActivationSignature,
+    PostgresPersistence, PostgresPoolConfig, SchemaFinalizationReceipt,
+    SchemaFinalizationSignature, VerifiedMemoryReconciliationActivationReceipt,
+    VerifiedSchemaFinalizationReceipt,
 };
 pub(crate) use query::{
     extract_speaker_filter, rrf_merge, CaptureStatus, EpisodeListPage, EpisodeListRequest,
