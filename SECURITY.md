@@ -82,7 +82,8 @@ successors.
 The standard rollout uses one immutable activation-capable image. Its built-in migrator installs
 and backfills v27, then the normal deployment process makes that same image homogeneous while the
 database remains `Installed`. Fresh signed receipts advance `Draining` and `Active`. The selected
-configuration, image assembler, and schema-12 metadata bind model/location/producer identity but
+configuration, image assembler, and schema-13 metadata bind model/location/producer identity and
+the exact per-account UTC-calendar-day Vertex quota with non-borrowing class shares, but
 contain no writer Boolean or tag-specific capability rule.
 A v27 install is transactionally refused while any v26 episode-deletion receipt is pending, or
 while a completed v26 receipt names orphan events whose stream/sequence/digest coordinates were not
@@ -315,9 +316,10 @@ The exhaustive release gate must include:
 - a non-skippable real PostgreSQL 17 contract run;
 - RustSec audit, SBOM generation, and fixed-policy vulnerability scan;
 - exact OCI archive quarantine and registry digest readback;
-- canonical schema-12 metadata binding required serving-schema verification, explicit
-  reconciliation model/location, compiled producer digest, and detached evidence
-  signature verification.
+- canonical schema-13 metadata binding required serving-schema verification, explicit
+  reconciliation model/location, compiled producer digest, the reviewed Vertex quota/reset/share
+  policy, and detached evidence signature verification. The exact v0.9.18 predecessor is readable
+  only through a frozen schema-12 state path that cannot admit new releases.
 
 Compatible runtime releases follow ADR-0041: predecessor/candidate KMS admission, staged canary,
 independent availability monitoring, at least two ready PostgreSQL-backed members with zero

@@ -119,7 +119,7 @@ to that source. The pipeline:
 5. creates the SPDX SBOM and vulnerability scan before cloud authentication;
 6. copies the scanned OCI bytes into a private unlinked read-only quarantine;
 7. promotes only those bytes and verifies the registry digest;
-8. emits canonical schema-12 release metadata and build evidence.
+8. emits canonical schema-13 release metadata and build evidence.
 
 `build-evidence.json` is frozen after build and scan, before any cloud authentication. The
 documented `push --resume` invocation reconstructs its build/scan timestamps from the immutable
@@ -130,10 +130,13 @@ resumed backward as a build.
 
 The release metadata binds source/tag/image digest, the live media bucket, KMS coordinates,
 PostgreSQL authority, required serving-schema verification, fleet connection budget, health/drain
-values, shared TLS, explicit reconciliation model/location, and compiled producer-contract SHA-256. Image assembly independently recomputes
+values, shared TLS, explicit reconciliation model/location, compiled producer-contract SHA-256,
+and the exact `2621440`-token per-account UTC-calendar-day Vertex output quota with non-borrowing
+50/25/25 audio/screen/derived shares. Image assembly independently recomputes
 that contract and rejects a supplied label mismatch. The schema-verification claim is a fixed source
 invariant, not copied from operator configuration.
-Earlier metadata that described removed storage authority is ineligible for new promotion.
+The exact v0.9.18 predecessor remains readable only through its frozen schema-12 state-verification
+path. Schema 12 and earlier metadata are ineligible for new promotion.
 
 ## Permanently activate memory reconciliation
 
@@ -141,8 +144,9 @@ Use one ordinary signed release image and the existing release, migration, and s
 processes. There is no activation-specific Python/Terraform operator, second tag, alternate binary,
 or runtime feature flag.
 
-1. Build, verify, sign, and publish the normal immutable release. Its schema-12 evidence must bind
-   the exact reconciliation model, Vertex location, and compiled producer digest. Do not roll it
+1. Build, verify, sign, and publish the normal immutable release. Its schema-13 evidence must bind
+   the exact reconciliation model, Vertex location, compiled producer digest, and reviewed Vertex
+   output quota/reset/share policy. Do not roll it
    yet; first audit `episode_deletions` while the predecessor fleet still serves schema 26. Finish
    every `pending` receipt. The v27 install also refuses a `complete` v26 receipt whose
    `orphan_event_ids` array is nonempty: v26 did not retain the deleted event's stream, sequence,
@@ -164,6 +168,12 @@ or runtime feature flag.
    `memory-reconciliation-v27-backfill` until the content-free result reports the bounded formation
    backfill complete. The durable phase is now `Installed`, marker 26 remains visible, and the
    predecessor stays schema-compatible throughout this step.
+
+   Raising the immutable quota does not rewrite or wake existing `vertex_daily_budget` retries;
+   their already-persisted retry timestamp remains authoritative (normally up to six hours). Wait
+   for those jobs to become due and be reclaimed through the normal worker path. Before advancing
+   to `Active`, perform a content-free live audit proving no material pre-egress/not-billed retry
+   amplification and enough remaining non-borrowing Derived slots for the activation backlog.
 
    The installer serializes with every v27-capable writer using the exclusive activation release
    advisory lock before it probes or creates objects, and also locks `episode_deletions` before the

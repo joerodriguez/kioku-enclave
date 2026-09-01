@@ -930,12 +930,19 @@ def _verify_bundle(
     *,
     image_repository: str,
     allow_frozen_v0_9_16_schema_11_state: bool = False,
+    allow_frozen_v0_9_18_schema_12_state: bool = False,
 ) -> dict[str, Any]:
     public, fingerprint = _public_key()
+    if allow_frozen_v0_9_16_schema_11_state and allow_frozen_v0_9_18_schema_12_state:
+        fail("only one frozen enclave evidence schema may be selected")
     legacy_arguments = (
         ("--allow-frozen-v0-9-16-schema-11-state",)
         if allow_frozen_v0_9_16_schema_11_state
-        else ()
+        else (
+            ("--allow-frozen-v0-9-18-schema-12-state",)
+            if allow_frozen_v0_9_18_schema_12_state
+            else ()
+        )
     )
     result = _run(
         (
@@ -1468,6 +1475,7 @@ def state(destination: str) -> Mapping[str, Any]:
         digest,
         image_repository=image_repository,
         allow_frozen_v0_9_16_schema_11_state=tag == "v0.9.16",
+        allow_frozen_v0_9_18_schema_12_state=tag == "v0.9.18",
     )
     registry_digest = _registry_digest(image_repository, tag, registry_reader)
     if registry_digest != digest:

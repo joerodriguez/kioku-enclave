@@ -22,7 +22,7 @@ DIGEST = "sha256:" + "b" * 64
 
 def metadata() -> dict[str, object]:
     return {
-        "schema_version": 12,
+        "schema_version": 13,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": TAG,
         "source_commit": COMMIT,
@@ -47,6 +47,11 @@ def metadata() -> dict[str, object]:
         "health_port": "8081",
         "drain_timeout_seconds": "105",
         "tls_mode": "shared-secret-manager",
+        "quota_vertex_output_tokens_per_day": "2621440",
+        "quota_vertex_output_reset_policy": "per-account-utc-calendar-day",
+        "quota_vertex_output_class_shares": (
+            "non-borrowing-percent:audio=50,screen=25,derived=25"
+        ),
     }
 
 
@@ -64,6 +69,7 @@ def arguments() -> argparse.Namespace:
         expected_vertex_reconciliation_model="gemini-reconciliation-v1",
         expected_vertex_location="us-central1",
         expected_reconciliation_producer_contract_sha256="sha256:" + "c" * 64,
+        expected_quota_vertex_output_tokens_per_day="2621440",
     )
 
 
@@ -77,10 +83,10 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(verifier.parse_metadata_bytes(encoded), document)
 
     def test_legacy_schemas_and_authority_fields_are_ineligible(self) -> None:
-        for schema in (4, 7, 8, 9, 10, 11):
+        for schema in (4, 7, 8, 9, 10, 11, 12):
             document = metadata()
             document["schema_version"] = schema
-            with self.assertRaisesRegex(SystemExit, "schema_version must be 12"):
+            with self.assertRaisesRegex(SystemExit, "schema_version must be 13"):
                 verifier.validate_shape(document)
 
     def test_frozen_v0_9_16_state_shape_cannot_follow_current_schema_growth(self) -> None:
@@ -95,6 +101,9 @@ class ReleaseMetadataTests(unittest.TestCase):
             "vertex_reconciliation_model",
             "vertex_location",
             "reconciliation_producer_contract_sha256",
+            "quota_vertex_output_tokens_per_day",
+            "quota_vertex_output_reset_policy",
+            "quota_vertex_output_class_shares",
         ):
             document.pop(field)
         encoded = (
@@ -121,6 +130,37 @@ class ReleaseMetadataTests(unittest.TestCase):
             document[extra] = "obsolete"
             with self.assertRaisesRegex(SystemExit, "missing or unexpected"):
                 verifier.validate_shape(document)
+
+    def test_frozen_v0_9_18_schema_twelve_is_exact_state_only(self) -> None:
+        document = metadata()
+        document["schema_version"] = 12
+        document["source_ref"] = "v0.9.18"
+        document["image_uri"] = f"{IMAGE_REPOSITORY}:v0.9.18"
+        document["release_url"] = (
+            "https://github.com/owner/repository/releases/tag/v0.9.18"
+        )
+        for field in (
+            "quota_vertex_output_tokens_per_day",
+            "quota_vertex_output_reset_policy",
+            "quota_vertex_output_class_shares",
+        ):
+            document.pop(field)
+        encoded = (
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        parsed = verifier.parse_frozen_v0_9_18_metadata_bytes(encoded)
+        frozen_arguments = arguments()
+        frozen_arguments.tag = "v0.9.18"
+        verifier.validate_frozen_v0_9_18_state(frozen_arguments, parsed)
+
+        mixed = dict(document)
+        mixed["quota_vertex_output_tokens_per_day"] = "2621440"
+        with self.assertRaisesRegex(SystemExit, "missing or unexpected"):
+            verifier.parse_frozen_v0_9_18_metadata_bytes(
+                (json.dumps(mixed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            )
+        with self.assertRaisesRegex(SystemExit, "schema_version must be 13"):
+            verifier.validate_shape(document)
 
     def test_source_image_media_and_kms_bindings_are_exact(self) -> None:
         mutations = {
@@ -152,6 +192,24 @@ class ReleaseMetadataTests(unittest.TestCase):
                 document[field] = value
                 with self.assertRaisesRegex(SystemExit, "reviewed serving invariant"):
                     verifier.validate(arguments(), document)
+
+    def test_vertex_quota_metadata_is_exact_and_policy_bound(self) -> None:
+        for field, value in (
+            ("quota_vertex_output_tokens_per_day", "1310720"),
+            ("quota_vertex_output_tokens_per_day", 2621440),
+            ("quota_vertex_output_reset_policy", "rolling-24-hours"),
+            ("quota_vertex_output_class_shares", "borrowing"),
+        ):
+            with self.subTest(field=field, value=value):
+                document = metadata()
+                document[field] = value
+                with self.assertRaises(SystemExit):
+                    verifier.validate(arguments(), document)
+
+        unreviewed_arguments = arguments()
+        unreviewed_arguments.expected_quota_vertex_output_tokens_per_day = "2621441"
+        with self.assertRaises(SystemExit):
+            verifier.validate(unreviewed_arguments, metadata())
 
     def test_reconciliation_image_identity_is_exact_and_typed(self) -> None:
         mutations = {

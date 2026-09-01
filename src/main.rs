@@ -126,6 +126,7 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "HEALTH_PORT",
     "DRAIN_TIMEOUT_SECONDS",
     "ENCLAVE_TLS",
+    "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
 ];
 
 /// Load the allowlisted image configuration assembled by the final Docker

@@ -767,7 +767,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn('"schema_version": 12', source)
+        self.assertIn('"schema_version": 13', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
@@ -793,6 +793,7 @@ class LocalImagePipelineTests(unittest.TestCase):
             runtime["SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"],
             values["PRODUCTION_SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256"],
         )
+        self.assertEqual(runtime["QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY"], "2621440")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("RUN --mount=type=secret,id=kioku-config,required", dockerfile)
         self.assertNotIn("ENV KMS_PROJECT=${KMS_PROJECT}", dockerfile)
@@ -821,6 +822,11 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("for required in $allowed_keys; do", assembler_source)
         self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64", assembler_keys)
         self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256", assembler_keys)
+        self.assertIn("QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY", assembler_keys)
+        self.assertIn(
+            'test "$(value QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY)" = 2621440',
+            assembler_source,
+        )
         self.assertIn('sha256sum "$key_tmp"', assembler_source)
         for obsolete in (
             "PERSISTENCE_BACKEND",
@@ -1544,6 +1550,41 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(output.read_bytes(), encoded)
             self.assertEqual(__import__("stat").S_IMODE(output.stat().st_mode), 0o600)
+
+            for label, quota_bytes in (
+                ("missing", b""),
+                ("leading-zero", b"02621440"),
+                ("unreviewed", b"1310720"),
+                ("signed", b"+2621440"),
+            ):
+                mutated = b"".join(
+                    (
+                        b""
+                        if label == "missing"
+                        else b"QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=" + quota_bytes + b"\n"
+                    )
+                    if line.startswith(b"QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY=")
+                    else line
+                    for line in encoded.splitlines(keepends=True)
+                )
+                mutated_source = directory / f"quota-{label}.env"
+                mutated_output = directory / f"quota-{label}.out"
+                mutated_source.write_bytes(mutated)
+                mutated_source.chmod(0o600)
+                mutated_result = subprocess.run(
+                    [
+                        str(SCRIPTS / "assemble_image_config.sh"),
+                        str(mutated_source),
+                        str(mutated_output),
+                        __import__("hashlib").sha256(mutated).hexdigest(),
+                        str(producer_contract_helper),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(mutated_result.returncode, 0, label)
+                self.assertFalse(mutated_output.exists(), label)
 
             # Zero is an intentional, hash-bound closed-signup value, not an
             # omitted budget or an unlimited sentinel.

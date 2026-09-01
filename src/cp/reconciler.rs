@@ -33,19 +33,19 @@ const PROMPT_VERSION: i64 = 1;
 const PARTITION_SCHEMA_VERSION: i64 = 1;
 const VALIDATOR_VERSION: i64 = 1;
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
-const MAX_COHORT_DRAFTS: i64 = 32;
+pub(crate) const MAX_COHORT_DRAFTS: i64 = 32;
 const MAX_COHORT_ATOMS: i64 = 4_000;
 // A single reconciliation may never create more active leaves than the
 // memory-handle resolver can traverse. Keep this tied to the 32-predecessor
 // topology/storage bound instead of maintaining an independent fanout value.
-const MAX_OUTPUTS: usize = MAX_COHORT_DRAFTS as usize;
+pub(crate) const MAX_OUTPUTS: usize = MAX_COHORT_DRAFTS as usize;
 const MAX_TITLE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 4_000;
 const MAX_GIST_CHARS: usize = 800;
 const MAX_CONTEXT_CHARS: usize = 1_200;
 const MAX_CONTEXT_TOTAL_CHARS: usize = 256 * 1_024;
 const MAX_MODEL_INPUT_BYTES: usize = 1_024 * 1_024;
-const RECONCILIATION_OUTPUT_TOKENS: u32 = 8_192;
+pub(crate) const RECONCILIATION_OUTPUT_TOKENS: u32 = 8_192;
 const CLAIM_LEASE_SECONDS: i64 = 5 * 60;
 const MODEL_ATTEMPTS_BEFORE_CONSERVATIVE_KEEP: i64 = 3;
 const CONSERVATIVE_MODEL: &str = "conservative-v1";

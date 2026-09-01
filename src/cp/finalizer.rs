@@ -16,7 +16,7 @@ use tracing::{info, warn};
 // canonical screen from one holistic episode-analysis call.
 pub(crate) const FINALIZATION_VERSION: i32 = 5;
 const MAX_EPISODE_ANALYSIS_INPUT_BYTES: usize = 512 * 1024;
-const FINALIZER_MAX_OUTPUT_TOKENS: u32 = 8_192;
+pub(crate) const FINALIZER_MAX_OUTPUT_TOKENS: u32 = 8_192;
 const MAX_FINALIZATION_ATTEMPTS: i64 = 3;
 // Per-screen head bound for OCR text in the unified analysis input (shared
 // with the deterministic capture-log tests).
