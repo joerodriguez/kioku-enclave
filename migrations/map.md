@@ -84,3 +84,36 @@ receipted expand declared compatible by the candidate.
   fingerprint, and `clock_timestamp()` receipt, then flips only
   `persistence_schema.version` to 26. A confirmation literal alone cannot
   finalize.
+- `0027_memory_reconciliation_activation.sql` installs the collision-refusing,
+  append-only activation authority, durable bounded drain/backfill ledgers,
+  exact per-session formation revisions, provisional finish receipts, and
+  trigger-verified capture seal/reopen generations plus content-free deleted
+  sequence tombstones used to qualify topology publication without losing late
+  offline evidence or permitting erased source resurrection. Six exact
+  `persistence_feature_episode_deletion_*` companions make arbitrarily large
+  episode deletion keyset-paged and restartable: provider-object acknowledgement
+  precedes bounded member/source purge, canonical-family references are
+  tombstoned and removed before their root, and every affected formation session
+  is refreshed before terminal closure. Install refuses
+  every still-pending v26 episode-deletion receipt and every completed v26
+  receipt with orphan event IDs but no retained stream/sequence/digest
+  coordinates. Those rows require authoritative restoration/reconstruction or
+  the fleet remains dark; tombstones and watermarks are never guessed. The
+  installer takes the exclusive activation release advisory lock before its
+  existence probe and a table lock before those deletion preflights; every
+  v27-capable writer takes the shared advisory counterpart before its own probe.
+  Durable revision-bound formation pages freeze exact provider requests and
+  attempt identities, while bounded providerless neighborhood discovery plus a
+  distinct verification pass must reproduce the same ordered commitment/count
+  before an oversized KEEP can become ready. The otherwise cold-object-only
+  install keeps marker 26. The signed `Draining` transaction first requires zero
+  legacy pending deletion receipts, then atomically attaches exact legacy-
+  finalization, paged-deletion, media/formation-claim, and pending-owner guards;
+  paged receipts cannot start during Installed. `Active` alone
+  advances marker 27 after generation-bound backfill/claim-drain and exact-zero-
+  claim checks. Sticky assignments, producer-bound stage companions, and
+  append-only pause/resume generations make activation forward-only. Every
+  signed event durably stores its candidate fleet image digest;
+  Draining-to-Active and Active/Paused transitions preserve it exactly, while
+  Paused-to-Draining may establish a freshly proved homogeneous fleet for the
+  next cycle.

@@ -4,6 +4,7 @@
 //! connection or SQL callback. PostgreSQL is the sole structured-state
 //! authority; GCS remains behind the media-object port for encrypted bytes.
 
+mod activation;
 mod admission;
 mod billing;
 mod capture;
@@ -30,6 +31,10 @@ mod work;
 
 use std::sync::Arc;
 
+pub(crate) use activation::{
+    ActiveReconciliationAuthority, MemoryReconciliationActivationPhase,
+    MemoryReconciliationActivationRepository, MemoryReconciliationActivationStatus,
+};
 pub(crate) use admission::{AdmissionRepository, FleetAdmissionLease};
 pub(crate) use billing::BillingRepository;
 pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics};
@@ -52,9 +57,9 @@ pub(crate) use episode_deletion::{
     EpisodeDeletionPlan, EpisodeDeletionRepository, EpisodeDeletionStart,
 };
 pub(crate) use finalization::{
-    FinalizationClaim, FinalizationClaimRequest, FinalizationEpisode, FinalizationRepository,
-    FinalizationRequest, FinalizationScreenResult, FinalizationScreenshot, FinalizationSettlement,
-    FinalizationUtterance,
+    FinalizationClaim, FinalizationClaimRequest, FinalizationEgressGuard, FinalizationEpisode,
+    FinalizationRepository, FinalizationRequest, FinalizationScreenResult, FinalizationScreenshot,
+    FinalizationSettlement, FinalizationUtterance,
 };
 pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
@@ -62,24 +67,36 @@ pub use lifecycle::AccountDeletionOperation;
 pub(crate) use lifecycle::AccountLifecycleRepository;
 pub(crate) use media_object::MediaObjectStore;
 pub(crate) use media_processing::{
-    is_owner_source_audio, is_supported_self_identification, names_form_refinement,
-    prefer_claimed_display_name, AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim,
-    MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository, MediaScreenProjection,
-    MediaUsageSettlement, ScreenMediaSettlement,
+    is_owner_source_audio, is_supported_self_identification, media_provider_attempt_identity,
+    names_form_refinement, prefer_claimed_display_name, AudioMediaSettlement,
+    MediaFailureDisposition, MediaFailurePolicy, MediaPersonEvidence, MediaProcessingClaim,
+    MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository, MediaProviderAttempt,
+    MediaProviderStagedResponse, MediaScreenProjection, MediaUsageSettlement,
+    ScreenMediaSettlement, MAX_MEDIA_PROVIDER_ATTEMPTS, MAX_MEDIA_PROVIDER_JOURNAL_BYTES,
+    MAX_MEDIA_PROVIDER_RESPONSE_BYTES,
 };
 pub(crate) use memory_formation::{
-    EpisodeEmbeddingSource, EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode,
-    SummaryScreenshot, SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,
+    capture_formation_response_schema_v1, parse_capture_formation_provider_response,
+    CaptureFormationClaim, CaptureFormationProviderRequest, CaptureFormationProviderResponse,
+    CaptureFormationRetryDisposition, CaptureFormationSettlement, EpisodeEmbeddingSource,
+    EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode, SummaryScreenshot,
+    SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,
+    CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS, CAPTURE_FORMATION_PROVIDER_REQUEST_MAX_BYTES,
+    CAPTURE_FORMATION_SCREENSHOT_PAGE_SIZE, CAPTURE_FORMATION_UTTERANCE_PAGE_SIZE,
 };
 pub(crate) use memory_reconciliation::{
-    reconciliation_outputs_commitment, MemoryHandleResolution, MemoryHandleState,
-    MemoryReconciliationRepository, ReconciledMemoryWrite, ReconciliationClaim,
-    ReconciliationDraft, ReconciliationEvidenceAtom, ReconciliationPublish,
-    ReconciliationPublishResult, ReconciliationSnapshot, ReconciliationStageWrite,
-    StagedReconciliation,
+    oversized_keep_policy_commitment, reconciliation_outputs_commitment,
+    reconciliation_provider_attempt_identity, MemoryHandleResolution, MemoryHandleState,
+    MemoryReconciliationRepository, OversizedKeepPromotionPolicy, OversizedKeepPromotionResult,
+    ReconciledMemoryWrite, ReconciliationClaim, ReconciliationDraft, ReconciliationEgressGuard,
+    ReconciliationEvidenceAtom, ReconciliationPublish, ReconciliationPublishResult,
+    ReconciliationSnapshot, ReconciliationStageWrite, StagedReconciliation,
+    MAX_OVERSIZED_KEEP_SOURCES, OVERSIZED_KEEP_MODEL, OVERSIZED_KEEP_SOURCE_PAGE_SIZE,
 };
 pub(crate) use model_usage::{
-    ClaimedVertexCoverage, ClaimedVertexUsageBatch, ModelUsageRepository,
+    vertex_attempt_event_id, vertex_invocation_fingerprint, ClaimedVertexCoverage,
+    ClaimedVertexUsageBatch, ModelUsageRepository, VertexInvocationAdmission,
+    VertexInvocationAttempt,
 };
 pub(crate) use notification::NotificationRepository;
 pub use notification::{PushInstallation, WebhookSubscription};
@@ -90,8 +107,11 @@ pub(crate) use oauth::{
 };
 pub(crate) use playback::PlaybackRepository;
 pub(crate) use postgres::{
-    verify_schema_finalization_authorization, PostgresPersistence, PostgresPoolConfig,
-    SchemaFinalizationReceipt, SchemaFinalizationSignature, VerifiedSchemaFinalizationReceipt,
+    verify_memory_reconciliation_activation_authorization,
+    verify_schema_finalization_authorization, MemoryReconciliationActivationReceipt,
+    MemoryReconciliationActivationSignature, PostgresPersistence, PostgresPoolConfig,
+    SchemaFinalizationReceipt, SchemaFinalizationSignature,
+    VerifiedMemoryReconciliationActivationReceipt, VerifiedSchemaFinalizationReceipt,
 };
 pub(crate) use query::{
     extract_speaker_filter, rrf_merge, CaptureStatus, EpisodeListPage, EpisodeListRequest,
@@ -136,6 +156,7 @@ pub(crate) struct RepositorySet {
     media_objects: Arc<dyn MediaObjectStore>,
     media_processing: Arc<dyn MediaProcessingRepository>,
     memory_formation: Arc<dyn MemoryFormationRepository>,
+    memory_reconciliation_activation: Arc<dyn MemoryReconciliationActivationRepository>,
     memory_reconciliation: Arc<dyn MemoryReconciliationRepository>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
@@ -164,6 +185,8 @@ impl RepositorySet {
             media_objects,
             media_processing: Arc::clone(&persistence) as Arc<dyn MediaProcessingRepository>,
             memory_formation: Arc::clone(&persistence) as Arc<dyn MemoryFormationRepository>,
+            memory_reconciliation_activation: Arc::clone(&persistence)
+                as Arc<dyn MemoryReconciliationActivationRepository>,
             memory_reconciliation: Arc::clone(&persistence)
                 as Arc<dyn MemoryReconciliationRepository>,
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
@@ -249,6 +272,12 @@ impl RepositorySet {
 
     pub(crate) fn memory_reconciliation(&self) -> &dyn MemoryReconciliationRepository {
         self.memory_reconciliation.as_ref()
+    }
+
+    pub(crate) fn memory_reconciliation_activation(
+        &self,
+    ) -> &dyn MemoryReconciliationActivationRepository {
+        self.memory_reconciliation_activation.as_ref()
     }
 
     pub(crate) fn model_usage(&self) -> &dyn ModelUsageRepository {

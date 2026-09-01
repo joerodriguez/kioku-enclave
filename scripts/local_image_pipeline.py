@@ -1275,7 +1275,7 @@ def runtime_config(configuration: dict[str, str], profile: str) -> dict[str, str
         "BILLING_SERVICE_URL", "BILLING_SERVICE_AUDIENCE", "BILLING_ENFORCEMENT_MODE",
         "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_UID", "REVIEWER_AUTH_EMAIL", "VERTEX_PROJECT",
         "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_RECONCILIATION_MODEL",
-        "MEMORY_RECONCILIATION_WRITER_ENABLED",
+        "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256",
         "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64",
         "SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256",
         "POSTGRES_MAX_CONNECTIONS", "HEALTH_PORT", "DRAIN_TIMEOUT_SECONDS", "ENCLAVE_TLS",
@@ -1975,8 +1975,19 @@ def create_release_evidence(
     voice_quality_gate = run(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
+    reconciliation_model = configuration.get("VERTEX_RECONCILIATION_MODEL", "")
+    producer_contract = configuration.get(
+        "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256", ""
+    )
+    if (
+        not reconciliation_model
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", producer_contract)
+    ):
+        raise PipelineError(
+            "release evidence requires an explicit reconciliation model and compiled producer contract"
+        )
     metadata: dict[str, object] = {
-        "schema_version": 11,
+        "schema_version": 12,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -1987,6 +1998,9 @@ def create_release_evidence(
         "build_profile": "production",
         "voice_quality_gate": voice_quality_gate,
         "billing_enforcement_mode": configuration["BILLING_ENFORCEMENT_MODE"],
+        "vertex_reconciliation_model": reconciliation_model,
+        "vertex_location": configuration["VERTEX_LOCATION"],
+        "reconciliation_producer_contract_sha256": producer_contract,
         "gcs_media_bucket": configuration["ENCLAVE_GCS_MEDIA_BUCKET"],
         "kms_project": configuration["ENCLAVE_KMS_PROJECT"],
         "kms_location": configuration["ENCLAVE_KMS_LOCATION"],
@@ -2028,6 +2042,9 @@ def create_release_evidence(
         "--expected-kms-location", configuration["ENCLAVE_KMS_LOCATION"],
         "--expected-kms-key-ring", configuration["ENCLAVE_KMS_KEY_RING"],
         "--expected-kms-key", configuration["ENCLAVE_KMS_KEY"],
+        "--expected-vertex-reconciliation-model", reconciliation_model,
+        "--expected-vertex-location", configuration["VERTEX_LOCATION"],
+        "--expected-reconciliation-producer-contract-sha256", producer_contract,
     ]
     run(verify_command, capture=True)
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

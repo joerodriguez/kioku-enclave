@@ -170,9 +170,21 @@ browser-v1 manifests remain replay-compatible, but new clients always send the e
 consent bit.
 
 `session_finished` is optional (false by default) and valid only on audio. A client sets
-it on its final durable, gracefully completed audio event. Acceptance atomically records
-the exact capture session as ended; byte-identical replay remains idempotent. A separate
-session-finish request may accelerate that fact but is not the durable boundary.
+it on its last currently known durable audio event. Acceptance atomically records a
+provisional finish request for the exact capture session; byte-identical replay remains
+idempotent. The server continues to accept a trailing event or stream from the same
+device/install while the request is quieting. After four hours of database-receipt and
+media-work silence it appends an exact per-stream seal generation. A genuinely novel
+late event still reopens that generation under the account source lock, while preserving
+the old seal audit, and starts a new quiet interval; it is never wedged solely because the
+device was offline longer than the quiet horizon. The separate session-finish request
+records the same provisional intent and is not an immutable source boundary. If episode
+deletion erases an accepted source event, the server retains only a content-free sequence
+tombstone: acknowledgements and seal contiguity remain exact, but neither that event ID nor
+its stream/sequence coordinate can ever be uploaded again as live evidence. An exact retry whose
+event ID, original manifest digest, stream, and sequence all match the tombstone is acknowledged as
+an idempotent duplicate with the current stream watermark so a client can clear a lost-ack outbox
+item; any changed digest/scope or a different event reusing the deleted coordinate is rejected.
 
 `recording_retention` is optional, audio-only, and strict. It contains exactly the four
 server-issued fields shown above. The recording lease response also includes client-local
@@ -618,13 +630,23 @@ holds its forward-only cursor over otherwise-empty spans while their failures ar
 the ladder's first rounds, so a transiently failed session can still resolve to `ready`
 or an honest `no_memory` without any client action. Once the cursor honestly passes an
 ended session with no materialized memory, its stage is `no_memory` even if internal
-per-item failure records remain. Recoveries after a memory already formed, or after the
-hold rounds, enrich search but do not reopen summarization.
+per-item failure records remain. A newly accepted or newly materialized source increments
+that session's durable formation revision. If the forward cursor has already passed it,
+the exact-session lane classifies the new revision (including an explicit `no_memory` or
+already-accounted outcome) without backdating or rewriting a previously published memory;
+genuinely unowned late evidence forms a new draft. Immediately before either formation lane sends
+plaintext to the model, PostgreSQL revalidates and renews the exact durable claim beyond the bounded
+provider timeout, then revalidates every requested projection, any supplied open-memory context,
+and the canonical capture family under the episode-deletion lock. Missing or pending-deletion
+evidence performs no provider call. While that renewed claim is live, episode deletion refuses to
+begin; settlement repeats the projection existence and deletion-family guard before any episode or
+member mutation.
 
 `POST /api/v2/capture/sessions/{capture_session_id}` is an idempotent completion
 acceleration. Native clients retry it only after all durable events for that session are
-accepted. Correctness and later finalization do not depend on this request because the
-final accepted audio manifest carries `session_finished=true`.
+accepted. It records the same provisional finish request as an accepted audio manifest
+with `session_finished=true`; neither call rejects a later offline outbox item merely
+because a prior quiet seal was reached.
 
 ## Screenshot evidence bytes
 
@@ -662,26 +684,31 @@ authoritative evidence returns `503 {"error":"enclave_unavailable"}`.
 
 Authenticated `DELETE /api/episodes/{id}` returns the deleted utterance, screenshot, and
 unreferenced audio-segment counts plus the utterance and screenshot local source keys. For a new
-deletion, one tenant-qualified PostgreSQL transaction locks the episode, inventories its exact
-member IDs, source keys, now-orphaned capture events, and live-media object names, freezes episode
-finalization, and records an immutable pending plan and replayable response. Structured rows are
-not physically removed before external media cleanup. Segments and capture events that still have
-non-target references are excluded from the purge.
+deletion, a tenant-qualified PostgreSQL transaction freezes the episode and records an immutable
+pending receipt. On a signed post-Installed fleet, exact member, canonical/reference-family,
+session, source-coordinate, and live-media inventories advance through durable keyset-bounded
+pages with rolling content-free commitments; there is no permanent episode-size cap. Capture
+families with non-target owners are classified as survivors. New references, owners, formation
+claims, or media egress that intersect an orphan-classified family are refused under the same
+activation/account lock order. Structured rows are not physically removed before external media
+cleanup.
 
-The route deletes and verifies every current and noncurrent GCS generation for each exact object
-name in that PostgreSQL plan. Only after every object is absent does a second transaction lock and
-revalidate the durable plan, delete the episode and its inventoried structured rows, and mark the
-receipt complete. A successful request returns `200` with `{"deleted":true,...}`. Repeating a
-completed request returns the persisted receipt without another provider call; a never-present
-episode returns `404`.
+The route deletes and verifies every current and noncurrent GCS generation for each exact bounded
+object-name page before acknowledging that page. Only after every object is absent may bounded
+member purge, accepted-sequence tombstone, reference-before-canonical source purge, formation
+refresh, and exact closure advance. The episode is removed only at terminal closure. A successful
+request returns `200` with `{"deleted":true,...}`. Repeating a completed request returns the
+persisted receipt without another provider call; a never-present episode returns `404`.
 
 Preparation failure returns `503 {"error":"enclave_unavailable"}`. Object cleanup or
 transactional completion failure returns
 `503 {"error":"media_delete_failed","deletion_pending":true}`—the episode API does not use
-`202`. The durable plan remains pending, so another `DELETE` resumes the same idempotent work and a
-restart-safe reconciler also scans immediately and every 30 seconds, processing at most 32 pending
-plans per scan in durable update/account/episode order. No response claims completion while an
-inventoried object generation or the transactional structured purge remains outstanding.
+`202`. The durable plan remains pending, so another `DELETE` resumes the same idempotent bounded
+page and a restart-safe reconciler also scans immediately and every 30 seconds, processing at most
+32 pending plans per scan in durable update/account/episode order. Internal inventory/purge pages
+also use this truthful `deletion_pending` response until closure. No response claims completion
+while an inventoried object generation, source coordinate, session refresh, or structured purge
+remains outstanding.
 
 ## Finalized-episode webhooks
 

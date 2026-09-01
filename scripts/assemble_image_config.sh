@@ -8,6 +8,7 @@ set -eu
 input=${1:?missing secret input}
 output=${2:?missing output}
 expected_sha256=${3:?missing CONFIG_SHA256}
+producer_contract_helper=${4:-/build/target/x86_64-unknown-linux-musl/release/kioku-enclave}
 case "$expected_sha256" in
   ''|*[!0-9a-f]*) exit 1 ;;
 esac
@@ -24,7 +25,7 @@ test ! -e "$tmp"
 test ! -L "$tmp"
 (set -C; : > "$tmp")
 
-allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL VERTEX_RECONCILIATION_MODEL MEMORY_RECONCILIATION_WRITER_ENABLED SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64 SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256 POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS'
+allowed_keys='KIOKU_BUILD_PROFILE KMS_PROJECT KMS_LOCATION KMS_KEY_RING KMS_KEY GCS_MEDIA_BUCKET RUN_SA_EMAIL ENCLAVE_AUDIENCE ATTEST_STS_AUDIENCE GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID APPLE_MACOS_CLIENT_ID APPLE_WEB_CLIENT_ID APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID ADMIN_USER_IDS SIGNUP_LIMIT_PER_DAY BASE_URL WEB_ORIGIN BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL VERTEX_RECONCILIATION_MODEL MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256 SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64 SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256 POSTGRES_MAX_CONNECTIONS HEALTH_PORT DRAIN_TIMEOUT_SECONDS ENCLAVE_TLS'
 allowed=" $allowed_keys "
 seen=' '
 while IFS= read -r line || test -n "$line"; do
@@ -83,7 +84,24 @@ test "${#vertex_model}" -le 128
 reconciliation_model=$(value VERTEX_RECONCILIATION_MODEL)
 case "$reconciliation_model" in *[!A-Za-z0-9._:-]*) exit 1 ;; esac
 test "${#reconciliation_model}" -le 128
-case "$(value MEMORY_RECONCILIATION_WRITER_ENABLED)" in ''|false) ;; *) exit 1 ;; esac
+producer_contract=$(value MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256)
+if test -n "$reconciliation_model"; then
+  case "$producer_contract" in sha256:*) ;; *) exit 1 ;; esac
+  producer_hex=${producer_contract#sha256:}
+  case "$producer_hex" in *[!0-9a-f]*|'') exit 1 ;; esac
+  test "${#producer_hex}" -eq 64
+  test -x "$producer_contract_helper"
+  computed_contract=$(
+    "$producer_contract_helper" --print-memory-reconciliation-producer-contract \
+      "$reconciliation_model" "$(value VERTEX_LOCATION)"
+  )
+  test "$computed_contract" = "$producer_contract"
+else
+  test -z "$producer_contract"
+fi
+if test "$profile" = production; then
+  test -n "$reconciliation_model"
+fi
 schema_public_key=$(value SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64)
 case "$schema_public_key" in MCowBQYDK2VwAyEA*) ;; *) exit 1 ;; esac
 case "$schema_public_key" in *[!A-Za-z0-9+/=]*|'') exit 1 ;; esac

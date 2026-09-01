@@ -3,6 +3,7 @@
 //! Serving startup selects this complete implementation as one authority. It
 //! never constructs a readable or writable legacy SQLite/GCS authority.
 
+mod activation;
 mod admission;
 mod billing;
 mod capture;
@@ -35,12 +36,23 @@ use crate::error::{EnclaveError, Result};
 #[cfg(test)]
 use schema_release::SchemaReleaseStatus;
 pub(crate) use schema_release::{
-    verify_schema_finalization_authorization, SchemaFinalizationReceipt,
-    SchemaFinalizationSignature, VerifiedSchemaFinalizationReceipt,
+    verify_memory_reconciliation_activation_authorization,
+    verify_schema_finalization_authorization, MemoryReconciliationActivationReceipt,
+    MemoryReconciliationActivationSignature, SchemaFinalizationReceipt,
+    SchemaFinalizationSignature, VerifiedMemoryReconciliationActivationReceipt,
+    VerifiedSchemaFinalizationReceipt,
 };
 
 pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 26;
+pub(crate) const MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION: i64 = 27;
 const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 24;
+
+// The two real-PostgreSQL contract tests deliberately exercise the same
+// production session-scoped release lock. Rust may schedule those tests in
+// parallel, so serialize only their release setup while leaving the product
+// lock fail-closed and independently covered by the concurrency fixtures.
+#[cfg(test)]
+static POSTGRES_RELEASE_CONTRACT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InstalledSchemaState {
@@ -201,7 +213,7 @@ impl PostgresPersistence {
         let mut transaction = self.pool.begin().await?;
         advisory_transaction_lock(&mut transaction, "schema", "adr-0040").await?;
         let installed = sqlx::query_scalar::<_, bool>(
-            "SELECT to_regclass('public.persistence_schema') IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I',current_schema(),'persistence_schema')) IS NOT NULL",
         )
         .fetch_one(&mut *transaction)
         .await?;
@@ -487,16 +499,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use sha2::{Digest, Sha256};
     use sqlx::Row;
 
     use super::{
-        advisory_transaction_lock, classify_serving_schema, InstalledSchemaState,
+        advisory_transaction_lock, classify_serving_schema, media_processing, InstalledSchemaState,
         PostgresPersistence, PostgresPoolConfig, SchemaReleaseStatus, ServingSchemaState,
         EXPECTED_SCHEMA_VERSION, MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
     };
     use crate::cp::media::AudioTurn;
     use crate::cp::vertex::{VertexMetadata, VertexOperation, VertexUsage};
+    use crate::error::EnclaveError;
     use crate::gcs::FakeGcs;
     use crate::persistence::identity::{AccountStatus, AppleAccountGrant};
     use crate::persistence::oauth::{
@@ -509,10 +521,9 @@ mod tests {
         FinalizationRequest, FinalizationScreenResult, FinalizationSettlement, FrozenEmailDelivery,
         FrozenPushDelivery, FrozenWebhookDelivery, McpContextRequest, McpTimeRangeRequest,
         McpTranscriptSearchRequest, MediaProcessingClass, MediaScreenProjection,
-        MediaUsageSettlement, MemoryFeedRequest, MemoryHandleState, PeopleListRequest,
-        PushInstallation, PushProviderOutcome, ReconciledMemoryWrite, ReconciliationPublish,
-        ReconciliationPublishResult, ReconciliationStageWrite, RecordingRetentionChangeRequest,
-        ScreenMediaSettlement, ScreenshotMediaLocator, SummaryWindowSettlement,
+        MediaUsageSettlement, MemoryFeedRequest, PeopleListRequest, PushInstallation,
+        PushProviderOutcome, RecordingRetentionChangeRequest, ScreenMediaSettlement,
+        ScreenshotMediaLocator, SummaryWindowSettlement, VertexInvocationAdmission,
         WebhookProviderOutcome, WebhookSubscription,
     };
     use crate::persistence::{GcsMediaObjectStore, MediaObjectStore, RepositorySet};
@@ -533,6 +544,7 @@ mod tests {
                 return None;
             }
         };
+        let _release_contract_guard = super::POSTGRES_RELEASE_CONTRACT_MUTEX.lock().await;
         let persistence = PostgresPersistence::connect(PostgresPoolConfig {
             database_url,
             root_ca_pem: None,
@@ -543,7 +555,7 @@ mod tests {
         .await
         .unwrap();
         let schema_was_installed = sqlx::query_scalar::<_, bool>(
-            "SELECT to_regclass('public.persistence_schema') IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I',current_schema(),'persistence_schema')) IS NOT NULL",
         )
         .fetch_one(persistence.pool())
         .await
@@ -581,9 +593,12 @@ mod tests {
                 .expand_memory_reconciliation_release_schema()
                 .await
                 .unwrap_err();
-            assert!(refused
-                .to_string()
-                .contains("repair any source assigned to more than one legacy episode"));
+            assert!(
+                refused
+                    .to_string()
+                    .contains("repair any source assigned to more than one legacy episode"),
+                "unexpected duplicate-source preflight error: {refused}"
+            );
             assert_eq!(
                 sqlx::query_as::<_, (i64, bool, bool, String)>(
                     "SELECT version, \
@@ -743,7 +758,11 @@ mod tests {
             );
             persistence.verify_schema().await.unwrap();
             assert!(persistence
-                .verify_reconciliation_writer_schema()
+                .verify_reconciliation_runtime_schema(
+                    Some("test-model"),
+                    "us-central1",
+                    Some(&[0_u8; 32]),
+                )
                 .await
                 .is_err());
             let mut invalid_fleet_receipt = super::schema_release::test_finalization_receipt();
@@ -778,7 +797,11 @@ mod tests {
                 SchemaReleaseStatus::Finalized
             );
             persistence
-                .verify_reconciliation_writer_schema()
+                .verify_reconciliation_runtime_schema(
+                    Some("test-model"),
+                    "us-central1",
+                    Some(&[0_u8; 32]),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -1401,13 +1424,18 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        media
-            .record_reservation(&screen_claim, 1_024, "2026-08-27T12:00:06.000Z")
-            .await
-            .unwrap();
+        let screen_attempt = media_processing::test_stage_media_provider_success(
+            persistence.as_ref(),
+            &screen_claim,
+            1_024,
+        )
+        .await
+        .unwrap();
+        let screen_usage_event_id = screen_attempt.event_id.clone();
         media
             .settle_usage(MediaUsageSettlement {
                 claim: screen_claim.clone(),
+                provider_attempt: screen_attempt.clone(),
                 usage: serde_json::json!({
                     "work_unit_id": screen_claim.work_unit_id,
                     "reservation_state": "reserved",
@@ -1429,6 +1457,7 @@ mod tests {
         media
             .settle_screens(ScreenMediaSettlement {
                 claim: screen_claim.clone(),
+                provider_attempt: screen_attempt.clone(),
                 results: vec![screen_projection.clone()],
             })
             .await
@@ -1438,6 +1467,7 @@ mod tests {
         media
             .settle_screens(ScreenMediaSettlement {
                 claim: screen_claim,
+                provider_attempt: screen_attempt,
                 results: vec![screen_projection],
             })
             .await
@@ -1579,11 +1609,11 @@ mod tests {
             episode_ids
         );
 
-        // Exercise the complete PostgreSQL reconciliation protocol on a
-        // separate tenant: two drafts thirty minutes apart become one active
-        // successor, the paid/validated mutation is staged before publication,
-        // and both old handles remain durable redirects while disappearing
-        // from ordinary discovery.
+        // The activation-capable candidate must remain dark while the durable
+        // v27 contract is absent. Even source-settled drafts on schema 26 must
+        // not be claimed or sent to the reconciliation provider. The isolated
+        // v27 contract below exercises the active protocol after a signed
+        // transition.
         let reconciliation_account_id = "reconciliation-contract-account".to_owned();
         sqlx::query(
             "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
@@ -1628,141 +1658,19 @@ mod tests {
         .await
         .unwrap();
         let reconciliation = repositories.memory_reconciliation();
-        let snapshot = reconciliation
-            .next_source_settled_cohort(
-                &reconciliation_account_id,
-                "2026-08-27T20:00:00.000Z",
-                32,
-                4_000,
-            )
-            .await
-            .unwrap()
-            .expect("source-settled reconciliation cohort");
-        assert_eq!(snapshot.predecessor_episode_ids, vec![1, 2]);
-        let claim = reconciliation
-            .claim_reconciliation(&snapshot, "2026-08-27T20:00:01.000Z", 900)
-            .await
-            .unwrap()
-            .expect("reconciliation claim");
-        let partition = serde_json::json!({
-            "memories": [{
-                "predecessor_episode_ids": [1, 2],
-                "member_source_ids": ["screenshot:1", "screenshot:2"]
-            }]
-        });
-        let result_commitment = Sha256::digest(serde_json::to_vec(&partition).unwrap()).to_vec();
-        let staged = reconciliation
-            .stage_reconciliation(
-                &claim,
-                ReconciliationStageWrite {
-                    normalized_partition: partition,
-                    result_commitment: result_commitment.clone(),
-                    planned_outputs: vec![ReconciledMemoryWrite {
-                        output_ordinal: 0,
-                        retained_episode_id: None,
-                        predecessor_episode_ids: vec![1, 2],
-                        started_at: "2026-08-27T10:00:00.000Z".into(),
-                        ended_at: "2026-08-27T10:31:00.000Z".into(),
-                        episode_type: Some("work".into()),
-                        title: "Combined topic".into(),
-                        summary: Some("Both recordings covered one objective.".into()),
-                        participants: Vec::new(),
-                        languages: Vec::new(),
-                        action_items: Vec::new(),
-                        model: Some("conservative-v1".into()),
-                        minute_summaries: serde_json::json!([]),
-                        minutes_text: None,
-                        substance: "normal".into(),
-                        visual_evidence: "useful".into(),
-                        member_source_ids: vec!["screenshot:1".into(), "screenshot:2".into()],
-                    }],
-                    model: "conservative-v1".into(),
-                    vertex_event_id: None,
-                    reconciliation_version: 1,
-                    prompt_version: 1,
-                    partition_schema_version: 1,
-                    validator_version: 1,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(staged.planned_outputs[0].title, "Combined topic");
-        let published = reconciliation
-            .publish_reconciliation(ReconciliationPublish {
-                claim,
-                reconciliation_id: "rec-postgres-contract-merge".into(),
-                cohort_started_at: snapshot.cohort_started_at.clone(),
-                cohort_ended_at: snapshot.cohort_ended_at.clone(),
-                result_commitment,
-            })
-            .await
-            .unwrap();
-        let successor_ids = match published {
-            ReconciliationPublishResult::Published {
-                successor_episode_ids,
-                archive_revision,
-            } => {
-                assert_eq!(archive_revision, 1);
-                successor_episode_ids
-            }
-            ReconciliationPublishResult::Replayed { .. } => {
-                panic!("first reconciliation publication unexpectedly replayed")
-            }
-        };
-        assert_eq!(successor_ids, vec![3]);
-        for predecessor in [1_i64, 2_i64] {
-            let resolution = reconciliation
-                .resolve_memory_handle(&reconciliation_account_id, predecessor, 32)
+        assert!(
+            reconciliation
+                .next_source_settled_cohort(
+                    &reconciliation_account_id,
+                    4 * 60 * 60,
+                    None,
+                    32,
+                    4_000,
+                )
                 .await
-                .unwrap();
-            assert_eq!(resolution.state, MemoryHandleState::Superseded);
-            assert_eq!(resolution.active_episode_ids, vec![3]);
-            assert_eq!(resolution.archive_revision, 1);
-        }
-        let active_resolution = reconciliation
-            .resolve_memory_handle(&reconciliation_account_id, 3, 32)
-            .await
-            .unwrap();
-        assert_eq!(active_resolution.state, MemoryHandleState::Active);
-        let reconciled_page = repositories
-            .memory_queries()
-            .list_episodes(
-                &reconciliation_account_id,
-                &EpisodeListRequest {
-                    from: None,
-                    to: None,
-                    limit: 10,
-                    include_low: true,
-                    episode_id: None,
-                    before_started_at: None,
-                    before_id: None,
-                    probe_for_more: false,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(reconciled_page.archive_revision, 1);
-        assert_eq!(reconciled_page.episodes.len(), 1);
-        assert_eq!(reconciled_page.episodes[0]["id"], 3);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM memory_reconciliation_stages WHERE account_id=$1",
-            )
-            .bind(&reconciliation_account_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT state FROM memory_reconciliation_jobs WHERE account_id=$1",
-            )
-            .bind(&reconciliation_account_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            "complete"
+                .unwrap()
+                .is_none(),
+            "schema-26 candidate must keep reconciliation dark"
         );
         sqlx::query("DELETE FROM accounts WHERE id=$1")
             .bind(&reconciliation_account_id)
@@ -1819,14 +1727,14 @@ mod tests {
         let finalization = repositories.finalization();
         assert_eq!(
             finalization
-                .request_finalization(&account_id, episode_ids[0], 5, false)
+                .request_finalization(&account_id, episode_ids[0], 5)
                 .await
                 .unwrap(),
             FinalizationRequest::Queued
         );
         assert_eq!(
             finalization
-                .request_finalization(&account_id, episode_ids[0], 5, false)
+                .request_finalization(&account_id, episode_ids[0], 5)
                 .await
                 .unwrap(),
             FinalizationRequest::AlreadyQueued {
@@ -1837,11 +1745,9 @@ mod tests {
             .claim_finalization(crate::persistence::FinalizationClaimRequest {
                 account_id: &account_id,
                 target_episode_id: Some(episode_ids[0]),
-                now: "2026-08-27T20:00:00.000Z",
-                horizon_before: "2026-08-27T16:00:00.000Z",
+                quiet_horizon_seconds: 4 * 60 * 60,
                 finalization_version: 5,
                 lease_seconds: 900,
-                require_reconciled: false,
             })
             .await
             .unwrap()
@@ -1850,11 +1756,9 @@ mod tests {
             .claim_finalization(crate::persistence::FinalizationClaimRequest {
                 account_id: &account_id,
                 target_episode_id: Some(episode_ids[0]),
-                now: "2026-08-27T20:00:01.000Z",
-                horizon_before: "2026-08-27T16:00:00.000Z",
+                quiet_horizon_seconds: 4 * 60 * 60,
                 finalization_version: 5,
                 lease_seconds: 900,
-                require_reconciled: false,
             })
             .await
             .unwrap()
@@ -2088,25 +1992,77 @@ mod tests {
             )]
         );
 
+        // Coverage is created with the invocation, so reporting must use that
+        // durable row rather than sampling the wall clock again. Force the row
+        // across a month boundary to pin the regression deterministically.
+        let original_billing_period = sqlx::query_scalar::<_, String>(
+            "SELECT period FROM vertex_usage_coverage WHERE account_id=$1",
+        )
+        .bind(&account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let rollover_billing_period = sqlx::query_scalar::<_, String>(
+            "UPDATE vertex_usage_coverage \
+                SET period=to_char(to_date(period,'YYYY-MM')-interval '1 month','YYYY-MM'), \
+                    updated_at=updated_at-interval '1 month' \
+              WHERE account_id=$1 \
+              RETURNING period",
+        )
+        .bind(&account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (billing_period, billing_observed_at) = sqlx::query_as::<_, (String, String)>(
+            "SELECT period, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') \
+               FROM vertex_usage_coverage \
+              WHERE account_id=$1 \
+              ORDER BY updated_at DESC,period DESC \
+              LIMIT 1",
+        )
+        .bind(&account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(billing_period, rollover_billing_period);
         let coverage = repositories
             .billing()
-            .reconcile_vertex_coverage(&account_id, "2026-08", 1, 0, 0, "2026-08-27T12:00:00.000Z")
+            .reconcile_vertex_coverage(&account_id, &billing_period, 1, 0, 0, &billing_observed_at)
             .await
             .unwrap();
         assert_eq!(coverage.sequence, 1);
         assert!(repositories
             .billing()
-            .active_vertex_coverage_complete("2026-08")
+            .active_vertex_coverage_complete(&billing_period)
             .await
             .unwrap());
         let account_drivers = repositories
             .billing()
-            .account_driver_metrics(&account_id, "2026-08")
+            .account_driver_metrics(&account_id, &billing_period)
             .await
             .unwrap();
         assert!(account_drivers.storage_bytes > 0);
         assert_eq!(account_drivers.accepted_email_count, 0);
         assert!(account_drivers.vertex_coverage.unwrap().sequence >= coverage.sequence);
+        sqlx::query("DELETE FROM vertex_coverage_anchors WHERE account_id=$1 AND period=$2")
+            .bind(&account_id)
+            .bind(&billing_period)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE vertex_usage_coverage \
+                SET period=$3,updated_at=clock_timestamp() \
+              WHERE account_id=$1 AND period=$2",
+        )
+        .bind(&account_id)
+        .bind(&billing_period)
+        .bind(&original_billing_period)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         repositories
             .billing()
@@ -3679,13 +3635,117 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // Reclaiming an unresolved durable attempt makes ambiguity terminal.
+        // A late HTTP completion from the original owner must not overwrite it
+        // or authorize staging provider bytes.
+        let late_response_attempt = repositories
+            .model_usage()
+            .begin_invocation_attempt(
+                &account_id,
+                VertexOperation::EpisodeReconciliation,
+                "gemini-contract",
+                "us-central1",
+                &[0x31; 32],
+                &[0x41; 32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            late_response_attempt.admission,
+            VertexInvocationAdmission::Send
+        );
+        let reclaimed = repositories
+            .model_usage()
+            .begin_invocation_attempt(
+                &account_id,
+                VertexOperation::EpisodeReconciliation,
+                "gemini-contract",
+                "us-central1",
+                &[0x31; 32],
+                &[0x41; 32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reclaimed.admission,
+            VertexInvocationAdmission::AmbiguousTerminal
+        );
+        let late_response = repositories
+            .model_usage()
+            .settle_response(
+                &account_id,
+                &late_response_attempt.event_id,
+                &VertexMetadata {
+                    model_version: Some("gemini-contract".into()),
+                    traffic_type: Some("ON_DEMAND".into()),
+                    usage: Some(VertexUsage {
+                        prompt_details_present: true,
+                        cache_details_present: false,
+                        prompt_tokens: Some(1),
+                        input_text_tokens: Some(1),
+                        input_audio_tokens: Some(0),
+                        input_image_tokens: Some(0),
+                        cached_input_tokens: Some(0),
+                        cached_input_text_tokens: Some(0),
+                        cached_input_audio_tokens: Some(0),
+                        cached_input_image_tokens: Some(0),
+                        output_tokens: Some(1),
+                        tool_use_prompt_tokens: Some(0),
+                        thought_tokens: Some(0),
+                        total_tokens: Some(2),
+                    }),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(late_response, EnclaveError::Conflict(_)));
+
+        let late_not_billed_attempt = repositories
+            .model_usage()
+            .begin_invocation_attempt(
+                &account_id,
+                VertexOperation::EpisodeReconciliation,
+                "gemini-contract",
+                "us-central1",
+                &[0x32; 32],
+                &[0x42; 32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            late_not_billed_attempt.admission,
+            VertexInvocationAdmission::Send
+        );
+        let reclaimed = repositories
+            .model_usage()
+            .begin_invocation_attempt(
+                &account_id,
+                VertexOperation::EpisodeReconciliation,
+                "gemini-contract",
+                "us-central1",
+                &[0x32; 32],
+                &[0x42; 32],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reclaimed.admission,
+            VertexInvocationAdmission::AmbiguousTerminal
+        );
+        let late_not_billed = repositories
+            .model_usage()
+            .settle_not_billed(&account_id, &late_not_billed_attempt.event_id, 503)
+            .await
+            .unwrap_err();
+        assert!(matches!(late_not_billed, EnclaveError::Conflict(_)));
         let usage_claim = repositories
             .model_usage()
             .pending_events(&account_id, &billing_account, false)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(usage_claim.events.len(), 2);
+        assert_eq!(usage_claim.events.len(), 5);
         assert!(usage_claim
             .events
             .iter()
@@ -3694,6 +3754,18 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_id == finalization_event));
+        assert!(usage_claim.events.iter().any(|event| {
+            event.event_id == screen_usage_event_id
+                && event.operation == "screen_understanding"
+                && event.outcome == "usage_missing"
+                && event.http_status == Some(200)
+        }));
+        assert!(usage_claim.events.iter().any(|event| {
+            event.event_id == late_response_attempt.event_id && event.outcome == "ambiguous"
+        }));
+        assert!(usage_claim.events.iter().any(|event| {
+            event.event_id == late_not_billed_attempt.event_id && event.outcome == "ambiguous"
+        }));
         assert!(repositories
             .model_usage()
             .pending_events(&account_id, &billing_account, false)
@@ -5041,13 +5113,17 @@ mod tests {
             .await
             .unwrap()
             .expect("audio identity regression claim");
-        identity_media
-            .record_reservation(&audio_claim, 4_096, "2026-08-27T13:00:06.000Z")
-            .await
-            .unwrap();
+        let audio_attempt = media_processing::test_stage_media_provider_success(
+            persistence.as_ref(),
+            &audio_claim,
+            4_096,
+        )
+        .await
+        .unwrap();
         identity_media
             .settle_usage(MediaUsageSettlement {
                 claim: audio_claim.clone(),
+                provider_attempt: audio_attempt.clone(),
                 usage: serde_json::json!({
                     "work_unit_id": audio_claim.work_unit_id,
                     "reservation_state": "reserved",
@@ -5112,6 +5188,7 @@ mod tests {
         ];
         let audio_settlement = AudioMediaSettlement {
             claim: audio_claim,
+            provider_attempt: audio_attempt,
             turns,
         };
         identity_media
@@ -5147,5 +5224,7 @@ mod tests {
         .await
         .unwrap()
         .is_none());
+
+        super::activation::test_real_pg_activation_contract(&persistence).await;
     }
 }

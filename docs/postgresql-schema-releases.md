@@ -9,8 +9,8 @@ without publishing its standalone version-marker advance.
 
 ## Memory-reconciliation v26
 
-1. Build and verify the candidate with `MEMORY_RECONCILIATION_WRITER_ENABLED` empty or
-   `false`. Do not authorize the writer during this release.
+1. Build and verify the candidate. Schema v26 does not grant topology authority; no image-local
+   setting can activate reconciliation.
 2. Before preauthorizing the candidate fleet, run the digest-pinned migration job with
    `POSTGRES_MIGRATION_CONFIRM=memory-reconciliation-v26-expand`. The job owns a session advisory
    lock, but never holds a table lock across the release. An exact-absence preflight runs before
@@ -86,11 +86,9 @@ without publishing its standalone version-marker advance.
    advancing `version` to 26. Serving and writer admission reparse, recanonicalize, rehash, and
    reverify the persisted signature. The phase literal alone cannot finalize. This is the
    rollback boundary for the v24 predecessor.
-9. Complete predecessor retirement and steady-state verification. Reconciliation writer
-   activation requires a separate durable fleet-wide activation protocol observed by both dark
-   and enabled processes. This release deliberately rejects a true writer setting even at
-   finalized `26/26`; a later reviewed release must add the shared activation receipt and
-   in-flight-finalizer fence before topology publication can be enabled.
+9. Complete predecessor retirement and steady-state verification. Reconciliation activation
+   requires the separate durable v27 fleet-wide phase and in-flight-finalizer fence; finalized
+   `26/26` alone cannot enable topology publication.
 
 Both job phases are idempotent only for their exact contract, step/catalog receipts, signed fleet
 authorization, and baked trust anchor. Expand progress is durable, bounded, and safe to retry; a

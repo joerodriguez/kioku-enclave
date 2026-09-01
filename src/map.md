@@ -41,8 +41,7 @@ main.rs
   operations.
 - Serving members verify finalized PostgreSQL schema or an exact candidate-compatible v24-to-v26 expand;
   only the explicit one-shot migrator runs append-only DDL. Memory-reconciliation publication is
-  hard-dark in this release; a future durable fleet-wide activation receipt must fence both dark
-  and enabled finalizers before the writer can be admitted.
+  authorized only by the durable v27 phase; no process-local flag can enable it.
 - Fleet-wide claims, leases, reservations, and compare-and-set settlement precede provider effects.
   Stale workers cannot settle and ambiguous provider results are never blindly resent.
 - GCS objects are application-encrypted and bound to the owning account, purpose, canonical name,
@@ -53,6 +52,6 @@ main.rs
   current/noncurrent object generations and reports completion only after durable reconciliation.
 - Production readiness requires the exact PostgreSQL schema marker, embedded-contract receipt and
   physical catalog plus the process-immutable shared TLS generation. Reconciliation writing also
-  requires the persisted, hash-verified homogeneous-fleet finalization receipt. Liveness remains
+  requires the persisted, hash-verified homogeneous-fleet activation receipt and `Active` phase. Liveness remains
   process-local so ADR-0041 can rotate certificates or replace fleet members with zero unavailable
   capacity.

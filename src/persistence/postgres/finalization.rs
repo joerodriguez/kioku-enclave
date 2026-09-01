@@ -2,22 +2,36 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 
 use crate::{
     cp::{isotime, tokens},
     error::{EnclaveError, Result},
     persistence::{
-        FinalizationClaim, FinalizationClaimRequest, FinalizationEpisode, FinalizationRepository,
-        FinalizationRequest, FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
+        FinalizationClaim, FinalizationClaimRequest, FinalizationEgressGuard, FinalizationEpisode,
+        FinalizationRepository, FinalizationRequest, FinalizationScreenshot,
+        FinalizationSettlement, FinalizationUtterance,
     },
 };
 
-use super::{duration_seconds, PostgresPersistence};
+use super::{
+    activation::finalization_requires_reconciled, advisory_transaction_lock, duration_seconds,
+    PostgresPersistence,
+};
 
-fn timestamp(value: &str, field: &str) -> Result<i64> {
-    isotime::parse_epoch_millis(value)
-        .ok_or_else(|| EnclaveError::InvalidRequest(format!("{field} is invalid")))
+struct PostgresFinalizationEgressGuard {
+    transaction: Option<Transaction<'static, Postgres>>,
+}
+
+#[async_trait]
+impl FinalizationEgressGuard for PostgresFinalizationEgressGuard {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        let transaction = self.transaction.take().ok_or_else(|| {
+            EnclaveError::Store("finalization egress guard was already released".into())
+        })?;
+        transaction.commit().await?;
+        Ok(())
+    }
 }
 
 fn json_value(raw: Option<String>) -> Value {
@@ -61,7 +75,6 @@ impl FinalizationRepository for PostgresPersistence {
         account_id: &str,
         episode_id: i64,
         finalization_version: i64,
-        require_reconciled: bool,
     ) -> Result<FinalizationRequest> {
         if finalization_version <= 0 {
             return Err(EnclaveError::InvalidRequest(
@@ -69,6 +82,8 @@ impl FinalizationRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
+        let require_reconciled =
+            finalization_requires_reconciled(&mut transaction, account_id).await?;
         let row = sqlx::query(
             "SELECT substance,structure_state,finalized_at IS NOT NULL AS finalized,\
                     coalesce(finalization_version,0) AS version,finalization_status \
@@ -104,7 +119,7 @@ impl FinalizationRepository for PostgresPersistence {
         sqlx::query(
             "UPDATE episodes SET finalization_status='queued',finalization_error=NULL,\
                     finalization_attempt_count=0,finalization_next_attempt_at=NULL,\
-                    finalization_claim_token=NULL,finalization_claim_until=NULL,updated_at=now() \
+                    finalization_claim_token=NULL,finalization_claim_until=NULL,updated_at=clock_timestamp() \
               WHERE account_id=$1 AND id=$2",
         )
         .bind(account_id)
@@ -122,45 +137,45 @@ impl FinalizationRepository for PostgresPersistence {
         let FinalizationClaimRequest {
             account_id,
             target_episode_id,
-            now,
-            horizon_before,
+            quiet_horizon_seconds,
             finalization_version,
             lease_seconds,
-            require_reconciled,
         } = request;
-        let now_ms = timestamp(now, "finalization claim time")?;
-        let horizon_ms = timestamp(horizon_before, "finalization horizon")?;
-        if finalization_version <= 0 || !(1..=3_600).contains(&lease_seconds) {
+        if finalization_version <= 0
+            || !(1..=7 * 24 * 60 * 60).contains(&quiet_horizon_seconds)
+            || !(1..=3_600).contains(&lease_seconds)
+        {
             return Err(EnclaveError::InvalidRequest(
-                "finalization version or lease is invalid".into(),
+                "finalization version, quiet horizon, or lease is invalid".into(),
             ));
         }
         let token = tokens::new_uuid();
         let mut transaction = self.pool().begin().await?;
+        let require_reconciled =
+            finalization_requires_reconciled(&mut transaction, account_id).await?;
         let row = sqlx::query(
             "WITH candidate AS (\
                 SELECT e.id FROM episodes e JOIN accounts a ON a.id=e.account_id \
                  WHERE e.account_id=$1 AND a.status='active' AND e.substance!='none' \
                    AND e.finalization_status!='deleting' \
-                   AND (NOT $8::bool OR e.structure_state='reconciled') \
+                   AND (NOT $7::bool OR e.structure_state='reconciled') \
                    AND ($2::bigint IS NULL OR e.id=$2) \
-                   AND e.ended_at<to_timestamp($3::double precision/1000.0) \
+                   AND e.ended_at<clock_timestamp()-make_interval(secs=>$3) \
                    AND a.summarized_until>=e.ended_at+interval '4 hours' \
                    AND (e.finalization_claim_token IS NULL \
-                        OR e.finalization_claim_until<=to_timestamp($4::double precision/1000.0)) \
+                        OR e.finalization_claim_until<=clock_timestamp()) \
                    AND (e.finalized_at IS NULL \
-                        OR coalesce(e.finalization_version,0)<$5 \
+                        OR coalesce(e.finalization_version,0)<$4 \
                         OR e.finalized_identity_revision<e.identity_revision) \
                    AND ($2::bigint IS NOT NULL OR (e.finalization_status!='failed_terminal' \
                         AND (e.finalization_next_attempt_at IS NULL \
-                             OR e.finalization_next_attempt_at<=to_timestamp($4::double precision/1000.0)))) \
+                             OR e.finalization_next_attempt_at<=clock_timestamp()))) \
                  ORDER BY e.ended_at,e.id FOR UPDATE SKIP LOCKED LIMIT 1) \
-             UPDATE episodes e SET finalization_claim_token=$6,\
-                    finalization_claim_until=to_timestamp($4::double precision/1000.0)+\
-                        make_interval(secs=>$7),finalization_status='processing',\
+             UPDATE episodes e SET finalization_claim_token=$5,\
+                    finalization_claim_until=clock_timestamp()+\
+                        make_interval(secs=>$6),finalization_status='processing',\
                     finalization_error=NULL,finalization_attempted_at=\
-                        to_timestamp($4::double precision/1000.0),updated_at=\
-                        to_timestamp($4::double precision/1000.0) \
+                        clock_timestamp(),updated_at=clock_timestamp() \
                FROM candidate c WHERE e.account_id=$1 AND e.id=c.id \
              RETURNING e.id,floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms,\
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
@@ -172,8 +187,7 @@ impl FinalizationRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(target_episode_id)
-        .bind(horizon_ms)
-        .bind(now_ms)
+        .bind(quiet_horizon_seconds)
         .bind(finalization_version)
         .bind(&token)
         .bind(duration_seconds(std::time::Duration::from_secs(
@@ -306,13 +320,58 @@ impl FinalizationRepository for PostgresPersistence {
         }))
     }
 
+    async fn acquire_finalization_egress_guard(
+        &self,
+        claim: &FinalizationClaim,
+    ) -> Result<Option<Box<dyn FinalizationEgressGuard>>> {
+        if claim.account_id.trim().is_empty()
+            || claim.claim_token.trim().is_empty()
+            || claim.episode.id <= 0
+            || claim.input_identity_revision < 0
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "finalization provider-egress claim is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        let require_reconciled =
+            finalization_requires_reconciled(&mut transaction, &claim.account_id).await?;
+        // Match every topology/source mutation: activation contract first,
+        // then the account advisory lock, then the exact episode row. This
+        // transaction remains open through provider usage settlement.
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", &claim.account_id)
+            .await?;
+        let authoritative = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM episodes \
+              WHERE account_id=$1 AND id=$2 AND finalization_status='processing' \
+                AND finalization_claim_token=$3 \
+                AND finalization_claim_until>clock_timestamp() \
+                AND identity_revision=$4 AND substance!='none' \
+                AND (NOT $5::bool OR structure_state='reconciled') \
+              FOR UPDATE",
+        )
+        .bind(&claim.account_id)
+        .bind(claim.episode.id)
+        .bind(&claim.claim_token)
+        .bind(claim.input_identity_revision)
+        .bind(require_reconciled)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if authoritative.is_none() {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        Ok(Some(Box::new(PostgresFinalizationEgressGuard {
+            transaction: Some(transaction),
+        })))
+    }
+
     async fn defer_finalization(
         &self,
         claim: &FinalizationClaim,
         status: &str,
         error_code: Option<&str>,
-        retry_at: Option<&str>,
-        deferred_at: &str,
+        retry_delay_seconds: Option<i64>,
         count_attempt: bool,
     ) -> Result<()> {
         let allowed = [
@@ -326,43 +385,51 @@ impl FinalizationRepository for PostgresPersistence {
                 "finalization defer status is invalid".into(),
             ));
         }
-        let deferred_ms = timestamp(deferred_at, "finalization defer time")?;
-        let retry_ms = retry_at
-            .map(|value| timestamp(value, "finalization retry time"))
-            .transpose()?;
+        if retry_delay_seconds.is_some_and(|seconds| !(0..=7 * 24 * 60 * 60).contains(&seconds)) {
+            return Err(EnclaveError::InvalidRequest(
+                "finalization retry delay is invalid".into(),
+            ));
+        }
+        let mut transaction = self.pool().begin().await?;
+        let require_reconciled =
+            finalization_requires_reconciled(&mut transaction, &claim.account_id).await?;
         let changed = sqlx::query(
             "UPDATE episodes SET finalization_status=$3,finalization_error=$4,\
                     finalization_attempt_count=finalization_attempt_count+\
-                        CASE WHEN $8 THEN 1 ELSE 0 END,\
+                        CASE WHEN $7 THEN 1 ELSE 0 END,\
                     finalization_next_attempt_at=CASE WHEN $5::bigint IS NULL THEN NULL \
-                        ELSE to_timestamp($5::double precision/1000.0) END,\
+                        ELSE clock_timestamp()+make_interval(secs=>$5) END,\
                     finalization_claim_token=NULL,finalization_claim_until=NULL,\
-                    updated_at=to_timestamp($6::double precision/1000.0) \
-              WHERE account_id=$1 AND id=$2 AND finalization_claim_token=$7",
+                    updated_at=clock_timestamp() \
+              WHERE account_id=$1 AND id=$2 AND finalization_claim_token=$6 \
+                AND (NOT $8::bool OR structure_state='reconciled')",
         )
         .bind(&claim.account_id)
         .bind(claim.episode.id)
         .bind(status)
         .bind(error_code.map(|value| value.chars().take(1_000).collect::<String>()))
-        .bind(retry_ms)
-        .bind(deferred_ms)
+        .bind(retry_delay_seconds)
         .bind(&claim.claim_token)
         .bind(count_attempt)
-        .execute(self.pool())
+        .bind(require_reconciled)
+        .execute(&mut *transaction)
         .await?;
         if changed.rows_affected() != 1 {
             return Err(EnclaveError::Conflict(
                 "finalization claim is no longer authoritative".into(),
             ));
         }
+        transaction.commit().await?;
         Ok(())
     }
 
     async fn settle_finalization(&self, result: FinalizationSettlement) -> Result<usize> {
         let mut transaction = self.pool().begin().await?;
+        let require_reconciled =
+            finalization_requires_reconciled(&mut transaction, &result.claim.account_id).await?;
         let row = sqlx::query(
             "SELECT finalized_at IS NULL AS is_initial,finalization_version,identity_revision,\
-                    finalization_claim_token,finalization_completed_claim_token \
+                    finalization_claim_token,finalization_completed_claim_token,structure_state \
                FROM episodes WHERE account_id=$1 AND id=$2 FOR UPDATE",
         )
         .bind(&result.claim.account_id)
@@ -382,6 +449,11 @@ impl FinalizationRepository for PostgresPersistence {
             transaction.rollback().await?;
             return Ok(count);
         }
+        if require_reconciled && row.try_get::<String, _>("structure_state")? != "reconciled" {
+            return Err(EnclaveError::Conflict(
+                "assigned account draft finalization requires reconciliation".into(),
+            ));
+        }
         let current_token: Option<String> = row.try_get("finalization_claim_token")?;
         if current_token.as_deref() != Some(result.claim.claim_token.as_str()) {
             return Err(EnclaveError::Conflict(
@@ -393,7 +465,7 @@ impl FinalizationRepository for PostgresPersistence {
             sqlx::query(
                 "UPDATE episodes SET identity_refresh_status='queued',\
                     finalization_status='pending_identity',finalization_claim_token=NULL,\
-                    finalization_claim_until=NULL,updated_at=now() WHERE account_id=$1 AND id=$2",
+                    finalization_claim_until=NULL,updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2",
             )
             .bind(&result.claim.account_id)
             .bind(result.claim.episode.id)
@@ -454,14 +526,14 @@ impl FinalizationRepository for PostgresPersistence {
                     account_id,screenshot_id,input_revision,observation_version,status,\
                     generation_method,literal_description,screen_state,content_type,\
                     visible_text_summary,notable_items,model_name,prompt_version,completed_at) \
-                 VALUES($1,$2,$3,$4,'ready','episode_model',$5,$6,$7,$8,$9::jsonb,$10,$11,now()) \
+                 VALUES($1,$2,$3,$4,'ready','episode_model',$5,$6,$7,$8,$9::jsonb,$10,$11,clock_timestamp()) \
                  ON CONFLICT(account_id,screenshot_id) DO UPDATE SET \
                     input_revision=excluded.input_revision,observation_version=excluded.observation_version,\
                     status='ready',generation_method='episode_model',\
                     literal_description=excluded.literal_description,screen_state=excluded.screen_state,\
                     content_type=excluded.content_type,visible_text_summary=excluded.visible_text_summary,\
                     notable_items=excluded.notable_items,model_name=excluded.model_name,\
-                    prompt_version=excluded.prompt_version,completed_at=now()",
+                    prompt_version=excluded.prompt_version,completed_at=clock_timestamp()",
             )
             .bind(&result.claim.account_id)
             .bind(screen.screenshot_id)
@@ -482,7 +554,7 @@ impl FinalizationRepository for PostgresPersistence {
                     status,activity_summary,relevance_level,relevance_reason,milestone_type,\
                     base_score,key_rank,is_key_screen,semantic_group,model_name,prompt_version,\
                     completed_at,updated_at) \
-                 VALUES($1,$2,$3,$4,$5,'ready',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),now())",
+                 VALUES($1,$2,$3,$4,$5,'ready',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,clock_timestamp(),clock_timestamp())",
             )
             .bind(&result.claim.account_id)
             .bind(result.claim.episode.id)
@@ -509,7 +581,7 @@ impl FinalizationRepository for PostgresPersistence {
              ON CONFLICT(account_id,episode_id) DO UPDATE SET overview=excluded.overview,\
                 decisions=excluded.decisions,action_items=excluded.action_items,\
                 important_links=excluded.important_links,open_questions=excluded.open_questions,\
-                created_at=now()",
+                created_at=clock_timestamp()",
         )
         .bind(&result.claim.account_id)
         .bind(result.claim.episode.id)
@@ -586,13 +658,13 @@ impl FinalizationRepository for PostgresPersistence {
             "UPDATE episodes SET title=CASE WHEN length($3)>0 THEN $3 ELSE title END,\
                     summary=CASE WHEN length($4)>0 THEN $4 ELSE summary END,\
                     minute_summaries=$5::jsonb,minutes_text=$6,action_items=$7::jsonb,\
-                    finalized_at=coalesce(finalized_at,now()),finalization_version=$8,\
+                    finalized_at=coalesce(finalized_at,clock_timestamp()),finalization_version=$8,\
                     finalization_status='complete',finalization_error=NULL,\
                     finalization_attempt_count=0,finalization_next_attempt_at=NULL,\
                     finalized_identity_revision=$9,identity_refresh_status='ready',\
                     finalization_completed_claim_token=finalization_claim_token,\
                     finalization_claim_token=NULL,finalization_claim_until=NULL,\
-                    finalization_vertex_event_id=$10,finalization_analysis_revision=$11,updated_at=now() \
+                    finalization_vertex_event_id=$10,finalization_analysis_revision=$11,updated_at=clock_timestamp() \
               WHERE account_id=$1 AND id=$2",
         )
         .bind(&result.claim.account_id)
@@ -610,5 +682,26 @@ impl FinalizationRepository for PostgresPersistence {
         .await?;
         transaction.commit().await?;
         Ok(deliveries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scheduling_authority_is_database_relative() {
+        let adapter = include_str!("finalization.rs");
+        let port = include_str!("../finalization.rs");
+        let production = adapter.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("e.ended_at<clock_timestamp()-make_interval(secs=>$3)"));
+        assert!(production.contains("finalization_claim_until=clock_timestamp()+"));
+        assert!(production.contains("e.finalization_next_attempt_at<=clock_timestamp()"));
+        assert!(production.contains("clock_timestamp()+make_interval(secs=>$5)"));
+        assert!(!production.contains("finalization claim time"));
+        assert!(!production.contains("finalization horizon"));
+        assert!(!production.contains("finalization defer time"));
+        assert!(!port.contains("pub(crate) now:"));
+        assert!(!port.contains("horizon_before"));
+        assert!(!port.contains("retry_at:"));
+        assert!(!port.contains("deferred_at:"));
     }
 }

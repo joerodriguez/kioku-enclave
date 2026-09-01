@@ -112,9 +112,10 @@ pub struct CpConfig {
     /// reconciliation. Keeping this separate lets operators qualify the
     /// writer without changing the latency-sensitive summarizer model.
     pub vertex_reconciliation_model: String,
-    /// The topology writer is deliberately dark by default. PostgreSQL still
-    /// owns all claims when enabled; this flag is only a rollout gate.
-    pub memory_reconciliation_writer_enabled: bool,
+    /// Image-baked declaration of the compiled producer contract. When an
+    /// explicit reconciliation model is present, startup recomputes and must
+    /// exactly match this lowercase SHA-256 label even while the writer is dark.
+    pub memory_reconciliation_producer_contract_sha256: Option<String>,
     /// Service-wide ceiling on new accounts per UTC day. Image-baked and
     /// required: signup is open to any verified identity, so this is the only
     /// bound on account creation and it must not have a permissive default.
@@ -182,18 +183,6 @@ fn validate_https_origin(name: &str, value: &str) -> crate::error::Result<String
         )));
     }
     Ok(value.trim_end_matches('/').to_string())
-}
-
-fn reconciliation_writer_enabled_from_config(value: Option<&str>) -> crate::error::Result<bool> {
-    match value.unwrap_or_default() {
-        "" | "false" => Ok(false),
-        "true" => Err(crate::error::EnclaveError::Config(
-            "memory reconciliation writer activation requires a durable fleet-wide activation protocol and is unavailable in this release".into(),
-        )),
-        _ => Err(crate::error::EnclaveError::Config(
-            "MEMORY_RECONCILIATION_WRITER_ENABLED must be false or empty".into(),
-        )),
-    }
 }
 
 fn reconciliation_model_from_config(
@@ -403,9 +392,29 @@ impl CpConfig {
                 std::env::var("VERTEX_RECONCILIATION_MODEL").ok(),
                 &vertex_model,
             )?;
-        let reconciliation_writer_raw = std::env::var("MEMORY_RECONCILIATION_WRITER_ENABLED").ok();
-        let memory_reconciliation_writer_enabled =
-            reconciliation_writer_enabled_from_config(reconciliation_writer_raw.as_deref())?;
+        let producer_contract_sha256 =
+            std::env::var("MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256").unwrap_or_default();
+        let memory_reconciliation_producer_contract_sha256 = match (
+            &vertex_reconciliation_model_requested,
+            producer_contract_sha256.as_str(),
+        ) {
+            (None, "") => None,
+            (Some(_), value)
+                if value.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) =>
+            {
+                Some(value.to_owned())
+            }
+            _ => {
+                return Err(crate::error::EnclaveError::Config(
+                        "VERTEX_RECONCILIATION_MODEL and MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256 must be supplied together with an exact lowercase sha256 label".into(),
+                    ));
+            }
+        };
         let billing_enforcement_mode = match std::env::var("BILLING_ENFORCEMENT_MODE")
             .unwrap_or_else(|_| {
                 if crate::test_mode_enabled() {
@@ -448,7 +457,7 @@ impl CpConfig {
             vertex_model,
             vertex_reconciliation_model_requested,
             vertex_reconciliation_model,
-            memory_reconciliation_writer_enabled,
+            memory_reconciliation_producer_contract_sha256,
             signup_limit_per_day,
             quota_vertex_output_tokens_per_day: parse_i64(
                 "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
@@ -666,18 +675,9 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
 #[cfg(test)]
 mod configuration_tests {
     use super::{
-        reconciliation_model_from_config, reconciliation_writer_enabled_from_config,
-        reviewer_identity_subject, vertex_model_name_is_billing_safe, ReviewerAuthConfig,
+        reconciliation_model_from_config, reviewer_identity_subject,
+        vertex_model_name_is_billing_safe, ReviewerAuthConfig,
     };
-
-    #[test]
-    fn memory_reconciliation_writer_is_hard_dark_until_fleet_activation_exists() {
-        assert!(!reconciliation_writer_enabled_from_config(None).unwrap());
-        assert!(!reconciliation_writer_enabled_from_config(Some("")).unwrap());
-        assert!(!reconciliation_writer_enabled_from_config(Some("false")).unwrap());
-        assert!(reconciliation_writer_enabled_from_config(Some("true")).is_err());
-        assert!(reconciliation_writer_enabled_from_config(Some("1")).is_err());
-    }
 
     #[test]
     fn reconciliation_model_preserves_requested_and_resolved_provenance() {

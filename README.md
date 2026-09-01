@@ -167,6 +167,10 @@ Deployment-specific groups include:
 - Google and optional atomic Apple client identifiers;
 - required production APNs team and environment-separated key identifiers;
 - admin, signup-budget, public-origin, billing, reviewer, and Vertex settings.
+- an explicit `VERTEX_RECONCILIATION_MODEL`, `VERTEX_LOCATION`, and compiled
+  `MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256`. The model and digest are
+  paired, and image assembly recomputes the producer contract before sealing
+  the manifest. PostgreSQL's durable v27 phase is the only activation input.
 
 The selector injects non-configurable fleet invariants:
 
@@ -185,9 +189,19 @@ come from their fixed runtime secret boundaries and are never Docker arguments.
 
 `scripts/deploy_latest.py` derives `vMAJOR.MINOR.PATCH` from `Cargo.toml`, requires a clean source
 equal to `origin/main`, and creates or verifies a signed annotated tag. The pipeline emits
-canonical schema-11 release metadata binding source, image digest, live media bucket, KMS
-coordinates, unconditional PostgreSQL schema verification, readiness/drain invariants, and shared
-TLS.
+canonical schema-12 release metadata binding source, image digest, live media bucket, KMS
+coordinates, unconditional PostgreSQL schema verification, readiness/drain invariants, shared TLS,
+the explicit reconciliation model/location and compiled producer-contract digest.
+
+Memory-reconciliation activation uses one ordinary immutable release image. That image carries the
+exact model, location, and producer digest and can run the built-in PostgreSQL migration phases, but
+the reconciler remains dormant unless the signed database phase is `Active`. The standard release
+process installs and backfills v27, rolls that same image to a homogeneous fleet while the durable
+phase remains `Installed`, then supplies a fresh signed `Draining` receipt proving the exact fleet
+before PostgreSQL attaches legacy-finalization/deletion guards and drains claims. `Active` alone
+advances marker 27 and permits provider egress. `Paused` is a forward-only kill switch: it stops new
+assignment, provider egress, and publication without restoring legacy draft finalization. There is
+no tag-specific activation rule or runtime feature flag.
 
 `scripts/release.sh` snapshots all release assets read-only, verifies the external evidence key,
 tag signer, source archive, exact OCI digest, SBOM, scan, and selected configuration, then publishes

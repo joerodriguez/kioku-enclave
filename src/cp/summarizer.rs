@@ -36,9 +36,11 @@ use tracing::{info, warn};
 
 use crate::error::{EnclaveError, Result};
 use crate::persistence::{
+    parse_capture_formation_provider_response, CaptureFormationClaim,
+    CaptureFormationProviderResponse, CaptureFormationRetryDisposition, CaptureFormationSettlement,
     EpisodeEmbeddingWrite, EpisodeInput, MinuteBucket, OpenEpisode as OpenEp,
     SummaryScreenshot as ScrRow, SummaryUtterance as UttRow, SummaryWindowClaim,
-    SummaryWindowSettlement,
+    SummaryWindowSettlement, CAPTURE_FORMATION_PROVIDER_REQUEST_MAX_BYTES,
 };
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
@@ -526,6 +528,545 @@ async fn release_summary_claim(
     }
 }
 
+async fn release_capture_claim(
+    state: &CpState,
+    claim: &CaptureFormationClaim,
+    error_code: Option<&str>,
+) {
+    release_capture_claim_with_disposition(
+        state,
+        claim,
+        error_code,
+        CaptureFormationRetryDisposition::PreserveProviderAttempt,
+    )
+    .await;
+}
+
+async fn release_capture_claim_with_disposition(
+    state: &CpState,
+    claim: &CaptureFormationClaim,
+    error_code: Option<&str>,
+    disposition: CaptureFormationRetryDisposition,
+) {
+    if let Err(error) = state
+        .repositories
+        .memory_formation()
+        .release_capture_formation(claim, error_code, disposition)
+        .await
+    {
+        warn!(error = %error, "failed to release capture formation claim");
+    }
+}
+
+/// Lossless providerless fallback for an attempt whose response is ambiguous
+/// or invalid. Raw evidence remains attached to a conservative draft so the
+/// structural reconciler can organize it later; the provider attempt is never
+/// resent.
+fn conservative_capture_page_input(
+    utterances: &[UttRow],
+    screenshots: &[ScrRow],
+) -> Option<EpisodeInput> {
+    let mut times = utterances
+        .iter()
+        .map(|row| ms(&row.started_at))
+        .chain(screenshots.iter().map(|row| ms(&row.captured_at)))
+        .collect::<Vec<_>>();
+    times.sort_unstable();
+    let started = *times.first()?;
+    let ended = times.last().copied().unwrap_or(started).max(started + 1);
+    let title = screenshots
+        .iter()
+        .find_map(|row| row.window_title.as_deref().or(row.active_app.as_deref()))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Captured activity")
+        .chars()
+        .take(200)
+        .collect::<String>();
+    let participants = utterances
+        .iter()
+        .map(|row| row.speaker_label.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let languages = utterances
+        .iter()
+        .filter_map(|row| row.language.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Some(EpisodeInput {
+        id: None,
+        started_at: format_epoch_millis(started),
+        ended_at: format_epoch_millis(ended),
+        episode_type: Some("other".into()),
+        title,
+        summary: Some("Captured evidence retained for later memory organization.".into()),
+        participants: Some(participants),
+        languages: Some(languages),
+        action_items: Some(Vec::new()),
+        substance: Some("normal".into()),
+        visual_evidence: Some(if screenshots.is_empty() {
+            "none".into()
+        } else {
+            "useful".into()
+        }),
+        minute_summaries: Some(Vec::new()),
+        model: Some("conservative-capture-page-keep-v1".into()),
+        member_utterance_ids: utterances.iter().map(|row| row.id).collect(),
+        member_screenshot_ids: screenshots.iter().map(|row| row.id).collect(),
+    })
+}
+
+fn capture_page_members_are_exact(
+    episodes: &[EpisodeInput],
+    utterance_ids: &[i64],
+    screenshot_ids: &[i64],
+) -> bool {
+    let mut actual_utterances = std::collections::BTreeSet::new();
+    let mut actual_screenshots = std::collections::BTreeSet::new();
+    let unique = episodes.iter().all(|episode| {
+        episode
+            .member_utterance_ids
+            .iter()
+            .all(|id| actual_utterances.insert(*id))
+            && episode
+                .member_screenshot_ids
+                .iter()
+                .all(|id| actual_screenshots.insert(*id))
+    });
+    unique
+        && actual_utterances == utterance_ids.iter().copied().collect()
+        && actual_screenshots == screenshot_ids.iter().copied().collect()
+}
+
+/// Convert one exact-session model response into new draft inputs. Exact
+/// revisions intentionally cannot extend an existing episode: evidence behind
+/// the global cursor becomes a new draft and is merged by the next structural
+/// reconciliation generation rather than silently backdating reconciled
+/// content.
+fn exact_episode_inputs(
+    model: &str,
+    parsed: &Value,
+    utterances: &[UttRow],
+    screenshots: &[ScrRow],
+    range_from_ms: i64,
+    range_to_ms: i64,
+) -> (Vec<EpisodeInput>, usize) {
+    struct ExactEpisode {
+        started: i64,
+        ended: i64,
+        type_: Option<String>,
+        title: String,
+        summary: Option<String>,
+        participants: Option<Vec<String>>,
+        languages: Option<Vec<String>>,
+        action_items: Option<Vec<String>>,
+        substance: Option<String>,
+        visual_evidence: Option<String>,
+        minutes: Option<Vec<MinuteBucket>>,
+    }
+    let str_arr = |value: Option<&Value>| -> Option<Vec<String>> {
+        value.and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+    };
+    let mut episodes = Vec::new();
+    for episode in parsed
+        .get("episodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(started), Some(ended), Some(title)) = (
+            episode.get("started_at").and_then(Value::as_str),
+            episode.get("ended_at").and_then(Value::as_str),
+            episode.get("title").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let started = ms(started);
+        let ended = ms(ended);
+        if started < range_from_ms
+            || ended > range_to_ms
+            || ended < started
+            || title.trim().is_empty()
+        {
+            continue;
+        }
+        let minutes = episode
+            .get("minutes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|minute| {
+                        Some(MinuteBucket {
+                            start: minute.get("start")?.as_str()?.to_owned(),
+                            gist: minute.get("gist")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect()
+            });
+        episodes.push(ExactEpisode {
+            started,
+            ended,
+            type_: episode
+                .get("type")
+                .and_then(Value::as_str)
+                .map(String::from),
+            title: title.to_owned(),
+            summary: episode
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(String::from),
+            participants: str_arr(episode.get("participants")),
+            languages: str_arr(episode.get("languages")),
+            action_items: str_arr(episode.get("action_items")),
+            substance: episode
+                .get("substance")
+                .and_then(Value::as_str)
+                .map(String::from),
+            visual_evidence: episode
+                .get("visual_evidence")
+                .and_then(Value::as_str)
+                .map(String::from),
+            minutes,
+        });
+    }
+    let spans = episodes
+        .iter()
+        .map(|episode| (episode.started, episode.ended))
+        .collect::<Vec<_>>();
+    let membership = derive_membership(utterances, screenshots, &spans);
+    let utterances_by_id = utterances
+        .iter()
+        .map(|utterance| (utterance.id, utterance))
+        .collect::<HashMap<_, _>>();
+    let mut inputs = Vec::new();
+    let mut dropped = 0;
+    for (index, episode) in episodes.iter().enumerate() {
+        let (utterance_ids, screenshot_ids) = &membership[index];
+        let substantive = utterance_ids
+            .iter()
+            .filter(|id| {
+                utterances_by_id
+                    .get(id)
+                    .is_some_and(|utterance| is_substantive(&utterance.text))
+            })
+            .count() as i64;
+        let screenshot_times = screenshot_ids
+            .iter()
+            .filter_map(|id| screenshots.iter().find(|screenshot| screenshot.id == *id))
+            .map(|screenshot| ms(&screenshot.captured_at))
+            .collect::<Vec<_>>();
+        let screen_span = match (screenshot_times.iter().min(), screenshot_times.iter().max()) {
+            (Some(first), Some(last)) => last - first,
+            _ => 0,
+        };
+        let span_minutes = ((episode.ended - episode.started) as f64 / 60_000.0).max(1.0);
+        let dense = substantive >= SIG_MIN_SUBSTANTIVE_UTT
+            && substantive as f64 >= span_minutes * SIG_MIN_UTT_PER_MIN;
+        if !(dense || screen_span >= SIG_MIN_SCREEN_MS) {
+            dropped += 1;
+            continue;
+        }
+        inputs.push(EpisodeInput {
+            id: None,
+            started_at: format_epoch_millis(episode.started),
+            ended_at: format_epoch_millis(episode.ended),
+            episode_type: episode.type_.clone(),
+            title: episode.title.clone(),
+            summary: episode.summary.clone(),
+            participants: episode.participants.clone(),
+            languages: episode.languages.clone(),
+            action_items: episode.action_items.clone(),
+            substance: episode.substance.clone(),
+            visual_evidence: episode.visual_evidence.clone(),
+            minute_summaries: episode.minutes.clone(),
+            model: Some(model.to_owned()),
+            member_utterance_ids: utterance_ids.clone(),
+            member_screenshot_ids: screenshot_ids.clone(),
+        });
+    }
+    (inputs, dropped)
+}
+
+/// Turn exact staged provider bytes into a lossless page settlement. Only an
+/// explicitly empty array is allowed to remain empty. A missing/mistyped
+/// response, or a non-empty candidate list that normalizes entirely away,
+/// keeps the complete provider-visible page in one conservative draft.
+fn capture_formation_response_inputs(
+    model: &str,
+    response: &str,
+    grounding: &[GroundingRequirement],
+    utterances: &[UttRow],
+    screenshots: &[ScrRow],
+    range_from_ms: i64,
+    range_to_ms: i64,
+) -> (Vec<EpisodeInput>, usize) {
+    let conservative = || {
+        (
+            conservative_capture_page_input(utterances, screenshots)
+                .into_iter()
+                .collect(),
+            0,
+        )
+    };
+    match parse_capture_formation_provider_response(response) {
+        Some(CaptureFormationProviderResponse::ExplicitNoMemory) => (Vec::new(), 0),
+        Some(CaptureFormationProviderResponse::CandidateEpisodes(parsed)) => {
+            if !missing_grounded_entities(&parsed, grounding).is_empty() {
+                return conservative();
+            }
+            let (episodes, dropped) = exact_episode_inputs(
+                model,
+                &parsed,
+                utterances,
+                screenshots,
+                range_from_ms,
+                range_to_ms,
+            );
+            let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
+            let screenshot_ids = screenshots.iter().map(|row| row.id).collect::<Vec<_>>();
+            if episodes.is_empty()
+                || !capture_page_members_are_exact(&episodes, &utterance_ids, &screenshot_ids)
+            {
+                conservative()
+            } else {
+                (episodes, dropped)
+            }
+        }
+        None => conservative(),
+    }
+}
+
+/// Process at most one dirty exact session. `None` means the forward lane
+/// still owns the user's next work. The repository admits this lane only when
+/// the full capture horizon is already behind `accounts.summarized_until`, so
+/// a fresh session never causes a duplicate provider call.
+async fn summarize_capture_formation_locked(
+    state: &CpState,
+    user_id: &str,
+) -> Result<Option<Value>> {
+    let Some(claim) = state
+        .repositories
+        .memory_formation()
+        .claim_capture_formation(user_id, SUMMARY_CLAIM_LEASE_SECONDS)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let (utterances, screenshots) = match state
+        .repositories
+        .memory_formation()
+        .capture_formation_evidence(&claim, UTT_CAP as i64, SCR_CAP as i64)
+        .await
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            release_capture_claim(state, &claim, Some("evidence")).await;
+            return Err(error);
+        }
+    };
+    if utterances.is_empty() && screenshots.is_empty() {
+        match state
+            .repositories
+            .memory_formation()
+            .settle_capture_formation(CaptureFormationSettlement {
+                claim: claim.clone(),
+                episodes: Vec::new(),
+            })
+            .await
+        {
+            Ok(_) => {
+                return Ok(Some(serde_json::json!({
+                    "capture_session_id": claim.capture_session_id,
+                    "formation_revision": claim.source_revision,
+                    "episodes": 0,
+                    "provider_egress": "none"
+                })));
+            }
+            Err(error) => {
+                release_capture_claim(state, &claim, Some("settlement")).await;
+                return Err(error);
+            }
+        }
+    }
+
+    let capture_text = render_capture_text(&utterances, &screenshots);
+    let grounding = grounding_requirements(&utterances, &screenshots);
+    let grounding_text = render_grounding_requirements(&grounding);
+    let range_from_ms = ms(&claim.from);
+    let range_to_ms = ms(&claim.to);
+    let user_message = format!(
+        "Range: {} → {}\n\n{grounding_text}NEW CAPTURE LOG:\n{capture_text}",
+        format_epoch_millis(range_from_ms),
+        format_epoch_millis(range_to_ms)
+    );
+    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
+    let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
+    let screenshot_ids = screenshots.iter().map(|row| row.id).collect::<Vec<_>>();
+    // This is deliberately not a boolean: an admitted attempt can become
+    // terminal without response bytes reaching this process. Reporting
+    // `false` for that case would incorrectly claim that no provider effect
+    // was possible.
+    let mut provider_egress = if claim.staged_provider_response.is_some() {
+        "staged_replay"
+    } else {
+        "none"
+    };
+    let mut conservative = false;
+    let current_request =
+        super::vertex::capture_formation_provider_request(state, &system_prompt, &user_message);
+    let mut provider_model = claim
+        .provider_request
+        .as_ref()
+        .map(|request| request.model.clone())
+        .unwrap_or_else(|| current_request.model.clone());
+    let current_request_too_large = claim.provider_request.is_none()
+        && serde_json::to_vec(&current_request)?.len()
+            > CAPTURE_FORMATION_PROVIDER_REQUEST_MAX_BYTES;
+    let response = if let Some(response) = claim.staged_provider_response.clone() {
+        response
+    } else if current_request_too_large {
+        // Row bounds are not byte bounds. Preserve every exact source in a
+        // providerless draft rather than truncating or retrying this page.
+        conservative = true;
+        String::new()
+    } else {
+        let provider_request = match state
+            .repositories
+            .memory_formation()
+            .authorize_capture_formation_egress(
+                &claim,
+                &utterance_ids,
+                &screenshot_ids,
+                &current_request,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                release_capture_claim(state, &claim, Some("provider_source_guard")).await;
+                return Err(error);
+            }
+        };
+        provider_model = provider_request.model.clone();
+        if let Err(error) =
+            reserve_vertex_output(state, user_id, provider_request.max_output_tokens).await
+        {
+            release_capture_claim(state, &claim, Some("quota_reservation")).await;
+            return Err(error);
+        }
+        let attempt_identity: [u8; 32] = claim
+            .provider_attempt_identity
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                EnclaveError::Store("capture formation provider attempt is invalid".into())
+            })?;
+        match super::vertex::generate_with_persisted_attempt(
+            state,
+            user_id,
+            &provider_request,
+            &attempt_identity,
+        )
+        .await
+        {
+            Ok(response) => {
+                state
+                    .repositories
+                    .memory_formation()
+                    .stage_capture_formation_response(&claim, &response.text, &response.event_id)
+                    .await?;
+                provider_egress = "completed";
+                response.text
+            }
+            Err(error) => {
+                use super::vertex::VertexGenerationFailureDisposition as Disposition;
+                match error.disposition {
+                    Disposition::RetryableBeforeEgress => {
+                        release_capture_claim(state, &claim, Some("provider_pre_egress")).await;
+                        return Ok(Some(serde_json::json!({
+                            "error": error.to_string(),
+                            "capture_session_id": claim.capture_session_id,
+                            "provider_egress": "none"
+                        })));
+                    }
+                    Disposition::RetryableNotBilled => {
+                        release_capture_claim_with_disposition(
+                            state,
+                            &claim,
+                            Some("provider_not_billed"),
+                            CaptureFormationRetryDisposition::AdvanceConfirmedNotBilled,
+                        )
+                        .await;
+                        return Ok(Some(serde_json::json!({
+                            "error": error.to_string(),
+                            "capture_session_id": claim.capture_session_id,
+                            "provider_egress": "confirmed_not_billed"
+                        })));
+                    }
+                    Disposition::AmbiguousTerminal | Disposition::ConfirmedInvalid => {
+                        // The durable attempt row makes this identity non-send
+                        // forever. Preserve every source in a providerless
+                        // draft instead of losing evidence or duplicating I/O.
+                        provider_egress = "possible_terminal";
+                        conservative = true;
+                        String::new()
+                    }
+                }
+            }
+        }
+    };
+    let (episodes, dropped) = if conservative {
+        (
+            conservative_capture_page_input(&utterances, &screenshots)
+                .into_iter()
+                .collect(),
+            0,
+        )
+    } else {
+        capture_formation_response_inputs(
+            &provider_model,
+            &response,
+            &grounding,
+            &utterances,
+            &screenshots,
+            range_from_ms,
+            range_to_ms,
+        )
+    };
+    let ids = match state
+        .repositories
+        .memory_formation()
+        .settle_capture_formation(CaptureFormationSettlement {
+            claim: claim.clone(),
+            episodes,
+        })
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            release_capture_claim(state, &claim, Some("settlement")).await;
+            return Err(error);
+        }
+    };
+    embed_episodes(state, user_id, &ids).await;
+    Ok(Some(serde_json::json!({
+        "capture_session_id": claim.capture_session_id,
+        "formation_revision": claim.source_revision,
+        "episodes": ids.len(),
+        "dropped": dropped,
+        "provider_egress": provider_egress,
+        "formation_page": claim.page_index,
+        "has_more": claim.page_has_more
+    })))
+}
+
 /// Summarize one user's recent capture into episodes. Returns a short status.
 pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     summarize_user_window(state, user_id, SummarizeMode::Scheduled).await
@@ -541,6 +1082,10 @@ async fn summarize_user_window(
     // session-settled kick before either attempts to claim or spend at Vertex.
     static SUMMARIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = SUMMARIZE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+    if let Some(result) = summarize_capture_formation_locked(state, user_id).await? {
+        return Ok(result);
+    }
 
     let summarized_until = state.repositories.work().summarized_until(user_id).await?;
     let now = now_ms();
@@ -670,6 +1215,26 @@ async fn summarize_user_window(
         release_summary_claim(state, &summary_claim, Some("quota_reservation")).await;
         return Err(error);
     }
+    let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
+    let screenshot_ids = screenshots.iter().map(|row| row.id).collect::<Vec<_>>();
+    let open_episode_ids = open_episodes
+        .iter()
+        .map(|episode| episode.id)
+        .collect::<Vec<_>>();
+    if let Err(error) = state
+        .repositories
+        .memory_formation()
+        .authorize_summary_window_egress(
+            &summary_claim,
+            &utterance_ids,
+            &screenshot_ids,
+            &open_episode_ids,
+        )
+        .await
+    {
+        release_summary_claim(state, &summary_claim, Some("provider_source_guard")).await;
+        return Err(error);
+    }
     let response = match super::vertex::generate(
         state,
         user_id,
@@ -721,6 +1286,20 @@ async fn summarize_user_window(
             reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
         {
             release_summary_claim(state, &summary_claim, Some("repair_quota")).await;
+            return Err(error);
+        }
+        if let Err(error) = state
+            .repositories
+            .memory_formation()
+            .authorize_summary_window_egress(
+                &summary_claim,
+                &utterance_ids,
+                &screenshot_ids,
+                &open_episode_ids,
+            )
+            .await
+        {
+            release_summary_claim(state, &summary_claim, Some("repair_source_guard")).await;
             return Err(error);
         }
         match super::vertex::generate(
@@ -889,15 +1468,26 @@ async fn summarize_user_window(
         );
         return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
     }
-    let ids = state
+    let ids = match state
         .repositories
         .memory_formation()
         .settle_summary_window(SummaryWindowSettlement {
-            claim: summary_claim,
+            claim: summary_claim.clone(),
             episodes: to_upsert,
             cursor: Some(cutoff_iso.clone()),
         })
-        .await?;
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            // The exact-session lane may have won ownership while this model
+            // call was in flight. Terminate the durable claim; the next pass
+            // observes the active owner / completed receipt exclusion and can
+            // advance without a second ownership mutation.
+            release_summary_claim(state, &summary_claim, Some("settlement")).await;
+            return Err(error);
+        }
+    };
     let upserted = ids.len();
     embed_episodes(state, user_id, &ids).await;
     info!(user_id, upserted, dropped, "summarized");
@@ -1350,6 +1940,179 @@ Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_late_revision_always_creates_a_new_draft() {
+        let utterances = [0, 5, 10]
+            .into_iter()
+            .enumerate()
+            .map(|(index, minute)| UttRow {
+                id: index as i64 + 1,
+                started_at: format_epoch_millis(1_800_000_000_000 + minute * 60_000),
+                speaker_label: "Me".into(),
+                language: Some("en".into()),
+                text: format!("substantive remembered statement number {index}"),
+            })
+            .collect::<Vec<_>>();
+        let from = 1_800_000_000_000;
+        let to = from + 12 * 60_000;
+        let parsed = json!({"episodes": [{
+            "episode_ref": "E99",
+            "started_at": format_epoch_millis(from),
+            "ended_at": format_epoch_millis(to),
+            "type": "meeting",
+            "title": "Late settled session",
+            "summary": "- Captured after the forward cursor",
+            "participants": ["Me"],
+            "languages": ["en"],
+            "action_items": [],
+            "substance": "normal",
+            "visual_evidence": "none",
+            "minutes": []
+        }]});
+        let (inputs, dropped) = exact_episode_inputs("model", &parsed, &utterances, &[], from, to);
+        assert_eq!(dropped, 0);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].id, None, "exact lane must never backdate by ref");
+        assert_eq!(inputs[0].member_utterance_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn exact_provider_empty_is_explicit_and_rejected_candidates_are_kept() {
+        let from = 1_800_000_000_000;
+        let to = from + 10 * 60_000;
+        let screenshots = vec![ScrRow {
+            id: 41,
+            captured_at: format_epoch_millis(from + 30_000),
+            active_app: Some("Browser".into()),
+            window_title: Some("Captured page".into()),
+            ocr_text: Some("visible evidence".into()),
+            salient_ocr_text: None,
+            url: None,
+            is_duplicate: 0,
+        }];
+        let classify = |response: &str| {
+            capture_formation_response_inputs("model", response, &[], &[], &screenshots, from, to)
+        };
+        let assert_conservative = |response: &str| {
+            let (inputs, dropped) = classify(response);
+            assert_eq!(dropped, 0);
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(
+                inputs[0].model.as_deref(),
+                Some("conservative-capture-page-keep-v1")
+            );
+            assert_eq!(inputs[0].member_screenshot_ids, vec![41]);
+        };
+
+        let (explicit_empty, dropped) = classify(r#"{"episodes":[]}"#);
+        assert!(explicit_empty.is_empty());
+        assert_eq!(dropped, 0);
+
+        assert_conservative("{}");
+        assert_conservative(r#"{"episodes":[{}]}"#);
+        assert_conservative(&format!(
+            r#"{{"episodes":[{{"started_at":"{}","ended_at":"{}","title":"Too sparse"}}]}}"#,
+            format_epoch_millis(from),
+            format_epoch_millis(to)
+        ));
+    }
+
+    #[test]
+    fn capture_page_requires_duplicate_free_exact_provider_membership() {
+        let input = |utterances: Vec<i64>, screenshots: Vec<i64>| EpisodeInput {
+            id: None,
+            started_at: "2026-08-31T12:00:00.000Z".into(),
+            ended_at: "2026-08-31T12:01:00.000Z".into(),
+            episode_type: Some("other".into()),
+            title: "Exact page".into(),
+            summary: None,
+            participants: Some(Vec::new()),
+            languages: Some(Vec::new()),
+            action_items: Some(Vec::new()),
+            substance: Some("normal".into()),
+            visual_evidence: Some("useful".into()),
+            minute_summaries: Some(Vec::new()),
+            model: Some("test".into()),
+            member_utterance_ids: utterances,
+            member_screenshot_ids: screenshots,
+        };
+        assert!(capture_page_members_are_exact(
+            &[input(vec![1, 2], vec![10, 11])],
+            &[1, 2],
+            &[10, 11]
+        ));
+        assert!(!capture_page_members_are_exact(
+            &[input(vec![1], vec![10, 11])],
+            &[1, 2],
+            &[10, 11]
+        ));
+        assert!(!capture_page_members_are_exact(
+            &[input(vec![1, 2], vec![10]), input(vec![2], vec![11])],
+            &[1, 2],
+            &[10, 11]
+        ));
+    }
+
+    #[test]
+    fn exact_owned_or_empty_revision_settles_before_provider_work() {
+        let source = include_str!("summarizer.rs");
+        let exact = source
+            .split("async fn summarize_capture_formation_locked(")
+            .nth(1)
+            .unwrap()
+            .split("/// Summarize one user's recent capture")
+            .next()
+            .unwrap();
+        let empty = exact.find("utterances.is_empty()").unwrap();
+        let settlement = exact[empty..].find("settle_capture_formation").unwrap() + empty;
+        let provider = exact.find("reserve_vertex_output").unwrap();
+        assert!(settlement < provider);
+        assert!(!exact.contains("open_episodes("));
+    }
+
+    #[test]
+    fn every_summary_provider_egress_revalidates_deletion_fence() {
+        let source = include_str!("summarizer.rs");
+        let exact = source
+            .split("async fn summarize_capture_formation_locked(")
+            .nth(1)
+            .unwrap()
+            .split("/// Summarize one user's recent capture")
+            .next()
+            .unwrap();
+        assert_eq!(
+            exact.matches("authorize_capture_formation_egress").count(),
+            1,
+            "the single exact-page provider call requires a source/request guard"
+        );
+        let exact_first_guard = exact.find("authorize_capture_formation_egress").unwrap();
+        let exact_first_provider = exact.find("super::vertex::generate").unwrap();
+        assert!(exact_first_guard < exact_first_provider);
+
+        let forward = source
+            .split("async fn summarize_user_window(")
+            .nth(1)
+            .unwrap()
+            .split("/// In-enclave episode embeddings")
+            .next()
+            .unwrap();
+        assert_eq!(
+            forward.matches("authorize_summary_window_egress").count(),
+            2,
+            "initial and repair provider calls require independent source guards"
+        );
+        let forward_first_guard = forward.find("authorize_summary_window_egress").unwrap();
+        let forward_first_provider = forward.find("super::vertex::generate").unwrap();
+        assert!(forward_first_guard < forward_first_provider);
+        assert!(forward.contains("open_episode_ids"));
+
+        let vertex = include_str!("vertex.rs");
+        assert!(vertex.contains("GENERATION_TIMEOUT_SECONDS: u64 = 120"));
+        const {
+            assert!(SUMMARY_CLAIM_LEASE_SECONDS > 2 * 120);
+        }
+    }
 
     #[test]
     fn automatic_summarization_crosses_sparse_history_without_stacking_model_work() {

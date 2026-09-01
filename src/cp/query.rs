@@ -1457,9 +1457,11 @@ async fn rest_episode(
 
 /// DELETE /api/episodes/{id} — purge an episode AND its member raw records
 /// (utterances, screenshots, emptied segments, vectors, FTS entries). The
-/// response carries the deleted records' source_keys so the caller (the Mac
-/// debugger's local server) can purge the matching LOCAL rows and media files
-/// — without that, a forced resync would re-upload the content.
+/// response carries a bounded page of the deleted records' source_keys so the
+/// caller (the Mac debugger's local server) can purge the matching LOCAL rows
+/// and media files, then acknowledge that exact page. Without that barrier, a
+/// forced resync could re-upload content whose terminal receipt was already
+/// marked complete.
 async fn advance_episode_deletion(
     repository: &dyn crate::persistence::EpisodeDeletionRepository,
     media_objects: &dyn crate::persistence::MediaObjectStore,
@@ -1472,12 +1474,50 @@ async fn advance_episode_deletion(
     repository.complete_episode_deletion(account_id, plan).await
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct EpisodeDeletionQuery {
+    /// The caller sends this only after every source key in the preceding
+    /// response has been removed from its local authority. A missing ACK is a
+    /// replay request and never advances durable delivery state.
+    source_key_ack: Option<String>,
+}
+
 async fn rest_episode_delete(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
     Path(episode_id): Path<i64>,
+    Query(query): Query<EpisodeDeletionQuery>,
 ) -> Response {
     let repository = state.repositories.episode_deletions();
+    if let Some(source_key_ack) = query.source_key_ack.as_deref() {
+        return match repository
+            .acknowledge_episode_deletion_source_keys(&user.0, episode_id, source_key_ack)
+            .await
+        {
+            Ok(purge) => episode_purge_response(episode_id, purge),
+            Err(crate::error::EnclaveError::Conflict(error))
+            | Err(crate::error::EnclaveError::InvalidRequest(error)) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "source_key_ack_rejected",
+                    "message": error,
+                    "deletion_pending": true,
+                })),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::error!(%error, episode_id, "episode deletion source-key ACK failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "enclave_unavailable",
+                        "deletion_pending": true,
+                    })),
+                )
+                    .into_response()
+            }
+        };
+    }
     let plan = 'attempts: {
         for attempt in 0..MAX_MEMORY_TOPOLOGY_READ_ATTEMPTS {
             let expected_revision =
@@ -1554,16 +1594,28 @@ async fn rest_episode_delete(
 }
 
 fn episode_purge_response(episode_id: i64, purge: crate::persistence::EpisodePurge) -> Response {
-    Json(json!({
-        "deleted": true,
+    let paged_delivery = !purge.source_key_delivery_complete || purge.source_key_cursor.is_some();
+    let mut body = json!({
+        "deleted": purge.source_key_delivery_complete,
         "episode_id": episode_id,
         "deleted_utterances": purge.deleted_utterances,
         "deleted_screenshots": purge.deleted_screenshots,
         "deleted_segments": purge.deleted_segments,
         "utterance_source_keys": purge.utterance_source_keys,
         "screenshot_source_keys": purge.screenshot_source_keys,
-    }))
-    .into_response()
+    });
+    if paged_delivery {
+        let object = body
+            .as_object_mut()
+            .expect("episode purge response is an object");
+        object.insert("deletion_pending".into(), Value::Bool(true));
+        object.insert(
+            "source_key_cursor".into(),
+            purge.source_key_cursor.map_or(Value::Null, Value::String),
+        );
+        object.insert("source_key_delivery_complete".into(), Value::Bool(false));
+    }
+    Json(body).into_response()
 }
 
 const EPISODE_DELETE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
@@ -1682,7 +1734,6 @@ async fn rest_episode_finalize(
                 &user.0,
                 episode_id,
                 i64::from(super::finalizer::FINALIZATION_VERSION),
-                state.config.memory_reconciliation_writer_enabled,
             )
             .await;
         match outcome {
@@ -2888,6 +2939,17 @@ mod episode_deletion_tests {
             self.complete_calls.fetch_add(1, Ordering::SeqCst);
             Ok(plan.purge.clone())
         }
+
+        async fn acknowledge_episode_deletion_source_keys(
+            &self,
+            _account_id: &str,
+            _episode_id: i64,
+            _source_key_cursor: &str,
+        ) -> Result<EpisodePurge> {
+            Err(EnclaveError::Conflict(
+                "fake deletion has no paged source-key delivery".into(),
+            ))
+        }
     }
 
     struct FakeMediaObjectStore {
@@ -2967,6 +3029,8 @@ mod episode_deletion_tests {
                 deleted_segments: 1,
                 utterance_source_keys: vec!["utterance-1".into(), "utterance-2".into()],
                 screenshot_source_keys: vec!["screenshot-1".into()],
+                source_key_cursor: None,
+                source_key_delivery_complete: true,
             },
             media_object_keys: vec![
                 "raw/account-1/first.enc".into(),

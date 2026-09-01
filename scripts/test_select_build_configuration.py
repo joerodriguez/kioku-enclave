@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
+SELECTOR_SPEC = importlib.util.spec_from_file_location(
+    "select_build_configuration_test", SELECTOR
+)
+assert SELECTOR_SPEC and SELECTOR_SPEC.loader
+SELECTOR_MODULE = importlib.util.module_from_spec(SELECTOR_SPEC)
+SELECTOR_SPEC.loader.exec_module(SELECTOR_MODULE)
 SCHEMA_FINALIZATION_PUBLIC_KEY_DER = bytes.fromhex(
     "302a300506032b6570032100"
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
@@ -48,6 +55,8 @@ CONFIGURATION = {
     "VERTEX_PROJECT": "kioku-joerodriguez",
     "VERTEX_LOCATION": "global",
     "VERTEX_MODEL": "gemini-3.5-flash",
+    "VERTEX_RECONCILIATION_MODEL": "gemini-reconciliation-v1",
+    "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256": "sha256:" + "a" * 64,
     "SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64": base64.b64encode(
         SCHEMA_FINALIZATION_PUBLIC_KEY_DER
     ).decode("ascii"),
@@ -135,8 +144,12 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("HEALTH_PORT=8081\n", content)
         self.assertIn("DRAIN_TIMEOUT_SECONDS=105\n", content)
         self.assertIn("ENCLAVE_TLS=1\n", content)
-        self.assertIn("VERTEX_RECONCILIATION_MODEL=\n", content)
-        self.assertIn("MEMORY_RECONCILIATION_WRITER_ENABLED=\n", content)
+        self.assertIn("VERTEX_RECONCILIATION_MODEL=gemini-reconciliation-v1\n", content)
+        self.assertIn(
+            "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256=sha256:" + "a" * 64 + "\n",
+            content,
+        )
+        self.assertNotIn("MEMORY_RECONCILIATION_WRITER_ENABLED", content)
         self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_DER_BASE64=", content)
         self.assertIn("SCHEMA_FINALIZATION_PUBLIC_KEY_SHA256=", content)
         for obsolete in (
@@ -172,21 +185,36 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET", completed.stderr)
         self.assertEqual(content, "")
 
-    def test_reconciliation_settings_are_optional_and_fail_closed(self) -> None:
+    def test_production_reconciliation_contract_is_required_and_tag_independent(self) -> None:
         values = environment()
         values["PRODUCTION_VERTEX_RECONCILIATION_MODEL"] = "gemini-strong:preview"
-        values["PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED"] = "false"
+        values["PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256"] = (
+            "sha256:" + "a" * 64
+        )
         accepted, content, _ = self.run_selector("production", values)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertIn(
             "VERTEX_RECONCILIATION_MODEL=gemini-strong:preview\n", content
         )
-        self.assertIn("MEMORY_RECONCILIATION_WRITER_ENABLED=false\n", content)
+        self.assertIn(
+            "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256=sha256:"
+            + "a" * 64
+            + "\n",
+            content,
+        )
+        self.assertNotIn("MEMORY_RECONCILIATION_WRITER_ENABLED", content)
+        tagged, tagged_content, _ = self.run_selector(
+            "production", values, source_ref="refs/tags/v1.2.3"
+        )
+        self.assertEqual(tagged.returncode, 0, tagged.stderr)
+        self.assertEqual(tagged_content, content)
 
         for key, value in (
             ("PRODUCTION_VERTEX_RECONCILIATION_MODEL", "bad model"),
-            ("PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED", "true"),
-            ("PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED", "yes"),
+            (
+                "PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256",
+                "sha256:" + "A" * 64,
+            ),
         ):
             with self.subTest(key=key):
                 rejected_values = environment()
@@ -196,6 +224,67 @@ class SelectorTests(unittest.TestCase):
                 )
                 self.assertNotEqual(rejected.returncode, 0)
                 self.assertEqual(rejected_content, "")
+
+        missing_model = environment()
+        missing_model.pop("PRODUCTION_VERTEX_RECONCILIATION_MODEL")
+        missing_model.pop("PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256")
+        rejected, rejected_content, _ = self.run_selector("production", missing_model)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("production builds require", rejected.stderr)
+        self.assertEqual(rejected_content, "")
+
+    def test_frozen_v0_9_16_selector_is_exact_and_read_only(self) -> None:
+        values = environment()
+        for prefix in ("PRODUCTION", "EVALUATION"):
+            values.pop(
+                f"{prefix}_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256"
+            )
+        values["PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED"] = "false"
+        raw = (
+            "\n".join(
+                f"{name}={value}"
+                for name, value in sorted(values.items())
+                if name != "PATH"
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        parsed = SELECTOR_MODULE.parse_frozen_v0_9_16_operator_configuration(raw)
+        selected = SELECTOR_MODULE.selected_frozen_v0_9_16_configuration(
+            "production", parsed, source_ref="v0.9.16"
+        )
+        self.assertEqual(
+            selected["MEMORY_RECONCILIATION_WRITER_ENABLED"], "false"
+        )
+        self.assertNotIn(
+            "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256", selected
+        )
+
+        with self.assertRaisesRegex(SystemExit, "exact v0.9.16 tag"):
+            SELECTOR_MODULE.selected_frozen_v0_9_16_configuration(
+                "production", parsed, source_ref="v0.9.17"
+            )
+
+        invalid_writer = dict(parsed)
+        invalid_writer["PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED"] = "true"
+        with self.assertRaisesRegex(SystemExit, "must be false or empty"):
+            SELECTOR_MODULE.selected_frozen_v0_9_16_configuration(
+                "production", invalid_writer, source_ref="v0.9.16"
+            )
+
+        with self.assertRaisesRegex(SystemExit, "unknown operator configuration"):
+            SELECTOR_MODULE.parse_frozen_v0_9_16_operator_configuration(
+                raw
+                + b"PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256="
+                + b"sha256:"
+                + b"a" * 64
+                + b"\n"
+            )
+
+        with self.assertRaises(SystemExit):
+            SELECTOR_MODULE.selected_configuration(
+                "production", parsed, source_ref="v0.9.16"
+            )
 
     def test_schema_finalization_anchor_is_required_and_fingerprint_bound(self) -> None:
         values = environment()

@@ -420,6 +420,65 @@ class EnclaveAdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.AdapterError, "Artifact Registry contains"):
                     MODULE.state("enclave-artifact-registry-release")
 
+    def test_state_routes_only_frozen_v0_9_16_through_schema_eleven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.env"
+            config.write_text("CONFIG=fixture\n", encoding="utf-8")
+            config.chmod(0o600)
+            evidence = root / "evidence"
+            evidence.mkdir(mode=0o700)
+            digest = "sha256:" + "d" * 64
+            metadata_path = evidence / "enclave-release.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "image_digest": digest,
+                        "source_ref": "v0.9.16",
+                        "source_commit": "a" * 40,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            metadata_path.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {"KIOKU_RELEASE_SOURCE_COMMIT": "a" * 40},
+                clear=True,
+            ), mock.patch.object(
+                MODULE,
+                "_source_coordinates",
+                return_value=("a" * 40, "b" * 40, "v0.9.16", "0.9.16"),
+            ), mock.patch.object(
+                MODULE, "_config", return_value=config
+            ), mock.patch.object(
+                MODULE, "_check_config_coordinate"
+            ), mock.patch.object(
+                MODULE, "_repository", return_value="owner/repository"
+            ), mock.patch.object(
+                MODULE,
+                "_image_repository",
+                return_value=("us-docker.pkg.dev/project/repo/image", "reader@example.com"),
+            ), mock.patch.object(
+                MODULE, "_release_json", return_value={"assets": []}
+            ), mock.patch.object(
+                MODULE, "_output_dir", return_value=root
+            ), mock.patch.object(
+                MODULE, "_download_release", return_value=evidence
+            ), mock.patch.object(
+                MODULE, "_verify_bundle", return_value={"metadata": {"schema_version": 11}}
+            ) as verifier, mock.patch.object(
+                MODULE, "_registry_digest", return_value=digest
+            ), mock.patch.object(
+                MODULE, "_expected_assets"
+            ):
+                result = MODULE.state("enclave-artifact-registry-release")
+        self.assertTrue(result["state"]["present"])
+        self.assertTrue(
+            verifier.call_args.kwargs["allow_frozen_v0_9_16_schema_11_state"]
+        )
+
     def test_reviewed_cloud_children_do_not_inherit_release_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cloud_config = Path(temporary) / "gcloud"
@@ -636,7 +695,7 @@ class EnclaveAdapterTests(unittest.TestCase):
                 with self.assertRaises(MODULE.AdapterError):
                     MODULE._native_child_env(include_cloud=False)
 
-    def test_adapter_bundle_call_reaches_schema_eleven_verifier_with_exact_digest_uri(self) -> None:
+    def test_adapter_bundle_call_requires_current_schema_twelve_with_exact_digest_uri(self) -> None:
         helper = bundle_fixtures.LocalEvidenceTests()
         image_repository = (
             "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
@@ -659,11 +718,48 @@ class EnclaveAdapterTests(unittest.TestCase):
                     bundle_fixtures.DIGEST,
                     image_repository=image_repository,
                 )
-        self.assertEqual(result["metadata"]["schema_version"], 11)
+        self.assertEqual(result["metadata"]["schema_version"], 12)
         self.assertEqual(
             result["evidence"]["image_digest_uri"],
             f"{image_repository}@{bundle_fixtures.DIGEST}",
         )
+
+    def test_frozen_v0_9_16_state_accepts_schema_eleven_but_prepare_does_not(self) -> None:
+        helper = bundle_fixtures.LocalEvidenceTests()
+        image_repository = (
+            "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = helper.create_bundle(
+                directory, metadata_schema=11, tag="v0.9.16"
+            )
+            environment = {
+                "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY": str(public),
+                "KIOKU_RELEASE_EVIDENCE_PUBLIC_KEY_SHA256": fingerprint,
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE, "_repository", return_value="owner/repository"
+            ):
+                with self.assertRaises(MODULE.AdapterError):
+                    MODULE._verify_bundle(
+                        directory,
+                        directory / "local.env",
+                        bundle_fixtures.COMMIT,
+                        "v0.9.16",
+                        bundle_fixtures.DIGEST,
+                        image_repository=image_repository,
+                    )
+                result = MODULE._verify_bundle(
+                    directory,
+                    directory / "local.env",
+                    bundle_fixtures.COMMIT,
+                    "v0.9.16",
+                    bundle_fixtures.DIGEST,
+                    image_repository=image_repository,
+                    allow_frozen_v0_9_16_schema_11_state=True,
+                )
+        self.assertEqual(result["metadata"]["schema_version"], 11)
 
     def test_adapter_rejects_git_overrides_replacements_and_grafts(self) -> None:
         with mock.patch.dict(

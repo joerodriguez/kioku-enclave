@@ -578,8 +578,8 @@ fn strict_stored_multiline(value: &str, max_chars: usize) -> bool {
             .any(|character| character.is_control() && character != '\n')
 }
 
-fn reusable_timeline(writer_enabled: bool, episode: &EpisodeRow) -> Option<ReusableTimeline> {
-    if !writer_enabled || episode.structure_state != "reconciled" {
+fn reusable_timeline(episode: &EpisodeRow) -> Option<ReusableTimeline> {
+    if episode.structure_state != "reconciled" {
         return None;
     }
     let summary = episode.summary.as_deref()?;
@@ -1169,38 +1169,43 @@ pub async fn finalize_user_episode(state: &CpState, user_id: &str, episode_id: i
     finalize_user_episodes_scoped(state, user_id, Some(episode_id)).await
 }
 const POSTGRES_FINALIZATION_LEASE_SECONDS: i64 = 15 * 60;
+const POSTGRES_FINALIZATION_QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
+
+fn finalization_provider_attempt_identity(
+    claim: &FinalizationClaim,
+    analysis_revision: &str,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.episode-finalization.provider-attempt.v1\0");
+    for part in [
+        claim.account_id.as_bytes(),
+        &claim.episode.id.to_be_bytes(),
+        &claim.input_identity_revision.to_be_bytes(),
+        claim.claim_token.as_bytes(),
+        analysis_revision.as_bytes(),
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
 
 async fn defer_finalization(state: &CpState, claim: &FinalizationClaim, error: &str, budget: bool) {
     let repository = state.repositories.finalization();
-    let now = isotime::format_epoch_millis(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
-    );
-    let (status, retry_at, count_attempt) = if budget {
-        (
-            "budget_wait",
-            Some(isotime::add_seconds(&now, 3_600.0)),
-            false,
-        )
+    let (status, retry_delay_seconds, count_attempt) = if budget {
+        ("budget_wait", Some(3_600), false)
     } else {
         let disposition = retry_disposition(claim.attempt_count.saturating_add(1));
-        (
-            disposition.status,
-            disposition
-                .delay_seconds
-                .map(|seconds| isotime::add_seconds(&now, seconds as f64)),
-            true,
-        )
+        (disposition.status, disposition.delay_seconds, true)
     };
     if let Err(defer_error) = repository
         .defer_finalization(
             claim,
             status,
             Some(error),
-            retry_at.as_deref(),
-            &now,
+            retry_delay_seconds,
             count_attempt,
         )
         .await
@@ -1215,28 +1220,20 @@ async fn finalize_user_episodes_scoped(
     target_episode_id: Option<i64>,
 ) -> Result<()> {
     // This is the topology gate in front of every finalization entry point.
-    // While the rollout flag is dark it preserves the existing lane. Once
-    // enabled, a claimed or retrying settled cohort defers finalization until
-    // PostgreSQL has published its partition.
+    // Preactive and Installed preserve the legacy lane. Draining and Paused
+    // hold finalization; Active defers it until PostgreSQL has published every
+    // eligible partition for the account.
     if !super::reconciler::reconcile_user_episodes(state, user_id).await? {
         return Ok(());
     }
     let repository = state.repositories.finalization();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    let now = isotime::format_epoch_millis(now_ms);
-    let horizon = isotime::format_epoch_millis(now_ms - 4 * 60 * 60 * 1_000);
     let Some(claim) = repository
         .claim_finalization(crate::persistence::FinalizationClaimRequest {
             account_id: user_id,
             target_episode_id,
-            now: &now,
-            horizon_before: &horizon,
+            quiet_horizon_seconds: POSTGRES_FINALIZATION_QUIET_HORIZON_SECONDS,
             finalization_version: i64::from(FINALIZATION_VERSION),
             lease_seconds: POSTGRES_FINALIZATION_LEASE_SECONDS,
-            require_reconciled: state.config.memory_reconciliation_writer_enabled,
         })
         .await?
     else {
@@ -1265,7 +1262,7 @@ async fn finalize_user_episodes_scoped(
         }
     }
     let model_candidates = model_url_candidates(&candidates, &screenshot_rows);
-    let reusable = reusable_timeline(state.config.memory_reconciliation_writer_enabled, &ep);
+    let reusable = reusable_timeline(&ep);
     let (model_input, grounding) = match render_bounded_episode_analysis(
         &ep,
         &utterance_rows,
@@ -1296,17 +1293,46 @@ async fn finalize_user_episodes_scoped(
     } else {
         brief_response_schema()
     };
-    let generation = match vertex::generate_custom(
+    let attempt_identity = finalization_provider_attempt_identity(&claim, &analysis_revision);
+    let provider_request = vertex::CustomTextGenerationRequest {
+        operation: vertex::VertexOperation::FinalEpisodeAnalysis,
+        system: &system_prompt,
+        user_message: &model_input,
+        schema: response_schema,
+        max_output_tokens: FINALIZER_MAX_OUTPUT_TOKENS,
+        model: &state.config.vertex_model,
+    };
+    let prepared = match vertex::prepare_custom_with_model_attempt(
         state,
         user_id,
-        vertex::VertexOperation::FinalEpisodeAnalysis,
-        &system_prompt,
-        &model_input,
-        response_schema,
-        FINALIZER_MAX_OUTPUT_TOKENS,
+        provider_request,
+        &attempt_identity,
     )
     .await
     {
+        Ok(response) => response,
+        Err(error) => {
+            defer_finalization(state, &claim, &error.to_string(), false).await;
+            return Ok(());
+        }
+    };
+    let egress_guard = match repository.acquire_finalization_egress_guard(&claim).await {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            prepared.reject_before_egress(state, user_id).await?;
+            return Ok(());
+        }
+        Err(error) => {
+            prepared.reject_before_egress(state, user_id).await?;
+            return Err(error);
+        }
+    };
+    let generation = prepared.send(state, user_id).await;
+    // `send` includes the exact terminal usage-ledger write. Only after that
+    // durable receipt exists may Draining, Pause, or deletion cross the held
+    // activation/account/episode fence.
+    egress_guard.release().await?;
+    let generation = match generation {
         Ok(response) => response,
         Err(error) => {
             defer_finalization(state, &claim, &error.to_string(), false).await;
@@ -1652,7 +1678,7 @@ mod tests {
             assert!(required.iter().any(|field| field == retained));
         }
 
-        let reusable = reusable_timeline(true, &reconciled_episode()).unwrap();
+        let reusable = reusable_timeline(&reconciled_episode()).unwrap();
         let compact = r#"{
           "overview":"Grounded final brief","decisions":[],"action_items":[],
           "important_links":[],"open_questions":[],"screens":[]
@@ -1673,7 +1699,7 @@ mod tests {
     #[test]
     fn reconciled_timeline_is_input_context_and_settlement_preserves_stored_artifacts() {
         let episode = reconciled_episode();
-        let reusable = reusable_timeline(true, &episode).unwrap();
+        let reusable = reusable_timeline(&episode).unwrap();
         let rendered = render_episode_analysis_input(
             &episode,
             &[],
@@ -1704,15 +1730,13 @@ mod tests {
     #[test]
     fn dark_legacy_or_invalid_timeline_uses_full_analysis_path() {
         let episode = reconciled_episode();
-        assert!(reusable_timeline(false, &episode).is_none());
-
         let mut legacy = episode.clone();
         legacy.structure_state = "draft".into();
-        assert!(reusable_timeline(true, &legacy).is_none());
+        assert!(reusable_timeline(&legacy).is_none());
 
         let mut invalid = episode;
         invalid.minutes_text = Some("Does not match the stored minute gists.".into());
-        assert!(reusable_timeline(true, &invalid).is_none());
+        assert!(reusable_timeline(&invalid).is_none());
 
         let full_prompt = finalizer_system_prompt(None);
         assert_eq!(full_prompt, FINALIZER_SYSTEM_PROMPT);
@@ -2168,6 +2192,25 @@ mod tests {
         assert_eq!(third.status, "failed_terminal");
         assert_eq!(third.delay_seconds, None);
     }
+
+    #[test]
+    fn final_provider_send_follows_the_database_egress_guard() {
+        let source = include_str!("finalizer.rs");
+        let prepare = source
+            .find("vertex::prepare_custom_with_model_attempt(")
+            .expect("finalizer must durably admit usage before its local fence");
+        let guard = source
+            .find(".acquire_finalization_egress_guard(&claim)")
+            .expect("finalizer must take its database egress fence");
+        let send = source
+            .find("prepared.send(state, user_id)")
+            .expect("finalizer must name its provider-visible boundary");
+        assert!(prepare < guard && guard < send);
+        let guarded = &source[guard..send];
+        assert!(!guarded.contains("generate_custom("));
+        assert!(!guarded.contains("begin_invocation"));
+    }
+
     #[test]
     fn episode_312_final_brief_requires_both_grounded_movie_titles() {
         let utterances = vec![UtteranceEvidenceRow {

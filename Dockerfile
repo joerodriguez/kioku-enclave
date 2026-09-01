@@ -132,7 +132,8 @@ FROM builder AS image-config
 ARG CONFIG_SHA256
 COPY --chmod=0555 scripts/assemble_image_config.sh /build/assemble_image_config.sh
 RUN --mount=type=secret,id=kioku-config,required \
-    /build/assemble_image_config.sh /run/secrets/kioku-config /build/kioku-config "${CONFIG_SHA256}"
+    /build/assemble_image_config.sh /run/secrets/kioku-config /build/kioku-config "${CONFIG_SHA256}" \
+      /build/target/x86_64-unknown-linux-musl/release/kioku-enclave
 
 # ── Stage 3: minimal runtime ──────────────────────────────────────────────────
 FROM scratch

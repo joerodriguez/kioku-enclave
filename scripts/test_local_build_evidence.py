@@ -50,6 +50,8 @@ class LocalEvidenceTests(unittest.TestCase):
         expected_scan_sha256: str | None = None,
         sbom_payload: str = '{"spdxVersion":"SPDX-2.3"}\n',
         scan_payload: str = '{"matches":[]}\n',
+        metadata_schema: int = 12,
+        tag: str = TAG,
     ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
         public = directory / "public.pem"
@@ -63,6 +65,21 @@ class LocalEvidenceTests(unittest.TestCase):
         config_values.pop("GCP_WIF_PROVIDER", None)
         config_values.pop("GCP_SERVICE_ACCOUNT", None)
         config_values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
+        if metadata_schema == 11:
+            for prefix in ("PRODUCTION", "EVALUATION"):
+                config_values.pop(
+                    f"{prefix}_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256"
+                )
+            config_values["PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED"] = (
+                "false"
+            )
+        else:
+            config_values["PRODUCTION_VERTEX_RECONCILIATION_MODEL"] = (
+                "gemini-reconciliation-v1"
+            )
+            config_values[
+                "PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256"
+            ] = "sha256:" + "c" * 64
         config.write_text("\n".join(f"{key}={value}" for key, value in sorted(config_values.items())) + "\n", encoding="utf-8")
         config.chmod(0o600)
         sbom = directory / "enclave-sbom.spdx.json"
@@ -73,11 +90,10 @@ class LocalEvidenceTests(unittest.TestCase):
         scan.chmod(0o600)
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
-        tag = TAG
         source_repository = "https://github.com/owner/repository"
         image_uri = f"{image_repository}:{tag}"
         metadata_payload: dict[str, object] = {
-            "schema_version": 11,
+            "schema_version": metadata_schema,
             "source_repository": source_repository,
             "source_ref": tag, "source_commit": COMMIT,
             "image_uri": image_uri,
@@ -98,6 +114,15 @@ class LocalEvidenceTests(unittest.TestCase):
             "drain_timeout_seconds": "105",
             "tls_mode": "shared-secret-manager",
         }
+        if metadata_schema == 12:
+            metadata_payload.update(
+                {
+                    "vertex_reconciliation_model": "gemini-reconciliation-v1",
+                    "vertex_location": "global",
+                    "reconciliation_producer_contract_sha256": "sha256:"
+                    + "c" * 64,
+                }
+            )
         metadata.write_text(
             json.dumps(
                 metadata_payload,
@@ -299,6 +324,67 @@ class LocalEvidenceTests(unittest.TestCase):
             tampered = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("exact enclave-release.json bytes", tampered.stderr)
+
+    def test_frozen_v0_9_16_bundle_uses_only_its_historical_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, _, public, fingerprint = self.create_bundle(
+                directory, metadata_schema=11, tag="v0.9.16"
+            )
+            config_text = (directory / "local.env").read_text(encoding="utf-8")
+            self.assertIn(
+                "PRODUCTION_MEMORY_RECONCILIATION_WRITER_ENABLED=false\n",
+                config_text,
+            )
+            self.assertNotIn(
+                "MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256", config_text
+            )
+            command = [
+                "python3",
+                str(BUNDLE_VERIFIER),
+                "--evidence-dir",
+                str(directory),
+                "--public-key",
+                str(public),
+                "--expected-public-key-sha256",
+                fingerprint,
+                "--repository",
+                "owner/repository",
+                "--tag",
+                "v0.9.16",
+                "--commit",
+                COMMIT,
+                "--image-repository",
+                "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
+                "--config",
+                str(directory / "local.env"),
+            ]
+
+            current = subprocess.run(
+                command, cwd=ROOT, text=True, capture_output=True
+            )
+            self.assertNotEqual(current.returncode, 0)
+            self.assertIn("selected production configuration are invalid", current.stderr)
+
+            frozen = subprocess.run(
+                [*command, "--allow-frozen-v0-9-16-schema-11-state"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(frozen.returncode, 0, frozen.stderr)
+            self.assertEqual(json.loads(frozen.stdout)["metadata"]["schema_version"], 11)
+
+            non_v0_9_16 = list(command)
+            non_v0_9_16[non_v0_9_16.index("v0.9.16")] = "v0.9.17"
+            rejected = subprocess.run(
+                [*non_v0_9_16, "--allow-frozen-v0-9-16-schema-11-state"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("restricted to frozen v0.9.16", rejected.stderr)
 
     def test_bundle_verifier_rejects_signed_host_local_paths(self) -> None:
         for asset, payload in (

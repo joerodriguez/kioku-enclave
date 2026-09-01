@@ -18,11 +18,12 @@ use sqlx::{Acquire, PgConnection, Postgres, Row};
 
 use crate::cp::isotime;
 use crate::error::{EnclaveError, Result};
+use crate::persistence::MemoryReconciliationActivationPhase;
 
 use super::{
     classify_serving_schema, installed_schema_state_from_row, transaction_schema_state,
     InstalledSchemaState, PostgresPersistence, ServingSchemaState, EXPECTED_SCHEMA_VERSION,
-    MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
+    MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION, MEMORY_RECONCILIATION_EXPAND_FROM_VERSION,
 };
 
 const RELEASE_PROTOCOL_VERSION: i64 = 1;
@@ -359,8 +360,8 @@ SELECT
                 WHERE table_schema=current_schema()
                   AND table_name='persistence_schema'
                   AND column_name='expanded_through_version')
-AND to_regclass('public.persistence_schema_releases') IS NULL
-AND to_regclass('public.persistence_schema_release_steps') IS NULL
+AND to_regclass(format('%I.%I',current_schema(),'persistence_schema_releases')) IS NULL
+AND to_regclass(format('%I.%I',current_schema(),'persistence_schema_release_steps')) IS NULL
 AND NOT EXISTS(
     SELECT 1 FROM pg_class relation
     JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
@@ -382,7 +383,10 @@ AND NOT EXISTS(
             AND constraint_state.conname='vertex_usage_events_operation_check_v26'))
 AND NOT EXISTS(
     SELECT 1 FROM pg_trigger trigger_state
-     WHERE NOT trigger_state.tgisinternal
+    JOIN pg_class trigger_relation ON trigger_relation.oid=trigger_state.tgrelid
+    JOIN pg_namespace trigger_namespace ON trigger_namespace.oid=trigger_relation.relnamespace
+     WHERE trigger_namespace.nspname=current_schema()
+       AND NOT trigger_state.tgisinternal
        AND trigger_state.tgname IN (
             'accounts_install_memory_archive','episodes_maintain_structure_state',
             'episodes_install_active_memory_handle','episodes_retire_deleted_memory',
@@ -494,6 +498,117 @@ pub(crate) struct VerifiedSchemaFinalizationReceipt {
     key_sha256: Vec<u8>,
     observed_at: i64,
     expires_at: i64,
+}
+
+/// A separate signed domain from the immutable v26 finalization receipt. Every
+/// transition advances one append-only activation generation.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryReconciliationActivationReceipt {
+    pub(crate) contract: String,
+    pub(crate) contract_version: u32,
+    pub(crate) generation: i64,
+    pub(crate) previous_phase: String,
+    pub(crate) requested_phase: String,
+    pub(crate) base_schema_version: i64,
+    pub(crate) target_schema_version: i64,
+    pub(crate) activation_contract_sha256: String,
+    pub(crate) activation_catalog_sha256: String,
+    pub(crate) base_finalization_receipt_sha256: String,
+    pub(crate) reconciliation_producer_contract_sha256: String,
+    pub(crate) reconciliation_model: String,
+    pub(crate) vertex_location: String,
+    pub(crate) rollout_basis_points: i64,
+    pub(crate) rollout_seed: String,
+    pub(crate) explicit_canary_account_ids: Vec<String>,
+    /// Digest observed on the homogeneous activation-capable fleet while it is
+    /// still dormant in `installed`. The signed transition binds this exact
+    /// image and producer before `draining` can begin.
+    pub(crate) candidate_fleet_image_digest: String,
+    pub(crate) fleet_evidence_sha256: String,
+    pub(crate) client_evidence_sha256: String,
+    pub(crate) observed_at: String,
+    pub(crate) expires_at: String,
+    pub(crate) candidate_instances: u32,
+    pub(crate) predecessor_instances: u32,
+    pub(crate) unavailable_instances: u32,
+    pub(crate) web_client_ready: bool,
+    pub(crate) macos_client_ready: bool,
+    pub(crate) ios_client_ready: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MemoryReconciliationActivationSignature(Vec<u8>);
+
+impl MemoryReconciliationActivationSignature {
+    pub(crate) fn from_base64(value: &str) -> Result<Self> {
+        let bytes = BASE64_STANDARD.decode(value).map_err(|_| {
+            EnclaveError::Config(
+                "memory reconciliation activation signature must be canonical standard base64"
+                    .into(),
+            )
+        })?;
+        if bytes.len() != 64 || BASE64_STANDARD.encode(&bytes) != value {
+            return Err(EnclaveError::Config(
+                "memory reconciliation activation signature must be canonical standard base64 for 64 bytes"
+                    .into(),
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.len() != 64 {
+            return Err(EnclaveError::Config(
+                "persisted memory reconciliation activation signature has invalid length".into(),
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedMemoryReconciliationActivationReceipt {
+    receipt: MemoryReconciliationActivationReceipt,
+    canonical_bytes: Vec<u8>,
+    signature: MemoryReconciliationActivationSignature,
+    key_sha256: Vec<u8>,
+    observed_at: i64,
+    expires_at: i64,
+}
+
+impl VerifiedMemoryReconciliationActivationReceipt {
+    pub(crate) fn has_exact_canonical_transport(&self, supplied: &str) -> bool {
+        supplied.as_bytes() == self.canonical_bytes
+    }
+
+    pub(super) fn receipt(&self) -> &MemoryReconciliationActivationReceipt {
+        &self.receipt
+    }
+
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub(super) fn signature_bytes(&self) -> &[u8] {
+        self.signature.as_bytes()
+    }
+
+    pub(super) fn key_sha256(&self) -> &[u8] {
+        &self.key_sha256
+    }
+
+    pub(super) fn observed_at(&self) -> i64 {
+        self.observed_at
+    }
+
+    pub(super) fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
 }
 
 impl VerifiedSchemaFinalizationReceipt {
@@ -680,6 +795,178 @@ fn canonical_receipt_bytes(receipt: &SchemaFinalizationReceipt) -> Result<Vec<u8
     Ok(canonical)
 }
 
+fn canonical_activation_receipt_bytes(
+    receipt: &MemoryReconciliationActivationReceipt,
+) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(receipt)?;
+    let object = value.as_object().ok_or_else(|| {
+        EnclaveError::Store("activation receipt did not serialize as an object".into())
+    })?;
+    let sorted = object
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect::<BTreeMap<_, _>>();
+    let mut canonical = serde_json::to_vec(&sorted)?;
+    canonical.push(b'\n');
+    Ok(canonical)
+}
+
+fn validate_activation_receipt_shape(
+    receipt: &MemoryReconciliationActivationReceipt,
+) -> Result<(i64, i64)> {
+    let transition = (
+        receipt.previous_phase.as_str(),
+        receipt.requested_phase.as_str(),
+    );
+    if receipt.contract != "kioku.postgresql.memory-reconciliation-activation"
+        || receipt.contract_version != 1
+        || receipt.generation <= 0
+        || receipt.base_schema_version != EXPECTED_SCHEMA_VERSION
+        || receipt.target_schema_version != MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION
+        || !matches!(
+            transition,
+            ("installed", "draining")
+                | ("draining", "active")
+                | ("active", "paused")
+                | ("paused", "draining")
+                | ("paused", "active")
+        )
+    {
+        return Err(EnclaveError::Config(
+            "memory reconciliation activation receipt has an invalid contract or transition".into(),
+        ));
+    }
+    for digest in [
+        &receipt.activation_contract_sha256,
+        &receipt.activation_catalog_sha256,
+        &receipt.base_finalization_receipt_sha256,
+        &receipt.reconciliation_producer_contract_sha256,
+        &receipt.rollout_seed,
+        &receipt.candidate_fleet_image_digest,
+        &receipt.fleet_evidence_sha256,
+        &receipt.client_evidence_sha256,
+    ] {
+        if !is_sha256_label(digest) {
+            return Err(EnclaveError::Config(
+                "activation receipt digests must be lowercase sha256 labels".into(),
+            ));
+        }
+    }
+    if receipt.reconciliation_model.is_empty()
+        || receipt.reconciliation_model.len() > 128
+        || !receipt
+            .reconciliation_model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+        || receipt.vertex_location.is_empty()
+        || receipt.vertex_location.len() > 63
+        || !receipt
+            .vertex_location
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(EnclaveError::Config(
+            "activation receipt must bind an explicit reconciliation model and Vertex location"
+                .into(),
+        ));
+    }
+    if !matches!(receipt.rollout_basis_points, 0 | 10_000)
+        || (receipt.rollout_basis_points == 0 && receipt.explicit_canary_account_ids.is_empty())
+        || (receipt.rollout_basis_points == 10_000
+            && !receipt.explicit_canary_account_ids.is_empty())
+        || receipt.explicit_canary_account_ids.len() > 128
+        || receipt
+            .explicit_canary_account_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || receipt
+            .explicit_canary_account_ids
+            .iter()
+            .any(|account_id| {
+                account_id.is_empty()
+                    || account_id.len() > 128
+                    || !account_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@')
+                    })
+            })
+    {
+        return Err(EnclaveError::Config(
+            "activation receipt scope must be an explicit bounded canary or exactly 10000 basis points"
+                .into(),
+        ));
+    }
+    if receipt.requested_phase != "paused"
+        && (receipt.candidate_instances == 0
+            || receipt.predecessor_instances != 0
+            || receipt.unavailable_instances != 0)
+    {
+        return Err(EnclaveError::Config(
+            "activation receipt must prove the homogeneous available activation-capable candidate fleet"
+                .into(),
+        ));
+    }
+    if receipt.requested_phase != "paused"
+        && !(receipt.web_client_ready && receipt.macos_client_ready && receipt.ios_client_ready)
+    {
+        return Err(EnclaveError::Config(
+            "activation requires compatible web, macOS, and iOS client evidence".into(),
+        ));
+    }
+    let observed_at = isotime::parse_epoch_millis(&receipt.observed_at).ok_or_else(|| {
+        EnclaveError::Config("activation receipt observed_at is not RFC3339".into())
+    })?;
+    let expires_at = isotime::parse_epoch_millis(&receipt.expires_at).ok_or_else(|| {
+        EnclaveError::Config("activation receipt expires_at is not RFC3339".into())
+    })?;
+    if isotime::format_epoch_millis(observed_at) != receipt.observed_at
+        || isotime::format_epoch_millis(expires_at) != receipt.expires_at
+        || expires_at <= observed_at
+        || expires_at - observed_at > FLEET_RECEIPT_MAX_VALIDITY_MILLIS
+    {
+        return Err(EnclaveError::Config(
+            "activation receipt timestamps must be canonical UTC and valid for at most 15 minutes"
+                .into(),
+        ));
+    }
+    Ok((observed_at, expires_at))
+}
+
+fn verify_activation_signature_with_anchor(
+    receipt: MemoryReconciliationActivationReceipt,
+    signature: MemoryReconciliationActivationSignature,
+    anchor: SchemaFinalizationTrustAnchor,
+) -> Result<VerifiedMemoryReconciliationActivationReceipt> {
+    let (observed_at, expires_at) = validate_activation_receipt_shape(&receipt)?;
+    let canonical_bytes = canonical_activation_receipt_bytes(&receipt)?;
+    UnparsedPublicKey::new(&ED25519, &anchor.public_key)
+        .verify(&canonical_bytes, signature.as_bytes())
+        .map_err(|_| {
+            EnclaveError::Config(
+                "activation receipt signature does not match the baked trust anchor".into(),
+            )
+        })?;
+    Ok(VerifiedMemoryReconciliationActivationReceipt {
+        receipt,
+        canonical_bytes,
+        signature,
+        key_sha256: anchor.der_sha256,
+        observed_at,
+        expires_at,
+    })
+}
+
+pub(crate) fn verify_memory_reconciliation_activation_authorization(
+    receipt: MemoryReconciliationActivationReceipt,
+    signature: MemoryReconciliationActivationSignature,
+) -> Result<VerifiedMemoryReconciliationActivationReceipt> {
+    verify_activation_signature_with_anchor(
+        receipt,
+        signature,
+        configured_schema_finalization_trust_anchor()?,
+    )
+}
+
 fn validate_finalization_receipt_shape(
     receipt: &SchemaFinalizationReceipt,
     expected_contract: &[u8],
@@ -852,9 +1139,55 @@ async fn ledger_catalog_evidence(connection: &mut PgConnection) -> Result<String
         .await?)
 }
 
-async fn verified_release_steps(
+const ACTIVE_FINALIZATION_GUARD_TRIGGER: &str =
+    "episodes_00_enforce_assigned_reconciliation_finalization";
+const PENDING_DELETION_MEMBER_GUARD_TRIGGER: &str =
+    "episode_members_00_reject_pending_deleted_source";
+const PAGED_DELETION_MEMBER_GUARD_TRIGGER: &str = "episode_members_01_guard_paged_deletion";
+const PAGED_DELETION_EPISODE_GUARD_TRIGGER: &str = "episodes_01_guard_paged_deletion";
+
+async fn step_catalog_evidence_for_verification(
+    connection: &mut PgConnection,
+    step_name: &str,
+    allow_active_guard: bool,
+) -> Result<String> {
+    let evidence = step_catalog_evidence(connection, step_name).await?;
+    if !allow_active_guard {
+        return Ok(evidence);
+    }
+    let recognized_guards = match step_name {
+        STEP_EPISODES_COMPATIBILITY => vec![
+            format!("episodes.{ACTIVE_FINALIZATION_GUARD_TRIGGER}"),
+            format!("episodes.{PAGED_DELETION_EPISODE_GUARD_TRIGGER}"),
+        ],
+        STEP_MEMBERS_COMPATIBILITY => vec![
+            format!("episode_members.{PENDING_DELETION_MEMBER_GUARD_TRIGGER}"),
+            format!("episode_members.{PAGED_DELETION_MEMBER_GUARD_TRIGGER}"),
+        ],
+        _ => return Ok(evidence),
+    };
+    // The frozen v26 digests were computed before the v27 draining guards
+    // existed. A v27 reader removes only the exact recognized triggers from
+    // the matching PostgreSQL JSONB projection; every other change still
+    // fails closed. v0.9.16 does not filter any guard and therefore becomes
+    // unready as soon as the signed draining transition attaches them.
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT coalesce(jsonb_agg(item ORDER BY item->>0,item->>1,item->>2),'[]'::jsonb)::text \
+           FROM jsonb_array_elements($1::jsonb) item \
+          WHERE NOT (item->>0='trigger' AND EXISTS( \
+                SELECT 1 FROM unnest($2::text[]) recognized(name) \
+                 WHERE item->>1=(recognized.name::name)::text))",
+    )
+    .bind(&evidence)
+    .bind(&recognized_guards)
+    .fetch_one(&mut *connection)
+    .await?)
+}
+
+async fn verified_release_steps_mode(
     connection: &mut PgConnection,
     require_complete: bool,
+    allow_active_guard: bool,
 ) -> Result<BTreeSet<String>> {
     let rows = sqlx::query(
         "SELECT release_version,step_name,ddl_sha256,catalog_sha256 \
@@ -886,7 +1219,9 @@ async fn verified_release_steps(
             )));
         }
         let stored_catalog: Vec<u8> = row.try_get("catalog_sha256")?;
-        let evidence = step_catalog_evidence(connection, &step_name).await?;
+        let evidence =
+            step_catalog_evidence_for_verification(connection, &step_name, allow_active_guard)
+                .await?;
         if stored_catalog != evidence_digest(&evidence) {
             return Err(EnclaveError::Config(format!(
                 "schema-release step {step_name} catalog evidence changed"
@@ -906,9 +1241,17 @@ async fn verified_release_steps(
     Ok(completed)
 }
 
-async fn verify_existing_release_ledger(
+async fn verified_release_steps(
+    connection: &mut PgConnection,
+    require_complete: bool,
+) -> Result<BTreeSet<String>> {
+    verified_release_steps_mode(connection, require_complete, false).await
+}
+
+async fn verify_existing_release_ledger_mode(
     connection: &mut PgConnection,
     expected_contract: &[u8],
+    allow_active_guard: bool,
 ) -> Result<ReleaseProgress> {
     let row = sqlx::query(
         "SELECT predecessor_version,protocol_version,contract_sha256, \
@@ -936,13 +1279,20 @@ async fn verify_existing_release_ledger(
             "schema-release ledger does not match the embedded v26 bootstrap contract".into(),
         ));
     }
-    verified_release_steps(connection, false).await?;
+    verified_release_steps_mode(connection, false, allow_active_guard).await?;
     Ok(ReleaseProgress {
         phase: row.try_get("phase")?,
         accounts_complete: row.try_get("accounts_complete")?,
         episodes_complete: row.try_get("episodes_complete")?,
         members_complete: row.try_get("members_complete")?,
     })
+}
+
+async fn verify_existing_release_ledger(
+    connection: &mut PgConnection,
+    expected_contract: &[u8],
+) -> Result<ReleaseProgress> {
+    verify_existing_release_ledger_mode(connection, expected_contract, false).await
 }
 
 async fn bootstrap_or_verify_release_ledger(
@@ -955,8 +1305,8 @@ async fn bootstrap_or_verify_release_ledger(
                     WHERE table_schema=current_schema() \
                       AND table_name='persistence_schema' \
                       AND column_name='expanded_through_version'), \
-            to_regclass('public.persistence_schema_releases') IS NOT NULL, \
-            to_regclass('public.persistence_schema_release_steps') IS NOT NULL",
+            to_regclass(format('%I.%I',current_schema(),'persistence_schema_releases')) IS NOT NULL, \
+            to_regclass(format('%I.%I',current_schema(),'persistence_schema_release_steps')) IS NOT NULL",
     )
     .fetch_one(&mut *connection)
     .await?;
@@ -1098,7 +1448,8 @@ async fn index_state(
 ) -> Result<Option<IndexState>> {
     let row = sqlx::query(
         "SELECT index_state.indisvalid,index_state.indisready,index_state.indisunique, \
-                pg_get_indexdef(index_state.indexrelid) AS definition \
+                replace(pg_get_indexdef(index_state.indexrelid), \
+                        quote_ident(current_schema()) || '.', '') AS definition \
            FROM pg_index index_state \
            JOIN pg_class index_class ON index_class.oid=index_state.indexrelid \
            JOIN pg_namespace namespace ON namespace.oid=index_class.relnamespace \
@@ -1132,7 +1483,7 @@ async fn drop_concurrent_index(connection: &mut PgConnection, index_name: &str) 
         _ => {
             return Err(EnclaveError::Config(format!(
                 "refusing to drop unrecognized schema-release index {index_name}"
-            )))
+            )));
         }
     };
     execute_concurrent_index_statement(connection, sql).await
@@ -1229,7 +1580,7 @@ fn expected_index_definition(index_name: &str) -> Result<(bool, String)> {
         _ => {
             return Err(EnclaveError::Config(format!(
                 "unknown schema-release index {index_name}"
-            )))
+            )));
         }
     };
     Ok((unique, normalize_index_definition(definition)))
@@ -1667,12 +2018,13 @@ fn release_result(
     }
 }
 
-async fn verify_release_row(
+async fn verify_release_row_mode(
     connection: &mut PgConnection,
     serving_state: ServingSchemaState,
+    allow_active_guard: bool,
 ) -> Result<Option<Vec<u8>>> {
     let expected_contract = contract_digest();
-    verify_existing_release_ledger(connection, &expected_contract).await?;
+    verify_existing_release_ledger_mode(connection, &expected_contract, allow_active_guard).await?;
     let row = sqlx::query(
         "SELECT predecessor_version,protocol_version,contract_sha256,phase, \
                 accounts_complete,episodes_complete,members_complete, \
@@ -1701,7 +2053,7 @@ async fn verify_release_row(
             "v26 schema release receipt does not match the embedded contract".into(),
         ));
     }
-    verify_catalog_contract(connection).await?;
+    verified_release_steps_mode(connection, true, allow_active_guard).await?;
 
     match serving_state {
         ServingSchemaState::ExpandedTransition if phase == "expanded" => {
@@ -1739,6 +2091,38 @@ async fn verify_release_row(
             "schema marker and durable release phase disagree: {serving_state:?}/{phase}"
         ))),
     }
+}
+
+async fn verify_release_row(
+    connection: &mut PgConnection,
+    serving_state: ServingSchemaState,
+) -> Result<Option<Vec<u8>>> {
+    verify_release_row_mode(connection, serving_state, false).await
+}
+
+/// Executable copy of the v0.9.16 serving decision at source authority
+/// `368f273e461e79599c7e9f9027b8f09441fc446d`. Keep this test seam frozen:
+/// unlike the current verifier it never recognizes schema 27 or removes the
+/// active guard from v26 catalog evidence.
+#[cfg(test)]
+pub(super) async fn test_frozen_v0_9_16_verify_schema(connection: &mut PgConnection) -> Result<()> {
+    let state = connection_schema_state(connection).await?;
+    let serving_state = classify_serving_schema(state)?;
+    verify_release_row_mode(connection, serving_state, false).await?;
+    Ok(())
+}
+
+pub(super) async fn verify_finalized_v26_release(
+    connection: &mut PgConnection,
+    allow_active_guard: bool,
+) -> Result<Vec<u8>> {
+    verify_release_row_mode(
+        connection,
+        ServingSchemaState::Finalized,
+        allow_active_guard,
+    )
+    .await?
+    .ok_or_else(|| EnclaveError::Config("v26 finalization receipt is missing".into()))
 }
 
 impl PostgresPersistence {
@@ -1815,7 +2199,7 @@ impl PostgresPersistence {
                         .expanded_through_version
                         .map(|version| version.to_string())
                         .unwrap_or_else(|| "none".into()),
-                )))
+                )));
             }
         }
 
@@ -2057,30 +2441,99 @@ impl PostgresPersistence {
     pub(crate) async fn verify_schema(&self) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
         let state = connection_schema_state(&mut connection).await?;
+        if state
+            == (InstalledSchemaState {
+                version: MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION,
+                expanded_through_version: Some(MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION),
+            })
+        {
+            let activation =
+                super::activation::verify_serving_activation_schema(&mut connection).await?;
+            if !matches!(
+                activation.phase,
+                MemoryReconciliationActivationPhase::Active
+                    | MemoryReconciliationActivationPhase::Paused
+            ) {
+                return Err(EnclaveError::Config(
+                    "schema 27 requires a verified active or paused activation chain".into(),
+                ));
+            }
+            return Ok(());
+        }
         let serving_state = classify_serving_schema(state)?;
+        if serving_state == ServingSchemaState::Finalized
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass(format('%I.%I',current_schema(), \
+                        'persistence_feature_activation_contracts')) IS NOT NULL",
+            )
+            .fetch_one(&mut *connection)
+            .await?
+        {
+            let activation =
+                super::activation::verify_serving_activation_schema(&mut connection).await?;
+            if !matches!(
+                activation.phase,
+                MemoryReconciliationActivationPhase::Installed
+                    | MemoryReconciliationActivationPhase::Draining
+            ) {
+                return Err(EnclaveError::Config(
+                    "schema 26 activation contract has an incompatible phase".into(),
+                ));
+            }
+            return Ok(());
+        }
         verify_release_row(&mut connection, serving_state).await?;
         Ok(())
     }
 
-    /// A receipted 24/26 expand is reader-compatible with a live v24 fleet but
-    /// can never authorize topology publication. The writer requires a 26/26
-    /// marker and a strict persisted fleet receipt whose canonical hash verifies.
-    pub(crate) async fn verify_reconciliation_writer_schema(&self) -> Result<()> {
+    /// Verifies that this immutable image is compatible with the durable
+    /// activation phase. The reconciliation implementation is intentionally
+    /// dormant in `installed`; repository authority remains absent until
+    /// `active`. Once draining has begun, every serving replica must carry the
+    /// exact signed model, location, and producer contract.
+    pub(crate) async fn verify_reconciliation_runtime_schema(
+        &self,
+        reconciliation_model: Option<&str>,
+        vertex_location: &str,
+        producer_contract_sha256: Option<&[u8; 32]>,
+    ) -> Result<()> {
+        self.verify_schema().await?;
         let mut connection = self.pool.acquire().await?;
-        let state = connection_schema_state(&mut connection).await?;
-        if classify_serving_schema(state)? != ServingSchemaState::Finalized {
-            return Err(EnclaveError::Config(format!(
-                "memory reconciliation writer requires finalized PostgreSQL schema version {EXPECTED_SCHEMA_VERSION}"
-            )));
-        }
-        if verify_release_row(&mut connection, ServingSchemaState::Finalized)
-            .await?
-            .is_none()
-        {
-            return Err(EnclaveError::Config(
-                "memory reconciliation writer requires a persisted fleet finalization receipt"
-                    .into(),
-            ));
+        let activation =
+            super::activation::verify_serving_activation_schema(&mut connection).await?;
+        match activation.phase {
+            MemoryReconciliationActivationPhase::Preactive => {}
+            MemoryReconciliationActivationPhase::Installed => {
+                if reconciliation_model.is_none() || producer_contract_sha256.is_none() {
+                    return Err(EnclaveError::Config(
+                        "activation-capable reconciliation image lacks its explicit producer contract"
+                            .into(),
+                    ));
+                }
+            }
+            MemoryReconciliationActivationPhase::Draining
+            | MemoryReconciliationActivationPhase::Active
+            | MemoryReconciliationActivationPhase::Paused => {
+                let (Some(reconciliation_model), Some(producer_contract_sha256)) =
+                    (reconciliation_model, producer_contract_sha256)
+                else {
+                    return Err(EnclaveError::Config(
+                        "draining or activated reconciliation requires an activation-capable image"
+                            .into(),
+                    ));
+                };
+                if activation.reconciliation_model.as_deref() != Some(reconciliation_model)
+                    || activation.vertex_location.as_deref() != Some(vertex_location)
+                    || activation
+                        .reconciliation_producer_contract_sha256
+                        .as_deref()
+                        != Some(sha256_label(producer_contract_sha256).as_str())
+                {
+                    return Err(EnclaveError::Config(
+                        "runtime does not match the signed fleet activation authority".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2167,8 +2620,58 @@ pub(super) fn test_reject_tampered_finalization_signature(
 }
 
 #[cfg(test)]
+pub(super) fn test_verify_activation_receipt(
+    receipt: MemoryReconciliationActivationReceipt,
+) -> Result<VerifiedMemoryReconciliationActivationReceipt> {
+    let signature = test_schema_finalization_key_pair().sign(
+        &canonical_activation_receipt_bytes(&receipt)
+            .expect("test activation receipt must canonicalize"),
+    );
+    verify_activation_signature_with_anchor(
+        receipt,
+        MemoryReconciliationActivationSignature(signature.as_ref().to_vec()),
+        test_schema_finalization_trust_anchor()?,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activation_receipt(
+        previous_phase: &str,
+        requested_phase: &str,
+    ) -> MemoryReconciliationActivationReceipt {
+        MemoryReconciliationActivationReceipt {
+            contract: "kioku.postgresql.memory-reconciliation-activation".into(),
+            contract_version: 1,
+            generation: 1,
+            previous_phase: previous_phase.into(),
+            requested_phase: requested_phase.into(),
+            base_schema_version: 26,
+            target_schema_version: 27,
+            activation_contract_sha256: format!("sha256:{}", "0".repeat(64)),
+            activation_catalog_sha256: format!("sha256:{}", "1".repeat(64)),
+            base_finalization_receipt_sha256: format!("sha256:{}", "2".repeat(64)),
+            reconciliation_producer_contract_sha256: format!("sha256:{}", "3".repeat(64)),
+            reconciliation_model: "gemini-reconciliation-v1".into(),
+            vertex_location: "us-central1".into(),
+            rollout_basis_points: 0,
+            rollout_seed: format!("sha256:{}", "4".repeat(64)),
+            explicit_canary_account_ids: vec!["canary-account".into()],
+            candidate_fleet_image_digest: format!("sha256:{}", "5".repeat(64)),
+            fleet_evidence_sha256: format!("sha256:{}", "6".repeat(64)),
+            client_evidence_sha256: format!("sha256:{}", "7".repeat(64)),
+            observed_at: "2026-08-31T12:00:00.000Z".into(),
+            expires_at: "2026-08-31T12:10:00.000Z".into(),
+            candidate_instances: 2,
+            predecessor_instances: 0,
+            unavailable_instances: 0,
+            web_client_ready: true,
+            macos_client_ready: true,
+            ios_client_ready: true,
+        }
+    }
 
     #[test]
     fn schema_contract_hash_binds_every_release_fragment() {
@@ -2202,6 +2705,46 @@ mod tests {
         stale.expires_at =
             isotime::format_epoch_millis(observed + FLEET_RECEIPT_MAX_VALIDITY_MILLIS + 1);
         assert!(validate_finalization_receipt_shape(&stale, &contract).is_err());
+    }
+
+    #[test]
+    fn activation_receipt_proves_a_homogeneous_activation_capable_fleet() {
+        let receipt = activation_receipt("installed", "draining");
+        assert!(validate_activation_receipt_shape(&receipt).is_ok());
+
+        let mut mixed_fleet = receipt;
+        mixed_fleet.predecessor_instances = 1;
+        assert!(validate_activation_receipt_shape(&mixed_fleet).is_err());
+    }
+
+    #[test]
+    fn activation_receipt_rejects_removed_process_local_writer_fields() {
+        let receipt = activation_receipt("installed", "draining");
+        let mut value = serde_json::to_value(receipt)
+            .expect("test activation receipt must serialize")
+            .as_object()
+            .expect("activation receipt must serialize as an object")
+            .clone();
+        value.insert("writer_enabled".into(), serde_json::json!(true));
+        value.insert("effective_writer_instances".into(), serde_json::json!(2));
+        assert!(
+            serde_json::from_value::<MemoryReconciliationActivationReceipt>(
+                serde_json::Value::Object(value)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pause_receipt_remains_operable_during_a_fleet_outage() {
+        let mut pause = activation_receipt("active", "paused");
+        pause.candidate_instances = 0;
+        pause.predecessor_instances = 7;
+        pause.unavailable_instances = 9;
+        pause.web_client_ready = false;
+        pause.macos_client_ready = false;
+        pause.ios_client_ready = false;
+        assert!(validate_activation_receipt_shape(&pause).is_ok());
     }
 
     #[test]

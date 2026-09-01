@@ -3,26 +3,29 @@
 The sole structured-state implementation. Every adapter shares one bounded SQLx PostgreSQL pool,
 uses tenant-qualified queries, database time for leases/deadlines, and explicit transactions for
 claims and settlement. Serving startup accepts finalized schema 26 or the exact receipted 24/26
-expand during the ADR-0041 mixed-fleet window. Topology publication remains hard-dark even after
-finalization until a later release adds a durable fleet-wide activation receipt and mixed-process
-finalizer fence. Only the explicit release migrator applies the append-only files under `migrations/`.
+expand during the ADR-0041 mixed-fleet window. The additive v27 activation contract keeps
+reconciliation egress dark through install/drain, attaches legacy/deletion guards at signed
+Draining, and enables topology publication only from a signed Active generation with exact
+fleet-image, source-completeness, and provider-contract fences. Pause is forward-only. Only the explicit
+release migrator applies the append-only files under `migrations/`.
 
 | File | Responsibility |
 |---|---|
 | `mod.rs` | TLS PostgreSQL pool construction, UTC/statement-timeout policy, schema marker primitives, disposable test ladder, and shared transaction helpers. |
-| `schema_release.rs` | Session-locked online v24-to-v26 release: marker-preserving account-status expansion, collision-refusing receipted DDL, exact per-step catalog evidence, concurrent guards/indexes, compatibility-trigger barrier, resumable keyset backfill, baked-anchor Ed25519 fleet authorization, and serving/writer re-verification. |
+| `schema_release.rs` | Session-locked online v24-to-v26 release plus phase-aware v27 serving verification: marker-preserving expansion, exact per-step catalog evidence, concurrent indexes, baked-anchor Ed25519 fleet/activation authorization, and immutable model/location/producer readiness binding. |
+| `activation.rs` | Append-only v27 install/backfill/drain/activate/pause/resume authority, shared/exclusive release-lock serialization before schema probes, sticky scope, durable candidate-fleet image identity, exact catalog/receipt verification, database guard installation, claim drain, and runtime/repository gates. |
 | `admission.rs` | Fleet token buckets and crash-recoverable concurrency leases. |
 | `billing.rs` | Creating and lookup-only billing pseudonym resolution, recording lease/credit receipts, coverage anchors, retained-account metrics, and detach work. |
-| `capture.rs` | Atomic capture/reference admission, media metadata, receipts, event/session status, and replay. |
+| `capture.rs` | Atomic capture/reference admission, media metadata, provisional finish receipts, append-audited seal-generation reopen for late offline sources, exact deletion-tombstone replay acknowledgement without resurrection, event/session status, and replay. |
 | `delivery_outbox.rs` | Fleet-owned email, webhook, and push candidate selection, frozen requests, claims, expiry takeover, and exact settlement. |
 | `entitlement.rs` | Active-account checks and atomic daily quota/Vertex reservations. |
-| `episode_deletion.rs` | Durable logical freeze, exact GCS inventory, provider-cleanup progress, structured purge, and replay receipt. |
-| `finalization.rs` | Finalization claims, source projection, and atomic recap/episode/outbox settlement. |
+| `episode_deletion.rs` | Durable logical freeze plus uncapped keyset-paged member/root/family/session inventory, canonical/reference-family and provider-claim fences, bounded GCS acknowledgement before structured mutation, reference-before-root accepted-sequence tombstone/purge, media aggregate cleanup/replan, formation refresh, exact terminal closure, and replay receipt. |
+| `finalization.rs` | Database-time finalization claims, the activation/account/episode provider-egress fence held through terminal usage, source projection, and atomic recap/episode/outbox settlement. |
 | `identity.rs` | Accounts, provider identities, signup budget, Apple credentials/grants, and coherent session reads. |
 | `lifecycle.rs` | Pre-fence account admission tombstones, deletion-owned recovery of expired outbound claims/global lanes, deletion ownership/progress, transactionally marked reviewer-fixture refusal, revocation settlement, cascading purge, and no-resurrection checks. |
-| `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection with stable owner-source classification, voice jobs, bounded retry/resurrection, and retention progress. |
-| `memory_formation.rs` | Summarizer windows, turn-timed source projections, episode/member writes, complete memory/final-brief human-text embeddings, and atomic durable cursor settlement. |
-| `memory_reconciliation.rs` | PostgreSQL source-closure snapshots and fingerprints, fleet claims, structured staged model results, serializable topology publication, and bounded handle resolution. |
+| `media_processing.rs` | Media work claims, attempts, usage, screen/audio projection with stable owner-source classification, voice jobs, database-time bounded retry/resurrection, and retention progress. |
+| `memory_formation.rs` | Forward summarizer windows plus exact late-session formation revisions and durable bounded pages, frozen request/attempt recovery, reference-aware unowned source projection, evidence-free deletion tombstones, renewed durable provider/deletion fences, pending-revision topology rebind, bounded legacy-finish import, four-hour quiet seal generations, episode/member writes, complete memory/final-brief human-text embeddings, and atomic durable settlement. |
+| `memory_reconciliation.rs` | PostgreSQL formation/seal-complete source closures and fingerprints, active-generation claims, producer-bound provider egress/stages, bounded providerless oversized-neighborhood discovery plus independent commitment verification, serializable topology publication, and bounded handle resolution. |
 | `model_usage.rs` | Paid-model intents/outcomes, usage batch claims/delivery, and coverage reconciliation. |
 | `notification.rs` | Webhook destinations, email consent, push installations, and configuration/disclosure-fence serialization. |
 | `oauth.rs` | OAuth registration, consent, authorization codes, native sessions, and refresh-token rotation. |

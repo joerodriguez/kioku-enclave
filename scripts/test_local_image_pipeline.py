@@ -68,6 +68,10 @@ def write_config(path: Path, *, mode: int = 0o600) -> None:
     values["LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT"] = (
         "local-builder@kioku-joerodriguez.iam.gserviceaccount.com"
     )
+    values["PRODUCTION_VERTEX_RECONCILIATION_MODEL"] = "gemini-reconciliation-v1"
+    values["PRODUCTION_MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256"] = (
+        "sha256:" + "c" * 64
+    )
     path.write_text(
         "\n".join(f"{name}={value}" for name, value in sorted(values.items())) + "\n",
         encoding="utf-8",
@@ -763,7 +767,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertIn("local_build_evidence.py", source)
         self.assertIn("enclave-local-build-evidence.json", source)
         self.assertIn("enclave-release.json", source)
-        self.assertIn('"schema_version": 11', source)
+        self.assertIn('"schema_version": 12', source)
         self.assertIn("enclave-scan.json", source)
         self.assertIn("source_snapshot(commit, expected_archive_digest=", source)
         self.assertLess(source.index("sbom_and_scan(image_uri, output_dir)"), source.index("verify_source_unchanged(arguments.source_ref, commit)"))
@@ -1511,10 +1515,28 @@ class LocalImagePipelineTests(unittest.TestCase):
             directory = Path(temporary_directory)
             source = directory / "secret.env"
             output = directory / "assembled.env"
+            producer_contract = "sha256:" + "a" * 64
+            producer_contract_helper = directory / "producer-contract-helper"
+            producer_contract_helper.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  --print-memory-reconciliation-producer-contract) "
+                "printf '%s\\n' '" + producer_contract + "' ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            producer_contract_helper.chmod(0o700)
             source.write_bytes(encoded)
             source.chmod(0o600)
             completed = subprocess.run(
-                [str(SCRIPTS / "assemble_image_config.sh"), str(source), str(output), expected],
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(source),
+                    str(output),
+                    expected,
+                    str(producer_contract_helper),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -1540,6 +1562,7 @@ class LocalImagePipelineTests(unittest.TestCase):
                     str(closed_source),
                     str(closed_output),
                     __import__("hashlib").sha256(closed).hexdigest(),
+                    str(producer_contract_helper),
                 ],
                 check=False,
                 capture_output=True,
@@ -1548,28 +1571,94 @@ class LocalImagePipelineTests(unittest.TestCase):
             self.assertEqual(closed_result.returncode, 0, closed_result.stderr)
             self.assertEqual(closed_output.read_bytes(), closed)
 
-            # A process-local true flag is unsafe during a mixed-fleet rollout.
-            # The image boundary stays hard-dark until a durable activation
-            # receipt observed by both old and new processes is implemented.
-            enabled_writer = encoded.replace(
-                b"MEMORY_RECONCILIATION_WRITER_ENABLED=\n",
-                b"MEMORY_RECONCILIATION_WRITER_ENABLED=true\n",
-            )
-            self.assertNotEqual(enabled_writer, encoded)
-            enabled_writer_source = directory / "enabled-writer.env"
-            enabled_writer_source.write_bytes(enabled_writer)
-            enabled_writer_source.chmod(0o600)
-            enabled_writer_result = subprocess.run(
+            # The removed writer flag is not an accepted image input. Runtime
+            # authority comes only from the durable PostgreSQL phase.
+            flagged = encoded + b"MEMORY_RECONCILIATION_WRITER_ENABLED=true\n"
+            flagged_source = directory / "flagged.env"
+            flagged_source.write_bytes(flagged)
+            flagged_source.chmod(0o600)
+            flagged_result = subprocess.run(
                 [
                     str(SCRIPTS / "assemble_image_config.sh"),
-                    str(enabled_writer_source),
-                    str(directory / "enabled-writer-output"),
-                    __import__("hashlib").sha256(enabled_writer).hexdigest(),
+                    str(flagged_source),
+                    str(directory / "flagged-output"),
+                    __import__("hashlib").sha256(flagged).hexdigest(),
                 ],
                 check=False,
             )
-            self.assertNotEqual(enabled_writer_result.returncode, 0)
-            self.assertFalse((directory / "enabled-writer-output").exists())
+            self.assertNotEqual(flagged_result.returncode, 0)
+            self.assertFalse((directory / "flagged-output").exists())
+
+            activation_capable = encoded
+            activation_capable_source = directory / "activation-capable.env"
+            activation_capable_output = directory / "activation-capable-output"
+            activation_capable_source.write_bytes(activation_capable)
+            activation_capable_source.chmod(0o600)
+            activation_capable_result = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(activation_capable_source),
+                    str(activation_capable_output),
+                    __import__("hashlib").sha256(activation_capable).hexdigest(),
+                    str(producer_contract_helper),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                activation_capable_result.returncode,
+                0,
+                activation_capable_result.stderr,
+            )
+            self.assertEqual(activation_capable_output.read_bytes(), activation_capable)
+
+            evaluation_capable = activation_capable.replace(
+                b"KIOKU_BUILD_PROFILE=production\n",
+                b"KIOKU_BUILD_PROFILE=evaluation\n",
+            )
+            evaluation_source = directory / "evaluation-capable.env"
+            evaluation_output = directory / "evaluation-capable-output"
+            evaluation_source.write_bytes(evaluation_capable)
+            evaluation_source.chmod(0o600)
+            local_evaluation = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(evaluation_source),
+                    str(evaluation_output),
+                    __import__("hashlib").sha256(evaluation_capable).hexdigest(),
+                    str(producer_contract_helper),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                local_evaluation.returncode,
+                0,
+                local_evaluation.stderr,
+            )
+            self.assertEqual(evaluation_output.read_bytes(), evaluation_capable)
+
+            mismatched_helper = directory / "mismatched-producer-contract-helper"
+            mismatched_helper.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'sha256:" + "d" * 64 + "'\n",
+                encoding="utf-8",
+            )
+            mismatched_helper.chmod(0o700)
+            mismatched_output = directory / "mismatched-producer-output"
+            mismatched = subprocess.run(
+                [
+                    str(SCRIPTS / "assemble_image_config.sh"),
+                    str(activation_capable_source),
+                    str(mismatched_output),
+                    __import__("hashlib").sha256(activation_capable).hexdigest(),
+                    str(mismatched_helper),
+                ],
+                check=False,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertFalse(mismatched_output.exists())
 
             source.write_bytes(encoded + b"KIOKU_BUILD_PROFILE=attacker\n")
             rejected = subprocess.run(

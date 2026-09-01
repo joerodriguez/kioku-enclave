@@ -18,8 +18,10 @@ use tracing::warn;
 
 use crate::error::{EnclaveError, Result};
 use crate::persistence::{
-    AudioMediaSettlement, MediaPersonEvidence, MediaProcessingClaim, MediaProcessingClass,
-    MediaProcessingJob, MediaScreenProjection, MediaUsageSettlement, ScreenMediaSettlement,
+    AudioMediaSettlement, MediaFailureDisposition, MediaFailurePolicy, MediaPersonEvidence,
+    MediaProcessingClaim, MediaProcessingClass, MediaProcessingJob, MediaProviderAttempt,
+    MediaProviderStagedResponse, MediaScreenProjection, MediaUsageSettlement,
+    ScreenMediaSettlement,
 };
 
 use super::media::parse_audio_result;
@@ -30,17 +32,77 @@ const WORKER_INTERVAL_SECONDS: u64 = 30;
 const MAX_JOBS_PER_USER_PER_SWEEP: usize = 2;
 const MAX_CONCURRENT_USER_SWEEPS: usize = 4;
 const MAX_ATTEMPTS: i64 = 3;
-const PROCESSOR_VERSION: i64 = 1;
+pub(crate) const PROCESSOR_VERSION: i64 = 1;
 const RESURRECTION_DELAY_SECONDS: i64 = 3_600;
-const RESURRECTION_TOTAL_ATTEMPT_CAP: i64 = 9;
+pub(crate) const RESURRECTION_TOTAL_ATTEMPT_CAP: i64 = 9;
 pub(crate) const RESURRECTION_WINDOW_SECONDS: f64 = 7.0 * 24.0 * 3_600.0;
 const RESURRECTION_MAX_PER_SWEEP: i64 = 16;
 pub(crate) const RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS: i64 = MAX_ATTEMPTS + 2;
 const CLAIM_SCAN_LIMIT: i64 = 128;
 const CLAIM_LEASE_SECONDS: i64 = 300;
 const BUDGET_RETRY_SECONDS: i64 = 6 * 60 * 60;
-const RESURRECTION_WINDOW_SECONDS_INTEGRAL: i64 = 7 * 24 * 3_600;
+pub(crate) const RESURRECTION_WINDOW_SECONDS_INTEGRAL: i64 = 7 * 24 * 3_600;
 pub(crate) const TRANSCRIPT_TARGET_CONFLICT: &str = "transcript_target_conflict";
+pub(crate) const NON_RESURRECTABLE_MEDIA_ERROR_CODES: [&str; 5] = [
+    "media_integrity",
+    TRANSCRIPT_TARGET_CONFLICT,
+    "unplannable_media",
+    "vertex_ambiguous",
+    "invalid_model_output",
+];
+
+#[derive(Debug)]
+struct MediaWorkFailure {
+    error: EnclaveError,
+    disposition: MediaFailureDisposition,
+    provider_attempt: Option<MediaProviderAttempt>,
+    preserve_staged_response: bool,
+}
+
+impl MediaWorkFailure {
+    fn before_egress(error: EnclaveError) -> Self {
+        Self {
+            error,
+            disposition: MediaFailureDisposition::RetryableBeforeEgress,
+            provider_attempt: None,
+            preserve_staged_response: false,
+        }
+    }
+
+    fn provider(
+        error: EnclaveError,
+        disposition: MediaFailureDisposition,
+        provider_attempt: MediaProviderAttempt,
+    ) -> Self {
+        Self {
+            error,
+            disposition,
+            provider_attempt: Some(provider_attempt),
+            preserve_staged_response: false,
+        }
+    }
+
+    fn staged(error: EnclaveError, provider_attempt: MediaProviderAttempt) -> Self {
+        Self {
+            error,
+            disposition: MediaFailureDisposition::AmbiguousTerminal,
+            provider_attempt: Some(provider_attempt),
+            preserve_staged_response: true,
+        }
+    }
+}
+
+impl From<EnclaveError> for MediaWorkFailure {
+    fn from(error: EnclaveError) -> Self {
+        Self::before_egress(error)
+    }
+}
+
+impl From<serde_json::Error> for MediaWorkFailure {
+    fn from(error: serde_json::Error) -> Self {
+        Self::before_egress(error.into())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MediaJob {
@@ -319,7 +381,7 @@ async fn reserve_media_output(
     state: &CpState,
     user_id: &str,
     claim: &MediaProcessingClaim,
-) -> Result<()> {
+) -> Result<i64> {
     let (class, requested) = match claim.class {
         MediaProcessingClass::Audio => (
             super::limits::VertexWorkClass::Audio,
@@ -341,103 +403,228 @@ async fn reserve_media_output(
     if !reserved {
         return Err(EnclaveError::Config("vertex_daily_budget".into()));
     }
-    state
-        .repositories
-        .media_processing()
-        .record_reservation(claim, requested, &now_iso())
-        .await
+    Ok(requested)
 }
 
-async fn process_work_unit(
+fn mapped_provider_disposition(
+    value: vertex::VertexGenerationFailureDisposition,
+) -> MediaFailureDisposition {
+    match value {
+        vertex::VertexGenerationFailureDisposition::RetryableBeforeEgress => {
+            MediaFailureDisposition::RetryableBeforeEgress
+        }
+        vertex::VertexGenerationFailureDisposition::RetryableNotBilled => {
+            MediaFailureDisposition::RetryableNotBilled
+        }
+        vertex::VertexGenerationFailureDisposition::AmbiguousTerminal => {
+            MediaFailureDisposition::AmbiguousTerminal
+        }
+        vertex::VertexGenerationFailureDisposition::ConfirmedInvalid => {
+            MediaFailureDisposition::ConfirmedInvalid
+        }
+    }
+}
+
+async fn authorize_and_send_media(
     state: &CpState,
     user_id: &str,
     claim: &MediaProcessingClaim,
-) -> Result<()> {
-    let work = MediaWorkUnit {
-        jobs: claim.jobs.iter().map(MediaJob::from).collect(),
-    };
-    let mut media = Vec::with_capacity(claim.jobs.len());
-    for job in &claim.jobs {
-        media.push(load_job_media(state, user_id, job).await?);
-    }
-    reserve_media_output(state, user_id, claim).await?;
+    reserved_output_tokens: i64,
+    prepared: vertex::PreparedMediaRequest,
+) -> std::result::Result<MediaProviderStagedResponse, MediaWorkFailure> {
+    let attempt = prepared.attempt().clone();
     let repository = state.repositories.media_processing();
+    match repository
+        .authorize_provider_attempt(claim, reserved_output_tokens, &attempt)
+        .await
+    {
+        Ok(()) => {
+            // This is deliberately the first and only await after the final
+            // authorization succeeds: it crosses the provider boundary.
+            let response = prepared.send().await.map_err(|failure| {
+                MediaWorkFailure::provider(
+                    failure.into_error(),
+                    MediaFailureDisposition::AmbiguousTerminal,
+                    attempt.clone(),
+                )
+            })?;
+            if let Err(error) = repository.stage_provider_response(claim, &response).await {
+                let settlement = super::model_usage::settle_ambiguous_required(
+                    state,
+                    user_id,
+                    &attempt.event_id,
+                    Some(response.http_status),
+                )
+                .await;
+                return Err(MediaWorkFailure::provider(
+                    settlement.err().unwrap_or(error),
+                    MediaFailureDisposition::AmbiguousTerminal,
+                    attempt,
+                ));
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            let settlement = super::model_usage::settle_pre_egress_not_billed_required(
+                state,
+                user_id,
+                &attempt.event_id,
+            )
+            .await;
+            match settlement {
+                Ok(()) => Err(MediaWorkFailure::provider(
+                    error,
+                    MediaFailureDisposition::RetryableNotBilled,
+                    attempt,
+                )),
+                Err(settlement_error) => {
+                    let _ = super::model_usage::settle_ambiguous_required(
+                        state,
+                        user_id,
+                        &attempt.event_id,
+                        None,
+                    )
+                    .await;
+                    Err(MediaWorkFailure::provider(
+                        settlement_error,
+                        MediaFailureDisposition::AmbiguousTerminal,
+                        attempt,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn settle_staged_media(
+    state: &CpState,
+    user_id: &str,
+    claim: &MediaProcessingClaim,
+    response: MediaProviderStagedResponse,
+) -> std::result::Result<(), MediaWorkFailure> {
+    let operation = match claim.class {
+        MediaProcessingClass::Audio => vertex::VertexOperation::AudioWindow,
+        MediaProcessingClass::Screen => vertex::VertexOperation::ScreenStoryboard,
+    };
+    let output_tokens = match claim.class {
+        MediaProcessingClass::Audio => vertex::MAX_MEDIA_OUTPUT_TOKENS,
+        MediaProcessingClass::Screen => vertex::MAX_SCREEN_OUTPUT_TOKENS,
+    };
+    let generation = match vertex::parse_staged_media_response(&response, operation, output_tokens)
+    {
+        Ok(generation) => generation,
+        Err(failure) => {
+            let disposition = mapped_provider_disposition(failure.disposition);
+            let settlement = match disposition {
+                MediaFailureDisposition::RetryableNotBilled => {
+                    super::model_usage::settle_not_billed_required(
+                        state,
+                        user_id,
+                        &response.attempt.event_id,
+                        response.http_status,
+                    )
+                    .await
+                }
+                MediaFailureDisposition::AmbiguousTerminal
+                | MediaFailureDisposition::ConfirmedInvalid => {
+                    super::model_usage::settle_ambiguous_required(
+                        state,
+                        user_id,
+                        &response.attempt.event_id,
+                        Some(response.http_status),
+                    )
+                    .await
+                }
+                MediaFailureDisposition::RetryableBeforeEgress => Err(EnclaveError::Store(
+                    "staged provider response was classified before egress".into(),
+                )),
+            };
+            let error = settlement.err().unwrap_or_else(|| failure.into_error());
+            return Err(MediaWorkFailure::provider(
+                error,
+                disposition,
+                response.attempt,
+            ));
+        }
+    };
+
+    if let Err(error) = super::model_usage::settle_response_required(
+        state,
+        user_id,
+        &generation.event_id,
+        &generation.metadata,
+    )
+    .await
+    {
+        return Err(MediaWorkFailure::staged(error, response.attempt));
+    }
+    let repository = state.repositories.media_processing();
+    if let Err(error) = repository
+        .settle_usage(MediaUsageSettlement {
+            claim: claim.clone(),
+            provider_attempt: response.attempt.clone(),
+            usage: media_usage(claim, &generation),
+        })
+        .await
+    {
+        return Err(MediaWorkFailure::staged(error, response.attempt));
+    }
+
     if claim.class == MediaProcessingClass::Audio {
-        let (window, _sources, duration_ms) = assemble_audio_window(&work.jobs, &media)?;
-        let candidate_names = repository.candidate_name_vocabulary(user_id).await?;
-        let prompt = format!(
-            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). A bare name is self_identification only when it answers a preceding request for that speaker's name. Never mark a speaker as self_identification merely because they repeat, spell, correct, or expand another speaker's name: after A answers 'Sarah', if B says 'Sarah Babetski', B's statement is a third_party_mention whose speaker_name_subject_turn_id points to A's turn, not B's identity. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
-            work.jobs[0].stream_kind,
-            serde_json::to_string(&candidate_names)?
-        );
-        let generation = vertex::generate_media_custom(
-            state,
-            user_id,
-            vertex::VertexOperation::AudioWindow,
-            &prompt,
-            "audio/wav",
-            &window,
-            audio_schema(),
-            true,
-        )
-        .await?;
-        super::model_usage::settle_response_required(
-            state,
-            user_id,
-            &generation.event_id,
-            &generation.metadata,
-        )
-        .await?;
-        repository
-            .settle_usage(MediaUsageSettlement {
-                claim: claim.clone(),
-                usage: media_usage(claim, &generation),
-            })
-            .await?;
-        let turns = parse_audio_result(&generation.text, duration_ms)?;
+        let window_start = claim
+            .jobs
+            .iter()
+            .filter_map(|job| isotime::parse_epoch_millis(&job.started_at))
+            .min()
+            .ok_or_else(|| {
+                MediaWorkFailure::provider(
+                    EnclaveError::InvalidRequest("audio window is empty".into()),
+                    MediaFailureDisposition::ConfirmedInvalid,
+                    response.attempt.clone(),
+                )
+            })?;
+        let window_end = claim
+            .jobs
+            .iter()
+            .filter_map(|job| isotime::parse_epoch_millis(&job.ended_at))
+            .max()
+            .ok_or_else(|| {
+                MediaWorkFailure::provider(
+                    EnclaveError::InvalidRequest("audio window is empty".into()),
+                    MediaFailureDisposition::ConfirmedInvalid,
+                    response.attempt.clone(),
+                )
+            })?;
+        let turns = parse_audio_result(&generation.text, window_end.saturating_sub(window_start))
+            .map_err(|error| {
+            MediaWorkFailure::provider(
+                error,
+                MediaFailureDisposition::ConfirmedInvalid,
+                response.attempt.clone(),
+            )
+        })?;
         repository
             .settle_audio(AudioMediaSettlement {
                 claim: claim.clone(),
+                provider_attempt: response.attempt.clone(),
                 turns,
             })
             .await
+            .map_err(|error| MediaWorkFailure::staged(error, response.attempt))
     } else {
-        let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. List a person only when a visible name label supports it, preferring the complete first and last name. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
-        let inputs = work
-            .jobs
-            .iter()
-            .zip(&media)
-            .map(|(job, bytes)| vertex::MediaInput::new(&job.event_id, &job.mime_type, bytes))
-            .collect::<Vec<_>>();
-        let generation = vertex::generate_media_parts_custom(
-            state,
-            user_id,
-            vertex::VertexOperation::ScreenStoryboard,
-            prompt,
-            &inputs,
-            storyboard_schema(),
-            vertex::MAX_SCREEN_OUTPUT_TOKENS,
-        )
-        .await?;
-        super::model_usage::settle_response_required(
-            state,
-            user_id,
-            &generation.event_id,
-            &generation.metadata,
-        )
-        .await?;
-        repository
-            .settle_usage(MediaUsageSettlement {
-                claim: claim.clone(),
-                usage: media_usage(claim, &generation),
-            })
-            .await?;
         let expected = claim
             .jobs
             .iter()
             .map(|job| job.event_id.clone())
             .collect::<Vec<_>>();
-        let results = validate_storyboard_result(&generation.text, &expected)?
+        let results = validate_storyboard_result(&generation.text, &expected)
+            .map_err(|error| {
+                MediaWorkFailure::provider(
+                    error,
+                    MediaFailureDisposition::ConfirmedInvalid,
+                    response.attempt.clone(),
+                )
+            })?
             .into_iter()
             .map(|(event_id, result)| MediaScreenProjection {
                 event_id,
@@ -461,10 +648,96 @@ async fn process_work_unit(
         repository
             .settle_screens(ScreenMediaSettlement {
                 claim: claim.clone(),
+                provider_attempt: response.attempt.clone(),
                 results,
             })
             .await
+            .map_err(|error| MediaWorkFailure::staged(error, response.attempt))
     }
+}
+
+async fn process_work_unit(
+    state: &CpState,
+    user_id: &str,
+    claim: &MediaProcessingClaim,
+) -> std::result::Result<(), MediaWorkFailure> {
+    if let Some(response) = claim.staged_response.clone() {
+        return settle_staged_media(state, user_id, claim, response).await;
+    }
+    let work = MediaWorkUnit {
+        jobs: claim.jobs.iter().map(MediaJob::from).collect(),
+    };
+    let mut media = Vec::with_capacity(claim.jobs.len());
+    for job in &claim.jobs {
+        media.push(load_job_media(state, user_id, job).await?);
+    }
+    let repository = state.repositories.media_processing();
+    let reserved_output_tokens = reserve_media_output(state, user_id, claim).await?;
+    let prepared = if claim.class == MediaProcessingClass::Audio {
+        let (window, _sources, _duration_ms) = assemble_audio_window(&work.jobs, &media)?;
+        let candidate_names = repository.candidate_name_vocabulary(user_id).await?;
+        let prompt = format!(
+            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). A bare name is self_identification only when it answers a preceding request for that speaker's name. Never mark a speaker as self_identification merely because they repeat, spell, correct, or expand another speaker's name: after A answers 'Sarah', if B says 'Sarah Babetski', B's statement is a third_party_mention whose speaker_name_subject_turn_id points to A's turn, not B's identity. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            work.jobs[0].stream_kind,
+            serde_json::to_string(&candidate_names)?
+        );
+        vertex::prepare_media_custom(
+            state,
+            user_id,
+            &claim.work_unit_id,
+            claim.provider_attempt_number,
+            vertex::VertexOperation::AudioWindow,
+            &prompt,
+            "audio/wav",
+            &window,
+            audio_schema(),
+            true,
+        )
+        .await
+    } else {
+        let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. List a person only when a visible name label supports it, preferring the complete first and last name. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
+        let inputs = work
+            .jobs
+            .iter()
+            .zip(&media)
+            .map(|(job, bytes)| vertex::MediaInput::new(&job.event_id, &job.mime_type, bytes))
+            .collect::<Vec<_>>();
+        vertex::prepare_media_parts_custom(
+            state,
+            user_id,
+            &claim.work_unit_id,
+            claim.provider_attempt_number,
+            vertex::VertexOperation::ScreenStoryboard,
+            prompt,
+            &inputs,
+            storyboard_schema(),
+            vertex::MAX_SCREEN_OUTPUT_TOKENS,
+        )
+        .await
+    };
+    let prepared = match prepared {
+        Ok(vertex::PreparedMediaInvocation::Send(prepared)) => *prepared,
+        Ok(vertex::PreparedMediaInvocation::ConfirmedNotBilled(attempt)) => {
+            return Err(MediaWorkFailure::provider(
+                EnclaveError::Conflict(
+                    "media provider attempt was already confirmed not billed".into(),
+                ),
+                MediaFailureDisposition::RetryableNotBilled,
+                attempt,
+            ));
+        }
+        Ok(vertex::PreparedMediaInvocation::AmbiguousTerminal(attempt)) => {
+            return Err(MediaWorkFailure::provider(
+                EnclaveError::Conflict("media provider attempt cannot be safely resent".into()),
+                MediaFailureDisposition::AmbiguousTerminal,
+                attempt,
+            ));
+        }
+        Err(failure) => return Err(MediaWorkFailure::before_egress(failure.into_error())),
+    };
+    let response =
+        authorize_and_send_media(state, user_id, claim, reserved_output_tokens, prepared).await?;
+    settle_staged_media(state, user_id, claim, response).await
 }
 fn assemble_audio_window(
     jobs: &[MediaJob],
@@ -585,34 +858,57 @@ async fn process_user(state: &CpState, user_id: &str) {
         let Some(claim) = claim else {
             continue;
         };
-        if let Err(error) = process_work_unit(state, user_id, &claim).await {
-            let error_code = match error {
-                EnclaveError::Config(ref message) if message == "quota" => "vertex_quota",
-                EnclaveError::Config(ref message) if message == "vertex_daily_budget" => {
-                    "vertex_daily_budget"
+        if let Err(failure) = process_work_unit(state, user_id, &claim).await {
+            let error_code = match (&failure.disposition, &failure.error) {
+                (MediaFailureDisposition::AmbiguousTerminal, _) => "vertex_ambiguous",
+                (MediaFailureDisposition::ConfirmedInvalid, _) => "invalid_model_output",
+                (MediaFailureDisposition::RetryableNotBilled, EnclaveError::Config(message))
+                    if message == "quota" =>
+                {
+                    "vertex_quota"
                 }
-                EnclaveError::Json(_) | EnclaveError::InvalidRequest(_) => "invalid_model_output",
-                EnclaveError::Crypto(_) => "media_integrity",
-                EnclaveError::Conflict(ref message) if message == TRANSCRIPT_TARGET_CONFLICT => {
-                    TRANSCRIPT_TARGET_CONFLICT
-                }
-                _ => "processing_error",
+                (MediaFailureDisposition::RetryableNotBilled, _) => "vertex_not_billed",
+                (_, error) => match error {
+                    EnclaveError::Config(ref message) if message == "quota" => "vertex_quota",
+                    EnclaveError::Config(ref message) if message == "vertex_daily_budget" => {
+                        "vertex_daily_budget"
+                    }
+                    EnclaveError::Json(_) | EnclaveError::InvalidRequest(_) => {
+                        "invalid_model_output"
+                    }
+                    EnclaveError::Crypto(_) => "media_integrity",
+                    EnclaveError::Conflict(ref message)
+                        if message == TRANSCRIPT_TARGET_CONFLICT =>
+                    {
+                        TRANSCRIPT_TARGET_CONFLICT
+                    }
+                    _ => "processing_error",
+                },
             };
             warn!(
                 user_id,
                 work_unit_id = claim.work_unit_id,
                 error_code,
-                error = %error,
+                error = %failure.error,
                 "media work unit failed"
             );
+            if failure.preserve_staged_response {
+                // Exact response bytes and usage identity are durable. Leave
+                // the claim to expire so a new owner replays providerlessly.
+                return;
+            }
             if let Err(settle_error) = repository
                 .settle_failure(
                     &claim,
+                    failure.provider_attempt.as_ref(),
+                    failure.disposition,
                     error_code,
                     &now_iso(),
-                    MAX_ATTEMPTS,
-                    BUDGET_RETRY_SECONDS,
-                    RESURRECTION_WINDOW_SECONDS_INTEGRAL,
+                    MediaFailurePolicy {
+                        max_attempts: MAX_ATTEMPTS,
+                        budget_retry_seconds: BUDGET_RETRY_SECONDS,
+                        resurrection_window_seconds: RESURRECTION_WINDOW_SECONDS_INTEGRAL,
+                    },
                 )
                 .await
             {
@@ -753,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_effects_follow_claim_reservation_and_usage_settlement() {
+    fn provider_effects_follow_final_authorization_stage_and_usage_settlement() {
         let source = include_str!("media_worker.rs");
         let user_start = source.find("async fn process_user").unwrap();
         let user_end = source.find("async fn sweep").unwrap();
@@ -764,18 +1060,45 @@ mod tests {
         let work_end = source.find("fn assemble_audio_window").unwrap();
         let work = &source[work_start..work_end];
         let reserve = work.find("reserve_media_output(").unwrap();
-        let audio_provider = work.find("generate_media_custom(").unwrap();
-        let required_usage = work.find("settle_response_required(").unwrap();
-        let durable_usage = work.find(".settle_usage(").unwrap();
-        let result = work.find(".settle_audio(").unwrap();
-        assert!(reserve < audio_provider);
-        assert!(audio_provider < required_usage);
+        let prepare = work.find("prepare_media_custom(").unwrap();
+        let authorize_send = work.find("authorize_and_send_media(").unwrap();
+        let settle_stage = work.rfind("settle_staged_media(").unwrap();
+        assert!(reserve < prepare);
+        assert!(prepare < authorize_send);
+        assert!(authorize_send < settle_stage);
+        assert_eq!(work.matches("reserve_media_output(").count(), 1);
+        assert_eq!(work.matches("prepare_media_custom(").count(), 1);
+        assert_eq!(work.matches("prepare_media_parts_custom(").count(), 1);
+
+        let egress_start = source.find("async fn authorize_and_send_media").unwrap();
+        let egress_end = source[egress_start..]
+            .find("async fn settle_staged_media")
+            .unwrap()
+            + egress_start;
+        let egress = &source[egress_start..egress_end];
+        let authorize = egress.find(".authorize_provider_attempt(").unwrap();
+        let send = egress.find("prepared.send().await").unwrap();
+        let stage = egress.find("stage_provider_response(").unwrap();
+        let authorized_arm = egress[authorize..send].find("Ok(()) =>").unwrap() + authorize;
+        assert!(authorize < authorized_arm);
+        assert!(authorized_arm < send);
+        assert!(send < stage);
+        assert!(!egress[authorized_arm..send].contains(".await"));
+
+        let settle_start = source.find("async fn settle_staged_media").unwrap();
+        let settle_end = source[settle_start..]
+            .find("async fn process_work_unit")
+            .unwrap()
+            + settle_start;
+        let settle = &source[settle_start..settle_end];
+        let parse = settle.find("parse_staged_media_response(").unwrap();
+        let required_usage = settle.find("settle_response_required(").unwrap();
+        let durable_usage = settle.find(".settle_usage(").unwrap();
+        let projection = settle.find(".settle_audio(").unwrap();
+        assert!(parse < required_usage);
         assert!(required_usage < durable_usage);
-        assert!(durable_usage < result);
-        assert_eq!(work.matches("generate_media_custom(").count(), 1);
-        assert_eq!(work.matches("generate_media_parts_custom(").count(), 1);
-        assert_eq!(work.matches("settle_response_required(").count(), 2);
-        assert_eq!(work.matches("&generation.event_id").count(), 2);
-        assert!(!work.contains("attempt_id"));
+        assert!(durable_usage < projection);
+        assert_eq!(settle.matches("settle_response_required(").count(), 1);
+        assert_eq!(settle.matches("&generation.event_id").count(), 1);
     }
 }
