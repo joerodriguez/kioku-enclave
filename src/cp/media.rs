@@ -1354,7 +1354,12 @@ async fn upload_screen_reference_batch(
         }
     };
     let mut preflight = Vec::with_capacity(request.events.len());
-    for (event, digest) in request.events.iter().zip(&validated.manifest_digests) {
+    for (index, (event, digest)) in request
+        .events
+        .iter()
+        .zip(&validated.manifest_digests)
+        .enumerate()
+    {
         match state
             .repositories
             .captures()
@@ -1367,7 +1372,7 @@ async fn upload_screen_reference_batch(
                     "screen_reference_batch",
                     started_at,
                     manifest,
-                    error,
+                    error.for_capture_reference_batch_item(index, event.sequence),
                 )
             }
         }
@@ -2741,6 +2746,72 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
         previous_overlap = turn.overlap;
     }
     Ok(result.turns)
+}
+
+#[cfg(test)]
+mod reference_batch_rebase_tests {
+    use axum::body::to_bytes;
+    use serde::Deserialize;
+
+    use super::capture_error_response_for_route;
+    use crate::error::{CaptureReferenceFailureReason, EnclaveError};
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ReleasedClientBatchRebase {
+        error: String,
+        reason: String,
+        index: usize,
+        sequence: i64,
+    }
+
+    #[tokio::test]
+    async fn batch_reference_failure_returns_exact_item_rebase_contract() {
+        let error = EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::ContextFingerprintMismatch,
+        )
+        .for_capture_reference_batch_item(7, 50);
+        assert!(matches!(
+            &error,
+            EnclaveError::CaptureReferenceBatch {
+                reason: CaptureReferenceFailureReason::ContextFingerprintMismatch,
+                index: 7,
+                sequence: 50,
+            }
+        ));
+
+        let response = capture_error_response_for_route(
+            "screen_reference_batch",
+            std::time::Instant::now(),
+            None,
+            error,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .expect("batch rebase response is bounded");
+        let decoded: ReleasedClientBatchRebase =
+            serde_json::from_slice(&bytes).expect("released client can decode batch rebase");
+        assert_eq!(
+            decoded,
+            ReleasedClientBatchRebase {
+                error: "screen_reference_rebase_required".into(),
+                reason: "context_fingerprint_mismatch".into(),
+                index: 7,
+                sequence: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn batch_item_conversion_preserves_non_reference_failures() {
+        let error = EnclaveError::InvalidRequest("invalid manifest".into())
+            .for_capture_reference_batch_item(7, 50);
+        assert!(matches!(
+            error,
+            EnclaveError::InvalidRequest(message) if message == "invalid manifest"
+        ));
+    }
 }
 
 #[cfg(test)]

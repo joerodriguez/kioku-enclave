@@ -133,6 +133,19 @@ pub enum EnclaveError {
     DeletionPending(DeletionPending),
 }
 
+impl EnclaveError {
+    pub(crate) fn for_capture_reference_batch_item(self, index: usize, sequence: i64) -> Self {
+        match self {
+            Self::CaptureReference(reason) => Self::CaptureReferenceBatch {
+                reason,
+                index,
+                sequence,
+            },
+            error => error,
+        }
+    }
+}
+
 impl IntoResponse for EnclaveError {
     fn into_response(self) -> Response {
         if let EnclaveError::CaptureReference(reason) = &self {
