@@ -49,7 +49,7 @@ pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 26;
 pub(crate) const MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION: i64 = 27;
 const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 24;
 
-// The two real-PostgreSQL contract tests deliberately exercise the same
+// The three real-PostgreSQL contract tests deliberately exercise the same
 // production session-scoped release lock. Rust may schedule those tests in
 // parallel, so serialize only their release setup while leaving the product
 // lock fail-closed and independently covered by the concurrency fixtures.
