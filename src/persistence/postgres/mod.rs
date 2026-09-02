@@ -498,9 +498,11 @@ pub(super) async fn advisory_transaction_lock(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::Row;
 
     use super::{
@@ -532,7 +534,13 @@ mod tests {
     use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
     use crate::persistence::{SearchHit, SearchRequest};
 
-    async fn test_persistence() -> Option<PostgresPersistence> {
+    struct ControlPlaneContractFixture {
+        persistence: PostgresPersistence,
+        base: PostgresPersistence,
+        schema: String,
+    }
+
+    async fn test_persistence() -> Option<ControlPlaneContractFixture> {
         let contract_required =
             std::env::var("KIOKU_REQUIRE_POSTGRES_CONTRACT").as_deref() == Ok("1");
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -547,8 +555,8 @@ mod tests {
             }
         };
         let _release_contract_guard = super::POSTGRES_RELEASE_CONTRACT_MUTEX.lock().await;
-        let persistence = PostgresPersistence::connect(PostgresPoolConfig {
-            database_url,
+        let base = PostgresPersistence::connect(PostgresPoolConfig {
+            database_url: database_url.clone(),
             root_ca_pem: None,
             max_connections: 8,
             acquire_timeout: Duration::from_secs(5),
@@ -556,6 +564,43 @@ mod tests {
         })
         .await
         .unwrap();
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+            .execute(base.pool())
+            .await
+            .unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock must follow the Unix epoch")
+            .as_nanos();
+        let schema = format!("kioku_control_plane_{}_{}", std::process::id(), unique);
+        assert!(schema
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(base.pool())
+            .await
+            .expect("create isolated control-plane schema");
+        let options = PgConnectOptions::from_str(&database_url)
+            .expect("parse real PostgreSQL control-plane URL")
+            .options([("search_path", format!("{schema},public"))]);
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(5))
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("SET TIME ZONE 'UTC'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SELECT set_config('statement_timeout', '10000', false)")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .expect("connect isolated control-plane schema");
+        let persistence = PostgresPersistence { pool };
         let schema_was_installed = sqlx::query_scalar::<_, bool>(
             "SELECT to_regclass(format('%I.%I',current_schema(),'persistence_schema')) IS NOT NULL",
         )
@@ -608,7 +653,7 @@ mod tests {
                                     WHERE table_schema=current_schema() \
                                       AND table_name='persistence_schema' \
                                       AND column_name='expanded_through_version'), \
-                            to_regclass('public.memory_handles') IS NOT NULL, \
+                            to_regclass(format('%I.%I',current_schema(),'memory_handles')) IS NOT NULL, \
                             (SELECT phase FROM persistence_schema_releases \
                               WHERE release_version=26) \
                        FROM persistence_schema WHERE singleton=true"
@@ -816,11 +861,10 @@ mod tests {
             );
         }
         persistence.verify_schema().await.unwrap();
-        // Reset every business table so this contract proves a database can be
-        // reused across repeated local/full-suite runs. A hand-maintained list
-        // silently missed newly added content and delivery tables and made the
-        // second run observe stale terminal receipts. Keep only SQLx's migration
-        // ledger and the release schema-version receipt.
+        // Reset every business table in the isolated contract schema. A
+        // hand-maintained list silently missed newly added content and delivery
+        // tables and made later assertions observe stale terminal receipts. Keep
+        // only SQLx's migration ledger and the release schema-version receipt.
         sqlx::raw_sql(
             "DO $$
              DECLARE tables_to_reset text;
@@ -828,7 +872,7 @@ mod tests {
                SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
                  INTO tables_to_reset
                  FROM pg_tables
-                WHERE schemaname = 'public'
+                WHERE schemaname = current_schema()
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
                       'persistence_schema_release_steps');
@@ -844,7 +888,11 @@ mod tests {
         .execute(persistence.pool())
         .await
         .unwrap();
-        Some(persistence)
+        Some(ControlPlaneContractFixture {
+            persistence,
+            base,
+            schema,
+        })
     }
 
     #[test]
@@ -927,11 +975,7 @@ mod tests {
         assert!(!finalize.contains("ALTER TABLE"));
     }
 
-    #[tokio::test]
-    async fn postgres_control_plane_contract() {
-        let Some(persistence) = test_persistence().await else {
-            return;
-        };
+    async fn test_real_pg_control_plane_contract_inner(persistence: PostgresPersistence) {
         let persistence = Arc::new(persistence);
         let pool = persistence.pool().clone();
 
@@ -5280,5 +5324,26 @@ mod tests {
 
         super::activation::test_real_pg_activation_contract(&persistence).await;
         super::aggregate_audit::test_real_pg_aggregate_audit(&persistence).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_control_plane_contract() {
+        let Some(fixture) = test_persistence().await else {
+            return;
+        };
+        let ControlPlaneContractFixture {
+            persistence,
+            base,
+            schema,
+        } = fixture;
+        let pool = persistence.pool().clone();
+        let outcome = tokio::spawn(test_real_pg_control_plane_contract_inner(persistence)).await;
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(base.pool())
+            .await
+            .expect("drop isolated control-plane schema");
+        base.pool.close().await;
+        outcome.expect("real PostgreSQL control-plane contract");
     }
 }
