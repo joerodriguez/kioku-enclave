@@ -675,6 +675,7 @@ async fn test_real_pg_aggregate_audit_isolated(base: &PostgresPersistence) {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
+    let _release_contract_guard = super::POSTGRES_RELEASE_CONTRACT_MUTEX.lock().await;
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("test clock must follow the Unix epoch")
