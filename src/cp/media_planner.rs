@@ -77,20 +77,26 @@ pub fn plan_first(candidates: &[PlanningEvent]) -> WorkPlan {
             // so they cannot fragment that head stream into one-event calls.
             continue;
         }
-        let accepted = match first.class {
-            WorkClass::Audio => {
-                candidate.route_key == first.route_key
-                    && candidate.started_ms.saturating_sub(ended_ms) <= MAX_AUDIO_GAP_MS
-                    && candidate.ended_ms.saturating_sub(first.started_ms) <= MAX_AUDIO_WINDOW_MS
-                    && total_bytes.saturating_add(candidate.byte_length) <= MAX_AUDIO_BYTES
-            }
-            WorkClass::Screen => {
-                members.len() < MAX_SCREEN_FRAMES
-                    && candidate.started_ms.saturating_sub(first.started_ms) <= MAX_SCREEN_SPAN_MS
-                    && total_bytes.saturating_add(candidate.byte_length) <= MAX_SCREEN_BYTES
-                    && total_pixels.saturating_add(candidate.pixel_count) <= MAX_SCREEN_PIXELS
-            }
-        };
+        // A persisted work interval is also the provider request boundary.
+        // Refuse zero/negative source intervals here so a compatibility
+        // replan cannot recreate malformed legacy work indefinitely.
+        let accepted = candidate.ended_ms > candidate.started_ms
+            && match first.class {
+                WorkClass::Audio => {
+                    candidate.route_key == first.route_key
+                        && candidate.started_ms.saturating_sub(ended_ms) <= MAX_AUDIO_GAP_MS
+                        && candidate.ended_ms.saturating_sub(first.started_ms)
+                            <= MAX_AUDIO_WINDOW_MS
+                        && total_bytes.saturating_add(candidate.byte_length) <= MAX_AUDIO_BYTES
+                }
+                WorkClass::Screen => {
+                    members.len() < MAX_SCREEN_FRAMES
+                        && candidate.started_ms.saturating_sub(first.started_ms)
+                            <= MAX_SCREEN_SPAN_MS
+                        && total_bytes.saturating_add(candidate.byte_length) <= MAX_SCREEN_BYTES
+                        && total_pixels.saturating_add(candidate.pixel_count) <= MAX_SCREEN_PIXELS
+                }
+            };
         if !accepted {
             break;
         }
@@ -338,6 +344,15 @@ mod tests {
         let plan = plan_first(&long_audio);
         assert!(plan.member_job_ids.is_empty());
         assert_eq!(plan.head_job_id, 7);
+
+        for malformed in [
+            event(8, WorkClass::Audio, "a", 0, 1_000, 1_000),
+            event(9, WorkClass::Audio, "a", 0, 1_001, 1_000),
+        ] {
+            let plan = plan_first(std::slice::from_ref(&malformed));
+            assert!(plan.member_job_ids.is_empty());
+            assert_eq!(plan.head_job_id, malformed.job_id);
+        }
 
         let huge_frame = vec![PlanningEvent {
             byte_length: MAX_SCREEN_BYTES + 1,

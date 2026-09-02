@@ -43,12 +43,15 @@ const CLAIM_LEASE_SECONDS: i64 = 300;
 const BUDGET_RETRY_SECONDS: i64 = 6 * 60 * 60;
 pub(crate) const RESURRECTION_WINDOW_SECONDS_INTEGRAL: i64 = 7 * 24 * 3_600;
 pub(crate) const TRANSCRIPT_TARGET_CONFLICT: &str = "transcript_target_conflict";
-pub(crate) const NON_RESURRECTABLE_MEDIA_ERROR_CODES: [&str; 5] = [
+pub(crate) const PERSISTED_MEDIA_WORK_COMPATIBILITY_HOLD: &str =
+    "persisted_work_compatibility_hold";
+pub(crate) const NON_RESURRECTABLE_MEDIA_ERROR_CODES: [&str; 6] = [
     "media_integrity",
     TRANSCRIPT_TARGET_CONFLICT,
     "unplannable_media",
     "vertex_ambiguous",
     "invalid_model_output",
+    PERSISTED_MEDIA_WORK_COMPATIBILITY_HOLD,
 ];
 
 #[derive(Debug)]
