@@ -96,3 +96,20 @@ different contract hash, invalid or extra catalog object, ambiguous legacy owner
 unsigned fleet evidence, unknown step, or marker/phase disagreement fails closed.
 The retired `empty-production-adr0040` confirmation is rejected; migration 0026 supports
 populated production and never makes a post-commit empty-account assertion.
+
+## Memory-reconciliation v27 aggregate readiness
+
+The fixed content-free aggregate audit reports the formation gate independently at every phase,
+but readiness is deliberately staged. `ready_for_drain` retains the domain, quota, provider,
+media-budget, lease-consistency, reconciliation, finalization-claim, capacity, and exact
+Installed/generation-0 activation gates. It does not require `formation_quiescent`: historical
+finish import and the first immutable capture seal are prohibited while Installed and become
+authoritative only after a signed Draining transition proves that no predecessor can accept a
+late source without dirtying its receipt. Requiring those repairs before Draining would make the
+transition cyclic for a populated capture history.
+
+`ready_for_active` continues to require every shared safety gate, exact Draining-generation
+backfill and claim-drain completion, and `formation_quiescent`. Historical ended sessions,
+pending seals, dirty formation revisions, and nonterminal formation pages therefore remain hard
+Active blockers. The aggregate fields and schema stay stable; this staging changes only how the
+two existing composite readiness booleans combine their independently reported constituents.

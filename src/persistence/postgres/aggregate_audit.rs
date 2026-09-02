@@ -339,6 +339,37 @@ pub(crate) struct GateAudit {
     pub(crate) ready_for_active: bool,
 }
 
+impl GateAudit {
+    fn shared_transition_gates_hold(&self) -> bool {
+        self.domain_clean
+            && self.quota_invariants_hold
+            && self.provider_quiescent
+            && self.media_budget_drained
+            && self.leases_unexpired
+            && self.reconciliation_quiescent
+            && self.finalization_claims_quiescent
+            && self.capacity_sufficient
+    }
+
+    fn expected_ready_for_drain(&self) -> bool {
+        // Formation's historical-finish import and first immutable seal become
+        // legal only after signed Draining. They remain observable here and are
+        // mandatory for Active, but cannot be a precondition of their own phase.
+        self.shared_transition_gates_hold() && self.activation_ready_for_drain
+    }
+
+    fn expected_ready_for_active(&self) -> bool {
+        self.shared_transition_gates_hold()
+            && self.formation_quiescent
+            && self.activation_ready_for_active
+    }
+
+    fn readiness_is_exact(&self) -> bool {
+        self.ready_for_drain == self.expected_ready_for_drain()
+            && self.ready_for_active == self.expected_ready_for_active()
+    }
+}
+
 pub(crate) fn parse_postgres_audit_since(raw: &str) -> Result<(), AggregateAuditFailure> {
     let bytes = raw.as_bytes();
     if bytes.len() != 20
@@ -450,6 +481,7 @@ impl PostgresAggregateAuditReport {
                     .map(|group| group.class.as_str()),
                 &USAGE_CLASSES,
             )
+            || !self.gates.readiness_is_exact()
         {
             return Err(AggregateAuditFailure::AuditFailed);
         }
@@ -894,6 +926,7 @@ async fn test_real_pg_aggregate_audit_inner(
             0
         );
         assert!(deletion_clear.gates.activation_ready_for_drain);
+        assert!(deletion_clear.gates.ready_for_drain);
 
         sqlx::query(
             "INSERT INTO episode_deletions( \
@@ -914,6 +947,7 @@ async fn test_real_pg_aggregate_audit_inner(
             1
         );
         assert!(!pending_deletion.gates.activation_ready_for_drain);
+        assert!(!pending_deletion.gates.ready_for_drain);
         sqlx::query(
             "DELETE FROM episode_deletions \
           WHERE account_id='aggregate-audit-gate-contract' AND episode_id=9100",
@@ -923,6 +957,290 @@ async fn test_real_pg_aggregate_audit_inner(
         .unwrap();
         let deletion_cleared = persistence.aggregate_audit(&since).await.unwrap();
         assert!(deletion_cleared.gates.activation_ready_for_drain);
+        assert!(deletion_cleared.gates.ready_for_drain);
+
+        sqlx::raw_sql(
+            "INSERT INTO capture_sessions( \
+                 account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
+             VALUES \
+                 ('aggregate-audit-gate-contract','historical-ended','gate-device','gate-install', \
+                  clock_timestamp()-interval '6 hours',clock_timestamp()-interval '5 hours', \
+                  clock_timestamp()-interval '5 hours',2), \
+                 ('aggregate-audit-gate-contract','historical-seal','gate-device','gate-install', \
+                  clock_timestamp()-interval '6 hours',clock_timestamp()-interval '5 hours', \
+                  clock_timestamp()-interval '5 hours',2); \
+             INSERT INTO capture_streams( \
+                 account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) \
+             VALUES \
+                 ('aggregate-audit-gate-contract','historical-ended-stream','historical-ended', \
+                  'gate-device','mac_screen',0), \
+                 ('aggregate-audit-gate-contract','historical-seal-stream','historical-seal', \
+                  'gate-device','mac_screen',0); \
+             INSERT INTO capture_events( \
+                 account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind, \
+                 sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id, \
+                 utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+             VALUES \
+                 ('aggregate-audit-gate-contract','historical-ended-event','gate-device', \
+                  'gate-install','historical-ended','historical-ended-stream','mac_screen',0, \
+                  clock_timestamp()-interval '5 hours','0',clock_timestamp()-interval '5 hours', \
+                  clock_timestamp()-interval '5 hours','UTC',0,0,'historical-ended-asset', \
+                  repeat('c',64),'canonical'), \
+                 ('aggregate-audit-gate-contract','historical-seal-event','gate-device', \
+                  'gate-install','historical-seal','historical-seal-stream','mac_screen',0, \
+                  clock_timestamp()-interval '5 hours','0',clock_timestamp()-interval '5 hours', \
+                  clock_timestamp()-interval '5 hours','UTC',0,0,'historical-seal-asset', \
+                  repeat('d',64),'canonical'); \
+             INSERT INTO capture_formation_receipts( \
+                 account_id,capture_session_id,source_revision) \
+             VALUES('aggregate-audit-gate-contract','historical-ended',1); \
+             INSERT INTO capture_formation_receipts( \
+                 account_id,capture_session_id,source_revision,completed_revision,state, \
+                 completed_outcome,completed_claim_token,completed_source_fingerprint,completed_at, \
+                 finish_requested_at,finish_request_provenance) \
+             VALUES('aggregate-audit-gate-contract','historical-seal',1,1,'complete','no_memory', \
+                    'historical-seal-claim',decode(repeat('cd',32),'hex'), \
+                    clock_timestamp()-interval '5 hours',clock_timestamp()-interval '5 hours', \
+                    'finish_endpoint_v1');",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let installed_formation_debt = persistence.aggregate_audit(&since).await.unwrap();
+        assert_eq!(
+            installed_formation_debt
+                .formation
+                .ended_without_finish_receipts,
+            1
+        );
+        assert_eq!(installed_formation_debt.formation.seal_pending_receipts, 1);
+        assert!(!installed_formation_debt.gates.formation_quiescent);
+        assert!(installed_formation_debt.gates.activation_ready_for_drain);
+        assert!(installed_formation_debt.gates.ready_for_drain);
+        assert!(!installed_formation_debt.gates.ready_for_active);
+
+        let budget_job_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO media_processing_jobs( \
+                 account_id,event_id,job_kind,input_revision,processor_version,state,error_code, \
+                 updated_at) \
+             VALUES('aggregate-audit-gate-contract','historical-ended-event','gemini_screen', \
+                    'aggregate-audit-budget-input',1,'retry_wait','vertex_daily_budget', \
+                    clock_timestamp()-interval '1 minute') RETURNING id",
+        )
+        .fetch_one(persistence.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_work_units( \
+                 account_id,id,work_class,processor_version,state,started_at,ended_at, \
+                 reserved_output_tokens,error_code,updated_at) \
+             VALUES('aggregate-audit-gate-contract','budget-work','screen',1,'retry_wait', \
+                    clock_timestamp()-interval '5 hours',clock_timestamp()-interval '5 hours', \
+                    1024,'vertex_daily_budget',clock_timestamp()-interval '1 minute')",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_work_members( \
+                 account_id,work_unit_id,event_id,job_id,ordinal,window_start_ms,window_end_ms) \
+             VALUES('aggregate-audit-gate-contract','budget-work','historical-ended-event', \
+                    $1,0,0,1000)",
+        )
+        .bind(budget_job_id)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let budget_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert_eq!(budget_blocked.media.current_budget_jobs, 1);
+        assert_eq!(budget_blocked.media.current_budget_work_units, 1);
+        assert!(!budget_blocked.gates.media_budget_drained);
+        assert!(!budget_blocked.gates.ready_for_drain);
+        sqlx::raw_sql(
+            "DELETE FROM media_work_units \
+               WHERE account_id='aggregate-audit-gate-contract' AND id='budget-work'; \
+             DELETE FROM media_processing_jobs \
+               WHERE account_id='aggregate-audit-gate-contract' \
+                 AND input_revision='aggregate-audit-budget-input';",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE capture_events SET stream_kind='gate_invalid' \
+              WHERE account_id='aggregate-audit-gate-contract' \
+                AND event_id='historical-ended-event'",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let domain_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!domain_blocked.gates.domain_clean);
+        assert!(!domain_blocked.gates.ready_for_drain);
+        sqlx::query(
+            "UPDATE capture_events SET stream_kind='mac_screen' \
+              WHERE account_id='aggregate-audit-gate-contract' \
+                AND event_id='historical-ended-event'",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO usage_daily( \
+                 account_id,day,vertex_requests,vertex_output_tokens, \
+                 vertex_audio_output_tokens,vertex_screen_output_tokens, \
+                 vertex_derived_output_tokens) \
+             VALUES('aggregate-audit-gate-contract', \
+                    ($1::timestamptz AT TIME ZONE 'UTC')::date,0,1,0,0,0)",
+        )
+        .bind(&since)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let quota_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!quota_blocked.gates.quota_invariants_hold);
+        assert!(quota_blocked.gates.provider_quiescent);
+        assert!(!quota_blocked.gates.ready_for_drain);
+        sqlx::query("DELETE FROM usage_daily WHERE account_id='aggregate-audit-gate-contract'")
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO vertex_usage_events( \
+                 account_id,event_id,request_fingerprint,operation,requested_model,location, \
+                 outcome,observed_at) \
+             VALUES('aggregate-audit-gate-contract','gate-provider-started', \
+                    decode(repeat('ef',32),'hex'),'episode_reconciliation','gate-model', \
+                    'us-central1','started',$1::timestamptz+interval '1 second')",
+        )
+        .bind(&since)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let provider_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(provider_blocked.gates.quota_invariants_hold);
+        assert!(!provider_blocked.gates.provider_quiescent);
+        assert!(!provider_blocked.gates.ready_for_drain);
+        sqlx::query(
+            "DELETE FROM vertex_usage_events \
+              WHERE account_id='aggregate-audit-gate-contract' \
+                AND event_id='gate-provider-started'",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO media_processing_jobs( \
+                 account_id,event_id,job_kind,input_revision,processor_version,state) \
+             VALUES('aggregate-audit-gate-contract','historical-ended-event','gemini_screen', \
+                    'aggregate-audit-lease-input',1,'processing'); \
+             INSERT INTO media_work_units( \
+                 account_id,id,work_class,processor_version,state,started_at,ended_at, \
+                 reserved_output_tokens) \
+             VALUES('aggregate-audit-gate-contract','lease-work','screen',1,'processing', \
+                    clock_timestamp()-interval '5 hours',clock_timestamp()-interval '5 hours', \
+                    1024);",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let lease_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!lease_blocked.gates.leases_unexpired);
+        assert!(!lease_blocked.gates.ready_for_drain);
+        sqlx::raw_sql(
+            "DELETE FROM media_work_units \
+               WHERE account_id='aggregate-audit-gate-contract' AND id='lease-work'; \
+             DELETE FROM media_processing_jobs \
+               WHERE account_id='aggregate-audit-gate-contract' \
+                 AND input_revision='aggregate-audit-lease-input';",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO memory_reconciliation_jobs( \
+                 account_id,source_fingerprint,topology_fingerprint,predecessor_episode_ids, \
+                 cohort_started_at,cohort_ended_at,state) \
+             VALUES('aggregate-audit-gate-contract',decode(repeat('12',32),'hex'), \
+                    decode(repeat('34',32),'hex'),ARRAY[1]::bigint[], \
+                    clock_timestamp()-interval '6 hours', \
+                    clock_timestamp()-interval '5 hours','pending')",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let reconciliation_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!reconciliation_blocked.gates.reconciliation_quiescent);
+        assert!(!reconciliation_blocked.gates.ready_for_drain);
+        sqlx::query(
+            "DELETE FROM memory_reconciliation_jobs \
+              WHERE account_id='aggregate-audit-gate-contract'",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO episodes( \
+                 account_id,id,started_at,ended_at,type,title,summary,structure_state, \
+                 finalization_status,updated_at) \
+             VALUES('aggregate-audit-gate-contract',9200,clock_timestamp()-interval '6 hours', \
+                    clock_timestamp()-interval '5 hours','work','Finalization gate fixture', \
+                    'Finalization gate fixture','reconciled','processing',clock_timestamp())",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let finalization_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!finalization_blocked.gates.finalization_claims_quiescent);
+        assert!(!finalization_blocked.gates.ready_for_drain);
+        sqlx::raw_sql(
+            "DELETE FROM memory_handles \
+               WHERE account_id='aggregate-audit-gate-contract' AND episode_id=9200; \
+             DELETE FROM episodes \
+               WHERE account_id='aggregate-audit-gate-contract' AND id=9200;",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO episodes( \
+                 account_id,id,started_at,ended_at,type,title,summary,structure_state, \
+                 finalization_status,updated_at) \
+             SELECT 'aggregate-audit-gate-contract',9300+value, \
+                    clock_timestamp()-interval '6 hours',clock_timestamp()-interval '5 hours', \
+                    'work','Capacity gate fixture','Capacity gate fixture','draft', \
+                    'pending_horizon',clock_timestamp() \
+               FROM generate_series(0,32) value",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let capacity_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!capacity_blocked.capacity.no_oversized_components);
+        assert!(!capacity_blocked.gates.capacity_sufficient);
+        assert!(!capacity_blocked.gates.ready_for_drain);
+        sqlx::raw_sql(
+            "DELETE FROM memory_handles \
+               WHERE account_id='aggregate-audit-gate-contract' \
+                 AND episode_id BETWEEN 9300 AND 9332; \
+             DELETE FROM episodes \
+               WHERE account_id='aggregate-audit-gate-contract' \
+                 AND id BETWEEN 9300 AND 9332;",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+        let predrain_clean = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(!predrain_clean.gates.formation_quiescent);
+        assert!(predrain_clean.gates.ready_for_drain);
 
         sqlx::raw_sql(
             "INSERT INTO persistence_feature_activation_events( \
@@ -965,9 +1283,28 @@ async fn test_real_pg_aggregate_audit_inner(
         .execute(persistence.pool())
         .await
         .unwrap();
-        let claims_clear = persistence.aggregate_audit(&since).await.unwrap();
-        assert_eq!(claims_clear.activation.scoped_draft_finalization_claims, 0);
-        assert!(claims_clear.gates.activation_ready_for_active);
+        let draining_formation_debt = persistence.aggregate_audit(&since).await.unwrap();
+        assert_eq!(
+            draining_formation_debt
+                .activation
+                .scoped_draft_finalization_claims,
+            0
+        );
+        assert!(draining_formation_debt.gates.activation_ready_for_active);
+        assert!(!draining_formation_debt.gates.formation_quiescent);
+        assert!(!draining_formation_debt.gates.ready_for_active);
+        sqlx::query(
+            "DELETE FROM capture_sessions \
+              WHERE account_id='aggregate-audit-gate-contract' \
+                AND id IN ('historical-ended','historical-seal')",
+        )
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+        let draining_clean = persistence.aggregate_audit(&since).await.unwrap();
+        assert!(draining_clean.gates.formation_quiescent);
+        assert!(draining_clean.gates.activation_ready_for_active);
+        assert!(draining_clean.gates.ready_for_active);
 
         sqlx::raw_sql(
             "INSERT INTO episodes( \
@@ -1004,55 +1341,7 @@ async fn test_real_pg_aggregate_audit_inner(
         .unwrap();
         let claim_cleared = persistence.aggregate_audit(&since).await.unwrap();
         assert!(claim_cleared.gates.activation_ready_for_active);
-
-        sqlx::raw_sql(
-        "INSERT INTO capture_sessions( \
-             account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
-         VALUES('aggregate-audit-gate-contract','ended-session','gate-device','gate-install', \
-                clock_timestamp()-interval '2 seconds',clock_timestamp(),clock_timestamp(),2); \
-         INSERT INTO capture_streams( \
-             account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) \
-         VALUES('aggregate-audit-gate-contract','gate-stream','ended-session', \
-                'gate-device','mac_screen',0); \
-         INSERT INTO capture_events( \
-             account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind, \
-             sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id, \
-             utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
-         VALUES('aggregate-audit-gate-contract','gate-event','gate-device','gate-install', \
-                'ended-session','gate-stream','mac_screen',0,clock_timestamp()-interval '1 second', \
-                '0',clock_timestamp()-interval '1 second',clock_timestamp(),'UTC',0,0, \
-                'gate-asset',repeat('a',64),'canonical'); \
-         INSERT INTO capture_formation_receipts( \
-             account_id,capture_session_id,source_revision) \
-         VALUES('aggregate-audit-gate-contract','ended-session',1); \
-         INSERT INTO media_processing_jobs( \
-             account_id,event_id,job_kind,input_revision,processor_version,state) \
-         VALUES('aggregate-audit-gate-contract','gate-event','gemini_screen', \
-                'aggregate-audit-gate-input',1,'processing'); \
-         INSERT INTO media_work_units( \
-             account_id,id,work_class,processor_version,state,started_at,ended_at, \
-             reserved_output_tokens) \
-         VALUES('aggregate-audit-gate-contract','gate-work','screen',1,'processing', \
-                clock_timestamp()-interval '1 second',clock_timestamp(),1024); \
-         INSERT INTO episodes( \
-             account_id,id,started_at,ended_at,type,title,summary,structure_state, \
-             finalization_status,updated_at) \
-         VALUES('aggregate-audit-gate-contract',9001,clock_timestamp()-interval '6 hours', \
-                clock_timestamp()-interval '5 hours','work','Gate fixture','Gate fixture', \
-                'reconciled','processing',clock_timestamp());",
-    )
-    .execute(persistence.pool())
-    .await
-    .unwrap();
-        let blocked = persistence.aggregate_audit(&since).await.unwrap();
-        assert_eq!(blocked.formation.ended_without_finish_receipts, 1);
-        assert!(!blocked.gates.formation_quiescent);
-        assert_eq!(blocked.media.inconsistent_processing_jobs, 1);
-        assert_eq!(blocked.media.inconsistent_processing_work_units, 1);
-        assert_eq!(blocked.media.unfinished_work_without_members, 1);
-        assert!(!blocked.gates.leases_unexpired);
-        assert_eq!(blocked.finalization.processing_claims, 1);
-        assert!(!blocked.gates.finalization_claims_quiescent);
+        assert!(claim_cleared.gates.ready_for_active);
     }
 
     let mut value = serde_json::to_value(&report).unwrap();
@@ -1129,6 +1418,81 @@ async fn test_real_pg_aggregate_audit_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn installed_gate_fixture() -> GateAudit {
+        GateAudit {
+            domain_clean: true,
+            quota_invariants_hold: true,
+            provider_quiescent: true,
+            media_budget_drained: true,
+            leases_unexpired: true,
+            formation_quiescent: false,
+            reconciliation_quiescent: true,
+            finalization_claims_quiescent: true,
+            activation_ready_for_drain: true,
+            activation_ready_for_active: false,
+            capacity_sufficient: true,
+            ready_for_drain: true,
+            ready_for_active: false,
+        }
+    }
+
+    #[test]
+    fn composite_readiness_stages_formation_after_drain_and_retains_other_gates() {
+        let installed = installed_gate_fixture();
+        assert!(installed.readiness_is_exact());
+        assert!(installed.expected_ready_for_drain());
+        assert!(!installed.expected_ready_for_active());
+
+        type BlockGate = (&'static str, fn(&mut GateAudit));
+        let shared_blockers: [BlockGate; 8] = [
+            ("domain", |gate| gate.domain_clean = false),
+            ("quota", |gate| gate.quota_invariants_hold = false),
+            ("provider", |gate| gate.provider_quiescent = false),
+            ("media budget", |gate| gate.media_budget_drained = false),
+            ("lease", |gate| gate.leases_unexpired = false),
+            ("reconciliation", |gate| {
+                gate.reconciliation_quiescent = false;
+            }),
+            ("finalization claim", |gate| {
+                gate.finalization_claims_quiescent = false;
+            }),
+            ("capacity", |gate| gate.capacity_sufficient = false),
+        ];
+        for (name, block) in shared_blockers {
+            let mut blocked = installed_gate_fixture();
+            block(&mut blocked);
+            assert!(!blocked.expected_ready_for_drain(), "{name}");
+            assert!(!blocked.readiness_is_exact(), "{name}");
+            blocked.ready_for_drain = false;
+            assert!(blocked.readiness_is_exact(), "{name}");
+        }
+
+        let mut stale_activation = installed_gate_fixture();
+        stale_activation.activation_ready_for_drain = false;
+        assert!(!stale_activation.expected_ready_for_drain());
+        assert!(!stale_activation.readiness_is_exact());
+
+        let mut draining = installed_gate_fixture();
+        draining.activation_ready_for_drain = false;
+        draining.activation_ready_for_active = true;
+        draining.ready_for_drain = false;
+        assert!(draining.readiness_is_exact());
+        assert!(!draining.expected_ready_for_active());
+        draining.formation_quiescent = true;
+        assert!(!draining.readiness_is_exact());
+        draining.ready_for_active = true;
+        assert!(draining.readiness_is_exact());
+
+        for (name, block) in shared_blockers {
+            let mut blocked = draining.clone();
+            block(&mut blocked);
+            assert!(!blocked.expected_ready_for_active(), "{name}");
+            assert!(!blocked.readiness_is_exact(), "{name}");
+            blocked.ready_for_active = false;
+            assert!(blocked.readiness_is_exact(), "{name}");
+        }
+    }
 
     #[test]
     fn since_is_exact_utc_seconds_with_real_calendar_validation() {
