@@ -1140,8 +1140,13 @@ gate_results AS MATERIALIZED (
            reconciliation_quiescent,finalization_claims_quiescent,
            activation_ready_for_drain,activation_ready_for_active,
            capacity_sufficient,
+           -- Historical finish import and the first immutable capture seal are
+           -- deliberately forbidden until signed Draining proves the predecessor
+           -- fleet is gone. Keep their independently reported formation gate for
+           -- Active, but do not make that post-drain repair a cyclic precondition
+           -- of the transition which authorizes it.
            domain_clean AND quota_invariants_hold AND provider_quiescent
-             AND media_budget_drained AND leases_unexpired AND formation_quiescent
+             AND media_budget_drained AND leases_unexpired
              AND reconciliation_quiescent AND finalization_claims_quiescent
              AND activation_ready_for_drain AND capacity_sufficient AS ready_for_drain,
            domain_clean AND quota_invariants_hold AND provider_quiescent
