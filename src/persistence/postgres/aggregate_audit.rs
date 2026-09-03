@@ -1588,6 +1588,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aggregate_drain_projection_tracks_the_latest_draining_event() {
+        assert!(AGGREGATE_AUDIT_SQL.contains("latest_draining_activation AS MATERIALIZED"));
+        assert!(AGGREGATE_AUDIT_SQL.contains("AND event.phase='draining'"));
+        assert!(AGGREGATE_AUDIT_SQL.contains("JOIN latest_draining_activation activation"));
+        assert!(!AGGREGATE_AUDIT_SQL.contains("JOIN latest_activation activation\n"));
+    }
+
     #[tokio::test]
     async fn postgres_aggregate_audit_contract() {
         let required = std::env::var("KIOKU_REQUIRE_POSTGRES_CONTRACT").as_deref() == Ok("1");
