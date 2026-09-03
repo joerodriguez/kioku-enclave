@@ -2345,6 +2345,13 @@ fn candidate_fleet_identity_changes_only_on_a_fresh_draining_cycle() {
 }
 
 #[cfg(test)]
+#[test]
+fn nested_activation_contract_future_stays_heap_pinned() {
+    let source = include_str!("activation.rs");
+    assert!(source.contains("Box::pin(test_real_pg_activation_contract_inner(&persistence)).await"));
+}
+
+#[cfg(test)]
 struct TestFleetEvidence<'a> {
     outage_pause: bool,
     candidate_fleet_image_digest: &'a str,
@@ -4663,7 +4670,9 @@ pub(super) async fn test_real_pg_activation_contract(base: &PostgresPersistence)
     let persistence = PostgresPersistence { pool };
     let outcome = async {
         persistence.migrate().await?;
-        test_real_pg_activation_contract_inner(&persistence).await
+        // This broad contract is also nested inside the exhaustive control-plane
+        // future. Keep its state off that test thread's bounded stack.
+        Box::pin(test_real_pg_activation_contract_inner(&persistence)).await
     }
     .await;
     persistence.pool.close().await;
