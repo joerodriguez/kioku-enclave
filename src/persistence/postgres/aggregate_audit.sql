@@ -29,6 +29,15 @@ latest_activation AS MATERIALIZED (
      ORDER BY event.event_sequence DESC
      LIMIT 1
 ),
+latest_draining_activation AS MATERIALIZED (
+    SELECT event.generation
+      FROM persistence_feature_activation_events event
+      CROSS JOIN valid
+     WHERE event.feature='episode_topology_reconciliation'
+       AND event.phase='draining'
+     ORDER BY event.event_sequence DESC
+     LIMIT 1
+),
 activation_backfill AS MATERIALIZED (
     SELECT backfill.refresh_generation,backfill.complete,backfill.rows_scanned,
            backfill.rows_inserted,backfill.rows_reopened,backfill.updated_at,
@@ -42,7 +51,7 @@ activation_drain AS MATERIALIZED (
     SELECT drain.complete,drain.claims_scanned,drain.claims_revoked,
            drain.updated_at,drain.completed_at
       FROM persistence_feature_activation_drains drain
-      JOIN latest_activation activation
+      JOIN latest_draining_activation activation
         ON drain.feature='episode_topology_reconciliation'
        AND drain.activation_generation=activation.generation
 ),

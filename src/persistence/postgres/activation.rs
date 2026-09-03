@@ -4359,9 +4359,37 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
             .is_err()
     );
     provider_guard.commit().await?;
-    pause_task
+    let paused_result = pause_task
         .await
         .map_err(|error| EnclaveError::Store(format!("pause transition task failed: {error}")))??;
+    let audit_since = sqlx::query_scalar::<_, String>(
+        "SELECT to_char(clock_timestamp()-interval '1 hour', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+    )
+    .fetch_one(persistence.pool())
+    .await?;
+    let paused_audit = persistence
+        .aggregate_audit(&audit_since)
+        .await
+        .expect("Paused aggregate audit must retain the latest Draining ledger");
+    assert_eq!(paused_audit.activation.phase.as_deref(), Some("paused"));
+    assert_eq!(
+        paused_audit.activation.generation,
+        Some(paused_result.generation)
+    );
+    assert!(paused_audit.activation.drain_present);
+    assert_eq!(
+        paused_audit.activation.drain_complete,
+        Some(paused_result.finalization_claim_drain_complete)
+    );
+    assert_eq!(
+        paused_audit.activation.drain_claims_scanned,
+        Some(paused_result.finalization_claims_scanned)
+    );
+    assert_eq!(
+        paused_audit.activation.drain_claims_revoked,
+        Some(paused_result.finalization_claims_revoked)
+    );
     persistence.verify_schema().await?;
     let mut paused_egress = persistence.pool().begin().await?;
     assert!(active_reconciliation_authority(&mut paused_egress, ACCOUNT)
@@ -4547,9 +4575,34 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         },
     )
     .await?;
-    persistence
+    let global_active_result = persistence
         .transition_memory_reconciliation_activation(&global_active)
         .await?;
+    let global_active_audit = persistence
+        .aggregate_audit(&audit_since)
+        .await
+        .expect("Active aggregate audit must select the latest of multiple Draining ledgers");
+    assert_eq!(
+        global_active_audit.activation.phase.as_deref(),
+        Some("active")
+    );
+    assert_eq!(
+        global_active_audit.activation.generation,
+        Some(global_active_result.generation)
+    );
+    assert!(global_active_audit.activation.drain_present);
+    assert_eq!(
+        global_active_audit.activation.drain_complete,
+        Some(global_active_result.finalization_claim_drain_complete)
+    );
+    assert_eq!(
+        global_active_audit.activation.drain_claims_scanned,
+        Some(global_active_result.finalization_claims_scanned)
+    );
+    assert_eq!(
+        global_active_audit.activation.drain_claims_revoked,
+        Some(global_active_result.finalization_claims_revoked)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT candidate_fleet_image_digest \
