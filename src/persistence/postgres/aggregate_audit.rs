@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use super::PostgresPersistence;
 
-pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v1";
+pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateAuditFailure {
@@ -44,6 +44,7 @@ pub(crate) struct PostgresAggregateAuditReport {
     pub(crate) reconciliation: ReconciliationAudit,
     pub(crate) topology: TopologyAudit,
     pub(crate) vertex_usage: VertexUsageAudit,
+    pub(crate) provider_activity: ProviderActivityAudit,
     pub(crate) usage_daily: UsageDailyAudit,
     pub(crate) finalization: FinalizationAudit,
     pub(crate) capacity: CapacityAudit,
@@ -248,6 +249,40 @@ pub(crate) struct VertexUsageGroup {
     pub(crate) total_tokens: i64,
 }
 
+/// Point-in-time model-provider authority, across all accounts and dates.
+/// Cumulative quota debits are not invocation identities or unsettled work.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderActivityAudit {
+    pub(crate) started_intents: i64,
+    pub(crate) media_work_claims: i64,
+    pub(crate) media_job_claims: i64,
+    pub(crate) summary_claims: i64,
+    pub(crate) formation_receipt_claims: i64,
+    pub(crate) formation_page_claims: i64,
+    pub(crate) reconciliation_claims: i64,
+    pub(crate) finalization_claims: i64,
+}
+
+impl ProviderActivityAudit {
+    fn counts(&self) -> [i64; 8] {
+        [
+            self.started_intents,
+            self.media_work_claims,
+            self.media_job_claims,
+            self.summary_claims,
+            self.formation_receipt_claims,
+            self.formation_page_claims,
+            self.reconciliation_claims,
+            self.finalization_claims,
+        ]
+    }
+
+    fn quiescent(&self) -> bool {
+        self.counts().into_iter().all(|count| count == 0)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UsageDailyAudit {
@@ -411,9 +446,71 @@ pub(crate) fn parse_postgres_audit_since(raw: &str) -> Result<(), AggregateAudit
 }
 
 impl PostgresAggregateAuditReport {
+    fn provider_activity_covers_subsets(&self) -> bool {
+        fn processing<'a>(rows: impl Iterator<Item = (&'a str, i64)>) -> i128 {
+            rows.filter(|(state, _)| *state == "processing")
+                .map(|(_, count)| i128::from(count))
+                .sum()
+        }
+        macro_rules! max_processing {
+            ($section:expr, $first:ident, $second:ident) => {
+                processing(
+                    $section
+                        .$first
+                        .iter()
+                        .map(|row| (row.state.as_str(), row.count)),
+                )
+                .max(processing(
+                    $section
+                        .$second
+                        .iter()
+                        .map(|row| (row.state.as_str(), row.count)),
+                ))
+            };
+        }
+        let subsets = [
+            self.vertex_usage
+                .groups
+                .iter()
+                .filter(|row| row.outcome == "started")
+                .map(|row| i128::from(row.count))
+                .sum::<i128>()
+                .max(
+                    self.usage_daily
+                        .classes
+                        .iter()
+                        .map(|row| i128::from(row.pending_started_rows))
+                        .sum(),
+                ),
+            max_processing!(self.media, work_units_since, work_units_unfinished),
+            max_processing!(self.media, jobs_since, jobs_unfinished),
+            i128::from(self.formation.legacy_processing_claims),
+            max_processing!(self.formation, receipts_since, receipts_unfinished),
+            max_processing!(self.formation, pages_since, pages_unfinished),
+            max_processing!(self.reconciliation, jobs_since, jobs_unfinished),
+            i128::from(
+                self.finalization
+                    .processing_claims
+                    .max(self.activation.scoped_draft_finalization_claims),
+            ),
+        ];
+        self.provider_activity
+            .counts()
+            .into_iter()
+            .zip(subsets)
+            .all(|(global, subset)| i128::from(global) >= subset)
+    }
+
     fn validate(&self, expected_since: &str) -> Result<(), AggregateAuditFailure> {
         if self.contract != POSTGRES_AGGREGATE_AUDIT_CONTRACT
-            || self.schema_version != 1
+            || self.schema_version != 2
+            || self
+                .provider_activity
+                .counts()
+                .into_iter()
+                .any(|count| count < 0)
+            || self.gates.provider_quiescent != self.provider_activity.quiescent()
+            || !self.provider_activity_covers_subsets()
             || self.since != expected_since
             || self.usage_day != expected_since[..10]
             || !self.transaction_read_only
@@ -807,7 +904,7 @@ async fn test_real_pg_aggregate_audit_inner(
     .unwrap();
     let report = persistence.aggregate_audit(&since).await.unwrap();
     assert_eq!(report.contract, POSTGRES_AGGREGATE_AUDIT_CONTRACT);
-    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.schema_version, 2);
     assert!(report.transaction_read_only);
     assert_eq!(report.capture_events.groups.len(), 12);
     assert_eq!(report.media.work_units_since.len(), 20);
@@ -1019,6 +1116,8 @@ async fn test_real_pg_aggregate_audit_inner(
         assert!(installed_formation_debt.gates.ready_for_drain);
         assert!(!installed_formation_debt.gates.ready_for_active);
 
+        Box::pin(test_provider_activity_authority(persistence, &since)).await;
+
         let budget_job_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO media_processing_jobs( \
                  account_id,event_id,job_kind,input_revision,processor_version,state,error_code, \
@@ -1197,6 +1296,11 @@ async fn test_real_pg_aggregate_audit_inner(
         .await
         .unwrap();
         let finalization_blocked = persistence.aggregate_audit(&since).await.unwrap();
+        assert_eq!(
+            finalization_blocked.provider_activity.finalization_claims,
+            1
+        );
+        assert!(!finalization_blocked.gates.provider_quiescent);
         assert!(!finalization_blocked.gates.finalization_claims_quiescent);
         assert!(!finalization_blocked.gates.ready_for_drain);
         sqlx::raw_sql(
@@ -1322,6 +1426,8 @@ async fn test_real_pg_aggregate_audit_inner(
         .await
         .unwrap();
         let scoped_draft_claim = persistence.aggregate_audit(&since).await.unwrap();
+        assert_eq!(scoped_draft_claim.provider_activity.finalization_claims, 1);
+        assert!(!scoped_draft_claim.gates.provider_quiescent);
         assert_eq!(scoped_draft_claim.finalization.processing_claims, 0);
         assert_eq!(
             scoped_draft_claim
@@ -1412,6 +1518,227 @@ async fn test_real_pg_aggregate_audit_inner(
         .await
         .unwrap(),
         0
+    );
+}
+
+#[cfg(test)]
+async fn test_provider_activity_authority(persistence: &PostgresPersistence, since: &str) {
+    use crate::cp::vertex::VertexOperation;
+    use crate::persistence::{EntitlementRepository, ModelUsageRepository, VertexWorkClass};
+
+    const ACCOUNT: &str = "aggregate-audit-gate-contract";
+    // A committed pre-admission debit cannot establish an in-flight call.
+    assert!(persistence
+        .reserve_vertex_output_tokens_for_class(
+            ACCOUNT,
+            VertexWorkClass::DerivedText,
+            8192,
+            2621440,
+        )
+        .await
+        .unwrap());
+    let pre_admission = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(
+        pre_admission.usage_daily.classes[2].unmatched_reservations,
+        1
+    );
+    assert!(pre_admission.gates.provider_quiescent);
+    sqlx::query("DELETE FROM usage_daily WHERE account_id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+    // Real repository admission deduplicates repeated attempts, whereas quota
+    // debits are deliberately conservative and cumulative. Preserve both ledgers.
+    for attempt in [1_u8, 2] {
+        for _ in 0..6 {
+            assert!(persistence
+                .reserve_vertex_output_tokens_for_class(
+                    ACCOUNT,
+                    VertexWorkClass::DerivedText,
+                    8192,
+                    2621440,
+                )
+                .await
+                .unwrap());
+            let invocation = persistence
+                .begin_invocation_attempt(
+                    ACCOUNT,
+                    VertexOperation::EpisodeSummary,
+                    "fixture-model",
+                    "us-central1",
+                    &[3; 32],
+                    &[attempt; 32],
+                )
+                .await
+                .unwrap();
+            persistence
+                .settle_pre_egress_not_billed(ACCOUNT, &invocation.event_id)
+                .await
+                .unwrap();
+        }
+    }
+    let repeated = persistence.aggregate_audit(since).await.unwrap();
+    let derived = &repeated.usage_daily.classes[2];
+    assert_eq!(
+        (
+            derived.reservation_slots,
+            derived.terminal_event_rows,
+            derived.unmatched_reservations
+        ),
+        (12, 2, 10)
+    );
+    assert!(repeated.gates.quota_invariants_hold);
+    assert!(repeated.gates.provider_quiescent);
+    assert!(repeated.gates.ready_for_drain);
+    assert!(!repeated.gates.ready_for_active); // historical formation debt remains.
+    sqlx::query("DELETE FROM usage_daily WHERE account_id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM vertex_usage_events WHERE account_id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(
+        "UPDATE accounts SET status='deletion_requested'
+        WHERE id='aggregate-audit-gate-contract';
+        INSERT INTO vertex_usage_events(account_id,event_id,request_fingerprint,
+            operation,requested_model,location,outcome,observed_at)
+        VALUES('aggregate-audit-gate-contract','old-started',decode(repeat('ea',32),'hex'),
+            'episode_summarization','fixture-model','us-central1','started',
+            clock_timestamp()-interval '3 days');",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let old = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(old.provider_activity.started_intents, 1);
+    assert_eq!(old.usage_daily.classes[2].pending_started_rows, 0);
+    assert!(!old.gates.provider_quiescent);
+    sqlx::raw_sql(
+        "DELETE FROM vertex_usage_events WHERE event_id='old-started'
+        AND account_id='aggregate-audit-gate-contract';
+        UPDATE accounts SET status='active' WHERE id='aggregate-audit-gate-contract';",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+
+    // A terminal-looking legacy row with residual ownership is still a blocker,
+    // even outside both the observation window and active-account enumeration.
+    sqlx::raw_sql(
+        "UPDATE accounts SET status='deletion_requested'
+        WHERE id='aggregate-audit-gate-contract';
+        INSERT INTO summary_window_claims(account_id,window_from,window_to,state,
+            claim_token,claim_until,updated_at)
+        VALUES('aggregate-audit-gate-contract',clock_timestamp()-interval '4 days',
+            clock_timestamp()-interval '3 days','succeeded','residual-claim',
+            clock_timestamp()-interval '3 days',clock_timestamp()-interval '3 days');",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let residual = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(residual.provider_activity.summary_claims, 1);
+    assert!(!residual.gates.provider_quiescent);
+    sqlx::raw_sql(
+        "DELETE FROM summary_window_claims
+        WHERE account_id='aggregate-audit-gate-contract';
+        UPDATE accounts SET status='active' WHERE id='aggregate-audit-gate-contract';",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    assert!(
+        persistence
+            .aggregate_audit(since)
+            .await
+            .unwrap()
+            .gates
+            .provider_quiescent
+    );
+    Box::pin(test_provider_worker_claim_counts(persistence, since)).await;
+}
+
+#[cfg(test)]
+async fn test_provider_worker_claim_counts(persistence: &PostgresPersistence, since: &str) {
+    // Every raw provider-capable worker family remains visible after expiry,
+    // outside the observation window, and outside active-account enumeration.
+    let cases = [
+        ("media work", 1, "INSERT INTO media_work_units(account_id,id,work_class,
+            processor_version,state,started_at,ended_at,reserved_output_tokens,
+            claim_token,claim_until,updated_at)
+            VALUES('aggregate-audit-gate-contract','old-work','audio',1,'processing',
+            clock_timestamp()-interval '4 days',clock_timestamp()-interval '3 days',
+            4096,'old-claim',clock_timestamp()-interval '3 days',clock_timestamp()-interval '3 days')",
+            "DELETE FROM media_work_units WHERE account_id='aggregate-audit-gate-contract' AND id='old-work'"),
+        ("media job", 2, "INSERT INTO media_processing_jobs(account_id,event_id,
+            job_kind,input_revision,processor_version,state,lease_owner,lease_token,lease_until,updated_at)
+            VALUES('aggregate-audit-gate-contract','historical-ended-event','gemini_screen',
+            'old-job',1,'processing','fixture','old-claim',clock_timestamp()-interval '3 days',
+            clock_timestamp()-interval '3 days')",
+            "DELETE FROM media_processing_jobs WHERE account_id='aggregate-audit-gate-contract' AND input_revision='old-job'"),
+        ("formation receipt", 4, "UPDATE capture_formation_receipts SET state='processing',
+            claimed_revision=source_revision,claimed_source_fingerprint=decode(repeat('ab',32),'hex'),
+            claim_token='old-claim',claim_until=clock_timestamp()-interval '3 days',
+            updated_at=clock_timestamp()-interval '3 days'
+            WHERE account_id='aggregate-audit-gate-contract' AND capture_session_id='historical-ended'",
+            "UPDATE capture_formation_receipts SET state='pending',claimed_revision=NULL,
+            claimed_source_fingerprint=NULL,claim_token=NULL,claim_until=NULL
+            WHERE account_id='aggregate-audit-gate-contract' AND capture_session_id='historical-ended'"),
+        ("formation page", 5, "INSERT INTO capture_formation_pages(account_id,capture_session_id,
+            source_revision,page_index,source_fingerprint,page_source_commitment,has_more,state,
+            claim_token,claim_until,updated_at)
+            VALUES('aggregate-audit-gate-contract','historical-ended',1,0,
+            decode(repeat('ab',32),'hex'),decode(repeat('cd',32),'hex'),false,'processing',
+            'old-claim',clock_timestamp()-interval '3 days',clock_timestamp()-interval '3 days')",
+            "DELETE FROM capture_formation_pages WHERE account_id='aggregate-audit-gate-contract' AND capture_session_id='historical-ended'"),
+        ("reconciliation", 6, "INSERT INTO memory_reconciliation_jobs(account_id,source_fingerprint,
+            topology_fingerprint,predecessor_episode_ids,cohort_started_at,cohort_ended_at,state,
+            claim_token,claim_until,updated_at)
+            VALUES('aggregate-audit-gate-contract',decode(repeat('ab',32),'hex'),
+            decode(repeat('cd',32),'hex'),ARRAY[9001]::bigint[],clock_timestamp()-interval '4 days',
+            clock_timestamp()-interval '3 days','processing','old-claim',
+            clock_timestamp()-interval '3 days',clock_timestamp()-interval '3 days')",
+            "DELETE FROM memory_reconciliation_jobs WHERE account_id='aggregate-audit-gate-contract'"),
+    ];
+    sqlx::query(
+        "UPDATE accounts SET status='deletion_requested' WHERE id='aggregate-audit-gate-contract'",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    for (name, index, setup, cleanup) in cases {
+        sqlx::raw_sql(setup)
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+        let audit = persistence.aggregate_audit(since).await.unwrap();
+        let mut expected = [0; 8];
+        expected[index] = 1;
+        assert_eq!(audit.provider_activity.counts(), expected, "{name}");
+        assert!(!audit.gates.provider_quiescent, "{name}");
+        sqlx::raw_sql(cleanup)
+            .execute(persistence.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE accounts SET status='active' WHERE id='aggregate-audit-gate-contract'")
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+    assert!(
+        persistence
+            .aggregate_audit(since)
+            .await
+            .unwrap()
+            .gates
+            .ready_for_drain
     );
 }
 
@@ -1558,6 +1885,80 @@ mod tests {
             .unwrap()
             .insert("unexpected".into(), serde_json::json!(0));
         assert!(serde_json::from_value::<PostgresAggregateAuditReport>(extra).is_err());
+    }
+
+    #[test]
+    fn provider_activity_refuses_contradictory_subsets() {
+        let report: PostgresAggregateAuditReport =
+            serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
+        let changes: [fn(&mut PostgresAggregateAuditReport); 15] = [
+            |r| r.vertex_usage.groups[0].count = 1,
+            |r| r.usage_daily.classes[0].pending_started_rows = 1,
+            |r| {
+                r.media
+                    .work_units_since
+                    .iter_mut()
+                    .find(|v| v.state == "processing")
+                    .unwrap()
+                    .count = 1
+            },
+            |r| {
+                r.media
+                    .work_units_unfinished
+                    .iter_mut()
+                    .find(|v| v.state == "processing")
+                    .unwrap()
+                    .count = 1
+            },
+            |r| {
+                r.media
+                    .jobs_since
+                    .iter_mut()
+                    .find(|v| v.state == "processing")
+                    .unwrap()
+                    .count = 1
+            },
+            |r| {
+                r.media
+                    .jobs_unfinished
+                    .iter_mut()
+                    .find(|v| v.state == "processing")
+                    .unwrap()
+                    .count = 1
+            },
+            |r| r.formation.legacy_processing_claims = 1,
+            |r| r.formation.receipts_since[1].count = 1,
+            |r| r.formation.receipts_unfinished[1].count = 1,
+            |r| r.formation.pages_since[0].count = 1,
+            |r| r.formation.pages_unfinished[0].count = 1,
+            |r| r.reconciliation.jobs_since[1].count = 1,
+            |r| r.reconciliation.jobs_unfinished[1].count = 1,
+            |r| r.finalization.processing_claims = 1,
+            |r| r.activation.scoped_draft_finalization_claims = 1,
+        ];
+        for change in changes {
+            let mut hostile = report.clone();
+            change(&mut hostile);
+            assert!(!hostile.provider_activity_covers_subsets());
+            assert!(hostile.validate(&hostile.since).is_err());
+        }
+        let mut overlap = report;
+        overlap
+            .media
+            .work_units_since
+            .iter_mut()
+            .find(|v| v.state == "processing")
+            .unwrap()
+            .count = 1;
+        overlap
+            .media
+            .work_units_unfinished
+            .iter_mut()
+            .find(|v| v.state == "processing")
+            .unwrap()
+            .count = 1;
+        overlap.provider_activity.media_work_claims = 1;
+        assert!(overlap.provider_activity_covers_subsets());
     }
 
     #[test]
