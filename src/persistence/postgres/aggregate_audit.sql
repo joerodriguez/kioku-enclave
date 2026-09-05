@@ -814,6 +814,38 @@ vertex_facts AS MATERIALIZED (
       LEFT JOIN vertex_aggregates aggregate USING(operation,outcome)
 ),
 
+-- Model-provider authority is not a calendar-day quota projection. A debit
+-- can precede failed admission or a deduplicated attempt; never refund it or
+-- synthesize a provider outcome to infer quiescence. Count raw authority even
+-- for inactive accounts, expired leases, or terminal-looking residual claims.
+provider_activity_facts AS MATERIALIZED (
+    SELECT (SELECT count(*)::bigint FROM vertex_usage_events
+             WHERE outcome='started') AS started_intents,
+           (SELECT count(*)::bigint FROM media_work_units
+             WHERE state='processing' OR claim_token IS NOT NULL OR claim_until IS NOT NULL)
+               AS media_work_claims,
+           (SELECT count(*)::bigint FROM media_processing_jobs
+             WHERE state='processing' OR lease_token IS NOT NULL
+                OR lease_owner IS NOT NULL OR lease_until IS NOT NULL) AS media_job_claims,
+           (SELECT count(*)::bigint FROM summary_window_claims
+             WHERE state='processing' OR claim_token IS NOT NULL OR claim_until IS NOT NULL)
+               AS summary_claims,
+           (SELECT count(*)::bigint FROM capture_formation_receipts
+             WHERE state='processing' OR claim_token IS NOT NULL OR claim_until IS NOT NULL
+                OR claimed_revision IS NOT NULL OR claimed_source_fingerprint IS NOT NULL)
+               AS formation_receipt_claims,
+           (SELECT count(*)::bigint FROM capture_formation_pages
+             WHERE state='processing' OR claim_token IS NOT NULL OR claim_until IS NOT NULL)
+               AS formation_page_claims,
+           (SELECT count(*)::bigint FROM memory_reconciliation_jobs
+             WHERE state='processing' OR claim_token IS NOT NULL OR claim_until IS NOT NULL)
+               AS reconciliation_claims,
+           (SELECT count(*)::bigint FROM episodes
+             WHERE finalization_status='processing' OR finalization_claim_token IS NOT NULL
+                OR finalization_claim_until IS NOT NULL) AS finalization_claims
+      FROM valid
+),
+
 usage_scope AS MATERIALIZED (
     SELECT usage.account_id,usage.vertex_requests,usage.vertex_output_tokens,
            usage.vertex_audio_output_tokens,usage.vertex_screen_output_tokens,
@@ -1094,8 +1126,10 @@ gate_facts AS MATERIALIZED (
              AND NOT EXISTS (SELECT 1 FROM usage_class_aggregates
                               WHERE nondivisible_rows<>0 OR accounts_at_or_over_limit<>0)
              AS quota_invariants_hold,
-           NOT EXISTS (SELECT 1 FROM usage_class_aggregates
-                        WHERE pending_started_rows<>0 OR unmatched_reservations<>0)
+           provider.started_intents=0 AND provider.media_work_claims=0
+             AND provider.media_job_claims=0 AND provider.summary_claims=0
+             AND provider.formation_receipt_claims=0 AND provider.formation_page_claims=0
+             AND provider.reconciliation_claims=0 AND provider.finalization_claims=0
              AS provider_quiescent,
            media.current_budget_jobs=0 AND media.current_budget_work_units=0
              AS media_budget_drained,
@@ -1141,7 +1175,7 @@ gate_facts AS MATERIALIZED (
       FROM domain_gate domain,usage_facts usage,media_facts media,
            formation_facts formation,reconciliation_facts reconciliation,
            finalization_facts finalization,activation_facts activation,
-           capacity_facts capacity
+           capacity_facts capacity,provider_activity_facts provider
 ),
 gate_results AS MATERIALIZED (
     SELECT domain_clean,quota_invariants_hold,provider_quiescent,
@@ -1165,13 +1199,14 @@ gate_results AS MATERIALIZED (
       FROM gate_facts
 )
 SELECT jsonb_build_object(
-    'contract','kioku.postdeploy.aggregate-audit.v1',
-    'schema_version',1,
+    'contract','kioku.postdeploy.aggregate-audit.v2',
+    'schema_version',2,
     'observed_at',to_char(audit_window.observed_at AT TIME ZONE 'UTC',
                           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'since',audit_window.raw_since,
     'usage_day',to_char(audit_window.since_at AT TIME ZONE 'UTC','YYYY-MM-DD'),
     'transaction_read_only',audit_window.transaction_read_only,
+    'provider_activity',(SELECT to_jsonb(provider) FROM provider_activity_facts provider),
     'activation',to_jsonb(activation),
     'capture_events',to_jsonb(capture),
     'media',to_jsonb(media),
