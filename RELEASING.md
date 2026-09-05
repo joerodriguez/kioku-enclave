@@ -165,8 +165,16 @@ or runtime feature flag.
    inactive. Never invent tombstones or lower a committed stream watermark. Once the query is
    empty, run this release image through the standard dedicated migration job with
    `POSTGRES_MIGRATION_CONFIRM=memory-reconciliation-v27-install`. Repeat
-   `memory-reconciliation-v27-backfill` until the content-free result reports the bounded formation
-   backfill complete. The durable phase is now `Installed`, marker 26 remains visible, and the
+   `memory-reconciliation-v27-backfill` until the content-free result status is
+   `backfill_complete` (not merely `formation_backfill_complete=true`). Installed backfill also
+   repairs at most 256 expired terminal media ownership rows per call, in one account with no
+   unfinished media, live media deadline, or started provider intent. It holds the activation and
+   account-lifecycle fences, requires a 15-minute unchanged-row age, and clears only ownership
+   markers; states, timestamps, provider journals/outcomes, quotas/reservations, and content remain
+   untouched. A following no-op pass establishes repair completion. It never requeues work or
+   claims provider quiescence: the independent raw-authority audit still rejects every remaining
+   live, contradictory, or otherwise ineligible residual. No new schema or alternate repair
+   binary is installed. The durable phase is now `Installed`, marker 26 remains visible, and the
    predecessor stays schema-compatible throughout this step.
 
    Raising the immutable quota does not rewrite or wake existing `vertex_daily_budget` retries;

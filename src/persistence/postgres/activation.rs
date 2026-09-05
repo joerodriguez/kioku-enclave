@@ -31,6 +31,7 @@ const INSTALL_SQL: &str =
 const FORMATION_BACKFILL_NAME: &str = "capture_formation_receipts";
 const FORMATION_BACKFILL_BATCH_SIZE: i64 = 256;
 const FINALIZATION_CLAIM_DRAIN_BATCH_SIZE: i64 = 256;
+const TERMINAL_MEDIA_CLAIM_REPAIR_BATCH_SIZE: i64 = 256;
 const FORMATION_BACKFILL_SELECT_SQL: &str = "SELECT account_id,id FROM capture_sessions \
       WHERE ($1::text IS NULL OR (account_id,id)>($1,$2)) \
       ORDER BY account_id,id LIMIT $3";
@@ -1689,6 +1690,104 @@ async fn advance_finalization_claim_drain_batch(
     Ok(false)
 }
 
+/// Metadata-only forward repair, called only by Installed backfill under its
+/// exclusive activation release lock. A whole account must have no unfinished
+/// media, live media deadline, or started provider intent before any ownership
+/// is cleared. Stale terminal rows cannot authorize egress or settlement.
+/// Account lifecycle locking also fences intent insertion (which does not take
+/// the activation lock), account deletion, and its cascades. No history, quota,
+/// timestamps, reservations, projections, or attempt journals are rewritten.
+async fn repair_terminal_media_claims_batch(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<bool> {
+    let account = sqlx::query_scalar::<_, String>(
+        "SELECT candidate.account_id FROM ( \
+             SELECT account_id FROM media_work_units \
+              WHERE state IN ('succeeded','failed_terminal') \
+                AND claim_token IS NOT NULL AND claim_until<=clock_timestamp() \
+                AND updated_at<=clock_timestamp()-interval '15 minutes' \
+             UNION \
+             SELECT account_id FROM media_processing_jobs \
+              WHERE state IN ('succeeded','failed_terminal','canceled') \
+                AND (lease_owner IS NOT NULL OR lease_token IS NOT NULL \
+                     OR lease_until IS NOT NULL) \
+                AND (lease_until IS NULL OR lease_until<=clock_timestamp()) \
+                AND updated_at<=clock_timestamp()-interval '15 minutes' \
+         ) candidate \
+         WHERE NOT EXISTS(SELECT 1 FROM media_work_units work \
+                 WHERE work.account_id=candidate.account_id \
+                   AND (work.state NOT IN ('succeeded','failed_terminal') \
+                        OR work.claim_until>clock_timestamp())) \
+           AND NOT EXISTS(SELECT 1 FROM media_processing_jobs job \
+                 WHERE job.account_id=candidate.account_id \
+                   AND (job.state NOT IN ('succeeded','failed_terminal','canceled') \
+                        OR job.lease_until>clock_timestamp())) \
+           AND NOT EXISTS(SELECT 1 FROM vertex_usage_events usage \
+                 WHERE usage.account_id=candidate.account_id AND usage.outcome='started') \
+         ORDER BY candidate.account_id LIMIT 1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(account) = account else {
+        // This means no safely repairable rows, not provider quiescence. Live,
+        // nonterminal, and contradictory residuals still fail the raw audit.
+        return Ok(true);
+    };
+    super::advisory_transaction_lock(transaction, "account-lifecycle", &account).await?;
+    super::advisory_transaction_lock(transaction, "memory-reconciliation", &account).await?;
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM vertex_usage_events \
+          WHERE account_id=$1 AND outcome='started')",
+    )
+    .bind(&account)
+    .fetch_one(&mut **transaction)
+    .await?
+    {
+        // An intent may have committed between candidate selection and its
+        // lifecycle fence. Leave every row untouched and require another call.
+        return Ok(false);
+    }
+    let work_changed = sqlx::query(
+        "WITH selected AS MATERIALIZED ( \
+             SELECT account_id,id FROM media_work_units WHERE account_id=$1 \
+               AND state IN ('succeeded','failed_terminal') \
+               AND claim_token IS NOT NULL AND claim_until<=clock_timestamp() \
+               AND updated_at<=clock_timestamp()-interval '15 minutes' \
+             ORDER BY id LIMIT $2 FOR UPDATE \
+         ) UPDATE media_work_units work SET claim_token=NULL,claim_until=NULL \
+           FROM selected WHERE work.account_id=selected.account_id AND work.id=selected.id \
+             AND work.state IN ('succeeded','failed_terminal') \
+             AND work.claim_until<=clock_timestamp()",
+    )
+    .bind(&account)
+    .bind(TERMINAL_MEDIA_CLAIM_REPAIR_BATCH_SIZE)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "WITH selected AS MATERIALIZED ( \
+             SELECT account_id,id FROM media_processing_jobs WHERE account_id=$1 \
+               AND state IN ('succeeded','failed_terminal','canceled') \
+               AND (lease_owner IS NOT NULL OR lease_token IS NOT NULL \
+                    OR lease_until IS NOT NULL) \
+               AND (lease_until IS NULL OR lease_until<=clock_timestamp()) \
+               AND updated_at<=clock_timestamp()-interval '15 minutes' \
+             ORDER BY id LIMIT $2 FOR UPDATE \
+         ) UPDATE media_processing_jobs job \
+              SET lease_owner=NULL,lease_token=NULL,lease_until=NULL \
+           FROM selected WHERE job.account_id=selected.account_id AND job.id=selected.id \
+             AND job.state IN ('succeeded','failed_terminal','canceled') \
+             AND (job.lease_until IS NULL OR job.lease_until<=clock_timestamp())",
+    )
+    .bind(&account)
+    .bind(TERMINAL_MEDIA_CLAIM_REPAIR_BATCH_SIZE - work_changed as i64)
+    .execute(&mut **transaction)
+    .await?;
+    // A following no-op pass proves there are no more eligible accounts or
+    // rows. Do not claim global completion merely because this batch is small.
+    Ok(false)
+}
+
 async fn advance_formation_backfill_batch(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     expected_generation: i64,
@@ -2056,8 +2155,8 @@ impl PostgresPersistence {
         .await
     }
 
-    /// Advances at most one bounded keyset batch. Operators repeat this
-    /// resumable step until `formation_backfill_complete` is true; install and
+    /// Advances bounded metadata batches. Operators repeat this resumable
+    /// step until its status is `BackfillComplete`; install and
     /// signed transitions never scan the populated capture corpus inline.
     pub(crate) async fn advance_memory_reconciliation_activation_backfill(
         &self,
@@ -2093,6 +2192,16 @@ impl PostgresPersistence {
             }
             MemoryReconciliationActivationPhase::Preactive => unreachable!(),
         };
+        // The exclusive release advisory lock above excludes every media
+        // claim/authorization/settlement writer. Only Installed may reconcile
+        // residual terminal ownership; never turn this into a worker retry or
+        // a way to relax the independent raw-authority activation audit.
+        let terminal_media_complete =
+            if state.phase == MemoryReconciliationActivationPhase::Installed {
+                repair_terminal_media_claims_batch(&mut transaction).await?
+            } else {
+                true
+            };
         let formation_complete = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM persistence_feature_activation_backfills \
               WHERE feature=$1 AND backfill_name=$2 AND refresh_generation=$3 \
@@ -2116,7 +2225,7 @@ impl PostgresPersistence {
         let mut connection = self.pool().acquire().await?;
         release_result(
             &mut connection,
-            if complete {
+            if complete && terminal_media_complete {
                 MemoryReconciliationActivationReleaseStatus::BackfillComplete
             } else {
                 MemoryReconciliationActivationReleaseStatus::BackfillInProgress
@@ -2480,7 +2589,8 @@ async fn test_advance_activation_until_complete(
         let result = persistence
             .advance_memory_reconciliation_activation_backfill()
             .await?;
-        if result.formation_backfill_complete
+        if result.status == MemoryReconciliationActivationReleaseStatus::BackfillComplete
+            && result.formation_backfill_complete
             && (!require_claim_drain || result.finalization_claim_drain_complete)
         {
             return Ok(());
@@ -2976,6 +3086,264 @@ async fn test_real_pg_seal_and_tombstone_contract(persistence: &PostgresPersiste
 }
 
 #[cfg(test)]
+async fn test_real_pg_terminal_media_claim_repair(persistence: &PostgresPersistence) -> Result<()> {
+    async fn fixture(persistence: &PostgresPersistence, account: &str, count: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+             VALUES($1,$1||'@example.com','google',$1)",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO usage_daily(account_id,day,vertex_requests,vertex_output_tokens, \
+                 vertex_audio_output_tokens) VALUES($1,CURRENT_DATE,3,12288,12288)",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO vertex_usage_events(account_id,event_id,request_fingerprint, \
+                 operation,requested_model,location,outcome) \
+             VALUES($1,'retained-usage',decode(repeat('b',64),'hex'), \
+                    'audio_understanding','model','global','ambiguous')",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_work_units(account_id,id,work_class,processor_version,state, \
+                 started_at,ended_at,reserved_output_tokens,reservation_retained,attempt_count, \
+                 claim_token,claim_until,error_code,usage_json,updated_at) \
+             SELECT $1,'work-'||n,'audio',1, \
+                    CASE WHEN n%2=0 THEN 'succeeded' ELSE 'failed_terminal' END, \
+                    now()-interval '3 hours',now()-interval '2 hours',4096,true,3, \
+                    'old-owner',now()-interval '1 hour','retained-history', \
+                    jsonb_build_object('provider_attempts', \
+                        jsonb_build_array(jsonb_build_object('state','ambiguous'))), \
+                    now()-interval '2 hours' FROM generate_series(1,$2::bigint) n",
+        )
+        .bind(account)
+        .bind(count)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at, \
+                 last_event_at,ended_at,schema_version) \
+             VALUES($1,'session','device','install',now(),now(),now(),2)",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) \
+             VALUES($1,'stream','session','device','mic')",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO capture_events(account_id,event_id,device_id,install_id, \
+                 capture_session_id,stream_id,stream_kind,sequence,source_wall_at, \
+                 source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
+                 clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+             VALUES($1,'event','device','install','session','stream','mic',0,now(),'0', \
+                    now(),now(),'UTC',0,0,'asset',repeat('a',64),'canonical')",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_processing_jobs(account_id,event_id,job_kind,input_revision, \
+                 processor_version,state,lease_owner,lease_token,lease_until,usage_json,updated_at) \
+             SELECT $1,'event','gemini_audio','input-'||n,1,state,'old-owner', \
+                    CASE WHEN n=3 THEN NULL ELSE 'old-token' END, \
+                    CASE WHEN n=3 THEN NULL ELSE now()-interval '1 hour' END, \
+                    jsonb_build_object('retained_usage',42),now()-interval '2 hours' \
+               FROM (VALUES(1,'succeeded'),(2,'failed_terminal'),(3,'canceled')) states(n,state)",
+        )
+        .bind(account)
+        .execute(persistence.pool())
+        .await?;
+        Ok(())
+    }
+    async fn snapshot(persistence: &PostgresPersistence, account: &str) -> Result<String> {
+        Ok(sqlx::query_scalar(
+            "SELECT jsonb_build_object( \
+               'work',(SELECT jsonb_agg(to_jsonb(w)-'claim_token'-'claim_until' ORDER BY id) \
+                       FROM media_work_units w WHERE account_id=$1), \
+               'jobs',(SELECT jsonb_agg(to_jsonb(j)-'lease_owner'-'lease_token'-'lease_until' \
+                       ORDER BY id) FROM media_processing_jobs j WHERE account_id=$1), \
+               'usage',(SELECT jsonb_agg(to_jsonb(u) ORDER BY event_id) \
+                        FROM vertex_usage_events u WHERE account_id=$1), \
+               'quota',(SELECT jsonb_agg(to_jsonb(q) ORDER BY day) \
+                        FROM usage_daily q WHERE account_id=$1), \
+               'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY event_id) \
+                         FROM capture_events e WHERE account_id=$1))::text",
+        )
+        .bind(account)
+        .fetch_one(persistence.pool())
+        .await?)
+    }
+    async fn claims(persistence: &PostgresPersistence, account: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM media_work_units WHERE account_id=$1 \
+                     AND (claim_token IS NOT NULL OR claim_until IS NOT NULL)) \
+                  + (SELECT count(*) FROM media_processing_jobs WHERE account_id=$1 \
+                     AND (lease_owner IS NOT NULL OR lease_token IS NOT NULL \
+                          OR lease_until IS NOT NULL))",
+        )
+        .bind(account)
+        .fetch_one(persistence.pool())
+        .await?)
+    }
+    async fn remove(persistence: &PostgresPersistence, account: &str) -> Result<()> {
+        sqlx::query("DELETE FROM accounts WHERE id=$1")
+            .bind(account)
+            .execute(persistence.pool())
+            .await?;
+        Ok(())
+    }
+    const ACCOUNT: &str = "000-terminal-repair";
+    const OTHER_ACCOUNT: &str = "000-terminal-repair-other";
+    fixture(persistence, OTHER_ACCOUNT, 1).await?;
+    sqlx::query("UPDATE media_work_units SET state='processing' WHERE account_id=$1")
+        .bind(OTHER_ACCOUNT)
+        .execute(persistence.pool())
+        .await?;
+    let other_before = snapshot(persistence, OTHER_ACCOUNT).await?;
+    fixture(persistence, ACCOUNT, 260).await?;
+    sqlx::query("UPDATE accounts SET status='deletion_requested' WHERE id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await?;
+    let before = snapshot(persistence, ACCOUNT).await?;
+    let first = persistence
+        .advance_memory_reconciliation_activation_backfill()
+        .await?;
+    assert_eq!(
+        first.status,
+        MemoryReconciliationActivationReleaseStatus::BackfillInProgress
+    );
+    assert_eq!(
+        claims(persistence, ACCOUNT).await?,
+        7,
+        "at most 256 rows, across both families"
+    );
+    persistence
+        .advance_memory_reconciliation_activation_backfill()
+        .await?;
+    assert_eq!(claims(persistence, ACCOUNT).await?, 0);
+    persistence
+        .advance_memory_reconciliation_activation_backfill()
+        .await?;
+    assert_eq!(
+        snapshot(persistence, ACCOUNT).await?,
+        before,
+        "only ownership may change"
+    );
+    assert_eq!(claims(persistence, OTHER_ACCOUNT).await?, 4);
+    assert_eq!(snapshot(persistence, OTHER_ACCOUNT).await?, other_before);
+    remove(persistence, ACCOUNT).await?;
+    remove(persistence, OTHER_ACCOUNT).await?;
+
+    for blocker in [
+        "work-processing",
+        "job-processing",
+        "live-work",
+        "live-job",
+        "started",
+        "recent",
+    ] {
+        fixture(persistence, ACCOUNT, 1).await?;
+        let statement = match blocker {
+            "work-processing" => "UPDATE media_work_units SET state='processing' WHERE account_id=$1",
+            "job-processing" => "UPDATE media_processing_jobs SET state='processing' WHERE account_id=$1",
+            "live-work" => "UPDATE media_work_units SET claim_until=now()+interval '1 hour' WHERE account_id=$1",
+            "live-job" => "UPDATE media_processing_jobs SET lease_until=now()+interval '1 hour' WHERE account_id=$1",
+            "started" => "INSERT INTO vertex_usage_events(account_id,event_id,request_fingerprint,operation,requested_model,location,outcome) VALUES($1,'intent',decode(repeat('a',64),'hex'),'audio_understanding','model','global','started')",
+            "recent" => "UPDATE media_work_units SET updated_at=now() WHERE account_id=$1",
+            _ => unreachable!(),
+        };
+        sqlx::query(statement)
+            .bind(ACCOUNT)
+            .execute(persistence.pool())
+            .await?;
+        if blocker == "recent" {
+            sqlx::query("UPDATE media_processing_jobs SET updated_at=now() WHERE account_id=$1")
+                .bind(ACCOUNT)
+                .execute(persistence.pool())
+                .await?;
+        }
+        let before = snapshot(persistence, ACCOUNT).await?;
+        persistence
+            .advance_memory_reconciliation_activation_backfill()
+            .await?;
+        assert_eq!(
+            claims(persistence, ACCOUNT).await?,
+            4,
+            "must preserve {blocker}"
+        );
+        assert_eq!(snapshot(persistence, ACCOUNT).await?, before);
+        remove(persistence, ACCOUNT).await?;
+    }
+
+    // An intent admitted during candidate selection must win before cleanup.
+    fixture(persistence, ACCOUNT, 1).await?;
+    let mut admission = persistence.pool().begin().await?;
+    super::advisory_transaction_lock(&mut admission, "account-lifecycle", ACCOUNT).await?;
+    let adapter = persistence.clone();
+    let mut repair = tokio::spawn(async move {
+        adapter
+            .advance_memory_reconciliation_activation_backfill()
+            .await
+    });
+    wait_for_exclusive_release_lock(persistence).await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut repair)
+            .await
+            .is_err()
+    );
+    sqlx::query("INSERT INTO vertex_usage_events(account_id,event_id,request_fingerprint,operation,requested_model,location,outcome) VALUES($1,'intent',decode(repeat('a',64),'hex'),'audio_understanding','model','global','started')")
+        .bind(ACCOUNT).execute(&mut *admission).await?;
+    admission.commit().await?;
+    repair
+        .await
+        .map_err(|_| EnclaveError::Store("terminal repair task failed".into()))??;
+    assert_eq!(claims(persistence, ACCOUNT).await?, 4);
+    remove(persistence, ACCOUNT).await?;
+
+    // The same fence taken by claim, authorization, and settlement excludes
+    // their mutation until the repair transaction has committed.
+    fixture(persistence, ACCOUNT, 1).await?;
+    let mut transaction = persistence.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(RELEASE_LOCK)
+        .execute(&mut *transaction)
+        .await?;
+    assert!(!repair_terminal_media_claims_batch(&mut transaction).await?);
+    let adapter = persistence.clone();
+    let mut writer = tokio::spawn(async move {
+        let mut writer = adapter.pool().begin().await?;
+        lock_activation_contract_key_share_if_installed(&mut writer).await?;
+        writer.commit().await?;
+        Ok::<_, EnclaveError>(())
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut writer)
+            .await
+            .is_err()
+    );
+    transaction.commit().await?;
+    writer
+        .await
+        .map_err(|_| EnclaveError::Store("terminal repair writer failed".into()))??;
+    assert_eq!(claims(persistence, ACCOUNT).await?, 0);
+    remove(persistence, ACCOUNT).await?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn wait_for_exclusive_release_lock(persistence: &PostgresPersistence) -> Result<()> {
     let mut observer = persistence.pool().acquire().await?;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3345,6 +3713,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     }
     persistence.verify_schema().await?;
     persistence.verify_schema().await?;
+    test_real_pg_terminal_media_claim_repair(persistence).await?;
     super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
     test_real_pg_seal_and_tombstone_contract(persistence).await?;
     let producer_contract = crate::cp::reconciler::producer_contract_commitment(
