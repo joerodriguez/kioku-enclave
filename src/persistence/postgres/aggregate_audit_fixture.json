@@ -1,6 +1,16 @@
 {
-  "contract": "kioku.postdeploy.aggregate-audit.v1",
-  "schema_version": 1,
+  "contract": "kioku.postdeploy.aggregate-audit.v2",
+  "schema_version": 2,
+  "provider_activity": {
+    "started_intents": 0,
+    "media_work_claims": 0,
+    "media_job_claims": 0,
+    "summary_claims": 0,
+    "formation_receipt_claims": 0,
+    "formation_page_claims": 0,
+    "reconciliation_claims": 0,
+    "finalization_claims": 0
+  },
   "observed_at": "2026-09-01T21:40:35.457Z",
   "since": "2026-09-01T20:40:35Z",
   "usage_day": "2026-09-01",
