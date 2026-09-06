@@ -54,6 +54,8 @@ pub(super) async fn test_real_pg_orphan_erasure_guards(
         sqlx::query(ddl).execute(&mut *tamper).await?;
         assert!(super::orphan_capture_erasure::require_runtime_schema(&mut tamper).await.is_err(),
             "the independent required catalog must reject structural/guard/collation loss");
+        assert!(super::orphan_capture_erasure::require_no_pending_erasures(&mut tamper).await.is_err(),
+            "compatible activation must also refuse partial or corrupt namespaces");
         tamper.rollback().await?;
     }
     let mut absent = persistence.pool().begin().await?;
@@ -69,8 +71,8 @@ pub(super) async fn test_real_pg_orphan_erasure_guards(
     assert!(
         super::orphan_capture_erasure::require_no_pending_erasures(&mut absent)
             .await
-            .is_err(),
-        "Active requires the explicit installed erasure contract, not only an empty lookup"
+            .is_ok(),
+        "compatible predecessor activation permits verified whole-namespace absence"
     );
     assert!(
         super::orphan_capture_erasure::require_capture_admission(

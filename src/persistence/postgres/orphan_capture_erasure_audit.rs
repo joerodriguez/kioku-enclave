@@ -34,6 +34,12 @@ impl OrphanErasureAudit {
         self.complete() && self.complete_fenced_operations == 0
     }
 
+    // Verified absence is not completion or restored capture. This is only an
+    // activation precondition for the compatible predecessor serving fleet.
+    pub(super) fn clear_for_activation(&self) -> bool {
+        self.valid() && (!self.schema_installed || self.complete())
+    }
+
     pub(super) fn valid(&self) -> bool {
         let counts = [
             self.pending_operations,
@@ -75,6 +81,7 @@ mod tests {
         let absent = OrphanErasureAudit::default();
         assert!(absent.valid() && absent.quiescent());
         assert!(!absent.complete() && !absent.unfenced());
+        assert!(absent.clear_for_activation());
         let mut audit = OrphanErasureAudit {
             schema_installed: true,
             ..absent

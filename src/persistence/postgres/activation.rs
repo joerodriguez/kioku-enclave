@@ -5525,7 +5525,7 @@ async fn test_signed_orphan_schema_install(
     persistence: &PostgresPersistence,
 ) -> Result<super::orphan_capture_erasure_authority::ErasureActivationBinding> {
     use super::orphan_capture_erasure_authority::{
-        test_verified_request, ErasureAction, ErasureActivationBinding, OrphanErasureRequest,
+        test_verified_request, ErasureAction, OrphanErasureRequest,
     };
     let mut transaction = persistence.pool().begin().await?;
     let (_, state) = verify_activation_and_base_release(&mut transaction).await?;
@@ -5536,14 +5536,6 @@ async fn test_signed_orphan_schema_install(
         .candidate_fleet_image_digest
         .clone()
         .expect("test candidate");
-    let binding = ErasureActivationBinding {
-        generation: state.generation,
-        phase: "draining".into(),
-        candidate_image_digest: candidate.clone(),
-        contract_sha256: sha256_label(&activation_contract_digest()),
-        catalog_sha256: sha256_label(&before_catalog),
-        receipt_sha256: sha256_label(state.receipt_sha256.as_deref().expect("test receipt")),
-    };
     sqlx::raw_sql(
         r#"
         DO $$
@@ -5596,13 +5588,18 @@ async fn test_signed_orphan_schema_install(
         },
     )
     .await?;
-    let refused = persistence
+    // Compatible migrator activation can retain the v24 serving fleet without
+    // installing an unrelated erasure namespace. This image still cannot serve.
+    persistence
         .transition_memory_reconciliation_activation(&active)
-        .await
-        .expect_err("an otherwise valid Active request needs the independent admission schema");
-    assert!(refused
-        .to_string()
-        .contains("orphan erasure admission contract is not installed"));
+        .await?;
+    assert!(
+        super::orphan_capture_erasure::require_runtime_schema(&mut admission_observer)
+            .await
+            .is_err()
+    );
+    test_erasure_activation_transition(persistence, "paused", false).await?;
+    let binding = test_erasure_activation_transition(persistence, "draining", false).await?;
     let now: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
             .fetch_one(persistence.pool())
@@ -5654,11 +5651,8 @@ async fn test_signed_orphan_schema_install(
     verify_activation_and_base_release(&mut connection).await?;
     super::orphan_capture_erasure::require_runtime_schema(&mut connection).await?;
     drop(connection);
-    // The identical Active authorization succeeds once the missing contract is
-    // installed, proving the refusal was not an unrelated invalid fixture.
-    persistence
-        .transition_memory_reconciliation_activation(&active)
-        .await?;
+    // Installed-schema activation remains independently valid as well.
+    test_erasure_activation_transition(persistence, "active", false).await?;
     test_erasure_activation_transition(persistence, "paused", false).await?;
     test_erasure_activation_transition(persistence, "draining", false).await
 }
