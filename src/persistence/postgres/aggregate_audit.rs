@@ -3,10 +3,11 @@ use sqlx::Row;
 
 use super::{
     orphan_capture_erasure_audit::{self, OrphanErasureAudit},
+    reconciliation_source_audit::{self, SourceGraphAudit},
     PostgresPersistence,
 };
 
-pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v5";
+pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v6";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateAuditFailure {
@@ -45,6 +46,7 @@ pub(crate) struct PostgresAggregateAuditReport {
     pub(crate) media: MediaAudit,
     pub(crate) formation: FormationAudit,
     pub(crate) source_isolation: SourceIsolationAudit,
+    pub(crate) source_graph: SourceGraphAudit,
     pub(crate) reconciliation: ReconciliationAudit,
     pub(crate) topology: TopologyAudit,
     pub(crate) vertex_usage: VertexUsageAudit,
@@ -215,33 +217,6 @@ impl SourceIsolationAudit {
             && self.inventory_rows <= 100_001
             && self.inventory_bounded == (self.inventory_rows <= 100_000)
             && (self.unsettled_sessions == 0) == (self.unsettled_accounts == 0)
-    }
-
-    fn formation_eligible(&self, formation: &FormationAudit, quiescent: bool) -> bool {
-        let held = self.isolated_historical_sessions;
-        self.inventory_bounded
-            && self.blocked_drafts == 0
-            && self.conflicting_components == 0
-            && (quiescent
-                || (held > 0
-                    && held <= 4
-                    && held == self.unsettled_sessions
-                    && held == formation.finished_dirty_receipts
-                    && held == formation.seal_pending_receipts
-                    && [
-                        formation.ended_without_finish_receipts,
-                        formation.nonterminal_pages_for_finished_receipts,
-                        formation.staged_response_pages,
-                        formation.legacy_processing_claims,
-                        formation.legacy_expired_claims,
-                        formation.legacy_retry_due_claims,
-                        formation.legacy_retry_future_claims,
-                        formation.retry_due_receipts,
-                        formation.retry_future_receipts,
-                        formation.expired_processing_receipts,
-                    ]
-                    .into_iter()
-                    .all(|count| count == 0)))
     }
 }
 
@@ -604,13 +579,14 @@ impl PostgresAggregateAuditReport {
 
     fn validate(&self, expected_since: &str) -> Result<(), AggregateAuditFailure> {
         if self.contract != POSTGRES_AGGREGATE_AUDIT_CONTRACT
-            || self.schema_version != 5
+            || self.schema_version != 6
             || !self.source_isolation.valid()
+            || !self.source_graph.valid()
+            || (self.source_graph.inventory_bounded
+                && self.source_graph.candidate_drafts != self.reconciliation.candidate_drafts)
             || self.source_isolation.unsettled_accounts != self.formation.unresolved_source_accounts
             || self.gates.formation_activation_eligible
-                != self
-                    .source_isolation
-                    .formation_eligible(&self.formation, self.gates.formation_quiescent)
+                != self.source_graph.formation_eligible(&self.formation)
             || !self.orphan_erasure.valid()
             || self.gates.orphan_erasures_quiescent != self.orphan_erasure.quiescent()
             || self.gates.orphan_erasures_complete != self.orphan_erasure.complete()
@@ -908,6 +884,9 @@ impl PostgresPersistence {
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(|_| AggregateAuditFailure::AuditFailed)?;
+        let source_graph = reconciliation_source_audit::snapshot(&mut transaction)
+            .await
+            .map_err(|_| AggregateAuditFailure::AuditFailed)?;
         let queried = sqlx::query(AGGREGATE_AUDIT_SQL)
             .bind(since)
             .bind(erasure_json)
@@ -916,6 +895,10 @@ impl PostgresPersistence {
             .bind(erasure.unfenced())
             .bind(isolation_json)
             .bind(erasure.clear_for_activation())
+            .bind(
+                serde_json::to_string(&source_graph)
+                    .map_err(|_| AggregateAuditFailure::AuditFailed)?,
+            )
             .fetch_all(&mut *transaction)
             .await;
         let rollback = transaction.rollback().await;
@@ -1008,6 +991,9 @@ async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
         .execute(&mut *tx)
         .await
         .unwrap();
+    let source_graph = reconciliation_source_audit::snapshot(&mut tx)
+        .await
+        .unwrap();
     let payload: String = sqlx::query_scalar(AGGREGATE_AUDIT_SQL)
         .bind(&since)
         .bind(serde_json::to_string(&erasure).unwrap())
@@ -1016,6 +1002,7 @@ async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
         .bind(erasure.unfenced())
         .bind(serde_json::to_string(&isolated).unwrap())
         .bind(erasure.clear_for_activation())
+        .bind(serde_json::to_string(&source_graph).unwrap())
         .fetch_one(&mut *tx)
         .await
         .unwrap();
@@ -1152,7 +1139,7 @@ async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
     let overflow = read(&mut tx).await;
     assert_eq!(overflow.inventory_rows, 100001);
     assert!(!overflow.inventory_bounded);
-    assert!(!overflow.formation_eligible(&report.formation, false));
+    assert!(!overflow.inventory_bounded);
     sqlx::query("ROLLBACK TO SAVEPOINT overflow")
         .execute(&mut *tx)
         .await
@@ -1281,7 +1268,7 @@ async fn test_real_pg_aggregate_audit_inner(
     .unwrap();
     let report = persistence.aggregate_audit(&since).await.unwrap();
     assert_eq!(report.contract, POSTGRES_AGGREGATE_AUDIT_CONTRACT);
-    assert_eq!(report.schema_version, 5);
+    assert_eq!(report.schema_version, 6);
     assert!(report.orphan_erasure.schema_installed);
     assert!(report.transaction_read_only);
     assert_eq!(report.capture_events.groups.len(), 12);
@@ -1779,7 +1766,10 @@ async fn test_real_pg_aggregate_audit_inner(
         );
         assert!(draining_formation_debt.gates.activation_ready_for_active);
         assert!(!draining_formation_debt.gates.formation_quiescent);
-        assert!(!draining_formation_debt.gates.ready_for_active);
+        assert!(draining_formation_debt.source_graph.inventory_bounded);
+        assert_eq!(draining_formation_debt.source_graph.candidate_components, 0);
+        assert!(draining_formation_debt.gates.ready_for_active,
+            "v6 may activate the source-closed runtime without claiming unrelated unfinished sessions completed");
         sqlx::query(
             "DELETE FROM capture_sessions \
               WHERE account_id='aggregate-audit-gate-contract' \
@@ -2733,7 +2723,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_requires_exact_erasure_counts_without_fencing_prelaunch_active() {
+    fn v6_requires_exact_erasure_counts_without_fencing_prelaunch_active() {
         let report: PostgresAggregateAuditReport =
             serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
         let mut fenced = report.clone();
@@ -2807,6 +2797,50 @@ mod tests {
                 "audit_failed",
             ]
         );
+    }
+
+    #[test]
+    fn source_graph_qualification_is_bounded_and_recomputed() {
+        let baseline: PostgresAggregateAuditReport =
+            serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
+        let graph = &baseline.source_graph;
+        assert!(graph.formation_eligible(&baseline.formation));
+        let mutations: [fn(&mut SourceGraphAudit); 8] = [
+            |g| g.inventory_rows = -1,
+            |g| g.inventory_bounded = false,
+            |g| g.sweep_component_limit = 9,
+            |g| g.candidate_components = 1,
+            |g| g.blocked_components = 1,
+            |g| g.oversized_components = 1,
+            |g| {
+                g.inventory_rows = 100001;
+                g.inventory_bounded = false;
+            },
+            |g| {
+                g.inventory_rows = 9;
+                g.candidate_drafts = 9;
+                g.candidate_components = 9;
+                g.max_components_per_account = 9;
+            },
+        ];
+        for mutate in mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed.source_graph);
+            assert!(!changed.source_graph.formation_eligible(&changed.formation));
+            assert!(
+                changed.validate(&changed.since).is_err(),
+                "forged eligible gate must not survive recomputation"
+            );
+        }
+        let mut within = graph.clone();
+        within.inventory_rows = 8;
+        within.candidate_drafts = 8;
+        within.candidate_components = 8;
+        within.max_components_per_account = 8;
+        assert!(within.formation_eligible(&baseline.formation));
+        let mut busy = baseline.formation.clone();
+        busy.staged_response_pages = 1;
+        assert!(!within.formation_eligible(&busy));
     }
 
     #[test]

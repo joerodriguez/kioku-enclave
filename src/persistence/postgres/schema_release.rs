@@ -561,6 +561,8 @@ pub(crate) struct VerifiedSchemaFinalizationReceipt {
 pub(crate) struct MemoryReconciliationActivationReceipt {
     pub(crate) contract: String,
     pub(crate) contract_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) epoch_upgrade: Option<ActivationEpochUpgrade>,
     pub(crate) generation: i64,
     pub(crate) previous_phase: String,
     pub(crate) requested_phase: String,
@@ -589,6 +591,17 @@ pub(crate) struct MemoryReconciliationActivationReceipt {
     pub(crate) web_client_ready: bool,
     pub(crate) macos_client_ready: bool,
     pub(crate) ios_client_ready: bool,
+}
+
+/// A one-time append-only upgrade of the original dormant generation. The
+/// ordinary v1 canonical bytes remain unchanged when this field is absent.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActivationEpochUpgrade {
+    pub(crate) prior_receipt_sha256: String,
+    pub(crate) prior_contract_sha256: String,
+    pub(crate) prior_catalog_sha256: String,
+    pub(crate) prior_candidate_fleet_image_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -885,23 +898,47 @@ fn validate_activation_receipt_shape(
         receipt.previous_phase.as_str(),
         receipt.requested_phase.as_str(),
     );
+    let upgrading = receipt.contract_version == 2
+        && transition == ("draining", "draining")
+        && receipt.generation == 2
+        && receipt.epoch_upgrade.is_some();
     if receipt.contract != "kioku.postgresql.memory-reconciliation-activation"
-        || receipt.contract_version != 1
+        || !matches!(receipt.contract_version, 1 | 2)
+        || receipt.epoch_upgrade.is_some() != upgrading
         || receipt.generation <= 0
         || receipt.base_schema_version != EXPECTED_SCHEMA_VERSION
         || receipt.target_schema_version != MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION
-        || !matches!(
-            transition,
-            ("installed", "draining")
-                | ("draining", "active")
-                | ("active", "paused")
-                | ("paused", "draining")
-                | ("paused", "active")
-        )
+        || !(upgrading
+            || matches!(
+                transition,
+                ("installed", "draining")
+                    | ("draining", "active")
+                    | ("active", "paused")
+                    | ("paused", "draining")
+                    | ("paused", "active")
+            ))
     {
         return Err(EnclaveError::Config(
             "memory reconciliation activation receipt has an invalid contract or transition".into(),
         ));
+    }
+    if let Some(epoch) = &receipt.epoch_upgrade {
+        if [
+            &epoch.prior_receipt_sha256,
+            &epoch.prior_contract_sha256,
+            &epoch.prior_catalog_sha256,
+            &epoch.prior_candidate_fleet_image_digest,
+        ]
+        .into_iter()
+        .any(|digest| !is_sha256_label(digest))
+            || epoch.prior_candidate_fleet_image_digest == receipt.candidate_fleet_image_digest
+            || epoch.prior_contract_sha256 == receipt.activation_contract_sha256
+            || epoch.prior_catalog_sha256 == receipt.activation_catalog_sha256
+        {
+            return Err(EnclaveError::Config(
+                "activation epoch predecessor binding is invalid".into(),
+            ));
+        }
     }
     for digest in [
         &receipt.activation_contract_sha256,
@@ -2734,6 +2771,7 @@ mod tests {
         MemoryReconciliationActivationReceipt {
             contract: "kioku.postgresql.memory-reconciliation-activation".into(),
             contract_version: 1,
+            epoch_upgrade: None,
             generation: 1,
             previous_phase: previous_phase.into(),
             requested_phase: requested_phase.into(),
@@ -2760,6 +2798,81 @@ mod tests {
             macos_client_ready: true,
             ios_client_ready: true,
         }
+    }
+
+    #[test]
+    fn epoch_capable_migrator_rejects_signed_legacy_active_and_preserves_repair() {
+        use crate::{
+            postgres_memory_reconciliation_transition_authorized as admits,
+            PostgresMigrationReleasePhase as Phase,
+        };
+        let mut legacy = activation_receipt("draining", "active");
+        legacy.generation = 2;
+        let signed_legacy = test_verify_activation_receipt(legacy.clone()).unwrap();
+        assert!(!admits(
+            signed_legacy.receipt(),
+            Phase::ActivateMemoryReconciliation
+        ));
+        let raw = String::from_utf8(signed_legacy.canonical_bytes().to_vec()).unwrap();
+        assert!(crate::postgres_memory_reconciliation_activation_receipt(
+            Some(&raw),
+            None,
+            Phase::ActivateMemoryReconciliation
+        )
+        .unwrap_err()
+        .contains("does not authorize"));
+        let mut current = legacy;
+        current.contract_version = 2;
+        current.generation = 3;
+        let signed_current = test_verify_activation_receipt(current.clone()).unwrap();
+        assert!(admits(
+            signed_current.receipt(),
+            Phase::ActivateMemoryReconciliation
+        ));
+        let mut resume = current.clone();
+        resume.previous_phase = "paused".into();
+        resume.generation = 5;
+        let signed_resume = test_verify_activation_receipt(resume.clone()).unwrap();
+        assert!(admits(
+            signed_resume.receipt(),
+            Phase::ResumeMemoryReconciliation
+        ));
+        resume.contract_version = 1;
+        let legacy_resume = test_verify_activation_receipt(resume).unwrap();
+        assert!(!admits(
+            legacy_resume.receipt(),
+            Phase::ResumeMemoryReconciliation
+        ));
+        current.generation = 2;
+        current.requested_phase = "draining".into();
+        current.epoch_upgrade = Some(ActivationEpochUpgrade {
+            prior_receipt_sha256: format!("sha256:{}", "a".repeat(64)),
+            prior_contract_sha256: format!("sha256:{}", "b".repeat(64)),
+            prior_catalog_sha256: format!("sha256:{}", "c".repeat(64)),
+            prior_candidate_fleet_image_digest: format!("sha256:{}", "d".repeat(64)),
+        });
+        let signed_epoch = test_verify_activation_receipt(current.clone()).unwrap();
+        assert!(admits(
+            signed_epoch.receipt(),
+            Phase::UpgradeMemoryReconciliationEpoch
+        ));
+        assert!(admits(
+            signed_epoch.receipt(),
+            Phase::RepairMemoryReconciliationDrainingScope
+        ));
+        assert!(!admits(
+            signed_epoch.receipt(),
+            Phase::DrainMemoryReconciliationActivation
+        ));
+        assert!(!admits(
+            signed_epoch.receipt(),
+            Phase::ActivateMemoryReconciliation
+        ));
+        current.generation = 3;
+        assert!(!admits(
+            &current,
+            Phase::RepairMemoryReconciliationDrainingScope
+        ));
     }
 
     #[test]

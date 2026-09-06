@@ -1,6 +1,16 @@
 {
-  "contract": "kioku.postdeploy.aggregate-audit.v5",
-  "schema_version": 5,
+  "contract": "kioku.postdeploy.aggregate-audit.v6",
+  "schema_version": 6,
+  "source_graph": {
+    "inventory_rows": 0,
+    "inventory_bounded": true,
+    "candidate_drafts": 0,
+    "candidate_components": 0,
+    "max_components_per_account": 0,
+    "blocked_components": 0,
+    "oversized_components": 0,
+    "sweep_component_limit": 8
+  },
   "source_isolation": {
     "unsettled_sessions": 0,
     "unsettled_accounts": 0,
