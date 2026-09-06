@@ -1773,8 +1773,12 @@ async fn upload_capture_event(
             .captures()
             .reserve_media_upload(
                 &user_id,
-                &manifest.event_id,
-                &media.asset_id,
+                crate::persistence::CaptureUploadIdentity {
+                    capture_session_id: &manifest.capture_session_id,
+                    stream_id: &manifest.stream_id,
+                    event_id: &manifest.event_id,
+                    asset_id: &media.asset_id,
+                },
                 &write.object_key,
                 &digest,
             )

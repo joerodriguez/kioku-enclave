@@ -1283,6 +1283,9 @@ gate_results AS MATERIALIZED (
            reconciliation_quiescent,finalization_claims_quiescent,
            activation_ready_for_drain,activation_ready_for_active,
            capacity_sufficient,
+           $3::boolean AS orphan_erasures_quiescent,
+           $4::boolean AS orphan_erasures_complete,
+           $5::boolean AS capture_admission_unfenced,
            -- Historical finish import and the first immutable capture seal are
            -- deliberately forbidden until signed Draining proves the predecessor
            -- fleet is gone. Keep their independently reported formation gate for
@@ -1291,22 +1294,23 @@ gate_results AS MATERIALIZED (
            domain_clean AND quota_invariants_hold AND provider_quiescent
              AND media_budget_drained AND leases_unexpired
              AND reconciliation_quiescent AND finalization_claims_quiescent
-             AND activation_ready_for_drain AND capacity_sufficient AS ready_for_drain,
+             AND activation_ready_for_drain AND capacity_sufficient AND $3::boolean AS ready_for_drain,
            domain_clean AND quota_invariants_hold AND provider_quiescent
              AND media_budget_drained AND leases_unexpired AND formation_quiescent
              AND reconciliation_quiescent AND finalization_claims_quiescent
-             AND activation_ready_for_active AND capacity_sufficient AS ready_for_active
+             AND activation_ready_for_active AND capacity_sufficient AND $3::boolean AND $4::boolean AS ready_for_active
       FROM gate_facts
 )
 SELECT jsonb_build_object(
-    'contract','kioku.postdeploy.aggregate-audit.v3',
-    'schema_version',3,
+    'contract','kioku.postdeploy.aggregate-audit.v4',
+    'schema_version',4,
     'observed_at',to_char(audit_window.observed_at AT TIME ZONE 'UTC',
                           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'since',audit_window.raw_since,
     'usage_day',to_char(audit_window.since_at AT TIME ZONE 'UTC','YYYY-MM-DD'),
     'transaction_read_only',audit_window.transaction_read_only,
     'provider_activity',(SELECT to_jsonb(provider) FROM provider_activity_facts provider),
+    'orphan_erasure',$2::jsonb,
     'activation',to_jsonb(activation),
     'capture_events',to_jsonb(capture),
     'media',to_jsonb(media),

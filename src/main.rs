@@ -1433,9 +1433,13 @@ const POSTGRES_FINALIZATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION
 const POSTGRES_FINALIZATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_SIGNATURE";
 const POSTGRES_ACTIVATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_RECEIPT";
 const POSTGRES_ACTIVATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_SIGNATURE";
+const ORPHAN_CAPTURE_ERASURE_CONFIRM: &str = "orphan-capture-erasure-v1";
+const POSTGRES_ERASURE_REQUEST_ENV: &str = "POSTGRES_MIGRATION_ERASURE_REQUEST";
+const POSTGRES_ERASURE_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ERASURE_SIGNATURE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
+    OrphanCaptureErasure,
     ExpandMemoryReconciliation,
     FinalizeMemoryReconciliation,
     InstallMemoryReconciliationActivation,
@@ -1464,6 +1468,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some(ORPHAN_CAPTURE_ERASURE_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::OrphanCaptureErasure)
+        }
         Some(MEMORY_RECONCILIATION_EXPAND_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::ExpandMemoryReconciliation)
         }
@@ -1623,6 +1630,18 @@ async fn migrate_postgres_release_schema() {
     } else {
         None
     };
+    let erasure_request = if phase == PostgresMigrationReleasePhase::OrphanCaptureErasure {
+        let raw_request = std::env::var(POSTGRES_ERASURE_REQUEST_ENV)
+            .unwrap_or_else(|_| panic!("strict signed erasure request is required"));
+        let raw_signature = std::env::var(POSTGRES_ERASURE_SIGNATURE_ENV)
+            .unwrap_or_else(|_| panic!("detached erasure request signature is required"));
+        Some(
+            persistence::verify_orphan_erasure_request(&raw_request, &raw_signature)
+                .unwrap_or_else(|_| panic!("strict signed erasure request is invalid")),
+        )
+    } else {
+        None
+    };
     let database_url = std::env::var("POSTGRES_DATABASE_URL")
         .expect("POSTGRES_DATABASE_URL is required by --migrate-postgres");
     let root_ca_pem = std::env::var("POSTGRES_ROOT_CA_PEM")
@@ -1638,6 +1657,14 @@ async fn migrate_postgres_release_schema() {
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
     let result = match phase {
+        PostgresMigrationReleasePhase::OrphanCaptureErasure => persistence
+            .execute_orphan_capture_erasure(
+                erasure_request
+                    .as_ref()
+                    .expect("erasure authority verified before database connection"),
+            )
+            .await
+            .map(|result| serde_json::to_value(result).expect("erasure result must serialize")),
         PostgresMigrationReleasePhase::ExpandMemoryReconciliation => persistence
             .expand_memory_reconciliation_release_schema()
             .await
@@ -1695,7 +1722,7 @@ mod postgres_migration_release_tests {
         MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
         MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
         MEMORY_RECONCILIATION_FINALIZE_CONFIRM, MEMORY_RECONCILIATION_PAUSE_CONFIRM,
-        MEMORY_RECONCILIATION_RESUME_CONFIRM,
+        MEMORY_RECONCILIATION_RESUME_CONFIRM, ORPHAN_CAPTURE_ERASURE_CONFIRM,
     };
 
     #[test]
@@ -1709,6 +1736,10 @@ mod postgres_migration_release_tests {
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
         for (confirmation, expected) in [
+            (
+                ORPHAN_CAPTURE_ERASURE_CONFIRM,
+                PostgresMigrationReleasePhase::OrphanCaptureErasure,
+            ),
             (
                 MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
                 PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation,
@@ -1748,6 +1779,8 @@ mod postgres_migration_release_tests {
             Some(""),
             Some("empty-production-adr0040"),
             Some("memory-reconciliation-v26"),
+            Some("orphan-capture-erasure-v1 "),
+            Some("orphan-capture-erasure"),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }
@@ -1774,6 +1807,12 @@ mod postgres_migration_release_tests {
             Some("{}"),
             Some("not-base64"),
             PostgresMigrationReleasePhase::InstallMemoryReconciliationActivation,
+        )
+        .is_err());
+        assert!(postgres_memory_reconciliation_activation_receipt(
+            Some("{}"),
+            Some("not-base64"),
+            PostgresMigrationReleasePhase::OrphanCaptureErasure,
         )
         .is_err());
     }

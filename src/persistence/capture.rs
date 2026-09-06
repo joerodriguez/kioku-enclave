@@ -5,6 +5,15 @@ use crate::{
     error::Result,
 };
 
+/// All identities needed to refuse an erased source before any provider PUT.
+#[derive(Clone, Copy)]
+pub(crate) struct CaptureUploadIdentity<'a> {
+    pub(crate) capture_session_id: &'a str,
+    pub(crate) stream_id: &'a str,
+    pub(crate) event_id: &'a str,
+    pub(crate) asset_id: &'a str,
+}
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct CaptureEventStatus {
     pub(crate) event_id: String,
@@ -125,12 +134,12 @@ pub(crate) trait CaptureRepository: Send + Sync {
     ) -> Result<CapturePreflight>;
 
     /// Reserve the right to publish one canonical GCS object while the
-    /// account is active. PostgreSQL returns a durable admission token.
+    /// account is active and the complete source identity is not erased.
+    /// PostgreSQL rechecks under the account lock before returning a token.
     async fn reserve_media_upload(
         &self,
         account_id: &str,
-        event_id: &str,
-        asset_id: &str,
+        identity: CaptureUploadIdentity<'_>,
         object_key: &str,
         manifest_digest: &str,
     ) -> Result<Option<String>>;

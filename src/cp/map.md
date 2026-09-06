@@ -25,7 +25,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `isotime.rs` | RFC 3339 UTC parsing, formatting, and arithmetic. |
 | `limits.rs` | Volatile request rate limiting plus PostgreSQL fleet admission, quota, concurrency, and Vertex reservation use. |
 | `mcp_safety.rs` | MCP query/projection boundary, pagination limits, restricted-data refusal, URL minimization, and recursive response redaction. |
-| `media.rs` | Cloud Capture ingestion, reference batching, exact live-media admission, encryption, and transactional receipt/session settlement. |
+| `media.rs` | Cloud Capture ingestion, reference batching, exact live-media admission with session-aware upload identity, encryption, and transactional receipt/session settlement. |
 | `media_planner.rs` | Deterministic bounded audio/screen processing work-unit planning. |
 | `media_worker.rs` | PostgreSQL-claimed media processing, KMS/GCS/Vertex work, result projection, voice work, bounded retry/resurrection, and retention cleanup. |
 | `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, coverage reconciliation, and final pre-fence account-deletion settlement that conservatively closes any deletion-owned `started` intent and classifies an idempotent already-active fence. |

@@ -14,7 +14,7 @@ use crate::{
     persistence::{
         CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight,
         CaptureRepository, CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing,
-        CaptureSessionStage, CaptureSessionStatus, ReferenceBatchCommit,
+        CaptureSessionStage, CaptureSessionStatus, CaptureUploadIdentity, ReferenceBatchCommit,
         ReferenceBatchCommitResult,
     },
 };
@@ -326,6 +326,32 @@ async fn preflight(
     manifest_digest: &str,
     allowed_object_keys: Option<&[String]>,
 ) -> Result<CapturePreflight> {
+    let asset_id = manifest
+        .media
+        .as_ref()
+        .map(|media| media.asset_id.as_str())
+        .or_else(|| {
+            manifest
+                .reference
+                .as_ref()
+                .map(|reference| reference.canonical_asset_id.as_str())
+        })
+        .unwrap_or("");
+    super::orphan_capture_erasure::require_capture_admission(
+        connection,
+        account_id,
+        CaptureUploadIdentity {
+            capture_session_id: &manifest.capture_session_id,
+            stream_id: &manifest.stream_id,
+            event_id: &manifest.event_id,
+            asset_id,
+        },
+        manifest
+            .reference
+            .as_ref()
+            .map(|reference| reference.canonical_event_id.as_str()),
+    )
+    .await?;
     let row = sqlx::query(
         "SELECT e.manifest_digest,m.object_key,e.stream_id,e.media_disposition \
            FROM capture_events e LEFT JOIN media_objects m \
@@ -1630,14 +1656,23 @@ impl CaptureRepository for PostgresPersistence {
     async fn reserve_media_upload(
         &self,
         account_id: &str,
-        event_id: &str,
-        asset_id: &str,
+        identity: CaptureUploadIdentity<'_>,
         object_key: &str,
         manifest_digest: &str,
     ) -> Result<Option<String>> {
-        if event_id.is_empty()
+        let CaptureUploadIdentity {
+            capture_session_id,
+            stream_id,
+            event_id,
+            asset_id,
+        } = identity;
+        if capture_session_id.is_empty()
+            || stream_id.is_empty()
+            || event_id.is_empty()
             || asset_id.is_empty()
-            || object_key.is_empty()
+            || (object_key != crate::gcs::canonical_capture_media_object_key(account_id, asset_id)?
+                && object_key
+                    != crate::gcs::canonical_recording_media_object_key(account_id, asset_id)?)
             || manifest_digest.len() != 64
             || !manifest_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -1648,6 +1683,13 @@ impl CaptureRepository for PostgresPersistence {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "capture-upload", event_id).await?;
         require_active_account(&mut transaction, account_id).await?;
+        super::orphan_capture_erasure::require_capture_admission(
+            &mut transaction,
+            account_id,
+            identity,
+            None,
+        )
+        .await?;
         let candidate = format!("upl_{}", crate::cp::tokens::random_token_hex());
         let token = sqlx::query_scalar::<_, String>(
             "INSERT INTO capture_upload_intents \

@@ -25,7 +25,7 @@ use super::{
 use crate::cp::isotime;
 
 const FEATURE: &str = "episode_topology_reconciliation";
-const RELEASE_LOCK: &str = "kioku:postgres-memory-reconciliation-activation:v27";
+pub(super) const RELEASE_LOCK: &str = "kioku:postgres-memory-reconciliation-activation:v27";
 const INSTALL_SQL: &str =
     include_str!("../../../migrations/0027_memory_reconciliation_activation.sql");
 const FORMATION_BACKFILL_NAME: &str = "capture_formation_receipts";
@@ -702,12 +702,9 @@ async fn catalog_digest(connection: &mut PgConnection) -> Result<Vec<u8>> {
     Ok(Sha256::digest(evidence.as_bytes()).to_vec())
 }
 
-async fn activation_contract_exists(connection: &mut PgConnection) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT to_regclass('persistence_feature_activation_contracts') IS NOT NULL",
-    )
-    .fetch_one(connection)
-    .await?)
+pub(super) async fn activation_contract_exists(connection: &mut PgConnection) -> Result<bool> {
+    super::current_schema_relation_exists(connection, "persistence_feature_activation_contracts")
+        .await
 }
 
 async fn schema_marker(connection: &mut PgConnection) -> Result<(i64, Option<i64>)> {
@@ -1246,6 +1243,27 @@ pub(super) async fn verify_serving_activation_schema(
     verified_status(connection).await
 }
 
+pub(super) async fn verify_erasure_activation_binding(
+    connection: &mut PgConnection,
+    binding: &super::orphan_capture_erasure_authority::ErasureActivationBinding,
+) -> Result<()> {
+    let (_, state) = verify_activation_and_base_release(connection).await?;
+    if state.generation != binding.generation
+        || state.phase.as_str() != binding.phase
+        || state.candidate_fleet_image_digest.as_deref()
+            != Some(binding.candidate_image_digest.as_str())
+        || sha256_label(&activation_contract_digest()) != binding.contract_sha256
+        || sha256_label(&catalog_digest(connection).await?) != binding.catalog_sha256
+        || state.receipt_sha256.as_deref().map(sha256_label).as_deref()
+            != Some(binding.receipt_sha256.as_str())
+    {
+        return Err(EnclaveError::Conflict(
+            "erasure request does not bind current signed activation authority".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Serialize a v27-capable source writer with signed activation transitions.
 /// Absence is an intentional no-op during the binary-first dark rollout.
 pub(super) async fn lock_activation_contract_key_share_if_installed(
@@ -1260,12 +1278,7 @@ pub(super) async fn lock_activation_contract_key_share_if_installed(
         .bind(RELEASE_LOCK)
         .execute(&mut **transaction)
         .await?;
-    if !sqlx::query_scalar::<_, bool>(
-        "SELECT to_regclass('persistence_feature_activation_contracts') IS NOT NULL",
-    )
-    .fetch_one(&mut **transaction)
-    .await?
-    {
+    if !activation_contract_exists(transaction).await? {
         return Ok(false);
     }
     sqlx::query(
@@ -2376,6 +2389,9 @@ impl PostgresPersistence {
         let (base, current) = verify_activation_and_base_release(&mut transaction).await?;
         let signed = authorization.receipt();
         let requested = phase(&signed.requested_phase)?;
+        if requested == MemoryReconciliationActivationPhase::Active {
+            super::orphan_capture_erasure::require_no_pending_erasures(&mut transaction).await?;
+        }
         let expected_contract = activation_contract_digest();
         let expected_catalog = catalog_digest(&mut transaction).await?;
         if signed.generation != current.generation + 1
@@ -2720,6 +2736,55 @@ async fn test_advance_activation_until_complete(
     Err(EnclaveError::Store(
         "test activation backfill did not converge within its bounded budget".into(),
     ))
+}
+
+#[cfg(test)]
+pub(super) async fn test_erasure_activation_transition(
+    persistence: &PostgresPersistence,
+    requested: &str,
+    rotate: bool,
+) -> Result<super::orphan_capture_erasure_authority::ErasureActivationBinding> {
+    let mut connection = persistence.pool().acquire().await?;
+    let (_, current) = verify_activation_and_base_release(&mut connection).await?;
+    drop(connection);
+    let candidate = if rotate {
+        sha256_label(&[0x42; 32])
+    } else {
+        current
+            .candidate_fleet_image_digest
+            .clone()
+            .expect("test candidate")
+    };
+    let authorization = test_transition_authorization_with_candidate_digest(
+        persistence,
+        current.generation + 1,
+        current.phase.as_str(),
+        requested,
+        current.rollout_basis_points,
+        current.explicit_canary_account_ids,
+        TestFleetEvidence {
+            outage_pause: false,
+            candidate_fleet_image_digest: &candidate,
+        },
+    )
+    .await?;
+    persistence
+        .transition_memory_reconciliation_activation(&authorization)
+        .await?;
+    if requested == "draining" {
+        test_advance_activation_until_complete(persistence, true).await?;
+    }
+    let signed = authorization.receipt();
+    Ok(
+        super::orphan_capture_erasure_authority::ErasureActivationBinding {
+            generation: signed.generation,
+            phase: signed.requested_phase.clone(),
+            candidate_image_digest: candidate,
+            contract_sha256: signed.activation_contract_sha256.clone(),
+            catalog_sha256: signed.activation_catalog_sha256.clone(),
+            receipt_sha256: sha256_label(&Sha256::digest(authorization.canonical_bytes())),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3498,6 +3563,8 @@ async fn wait_for_exclusive_release_lock(persistence: &PostgresPersistence) -> R
 async fn test_real_pg_v27_install_refuses_pending_deletion(
     persistence: &PostgresPersistence,
 ) -> Result<()> {
+    use sqlx::Acquire as _;
+
     const ACCOUNT: &str = "activation-install-pending-deletion";
     for (description, setup, cleanup) in [
         (
@@ -3562,7 +3629,15 @@ async fn test_real_pg_v27_install_refuses_pending_deletion(
     // Writer-first: the v17/schema-26 writer takes the shared release lock
     // before it observes the activation table as absent. The installer must
     // wait through that writer's legacy-safe DML, then see and refuse it.
-    let mut legacy_writer = persistence.pool().begin().await?;
+    // Keep one connection across absence and installation so SQLx's prepared
+    // statement cache is always exercised, independent of pool scheduling.
+    let mut writer_connection = persistence.pool().acquire().await?;
+    for _ in 0..6 {
+        let mut before_install = writer_connection.begin().await?;
+        assert!(!lock_activation_contract_key_share_if_installed(&mut before_install).await?);
+        before_install.commit().await?;
+    }
+    let mut legacy_writer = writer_connection.begin().await?;
     assert!(!lock_activation_contract_key_share_if_installed(&mut legacy_writer).await?);
     let install_persistence = persistence.clone();
     let mut install_task = tokio::spawn(async move {
@@ -3688,9 +3763,8 @@ async fn test_real_pg_v27_install_refuses_pending_deletion(
             .is_err(),
         "installer must remain behind the conflicting table lock"
     );
-    let writer_persistence = persistence.clone();
     let mut exact_writer = tokio::spawn(async move {
-        let mut transaction = writer_persistence.pool().begin().await?;
+        let mut transaction = writer_connection.begin().await?;
         if !lock_activation_contract_key_share_if_installed(&mut transaction).await? {
             return Err(EnclaveError::Store(
                 "writer resumed without the installed activation contract".into(),
@@ -5430,7 +5504,163 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         &global_active,
     ))
     .await?;
+    let binding = Box::pin(test_signed_orphan_schema_install(persistence)).await?;
+    Box::pin(super::orphan_capture_erasure_tests::test_real_pg_orphan_erasure_guards(persistence))
+        .await?;
+    Box::pin(
+        super::orphan_capture_erasure_operator_tests::test_signed_orphan_operator(
+            persistence,
+            binding,
+        ),
+    )
+    .await?;
     Ok(())
+}
+
+/// Recreate the production-shaped v27 Draining / erasure-absent boundary in
+/// this disposable schema. Only an empty test namespace is removed; the signed
+/// controller must perform the actual first installation and preserve v27.
+#[cfg(test)]
+async fn test_signed_orphan_schema_install(
+    persistence: &PostgresPersistence,
+) -> Result<super::orphan_capture_erasure_authority::ErasureActivationBinding> {
+    use super::orphan_capture_erasure_authority::{
+        test_verified_request, ErasureAction, ErasureActivationBinding, OrphanErasureRequest,
+    };
+    let mut transaction = persistence.pool().begin().await?;
+    let (_, state) = verify_activation_and_base_release(&mut transaction).await?;
+    assert_eq!(state.phase, MemoryReconciliationActivationPhase::Draining);
+    let before_catalog = catalog_digest(&mut transaction).await?;
+    let before_marker = schema_marker(&mut transaction).await?;
+    let candidate = state
+        .candidate_fleet_image_digest
+        .clone()
+        .expect("test candidate");
+    let binding = ErasureActivationBinding {
+        generation: state.generation,
+        phase: "draining".into(),
+        candidate_image_digest: candidate.clone(),
+        contract_sha256: sha256_label(&activation_contract_digest()),
+        catalog_sha256: sha256_label(&before_catalog),
+        receipt_sha256: sha256_label(state.receipt_sha256.as_deref().expect("test receipt")),
+    };
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE routine record;
+        BEGIN
+            IF current_schema() NOT LIKE 'kioku_activation_%'
+               OR EXISTS(SELECT 1 FROM orphan_capture_erasure_operations) THEN
+                RAISE EXCEPTION 'only an empty isolated test erasure namespace can be removed';
+            END IF;
+            DROP TABLE orphan_capture_erasure_objects, orphan_capture_erasure_events,
+                       orphan_capture_erasure_streams, orphan_capture_erasure_sessions,
+                       orphan_capture_erasure_operations, orphan_capture_erasure_contract CASCADE;
+            FOR routine IN
+                SELECT p.proname,oidvectortypes(p.proargtypes) arguments
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                 WHERE n.nspname=current_schema()
+                   AND p.proname LIKE 'orphan\_capture\_erasure\_%' ESCAPE '\'
+            LOOP
+                EXECUTE format('DROP FUNCTION %I.%I(%s) CASCADE',
+                               current_schema(),routine.proname,routine.arguments);
+            END LOOP;
+        END $$;
+    "#,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    assert!(!super::orphan_capture_erasure::verify_schema_if_installed(&mut transaction).await?);
+    assert_eq!(catalog_digest(&mut transaction).await?, before_catalog);
+    assert_eq!(schema_marker(&mut transaction).await?, before_marker);
+    verify_activation_and_base_release(&mut transaction).await?;
+    transaction.commit().await?;
+
+    // Keep a prepared absence probe on a distinct connection across the actual
+    // signed install; a pooled connection may not keep treating it as absent.
+    let mut admission_observer = persistence.pool().acquire().await?;
+    assert!(
+        !super::orphan_capture_erasure::verify_schema_if_installed(&mut admission_observer).await?
+    );
+
+    let active = test_transition_authorization_with_candidate_digest(
+        persistence,
+        state.generation + 1,
+        "draining",
+        "active",
+        state.rollout_basis_points,
+        state.explicit_canary_account_ids,
+        TestFleetEvidence {
+            outage_pause: false,
+            candidate_fleet_image_digest: &candidate,
+        },
+    )
+    .await?;
+    let refused = persistence
+        .transition_memory_reconciliation_activation(&active)
+        .await
+        .expect_err("an otherwise valid Active request needs the independent admission schema");
+    assert!(refused
+        .to_string()
+        .contains("orphan erasure admission contract is not installed"));
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(persistence.pool())
+            .await?;
+    let install = test_verified_request(OrphanErasureRequest {
+        contract: "kioku.postgresql.orphan-capture-erasure.v1".into(),
+        erasure_contract_sha256: sha256_label(&super::orphan_capture_erasure::contract_digest()),
+        account_id: "schema".into(),
+        operation_id: "install".into(),
+        activation: binding,
+        observed_at: isotime::format_epoch_millis(now - 1000),
+        expires_at: isotime::format_epoch_millis(now + 14 * 60 * 1000),
+        action: ErasureAction::InstallSchema,
+    })?;
+    assert_eq!(
+        persistence
+            .execute_orphan_capture_erasure_inner(&install)
+            .await?
+            .state,
+        "installed"
+    );
+    assert!(
+        super::orphan_capture_erasure::verify_schema_if_installed(&mut admission_observer).await?
+    );
+    super::orphan_capture_erasure::require_runtime_schema(&mut admission_observer).await?;
+    drop(admission_observer);
+    let installed_at: String =
+        sqlx::query_scalar("SELECT installed_at::text FROM orphan_capture_erasure_contract")
+            .fetch_one(persistence.pool())
+            .await?;
+    assert_eq!(
+        persistence
+            .execute_orphan_capture_erasure_inner(&install)
+            .await?
+            .state,
+        "already_installed"
+    );
+    let mut connection = persistence.pool().acquire().await?;
+    assert_eq!(catalog_digest(&mut connection).await?, before_catalog);
+    assert_eq!(schema_marker(&mut connection).await?, before_marker);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT installed_at::text FROM orphan_capture_erasure_contract"
+        )
+        .fetch_one(&mut *connection)
+        .await?,
+        installed_at
+    );
+    verify_activation_and_base_release(&mut connection).await?;
+    super::orphan_capture_erasure::require_runtime_schema(&mut connection).await?;
+    drop(connection);
+    // The identical Active authorization succeeds once the missing contract is
+    // installed, proving the refusal was not an unrelated invalid fixture.
+    persistence
+        .transition_memory_reconciliation_activation(&active)
+        .await?;
+    test_erasure_activation_transition(persistence, "paused", false).await?;
+    test_erasure_activation_transition(persistence, "draining", false).await
 }
 
 /// Executes v27 against an isolated real-PostgreSQL schema so the frozen v26

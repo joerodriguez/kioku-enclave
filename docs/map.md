@@ -7,3 +7,4 @@ remain stable across the enclave, client applications, and the external billing 
 |---|---|
 | [adr/](adr/map.md) | Proposed and accepted architecture decisions and their operational consequences |
 | [postgresql-schema-releases.md](postgresql-schema-releases.md) | Receipt-bound PostgreSQL expand/finalize ordering, compatibility window, and writer-activation boundary |
+| [orphan-capture-erasure.md](orphan-capture-erasure.md) | Bounded owner-authorized orphan-capture erasure, durable media inventory/replay barriers, and compatibility/verification requirements; source implemented and under review, provider/operator delivery and production enablement pending |
