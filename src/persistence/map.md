@@ -10,7 +10,7 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `mod.rs` | Port exports and `RepositorySet`, which composes PostgreSQL repositories—including the durable reconciliation-activation authority—with the live encrypted-media object port. |
 | `admission.rs` | Fleet token-bucket and crash-recoverable concurrency-lease contract. |
 | `billing.rs` | Billing pseudonym, recording authorization/credit, coverage, retained-account metrics, and detach-outbox contract. |
-| `capture.rs` | Atomic capture/reference preflight, commit, replay, deletion-tombstone no-resurrection, session, and event-status contract. |
+| `capture.rs` | Atomic capture/reference preflight, commit, replay, deletion-tombstone no-resurrection, session, and event-status contract; canonical upload reservations carry session/stream/event/asset identity for atomic erasure admission. |
 | `delivery_outbox.rs` | Email, webhook, and push candidate/claim/frozen-request/settlement contract. |
 | `entitlement.rs` | Active-account checks and atomic daily quota/Vertex reservations. |
 | `episode.rs` | Pure episode merge/substance/visual-evidence domain rules shared by memory formation and deletion. |

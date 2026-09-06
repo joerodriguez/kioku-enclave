@@ -5,6 +5,13 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0027_orphan_capture_erasure.sql` is an independent additive erasure
+  contract: durable scope/object journals, identity tombstones and predecessor-safe
+  upload fencing. It does not alter the frozen v27 activation catalog or schema
+  marker. Its signed migrator controller is implemented and under review, with
+  synthetic local verification; production operator/provider delivery is pending.
+  It has not been released, installed in production, or executed on owner data.
+
 - `0001_identity_oauth.sql` creates the account, identity, Apple credential,
   signup-budget, OAuth client/consent/code, and refresh-token foundation.
 - `0002_entitlements.sql` adds tenant-scoped, fleet-wide daily quota and Vertex

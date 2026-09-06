@@ -8,6 +8,8 @@ mod admission;
 mod aggregate_audit;
 mod billing;
 mod capture;
+#[cfg(test)]
+mod catalog_presence_tests;
 mod delivery_outbox;
 mod entitlement;
 mod episode_deletion;
@@ -20,6 +22,15 @@ mod memory_reconciliation;
 mod model_usage;
 mod notification;
 mod oauth;
+mod orphan_capture_erasure;
+mod orphan_capture_erasure_audit;
+mod orphan_capture_erasure_authority;
+mod orphan_capture_erasure_operator;
+#[cfg(test)]
+mod orphan_capture_erasure_operator_tests;
+mod orphan_capture_erasure_scope;
+#[cfg(test)]
+mod orphan_capture_erasure_tests;
 mod playback;
 mod query;
 mod recording_retention;
@@ -35,6 +46,7 @@ use sqlx::{PgPool, Row};
 use crate::error::{EnclaveError, Result};
 
 pub(crate) use aggregate_audit::{parse_postgres_audit_since, AggregateAuditFailure};
+pub(crate) use orphan_capture_erasure_authority::verify_orphan_erasure_request;
 #[cfg(test)]
 use schema_release::SchemaReleaseStatus;
 pub(crate) use schema_release::{
@@ -49,7 +61,7 @@ pub(crate) const EXPECTED_SCHEMA_VERSION: i64 = 26;
 pub(crate) const MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION: i64 = 27;
 const MEMORY_RECONCILIATION_EXPAND_FROM_VERSION: i64 = 24;
 
-// The three real-PostgreSQL contract tests deliberately exercise the same
+// The real-PostgreSQL contract tests deliberately exercise the same
 // production session-scoped release lock. Rust may schedule those tests in
 // parallel, so serialize only their release setup while leaving the product
 // lock fail-closed and independently covered by the concurrency fixtures.
@@ -193,13 +205,26 @@ impl PostgresPersistence {
     /// calls `verify_schema` and never either mutation path.
     #[cfg(test)]
     pub(crate) async fn migrate(&self) -> Result<()> {
-        self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await
+        self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await?;
+        self.install_test_orphan_erasure_schema().await
     }
 
     #[cfg(test)]
     async fn migrate_to_memory_reconciliation_predecessor(&self) -> Result<()> {
         self.migrate_to_version(MEMORY_RECONCILIATION_EXPAND_FROM_VERSION)
             .await
+    }
+
+    #[cfg(test)]
+    async fn install_test_orphan_erasure_schema(&self) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind("kioku:postgres-memory-reconciliation-activation:v27")
+            .execute(&mut *transaction)
+            .await?;
+        orphan_capture_erasure::install_schema_in_locked_transaction(&mut transaction).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -446,6 +471,24 @@ impl PostgresPersistence {
             Ok(())
         }
     }
+}
+
+/// Read the current command's catalog snapshot, including after a release-lock
+/// wait. A cached name-resolution probe can retain an absent relation across
+/// another connection's DDL commit. Wrong-kind objects count as present so the
+/// caller's exact contract verification fails closed rather than going legacy.
+pub(super) async fn current_schema_relation_exists(
+    connection: &mut sqlx::PgConnection,
+    relation_name: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class relation \
+         JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace \
+         WHERE namespace.nspname=current_schema() AND relation.relname=$1)",
+    )
+    .bind(relation_name)
+    .fetch_one(connection)
+    .await?)
 }
 
 pub(super) async fn allocate_content_id(
@@ -844,6 +887,10 @@ mod tests {
                 SchemaReleaseStatus::Finalized
             );
             persistence
+                .install_test_orphan_erasure_schema()
+                .await
+                .unwrap();
+            persistence
                 .verify_reconciliation_runtime_schema(
                     Some("test-model"),
                     "us-central1",
@@ -875,7 +922,7 @@ mod tests {
                 WHERE schemaname = current_schema()
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
-                      'persistence_schema_release_steps');
+                      'persistence_schema_release_steps','orphan_capture_erasure_contract');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;
@@ -1336,8 +1383,12 @@ mod tests {
             .captures()
             .reserve_media_upload(
                 &account_id,
-                &canonical.event_id,
-                &canonical.media.as_ref().unwrap().asset_id,
+                crate::persistence::CaptureUploadIdentity {
+                    capture_session_id: &canonical.capture_session_id,
+                    stream_id: &canonical.stream_id,
+                    event_id: &canonical.event_id,
+                    asset_id: &canonical.media.as_ref().unwrap().asset_id,
+                },
                 &object_key,
                 &canonical_digest,
             )
@@ -4588,8 +4639,12 @@ mod tests {
             .captures()
             .reserve_media_upload(
                 &account_id,
-                "deletion-race-event",
-                "deletion-race-asset",
+                crate::persistence::CaptureUploadIdentity {
+                    capture_session_id: "deletion-race-session",
+                    stream_id: "deletion-race-stream",
+                    event_id: "deletion-race-event",
+                    asset_id: "deletion-race-asset",
+                },
                 &crate::gcs::canonical_capture_media_object_key(&account_id, "deletion-race-asset")
                     .unwrap(),
                 &"d".repeat(64),
@@ -4710,8 +4765,12 @@ mod tests {
             .captures()
             .reserve_media_upload(
                 &account_id,
-                "post-deletion-request-event",
-                "post-deletion-request-asset",
+                crate::persistence::CaptureUploadIdentity {
+                    capture_session_id: "post-deletion-request-session",
+                    stream_id: "post-deletion-request-stream",
+                    event_id: "post-deletion-request-event",
+                    asset_id: "post-deletion-request-asset",
+                },
                 &crate::gcs::canonical_capture_media_object_key(
                     &account_id,
                     "post-deletion-request-asset",
@@ -5172,8 +5231,12 @@ mod tests {
             .captures()
             .reserve_media_upload(
                 &identity_account.id,
-                &audio_manifest.event_id,
-                &audio_manifest.media.as_ref().unwrap().asset_id,
+                crate::persistence::CaptureUploadIdentity {
+                    capture_session_id: &audio_manifest.capture_session_id,
+                    stream_id: &audio_manifest.stream_id,
+                    event_id: &audio_manifest.event_id,
+                    asset_id: &audio_manifest.media.as_ref().unwrap().asset_id,
+                },
                 &audio_object_key,
                 &audio_digest,
             )
@@ -5322,8 +5385,14 @@ mod tests {
         .unwrap()
         .is_none());
 
-        super::activation::test_real_pg_activation_contract(&persistence).await;
-        super::aggregate_audit::test_real_pg_aggregate_audit(&persistence).await;
+        Box::pin(super::activation::test_real_pg_activation_contract(
+            &persistence,
+        ))
+        .await;
+        Box::pin(super::aggregate_audit::test_real_pg_aggregate_audit(
+            &persistence,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -5337,7 +5406,10 @@ mod tests {
             schema,
         } = fixture;
         let pool = persistence.pool().clone();
-        let outcome = tokio::spawn(test_real_pg_control_plane_contract_inner(persistence)).await;
+        let outcome = tokio::spawn(Box::pin(test_real_pg_control_plane_contract_inner(
+            persistence,
+        )))
+        .await;
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(base.pool())

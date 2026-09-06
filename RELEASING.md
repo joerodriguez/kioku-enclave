@@ -152,14 +152,31 @@ phase selectors for execution/recovery; no arbitrary image or SQL override is pe
 does not authorize a serving-runtime change within the current Draining cycle. See the deployment
 repository's [activation contract](https://github.com/joerodriguez/kioku/blob/main/docs/adr/0043-source-settled-memory-reconciliation-and-durable-links.md).
 
-The fixed read-only aggregate audit now emits `kioku.postdeploy.aggregate-audit.v3`. Its
+The fixed read-only aggregate audit now emits `kioku.postdeploy.aggregate-audit.v4`. Its
 `formation.stream_readiness` counts all streams in ended, finish-receipted sessions awaiting seal
 finalization. It compares committed watermarks with the same accepted-maximum and contiguous-prefix
 functions used by formation/sealing, and separately counts sealed-watermark disagreement and live-only
 gaps bridged by genuine deletion tombstones. These are diagnostic counts, not replacements for any
 readiness gate. They expose neither content nor identifiers and remain inside the ordinary
-repeatable-read, read-only, rollback-only audit transaction. Consumers must validate the exact v3
-shape; legacy v2 evidence must not be represented as containing these diagnostics.
+repeatable-read, read-only, rollback-only audit transaction. The v4 snapshot also independently
+verifies the orphan-erasure catalog and distinguishes pending, complete-but-capture-fenced, and
+fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
+evidence is not v4 evidence and cannot authorize the new erasure completion gates.
+
+### v0.9.28 erasure-admission prerequisite
+
+This release requires the independent orphan-erasure admission schema before any serving member
+starts or the migrator authorizes Active. The signed erasure installer requires an existing verified
+v27 **Draining** predecessor; it is not part of the unsigned v27 bootstrap. Therefore do not use
+the first-activation sequence below to roll v0.9.28 into an erasure-absent Installed database.
+For the existing owner-prelaunch Draining rollout, install the new signed image on the dedicated
+migration job first, preserve the current serving/KMS/candidate identity, then use the reviewed
+[scoped erasure procedure](docs/orphan-capture-erasure.md). Its signed install creates no capture
+fence or deletion by itself. Prepare is separately signed and must wait until the full cleanup and
+later new-runtime Active/fence-release delivery path is verified and ready. The serving rollout
+occurs only in the documented Paused window, with permanent erased-identity barriers retained.
+
+### Initial activation with a bootstrap-compatible predecessor
 
 1. Build, verify, sign, and publish the normal immutable release. Its schema-13 evidence must bind
    the exact reconciliation model, Vertex location, compiled producer digest, and reviewed Vertex

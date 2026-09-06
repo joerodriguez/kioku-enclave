@@ -41,7 +41,7 @@ pub use billing::{RecordingLeaseRequestRow, RetainedAccountMetrics};
 pub(crate) use capture::{
     CaptureCommit, CaptureCommitResult, CaptureEventStatus, CapturePreflight, CaptureRepository,
     CaptureSessionEvidence, CaptureSessionMemory, CaptureSessionProcessing, CaptureSessionStage,
-    CaptureSessionStatus, ReferenceBatchCommit, ReferenceBatchCommitResult,
+    CaptureSessionStatus, CaptureUploadIdentity, ReferenceBatchCommit, ReferenceBatchCommitResult,
 };
 pub(crate) use delivery_outbox::{
     DeliveryRepository, EmailDeliveryCandidate, EmailDeliveryClaim, FrozenEmailDelivery,
@@ -108,7 +108,7 @@ pub(crate) use oauth::{
 pub(crate) use playback::PlaybackRepository;
 pub(crate) use postgres::{
     parse_postgres_audit_since, verify_memory_reconciliation_activation_authorization,
-    verify_schema_finalization_authorization, AggregateAuditFailure,
+    verify_orphan_erasure_request, verify_schema_finalization_authorization, AggregateAuditFailure,
     MemoryReconciliationActivationReceipt, MemoryReconciliationActivationSignature,
     PostgresPersistence, PostgresPoolConfig, SchemaFinalizationReceipt,
     SchemaFinalizationSignature, VerifiedMemoryReconciliationActivationReceipt,

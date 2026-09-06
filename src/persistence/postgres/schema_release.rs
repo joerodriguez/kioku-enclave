@@ -398,7 +398,7 @@ AND NOT EXISTS(
             'retire_deleted_memory'))
 "#;
 
-// The real-PG activation contract runs in a disposable sibling schema after
+// The real-PG activation/control-plane contracts run in disposable sibling schemas after
 // the main contract has populated `public`. Its test-only admission check must
 // therefore scope every collision to that disposable schema. This string is
 // deliberately not a member of the frozen production CONTRACT_PARTS.
@@ -824,6 +824,19 @@ fn configured_schema_finalization_trust_anchor() -> Result<SchemaFinalizationTru
         ))
     })?;
     schema_finalization_trust_anchor_from_values(&public_key, &fingerprint)
+}
+
+/// Reuse the baked release trust anchor, not activation authorization. Callers
+/// must validate their own strict, domain-separated request before this check.
+pub(super) fn verify_operator_request_signature(
+    canonical_bytes: &[u8],
+    signature: &[u8],
+) -> Result<Vec<u8>> {
+    let anchor = configured_schema_finalization_trust_anchor()?;
+    UnparsedPublicKey::new(&ED25519, &anchor.public_key)
+        .verify(canonical_bytes, signature)
+        .map_err(|_| EnclaveError::Config("operator request signature is invalid".into()))?;
+    Ok(anchor.der_sha256)
 }
 
 fn is_sha256_label(value: &str) -> bool {
@@ -1355,7 +1368,7 @@ async fn pristine_v26_preflight(connection: &mut PgConnection) -> Result<bool> {
         let schema = sqlx::query_scalar::<_, String>("SELECT current_schema()")
             .fetch_one(&mut *connection)
             .await?;
-        if schema.starts_with("kioku_activation_") {
+        if schema.starts_with("kioku_activation_") || schema.starts_with("kioku_control_plane_") {
             return Ok(
                 sqlx::query_scalar::<_, bool>(ISOLATED_TEST_PRISTINE_V26_PREFLIGHT_SQL)
                     .fetch_one(&mut *connection)
@@ -2512,6 +2525,7 @@ impl PostgresPersistence {
     pub(crate) async fn verify_schema(&self) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
         let state = connection_schema_state(&mut connection).await?;
+        super::orphan_capture_erasure::verify_schema_if_installed(&mut connection).await?;
         if state
             == (InstalledSchemaState {
                 version: MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION,
@@ -2533,12 +2547,7 @@ impl PostgresPersistence {
         }
         let serving_state = classify_serving_schema(state)?;
         if serving_state == ServingSchemaState::Finalized
-            && sqlx::query_scalar::<_, bool>(
-                "SELECT to_regclass(format('%I.%I',current_schema(), \
-                        'persistence_feature_activation_contracts')) IS NOT NULL",
-            )
-            .fetch_one(&mut *connection)
-            .await?
+            && super::activation::activation_contract_exists(&mut connection).await?
         {
             let activation =
                 super::activation::verify_serving_activation_schema(&mut connection).await?;
@@ -2570,6 +2579,7 @@ impl PostgresPersistence {
     ) -> Result<()> {
         self.verify_schema().await?;
         let mut connection = self.pool.acquire().await?;
+        super::orphan_capture_erasure::require_runtime_schema(&mut connection).await?;
         let activation =
             super::activation::verify_serving_activation_schema(&mut connection).await?;
         match activation.phase {
@@ -2640,6 +2650,14 @@ fn test_schema_finalization_key_pair() -> ring::signature::Ed25519KeyPair {
         0x7f, 0x60,
     ])
     .expect("RFC 8032 Ed25519 seed must be valid")
+}
+
+#[cfg(test)]
+pub(super) fn test_sign_operator_request(bytes: &[u8]) -> Vec<u8> {
+    test_schema_finalization_key_pair()
+        .sign(bytes)
+        .as_ref()
+        .to_vec()
 }
 
 #[cfg(test)]

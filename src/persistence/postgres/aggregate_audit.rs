@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use super::PostgresPersistence;
+use super::{
+    orphan_capture_erasure_audit::{self, OrphanErasureAudit},
+    PostgresPersistence,
+};
 
-pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v3";
+pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateAuditFailure {
@@ -45,6 +48,7 @@ pub(crate) struct PostgresAggregateAuditReport {
     pub(crate) topology: TopologyAudit,
     pub(crate) vertex_usage: VertexUsageAudit,
     pub(crate) provider_activity: ProviderActivityAudit,
+    pub(crate) orphan_erasure: OrphanErasureAudit,
     pub(crate) usage_daily: UsageDailyAudit,
     pub(crate) finalization: FinalizationAudit,
     pub(crate) capacity: CapacityAudit,
@@ -400,6 +404,9 @@ pub(crate) struct GateAudit {
     pub(crate) activation_ready_for_drain: bool,
     pub(crate) activation_ready_for_active: bool,
     pub(crate) capacity_sufficient: bool,
+    pub(crate) orphan_erasures_quiescent: bool,
+    pub(crate) orphan_erasures_complete: bool,
+    pub(crate) capture_admission_unfenced: bool,
     pub(crate) ready_for_drain: bool,
     pub(crate) ready_for_active: bool,
 }
@@ -414,6 +421,7 @@ impl GateAudit {
             && self.reconciliation_quiescent
             && self.finalization_claims_quiescent
             && self.capacity_sufficient
+            && self.orphan_erasures_quiescent
     }
 
     fn expected_ready_for_drain(&self) -> bool {
@@ -427,6 +435,7 @@ impl GateAudit {
         self.shared_transition_gates_hold()
             && self.formation_quiescent
             && self.activation_ready_for_active
+            && self.orphan_erasures_complete
     }
 
     fn readiness_is_exact(&self) -> bool {
@@ -533,7 +542,11 @@ impl PostgresAggregateAuditReport {
 
     fn validate(&self, expected_since: &str) -> Result<(), AggregateAuditFailure> {
         if self.contract != POSTGRES_AGGREGATE_AUDIT_CONTRACT
-            || self.schema_version != 3
+            || self.schema_version != 4
+            || !self.orphan_erasure.valid()
+            || self.gates.orphan_erasures_quiescent != self.orphan_erasure.quiescent()
+            || self.gates.orphan_erasures_complete != self.orphan_erasure.complete()
+            || self.gates.capture_admission_unfenced != self.orphan_erasure.unfenced()
             || !self.formation.stream_readiness.valid_counts()
             || self.capacity.projected_reconciliation_calls != self.reconciliation.candidate_drafts
             || self.capacity.projected_reconciliation_calls < self.capacity.projected_components
@@ -807,8 +820,17 @@ impl PostgresPersistence {
     ) -> Result<PostgresAggregateAuditReport, AggregateAuditFailure> {
         parse_postgres_audit_since(since)?;
         let mut transaction = self.begin_aggregate_audit_transaction().await?;
+        let erasure = orphan_capture_erasure_audit::snapshot(&mut transaction)
+            .await
+            .map_err(|_| AggregateAuditFailure::AuditFailed)?;
+        let erasure_json =
+            serde_json::to_string(&erasure).map_err(|_| AggregateAuditFailure::AuditFailed)?;
         let queried = sqlx::query(AGGREGATE_AUDIT_SQL)
             .bind(since)
+            .bind(erasure_json)
+            .bind(erasure.quiescent())
+            .bind(erasure.complete())
+            .bind(erasure.unfenced())
             .fetch_all(&mut *transaction)
             .await;
         let rollback = transaction.rollback().await;
@@ -926,6 +948,11 @@ async fn test_real_pg_aggregate_audit_inner(
             .await
             .unwrap();
     }
+    let mut erasure_install = persistence.pool().begin().await.unwrap();
+    super::orphan_capture_erasure::install_schema_in_locked_transaction(&mut erasure_install)
+        .await
+        .unwrap();
+    erasure_install.commit().await.unwrap();
     let before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
         .fetch_one(persistence.pool())
         .await
@@ -939,7 +966,8 @@ async fn test_real_pg_aggregate_audit_inner(
     .unwrap();
     let report = persistence.aggregate_audit(&since).await.unwrap();
     assert_eq!(report.contract, POSTGRES_AGGREGATE_AUDIT_CONTRACT);
-    assert_eq!(report.schema_version, 3);
+    assert_eq!(report.schema_version, 4);
+    assert!(report.orphan_erasure.schema_installed);
     assert!(report.transaction_read_only);
     assert_eq!(report.capture_events.groups.len(), 12);
     assert_eq!(report.media.work_units_since.len(), 20);
@@ -2317,6 +2345,9 @@ mod tests {
             activation_ready_for_drain: true,
             activation_ready_for_active: false,
             capacity_sufficient: true,
+            orphan_erasures_quiescent: true,
+            orphan_erasures_complete: true,
+            capture_admission_unfenced: true,
             ready_for_drain: true,
             ready_for_active: false,
         }
@@ -2330,7 +2361,7 @@ mod tests {
         assert!(!installed.expected_ready_for_active());
 
         type BlockGate = (&'static str, fn(&mut GateAudit));
-        let shared_blockers: [BlockGate; 8] = [
+        let shared_blockers: [BlockGate; 9] = [
             ("domain", |gate| gate.domain_clean = false),
             ("quota", |gate| gate.quota_invariants_hold = false),
             ("provider", |gate| gate.provider_quiescent = false),
@@ -2343,6 +2374,9 @@ mod tests {
                 gate.finalization_claims_quiescent = false;
             }),
             ("capacity", |gate| gate.capacity_sufficient = false),
+            ("orphan erasure", |gate| {
+                gate.orphan_erasures_quiescent = false
+            }),
         ];
         for (name, block) in shared_blockers {
             let mut blocked = installed_gate_fixture();
@@ -2377,6 +2411,30 @@ mod tests {
             blocked.ready_for_active = false;
             assert!(blocked.readiness_is_exact(), "{name}");
         }
+    }
+
+    #[test]
+    fn v4_requires_exact_erasure_counts_without_fencing_prelaunch_active() {
+        let report: PostgresAggregateAuditReport =
+            serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
+        let mut fenced = report.clone();
+        fenced.orphan_erasure.complete_fenced_operations = 1;
+        assert!(fenced.validate(&fenced.since).is_err());
+        fenced.gates.capture_admission_unfenced = false;
+        assert!(fenced.validate(&fenced.since).is_ok());
+        assert!(fenced.gates.orphan_erasures_complete);
+        let mut absent = report.clone();
+        absent.orphan_erasure.schema_installed = false;
+        absent.gates.orphan_erasures_complete = false;
+        absent.gates.capture_admission_unfenced = false;
+        assert!(absent.validate(&absent.since).is_ok());
+        assert!(absent.gates.orphan_erasures_quiescent);
+        absent.orphan_erasure.released_operations = 1;
+        assert!(absent.validate(&absent.since).is_err());
+        let mut historical = report;
+        historical.contract = "kioku.postdeploy.aggregate-audit.v3".into();
+        historical.schema_version = 3;
+        assert!(historical.validate(&historical.since).is_err());
     }
 
     #[test]
@@ -2567,9 +2625,9 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_query_has_one_parameter_and_no_arbitrary_surface() {
+    fn aggregate_query_has_one_external_parameter_and_only_internal_erasure_evidence() {
         assert!(AGGREGATE_AUDIT_SQL.contains("$1::timestamptz"));
-        assert!(!AGGREGATE_AUDIT_SQL.contains("$2"));
+        assert!(AGGREGATE_AUDIT_SQL.contains("$2::jsonb"));
         assert!(!AGGREGATE_AUDIT_SQL
             .to_ascii_lowercase()
             .contains("select *"));
