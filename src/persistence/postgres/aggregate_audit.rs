@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use super::PostgresPersistence;
 
-pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v2";
+pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateAuditFailure {
@@ -148,6 +148,7 @@ pub(crate) struct MediaJobGroup {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FormationAudit {
+    pub(crate) stream_readiness: FormationStreamReadiness,
     pub(crate) receipts_since: Vec<FormationReceiptGroup>,
     pub(crate) receipts_unfinished: Vec<FormationReceiptGroup>,
     pub(crate) pages_since: Vec<FormationPageGroup>,
@@ -168,6 +169,34 @@ pub(crate) struct FormationAudit {
     pub(crate) legacy_retry_due_claims: i64,
     pub(crate) legacy_retry_future_claims: i64,
     pub(crate) legacy_budget_error_claims: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FormationStreamReadiness {
+    pub(crate) pending_seal_streams: i64,
+    pub(crate) accepted_max_mismatch_streams: i64,
+    pub(crate) noncontiguous_streams: i64,
+    pub(crate) sealed_sequence_mismatch_streams: i64,
+    pub(crate) live_gap_tombstone_bridged_streams: i64,
+}
+
+impl FormationStreamReadiness {
+    fn valid_counts(&self) -> bool {
+        let total = i128::from(self.pending_seal_streams);
+        let bridged = i128::from(self.live_gap_tombstone_bridged_streams);
+        total >= 0
+            && [
+                self.accepted_max_mismatch_streams,
+                self.noncontiguous_streams,
+                self.sealed_sequence_mismatch_streams,
+                self.live_gap_tombstone_bridged_streams,
+            ]
+            .into_iter()
+            .all(|count| count >= 0 && i128::from(count) <= total)
+            && bridged + i128::from(self.accepted_max_mismatch_streams) <= total
+            && bridged + i128::from(self.noncontiguous_streams) <= total
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -343,6 +372,7 @@ pub(crate) struct FinalizationAudit {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CapacityAudit {
     pub(crate) projected_components: i64,
+    pub(crate) projected_reconciliation_calls: i64,
     pub(crate) projected_successor_finalizers: i64,
     pub(crate) max_required_derived_slots: i64,
     pub(crate) accounts_insufficient_derived: i64,
@@ -503,7 +533,12 @@ impl PostgresAggregateAuditReport {
 
     fn validate(&self, expected_since: &str) -> Result<(), AggregateAuditFailure> {
         if self.contract != POSTGRES_AGGREGATE_AUDIT_CONTRACT
-            || self.schema_version != 2
+            || self.schema_version != 3
+            || !self.formation.stream_readiness.valid_counts()
+            || self.capacity.projected_reconciliation_calls != self.reconciliation.candidate_drafts
+            || self.capacity.projected_reconciliation_calls < self.capacity.projected_components
+            || self.capacity.projected_successor_finalizers
+                < self.capacity.projected_reconciliation_calls
             || self
                 .provider_activity
                 .counts()
@@ -904,7 +939,7 @@ async fn test_real_pg_aggregate_audit_inner(
     .unwrap();
     let report = persistence.aggregate_audit(&since).await.unwrap();
     assert_eq!(report.contract, POSTGRES_AGGREGATE_AUDIT_CONTRACT);
-    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.schema_version, 3);
     assert!(report.transaction_read_only);
     assert_eq!(report.capture_events.groups.len(), 12);
     assert_eq!(report.media.work_units_since.len(), 20);
@@ -924,6 +959,9 @@ async fn test_real_pg_aggregate_audit_inner(
 
     if isolated_gate_edges {
         Box::pin(test_source_bounded_capacity(persistence, &since)).await;
+        Box::pin(test_account_amortized_capacity(persistence, &since)).await;
+        Box::pin(test_deletion_stable_capacity(persistence, &since)).await;
+        Box::pin(test_formation_stream_readiness(persistence, &since)).await;
         sqlx::raw_sql(
             "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
          VALUES('aggregate-audit-gate-contract','aggregate-audit-gate@example.com', \
@@ -1613,7 +1651,7 @@ async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: 
     .await
     .unwrap();
     let unowned = persistence.aggregate_audit(since).await.unwrap();
-    assert_eq!(unowned.capacity.projected_successor_finalizers, 16);
+    assert_eq!(unowned.capacity.projected_successor_finalizers, 10);
 
     // Join draft intervals to test the component-union bound. This fixture
     // exercises interval grouping, not the runtime capture-session closure.
@@ -1627,7 +1665,7 @@ async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: 
     .unwrap();
     let joined = persistence.aggregate_audit(since).await.unwrap();
     assert_eq!(joined.capacity.projected_components, 3);
-    assert_eq!(joined.capacity.projected_successor_finalizers, 14);
+    assert_eq!(joined.capacity.projected_successor_finalizers, 10);
     assert!(
         unowned.capacity.projected_successor_finalizers
             >= joined.capacity.projected_successor_finalizers
@@ -1664,12 +1702,13 @@ async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: 
         .await
         .unwrap();
 
-    // Every component can really reach 32 outputs when enough unowned atoms
-    // exist. Existing reconciled finalizer work is charged in addition.
+    // Four components can collectively reach 128 outputs when 120 distinct
+    // unowned atoms augment their eight owned atoms. Do not reuse a smaller
+    // unowned pool four times. Existing reconciled finalizers remain additive.
     sqlx::raw_sql(
         "INSERT INTO screenshots(account_id,id,captured_at) \
          SELECT 'aggregate-capacity-source-bound',100+value,'2025-01-01T00:00:00Z'::timestamptz \
-           FROM generate_series(1,40) value; \
+           FROM generate_series(1,118) value; \
          INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,structure_state) \
          VALUES('aggregate-capacity-source-bound',7,'2026-02-01T00:00:00Z', \
                 '2026-02-01T00:01:00Z','work','Needs finalization','Fixture','reconciled');",
@@ -1687,6 +1726,354 @@ async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: 
 
     sqlx::query("DELETE FROM accounts WHERE id IN ($1,'aggregate-capacity-other')")
         .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+async fn test_account_amortized_capacity(persistence: &PostgresPersistence, since: &str) {
+    use crate::persistence::{EntitlementRepository, VertexWorkClass};
+
+    const ACCOUNT: &str = "aggregate-capacity-account-bound";
+    // Match the diagnostic shape, using only synthetic data: four components
+    // own 1/2/3/5 atoms, with 27 unowned atoms available to any source closure.
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         VALUES('aggregate-capacity-account-bound','account-capacity@example.com', \
+                'google','account-capacity'); \
+         INSERT INTO screenshots(account_id,id,captured_at) \
+         SELECT 'aggregate-capacity-account-bound',value,'2025-01-01T00:00:00Z'::timestamptz \
+           FROM generate_series(1,38) value; \
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) \
+         SELECT 'aggregate-capacity-account-bound',value, \
+                '2026-01-01T00:00:00Z'::timestamptz+value*interval '1 day', \
+                '2026-01-01T00:01:00Z'::timestamptz+value*interval '1 day', \
+                'work','Fixture','Fixture' FROM generate_series(1,4) value; \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+         SELECT 'aggregate-capacity-account-bound', \
+                CASE WHEN value=1 THEN 1 WHEN value<=3 THEN 2 WHEN value<=6 THEN 3 ELSE 4 END, \
+                'screenshot',value FROM generate_series(1,11) value;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    for _ in 0..14 {
+        assert!(persistence
+            .reserve_vertex_output_tokens_for_class(
+                ACCOUNT,
+                VertexWorkClass::DerivedText,
+                8192,
+                2621440,
+            )
+            .await
+            .unwrap());
+    }
+    let shared = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(shared.capacity.projected_components, 4);
+    assert_eq!(shared.capacity.projected_reconciliation_calls, 4);
+    assert_eq!(shared.capacity.projected_successor_finalizers, 38);
+    assert_eq!(shared.capacity.max_required_derived_slots, 65);
+    assert_eq!(shared.capacity.minimum_derived_headroom_slots, 1);
+    assert!(shared.gates.capacity_sufficient);
+
+    // Empty-member drafts retain the KEEP floor alongside normal components and
+    // an unowned pool. Dangling members conservatively retain that floor, though
+    // runtime refuses their publication; source-less members cannot inflate atoms.
+    sqlx::raw_sql(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) \
+         SELECT 'aggregate-capacity-account-bound',value,'2026-02-01T00:00:00Z', \
+                '2026-02-01T00:01:00Z','work','Empty','Empty' \
+           FROM generate_series(5,6) value; \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+         VALUES('aggregate-capacity-account-bound',6,'screenshot',99999);",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let mixed = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(mixed.capacity.projected_components, 5);
+    assert_eq!(mixed.capacity.projected_successor_finalizers, 40);
+    sqlx::raw_sql(
+        "DELETE FROM memory_handles WHERE account_id='aggregate-capacity-account-bound' \
+                                      AND episode_id IN (5,6); \
+         DELETE FROM episodes WHERE account_id='aggregate-capacity-account-bound' AND id IN (5,6); \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+         SELECT 'aggregate-capacity-account-bound',1,'screenshot',value \
+           FROM generate_series(12,38) value;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    // One component may acquire every unowned atom. Reclassification as owned
+    // cannot increase the budget or make the original account-wide bound unsafe.
+    let transferred = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(transferred.capacity.projected_components, 4);
+    assert_eq!(transferred.capacity.projected_successor_finalizers, 38);
+    assert_eq!(
+        shared.capacity.projected_successor_finalizers,
+        transferred.capacity.projected_successor_finalizers
+    );
+
+    // With 66 remaining slots, 38 successors + four reconciliation calls leave
+    // room for exactly 24 already-reconciled finalizers, never 25.
+    sqlx::raw_sql(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,structure_state) \
+         SELECT 'aggregate-capacity-account-bound',100+value,'2026-03-01T00:00:00Z', \
+                '2026-03-01T00:01:00Z','work','Finalize','Fixture','reconciled' \
+           FROM generate_series(1,24) value;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let covered = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(covered.capacity.max_required_derived_slots, 66);
+    assert_eq!(covered.capacity.minimum_derived_headroom_slots, 0);
+    assert!(covered.gates.capacity_sufficient);
+    sqlx::query(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,structure_state) \
+         VALUES($1,125,'2026-03-01T00:00:00Z','2026-03-01T00:01:00Z', \
+                'work','Finalize','Fixture','reconciled')",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let insufficient = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(insufficient.capacity.max_required_derived_slots, 67);
+    assert_eq!(insufficient.capacity.minimum_derived_headroom_slots, -1);
+    assert!(!insufficient.gates.capacity_sufficient);
+
+    // No draft candidates means no reconciliation successors, even though
+    // deleting the fixture episodes makes every atom unowned again.
+    sqlx::raw_sql(
+        "DELETE FROM memory_handles WHERE account_id='aggregate-capacity-account-bound'; \
+         DELETE FROM episodes WHERE account_id='aggregate-capacity-account-bound';",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let no_components = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(no_components.capacity.projected_components, 0);
+    assert_eq!(no_components.capacity.projected_successor_finalizers, 0);
+    sqlx::query("DELETE FROM accounts WHERE id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+async fn test_deletion_stable_capacity(persistence: &PostgresPersistence, since: &str) {
+    use crate::persistence::{EntitlementRepository, VertexWorkClass};
+
+    // Account 1: 32 owned atoms -- empty bridge -- 32 owned atoms.
+    // Account 2: four owned atoms -- empty bridge -- three empty drafts.
+    // Deleting a bridge disproves both per-component caps and aggregate floors.
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         SELECT 'aggregate-split-'||value,'split-'||value||'@example.com','google', \
+                'split-'||value FROM generate_series(1,2) value; \
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) \
+         SELECT 'aggregate-split-'||account,id, \
+                '2026-01-01T00:00:00Z'::timestamptz+ \
+                    (CASE id WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 3 END)*interval '1 day', \
+                '2026-01-01T00:00:00Z'::timestamptz+ \
+                    (CASE id WHEN 1 THEN 1 WHEN 2 THEN 3 ELSE 4 END)*interval '1 day', \
+                'work','Fixture','Fixture' \
+           FROM generate_series(1,2) account CROSS JOIN generate_series(1,5) id \
+          WHERE account=2 OR id<=3; \
+         INSERT INTO screenshots(account_id,id,captured_at) \
+         SELECT 'aggregate-split-'||account,id,'2026-01-01T00:00:00Z' \
+           FROM generate_series(1,2) account CROSS JOIN generate_series(1,64) id \
+          WHERE account=1 OR id<=4; \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+         SELECT account_id,CASE WHEN account_id='aggregate-split-1' AND id>32 THEN 3 ELSE 1 END, \
+                'screenshot',id FROM screenshots WHERE account_id IN ('aggregate-split-1','aggregate-split-2');",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    for _ in 0..14 {
+        assert!(persistence
+            .reserve_vertex_output_tokens_for_class(
+                "aggregate-split-1",
+                VertexWorkClass::DerivedText,
+                8192,
+                2621440
+            )
+            .await
+            .unwrap());
+    }
+    let connected = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(connected.capacity.projected_components, 2);
+    assert_eq!(connected.capacity.projected_reconciliation_calls, 8);
+    assert_eq!(connected.capacity.projected_successor_finalizers, 73);
+    assert_eq!(connected.capacity.max_required_derived_slots, 68);
+    assert!(!connected.gates.capacity_sufficient);
+    sqlx::raw_sql(
+        "DELETE FROM memory_handles WHERE account_id IN ('aggregate-split-1','aggregate-split-2') AND episode_id=2; \
+         DELETE FROM episodes WHERE account_id IN ('aggregate-split-1','aggregate-split-2') AND id=2;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let separated = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(separated.capacity.projected_components, 4);
+    assert_eq!(separated.capacity.projected_reconciliation_calls, 6);
+    assert_eq!(separated.capacity.projected_successor_finalizers, 71);
+    assert_eq!(separated.capacity.max_required_derived_slots, 66);
+    assert!(separated.gates.capacity_sufficient);
+    assert!(
+        connected.capacity.projected_successor_finalizers
+            >= separated.capacity.projected_successor_finalizers
+    );
+    assert!(
+        connected.capacity.projected_reconciliation_calls
+            >= separated.capacity.projected_reconciliation_calls
+    );
+    sqlx::query("DELETE FROM accounts WHERE id IN ('aggregate-split-1','aggregate-split-2')")
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+async fn test_formation_stream_readiness(persistence: &PostgresPersistence, since: &str) {
+    // Identical stream/session IDs across accounts exercise tenant isolation.
+    // The first account has a real gap, the second has its own sequence 1.
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         SELECT 'aggregate-stream-'||value,'stream-'||value||'@example.com', \
+                'google','stream-'||value FROM generate_series(1,2) value; \
+         INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at, \
+                                      last_event_at,ended_at,schema_version) \
+         SELECT 'aggregate-stream-'||value,'session','device','install', \
+                '2026-01-01T00:00:00Z','2026-01-01T00:01:00Z','2026-01-01T00:01:00Z',2 \
+           FROM generate_series(1,2) value; \
+         INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind, \
+                                     committed_through_sequence) \
+         SELECT 'aggregate-stream-'||value,'stream','session','device','mac_screen',2 \
+           FROM generate_series(1,2) value; \
+         INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind, \
+                                     committed_through_sequence) \
+         VALUES('aggregate-stream-2','empty-stream','session','device','mic',-1); \
+         INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id, \
+             stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at, \
+             timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+         SELECT 'aggregate-stream-'||account,'event-'||sequence,'device','install','session', \
+                'stream','mac_screen',sequence,'2026-01-01T00:00:00Z','0', \
+                '2026-01-01T00:00:00Z','2026-01-01T00:01:00Z','UTC',0,0, \
+                'asset-'||sequence,repeat('b',64),'canonical' \
+           FROM generate_series(1,2) account CROSS JOIN generate_series(0,2) sequence \
+          WHERE account=2 OR sequence<>1; \
+         INSERT INTO capture_formation_receipts(account_id,capture_session_id,source_revision, \
+             completed_revision,state,finish_requested_at,finish_request_provenance) \
+         SELECT 'aggregate-stream-'||value,'session',1,0,'pending', \
+                '2026-01-01T00:01:00Z','finish_endpoint_v1' FROM generate_series(1,2) value;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let gap = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(gap.formation.stream_readiness.pending_seal_streams, 3);
+    assert_eq!(
+        gap.formation.stream_readiness.accepted_max_mismatch_streams,
+        0
+    );
+    assert_eq!(gap.formation.stream_readiness.noncontiguous_streams, 1);
+    assert_eq!(
+        gap.formation
+            .stream_readiness
+            .live_gap_tombstone_bridged_streams,
+        0
+    );
+    assert!(!gap.gates.formation_quiescent);
+
+    sqlx::query("UPDATE capture_streams SET committed_through_sequence=3 WHERE account_id='aggregate-stream-1'")
+        .execute(persistence.pool()).await.unwrap();
+    let mismatch = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(
+        mismatch
+            .formation
+            .stream_readiness
+            .accepted_max_mismatch_streams,
+        1
+    );
+    assert_eq!(mismatch.formation.stream_readiness.noncontiguous_streams, 1);
+    sqlx::raw_sql(
+        "UPDATE capture_streams SET committed_through_sequence=2 WHERE account_id='aggregate-stream-1'; \
+         INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id, \
+             stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at, \
+             timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+         VALUES('aggregate-stream-1','event-1','device','install','session','stream','mac_screen',1, \
+                '2026-01-01T00:00:00Z','0','2026-01-01T00:00:00Z','2026-01-01T00:01:00Z', \
+                'UTC',0,0,'asset-1',repeat('b',64),'canonical'); \
+         INSERT INTO episode_deletions(account_id,episode_id,state,purge,media_object_keys, \
+             utterance_ids,screenshot_ids,segment_ids,orphan_event_ids) \
+         VALUES('aggregate-stream-1',123,'pending','{}','[]','[]','[]','[]', \
+                '[\"event-1\",\"event-2\"]'); \
+         INSERT INTO capture_formation_deleted_sequences(account_id,capture_session_id,stream_id, \
+             sequence,event_id,original_manifest_digest,deletion_episode_id,provenance) \
+         VALUES('aggregate-stream-1','session','stream',1,'event-1',repeat('b',64),123,'episode_deletion_v1'); \
+         DELETE FROM capture_events WHERE account_id='aggregate-stream-1' AND event_id='event-1';",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let bridged = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(
+        bridged
+            .formation
+            .stream_readiness
+            .accepted_max_mismatch_streams,
+        0
+    );
+    assert_eq!(bridged.formation.stream_readiness.noncontiguous_streams, 0);
+    assert_eq!(
+        bridged
+            .formation
+            .stream_readiness
+            .live_gap_tombstone_bridged_streams,
+        1
+    );
+    // A deleted trailing event also makes live MAX misleading; the immutable
+    // tombstone still proves the accepted contiguous prefix through sequence 2.
+    sqlx::raw_sql(
+        "INSERT INTO capture_formation_deleted_sequences(account_id,capture_session_id,stream_id, \
+             sequence,event_id,original_manifest_digest,deletion_episode_id,provenance) \
+         VALUES('aggregate-stream-1','session','stream',2,'event-2',repeat('b',64),123,'episode_deletion_v1'); \
+         DELETE FROM capture_events WHERE account_id='aggregate-stream-1' AND event_id='event-2'; \
+         UPDATE capture_streams SET sealed_sequence=0 WHERE account_id='aggregate-stream-1';",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let trailing = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(
+        trailing
+            .formation
+            .stream_readiness
+            .accepted_max_mismatch_streams,
+        0
+    );
+    assert_eq!(trailing.formation.stream_readiness.noncontiguous_streams, 0);
+    assert_eq!(
+        trailing
+            .formation
+            .stream_readiness
+            .live_gap_tombstone_bridged_streams,
+        1
+    );
+    assert_eq!(
+        trailing
+            .formation
+            .stream_readiness
+            .sealed_sequence_mismatch_streams,
+        1
+    );
+    assert!(!trailing.gates.formation_quiescent);
+    sqlx::query("DELETE FROM accounts WHERE id IN ('aggregate-stream-1','aggregate-stream-2')")
         .execute(persistence.pool())
         .await
         .unwrap();
@@ -2056,6 +2443,53 @@ mod tests {
             .unwrap()
             .insert("unexpected".into(), serde_json::json!(0));
         assert!(serde_json::from_value::<PostgresAggregateAuditReport>(extra).is_err());
+    }
+
+    #[test]
+    fn stream_readiness_diagnostics_refuse_invalid_or_legacy_shapes() {
+        let report: PostgresAggregateAuditReport =
+            serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
+        let changes: [fn(&mut PostgresAggregateAuditReport); 7] = [
+            |r| r.formation.stream_readiness.pending_seal_streams = -1,
+            |r| r.formation.stream_readiness.noncontiguous_streams = 1,
+            |r| {
+                r.formation.stream_readiness.pending_seal_streams = 1;
+                r.formation
+                    .stream_readiness
+                    .live_gap_tombstone_bridged_streams = 1;
+                r.formation.stream_readiness.accepted_max_mismatch_streams = 1;
+            },
+            |r| {
+                r.formation.stream_readiness.pending_seal_streams = 1;
+                r.formation
+                    .stream_readiness
+                    .live_gap_tombstone_bridged_streams = 1;
+                r.formation.stream_readiness.noncontiguous_streams = 1;
+            },
+            |r| {
+                r.contract = "kioku.postdeploy.aggregate-audit.v2".into();
+                r.schema_version = 2;
+            },
+            |r| r.capacity.projected_reconciliation_calls = 1,
+            |r| r.capacity.projected_components = 1,
+        ];
+        for change in changes {
+            let mut invalid = report.clone();
+            change(&mut invalid);
+            assert_eq!(
+                invalid.validate(&invalid.since),
+                Err(AggregateAuditFailure::AuditFailed)
+            );
+        }
+        let mut unknown = serde_json::to_value(&report).unwrap();
+        unknown["formation"]["stream_readiness"]["session_id"] = serde_json::json!("not-allowed");
+        assert!(serde_json::from_value::<PostgresAggregateAuditReport>(unknown).is_err());
+        let mut missing = serde_json::to_value(&report).unwrap();
+        missing["formation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_readiness");
+        assert!(serde_json::from_value::<PostgresAggregateAuditReport>(missing).is_err());
     }
 
     #[test]

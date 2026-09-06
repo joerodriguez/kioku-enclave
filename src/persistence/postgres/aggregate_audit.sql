@@ -487,8 +487,48 @@ formation_page_unfinished_groups AS MATERIALIZED (
       FROM formation_page_categories category
       LEFT JOIN formation_page_unfinished_aggregates aggregate USING(state)
 ),
+formation_seal_stream_state AS MATERIALIZED (
+    -- Inspect the exact runtime source functions, not a live-export surrogate:
+    -- deletion tombstones remain accepted sequence evidence after content purge.
+    -- Scope all streams in ended sessions still awaiting their first/fresh seal.
+    SELECT stream.committed_through_sequence,stream.sealed_sequence,
+           capture_formation_stream_accepted_max(stream.account_id,stream.id) AS accepted_max,
+           capture_formation_stream_contiguous_through(stream.account_id,stream.id)
+               AS contiguous_through,
+           live.count AS live_count,live.maximum AS live_max
+      FROM capture_formation_receipts receipt
+      JOIN capture_sessions session ON session.account_id=receipt.account_id
+                                   AND session.id=receipt.capture_session_id
+      JOIN capture_streams stream ON stream.account_id=receipt.account_id
+                                 AND stream.capture_session_id=receipt.capture_session_id
+      CROSS JOIN valid
+      CROSS JOIN LATERAL (
+          SELECT count(*)::bigint AS count,coalesce(max(event.sequence),-1)::bigint AS maximum
+            FROM capture_events event
+           WHERE event.account_id=stream.account_id AND event.stream_id=stream.id
+      ) live
+     WHERE receipt.finish_requested_at IS NOT NULL AND receipt.seal_finalized_at IS NULL
+       AND session.ended_at IS NOT NULL
+),
+formation_stream_readiness AS MATERIALIZED (
+    -- Diagnostic-only counts: do not replace or relax the existing readiness gates.
+    SELECT count(*)::bigint AS pending_seal_streams,
+           count(*) FILTER (WHERE accepted_max IS DISTINCT FROM committed_through_sequence)::bigint
+               AS accepted_max_mismatch_streams,
+           count(*) FILTER (WHERE contiguous_through IS DISTINCT FROM committed_through_sequence)::bigint
+               AS noncontiguous_streams,
+           count(*) FILTER (WHERE sealed_sequence IS NOT NULL
+                             AND sealed_sequence IS DISTINCT FROM committed_through_sequence)::bigint
+               AS sealed_sequence_mismatch_streams,
+           count(*) FILTER (WHERE (live_count<>live_max+1 OR live_max<>committed_through_sequence)
+                             AND accepted_max=committed_through_sequence
+                             AND contiguous_through=committed_through_sequence)::bigint
+               AS live_gap_tombstone_bridged_streams
+      FROM formation_seal_stream_state
+),
 formation_facts AS MATERIALIZED (
     SELECT (SELECT groups FROM formation_receipt_since_groups) AS receipts_since,
+           (SELECT to_jsonb(readiness) FROM formation_stream_readiness readiness) AS stream_readiness,
            (SELECT groups FROM formation_receipt_unfinished_groups) AS receipts_unfinished,
            (SELECT groups FROM formation_page_since_groups) AS pages_since,
            (SELECT groups FROM formation_page_unfinished_groups) AS pages_unfinished,
@@ -717,37 +757,35 @@ account_unowned_atom_counts AS MATERIALIZED (
                          AND owner.record_id=atom.record_id)
      GROUP BY atom.account_id
 ),
-candidate_component_owned_atom_counts AS MATERIALIZED (
-    SELECT draft.account_id,draft.component,
-           count(DISTINCT (atom.record_type,atom.record_id))::bigint AS atoms
+candidate_draft_owned_atom_counts AS MATERIALIZED (
+    SELECT draft.account_id,draft.id,draft.component,
+           count(atom.record_id)::bigint AS atoms
       FROM candidate_draft_components draft
-      JOIN active_episode_members member ON member.account_id=draft.account_id
-                                        AND member.episode_id=draft.id
-      JOIN candidate_source_atoms atom ON atom.account_id=member.account_id
-                                      AND atom.record_type=member.record_type
-                                      AND atom.record_id=member.record_id
-     GROUP BY draft.account_id,draft.component
+      LEFT JOIN active_episode_members member ON member.account_id=draft.account_id
+                                             AND member.episode_id=draft.id
+      LEFT JOIN candidate_source_atoms atom ON atom.account_id=member.account_id
+                                           AND atom.record_type=member.record_type
+                                           AND atom.record_id=member.record_id
+     GROUP BY draft.account_id,draft.id,draft.component
 ),
 candidate_component_output_bounds AS MATERIALIZED (
     -- Every model or conservative-keep output is a nonempty disjoint atom set.
-    -- Session closure may add unowned atoms outside a draft's initial interval:
-    -- include ALL account-unowned atoms for EVERY component, deliberately
-    -- overcounting them instead of assuming a timestamp or membership boundary.
-    -- Owned atoms outside the selected predecessors cause runtime refusal.
-    -- If source closure joins components, the sum of these separately capped
-    -- bounds is at least the bound for their union. Never cap by draft count:
-    -- one draft can split into several outputs, including unowned-only outputs.
-    -- Separately, providerless oversized KEEP preserves one existing output per
-    -- draft and can trigger on session count even with empty members. Keep the
-    -- draft count as a FLOOR to cover that non-partition publication path.
-    SELECT component.account_id,component.component,
-           greatest(component.drafts,
-                    least(32,coalesce(owned.atoms,0)+coalesce(unowned.atoms,0)))::bigint
-               AS successor_finalizers
-      FROM candidate_component_sizes component
-      LEFT JOIN candidate_component_owned_atom_counts owned
-        ON owned.account_id=component.account_id AND owned.component=component.component
-      LEFT JOIN account_unowned_atom_counts unowned ON unowned.account_id=component.account_id
+    -- Count all owned atoms plus one floor for every source-less draft: unlike
+    -- a per-component cap or floor, this survives deletion splitting components.
+    -- Reserve one reconciliation call per draft (an upper bound on component
+    -- count after splitting). The account-wide unowned pool is added ONCE below.
+    -- Serializability, the account publication lock, source revalidation, and
+    -- unique active atom ownership prevent two successful publications from
+    -- consuming the same initially unowned atom. Stale attempts publish nothing.
+    -- Owned atoms outside selected predecessors cause runtime refusal.
+    -- Providerless oversized KEEP instead preserves one output per draft and
+    -- can trigger on session count even with empty members. Dangling members
+    -- still get the conservative floor, though runtime refuses their publication.
+    -- Never use draft count as an upper bound on a split.
+    SELECT draft.account_id,draft.component,count(*)::bigint AS reconciliation_calls,
+           sum(greatest(1,draft.atoms))::bigint AS successor_finalizers
+      FROM candidate_draft_owned_atom_counts draft
+     GROUP BY draft.account_id,draft.component
 ),
 reconciliation_facts AS MATERIALIZED (
     SELECT (SELECT groups FROM reconciliation_since_groups) AS jobs_since,
@@ -1114,13 +1152,18 @@ finalization_facts AS MATERIALIZED (
 
 account_component_counts AS MATERIALIZED (
     SELECT account.id AS account_id,coalesce(component.count,0)::bigint AS components,
-           coalesce(component.successor_finalizers,0)::bigint AS successor_finalizers
+           coalesce(component.reconciliation_calls,0)::bigint AS reconciliation_calls,
+           (coalesce(component.successor_finalizers,0)+
+            CASE WHEN component.count>0 THEN coalesce(unowned.atoms,0) ELSE 0 END)::bigint
+               AS successor_finalizers
       FROM active_accounts account
       LEFT JOIN (
           SELECT account_id,count(*)::bigint AS count,
+                 sum(reconciliation_calls)::bigint AS reconciliation_calls,
                  sum(successor_finalizers)::bigint AS successor_finalizers
             FROM candidate_component_output_bounds GROUP BY account_id
       ) component ON component.account_id=account.id
+      LEFT JOIN account_unowned_atom_counts unowned ON unowned.account_id=account.id
 ),
 account_finalization_needs AS MATERIALIZED (
     SELECT account.id AS account_id,count(scope.account_id)::bigint AS reconciled_needs
@@ -1136,8 +1179,8 @@ account_capacity AS MATERIALIZED (
            greatest(1310720-usage.audio_tokens,0)/4096 AS audio_remaining_slots,
            greatest(655360-usage.screen_tokens,0)/1024 AS screen_remaining_slots,
            greatest(655360-usage.derived_tokens,0)/8192 AS derived_remaining_slots,
-           component.components,component.successor_finalizers,
-           (component.components+component.successor_finalizers+
+           component.components,component.reconciliation_calls,component.successor_finalizers,
+           (component.reconciliation_calls+component.successor_finalizers+
               finalization.reconciled_needs)::bigint AS projected_required_slots
       FROM active_accounts account
       JOIN active_usage usage ON usage.account_id=account.id
@@ -1146,6 +1189,7 @@ account_capacity AS MATERIALIZED (
 ),
 capacity_facts AS MATERIALIZED (
     SELECT coalesce(sum(components),0)::bigint AS projected_components,
+           coalesce(sum(reconciliation_calls),0)::bigint AS projected_reconciliation_calls,
            coalesce(sum(successor_finalizers),0)::bigint AS projected_successor_finalizers,
            greatest(65,coalesce(max(projected_required_slots),0))::bigint
                AS max_required_derived_slots,
@@ -1255,8 +1299,8 @@ gate_results AS MATERIALIZED (
       FROM gate_facts
 )
 SELECT jsonb_build_object(
-    'contract','kioku.postdeploy.aggregate-audit.v2',
-    'schema_version',2,
+    'contract','kioku.postdeploy.aggregate-audit.v3',
+    'schema_version',3,
     'observed_at',to_char(audit_window.observed_at AT TIME ZONE 'UTC',
                           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'since',audit_window.raw_since,

@@ -1,6 +1,6 @@
 {
-  "contract": "kioku.postdeploy.aggregate-audit.v2",
-  "schema_version": 2,
+  "contract": "kioku.postdeploy.aggregate-audit.v3",
+  "schema_version": 3,
   "provider_activity": {
     "started_intents": 0,
     "media_work_claims": 0,
@@ -152,6 +152,13 @@
     "unfinished_work_without_members": 0
   },
   "formation": {
+    "stream_readiness": {
+      "pending_seal_streams": 0,
+      "accepted_max_mismatch_streams": 0,
+      "noncontiguous_streams": 0,
+      "sealed_sequence_mismatch_streams": 0,
+      "live_gap_tombstone_bridged_streams": 0
+    },
     "receipts_since": [
       {"state":"pending","count":0,"attempt_count":0,"outstanding_revisions":0},
       {"state":"processing","count":0,"attempt_count":0,"outstanding_revisions":0},
@@ -289,6 +296,7 @@
   },
   "capacity": {
     "projected_components": 0,
+    "projected_reconciliation_calls": 0,
     "projected_successor_finalizers": 0,
     "max_required_derived_slots": 65,
     "accounts_insufficient_derived": 0,

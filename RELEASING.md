@@ -140,9 +140,26 @@ path. Schema 12 and earlier metadata are ineligible for new promotion.
 
 ## Permanently activate memory reconciliation
 
-Use one ordinary signed release image and the existing release, migration, and staged deployment
-processes. There is no activation-specific Python/Terraform operator, second tag, alternate binary,
-or runtime feature flag.
+The normal first activation uses one ordinary signed release image and the existing release,
+migration, and staged deployment processes. There is no separate activation binary or runtime flag.
+
+After signed `Draining`, a reviewed source-compatible correction to audit/migration tooling may use
+a newer ordinary signed release image for the dedicated migrator only. The operator must pin that
+exact signed image separately for audit/backfill/activate/pause/resume, retain the original image for
+install/drain, and preserve the signed candidate, serving fleet, KMS authority, model/location/producer
+contract, and all readiness gates. Use only the reviewed migrator-only Terraform plan and saved-source
+phase selectors for execution/recovery; no arbitrary image or SQL override is permitted. This exception
+does not authorize a serving-runtime change within the current Draining cycle. See the deployment
+repository's [activation contract](https://github.com/joerodriguez/kioku/blob/main/docs/adr/0043-source-settled-memory-reconciliation-and-durable-links.md).
+
+The fixed read-only aggregate audit now emits `kioku.postdeploy.aggregate-audit.v3`. Its
+`formation.stream_readiness` counts all streams in ended, finish-receipted sessions awaiting seal
+finalization. It compares committed watermarks with the same accepted-maximum and contiguous-prefix
+functions used by formation/sealing, and separately counts sealed-watermark disagreement and live-only
+gaps bridged by genuine deletion tombstones. These are diagnostic counts, not replacements for any
+readiness gate. They expose neither content nor identifiers and remain inside the ordinary
+repeatable-read, read-only, rollback-only audit transaction. Consumers must validate the exact v3
+shape; legacy v2 evidence must not be represented as containing these diagnostics.
 
 1. Build, verify, sign, and publish the normal immutable release. Its schema-13 evidence must bind
    the exact reconciliation model, Vertex location, compiled producer digest, and reviewed Vertex
@@ -184,11 +201,16 @@ or runtime feature flag.
    amplification and enough remaining non-borrowing Derived slots for the activation backlog.
 
    The fixed audit projects the same active, unfinalized draft universe as the reconciler,
-   including `substance=none` drafts. Each component needs one reconciliation slot and conservatively
-   `max(drafts, min(32, canonical owned atoms + all account-unowned atoms))` successor-finalization slots.
-   Account-wide unowned atoms deliberately overestimate every component's possible source-session
-   expansion; draft count alone is not an output bound. Nonempty disjoint partitions enforce the
-   atom bound for both model results and conservative partitions. The draft-count floor covers the
+   including `substance=none` drafts. It reserves one reconciliation call per candidate draft, an upper
+   bound on component count even if deletion separates a connected group. Successor-finalization
+   capacity is `sum(max(1, canonical owned atoms per draft)) + account-unowned atoms`, with the
+   unowned pool added only when that account has a candidate draft. Per-component caps/floors are
+   insufficient when deletion splits a group; the per-draft bound remains conservative across those
+   partitions and source-less KEEP outputs. The pool covers every possible
+   source-session expansion without charging the same atom to multiple successful publications:
+   serializable publication, the account lock, source revalidation, and unique active ownership prevent
+   reuse. Nonempty disjoint partitions enforce the atom bound for both model results and conservative
+   partitions. Draft count alone is not an output bound. The individual source-less draft floors cover the
    distinct providerless oversized KEEP path, which retains one existing output per draft even when
    a session-count bound triggers with empty members. Existing reconciled finalizers are
    charged separately. The 65-slot minimum reserve, 80-slot daily derived allowance, other class
