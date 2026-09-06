@@ -183,6 +183,19 @@ or runtime feature flag.
    to `Active`, perform a content-free live audit proving no material pre-egress/not-billed retry
    amplification and enough remaining non-borrowing Derived slots for the activation backlog.
 
+   The fixed audit projects the same active, unfinalized draft universe as the reconciler,
+   including `substance=none` drafts. Each component needs one reconciliation slot and conservatively
+   `max(drafts, min(32, canonical owned atoms + all account-unowned atoms))` successor-finalization slots.
+   Account-wide unowned atoms deliberately overestimate every component's possible source-session
+   expansion; draft count alone is not an output bound. Nonempty disjoint partitions enforce the
+   atom bound for both model results and conservative partitions. The draft-count floor covers the
+   distinct providerless oversized KEEP path, which retains one existing output per draft even when
+   a session-count bound triggers with empty members. Existing reconciled finalizers are
+   charged separately. The 65-slot minimum reserve, 80-slot daily derived allowance, other class
+   headroom, oversized-component refusal, and every quiescence gate remain unchanged. A tighter
+   projection is not proof that a particular production backlog is ready; fresh signed-image audit
+   evidence must still pass every gate.
+
    The installer serializes with every v27-capable writer using the exclusive activation release
    advisory lock before it probes or creates objects, and also locks `episode_deletions` before the
    legacy-receipt checks. Writers take the shared counterpart before their absence probe. Do not

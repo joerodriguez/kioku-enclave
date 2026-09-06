@@ -1510,6 +1510,41 @@ mod tests {
     }
 
     #[test]
+    fn conservative_multi_draft_outputs_obey_the_nonempty_atom_bound() {
+        let source = snapshot(
+            vec![draft(10, &["utterance:1"]), draft(11, &["utterance:2"])],
+            vec![atom(1, 1), atom(2, 2), atom(3, 3), atom(4, 4)],
+        );
+        let result = validate_partition(&source, conservative_partition(&source).unwrap()).unwrap();
+        assert_eq!(result.outputs.len(), 2);
+        assert!(result.outputs.len() <= MAX_OUTPUTS.min(source.atoms.len()));
+        let mut assigned = BTreeSet::new();
+        for output in &result.outputs {
+            assert!(!output.member_source_ids.is_empty());
+            for source_id in &output.member_source_ids {
+                assert!(assigned.insert(source_id.clone()));
+            }
+        }
+        assert_eq!(assigned.len(), source.atoms.len());
+
+        // The model may split unowned evidence into its own output: counting
+        // only predecessor membership or draft count would be unsound.
+        let split = validate_partition(
+            &source,
+            ModelPartition {
+                memories: vec![
+                    memory(&["utterance:1"], "First"),
+                    memory(&["utterance:2"], "Second"),
+                    memory(&["utterance:3"], "Unowned third"),
+                    memory(&["utterance:4"], "Unowned fourth"),
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(split.outputs.len(), source.atoms.len());
+    }
+
+    #[test]
     fn evidence_uses_interval_end_not_only_atom_start() {
         let mut evidence = atom(1, 1_000);
         evidence.ended_at = isotime::format_epoch_millis(9_000);

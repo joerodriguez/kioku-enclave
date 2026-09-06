@@ -923,6 +923,7 @@ async fn test_real_pg_aggregate_audit_inner(
     );
 
     if isolated_gate_edges {
+        Box::pin(test_source_bounded_capacity(persistence, &since)).await;
         sqlx::raw_sql(
             "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
          VALUES('aggregate-audit-gate-contract','aggregate-audit-gate@example.com', \
@@ -1519,6 +1520,176 @@ async fn test_real_pg_aggregate_audit_inner(
         .unwrap(),
         0
     );
+}
+
+#[cfg(test)]
+async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: &str) {
+    use crate::persistence::{EntitlementRepository, VertexWorkClass};
+
+    const ACCOUNT: &str = "aggregate-capacity-source-bound";
+    // Four small components used to demand 132 slots against an 80-slot day.
+    // Equal numeric IDs across source kinds/accounts must remain distinct.
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES \
+          ('aggregate-capacity-source-bound','capacity@example.com','google','capacity'), \
+          ('aggregate-capacity-other','capacity-other@example.com','google','capacity-other'); \
+         INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) \
+         SELECT 'aggregate-capacity-source-bound',value, \
+                '2026-01-01T00:00:00Z'::timestamptz+value*interval '1 day', \
+                '2026-01-01T00:01:00Z'::timestamptz+value*interval '1 day',60,'mic' \
+           FROM generate_series(1,4) value; \
+         INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds, \
+                                end_offset_seconds,text,speaker_label) \
+         SELECT 'aggregate-capacity-source-bound',value,value,0,60,'Fixture','speaker' \
+           FROM generate_series(1,4) value; \
+         INSERT INTO screenshots(account_id,id,captured_at) \
+         SELECT 'aggregate-capacity-source-bound',value, \
+                '2026-01-01T00:00:00Z'::timestamptz+value*interval '1 day' \
+           FROM generate_series(1,4) value; \
+         INSERT INTO screenshots(account_id,id,captured_at) \
+         SELECT 'aggregate-capacity-other',value,'2026-01-01T00:00:00Z'::timestamptz \
+           FROM generate_series(1,40) value; \
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,substance) \
+         SELECT 'aggregate-capacity-source-bound',value, \
+                '2026-01-01T00:00:00Z'::timestamptz+value*interval '1 day', \
+                '2026-01-01T00:01:00Z'::timestamptz+value*interval '1 day', \
+                'work','Fixture','Fixture',CASE WHEN value=4 THEN 'none' ELSE 'normal' END \
+           FROM generate_series(1,4) value; \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+         SELECT 'aggregate-capacity-source-bound',value,kind,value \
+           FROM generate_series(1,4) value CROSS JOIN (VALUES('utterance'),('screenshot')) k(kind);",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let small = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(small.reconciliation.candidate_drafts, 4);
+    assert_eq!(small.capacity.projected_components, 4);
+    assert_eq!(small.capacity.projected_successor_finalizers, 8);
+    assert_eq!(small.capacity.max_required_derived_slots, 65);
+    assert_eq!(small.capacity.minimum_derived_headroom_slots, 15);
+    assert!(small.gates.capacity_sufficient);
+
+    // Ordinary partitions cannot emit empty outputs, but the separate
+    // providerless KEEP path preserves existing drafts and can trigger on
+    // >256 sessions even with no atoms. Reserve both empty draft successors.
+    // A finalized draft is not a runtime candidate.
+    sqlx::raw_sql(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,finalized_at) \
+         VALUES('aggregate-capacity-source-bound',5,'2026-02-01T00:00:00Z', \
+                 '2026-02-01T00:01:00Z','work','Empty','Empty',NULL), \
+               ('aggregate-capacity-source-bound',8,'2026-02-01T00:00:00Z', \
+                 '2026-02-01T00:01:00Z','work','Second empty','Empty',NULL), \
+               ('aggregate-capacity-source-bound',6,'2026-03-01T00:00:00Z', \
+                 '2026-03-01T00:01:00Z','work','Finalized','Finalized',clock_timestamp()); \
+         INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at, \
+                                      last_event_at,ended_at,schema_version) \
+         SELECT 'aggregate-capacity-source-bound','empty-capacity-session-'||value, \
+                'capacity-device','capacity-install','2026-02-01T00:00:00Z'::timestamptz, \
+                '2026-02-01T00:01:00Z'::timestamptz,'2026-02-01T00:01:00Z'::timestamptz,2 \
+           FROM generate_series(1,257) value;",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let empty = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(empty.reconciliation.candidate_drafts, 6);
+    assert_eq!(empty.capacity.projected_components, 5);
+    assert_eq!(empty.capacity.projected_successor_finalizers, 10);
+    sqlx::raw_sql(
+        "DELETE FROM memory_handles WHERE account_id='aggregate-capacity-source-bound' \
+                                      AND episode_id IN (5,6,8); \
+         DELETE FROM episodes WHERE account_id='aggregate-capacity-source-bound' AND id IN (5,6,8); \
+         INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) \
+         VALUES('aggregate-capacity-source-bound',9,'2025-01-01T00:00:00Z', \
+                '2025-01-01T00:01:00Z',60,'mic'); \
+         INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds, \
+                                end_offset_seconds,text,speaker_label) \
+         VALUES('aggregate-capacity-source-bound',9,9,0,60,'Outside interval','speaker'); \
+         INSERT INTO screenshots(account_id,id,captured_at) \
+         VALUES('aggregate-capacity-source-bound',9,'2025-01-01T00:00:00Z');",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let unowned = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(unowned.capacity.projected_successor_finalizers, 16);
+
+    // Join draft intervals to test the component-union bound. This fixture
+    // exercises interval grouping, not the runtime capture-session closure.
+    sqlx::query(
+        "UPDATE episodes SET ended_at='2026-01-03T00:00:00Z' \
+          WHERE account_id=$1 AND id=1",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let joined = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(joined.capacity.projected_components, 3);
+    assert_eq!(joined.capacity.projected_successor_finalizers, 14);
+    assert!(
+        unowned.capacity.projected_successor_finalizers
+            >= joined.capacity.projected_successor_finalizers
+    );
+    sqlx::query(
+        "UPDATE episodes SET ended_at='2026-01-02T00:01:00Z' \
+          WHERE account_id=$1 AND id=1",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+
+    // The existing 65-slot reserve still rejects 64 remaining slots. Runtime
+    // quota reservation remains the source of usage; no allowance is relaxed.
+    for _ in 0..16 {
+        assert!(persistence
+            .reserve_vertex_output_tokens_for_class(
+                ACCOUNT,
+                VertexWorkClass::DerivedText,
+                8192,
+                2621440
+            )
+            .await
+            .unwrap());
+    }
+    let reserved = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(reserved.capacity.max_required_derived_slots, 65);
+    assert_eq!(reserved.capacity.minimum_derived_headroom_slots, -1);
+    assert!(!reserved.gates.capacity_sufficient);
+    sqlx::query("DELETE FROM usage_daily WHERE account_id=$1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+
+    // Every component can really reach 32 outputs when enough unowned atoms
+    // exist. Existing reconciled finalizer work is charged in addition.
+    sqlx::raw_sql(
+        "INSERT INTO screenshots(account_id,id,captured_at) \
+         SELECT 'aggregate-capacity-source-bound',100+value,'2025-01-01T00:00:00Z'::timestamptz \
+           FROM generate_series(1,40) value; \
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,structure_state) \
+         VALUES('aggregate-capacity-source-bound',7,'2026-02-01T00:00:00Z', \
+                '2026-02-01T00:01:00Z','work','Needs finalization','Fixture','reconciled');",
+    )
+    .execute(persistence.pool())
+    .await
+    .unwrap();
+    let saturated = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(saturated.capacity.projected_components, 4);
+    assert_eq!(saturated.capacity.projected_successor_finalizers, 128);
+    assert_eq!(saturated.capacity.max_required_derived_slots, 133);
+    assert_eq!(saturated.capacity.accounts_insufficient_derived, 1);
+    assert_eq!(saturated.capacity.minimum_derived_headroom_slots, -53);
+    assert!(!saturated.gates.capacity_sufficient);
+
+    sqlx::query("DELETE FROM accounts WHERE id IN ($1,'aggregate-capacity-other')")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
