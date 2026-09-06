@@ -94,7 +94,12 @@ pub(super) async fn require_runtime_schema(connection: &mut sqlx::PgConnection) 
 }
 
 pub(super) async fn require_no_pending_erasures(connection: &mut sqlx::PgConnection) -> Result<()> {
-    require_runtime_schema(connection).await?;
+    // Compatible migrator-only activation may retain a predecessor serving
+    // image with no erasure contract. Partial/tampered namespaces still fail in
+    // this exact catalog verifier; serving startup remains mandatory above.
+    if !verify_schema_if_installed(connection).await? {
+        return Ok(());
+    }
     if sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM orphan_capture_erasure_operations WHERE state<>'complete')",
     )

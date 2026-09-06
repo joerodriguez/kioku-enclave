@@ -1,6 +1,15 @@
 {
-  "contract": "kioku.postdeploy.aggregate-audit.v4",
-  "schema_version": 4,
+  "contract": "kioku.postdeploy.aggregate-audit.v5",
+  "schema_version": 5,
+  "source_isolation": {
+    "unsettled_sessions": 0,
+    "unsettled_accounts": 0,
+    "isolated_historical_sessions": 0,
+    "inventory_rows": 0,
+    "inventory_bounded": true,
+    "blocked_drafts": 0,
+    "conflicting_components": 0
+  },
   "orphan_erasure": {
     "schema_installed": true,
     "pending_operations": 0,
@@ -325,6 +334,7 @@
     "media_budget_drained": true,
     "leases_unexpired": true,
     "formation_quiescent": true,
+    "formation_activation_eligible": true,
     "reconciliation_quiescent": true,
     "finalization_claims_quiescent": true,
     "activation_ready_for_drain": false,
@@ -333,6 +343,7 @@
     "orphan_erasures_quiescent": true,
     "orphan_erasures_complete": true,
     "capture_admission_unfenced": true,
+    "erasure_clear_for_activation": true,
     "ready_for_drain": false,
     "ready_for_active": false
   }

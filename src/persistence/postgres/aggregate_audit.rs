@@ -6,7 +6,7 @@ use super::{
     PostgresPersistence,
 };
 
-pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v4";
+pub(crate) const POSTGRES_AGGREGATE_AUDIT_CONTRACT: &str = "kioku.postdeploy.aggregate-audit.v5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateAuditFailure {
@@ -44,6 +44,7 @@ pub(crate) struct PostgresAggregateAuditReport {
     pub(crate) capture_events: CaptureEventsAudit,
     pub(crate) media: MediaAudit,
     pub(crate) formation: FormationAudit,
+    pub(crate) source_isolation: SourceIsolationAudit,
     pub(crate) reconciliation: ReconciliationAudit,
     pub(crate) topology: TopologyAudit,
     pub(crate) vertex_usage: VertexUsageAudit,
@@ -183,6 +184,65 @@ pub(crate) struct FormationStreamReadiness {
     pub(crate) noncontiguous_streams: i64,
     pub(crate) sealed_sequence_mismatch_streams: i64,
     pub(crate) live_gap_tombstone_bridged_streams: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceIsolationAudit {
+    pub(crate) unsettled_sessions: i64,
+    pub(crate) unsettled_accounts: i64,
+    pub(crate) isolated_historical_sessions: i64,
+    pub(crate) inventory_rows: i64,
+    pub(crate) inventory_bounded: bool,
+    pub(crate) blocked_drafts: i64,
+    pub(crate) conflicting_components: i64,
+}
+
+impl SourceIsolationAudit {
+    fn valid(&self) -> bool {
+        [
+            self.unsettled_sessions,
+            self.unsettled_accounts,
+            self.isolated_historical_sessions,
+            self.inventory_rows,
+            self.blocked_drafts,
+            self.conflicting_components,
+        ]
+        .into_iter()
+        .all(|count| count >= 0)
+            && self.unsettled_sessions >= self.isolated_historical_sessions
+            && self.unsettled_sessions >= self.unsettled_accounts
+            && self.inventory_rows <= 100_001
+            && self.inventory_bounded == (self.inventory_rows <= 100_000)
+            && (self.unsettled_sessions == 0) == (self.unsettled_accounts == 0)
+    }
+
+    fn formation_eligible(&self, formation: &FormationAudit, quiescent: bool) -> bool {
+        let held = self.isolated_historical_sessions;
+        self.inventory_bounded
+            && self.blocked_drafts == 0
+            && self.conflicting_components == 0
+            && (quiescent
+                || (held > 0
+                    && held <= 4
+                    && held == self.unsettled_sessions
+                    && held == formation.finished_dirty_receipts
+                    && held == formation.seal_pending_receipts
+                    && [
+                        formation.ended_without_finish_receipts,
+                        formation.nonterminal_pages_for_finished_receipts,
+                        formation.staged_response_pages,
+                        formation.legacy_processing_claims,
+                        formation.legacy_expired_claims,
+                        formation.legacy_retry_due_claims,
+                        formation.legacy_retry_future_claims,
+                        formation.retry_due_receipts,
+                        formation.retry_future_receipts,
+                        formation.expired_processing_receipts,
+                    ]
+                    .into_iter()
+                    .all(|count| count == 0)))
+    }
 }
 
 impl FormationStreamReadiness {
@@ -399,6 +459,7 @@ pub(crate) struct GateAudit {
     pub(crate) media_budget_drained: bool,
     pub(crate) leases_unexpired: bool,
     pub(crate) formation_quiescent: bool,
+    pub(crate) formation_activation_eligible: bool,
     pub(crate) reconciliation_quiescent: bool,
     pub(crate) finalization_claims_quiescent: bool,
     pub(crate) activation_ready_for_drain: bool,
@@ -407,6 +468,7 @@ pub(crate) struct GateAudit {
     pub(crate) orphan_erasures_quiescent: bool,
     pub(crate) orphan_erasures_complete: bool,
     pub(crate) capture_admission_unfenced: bool,
+    pub(crate) erasure_clear_for_activation: bool,
     pub(crate) ready_for_drain: bool,
     pub(crate) ready_for_active: bool,
 }
@@ -433,9 +495,9 @@ impl GateAudit {
 
     fn expected_ready_for_active(&self) -> bool {
         self.shared_transition_gates_hold()
-            && self.formation_quiescent
+            && self.formation_activation_eligible
             && self.activation_ready_for_active
-            && self.orphan_erasures_complete
+            && self.erasure_clear_for_activation
     }
 
     fn readiness_is_exact(&self) -> bool {
@@ -542,11 +604,18 @@ impl PostgresAggregateAuditReport {
 
     fn validate(&self, expected_since: &str) -> Result<(), AggregateAuditFailure> {
         if self.contract != POSTGRES_AGGREGATE_AUDIT_CONTRACT
-            || self.schema_version != 4
+            || self.schema_version != 5
+            || !self.source_isolation.valid()
+            || self.source_isolation.unsettled_accounts != self.formation.unresolved_source_accounts
+            || self.gates.formation_activation_eligible
+                != self
+                    .source_isolation
+                    .formation_eligible(&self.formation, self.gates.formation_quiescent)
             || !self.orphan_erasure.valid()
             || self.gates.orphan_erasures_quiescent != self.orphan_erasure.quiescent()
             || self.gates.orphan_erasures_complete != self.orphan_erasure.complete()
             || self.gates.capture_admission_unfenced != self.orphan_erasure.unfenced()
+            || self.gates.erasure_clear_for_activation != self.orphan_erasure.clear_for_activation()
             || !self.formation.stream_readiness.valid_counts()
             || self.capacity.projected_reconciliation_calls != self.reconciliation.candidate_drafts
             || self.capacity.projected_reconciliation_calls < self.capacity.projected_components
@@ -818,6 +887,15 @@ impl PostgresPersistence {
         &self,
         since: &str,
     ) -> Result<PostgresAggregateAuditReport, AggregateAuditFailure> {
+        // Keep the fixed multi-query snapshot state on the heap rather than
+        // multiplying its size in activation/control-plane caller futures.
+        Box::pin(self.aggregate_audit_snapshot(since)).await
+    }
+
+    async fn aggregate_audit_snapshot(
+        &self,
+        since: &str,
+    ) -> Result<PostgresAggregateAuditReport, AggregateAuditFailure> {
         parse_postgres_audit_since(since)?;
         let mut transaction = self.begin_aggregate_audit_transaction().await?;
         let erasure = orphan_capture_erasure_audit::snapshot(&mut transaction)
@@ -825,12 +903,19 @@ impl PostgresPersistence {
             .map_err(|_| AggregateAuditFailure::AuditFailed)?;
         let erasure_json =
             serde_json::to_string(&erasure).map_err(|_| AggregateAuditFailure::AuditFailed)?;
+        let isolation_json: String =
+            sqlx::query_scalar(include_str!("activation_source_isolation.sql"))
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| AggregateAuditFailure::AuditFailed)?;
         let queried = sqlx::query(AGGREGATE_AUDIT_SQL)
             .bind(since)
             .bind(erasure_json)
             .bind(erasure.quiescent())
             .bind(erasure.complete())
             .bind(erasure.unfenced())
+            .bind(isolation_json)
+            .bind(erasure.clear_for_activation())
             .fetch_all(&mut *transaction)
             .await;
         let rollback = transaction.rollback().await;
@@ -854,6 +939,236 @@ impl PostgresPersistence {
 }
 
 const AGGREGATE_AUDIT_SQL: &str = include_str!("aggregate_audit.sql");
+
+#[cfg(test)]
+async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
+    async fn read(connection: &mut sqlx::PgConnection) -> SourceIsolationAudit {
+        let payload: String = sqlx::query_scalar(include_str!("activation_source_isolation.sql"))
+            .fetch_one(connection)
+            .await
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+    let mut tx = persistence.pool().begin().await.unwrap();
+    let baseline = read(&mut tx).await;
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject)
+         VALUES('isolation-test','isolation@example.com','google','isolation-test');
+         INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,
+                                      ended_at,schema_version,created_at)
+         VALUES('isolation-test','old-session','device','install',now()-interval '20 days',
+                now()-interval '20 days',now()-interval '20 days',2,now()-interval '20 days');
+         INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind)
+         VALUES('isolation-test','old-stream','old-session','device','mac_screen');
+         INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,
+                stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,
+                timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,
+                media_disposition,received_at)
+         VALUES('isolation-test','old-event','device','install','old-session','old-stream',
+                'mac_screen',2,now()-interval '20 days','0',now()-interval '20 days',
+                now()-interval '20 days','UTC',0,0,'old-asset',repeat('a',64),'canonical',
+                now()-interval '20 days');
+         INSERT INTO capture_formation_receipts(account_id,capture_session_id,source_revision,
+                completed_revision,state,finish_requested_at,finish_request_provenance)
+         VALUES('isolation-test','old-session',1,0,'pending',now()-interval '20 days','finish_endpoint_v1');
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary)
+         VALUES('isolation-test',901,now()-interval '2 days',now()-interval '2 days','note','Synthetic','Synthetic');
+         INSERT INTO screenshots(account_id,id,captured_at)
+         VALUES('isolation-test',901,now()-interval '2 days');
+         INSERT INTO active_episode_members(account_id,episode_id,record_type,record_id)
+         VALUES('isolation-test',901,'screenshot',901);"
+    ).execute(&mut *tx).await.unwrap();
+    let isolated = read(&mut tx).await;
+    assert_eq!(
+        isolated.isolated_historical_sessions,
+        baseline.isolated_historical_sessions + 1
+    );
+    assert_eq!(isolated.unsettled_sessions, baseline.unsettled_sessions + 1);
+    assert_eq!(isolated.blocked_drafts, baseline.blocked_drafts);
+    assert_eq!(
+        isolated.conflicting_components,
+        baseline.conflicting_components
+    );
+    let erasure = orphan_capture_erasure_audit::snapshot(&mut tx)
+        .await
+        .unwrap();
+    let since: String = sqlx::query_scalar(
+        "SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    // The production aggregate consumes the same independently counted proof;
+    // raw unfinished formation must remain truthful when owner eligibility holds.
+    sqlx::query("SAVEPOINT readonly_audit")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL transaction_read_only=on")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let payload: String = sqlx::query_scalar(AGGREGATE_AUDIT_SQL)
+        .bind(&since)
+        .bind(serde_json::to_string(&erasure).unwrap())
+        .bind(erasure.quiescent())
+        .bind(erasure.complete())
+        .bind(erasure.unfenced())
+        .bind(serde_json::to_string(&isolated).unwrap())
+        .bind(erasure.clear_for_activation())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let report: PostgresAggregateAuditReport = serde_json::from_str(&payload).unwrap();
+    report.validate(&since).unwrap();
+    assert!(!report.gates.formation_quiescent);
+    assert!(report.gates.formation_activation_eligible);
+    sqlx::query("ROLLBACK TO SAVEPOINT readonly_audit")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // A member outside its owner's declared time window is still connected.
+    sqlx::query("UPDATE screenshots SET captured_at=now()-interval '20 days' WHERE account_id='isolation-test'")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        baseline.isolated_historical_sessions
+    );
+    sqlx::query("UPDATE screenshots SET captured_at=now()-interval '2 days' WHERE account_id='isolation-test'")
+        .execute(&mut *tx).await.unwrap();
+    // Unowned long intervals bridge components just as owned evidence does.
+    sqlx::query("INSERT INTO screenshots(account_id,id,captured_at,visible_until) VALUES('isolation-test',902,now()-interval '20 days',now()-interval '2 days')")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        baseline.isolated_historical_sessions
+    );
+    sqlx::query("DELETE FROM screenshots WHERE account_id='isolation-test' AND id=902")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Source-to-projection linkage is non-temporal, too.
+    sqlx::query(
+        "UPDATE screenshots SET source_key='cloud-v2:old-event' WHERE account_id='isolation-test'",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        baseline.isolated_historical_sessions
+    );
+    sqlx::query("UPDATE screenshots SET source_key=NULL WHERE account_id='isolation-test'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO visual_speaker_observations(account_id,id,event_id,screenshot_id,
+        observed_at,platform,displayed_name,normalized_name,highlight_state,confidence)
+        VALUES('isolation-test',901,'old-event',901,now(),'synthetic','Synthetic','synthetic','none',1)")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        baseline.isolated_historical_sessions
+    );
+    sqlx::query("DELETE FROM visual_speaker_observations WHERE account_id='isolation-test'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // A newly received event cannot be made historical by a backdated clock.
+    sqlx::query("UPDATE capture_events SET received_at=now() WHERE account_id='isolation-test'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        baseline.isolated_historical_sessions
+    );
+    sqlx::query("UPDATE capture_events SET received_at=now()-interval '20 days' WHERE account_id='isolation-test'")
+        .execute(&mut *tx).await.unwrap();
+    // An empty oldest draft cannot make progress in the retained v24 selector.
+    sqlx::query("DELETE FROM active_episode_members WHERE account_id='isolation-test'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        read(&mut tx).await.blocked_drafts,
+        baseline.blocked_drafts + 1
+    );
+    sqlx::query("INSERT INTO active_episode_members(account_id,episode_id,record_type,record_id) VALUES('isolation-test',901,'screenshot',901)")
+        .execute(&mut *tx).await.unwrap();
+    // Recent and open sessions, missing receipts, and malformed seals never qualify.
+    for sql in [
+        "UPDATE capture_sessions SET ended_at=NULL WHERE account_id='isolation-test'",
+        "UPDATE capture_formation_receipts SET seal_generation=1 WHERE account_id='isolation-test'",
+        "UPDATE capture_formation_receipts SET attempt_count=1 WHERE account_id='isolation-test'",
+        "DELETE FROM capture_formation_receipts WHERE account_id='isolation-test'",
+    ] {
+        sqlx::query("SAVEPOINT hostile")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(sql).execute(&mut *tx).await.unwrap();
+        assert_eq!(
+            read(&mut tx).await.isolated_historical_sessions,
+            baseline.isolated_historical_sessions
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT hostile")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    // Separate header components joined by an atom cannot make v24 progress.
+    sqlx::query("SAVEPOINT merged_headers")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::raw_sql("INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary)
+        VALUES('isolation-test',902,now()-interval '3 days',now()-interval '3 days','note','Synthetic','Synthetic');
+        INSERT INTO screenshots(account_id,id,captured_at,visible_until)
+        VALUES('isolation-test',902,now()-interval '3 days',now()-interval '2 days');
+        INSERT INTO active_episode_members(account_id,episode_id,record_type,record_id)
+        VALUES('isolation-test',902,'screenshot',902)")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(&mut tx).await.conflicting_components,
+        baseline.conflicting_components + 1
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT merged_headers")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Bounded does not mean silently truncated: exhaustion explicitly refuses.
+    sqlx::query("SAVEPOINT overflow")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO screenshots(account_id,id,captured_at)
+        SELECT 'isolation-test',id,now() FROM generate_series(1000,101000) id",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let overflow = read(&mut tx).await;
+    assert_eq!(overflow.inventory_rows, 100001);
+    assert!(!overflow.inventory_bounded);
+    assert!(!overflow.formation_eligible(&report.formation, false));
+    sqlx::query("ROLLBACK TO SAVEPOINT overflow")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Equal time in a different account is not a connection.
+    sqlx::raw_sql("INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES('isolation-other','other@example.com','google','isolation-other');
+        INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) VALUES('isolation-other',901,now()-interval '20 days',now()-interval '20 days','note','Synthetic','Synthetic');
+        INSERT INTO screenshots(account_id,id,captured_at) VALUES('isolation-other',901,now()-interval '20 days');
+        INSERT INTO active_episode_members(account_id,episode_id,record_type,record_id) VALUES('isolation-other',901,'screenshot',901);")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(&mut tx).await.isolated_historical_sessions,
+        isolated.isolated_historical_sessions
+    );
+    tx.rollback().await.unwrap();
+}
 
 #[cfg(test)]
 async fn test_real_pg_aggregate_audit_isolated(base: &PostgresPersistence) {
@@ -966,7 +1281,7 @@ async fn test_real_pg_aggregate_audit_inner(
     .unwrap();
     let report = persistence.aggregate_audit(&since).await.unwrap();
     assert_eq!(report.contract, POSTGRES_AGGREGATE_AUDIT_CONTRACT);
-    assert_eq!(report.schema_version, 4);
+    assert_eq!(report.schema_version, 5);
     assert!(report.orphan_erasure.schema_installed);
     assert!(report.transaction_read_only);
     assert_eq!(report.capture_events.groups.len(), 12);
@@ -986,6 +1301,7 @@ async fn test_real_pg_aggregate_audit_inner(
     );
 
     if isolated_gate_edges {
+        Box::pin(test_activation_source_isolation(persistence)).await;
         Box::pin(test_source_bounded_capacity(persistence, &since)).await;
         Box::pin(test_account_amortized_capacity(persistence, &since)).await;
         Box::pin(test_deletion_stable_capacity(persistence, &since)).await;
@@ -2340,6 +2656,7 @@ mod tests {
             media_budget_drained: true,
             leases_unexpired: true,
             formation_quiescent: false,
+            formation_activation_eligible: false,
             reconciliation_quiescent: true,
             finalization_claims_quiescent: true,
             activation_ready_for_drain: true,
@@ -2348,6 +2665,7 @@ mod tests {
             orphan_erasures_quiescent: true,
             orphan_erasures_complete: true,
             capture_admission_unfenced: true,
+            erasure_clear_for_activation: true,
             ready_for_drain: true,
             ready_for_active: false,
         }
@@ -2399,6 +2717,7 @@ mod tests {
         assert!(draining.readiness_is_exact());
         assert!(!draining.expected_ready_for_active());
         draining.formation_quiescent = true;
+        draining.formation_activation_eligible = true;
         assert!(!draining.readiness_is_exact());
         draining.ready_for_active = true;
         assert!(draining.readiness_is_exact());
@@ -2414,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_requires_exact_erasure_counts_without_fencing_prelaunch_active() {
+    fn v5_requires_exact_erasure_counts_without_fencing_prelaunch_active() {
         let report: PostgresAggregateAuditReport =
             serde_json::from_str(include_str!("aggregate_audit_fixture.json")).unwrap();
         let mut fenced = report.clone();

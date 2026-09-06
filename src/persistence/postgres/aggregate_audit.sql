@@ -1277,15 +1277,41 @@ gate_facts AS MATERIALIZED (
            finalization_facts finalization,activation_facts activation,
            capacity_facts capacity,provider_activity_facts provider
 ),
+owner_gate AS MATERIALIZED (
+    SELECT gate_facts.*,
+           ($6::jsonb->>'inventory_bounded')::boolean
+             AND ($6::jsonb->>'blocked_drafts')::bigint=0
+             AND ($6::jsonb->>'conflicting_components')::bigint=0
+             AND (formation_quiescent OR (
+                 ($6::jsonb->>'isolated_historical_sessions')::bigint BETWEEN 1 AND 4
+                 AND ($6::jsonb->>'isolated_historical_sessions')::bigint=
+                     ($6::jsonb->>'unsettled_sessions')::bigint
+                 AND formation.finished_dirty_receipts=
+                     ($6::jsonb->>'isolated_historical_sessions')::bigint
+                 AND formation.seal_pending_receipts=
+                     ($6::jsonb->>'isolated_historical_sessions')::bigint
+                 AND formation.ended_without_finish_receipts=0
+                 AND formation.nonterminal_pages_for_finished_receipts=0
+                 AND formation.staged_response_pages=0
+                 AND formation.legacy_processing_claims=0
+                 AND formation.legacy_expired_claims=0
+                 AND formation.legacy_retry_due_claims=0
+                 AND formation.legacy_retry_future_claims=0
+                 AND formation.retry_due_receipts=0
+                 AND formation.retry_future_receipts=0
+                 AND formation.expired_processing_receipts=0)) AS formation_activation_eligible
+      FROM gate_facts,formation_facts formation
+),
 gate_results AS MATERIALIZED (
     SELECT domain_clean,quota_invariants_hold,provider_quiescent,
-           media_budget_drained,leases_unexpired,formation_quiescent,
+           media_budget_drained,leases_unexpired,formation_quiescent,formation_activation_eligible,
            reconciliation_quiescent,finalization_claims_quiescent,
            activation_ready_for_drain,activation_ready_for_active,
            capacity_sufficient,
            $3::boolean AS orphan_erasures_quiescent,
            $4::boolean AS orphan_erasures_complete,
            $5::boolean AS capture_admission_unfenced,
+           $7::boolean AS erasure_clear_for_activation,
            -- Historical finish import and the first immutable capture seal are
            -- deliberately forbidden until signed Draining proves the predecessor
            -- fleet is gone. Keep their independently reported formation gate for
@@ -1296,14 +1322,14 @@ gate_results AS MATERIALIZED (
              AND reconciliation_quiescent AND finalization_claims_quiescent
              AND activation_ready_for_drain AND capacity_sufficient AND $3::boolean AS ready_for_drain,
            domain_clean AND quota_invariants_hold AND provider_quiescent
-             AND media_budget_drained AND leases_unexpired AND formation_quiescent
+             AND media_budget_drained AND leases_unexpired AND formation_activation_eligible
              AND reconciliation_quiescent AND finalization_claims_quiescent
-             AND activation_ready_for_active AND capacity_sufficient AND $3::boolean AND $4::boolean AS ready_for_active
-      FROM gate_facts
+             AND activation_ready_for_active AND capacity_sufficient AND $3::boolean AND $7::boolean AS ready_for_active
+      FROM owner_gate
 )
 SELECT jsonb_build_object(
-    'contract','kioku.postdeploy.aggregate-audit.v4',
-    'schema_version',4,
+    'contract','kioku.postdeploy.aggregate-audit.v5',
+    'schema_version',5,
     'observed_at',to_char(audit_window.observed_at AT TIME ZONE 'UTC',
                           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'since',audit_window.raw_since,
@@ -1311,6 +1337,7 @@ SELECT jsonb_build_object(
     'transaction_read_only',audit_window.transaction_read_only,
     'provider_activity',(SELECT to_jsonb(provider) FROM provider_activity_facts provider),
     'orphan_erasure',$2::jsonb,
+    'source_isolation',$6::jsonb,
     'activation',to_jsonb(activation),
     'capture_events',to_jsonb(capture),
     'media',to_jsonb(media),
