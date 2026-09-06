@@ -12,6 +12,17 @@ receipted expand declared compatible by the candidate.
   synthetic local verification; production operator/provider delivery is pending.
   It has not been released, installed in production, or executed on owner data.
 
+- `0027_memory_reconciliation_activation_epoch.sql` is the one-time signed
+  dormant v1 Draining/g1 to v2 Draining/g2 upgrade. It preserves the frozen v1
+  installer, original contract row and every historical event byte. An immutable
+  signed epoch row anchors the original append-function definition and exact prior
+  receipt/catalog/image, with a deferred FK requiring its matching g2 event in the
+  same transaction. Only that exact signed event gains the additional D-to-D edge;
+  producer, location, model, scope and all ordinary transition fences remain intact.
+  The fixed DDL preview always rolls back and verifies the old state from a distinct
+  physical backend. Publication/serving rollout and the later v2 Active receipt
+  remain separately verified operations; this file never activates reconciliation.
+
 - `0001_identity_oauth.sql` creates the account, identity, Apple credential,
   signup-budget, OAuth client/consent/code, and refresh-token foundation.
 - `0002_entitlements.sql` adds tenant-scoped, fleet-wide daily quota and Vertex

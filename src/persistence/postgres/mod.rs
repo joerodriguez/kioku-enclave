@@ -33,6 +33,7 @@ mod orphan_capture_erasure_scope;
 mod orphan_capture_erasure_tests;
 mod playback;
 mod query;
+mod reconciliation_source_audit;
 mod recording_retention;
 mod schema_release;
 mod work;

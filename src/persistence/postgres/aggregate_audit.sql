@@ -1279,18 +1279,11 @@ gate_facts AS MATERIALIZED (
 ),
 owner_gate AS MATERIALIZED (
     SELECT gate_facts.*,
-           ($6::jsonb->>'inventory_bounded')::boolean
-             AND ($6::jsonb->>'blocked_drafts')::bigint=0
-             AND ($6::jsonb->>'conflicting_components')::bigint=0
-             AND (formation_quiescent OR (
-                 ($6::jsonb->>'isolated_historical_sessions')::bigint BETWEEN 1 AND 4
-                 AND ($6::jsonb->>'isolated_historical_sessions')::bigint=
-                     ($6::jsonb->>'unsettled_sessions')::bigint
-                 AND formation.finished_dirty_receipts=
-                     ($6::jsonb->>'isolated_historical_sessions')::bigint
-                 AND formation.seal_pending_receipts=
-                     ($6::jsonb->>'isolated_historical_sessions')::bigint
-                 AND formation.ended_without_finish_receipts=0
+           ($8::jsonb->>'inventory_bounded')::boolean
+             AND ($8::jsonb->>'blocked_components')::bigint=0
+             AND ($8::jsonb->>'oversized_components')::bigint=0
+             AND ($8::jsonb->>'max_components_per_account')::bigint<=
+                 ($8::jsonb->>'sweep_component_limit')::bigint
                  AND formation.nonterminal_pages_for_finished_receipts=0
                  AND formation.staged_response_pages=0
                  AND formation.legacy_processing_claims=0
@@ -1299,7 +1292,7 @@ owner_gate AS MATERIALIZED (
                  AND formation.legacy_retry_future_claims=0
                  AND formation.retry_due_receipts=0
                  AND formation.retry_future_receipts=0
-                 AND formation.expired_processing_receipts=0)) AS formation_activation_eligible
+                 AND formation.expired_processing_receipts=0 AS formation_activation_eligible
       FROM gate_facts,formation_facts formation
 ),
 gate_results AS MATERIALIZED (
@@ -1328,8 +1321,8 @@ gate_results AS MATERIALIZED (
       FROM owner_gate
 )
 SELECT jsonb_build_object(
-    'contract','kioku.postdeploy.aggregate-audit.v5',
-    'schema_version',5,
+    'contract','kioku.postdeploy.aggregate-audit.v6',
+    'schema_version',6,
     'observed_at',to_char(audit_window.observed_at AT TIME ZONE 'UTC',
                           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'since',audit_window.raw_since,
@@ -1338,6 +1331,7 @@ SELECT jsonb_build_object(
     'provider_activity',(SELECT to_jsonb(provider) FROM provider_activity_facts provider),
     'orphan_erasure',$2::jsonb,
     'source_isolation',$6::jsonb,
+    'source_graph',$8::jsonb,
     'activation',to_jsonb(activation),
     'capture_events',to_jsonb(capture),
     'media',to_jsonb(media),

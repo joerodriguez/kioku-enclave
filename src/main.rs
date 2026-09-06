@@ -1429,6 +1429,8 @@ const MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM: &str = "memory-reconciliat
 const MEMORY_RECONCILIATION_ACTIVATE_CONFIRM: &str = "memory-reconciliation-v27-activate";
 const MEMORY_RECONCILIATION_PAUSE_CONFIRM: &str = "memory-reconciliation-v27-pause";
 const MEMORY_RECONCILIATION_RESUME_CONFIRM: &str = "memory-reconciliation-v27-resume";
+const MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM: &str = "memory-reconciliation-v27-epoch-preview";
+const MEMORY_RECONCILIATION_EPOCH_UPGRADE_CONFIRM: &str = "memory-reconciliation-v27-upgrade-epoch";
 const POSTGRES_FINALIZATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_RECEIPT";
 const POSTGRES_FINALIZATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_FINALIZATION_SIGNATURE";
 const POSTGRES_ACTIVATION_RECEIPT_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_RECEIPT";
@@ -1449,6 +1451,8 @@ enum PostgresMigrationReleasePhase {
     ActivateMemoryReconciliation,
     PauseMemoryReconciliation,
     ResumeMemoryReconciliation,
+    PreviewMemoryReconciliationEpoch,
+    UpgradeMemoryReconciliationEpoch,
 }
 
 impl PostgresMigrationReleasePhase {
@@ -1460,6 +1464,7 @@ impl PostgresMigrationReleasePhase {
                 | Self::ActivateMemoryReconciliation
                 | Self::PauseMemoryReconciliation
                 | Self::ResumeMemoryReconciliation
+                | Self::UpgradeMemoryReconciliationEpoch
         )
     }
 }
@@ -1468,6 +1473,12 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some(MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch)
+        }
+        Some(MEMORY_RECONCILIATION_EPOCH_UPGRADE_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::UpgradeMemoryReconciliationEpoch)
+        }
         Some(ORPHAN_CAPTURE_ERASURE_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::OrphanCaptureErasure)
         }
@@ -1504,6 +1515,50 @@ fn postgres_migration_release_phase(
     }
 }
 
+fn postgres_memory_reconciliation_transition_authorized(
+    receipt: &persistence::MemoryReconciliationActivationReceipt,
+    phase: PostgresMigrationReleasePhase,
+) -> bool {
+    let epoch_upgrade = receipt.contract_version == 2
+        && receipt.generation == 2
+        && receipt.epoch_upgrade.is_some()
+        && receipt.previous_phase == "draining"
+        && receipt.requested_phase == "draining";
+    match phase {
+        PostgresMigrationReleasePhase::UpgradeMemoryReconciliationEpoch => epoch_upgrade,
+        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation => {
+            receipt.requested_phase == "draining"
+                && matches!(receipt.previous_phase.as_str(), "installed" | "paused")
+        }
+        PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope => {
+            epoch_upgrade
+                || (receipt.requested_phase == "draining"
+                    && matches!(receipt.previous_phase.as_str(), "installed" | "paused"))
+        }
+        PostgresMigrationReleasePhase::ActivateMemoryReconciliation => {
+            // The migrator is the only production transition caller. Historical
+            // v1 verification/recovery remains valid, but this image cannot turn
+            // on the old serving epoch or bypass the reviewed v2 upgrade.
+            receipt.contract_version == 2
+                && receipt.generation >= 3
+                && receipt.epoch_upgrade.is_none()
+                && receipt.previous_phase == "draining"
+                && receipt.requested_phase == "active"
+        }
+        PostgresMigrationReleasePhase::PauseMemoryReconciliation => {
+            receipt.previous_phase == "active" && receipt.requested_phase == "paused"
+        }
+        PostgresMigrationReleasePhase::ResumeMemoryReconciliation => {
+            receipt.contract_version == 2
+                && receipt.generation >= 3
+                && receipt.epoch_upgrade.is_none()
+                && receipt.previous_phase == "paused"
+                && receipt.requested_phase == "active"
+        }
+        _ => false,
+    }
+}
+
 fn postgres_memory_reconciliation_activation_receipt(
     raw_receipt: Option<&str>,
     raw_signature: Option<&str>,
@@ -1518,24 +1573,7 @@ fn postgres_memory_reconciliation_activation_receipt(
             "{POSTGRES_ACTIVATION_RECEIPT_ENV} must contain the strict activation receipt: {error}"
         )
         })?;
-    let expected_transition = match phase {
-        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation
-        | PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope => {
-            receipt.requested_phase == "draining"
-                && matches!(receipt.previous_phase.as_str(), "installed" | "paused")
-        }
-        PostgresMigrationReleasePhase::ActivateMemoryReconciliation => {
-            receipt.previous_phase == "draining" && receipt.requested_phase == "active"
-        }
-        PostgresMigrationReleasePhase::PauseMemoryReconciliation => {
-            receipt.previous_phase == "active" && receipt.requested_phase == "paused"
-        }
-        PostgresMigrationReleasePhase::ResumeMemoryReconciliation => {
-            receipt.previous_phase == "paused" && receipt.requested_phase == "active"
-        }
-        _ => false,
-    };
-    if !expected_transition {
+    if !postgres_memory_reconciliation_transition_authorized(&receipt, phase) {
         return Err(format!(
             "{POSTGRES_ACTIVATION_RECEIPT_ENV} does not authorize the confirmed transition"
         ));
@@ -1694,6 +1732,7 @@ async fn migrate_postgres_release_schema() {
                 .map(|result| serde_json::to_value(result).expect("repair result must serialize"))
         }
         PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation
+        | PostgresMigrationReleasePhase::UpgradeMemoryReconciliationEpoch
         | PostgresMigrationReleasePhase::ActivateMemoryReconciliation
         | PostgresMigrationReleasePhase::PauseMemoryReconciliation
         | PostgresMigrationReleasePhase::ResumeMemoryReconciliation => persistence
@@ -1704,6 +1743,11 @@ async fn migrate_postgres_release_schema() {
             )
             .await
             .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch => {
+            persistence
+                .preview_memory_reconciliation_activation_epoch()
+                .await
+        }
     }
     .unwrap_or_else(|error| panic!("PostgreSQL migration phase failed: {error}"));
     println!(
@@ -1720,7 +1764,8 @@ mod postgres_migration_release_tests {
         MEMORY_RECONCILIATION_ACTIVATE_CONFIRM, MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
         MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
         MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
-        MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
+        MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM, MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM,
+        MEMORY_RECONCILIATION_EPOCH_UPGRADE_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
         MEMORY_RECONCILIATION_FINALIZE_CONFIRM, MEMORY_RECONCILIATION_PAUSE_CONFIRM,
         MEMORY_RECONCILIATION_RESUME_CONFIRM, ORPHAN_CAPTURE_ERASURE_CONFIRM,
     };
@@ -1768,6 +1813,14 @@ mod postgres_migration_release_tests {
                 MEMORY_RECONCILIATION_RESUME_CONFIRM,
                 PostgresMigrationReleasePhase::ResumeMemoryReconciliation,
             ),
+            (
+                MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM,
+                PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch,
+            ),
+            (
+                MEMORY_RECONCILIATION_EPOCH_UPGRADE_CONFIRM,
+                PostgresMigrationReleasePhase::UpgradeMemoryReconciliationEpoch,
+            ),
         ] {
             assert_eq!(
                 postgres_migration_release_phase(Some(confirmation)).unwrap(),
@@ -1781,6 +1834,9 @@ mod postgres_migration_release_tests {
             Some("memory-reconciliation-v26"),
             Some("orphan-capture-erasure-v1 "),
             Some("orphan-capture-erasure"),
+            Some("memory-reconciliation-v27-epoch-preview "),
+            Some("memory-reconciliation-v27-upgrade-epoch "),
+            Some("memory-reconciliation-v27-epoch-upgrade"),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }
@@ -1788,13 +1844,19 @@ mod postgres_migration_release_tests {
 
     #[test]
     fn activation_transition_requires_the_exact_confirmation_domain() {
+        assert!(
+            !PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch
+                .requires_activation_receipt()
+        );
         for phase in [
+            PostgresMigrationReleasePhase::UpgradeMemoryReconciliationEpoch,
             PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope,
             PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation,
             PostgresMigrationReleasePhase::ActivateMemoryReconciliation,
             PostgresMigrationReleasePhase::PauseMemoryReconciliation,
             PostgresMigrationReleasePhase::ResumeMemoryReconciliation,
         ] {
+            assert!(phase.requires_activation_receipt());
             assert!(postgres_memory_reconciliation_activation_receipt(None, None, phase).is_err());
             assert!(postgres_memory_reconciliation_activation_receipt(
                 Some("{}"),

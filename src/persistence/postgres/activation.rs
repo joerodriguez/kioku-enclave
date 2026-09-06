@@ -21,6 +21,9 @@ use super::{
     PostgresPersistence, EXPECTED_SCHEMA_VERSION, MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION,
 };
 
+#[path = "activation_epoch.rs"]
+mod epoch;
+
 #[cfg(test)]
 use crate::cp::isotime;
 
@@ -694,12 +697,28 @@ async fn ensure_pristine_reserved_catalog_namespace(connection: &mut PgConnectio
     Ok(())
 }
 
-async fn catalog_digest(connection: &mut PgConnection) -> Result<Vec<u8>> {
+async fn base_catalog_evidence(connection: &mut PgConnection) -> Result<String> {
     ensure_reserved_catalog_manifest(connection).await?;
-    let evidence: String = sqlx::query_scalar(CATALOG_EVIDENCE_SQL)
+    Ok(sqlx::query_scalar(CATALOG_EVIDENCE_SQL)
         .fetch_one(connection)
-        .await?;
-    Ok(Sha256::digest(evidence.as_bytes()).to_vec())
+        .await?)
+}
+
+async fn current_contract_digest(connection: &mut PgConnection) -> Result<Vec<u8>> {
+    Ok(if epoch::present(connection).await? {
+        epoch::contract_digest()
+    } else {
+        activation_contract_digest()
+    })
+}
+
+async fn catalog_digest(connection: &mut PgConnection) -> Result<Vec<u8>> {
+    let evidence = base_catalog_evidence(connection).await?;
+    if epoch::present(connection).await? {
+        epoch::catalog_digest(connection, &evidence).await
+    } else {
+        Ok(Sha256::digest(evidence.as_bytes()).to_vec())
+    }
 }
 
 pub(super) async fn activation_contract_exists(connection: &mut PgConnection) -> Result<bool> {
@@ -844,7 +863,12 @@ async fn verify_contract_and_events(
     base_receipt_sha256: &[u8],
 ) -> Result<ActivationState> {
     let expected_contract = activation_contract_digest();
-    let expected_catalog = catalog_digest(connection).await?;
+    let base_evidence = base_catalog_evidence(connection).await?;
+    let epoch = epoch::verified_context(connection, &base_evidence).await?;
+    let expected_catalog = epoch.as_ref().map_or_else(
+        || Sha256::digest(base_evidence.as_bytes()).to_vec(),
+        |epoch| epoch.prior_catalog.clone(),
+    );
     let contract = sqlx::query(
         "SELECT protocol_version,base_schema_version,target_schema_version,contract_sha256, \
                 catalog_sha256,base_finalization_receipt_sha256 \
@@ -921,11 +945,47 @@ async fn verify_contract_and_events(
                 )?;
             let signed = verified.receipt();
             let computed_digest = Sha256::digest(verified.canonical_bytes()).to_vec();
+            let (event_contract, event_catalog, event_version) = if generation >= 2 {
+                epoch.as_ref().map_or_else(
+                    || (expected_contract.clone(), expected_catalog.clone(), 1),
+                    |epoch| (epoch::contract_digest(), epoch.current_catalog.clone(), 2),
+                )
+            } else {
+                (expected_contract.clone(), expected_catalog.clone(), 1)
+            };
+            if let Some(epoch) = &epoch {
+                if generation == 2
+                    && (signed != epoch.authorization.receipt()
+                        || state.as_ref().is_none_or(|prior: &ActivationState| {
+                            signed.epoch_upgrade.as_ref().is_none_or(|upgrade| {
+                                prior.receipt_sha256.as_deref().map(sha256_label).as_deref()
+                                    != Some(&upgrade.prior_receipt_sha256)
+                                    || prior.candidate_fleet_image_digest.as_deref()
+                                        != Some(&upgrade.prior_candidate_fleet_image_digest)
+                                    || prior.rollout_basis_points != signed.rollout_basis_points
+                                    || prior.rollout_seed != signed.rollout_seed
+                                    || prior.explicit_canary_account_ids
+                                        != signed.explicit_canary_account_ids
+                                    || prior.reconciliation_producer_contract_sha256.as_deref()
+                                        != Some(&signed.reconciliation_producer_contract_sha256)
+                                    || prior.reconciliation_model.as_deref()
+                                        != Some(&signed.reconciliation_model)
+                                    || prior.vertex_location.as_deref()
+                                        != Some(&signed.vertex_location)
+                            })
+                        }))
+                {
+                    return Err(EnclaveError::Config(
+                        "activation epoch edge does not match immutable history".into(),
+                    ));
+                }
+            }
             if signed.generation != generation
+                || signed.contract_version != event_version
                 || signed.previous_phase != previous_phase
                 || signed.requested_phase != next_phase
-                || signed.activation_contract_sha256 != sha256_label(&expected_contract)
-                || signed.activation_catalog_sha256 != sha256_label(&expected_catalog)
+                || signed.activation_contract_sha256 != sha256_label(&event_contract)
+                || signed.activation_catalog_sha256 != sha256_label(&event_catalog)
                 || signed.base_finalization_receipt_sha256 != sha256_label(base_receipt_sha256)
                 || receipt_sha256.as_deref() != Some(computed_digest.as_slice())
                 || row.try_get::<Vec<u8>, _>("receipt_key_sha256")? != verified.key_sha256()
@@ -1252,7 +1312,7 @@ pub(super) async fn verify_erasure_activation_binding(
         || state.phase.as_str() != binding.phase
         || state.candidate_fleet_image_digest.as_deref()
             != Some(binding.candidate_image_digest.as_str())
-        || sha256_label(&activation_contract_digest()) != binding.contract_sha256
+        || sha256_label(&current_contract_digest(connection).await?) != binding.contract_sha256
         || sha256_label(&catalog_digest(connection).await?) != binding.catalog_sha256
         || state.receipt_sha256.as_deref().map(sha256_label).as_deref()
             != Some(binding.receipt_sha256.as_str())
@@ -2149,7 +2209,7 @@ async fn release_result(
         finalization_claim_drain_complete: drain.complete,
         finalization_claims_scanned: drain.claims_scanned,
         finalization_claims_revoked: drain.claims_revoked,
-        contract_sha256: sha256_label(&activation_contract_digest()),
+        contract_sha256: sha256_label(&current_contract_digest(connection).await?),
         catalog_sha256: sha256_label(&catalog_digest(connection).await?),
         base_finalization_receipt_sha256: sha256_label(&base),
         receipt_sha256: activation.receipt_sha256,
@@ -2389,12 +2449,26 @@ impl PostgresPersistence {
         let (base, current) = verify_activation_and_base_release(&mut transaction).await?;
         let signed = authorization.receipt();
         let requested = phase(&signed.requested_phase)?;
+        let prior_append_definition = if signed.epoch_upgrade.is_some() {
+            require_formation_backfill_complete(&mut transaction, Some(1)).await?;
+            require_finalization_claim_drain_complete(&mut transaction, Some(1)).await?;
+            require_zero_scoped_draft_claims(&mut transaction, &current).await?;
+            Some(epoch::prepare_upgrade(&mut transaction, &current, signed).await?)
+        } else {
+            None
+        };
         if requested == MemoryReconciliationActivationPhase::Active {
             super::orphan_capture_erasure::require_no_pending_erasures(&mut transaction).await?;
         }
-        let expected_contract = activation_contract_digest();
+        let expected_contract = current_contract_digest(&mut transaction).await?;
         let expected_catalog = catalog_digest(&mut transaction).await?;
-        if signed.generation != current.generation + 1
+        let expected_version = if epoch::present(&mut transaction).await? {
+            2
+        } else {
+            1
+        };
+        if signed.contract_version != expected_version
+            || signed.generation != current.generation + 1
             || signed.previous_phase != current.phase.as_str()
             || signed.activation_contract_sha256 != sha256_label(&expected_contract)
             || signed.activation_catalog_sha256 != sha256_label(&expected_catalog)
@@ -2488,6 +2562,9 @@ impl PostgresPersistence {
         let receipt_digest = Sha256::digest(authorization.canonical_bytes()).to_vec();
         let receipt_json = std::str::from_utf8(authorization.canonical_bytes())
             .map_err(|_| EnclaveError::Config("activation receipt is not UTF-8".into()))?;
+        if let Some(prior_definition) = &prior_append_definition {
+            epoch::append_authority(&mut transaction, authorization, prior_definition).await?;
+        }
         sqlx::query(
             "INSERT INTO persistence_feature_activation_events( \
                  feature,generation,previous_phase,phase,rollout_basis_points,rollout_seed, \
@@ -2651,13 +2728,18 @@ async fn test_transition_authorization_with_candidate_digest(
         .as_millis() as i64;
     let receipt = super::schema_release::MemoryReconciliationActivationReceipt {
         contract: "kioku.postgresql.memory-reconciliation-activation".into(),
-        contract_version: 1,
+        contract_version: if epoch::present(&mut connection).await? {
+            2
+        } else {
+            1
+        },
+        epoch_upgrade: None,
         generation,
         previous_phase: previous_phase.into(),
         requested_phase: requested_phase.into(),
         base_schema_version: EXPECTED_SCHEMA_VERSION,
         target_schema_version: MEMORY_RECONCILIATION_ACTIVATION_SCHEMA_VERSION,
-        activation_contract_sha256: sha256_label(&activation_contract_digest()),
+        activation_contract_sha256: sha256_label(&current_contract_digest(&mut connection).await?),
         activation_catalog_sha256: sha256_label(&catalog_digest(&mut connection).await?),
         base_finalization_receipt_sha256: sha256_label(&base),
         reconciliation_producer_contract_sha256: sha256_label(&producer_contract),
@@ -4617,12 +4699,22 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         )
         .await?;
 
+    Box::pin(super::memory_reconciliation::test_source_closed_components(
+        persistence,
+    ))
+    .await?;
     sqlx::raw_sql(
         "INSERT INTO screenshots(account_id,id,captured_at,active_app,ocr_text,source_key) \
          VALUES('activation-contract-account',100,'2026-08-31T10:00:30Z', \
-                'Notes','provider lock order','activation-lock-source'); \
+                'Notes','provider lock order','activation-lock-source'), \
+               ('activation-contract-account',101,'2026-08-31T10:04:30Z', \
+                'Notes','provider lock order peer','activation-lock-peer'), \
+               ('activation-contract-account',102,'2026-08-31T10:08:30Z', \
+                'Notes','provider lock order peer','activation-lock-deletion-peer'); \
          INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
-         VALUES('activation-contract-account',1,'screenshot',100);",
+         VALUES('activation-contract-account',1,'screenshot',100), \
+               ('activation-contract-account',3,'screenshot',101), \
+               ('activation-contract-account',92,'screenshot',102);",
     )
     .execute(persistence.pool())
     .await?;
@@ -5662,6 +5754,12 @@ async fn test_signed_orphan_schema_install(
 /// making the main reusable contract database irreversible.
 #[cfg(test)]
 pub(super) async fn test_real_pg_activation_contract(base: &PostgresPersistence) {
+    test_isolated_activation_contract(base, false).await;
+    test_isolated_activation_contract(base, true).await;
+}
+
+#[cfg(test)]
+async fn test_isolated_activation_contract(base: &PostgresPersistence, epoch_only: bool) {
     use std::{str::FromStr as _, time::Duration};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -5695,7 +5793,11 @@ pub(super) async fn test_real_pg_activation_contract(base: &PostgresPersistence)
         persistence.migrate().await?;
         // This broad contract is also nested inside the exhaustive control-plane
         // future. Keep its state off that test thread's bounded stack.
-        Box::pin(test_real_pg_activation_contract_inner(&persistence)).await
+        if epoch_only {
+            Box::pin(epoch::test_epoch_contract_inner(&persistence)).await
+        } else {
+            Box::pin(test_real_pg_activation_contract_inner(&persistence)).await
+        }
     }
     .await;
     persistence.pool.close().await;

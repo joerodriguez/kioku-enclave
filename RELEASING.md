@@ -152,7 +152,7 @@ phase selectors for execution/recovery; no arbitrary image or SQL override is pe
 does not authorize a serving-runtime change within the current Draining cycle. See the deployment
 repository's [activation contract](https://github.com/joerodriguez/kioku/blob/main/docs/adr/0043-source-settled-memory-reconciliation-and-durable-links.md).
 
-The fixed read-only aggregate audit now emits `kioku.postdeploy.aggregate-audit.v4`. Its
+The fixed read-only aggregate audit now emits `kioku.postdeploy.aggregate-audit.v6`. Its
 `formation.stream_readiness` counts all streams in ended, finish-receipted sessions awaiting seal
 finalization. It compares committed watermarks with the same accepted-maximum and contiguous-prefix
 functions used by formation/sealing, and separately counts sealed-watermark disagreement and live-only
@@ -161,7 +161,55 @@ readiness gate. They expose neither content nor identifiers and remain inside th
 repeatable-read, read-only, rollback-only audit transaction. The v4 snapshot also independently
 verifies the orphan-erasure catalog and distinguishes pending, complete-but-capture-fenced, and
 fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
-evidence is not v4 evidence and cannot authorize the new erasure completion gates.
+evidence is not v6 evidence and cannot authorize the new release's gates.
+
+### v0.9.30 source-closed serving and dormant activation epoch
+
+V6 preserves all raw v5 diagnostics and adds `source_graph`, derived by the exact
+same account-qualified complete component query used by both runtime selection
+lanes and every normal snapshot revalidation. Whole capture horizons, canonical
+cross-session families and all five projection routes connect candidate drafts.
+Unfinished sources hold their entire component; later independent settled components
+remain reachable. The owner-prelaunch eligibility gate requires complete inventory,
+no empty/conflicted/oversized candidate component, at most eight components per
+account (the runtime sweep bound), and zero staged/processing/retry formation work.
+All capacity, provider, quota, lease and other domain gates remain mandatory.
+This is a point-in-time bounded reachability proof, not source completion or an
+unbounded liveness promise. A later accumulation beyond eight held components
+fails closed and requires fresh review; old v24 serving cannot consume v6 authority.
+
+The previously frozen v1 Draining/g1 candidate must not be transiently activated
+to change its serving image. The narrowly reviewed source-compatible ADR-0041
+dormant rollout window instead permits exactly the signed predecessor/candidate
+pair while Draining (or Paused), preserving schema/API, model, location, producer
+and all runtime admission fences. Its reviewed source/plan and exact KMS pair
+authorize that bounded deployment; historical g1 remains an observation of the
+old image, never a claim that it attests the new fleet. This exception is not
+available while Active. Install the neutral signed orphan-erasure schema before
+starting v0.9.30 serving; install alone fences/deletes no owner capture.
+
+After standard freezing/preauthorization/rolling/retiring/steady, fresh continuous
+readiness and homogeneous sole-candidate proof, use the ordinary no-retry migrator
+with `memory-reconciliation-v27-epoch-preview`. It runs only the baked one-time
+DDL under the release lock, verifies the unchanged v1 catalog subset, rolls back
+the whole transaction, and re-reads the original state using a separately held
+physical PostgreSQL connection. The content-free proposal binds old receipt,
+contract/catalog/image, new contract/catalog, base receipt and DDL/query hashes.
+It changes no activation event, owner data or durable schema.
+
+The separately signed canonical v2 receipt for
+`memory-reconciliation-v27-upgrade-epoch` authorizes only Draining/g1 to Draining/g2,
+binds that proposal and the newly observed homogeneous signed fleet, and preserves
+the exact old scope/seed/model/location/producer. It atomically appends an immutable
+epoch authority and matching event while retaining the original contract row and
+historical bytes. No `UPDATE` of history, arbitrary SQL or unsigned phase override
+is allowed. Complete the normal generation-2 backfill/claim drain, collect fresh
+v6/client/fleet roots plus a finalized/nonselectable protected-control proof, then
+sign ordinary v2 Active/g3 and its adjacent contingency Pause. This image's CLI
+refuses legacy v1 receipts for both Draining-to-Active and Paused-to-Active. The internal transition repository
+is deliberately not exposed to serving routes. Exact historical g2 repair remains
+available but is not an epoch replay or a transition. Pass immediate and quiescent
+protected-control canaries before declaring activation complete.
 
 ### v0.9.28 erasure-admission prerequisite
 

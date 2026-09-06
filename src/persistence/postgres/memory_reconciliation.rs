@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -35,6 +36,12 @@ use super::{
     PostgresPersistence,
 };
 
+#[cfg(test)]
+#[path = "reconciliation_source_components_tests.rs"]
+mod source_component_tests;
+#[cfg(test)]
+pub(super) use source_component_tests::test_source_closed_components;
+
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
 const MAX_DRAFTS: i64 = 32;
 const MAX_ATOMS: i64 = 4_000;
@@ -42,6 +49,62 @@ const MAX_SOURCE_SESSIONS: usize = 256;
 const MAX_CANDIDATE_HEADERS: usize = 257;
 const NEIGHBORHOOD_PAGE_SIZE: i64 = 256;
 const NEIGHBORHOOD_MAX_PAGES_PER_INVOCATION: usize = 4;
+const MAX_SOURCE_COMPONENT_INVENTORY: i64 = 100_000;
+pub(super) const MAX_SOURCE_COMPONENTS_PER_SWEEP: usize = 8;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceClosedComponent {
+    started_ms: i64,
+    ended_ms: i64,
+    draft_ids: Vec<i64>,
+    atoms: i64,
+    sessions: i64,
+    blocked_drafts: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceComponentInventory {
+    inventory_rows: i64,
+    components: Vec<SourceClosedComponent>,
+}
+
+async fn source_closed_components(
+    connection: &mut PgConnection,
+    account_id: &str,
+) -> Result<SourceComponentInventory> {
+    let payload: String = sqlx::query_scalar(concat!(
+        include_str!("reconciliation_source_components.sql"),
+        "SELECT jsonb_build_object( \
+            'inventory_rows',(SELECT count(*)::bigint FROM inventory), \
+            'components',coalesce((SELECT jsonb_agg(jsonb_build_object( \
+                'started_ms',floor(extract(epoch FROM started_at)*1000)::bigint, \
+                'ended_ms',ceil(extract(epoch FROM ended_at)*1000)::bigint, \
+                'draft_ids',draft_ids,'atoms',atoms,'sessions',sessions, \
+                'blocked_drafts',blocked_drafts) ORDER BY started_at,ended_at,component) \
+                FROM candidate_components),'[]'::jsonb))::text"
+    ))
+    .bind(account_id)
+    .fetch_one(connection)
+    .await?;
+    let inventory: SourceComponentInventory = serde_json::from_str(&payload)?;
+    if !(0..=MAX_SOURCE_COMPONENT_INVENTORY + 1).contains(&inventory.inventory_rows)
+        || inventory.components.iter().any(|component| {
+            component.started_ms > component.ended_ms
+                || component.draft_ids.is_empty()
+                || component.draft_ids.windows(2).any(|ids| ids[0] >= ids[1])
+                || component.atoms < 0
+                || component.sessions < 0
+                || component.blocked_drafts < 0
+        })
+    {
+        return Err(EnclaveError::Store(
+            "memory reconciliation component inventory is malformed".into(),
+        ));
+    }
+    Ok(inventory)
+}
 
 fn empty_neighborhood_commitment() -> Vec<u8> {
     Sha256::digest(b"kioku.memory-reconciliation.neighborhood.empty.v1\0").to_vec()
@@ -138,37 +201,22 @@ async fn archive_revision(connection: &mut PgConnection, account_id: &str) -> Re
     .await?)
 }
 
-async fn candidate_headers(
+async fn oldest_source_component(
     connection: &mut PgConnection,
     account_id: &str,
     resume_after_component_ended_ms: Option<i64>,
-) -> Result<Vec<(i64, i64, i64)>> {
-    let rows = sqlx::query(
-        "SELECT episode.id,floor(extract(epoch FROM episode.started_at)*1000)::bigint AS started_ms, \
-                floor(extract(epoch FROM episode.ended_at)*1000)::bigint AS ended_ms \
-           FROM episodes episode \
-           JOIN memory_handles handle ON handle.account_id=episode.account_id \
-                AND handle.episode_id=episode.id AND handle.state='active' \
-          WHERE episode.account_id=$1 AND episode.structure_state='draft' \
-            AND episode.finalized_at IS NULL \
-            AND ($2::bigint IS NULL OR episode.started_at> \
-                 to_timestamp($2::double precision/1000.0)+make_interval(secs=>$3)) \
-          ORDER BY episode.started_at,episode.id LIMIT 257",
-    )
-    .bind(account_id)
-    .bind(resume_after_component_ended_ms)
-    .bind(QUIET_HORIZON_SECONDS as f64)
-    .fetch_all(&mut *connection)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get("id")?,
-                row.try_get("started_ms")?,
-                row.try_get("ended_ms")?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()
+) -> Result<Option<SourceClosedComponent>> {
+    let inventory = source_closed_components(connection, account_id).await?;
+    if inventory.inventory_rows > MAX_SOURCE_COMPONENT_INVENTORY {
+        return Err(EnclaveError::Store(
+            "memory reconciliation source inventory exceeds its discovery bound".into(),
+        ));
+    }
+    // KEEP and provider discovery share the same complete source graph; a held
+    // prefix cannot expose an apparently separate but source-connected suffix.
+    Ok(inventory.components.into_iter().find(|component| {
+        resume_after_component_ended_ms.is_none_or(|boundary| component.started_ms > boundary)
+    }))
 }
 
 fn oldest_connected_prefix_with_boundary(
@@ -200,19 +248,66 @@ fn oldest_connected_prefix_with_boundary(
     )
 }
 
-fn oldest_connected_prefix(headers: &[(i64, i64, i64)], draft_limit: i64) -> (Vec<i64>, bool) {
-    let (prefix, oversized, _, _) = oldest_connected_prefix_with_boundary(headers, draft_limit);
-    (prefix, oversized)
-}
-
-fn oldest_connected_drafts(headers: &[(i64, i64, i64)], draft_limit: i64) -> Result<Vec<i64>> {
-    let (component, oversized) = oldest_connected_prefix(headers, draft_limit);
-    if oversized {
-        return Err(EnclaveError::Store(
-            "memory reconciliation cohort exceeds its configured bound".into(),
-        ));
+async fn select_source_settled_cohort(
+    connection: &mut PgConnection,
+    account_id: &str,
+    resume_after_component_ended_ms: Option<i64>,
+    draft_limit: i64,
+    atom_limit: i64,
+    authority: &ActiveReconciliationAuthority,
+) -> Result<Option<ReconciliationSnapshot>> {
+    let inventory = source_closed_components(connection, account_id).await?;
+    if inventory.inventory_rows > MAX_SOURCE_COMPONENT_INVENTORY
+        || inventory.components.len() >= MAX_CANDIDATE_HEADERS
+    {
+        return Ok(None);
     }
-    Ok(component)
+    let mut snapshots_examined = 0;
+    for component in inventory.components {
+        // An earlier oversized hold may lie inside this larger source
+        // component. Skip the whole component, never its apparent suffix.
+        if resume_after_component_ended_ms.is_some_and(|boundary| component.started_ms <= boundary)
+        {
+            continue;
+        }
+        if snapshots_examined == MAX_SOURCE_COMPONENTS_PER_SWEEP {
+            return Ok(None);
+        }
+        snapshots_examined += 1;
+        if component.draft_ids.len() > draft_limit as usize
+            || component.atoms > atom_limit
+            || component.sessions > MAX_SOURCE_SESSIONS as i64
+            || component.blocked_drafts != 0
+        {
+            return Ok(None);
+        }
+        let Some((snapshot, settled)) = read_snapshot(
+            connection,
+            account_id,
+            &component.draft_ids,
+            atom_limit,
+            authority,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if timestamp(&snapshot.cohort_started_at, "source component start")? < component.started_ms
+            || timestamp(&snapshot.cohort_ended_at, "source component end")? > component.ended_ms
+        {
+            return Err(EnclaveError::Conflict(
+                "memory reconciliation source component changed during discovery".into(),
+            ));
+        }
+        if !settled {
+            // No source completion, claim or provider effect is invented.
+            // Every sweep starts from the oldest graph again, so a late
+            // source/finish can make this held component eligible normally.
+            continue;
+        }
+        return Ok(Some(snapshot));
+    }
+    Ok(None)
 }
 
 async fn read_atoms(
@@ -1245,6 +1340,29 @@ async fn read_snapshot(
             "memory reconciliation predecessor set is invalid".into(),
         ));
     }
+    // Repeat the complete graph at every claim/egress/publication boundary,
+    // not only at discovery. A canonical family or projection can connect a
+    // remote session without adding another draft to the selected set.
+    let inventory = source_closed_components(connection, account_id).await?;
+    if inventory.inventory_rows > MAX_SOURCE_COMPONENT_INVENTORY {
+        return Ok(None);
+    }
+    let mut requested = predecessor_ids.to_vec();
+    requested.sort_unstable();
+    let Some(component) = inventory
+        .components
+        .into_iter()
+        .find(|component| component.draft_ids == requested)
+    else {
+        return Ok(None);
+    };
+    if component.blocked_drafts != 0
+        || component.atoms == 0
+        || component.atoms > atom_limit
+        || component.sessions > MAX_SOURCE_SESSIONS as i64
+    {
+        return Ok(None);
+    }
     let rows = sqlx::query(
         "SELECT episode.id, \
                 floor(extract(epoch FROM episode.started_at)*1000)::bigint AS started_at_ms, \
@@ -1326,20 +1444,8 @@ async fn read_snapshot(
             member_source_ids: members.remove(&id).unwrap_or_default(),
         });
     }
-    let mut closure_started_ms = drafts
-        .iter()
-        .map(|draft| timestamp(&draft.started_at, "reconciliation draft start"))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .min()
-        .ok_or_else(|| EnclaveError::Store("memory reconciliation cohort is empty".into()))?;
-    let mut closure_ended_ms = drafts
-        .iter()
-        .map(|draft| timestamp(&draft.ended_at, "reconciliation draft end"))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .ok_or_else(|| EnclaveError::Store("memory reconciliation cohort is empty".into()))?;
+    let mut closure_started_ms = component.started_ms;
+    let mut closure_ended_ms = component.ended_ms;
     let mut atoms = Vec::new();
     let mut sessions = Vec::new();
     let mut outside_drafts = OutsideDraftClosure::default();
@@ -2438,12 +2544,24 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             return Ok(held_keep_promotion(None, false));
         };
         advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
-        let headers = candidate_headers(
+        let Some(component) = oldest_source_component(
             &mut transaction,
             account_id,
             resume_after_component_ended_ms,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(OversizedKeepPromotionResult::NotOversized);
+        };
+        if component.blocked_drafts != 0 || component.atoms == 0 {
+            return Ok(held_keep_promotion(Some(component.ended_ms), true));
+        }
+        let headers = component
+            .draft_ids
+            .iter()
+            .map(|id| (*id, component.started_ms, component.ended_ms))
+            .take(MAX_CANDIDATE_HEADERS)
+            .collect::<Vec<_>>();
         let (episode_ids, oversized_drafts, _component_ended_ms, boundary_complete) =
             oldest_connected_prefix_with_boundary(&headers, draft_limit);
         if episode_ids.is_empty() {
@@ -2458,7 +2576,7 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                             AND stage.source_fingerprint=job.source_fingerprint)))",
         )
         .bind(account_id)
-        .bind(&episode_ids)
+        .bind(&component.draft_ids)
         .fetch_one(&mut *transaction)
         .await?;
         if overlapping_paid_work {
@@ -2471,15 +2589,13 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         if !selected_members_are_exact(&mut transaction, account_id, &episode_ids).await? {
             return Ok(held_keep_promotion(None, false));
         }
-        let mut closure_started_ms = drafts
-            .iter()
-            .map(|draft| draft.started_ms)
-            .min()
+        let mut closure_started_ms = headers
+            .first()
+            .map(|(_, started_ms, _)| *started_ms)
             .ok_or_else(|| EnclaveError::Store("providerless KEEP cohort is empty".into()))?;
-        let mut closure_ended_ms = drafts
-            .iter()
-            .map(|draft| draft.ended_ms)
-            .max()
+        let mut closure_ended_ms = headers
+            .first()
+            .map(|(_, _, ended_ms)| *ended_ms)
             .ok_or_else(|| EnclaveError::Store("providerless KEEP cohort is empty".into()))?;
         let member_count: i64 = sqlx::query_scalar(
             "SELECT count(*)::bigint FROM active_episode_members \
@@ -2510,6 +2626,11 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "account_id": account_id,
                 "episode_ids": episode_ids,
                 "exact_episode_rows": drafts.iter().map(|draft| &draft.exact_row).collect::<Vec<_>>(),
+                "source_component_started_ms": closure_started_ms,
+                "source_component_ended_ms": closure_ended_ms,
+                "source_component_draft_ids": component.draft_ids,
+                "source_component_atom_count": component.atoms,
+                "source_component_session_count": component.sessions,
                 "member_count": member_count,
                 "member_commitment": member_commitment,
                 "archive_revision": prior_archive_revision,
@@ -2848,28 +2969,21 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         else {
             return Ok(None);
         };
-        let ids = oldest_connected_drafts(
-            &candidate_headers(
-                &mut transaction,
-                account_id,
-                resume_after_component_ended_ms,
-            )
-            .await?,
+        // A complete graph includes headers, owned/unowned projections, whole
+        // touching sessions and cross-session canonical families. Selecting a
+        // header prefix first can split one real source component into two jobs.
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
+        let selected = select_source_settled_cohort(
+            &mut transaction,
+            account_id,
+            resume_after_component_ended_ms,
             draft_limit,
-        )?;
-        if ids.is_empty() {
-            return Ok(None);
-        }
-        let Some((snapshot, settled)) =
-            read_snapshot(&mut transaction, account_id, &ids, atom_limit, &authority).await?
-        else {
-            return Ok(None);
-        };
-        if !settled {
-            return Ok(None);
-        }
+            atom_limit,
+            &authority,
+        )
+        .await?;
         transaction.commit().await?;
-        Ok(Some(snapshot))
+        Ok(selected)
     }
 
     async fn revalidate_source_fingerprint(
@@ -4109,10 +4223,9 @@ pub(super) fn test_provider_stage_write_with_provenance(
 mod tests {
     use super::{
         connected_source_sessions, digest_json, ensure_no_external_owners,
-        ensure_source_session_bound, held_keep_promotion, oldest_connected_drafts,
-        oldest_connected_prefix_with_boundary, partition_commitment, rebuilt_speaker_projections,
-        source_id, source_sessions_are_settled, valid_digest, validate_resolution_graph,
-        AssignedSpeakerEvidence, SourceSession,
+        ensure_source_session_bound, held_keep_promotion, oldest_connected_prefix_with_boundary,
+        partition_commitment, rebuilt_speaker_projections, source_id, source_sessions_are_settled,
+        valid_digest, validate_resolution_graph, AssignedSpeakerEvidence, SourceSession,
     };
     use crate::persistence::{
         reconciliation_outputs_commitment, OversizedKeepPromotionResult, ReconciledMemoryWrite,
@@ -4184,7 +4297,10 @@ mod tests {
             (11, 10 * hour + 30 * 60 * 1_000, 10 * hour + 45 * 60 * 1_000),
             (12, 16 * hour, 17 * hour),
         ];
-        assert_eq!(oldest_connected_drafts(&headers, 32).unwrap(), vec![10, 11]);
+        assert_eq!(
+            oldest_connected_prefix_with_boundary(&headers, 32).0,
+            vec![10, 11]
+        );
     }
 
     #[test]
