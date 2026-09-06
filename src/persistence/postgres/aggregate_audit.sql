@@ -660,10 +660,12 @@ reconciliation_unfinished_groups AS MATERIALIZED (
       LEFT JOIN reconciliation_unfinished_aggregates aggregate USING(state)
 ),
 candidate_draft_rows AS MATERIALIZED (
-    SELECT episode.account_id,episode.started_at,episode.ended_at,
+    -- Match candidate_headers, including substance='none': the reconciler may
+    -- repartition those drafts when the complete source evidence warrants it.
+    SELECT episode.account_id,episode.id,episode.started_at,episode.ended_at,
            max(episode.ended_at) OVER (
                PARTITION BY episode.account_id
-               ORDER BY episode.started_at,episode.ended_at
+               ORDER BY episode.started_at,episode.id
                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
            ) AS prior_max_ended_at
       FROM episodes episode
@@ -671,19 +673,19 @@ candidate_draft_rows AS MATERIALIZED (
         ON handle.account_id=episode.account_id AND handle.episode_id=episode.id
        AND handle.state='active'
       JOIN active_accounts account ON account.id=episode.account_id
-     WHERE episode.structure_state='draft' AND episode.substance!='none'
+     WHERE episode.structure_state='draft' AND episode.finalized_at IS NULL
 ),
 candidate_draft_marked AS MATERIALIZED (
-    SELECT account_id,started_at,ended_at,
+    SELECT account_id,id,started_at,ended_at,
            CASE WHEN prior_max_ended_at IS NULL
                        OR started_at>prior_max_ended_at+interval '4 hours'
                   THEN 1 ELSE 0 END AS new_component
       FROM candidate_draft_rows
 ),
 candidate_draft_components AS MATERIALIZED (
-    SELECT account_id,started_at,ended_at,
+    SELECT account_id,id,started_at,ended_at,
            sum(new_component) OVER (
-               PARTITION BY account_id ORDER BY started_at,ended_at
+               PARTITION BY account_id ORDER BY started_at,id
                ROWS UNBOUNDED PRECEDING
            ) AS component
       FROM candidate_draft_marked
@@ -692,6 +694,60 @@ candidate_component_sizes AS MATERIALIZED (
     SELECT account_id,component,count(*)::bigint AS drafts
       FROM candidate_draft_components
      GROUP BY account_id,component
+),
+candidate_source_atoms AS MATERIALIZED (
+    -- These are the canonical atom kinds and joins admitted by read_atoms.
+    -- No text, timestamps, usefulness filter, or caller-supplied source scope.
+    SELECT utterance.account_id,'utterance'::text AS record_type,utterance.id AS record_id
+      FROM utterances utterance
+      JOIN audio_segments segment ON segment.account_id=utterance.account_id
+                                 AND segment.id=utterance.audio_segment_id
+      JOIN active_accounts account ON account.id=utterance.account_id
+    UNION ALL
+    SELECT screenshot.account_id,'screenshot',screenshot.id
+      FROM screenshots screenshot
+      JOIN active_accounts account ON account.id=screenshot.account_id
+),
+account_unowned_atom_counts AS MATERIALIZED (
+    SELECT atom.account_id,count(*)::bigint AS atoms
+      FROM candidate_source_atoms atom
+     WHERE NOT EXISTS(SELECT 1 FROM active_episode_members owner
+                       WHERE owner.account_id=atom.account_id
+                         AND owner.record_type=atom.record_type
+                         AND owner.record_id=atom.record_id)
+     GROUP BY atom.account_id
+),
+candidate_component_owned_atom_counts AS MATERIALIZED (
+    SELECT draft.account_id,draft.component,
+           count(DISTINCT (atom.record_type,atom.record_id))::bigint AS atoms
+      FROM candidate_draft_components draft
+      JOIN active_episode_members member ON member.account_id=draft.account_id
+                                        AND member.episode_id=draft.id
+      JOIN candidate_source_atoms atom ON atom.account_id=member.account_id
+                                      AND atom.record_type=member.record_type
+                                      AND atom.record_id=member.record_id
+     GROUP BY draft.account_id,draft.component
+),
+candidate_component_output_bounds AS MATERIALIZED (
+    -- Every model or conservative-keep output is a nonempty disjoint atom set.
+    -- Session closure may add unowned atoms outside a draft's initial interval:
+    -- include ALL account-unowned atoms for EVERY component, deliberately
+    -- overcounting them instead of assuming a timestamp or membership boundary.
+    -- Owned atoms outside the selected predecessors cause runtime refusal.
+    -- If source closure joins components, the sum of these separately capped
+    -- bounds is at least the bound for their union. Never cap by draft count:
+    -- one draft can split into several outputs, including unowned-only outputs.
+    -- Separately, providerless oversized KEEP preserves one existing output per
+    -- draft and can trigger on session count even with empty members. Keep the
+    -- draft count as a FLOOR to cover that non-partition publication path.
+    SELECT component.account_id,component.component,
+           greatest(component.drafts,
+                    least(32,coalesce(owned.atoms,0)+coalesce(unowned.atoms,0)))::bigint
+               AS successor_finalizers
+      FROM candidate_component_sizes component
+      LEFT JOIN candidate_component_owned_atom_counts owned
+        ON owned.account_id=component.account_id AND owned.component=component.component
+      LEFT JOIN account_unowned_atom_counts unowned ON unowned.account_id=component.account_id
 ),
 reconciliation_facts AS MATERIALIZED (
     SELECT (SELECT groups FROM reconciliation_since_groups) AS jobs_since,
@@ -1062,8 +1118,8 @@ account_component_counts AS MATERIALIZED (
       FROM active_accounts account
       LEFT JOIN (
           SELECT account_id,count(*)::bigint AS count,
-                 (count(*)*32)::bigint AS successor_finalizers
-            FROM candidate_component_sizes GROUP BY account_id
+                 sum(successor_finalizers)::bigint AS successor_finalizers
+            FROM candidate_component_output_bounds GROUP BY account_id
       ) component ON component.account_id=account.id
 ),
 account_finalization_needs AS MATERIALIZED (
