@@ -202,7 +202,12 @@ or runtime feature flag.
    exact finalization, pending-owner, paged-deletion, media-work, and formation-claim guards in
    this transaction while marker 26 remains visible, then initializes resumable source-refresh and
    legacy-claim-drain ledgers.
-4. Repeat `memory-reconciliation-v27-backfill` until both generation-bound ledgers are complete.
+4. Repeat `memory-reconciliation-v27-backfill` until its status is `backfill_complete`, not merely
+   both generation-bound ledger flags being true. After those ledgers complete, each call assigns
+   at most 256 active accounts from the verified signed Draining scope, including empty accounts.
+   A subsequent empty pass proves completion. The release, lifecycle, and reconciliation fences
+   serialize assignment with deletion and preserve all existing sticky assignments. This metadata
+   operation never requires provider/finalization work or modifies memories.
    A runtime whose model/location/producer does not match the signed authority is unready from
    `Draining` onward, and the frozen predecessor verifier refuses the added guards.
    An episode-finalization request already authorized before the transition may finish HTTP and its
@@ -219,6 +224,25 @@ or runtime feature flag.
    requires an unchanged signed scope/producer, or use `paused -> draining` for a monotonic scope or
    producer expansion and freshly proved homogeneous candidate digest before a later
    `draining -> active`.
+
+### Repair an already committed Draining scope
+
+If an earlier signed serving image completed the Draining ledgers without materializing global
+scope, use the ordinary reviewed release image and dedicated migrator with the explicit
+`POSTGRES_MIGRATION_CONFIRM=memory-reconciliation-v27-repair-draining` phase. Pass the exact original
+already-applied Draining receipt and signature in the same execution-scoped activation variables.
+The migrator verifies their canonical signature and matches the complete committed event, signer,
+generation, scope, catalog, base receipt, image and producer identity under the exclusive release
+lock. Receipt expiration is historical here only: this operation cannot append an event, change a
+marker, expand scope, activate, or authorize a new transition. Both current-generation ledgers must
+already be complete. Repeat bounded calls until `draining_scope_repair_complete`; the distinct
+repair statuses are not ordinary activation backfill evidence.
+
+A migrator-only repair image must be separately pinned and reviewed by the standard deployment
+owner. Keep serving/KMS admission and the signed Draining candidate unchanged. Retain genuine
+operation/image/source-bound repair journals, restore the original migrator through the reviewed
+deployment path, then collect new original-image backfill, audit, fleet and client evidence before
+activation. Do not substitute the repair result for an activation root or replay a signed Drain.
 
 Never persist activation receipts or signatures in Terraform, image metadata, or a release
 artifact. Status and health output remain content-free; retain the exact signed receipt, detached

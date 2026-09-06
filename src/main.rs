@@ -1423,6 +1423,8 @@ const MEMORY_RECONCILIATION_FINALIZE_CONFIRM: &str = "memory-reconciliation-v26-
 const MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM: &str = "memory-reconciliation-v27-install";
 const MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM: &str =
     "memory-reconciliation-v27-backfill";
+const MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM: &str =
+    "memory-reconciliation-v27-repair-draining";
 const MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM: &str = "memory-reconciliation-v27-drain";
 const MEMORY_RECONCILIATION_ACTIVATE_CONFIRM: &str = "memory-reconciliation-v27-activate";
 const MEMORY_RECONCILIATION_PAUSE_CONFIRM: &str = "memory-reconciliation-v27-pause";
@@ -1438,6 +1440,7 @@ enum PostgresMigrationReleasePhase {
     FinalizeMemoryReconciliation,
     InstallMemoryReconciliationActivation,
     AdvanceMemoryReconciliationActivationBackfill,
+    RepairMemoryReconciliationDrainingScope,
     DrainMemoryReconciliationActivation,
     ActivateMemoryReconciliation,
     PauseMemoryReconciliation,
@@ -1449,6 +1452,7 @@ impl PostgresMigrationReleasePhase {
         matches!(
             self,
             Self::DrainMemoryReconciliationActivation
+                | Self::RepairMemoryReconciliationDrainingScope
                 | Self::ActivateMemoryReconciliation
                 | Self::PauseMemoryReconciliation
                 | Self::ResumeMemoryReconciliation
@@ -1471,6 +1475,9 @@ fn postgres_migration_release_phase(
         }
         Some(MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::AdvanceMemoryReconciliationActivationBackfill)
+        }
+        Some(MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM) => {
+            Ok(PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope)
         }
         Some(MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation)
@@ -1505,7 +1512,8 @@ fn postgres_memory_reconciliation_activation_receipt(
         )
         })?;
     let expected_transition = match phase {
-        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation => {
+        PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation
+        | PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope => {
             receipt.requested_phase == "draining"
                 && matches!(receipt.previous_phase.as_str(), "installed" | "paused")
         }
@@ -1650,6 +1658,14 @@ async fn migrate_postgres_release_schema() {
             .advance_memory_reconciliation_activation_backfill()
             .await
             .map(|result| serde_json::to_value(result).expect("release result must serialize")),
+        PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope => {
+            persistence
+                .repair_memory_reconciliation_draining_scope(activation_receipt.as_ref().expect(
+                    "historical Draining signature was verified before PostgreSQL connection",
+                ))
+                .await
+                .map(|result| serde_json::to_value(result).expect("repair result must serialize"))
+        }
         PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation
         | PostgresMigrationReleasePhase::ActivateMemoryReconciliation
         | PostgresMigrationReleasePhase::PauseMemoryReconciliation
@@ -1676,7 +1692,8 @@ mod postgres_migration_release_tests {
         postgres_schema_finalization_receipt, PostgresMigrationReleasePhase,
         MEMORY_RECONCILIATION_ACTIVATE_CONFIRM, MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
         MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
-        MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
+        MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
+        MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM, MEMORY_RECONCILIATION_EXPAND_CONFIRM,
         MEMORY_RECONCILIATION_FINALIZE_CONFIRM, MEMORY_RECONCILIATION_PAUSE_CONFIRM,
         MEMORY_RECONCILIATION_RESUME_CONFIRM,
     };
@@ -1699,6 +1716,10 @@ mod postgres_migration_release_tests {
             (
                 MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
                 PostgresMigrationReleasePhase::AdvanceMemoryReconciliationActivationBackfill,
+            ),
+            (
+                MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM,
+                PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope,
             ),
             (
                 MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
@@ -1735,6 +1756,7 @@ mod postgres_migration_release_tests {
     #[test]
     fn activation_transition_requires_the_exact_confirmation_domain() {
         for phase in [
+            PostgresMigrationReleasePhase::RepairMemoryReconciliationDrainingScope,
             PostgresMigrationReleasePhase::DrainMemoryReconciliationActivation,
             PostgresMigrationReleasePhase::ActivateMemoryReconciliation,
             PostgresMigrationReleasePhase::PauseMemoryReconciliation,

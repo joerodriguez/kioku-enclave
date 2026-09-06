@@ -31,6 +31,7 @@ const INSTALL_SQL: &str =
 const FORMATION_BACKFILL_NAME: &str = "capture_formation_receipts";
 const FORMATION_BACKFILL_BATCH_SIZE: i64 = 256;
 const FINALIZATION_CLAIM_DRAIN_BATCH_SIZE: i64 = 256;
+const DRAINING_SCOPE_ASSIGNMENT_BATCH_SIZE: i64 = 256;
 const TERMINAL_MEDIA_CLAIM_REPAIR_BATCH_SIZE: i64 = 256;
 const FORMATION_BACKFILL_SELECT_SQL: &str = "SELECT account_id,id FROM capture_sessions \
       WHERE ($1::text IS NULL OR (account_id,id)>($1,$2)) \
@@ -387,6 +388,8 @@ pub(crate) enum MemoryReconciliationActivationReleaseStatus {
     AlreadyInstalled,
     BackfillInProgress,
     BackfillComplete,
+    DrainingScopeRepairInProgress,
+    DrainingScopeRepairComplete,
     Draining,
     Active,
     Paused,
@@ -1449,6 +1452,60 @@ async fn insert_scope_assignments(
     Ok(())
 }
 
+/// Materialize the already-signed Draining scope without requiring accounts to
+/// manufacture provider/finalization work. The caller holds the exclusive
+/// release lock and supplies the verified current state, not operator IDs.
+async fn advance_draining_scope_assignments_batch(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    state: &ActivationState,
+) -> Result<bool> {
+    if state.phase != MemoryReconciliationActivationPhase::Draining {
+        return Err(EnclaveError::Conflict(
+            "scope assignment backfill requires the current Draining generation".into(),
+        ));
+    }
+    require_formation_backfill_complete(transaction, Some(state.generation)).await?;
+    require_finalization_claim_drain_complete(transaction, Some(state.generation)).await?;
+    let accounts = sqlx::query_scalar::<_, String>(
+        "SELECT account.id FROM accounts account \
+          WHERE account.status='active' \
+            AND ($2=10000 OR account.id=ANY($3::text[])) \
+            AND NOT EXISTS(SELECT 1 FROM persistence_feature_activation_assignments assignment \
+              WHERE assignment.feature=$1 AND assignment.account_id=account.id) \
+          ORDER BY account.id LIMIT $4",
+    )
+    .bind(FEATURE)
+    .bind(state.rollout_basis_points)
+    .bind(&state.explicit_canary_account_ids)
+    .bind(DRAINING_SCOPE_ASSIGNMENT_BATCH_SIZE)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if accounts.is_empty() {
+        return Ok(true);
+    }
+    for account_id in accounts {
+        super::advisory_transaction_lock(transaction, "account-lifecycle", &account_id).await?;
+        super::advisory_transaction_lock(transaction, "memory-reconciliation", &account_id).await?;
+        // Deletion may have won while selection waited for lifecycle authority.
+        // Recheck after the fence; never resurrect a deleted/deleting account.
+        sqlx::query(
+            "INSERT INTO persistence_feature_activation_assignments( \
+                 feature,account_id,activation_generation) \
+             SELECT $1,account.id,$3 FROM accounts account \
+              WHERE account.id=$2 AND account.status='active' \
+             ON CONFLICT(feature,account_id) DO NOTHING",
+        )
+        .bind(FEATURE)
+        .bind(&account_id)
+        .bind(state.generation)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    // A following empty pass proves completion, including late-created accounts
+    // below an earlier key. Existing sticky assignments are never rewritten.
+    Ok(false)
+}
+
 async fn require_formation_backfill_complete(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     generation: Option<i64>,
@@ -2217,7 +2274,11 @@ impl PostgresPersistence {
                 advance_formation_backfill_batch(&mut transaction, expected_generation).await?;
             formation_now_complete && state.phase == MemoryReconciliationActivationPhase::Installed
         } else if state.phase == MemoryReconciliationActivationPhase::Draining {
-            advance_finalization_claim_drain_batch(&mut transaction, state.generation).await?
+            if advance_finalization_claim_drain_batch(&mut transaction, state.generation).await? {
+                advance_draining_scope_assignments_batch(&mut transaction, &state).await?
+            } else {
+                false
+            }
         } else {
             true
         };
@@ -2229,6 +2290,66 @@ impl PostgresPersistence {
                 MemoryReconciliationActivationReleaseStatus::BackfillComplete
             } else {
                 MemoryReconciliationActivationReleaseStatus::BackfillInProgress
+            },
+        )
+        .await
+    }
+
+    /// Migrator-only repair of an already committed Draining scope. This is not
+    /// a transition: historical receipt timestamps are intentionally not a new
+    /// admission window, and exact committed authority must match under lock.
+    pub(crate) async fn repair_memory_reconciliation_draining_scope(
+        &self,
+        authorization: &VerifiedMemoryReconciliationActivationReceipt,
+    ) -> Result<MemoryReconciliationActivationReleaseResult> {
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(RELEASE_LOCK)
+            .execute(&mut *transaction)
+            .await?;
+        let (_, current) = verify_activation_and_base_release(&mut transaction).await?;
+        let signed = authorization.receipt();
+        if current.phase != MemoryReconciliationActivationPhase::Draining
+            || signed.requested_phase != "draining"
+            || signed.generation != current.generation
+        {
+            return Err(EnclaveError::Conflict(
+                "scope repair requires the exact already-committed Draining authority".into(),
+            ));
+        }
+        let canonical = std::str::from_utf8(authorization.canonical_bytes())
+            .map_err(|_| EnclaveError::Config("activation receipt is not UTF-8".into()))?;
+        // The full verified event chain above binds the schema/catalog, base
+        // finalization receipt, scope, seed, serving image, and producer. Match
+        // all supplied historical receipt and signer bytes to that exact event.
+        let exact = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM persistence_feature_activation_events \
+              WHERE feature=$1 AND generation=$2 AND phase='draining' \
+                AND receipt=$3::jsonb AND receipt_sha256=$4 \
+                AND receipt_signature=$5 AND receipt_key_sha256=$6)",
+        )
+        .bind(FEATURE)
+        .bind(current.generation)
+        .bind(canonical)
+        .bind(Sha256::digest(authorization.canonical_bytes()).to_vec())
+        .bind(authorization.signature_bytes())
+        .bind(authorization.key_sha256())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !exact {
+            return Err(EnclaveError::Conflict(
+                "scope repair receipt differs from committed Draining authority".into(),
+            ));
+        }
+        let complete = advance_draining_scope_assignments_batch(&mut transaction, &current).await?;
+        transaction.commit().await?;
+        let mut connection = self.pool().acquire().await?;
+        release_result(
+            &mut connection,
+            if complete {
+                MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairComplete
+            } else {
+                MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairInProgress
             },
         )
         .await
@@ -3652,6 +3773,250 @@ async fn test_real_pg_v27_install_refuses_pending_deletion(
 }
 
 #[cfg(test)]
+async fn test_real_pg_draining_scope_batches(
+    persistence: &PostgresPersistence,
+    authority: &VerifiedMemoryReconciliationActivationReceipt,
+) -> Result<()> {
+    async fn snapshot(persistence: &PostgresPersistence) -> Result<Vec<String>> {
+        let mut snapshots = Vec::new();
+        for table in [
+            "persistence_schema",
+            "persistence_feature_activation_contracts",
+            "persistence_feature_activation_events",
+            "persistence_feature_activation_backfills",
+            "persistence_feature_activation_drains",
+            "episodes",
+            "utterances",
+            "capture_sessions",
+            "capture_events",
+            "capture_formation_receipts",
+            "media_work_units",
+            "media_processing_jobs",
+            "vertex_usage_events",
+        ] {
+            snapshots.push(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT coalesce(jsonb_agg(to_jsonb(value) ORDER BY to_jsonb(value)::text),'[]'::jsonb)::text FROM {table} value"
+            ))).fetch_one(persistence.pool()).await?);
+        }
+        Ok(snapshots)
+    }
+    async fn assignments(persistence: &PostgresPersistence, prefix: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM persistence_feature_activation_assignments \
+              WHERE feature=$1 AND account_id LIKE $2",
+        )
+        .bind(FEATURE)
+        .bind(prefix)
+        .fetch_one(persistence.pool())
+        .await?)
+    }
+    let before = snapshot(persistence).await?;
+    let prior_assignments: String = sqlx::query_scalar(
+        "SELECT coalesce(jsonb_agg(to_jsonb(value) ORDER BY account_id),'[]'::jsonb)::text \
+          FROM persistence_feature_activation_assignments value WHERE account_id NOT LIKE '%scope-repair-%'",
+    ).fetch_one(persistence.pool()).await?;
+    sqlx::query(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         SELECT 'scope-repair-batch-'||lpad(i::text,3,'0'), \
+                'scope-repair-batch-'||i||'@example.invalid','google','scope-repair-batch-'||i \
+           FROM generate_series(0,259) i",
+    )
+    .execute(persistence.pool())
+    .await?;
+    for expected_count in [256, 260] {
+        let result = persistence
+            .repair_memory_reconciliation_draining_scope(authority)
+            .await?;
+        assert_eq!(
+            result.status,
+            MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairInProgress
+        );
+        assert_eq!(
+            assignments(persistence, "scope-repair-batch-%").await?,
+            expected_count
+        );
+        assert_eq!(result.phase, "draining");
+        assert_eq!(result.generation, authority.receipt().generation);
+    }
+    assert_eq!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(authority)
+            .await?
+            .status,
+        MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairComplete
+    );
+    // A later lower key is still found: no persistent cursor skips new accounts.
+    sqlx::query(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES \
+      ('000-scope-repair-late','scope-repair-late@example.invalid','google','scope-repair-late'), \
+      ('scope-repair-race','scope-repair-race@example.invalid','google','scope-repair-race')",
+    )
+    .execute(persistence.pool())
+    .await?;
+    let mut deleting = persistence.pool().begin().await?;
+    super::advisory_transaction_lock(&mut deleting, "account-lifecycle", "scope-repair-race")
+        .await?;
+    let adapter = persistence.clone();
+    let signed = authority.clone();
+    let mut repair = tokio::spawn(async move {
+        adapter
+            .repair_memory_reconciliation_draining_scope(&signed)
+            .await
+    });
+    wait_for_exclusive_release_lock(persistence).await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut repair)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE accounts SET status='deletion_requested' WHERE id='scope-repair-race'")
+        .execute(&mut *deleting)
+        .await?;
+    deleting.commit().await?;
+    assert_eq!(
+        repair
+            .await
+            .map_err(|_| EnclaveError::Store("scope repair task failed".into()))??
+            .status,
+        MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairInProgress
+    );
+    assert_eq!(assignments(persistence, "scope-repair-race").await?, 0);
+    assert_eq!(assignments(persistence, "000-scope-repair-late").await?, 1);
+    assert_eq!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(authority)
+            .await?
+            .status,
+        MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairComplete
+    );
+    for mutation in ["generation", "scope", "seed", "image", "evidence"] {
+        let mut receipt = authority.receipt().clone();
+        match mutation {
+            "generation" => receipt.generation += 1,
+            "scope" => {
+                receipt.rollout_basis_points = 0;
+                receipt.explicit_canary_account_ids = vec!["scope-repair-race".into()];
+            }
+            "seed" => receipt.rollout_seed = format!("sha256:{}", "f".repeat(64)),
+            "image" => receipt.candidate_fleet_image_digest = format!("sha256:{}", "f".repeat(64)),
+            "evidence" => receipt.fleet_evidence_sha256 = format!("sha256:{}", "f".repeat(64)),
+            _ => unreachable!(),
+        }
+        let different = super::schema_release::test_verify_activation_receipt(receipt)?;
+        assert!(
+            persistence
+                .repair_memory_reconciliation_draining_scope(&different)
+                .await
+                .is_err(),
+            "even correctly signed {mutation} changes are not committed authority"
+        );
+    }
+    assert_eq!(
+        snapshot(persistence).await?,
+        before,
+        "repair changes no source, provider, catalog, marker, event or ledger"
+    );
+    assert_eq!(sqlx::query_scalar::<_, String>(
+        "SELECT coalesce(jsonb_agg(to_jsonb(value) ORDER BY account_id),'[]'::jsonb)::text \
+          FROM persistence_feature_activation_assignments value WHERE account_id NOT LIKE '%scope-repair-%'",
+    ).fetch_one(persistence.pool()).await?, prior_assignments, "sticky assignments retain exact original bytes");
+    Ok(())
+}
+
+#[cfg(test)]
+async fn test_real_pg_historical_draining_scope(
+    persistence: &PostgresPersistence,
+    active: &VerifiedMemoryReconciliationActivationReceipt,
+) -> Result<()> {
+    let mut pause_receipt = active.receipt().clone();
+    pause_receipt.generation += 1;
+    pause_receipt.previous_phase = "active".into();
+    pause_receipt.requested_phase = "paused".into();
+    let paused = super::schema_release::test_verify_activation_receipt(pause_receipt)?;
+    persistence
+        .transition_memory_reconciliation_activation(&paused)
+        .await?;
+    let mut receipt = paused.receipt().clone();
+    receipt.generation += 1;
+    receipt.previous_phase = "paused".into();
+    receipt.requested_phase = "draining".into();
+    receipt.observed_at = "2020-01-01T00:00:00.000Z".into();
+    receipt.expires_at = "2020-01-01T00:10:00.000Z".into();
+    let historical = super::schema_release::test_verify_activation_receipt(receipt)?;
+    assert!(
+        persistence
+            .transition_memory_reconciliation_activation(&historical)
+            .await
+            .is_err(),
+        "expired authority remains forbidden for a new transition"
+    );
+    assert!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&historical)
+            .await
+            .is_err(),
+        "historical signature alone cannot create a Draining generation"
+    );
+    // Fixture only: model the exact previously applied, now-expired event and
+    // generation-bound ledgers. No production transition bypass is exposed.
+    test_insert_transition_event_directly(persistence, &historical).await?;
+    let mut setup = persistence.pool().begin().await?;
+    reset_formation_backfill(&mut setup, historical.receipt().generation).await?;
+    initialize_finalization_claim_drain(&mut setup, historical.receipt().generation).await?;
+    setup.commit().await?;
+    assert!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&historical)
+            .await
+            .is_err(),
+        "an older complete ledger cannot authorize the current Draining repair"
+    );
+    test_advance_activation_until_complete(persistence, true).await?;
+    sqlx::query("INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES \
+        ('scope-repair-historical','scope-repair-historical@example.invalid','google','scope-repair-historical')")
+        .execute(persistence.pool()).await?;
+    let marker_before = {
+        let mut connection = persistence.pool().acquire().await?;
+        schema_marker(&mut connection).await?
+    };
+    let repaired = persistence
+        .repair_memory_reconciliation_draining_scope(&historical)
+        .await?;
+    assert_eq!(
+        repaired.status,
+        MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairInProgress
+    );
+    assert_eq!(repaired.generation, historical.receipt().generation);
+    assert_eq!(
+        repaired.receipt_sha256,
+        Some(sha256_label(&Sha256::digest(historical.canonical_bytes())))
+    );
+    assert_eq!(
+        (repaired.schema_version, repaired.expanded_through_version),
+        marker_before
+    );
+    assert_eq!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&historical)
+            .await?
+            .status,
+        MemoryReconciliationActivationReleaseStatus::DrainingScopeRepairComplete
+    );
+    assert!(persistence
+        .transition_memory_reconciliation_activation(&historical)
+        .await
+        .is_err());
+    let mut connection = persistence.pool().acquire().await?;
+    assert_eq!(
+        verify_serving_activation_schema(&mut connection)
+            .await?
+            .phase,
+        MemoryReconciliationActivationPhase::Draining
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistence) -> Result<()> {
     use crate::persistence::{
         EpisodeDeletionRepository as _, FinalizationClaimRequest, FinalizationRepository as _,
@@ -4015,6 +4380,10 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     .await
     .is_err());
     test_advance_activation_until_complete(persistence, true).await?;
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM persistence_feature_activation_assignments WHERE feature=$1 AND account_id<>$2",
+    ).bind(FEATURE).bind(ACCOUNT).fetch_one(persistence.pool()).await?, 0,
+        "explicit scope backfill never admits another active account");
     assert!(sqlx::query_scalar::<_, Option<String>>(
         "SELECT finalization_claim_token FROM episodes WHERE account_id=$1 AND id=90",
     )
@@ -4920,10 +5289,59 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         },
     )
     .await?;
+    assert!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&global_drain)
+            .await
+            .is_err(),
+        "an uncommitted receipt cannot repair a Paused phase"
+    );
     persistence
         .transition_memory_reconciliation_activation(&global_drain)
         .await?;
+    assert!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&global_drain)
+            .await
+            .is_err(),
+        "Draining repair requires this generation's complete ledgers"
+    );
+    // Global admission includes empty accounts: no provider or finalization
+    // work can be required to materialize their already-signed scope.
+    sqlx::query(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject,status) VALUES \
+         ('activation-empty-scope','activation-empty-scope@example.invalid','google','activation-empty-scope','active'), \
+         ('activation-deleting-scope','activation-deleting-scope@example.invalid','google','activation-deleting-scope','deletion_requested')",
+    )
+    .execute(persistence.pool())
+    .await?;
     test_advance_activation_until_complete(persistence, true).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM accounts account WHERE account.status='active' \
+             AND NOT EXISTS(SELECT 1 FROM persistence_feature_activation_assignments assignment \
+               WHERE assignment.feature=$1 AND assignment.account_id=account.id)",
+        )
+        .bind(FEATURE)
+        .fetch_one(persistence.pool())
+        .await?,
+        0,
+        "completed global Draining must materialize scope even for empty accounts"
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM persistence_feature_activation_assignments \
+          WHERE feature=$1 AND account_id='activation-deleting-scope')",
+        )
+        .bind(FEATURE)
+        .fetch_one(persistence.pool())
+        .await?
+    );
+    Box::pin(test_real_pg_draining_scope_batches(
+        persistence,
+        &global_drain,
+    ))
+    .await?;
     let stale_fleet_active = test_transition_authorization(
         persistence,
         7,
@@ -5000,6 +5418,18 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         .await?;
     assert_eq!(status.phase, MemoryReconciliationActivationPhase::Active);
     assert_eq!(status.rollout_basis_points, 10_000);
+    assert!(
+        persistence
+            .repair_memory_reconciliation_draining_scope(&global_drain)
+            .await
+            .is_err(),
+        "the prior Draining receipt cannot repair Active"
+    );
+    Box::pin(test_real_pg_historical_draining_scope(
+        persistence,
+        &global_active,
+    ))
+    .await?;
     Ok(())
 }
 
