@@ -39,6 +39,8 @@ pub(crate) struct MemoryReconciliationActivationStatus {
     pub(crate) formation_backfill_complete: bool,
     pub(crate) finalization_claim_drain_complete: bool,
     pub(crate) receipt_sha256: Option<String>,
+    pub(crate) contract_version: Option<u32>,
+    pub(crate) candidate_fleet_image_digest: Option<String>,
     pub(crate) reconciliation_producer_contract_sha256: Option<String>,
     pub(crate) reconciliation_model: Option<String>,
     pub(crate) vertex_location: Option<String>,

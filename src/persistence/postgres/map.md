@@ -6,7 +6,11 @@ claims and settlement. Serving startup accepts finalized schema 26 or the exact 
 expand during the ADR-0041 mixed-fleet window. The additive v27 activation contract keeps
 reconciliation egress dark through install/drain, attaches legacy/deletion guards at signed
 Draining, and enables topology publication only from a signed Active generation with exact
-fleet-image, source-completeness, and provider-contract fences. Pause is forward-only. Only the explicit
+fleet-image, source-completeness, and provider-contract fences. Pause is forward-only. The exact
+v2 Paused/g4 v0.9.30 predecessor has a one-release, worker-dark readiness bridge for the
+v0.9.31 Vertex schema correction; signed redrain must replace image/producer authority before Active.
+Its exact v2 Draining/g5 state remains schema-ready and worker-dark while g5 backfill completes.
+Only the explicit
 release migrator applies the append-only files under `migrations/`.
 
 | File | Responsibility |

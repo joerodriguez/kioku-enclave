@@ -18,7 +18,9 @@ use sqlx::{Acquire, PgConnection, Postgres, Row};
 
 use crate::cp::isotime;
 use crate::error::{EnclaveError, Result};
-use crate::persistence::MemoryReconciliationActivationPhase;
+use crate::persistence::{
+    MemoryReconciliationActivationPhase, MemoryReconciliationActivationStatus,
+};
 
 use super::{
     classify_serving_schema, installed_schema_state_from_row, transaction_schema_state,
@@ -27,6 +29,67 @@ use super::{
 };
 
 const RELEASE_PROTOCOL_VERSION: i64 = 1;
+const SCHEMA_COMPATIBILITY_PREDECESSOR_IMAGE: &str =
+    "sha256:dba7ceb3937b267786a24f778118084becabde481930ce1427d074527266d3e6";
+const SCHEMA_COMPATIBILITY_PREDECESSOR_PRODUCER: &str =
+    "sha256:bbdae4ec761951ec0317feed36c40819419de1f8fac7db4f6f7298ca8d066e0c";
+const SCHEMA_COMPATIBILITY_SUCCESSOR_PRODUCER: &str =
+    "sha256:3a7a8d2d0f2a5e2045524f73822663d732ed31538792f1b2d9d7341a4f323225";
+
+fn corrected_producer_redrain(activation: &MemoryReconciliationActivationStatus) -> bool {
+    env!("CARGO_PKG_VERSION") == "0.9.31"
+        && activation.phase == MemoryReconciliationActivationPhase::Draining
+        && activation.contract_version == Some(2)
+        && activation.generation == 5
+        && activation.rollout_basis_points == 10_000
+        && activation.explicit_canary_accounts == 0
+        && activation.formation_backfill_generation == Some(5)
+        && activation.reconciliation_model.as_deref() == Some("gemini-3.5-flash")
+        && activation.vertex_location.as_deref() == Some("global")
+        && activation
+            .reconciliation_producer_contract_sha256
+            .as_deref()
+            == Some(SCHEMA_COMPATIBILITY_SUCCESSOR_PRODUCER)
+}
+
+/// One-release dark compatibility, not writer authority. The status is built
+/// only after full PostgreSQL catalog, signed-history and completed-ledger
+/// verification. It permits replacing the rejected Vertex schema while the
+/// old producer is Paused; signed redrain must bind the new image/producer
+/// before that process can ever become Active.
+fn paused_vertex_schema_compatibility(
+    activation: &MemoryReconciliationActivationStatus,
+    model: &str,
+    location: &str,
+    producer: &[u8; 32],
+) -> Result<bool> {
+    if env!("CARGO_PKG_VERSION") != "0.9.31"
+        || activation.phase != MemoryReconciliationActivationPhase::Paused
+        || activation.contract_version != Some(2)
+        || activation.generation != 4
+        || activation.rollout_basis_points != 10_000
+        || activation.explicit_canary_accounts != 0
+        || activation.formation_backfill_generation != Some(2)
+        || !activation.formation_backfill_complete
+        || !activation.finalization_claim_drain_complete
+        || activation.candidate_fleet_image_digest.as_deref()
+            != Some(SCHEMA_COMPATIBILITY_PREDECESSOR_IMAGE)
+        || activation
+            .reconciliation_producer_contract_sha256
+            .as_deref()
+            != Some(SCHEMA_COMPATIBILITY_PREDECESSOR_PRODUCER)
+        || model != "gemini-3.5-flash"
+        || location != "global"
+        || activation.reconciliation_model.as_deref() != Some(model)
+        || activation.vertex_location.as_deref() != Some(location)
+    {
+        return Ok(false);
+    }
+    Ok(
+        *producer == crate::cp::reconciler::producer_contract_commitment(model, location)?
+            && sha256_label(producer) == SCHEMA_COMPATIBILITY_SUCCESSOR_PRODUCER,
+    )
+}
 const BACKFILL_BATCH_SIZE: i64 = 250;
 const MAX_BACKFILL_BATCHES_PER_RUN: usize = 100;
 const FLEET_RECEIPT_MAX_VALIDITY_MILLIS: i64 = 15 * 60 * 1_000;
@@ -2575,9 +2638,10 @@ impl PostgresPersistence {
                 activation.phase,
                 MemoryReconciliationActivationPhase::Active
                     | MemoryReconciliationActivationPhase::Paused
-            ) {
+            ) && !corrected_producer_redrain(&activation)
+            {
                 return Err(EnclaveError::Config(
-                    "schema 27 requires a verified active or paused activation chain".into(),
+                    "schema 27 requires a verified active, paused, or exact corrected redrain chain".into(),
                 ));
             }
             return Ok(());
@@ -2607,7 +2671,8 @@ impl PostgresPersistence {
     /// activation phase. The reconciliation implementation is intentionally
     /// dormant in `installed`; repository authority remains absent until
     /// `active`. Once draining has begun, every serving replica must carry the
-    /// exact signed model, location, and producer contract.
+    /// exact signed model, location, and producer contract, except for the
+    /// fixed Paused/g4 schema-compatibility bridge that grants no writer lane.
     pub(crate) async fn verify_reconciliation_runtime_schema(
         &self,
         reconciliation_model: Option<&str>,
@@ -2640,12 +2705,18 @@ impl PostgresPersistence {
                             .into(),
                     ));
                 };
-                if activation.reconciliation_model.as_deref() != Some(reconciliation_model)
+                if (activation.reconciliation_model.as_deref() != Some(reconciliation_model)
                     || activation.vertex_location.as_deref() != Some(vertex_location)
                     || activation
                         .reconciliation_producer_contract_sha256
                         .as_deref()
-                        != Some(sha256_label(producer_contract_sha256).as_str())
+                        != Some(sha256_label(producer_contract_sha256).as_str()))
+                    && !paused_vertex_schema_compatibility(
+                        &activation,
+                        reconciliation_model,
+                        vertex_location,
+                        producer_contract_sha256,
+                    )?
                 {
                     return Err(EnclaveError::Config(
                         "runtime does not match the signed fleet activation authority".into(),
@@ -2763,6 +2834,107 @@ pub(super) fn test_verify_activation_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_schema_bridge_is_only_the_verified_dark_predecessor() {
+        let model = "gemini-3.5-flash";
+        let location = "global";
+        let producer =
+            crate::cp::reconciler::producer_contract_commitment(model, location).unwrap();
+        assert_eq!(
+            sha256_label(&producer),
+            SCHEMA_COMPATIBILITY_SUCCESSOR_PRODUCER
+        );
+        let status = MemoryReconciliationActivationStatus {
+            phase: MemoryReconciliationActivationPhase::Paused,
+            generation: 4,
+            rollout_basis_points: 10_000,
+            explicit_canary_accounts: 0,
+            assigned_accounts: 2,
+            formation_backfill_generation: Some(2),
+            formation_backfill_complete: true,
+            finalization_claim_drain_complete: true,
+            receipt_sha256: Some(format!("sha256:{}", "a".repeat(64))),
+            contract_version: Some(2),
+            candidate_fleet_image_digest: Some(SCHEMA_COMPATIBILITY_PREDECESSOR_IMAGE.into()),
+            reconciliation_producer_contract_sha256: Some(
+                SCHEMA_COMPATIBILITY_PREDECESSOR_PRODUCER.into(),
+            ),
+            reconciliation_model: Some(model.into()),
+            vertex_location: Some(location.into()),
+        };
+        assert!(paused_vertex_schema_compatibility(&status, model, location, &producer).unwrap());
+        for mutation in 0..18 {
+            let mut invalid = status.clone();
+            match mutation {
+                0 => invalid.phase = MemoryReconciliationActivationPhase::Preactive,
+                1 => invalid.phase = MemoryReconciliationActivationPhase::Installed,
+                2 => invalid.phase = MemoryReconciliationActivationPhase::Draining,
+                3 => invalid.phase = MemoryReconciliationActivationPhase::Active,
+                4 => invalid.contract_version = Some(1),
+                5 => invalid.contract_version = None,
+                6 => invalid.generation = 3,
+                7 => invalid.generation = 5,
+                8 => invalid.rollout_basis_points = 0,
+                9 => invalid.explicit_canary_accounts = 1,
+                10 => invalid.formation_backfill_generation = Some(3),
+                11 => invalid.formation_backfill_generation = None,
+                12 => invalid.formation_backfill_complete = false,
+                13 => invalid.finalization_claim_drain_complete = false,
+                14 => invalid.candidate_fleet_image_digest = None,
+                15 => {
+                    invalid.reconciliation_producer_contract_sha256 = Some(sha256_label(&producer))
+                }
+                16 => invalid.reconciliation_model = Some("different-model".into()),
+                17 => invalid.vertex_location = Some("us-central1".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                !paused_vertex_schema_compatibility(&invalid, model, location, &producer).unwrap(),
+                "mutation {mutation}"
+            );
+        }
+        assert!(!paused_vertex_schema_compatibility(
+            &status,
+            "different-model",
+            location,
+            &producer
+        )
+        .unwrap());
+        assert!(
+            !paused_vertex_schema_compatibility(&status, model, "us-central1", &producer).unwrap()
+        );
+        assert!(!paused_vertex_schema_compatibility(&status, model, location, &[0; 32]).unwrap());
+        let mut redrain = status.clone();
+        redrain.phase = MemoryReconciliationActivationPhase::Draining;
+        redrain.generation = 5;
+        redrain.formation_backfill_generation = Some(5);
+        redrain.reconciliation_producer_contract_sha256 = Some(sha256_label(&producer));
+        for completed in [false, true] {
+            redrain.formation_backfill_complete = completed;
+            redrain.finalization_claim_drain_complete = completed;
+            assert!(corrected_producer_redrain(&redrain));
+            assert!(
+                !paused_vertex_schema_compatibility(&redrain, model, location, &producer).unwrap()
+            );
+        }
+        for mutation in 0..6 {
+            let mut invalid = redrain.clone();
+            match mutation {
+                0 => invalid.contract_version = Some(1),
+                1 => invalid.generation = 4,
+                2 => invalid.formation_backfill_generation = Some(2),
+                3 => {
+                    invalid.reconciliation_producer_contract_sha256 =
+                        Some(SCHEMA_COMPATIBILITY_PREDECESSOR_PRODUCER.into())
+                }
+                4 => invalid.phase = MemoryReconciliationActivationPhase::Installed,
+                5 => invalid.rollout_basis_points = 0,
+                _ => unreachable!(),
+            }
+            assert!(!corrected_producer_redrain(&invalid));
+        }
+    }
 
     fn activation_receipt(
         previous_phase: &str,

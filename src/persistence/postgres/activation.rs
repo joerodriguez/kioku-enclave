@@ -1254,6 +1254,8 @@ async fn verified_status(
             formation_backfill_complete: false,
             finalization_claim_drain_complete: false,
             receipt_sha256: None,
+            contract_version: None,
+            candidate_fleet_image_digest: None,
             reconciliation_producer_contract_sha256: None,
             reconciliation_model: None,
             vertex_location: None,
@@ -1291,6 +1293,12 @@ async fn verified_status(
         formation_backfill_complete: backfill.complete,
         finalization_claim_drain_complete: drain.complete,
         receipt_sha256: state.receipt_sha256.as_deref().map(sha256_label),
+        contract_version: Some(if epoch::present(connection).await? {
+            2
+        } else {
+            1
+        }),
+        candidate_fleet_image_digest: state.candidate_fleet_image_digest,
         reconciliation_producer_contract_sha256: state.reconciliation_producer_contract_sha256,
         reconciliation_model: state.reconciliation_model,
         vertex_location: state.vertex_location,
@@ -5805,7 +5813,9 @@ async fn test_isolated_activation_contract(base: &PostgresPersistence, epoch_onl
         .execute(base.pool())
         .await
         .expect("drop isolated activation schema");
-    outcome.expect("real PostgreSQL v27 activation contract");
+    outcome.unwrap_or_else(|error| {
+        panic!("real PostgreSQL v27 activation contract (epoch_only={epoch_only}): {error:?}")
+    });
 }
 
 /// Independently runnable activation contract. Keeping this separate from the
@@ -5815,6 +5825,17 @@ async fn test_isolated_activation_contract(base: &PostgresPersistence, epoch_onl
 #[cfg(test)]
 #[tokio::test]
 async fn postgres_memory_reconciliation_activation_contract() {
+    postgres_activation_contract_test(false).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn postgres_memory_reconciliation_epoch_contract() {
+    postgres_activation_contract_test(true).await;
+}
+
+#[cfg(test)]
+async fn postgres_activation_contract_test(epoch_only: bool) {
     use std::time::Duration;
 
     let required = std::env::var("KIOKU_REQUIRE_POSTGRES_CONTRACT").as_deref() == Ok("1");
@@ -5838,6 +5859,6 @@ async fn postgres_memory_reconciliation_activation_contract() {
     })
     .await
     .expect("connect real PostgreSQL activation contract");
-    test_real_pg_activation_contract(&base).await;
+    test_isolated_activation_contract(&base, epoch_only).await;
     base.pool.close().await;
 }

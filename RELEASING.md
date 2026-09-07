@@ -163,6 +163,29 @@ verifies the orphan-erasure catalog and distinguishes pending, complete-but-capt
 fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
 evidence is not v6 evidence and cannot authorize the new release's gates.
 
+### v0.9.31 Vertex schema correction from Paused/g4
+
+Vertex rejected the nested reconciliation response schema with its outer `maxItems`
+hint. The corrected producer omits only that hint; local validation still refuses more
+than 32 outputs before staging/publication. A fixed synthetic same-model probe changed
+from HTTP 400 to HTTP 200 with only this hint removed. Model, location, thinking settings,
+quota and output validation are unchanged. The compiled producer is
+`sha256:3a7a8d2d0f2a5e2045524f73822663d732ed31538792f1b2d9d7341a4f323225`.
+
+The one-release readiness bridge requires package v0.9.31, that exact compiled producer,
+verified v2 Paused/g4, the exact v0.9.30 image/producer, global scope, unchanged
+model/location, and complete g2 ledgers. It grants no worker authority. This producer-changing
+release uses the explicitly authorized existing incompatible-release maintenance lane:
+separately reviewed fleet-drained plan and zero-runtime proof, then a separate sole-v31
+restoration plan. Keep the database Paused and retain all v30 signed history; make no
+zero-downtime claim. Fresh homogeneous v31 evidence plus the exact signed g4 predecessor authorizes
+ordinary Paused-to-Draining/g5 with the new image/producer, then normal multipass g5
+backfill and Draining-to-Active/g6 with adjacent Pause/g7. No epoch reinstall or DDL is
+needed. The sole-owner operator may carry one due parked retry through those two edges,
+but every other gate and final quiescence remain strict. Normal successful publication
+retires the obsolete overlapping retry transactionally; never reset its attempt or
+rewrite historical receipts. Both protected-control canaries remain required.
+
 ### v0.9.30 source-closed serving and dormant activation epoch
 
 V6 preserves all raw v5 diagnostics and adds `source_graph`, derived by the exact

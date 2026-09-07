@@ -147,12 +147,14 @@ fn reconciled_substance(predecessors: &[&ReconciliationDraft]) -> &'static str {
 }
 
 fn response_schema() -> Value {
+    // Vertex rejects this nested schema when the outer array also carries a
+    // maxItems constraint. Keep the authoritative fanout bound in
+    // validate_partition; an oversized response still cannot stage or publish.
     json!({
         "type": "OBJECT",
         "properties": {
             "memories": {
                 "type": "ARRAY",
-                "maxItems": MAX_OUTPUTS,
                 "items": {
                     "type": "OBJECT",
                     "properties": {
@@ -1455,7 +1457,9 @@ mod tests {
     #[test]
     fn output_fanout_never_exceeds_the_handle_leaf_bound() {
         assert_eq!(MAX_OUTPUTS, 32);
-        assert_eq!(response_schema()["properties"]["memories"]["maxItems"], 32);
+        assert!(response_schema()["properties"]["memories"]
+            .get("maxItems")
+            .is_none());
         let source = snapshot(vec![draft(10, &["utterance:1"])], vec![atom(1, 1)]);
         let oversized = ModelPartition {
             memories: (0..=MAX_OUTPUTS)
