@@ -18,7 +18,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `cors.rs` | Exact public-origin CORS policy. |
 | `delivery.rs` | Canonical finalized-memory delivery model and PostgreSQL-backed loader shared by outbound channels. |
 | `dlp.rs` | Bounded sensitive-data classification/redaction helpers. |
-| `email_renderer.rs` | Pure text/HTML email rendering, escaping, and link safety. |
+| `email_renderer.rs` | Pure text/HTML email rendering in the apps' own vocabulary (subject "Your memory is ready" like the iPhone push, or "Final brief: <title>" with the Brief page's Final brief / Decisions / Action items / Important links / Open questions sections), readable UTC dates, escaping, and link safety. |
 | `email_worker.rs` | PostgreSQL-claimed Resend delivery with frozen requests, bounded retry, disclosure fences, ambiguity no-resend, and horizontally safe settlement. |
 | `finalizer.rs` | Restartable final-memory/recap worker, gated by settled memory reconciliation before any finalization claim. Qualified reconciled rows reuse their validated compact timeline while regenerating grounded briefs and screen semantics from raw evidence; settlement also atomically creates email, webhook, and APNs outbox rows. |
 | `identity.rs` | Identity facade and account/session projections. |

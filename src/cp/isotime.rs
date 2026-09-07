@@ -83,6 +83,16 @@ fn parse_time_and_offset(time_part: &str) -> Option<(&str, i64)> {
     Some((time_part, 0))
 }
 
+/// Split epoch milliseconds into UTC civil fields `(year, month, day, hour,
+/// minute, second)` for human-readable rendering.
+pub fn civil_utc(epoch_millis: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let total_secs = epoch_millis.div_euclid(1000);
+    let days = total_secs.div_euclid(86400);
+    let sod = total_secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    (y, mo, d, sod / 3600, (sod % 3600) / 60, sod % 60)
+}
+
 /// Format epoch milliseconds back to `YYYY-MM-DDTHH:MM:SS.fffZ`.
 pub fn format_epoch_millis(epoch_millis: i64) -> String {
     let total_secs = epoch_millis.div_euclid(1000);
@@ -123,6 +133,14 @@ mod tests {
         let ts = "2026-06-09T20:00:00.000Z";
         let ms = parse_epoch_millis(ts).unwrap();
         assert_eq!(format_epoch_millis(ms), ts);
+    }
+
+    #[test]
+    fn civil_utc_splits_fields() {
+        let ms = parse_epoch_millis("2026-07-30T10:31:05.900Z").unwrap();
+        assert_eq!(civil_utc(ms), (2026, 7, 30, 10, 31, 5));
+        assert_eq!(civil_utc(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(civil_utc(-1), (1969, 12, 31, 23, 59, 59));
     }
 
     #[test]
