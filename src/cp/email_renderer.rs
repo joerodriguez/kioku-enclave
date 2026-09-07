@@ -170,15 +170,28 @@ pub fn render_email_body(
     let finalized = human_utc(&episode.finalized_at);
 
     if !include_content {
+        let finalized_line = if finalized.trim().is_empty() {
+            String::new()
+        } else {
+            format!("Finalized {finalized}.\n")
+        };
         let text = format!(
-            "{READY_SUBJECT}.\n\n{READY_LEAD}\nFinalized {finalized}.\n\n{OPEN_IN_KIOKU}: {app_url}\n"
+            "{READY_SUBJECT}.\n\n{READY_LEAD}\n{finalized_line}\n{OPEN_IN_KIOKU}: {app_url}\n"
         );
+        let finalized_html = if finalized.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="meta">Finalized {}</div>"#,
+                escape_html(&finalized)
+            )
+        };
         let body = format!(
             r#"    <div class="h1">{READY_SUBJECT}</div>
     <p class="lead">{READY_LEAD}</p>
-    <div class="meta">Finalized {}</div>
+    {}
     {}"#,
-            escape_html(&finalized),
+            finalized_html,
             cta_html(&app_url)
         );
         return (
@@ -203,7 +216,14 @@ pub fn render_email_body(
         text_parts.push(format!("Participants: {}", episode.participants.join(", ")));
     }
 
-    text_parts.push("\nFinal brief".to_string());
+    let has_brief = !episode.overview.is_empty()
+        || !episode.decisions.is_empty()
+        || !episode.action_items.is_empty()
+        || !episode.important_links.is_empty()
+        || !episode.open_questions.is_empty();
+    if has_brief {
+        text_parts.push("\nFinal brief".to_string());
+    }
     if !episode.overview.is_empty() {
         text_parts.push(episode.overview.clone());
     }
@@ -270,7 +290,9 @@ pub fn render_email_body(
     }
     body.push_str("</div>\n");
 
-    body.push_str(r#"<div class="section-title">Final brief</div>"#);
+    if has_brief {
+        body.push_str(r#"<div class="section-title">Final brief</div>"#);
+    }
     if !episode.overview.is_empty() {
         body.push_str(&format!(
             r#"<div class="overview">{}</div>"#,
@@ -479,6 +501,25 @@ mod tests {
         assert_eq!(render_email_subject(&ep, true), "Your memory is ready");
         let (_, html) = render_email_body(&ep, true, "https://api.kiokuu.com");
         assert!(html.contains(r#"<div class="h1">Memory</div>"#));
+    }
+
+    #[test]
+    fn empty_brief_and_missing_finalized_time_render_nothing_misleading() {
+        let mut ep = sample_episode();
+        ep.overview.clear();
+        ep.decisions.clear();
+        ep.action_items.clear();
+        ep.important_links.clear();
+        ep.open_questions.clear();
+        ep.finalized_at.clear();
+        let (text, html) = render_email_body(&ep, true, "https://api.kiokuu.com");
+        assert!(!text.contains("Final brief\n"));
+        assert!(!html.contains("Final brief</div>"));
+        assert!(html.contains("Project Alpha Launch Plan"));
+        let (text, html) = render_email_body(&ep, false, "https://api.kiokuu.com");
+        assert!(!text.contains("Finalized"));
+        assert!(!html.contains("Finalized"));
+        assert!(html.contains("Your memory is ready"));
     }
 
     #[test]

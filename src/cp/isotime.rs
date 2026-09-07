@@ -39,6 +39,11 @@ pub fn parse_epoch_millis(ts: &str) -> Option<i64> {
     let y: i64 = dp.next()?.parse().ok()?;
     let mo: i64 = dp.next()?.parse().ok()?;
     let d: i64 = dp.next()?.parse().ok()?;
+    // Bound every field so the civil-date arithmetic below stays finite on
+    // absurd input (a debug build would otherwise panic on overflow).
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
     let (hms, frac) = match time.split_once('.') {
         Some((a, b)) => (a, b),
         None => (time, ""),
@@ -47,6 +52,9 @@ pub fn parse_epoch_millis(ts: &str) -> Option<i64> {
     let h: i64 = tp.next()?.parse().ok()?;
     let mi: i64 = tp.next()?.parse().ok()?;
     let s: i64 = tp.next().unwrap_or("0").parse().ok()?;
+    if !(0..=24).contains(&h) || !(0..=59).contains(&mi) || !(0..=60).contains(&s) {
+        return None;
+    }
     // Milliseconds from up-to-3 fractional digits.
     let mut millis = 0i64;
     if !frac.is_empty() {
@@ -69,12 +77,21 @@ fn parse_time_and_offset(time_part: &str) -> Option<(&str, i64)> {
     }
     // Look for +HH:MM or -HH:MM at the end (always 6 chars: ±HH:MM)
     if time_part.len() >= 6 {
-        let (rest, offset_str) = time_part.split_at(time_part.len() - 6);
+        let split = time_part.len() - 6;
+        // A multi-byte character straddling the split would make `split_at`
+        // panic; such input is simply not a timestamp.
+        if !time_part.is_char_boundary(split) {
+            return None;
+        }
+        let (rest, offset_str) = time_part.split_at(split);
         let sign_byte = offset_str.as_bytes()[0];
         if sign_byte == b'+' || sign_byte == b'-' {
             let mut parts = offset_str[1..].split(':');
             let oh: i64 = parts.next()?.parse().ok()?;
             let om: i64 = parts.next()?.parse().ok()?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
             let sign: i64 = if sign_byte == b'+' { 1 } else { -1 };
             return Some((rest, sign * (oh * 3600 + om * 60)));
         }
@@ -214,6 +231,28 @@ mod tests {
             normalize_to_utc("2026-07-26T19:51:39.450-04:00"),
             "2026-07-26T23:51:39.450Z"
         );
+    }
+
+    #[test]
+    fn malformed_or_absurd_input_is_rejected_without_panicking() {
+        // Multi-byte character across the offset split point.
+        assert_eq!(parse_epoch_millis("2026-07-30T1\u{e9}23456"), None);
+        assert_eq!(parse_epoch_millis("2026-07-30T10:00:00+\u{e9}9:00"), None);
+        // Fields far outside any calendar.
+        assert_eq!(
+            parse_epoch_millis("9223372036854775807-01-01T00:00:00Z"),
+            None
+        );
+        assert_eq!(parse_epoch_millis("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_epoch_millis("2026-07-30T25:00:00Z"), None);
+        assert_eq!(
+            parse_epoch_millis("2026-07-30T10:00:00+9223372036854775807:00"),
+            None
+        );
+        assert_eq!(parse_epoch_millis("2026-07-30T10:00:00+99:00"), None);
+        // Still lenient where it matters: leap second and offset-free.
+        assert!(parse_epoch_millis("2026-07-30T23:59:60Z").is_some());
+        assert!(parse_epoch_millis("2026-07-30T10:00:00").is_some());
     }
 
     #[test]
