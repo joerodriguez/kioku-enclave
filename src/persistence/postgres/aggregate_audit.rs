@@ -1259,8 +1259,10 @@ async fn test_real_pg_aggregate_audit_inner(
         .fetch_one(persistence.pool())
         .await
         .unwrap();
+    // Runtime quota reservations use the current UTC calendar day. Neither the
+    // server timezone nor the first UTC hour may move this fixture to yesterday.
     let since = sqlx::query_scalar::<_, String>(
-        "SELECT to_char(clock_timestamp()-interval '1 hour', \
+        "SELECT to_char(date_trunc('day',clock_timestamp() AT TIME ZONE 'UTC'), \
                         'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
     )
     .fetch_one(persistence.pool())
