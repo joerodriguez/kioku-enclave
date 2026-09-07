@@ -423,7 +423,7 @@ mod tests {
     fn request() -> EmailRequest {
         EmailRequest {
             to: "user@example.com".into(),
-            subject: "Your Kioku brief is ready".into(),
+            subject: "Your memory is ready".into(),
             text_body: "Brief text".into(),
             html_body: "<p>Brief html</p>".into(),
             idempotency_key: "delivery_123".into(),
@@ -440,7 +440,7 @@ mod tests {
 
         assert_eq!(payload["from"], "Kioku <notifications@notify.kiokuu.com>");
         assert_eq!(payload["to"][0], "user@example.com");
-        assert_eq!(payload["subject"], "Your Kioku brief is ready");
+        assert_eq!(payload["subject"], "Your memory is ready");
         assert_eq!(payload["text"], "Brief text");
         assert_eq!(payload["html"], "<p>Brief html</p>");
         assert!(payload.get("idempotency_key").is_none());
