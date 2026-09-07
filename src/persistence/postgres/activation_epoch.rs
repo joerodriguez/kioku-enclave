@@ -326,6 +326,12 @@ impl PostgresPersistence {
 pub(super) async fn test_epoch_contract_inner(persistence: &PostgresPersistence) -> Result<()> {
     use super::super::schema_release::{test_verify_activation_receipt, ActivationEpochUpgrade};
     const ACCOUNT: &str = "activation-epoch-contract-account";
+    const MODEL: &str = "gemini-3.5-flash";
+    const LOCATION: &str = "global";
+    const OLD_IMAGE: &str =
+        "sha256:dba7ceb3937b267786a24f778118084becabde481930ce1427d074527266d3e6";
+    const OLD_PRODUCER: &str =
+        "sha256:bbdae4ec761951ec0317feed36c40819419de1f8fac7db4f6f7298ca8d066e0c";
     persistence
         .install_memory_reconciliation_activation_schema()
         .await?;
@@ -342,11 +348,16 @@ pub(super) async fn test_epoch_contract_inner(persistence: &PostgresPersistence)
         1,
         "installed",
         "draining",
-        0,
-        vec![ACCOUNT.into()],
+        10_000,
+        Vec::new(),
         false,
     )
     .await?;
+    let mut predecessor = draining.receipt().clone();
+    predecessor.reconciliation_model = MODEL.into();
+    predecessor.vertex_location = LOCATION.into();
+    predecessor.reconciliation_producer_contract_sha256 = OLD_PRODUCER.into();
+    let draining = test_verify_activation_receipt(predecessor)?;
     persistence
         .transition_memory_reconciliation_activation(&draining)
         .await?;
@@ -389,7 +400,7 @@ pub(super) async fn test_epoch_contract_inner(persistence: &PostgresPersistence)
     receipt.previous_phase = "draining".into();
     receipt.activation_contract_sha256 = label("activation_contract_sha256");
     receipt.activation_catalog_sha256 = label("activation_catalog_sha256");
-    receipt.candidate_fleet_image_digest = format!("sha256:{}", "e".repeat(64));
+    receipt.candidate_fleet_image_digest = OLD_IMAGE.into();
     receipt.epoch_upgrade = Some(ActivationEpochUpgrade {
         prior_receipt_sha256: label("prior_receipt_sha256"),
         prior_contract_sha256: label("prior_contract_sha256"),
@@ -491,12 +502,135 @@ pub(super) async fn test_epoch_contract_inner(persistence: &PostgresPersistence)
             .await
             .is_err()
     );
+    Box::pin(test_schema_correction_retry_cycle(persistence, active)).await?;
+    assert_eq!(immutable_history(persistence).await?, original);
+    Ok(())
+}
+
+#[cfg(test)]
+async fn test_schema_correction_retry_cycle(
+    persistence: &PostgresPersistence,
+    mut active: super::super::schema_release::MemoryReconciliationActivationReceipt,
+) -> Result<()> {
+    use super::super::schema_release::test_verify_activation_receipt;
+    use crate::persistence::MemoryReconciliationRepository;
+    const ACCOUNT: &str = "activation-epoch-contract-account";
+    const MODEL: &str = "gemini-3.5-flash";
+    const LOCATION: &str = "global";
+    // A known-not-billed failed attempt remains durable across the dark upgrade.
+    let old_snapshot = persistence
+        .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
+        .await?
+        .expect("one unselected draft remains after partial KEEP");
+    let old_claim = persistence
+        .claim_reconciliation(&old_snapshot, 900)
+        .await?
+        .unwrap();
+    persistence
+        .release_reconciliation(&old_claim, Some(0), "provider_not_billed", false, true)
+        .await?;
+    let successor = crate::cp::reconciler::producer_contract_commitment(MODEL, LOCATION)?;
+    assert!(
+        persistence
+            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+            .await
+            .is_err(),
+        "the compatibility bridge never admits old Active"
+    );
     active.generation = 4;
     active.previous_phase = "active".into();
     active.requested_phase = "paused".into();
     persistence
+        .transition_memory_reconciliation_activation(&test_verify_activation_receipt(
+            active.clone(),
+        )?)
+        .await?;
+    persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+        .await?;
+    assert!(
+        persistence
+            .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
+            .await?
+            .is_none(),
+        "compatible readiness cannot grant Paused worker authority"
+    );
+    let retry_before: String = sqlx::query_scalar("SELECT to_jsonb(j)::text FROM memory_reconciliation_jobs j WHERE account_id=$1 AND source_fingerprint=$2")
+        .bind(ACCOUNT).bind(&old_snapshot.source_fingerprint).fetch_one(persistence.pool()).await?;
+    let retry: Value = serde_json::from_str(&retry_before)?;
+    assert_eq!(retry["state"], "retry_wait");
+    assert_eq!(retry["model_attempt_count"], 1);
+    assert_eq!(retry["last_error_code"], "provider_not_billed");
+    active.generation = 5;
+    active.previous_phase = "paused".into();
+    active.requested_phase = "draining".into();
+    active.candidate_fleet_image_digest = format!("sha256:{}", "f".repeat(64));
+    active.reconciliation_producer_contract_sha256 = sha256_label(&successor);
+    let redrain = persistence
+        .transition_memory_reconciliation_activation(&test_verify_activation_receipt(
+            active.clone(),
+        )?)
+        .await?;
+    assert!(!redrain.formation_backfill_complete);
+    test_advance_activation_until_complete(persistence, true).await?;
+    assert_eq!(sqlx::query_scalar::<_, String>("SELECT to_jsonb(j)::text FROM memory_reconciliation_jobs j WHERE account_id=$1 AND source_fingerprint=$2")
+        .bind(ACCOUNT).bind(&old_snapshot.source_fingerprint).fetch_one(persistence.pool()).await?, retry_before,
+        "redrain/backfill must not reset or discard the old attempt");
+    persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+        .await?;
+    active.generation = 6;
+    active.previous_phase = "draining".into();
+    active.requested_phase = "active".into();
+    persistence
         .transition_memory_reconciliation_activation(&test_verify_activation_receipt(active)?)
         .await?;
+    let new_snapshot = persistence
+        .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
+        .await?
+        .unwrap();
+    assert_ne!(
+        new_snapshot.source_fingerprint,
+        old_snapshot.source_fingerprint
+    );
+    let new_claim = persistence
+        .claim_reconciliation(&new_snapshot, 900)
+        .await?
+        .unwrap();
+    assert_eq!(new_claim.activation_generation, 6);
+    assert_eq!(new_claim.producer_contract_sha256, successor.to_vec());
+    let guard = persistence
+        .acquire_provider_egress_guard(&new_claim)
+        .await?
+        .unwrap();
+    let mut staged_write = super::super::memory_reconciliation::test_provider_stage_write(
+        &new_snapshot,
+        "schema-correction",
+    )?;
+    assert_eq!(new_snapshot.predecessor_episode_ids.len(), 1);
+    staged_write.planned_outputs[0].retained_episode_id =
+        Some(new_snapshot.predecessor_episode_ids[0]);
+    let stage = guard.stage_and_release(staged_write).await?;
+    let mut digest = Sha256::new();
+    digest.update(b"kioku:postgres-memory-reconciliation:v1\0");
+    digest.update(&new_snapshot.source_fingerprint);
+    digest.update(&stage.result_commitment);
+    let published = persistence
+        .publish_reconciliation(crate::persistence::ReconciliationPublish {
+            claim: new_claim,
+            reconciliation_id: format!("rec_{:x}", digest.finalize()),
+            cohort_started_at: new_snapshot.cohort_started_at,
+            cohort_ended_at: new_snapshot.cohort_ended_at,
+            result_commitment: stage.result_commitment,
+        })
+        .await?;
+    assert!(matches!(
+        published,
+        crate::persistence::ReconciliationPublishResult::Published { .. }
+    ));
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM memory_reconciliation_jobs WHERE account_id=$1 AND (source_fingerprint=$2 OR state<>'complete')")
+        .bind(ACCOUNT).bind(&old_snapshot.source_fingerprint).fetch_one(persistence.pool()).await?, 0,
+        "normal publication retires the obsolete retry and leaves no unfinished jobs");
     Ok(())
 }
 

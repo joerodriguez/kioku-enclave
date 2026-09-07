@@ -62,6 +62,9 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
   and cannot be bypassed by a stale worker.
 - Query absence remains distinguishable from PostgreSQL/provider unavailability and malformed
   encrypted evidence; public errors never contain content.
+- The reconciliation response schema omits Vertex's rejected outer `maxItems` hint.
+  The local exhaustive partition validator still rejects more than 32 outputs before
+  staging or publication; its compiled producer commitment includes the changed schema.
 - Export includes selected tenant-qualified PostgreSQL rows and media metadata, not GCS bytes; full
   media-byte export remains an activation blocker. Episode/account deletion remains restartable
   and cannot report completion before PostgreSQL and GCS converge.
