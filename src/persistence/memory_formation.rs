@@ -326,5 +326,16 @@ pub(crate) trait MemoryFormationRepository: Send + Sync {
         writes: &[EpisodeEmbeddingWrite],
     ) -> Result<()>;
 
-    async fn session_tail_is_settled(&self, account_id: &str, recent_after: &str) -> Result<bool>;
+    /// True only when the account's evidence up to `window_end` is complete:
+    /// no open capture session saw an event at or after `recent_after`, no
+    /// session's horizon (its last event or end) extends past `window_end`,
+    /// and no media is queued, processing, or retrying — except screen
+    /// storyboards parked on the daily Vertex budget, which form later as late
+    /// evidence rather than gating the spoken memory.
+    async fn session_tail_is_settled(
+        &self,
+        account_id: &str,
+        recent_after: &str,
+        window_end: &str,
+    ) -> Result<bool>;
 }

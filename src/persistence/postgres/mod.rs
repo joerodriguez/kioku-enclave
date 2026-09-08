@@ -1167,8 +1167,14 @@ mod tests {
                 pending
             );
         };
+        let window_end = "2026-08-27T12:40:00.000Z";
         assert!(memory
-            .session_tail_is_settled(account_id, recent_cutoff)
+            .session_tail_is_settled(account_id, recent_cutoff, window_end)
+            .await
+            .unwrap());
+        // A window ending before the session's horizon would send a fragment.
+        assert!(!memory
+            .session_tail_is_settled(account_id, recent_cutoff, "2026-08-27T12:20:30.000Z")
             .await
             .unwrap());
         parked_span(false).await;
@@ -1181,7 +1187,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!memory
-            .session_tail_is_settled(account_id, recent_cutoff)
+            .session_tail_is_settled(account_id, recent_cutoff, window_end)
             .await
             .unwrap());
         parked_span(true).await;
