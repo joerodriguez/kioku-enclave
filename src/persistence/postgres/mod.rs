@@ -1023,6 +1023,183 @@ mod tests {
         assert!(!finalize.contains("ALTER TABLE"));
     }
 
+    /// ADR-0034 settled evidence: a forward-lane pass over complete evidence
+    /// that forms nothing settles with no episodes and a cursor at the window
+    /// end, and a finished session behind that cursor reports `no_memory`
+    /// instead of staying `organizing` until a later sweep. This is its own
+    /// heap-pinned future so the contract test's poll frame does not grow.
+    async fn settled_zero_result_contract(
+        pool: &sqlx::PgPool,
+        repositories: &RepositorySet,
+        account_id: &str,
+    ) {
+        let memory = repositories.memory_formation();
+        sqlx::query(
+            "INSERT INTO capture_sessions \
+             (account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
+             VALUES($1,'session-settled-empty','device-contract','install-contract', \
+                    '2026-08-27T12:20:00Z','2026-08-27T12:21:00Z','2026-08-27T12:21:00Z',1)",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let settled_claim = memory
+            .claim_summary_window(
+                account_id,
+                "2026-08-27T12:00:02.000Z",
+                "2026-08-27T12:40:00.000Z",
+                "2026-08-27T12:40:01.000Z",
+                900,
+            )
+            .await
+            .unwrap()
+            .expect("settled window claim");
+        assert!(memory
+            .settle_summary_window(SummaryWindowSettlement {
+                claim: settled_claim,
+                episodes: Vec::new(),
+                cursor: Some("2026-08-27T12:40:00.000Z".into()),
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repositories
+                .work()
+                .summarized_until(account_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-08-27T12:40:00.000Z")
+        );
+        let settled_cursor_ms =
+            crate::cp::isotime::parse_epoch_millis("2026-08-27T12:40:00.000Z").unwrap();
+        let settled_status = repositories
+            .captures()
+            .session_status(account_id, "session-settled-empty", Some(settled_cursor_ms))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled_status.event_count, 0);
+        assert_eq!(settled_status.stage, CaptureSessionStage::NoMemory);
+        let early_cursor_ms =
+            crate::cp::isotime::parse_epoch_millis("2026-08-27T12:20:30.000Z").unwrap();
+        assert_eq!(
+            repositories
+                .captures()
+                .session_status(account_id, "session-settled-empty", Some(early_cursor_ms))
+                .await
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Organizing
+        );
+
+        // Screen work parked on the daily Vertex budget never gates formation:
+        // the tail still counts as settled and the parked span is not held for
+        // recovery, so the spoken memory forms now and the storyboard joins as
+        // late evidence. Any other retrying media still settles the tail.
+        sqlx::query(
+            "INSERT INTO capture_streams \
+             (account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) \
+             VALUES($1,'settled-parked-stream','session-settled-empty','device-contract','mac_screen',0)",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO capture_events( \
+                 account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind, \
+                 sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id, \
+                 utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,context_json, \
+                 media_disposition,canonical_event_id,canonical_asset_id,canonical_media_sha256, \
+                 perceptual_hash,hamming_distance,pixel_change_ratio,context_fingerprint, \
+                 dedupe_version,received_at) \
+             VALUES($1,'settled-parked-event','device-contract','install-contract', \
+                    'session-settled-empty','settled-parked-stream','mac_screen',0, \
+                    '2026-08-27T12:20:10Z','1','2026-08-27T12:20:10Z','2026-08-27T12:20:11Z','UTC', \
+                    0,0,'settled-parked-asset',repeat('a',64),'{}','canonical', \
+                    NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,clock_timestamp())",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_objects( \
+                 account_id,asset_id,event_id,object_key,object_generation,object_backend,mime_type, \
+                 codec,byte_length,sha256,width,height,processing_state) \
+             VALUES($1,'settled-parked-asset','settled-parked-event','media/settled/parked',1, \
+                    'current','image/png','png',1024,repeat('e',64),100,100,'retry_wait')",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_processing_jobs( \
+                 account_id,event_id,job_kind,input_revision,processor_version,state,error_code) \
+             VALUES($1,'settled-parked-event','gemini_screen','settled-parked-input',1, \
+                    'retry_wait','vertex_daily_budget')",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        // The still-open contract session last saw an event at 12:00:02, so a
+        // later recent-session cutoff leaves only the parked media to decide.
+        let recent_cutoff = "2026-08-27T12:05:00.000Z";
+        let parked_span = |pending: bool| async move {
+            assert_eq!(
+                repositories
+                    .media_processing()
+                    .span_has_recoverable_media(
+                        account_id,
+                        "2026-08-27T12:00:02.000Z",
+                        "2026-08-27T12:40:00.000Z",
+                        "2026-08-20T00:00:00.000Z",
+                        5,
+                    )
+                    .await
+                    .unwrap(),
+                pending
+            );
+        };
+        assert!(memory
+            .session_tail_is_settled(account_id, recent_cutoff)
+            .await
+            .unwrap());
+        parked_span(false).await;
+        sqlx::query(
+            "UPDATE media_processing_jobs SET error_code='vertex_not_billed' \
+              WHERE account_id=$1 AND event_id='settled-parked-event'",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(!memory
+            .session_tail_is_settled(account_id, recent_cutoff)
+            .await
+            .unwrap());
+        parked_span(true).await;
+        for statement in [
+            "DELETE FROM media_processing_jobs WHERE account_id=$1 AND event_id='settled-parked-event'",
+            "DELETE FROM media_objects WHERE account_id=$1 AND asset_id='settled-parked-asset'",
+            "DELETE FROM capture_events WHERE account_id=$1 AND event_id='settled-parked-event'",
+            "DELETE FROM capture_streams WHERE account_id=$1 AND id='settled-parked-stream'",
+            "DELETE FROM capture_sessions WHERE account_id=$1 AND id='session-settled-empty'",
+        ] {
+            sqlx::query(statement)
+                .bind(account_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn test_real_pg_control_plane_contract_inner(persistence: PostgresPersistence) {
         let persistence = Arc::new(persistence);
         let pool = persistence.pool().clone();
@@ -1854,6 +2031,14 @@ mod tests {
                 .unwrap(),
             Some("2026-08-27T12:00:02.000Z".into())
         );
+
+        Box::pin(settled_zero_result_contract(
+            &pool,
+            &repositories,
+            &account_id,
+        ))
+        .await;
+
         repositories
             .work()
             .set_summarized_until(&account_id, "2026-08-27T12:34:56.789Z")

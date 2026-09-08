@@ -983,7 +983,7 @@ provider_day AS MATERIALIZED (
 ),
 usage_categories(class,token_limit,quantum,ordinal) AS (
     VALUES ('audio',1310720::bigint,4096::bigint,1),
-           ('screen',655360::bigint,1024::bigint,2),
+           ('screen',655360::bigint,4096::bigint,2),
            ('derived',655360::bigint,8192::bigint,3)
 ),
 usage_class_account AS MATERIALIZED (
@@ -1073,7 +1073,7 @@ usage_facts AS MATERIALIZED (
            (SELECT count(*)::bigint FROM usage_scope
              WHERE vertex_requests<>
                    vertex_audio_output_tokens/4096+
-                   vertex_screen_output_tokens/1024+
+                   vertex_screen_output_tokens/4096+
                    vertex_derived_output_tokens/8192) AS request_slot_mismatch_rows,
            jsonb_agg(jsonb_build_object(
                'class',class,'token_limit',token_limit,'quantum',quantum,
@@ -1177,7 +1177,7 @@ account_finalization_needs AS MATERIALIZED (
 account_capacity AS MATERIALIZED (
     SELECT account.id AS account_id,
            greatest(1310720-usage.audio_tokens,0)/4096 AS audio_remaining_slots,
-           greatest(655360-usage.screen_tokens,0)/1024 AS screen_remaining_slots,
+           greatest(655360-usage.screen_tokens,0)/4096 AS screen_remaining_slots,
            greatest(655360-usage.derived_tokens,0)/8192 AS derived_remaining_slots,
            component.components,component.reconciliation_calls,component.successor_finalizers,
            (component.reconciliation_calls+component.successor_finalizers+

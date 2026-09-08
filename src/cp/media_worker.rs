@@ -573,6 +573,19 @@ async fn settle_staged_media(
         return Err(MediaWorkFailure::staged(error, response.attempt));
     }
 
+    if generation.finish_reason.as_deref() == Some("MAX_TOKENS") {
+        // The provider stopped at the output ceiling, so the JSON is cut
+        // mid-document. Name the cause instead of surfacing the resulting
+        // parse error; the attempt is billed and terminal either way.
+        return Err(MediaWorkFailure::provider(
+            EnclaveError::InvalidRequest(format!(
+                "model output truncated at the {output_tokens}-token ceiling"
+            )),
+            MediaFailureDisposition::ConfirmedInvalid,
+            response.attempt.clone(),
+        ));
+    }
+
     if claim.class == MediaProcessingClass::Audio {
         let window_start = claim
             .jobs
@@ -698,7 +711,7 @@ async fn process_work_unit(
         )
         .await
     } else {
-        let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. List a person only when a visible name label supports it, preferring the complete first and last name. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
+        let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. Keep every frame compact so the complete storyboard fits the response budget: visible_text holds at most the 400 most useful characters, salient_text at most 160 characters, and literal_description at most 200 characters; when a frame repeats the previous frame's content, say so briefly instead of transcribing it again. List a person only when a visible name label supports it, preferring the complete first and last name, and list at most the six most prominent labeled people per frame. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
         let inputs = work
             .jobs
             .iter()
@@ -973,6 +986,32 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response cut at the output ceiling is billed like any other
+    /// terminal invalid output: usage settles first, then the unit fails
+    /// with a truncation error instead of a bare JSON parse error.
+    #[test]
+    fn truncated_media_output_fails_after_usage_settlement() {
+        let source = include_str!("media_worker.rs");
+        let settle = source
+            .split("async fn settle_staged_media(")
+            .nth(1)
+            .unwrap()
+            .split("fn assemble_audio_window(")
+            .next()
+            .unwrap();
+        let usage = settle
+            .find(".settle_usage(MediaUsageSettlement {")
+            .expect("usage settlement");
+        let truncated = settle
+            .find("finish_reason.as_deref() == Some(\"MAX_TOKENS\")")
+            .expect("truncation check");
+        let audio = settle
+            .find("if claim.class == MediaProcessingClass::Audio {")
+            .expect("class-specific parsing");
+        assert!(usage < truncated && truncated < audio);
+        assert!(settle.contains("model output truncated at the {output_tokens}-token ceiling"));
+    }
 
     fn storyboard_json(ids: &[&str]) -> String {
         serde_json::to_string(&json!({

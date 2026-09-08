@@ -130,9 +130,13 @@ mod tests {
             audio / i64::from(super::super::vertex::MAX_MEDIA_OUTPUT_TOKENS),
             320
         );
+        // Storyboards reserve the same ceiling as audio windows now that the
+        // 1,024-token ceiling is known to truncate every real storyboard; the
+        // protected screen share therefore admits 160 storyboards (about four
+        // hours of screen coverage) per account per day.
         assert_eq!(
             screen / i64::from(super::super::vertex::MAX_SCREEN_OUTPUT_TOKENS),
-            640
+            160
         );
         assert_eq!(
             derived / i64::from(CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS),
