@@ -602,8 +602,11 @@ an active-speaker label is never smeared across the storyboard.
 
 The persistent daily Vertex ceiling is divided into protected output-token
 reservations: 50% audio, 25% screens, and 25% episode/finalization text. Screen
-storyboards reserve at most 1,024 output tokens; audio windows reserve at most
-4,096. Audio is scheduled before screen work for each user sweep, so screen
+storyboards and audio windows each reserve at most 4,096 output tokens (the
+earlier 1,024-token storyboard ceiling truncated real storyboards mid-JSON), so the
+protected screen share admits 160 storyboards per account per day. Screen work parked
+on that budget waits for the next UTC day without gating memory formation: the spoken
+memory forms from the settled audio, and the storyboard joins as late evidence. Audio is scheduled before screen work for each user sweep, so screen
 volume cannot consume or queue ahead of protected audio capacity. Retries reuse
 the deterministic work-unit reservation. Encrypted per-user telemetry stores
 only work class, opaque unit/version, reserved and actual token counts,
@@ -630,7 +633,12 @@ holds its forward-only cursor over otherwise-empty spans while their failures ar
 the ladder's first rounds, so a transiently failed session can still resolve to `ready`
 or an honest `no_memory` without any client action. Once the cursor honestly passes an
 ended session with no materialized memory, its stage is `no_memory` even if internal
-per-item failure records remain. A newly accepted or newly materialized source increments
+per-item failure records remain. Settled evidence is never held for a tail that cannot
+grow: when every recording in a summarizer window has ended and its media has settled, a
+pass that forms nothing advances the cursor past the whole window at once, so a finished
+session reports `no_memory` promptly instead of after the six-hour window cap, and a short
+recording with substantive speech (even under a minute) forms a memory rather than being
+dropped as a fragment. A newly accepted or newly materialized source increments
 that session's durable formation revision. If the forward cursor has already passed it,
 the exact-session lane classifies the new revision (including an explicit `no_memory` or
 already-accounted outcome) without backdating or rewriting a previously published memory;

@@ -37,7 +37,15 @@ pub(crate) const JSON_RESPONSE_MIME_TYPE: &str = "application/json";
 pub(crate) const THINKING_BUDGET: i64 = 0;
 pub(crate) const MAX_TEXT_OUTPUT_TOKENS: u32 = CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS;
 pub(crate) const MAX_MEDIA_OUTPUT_TOKENS: u32 = 4_096;
-pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 1_024;
+/// A storyboard carries up to [`super::media_planner::MAX_SCREEN_FRAMES`]
+/// frames, each with several required free-text fields. The former
+/// 1,024-token ceiling truncated essentially every production storyboard
+/// mid-JSON (Gemini stopped at 1,008–1,009 output tokens), so no screen
+/// evidence ever settled. The ceiling now matches the audio window (the media
+/// request clamp), the storyboard holds eight frames instead of twelve, and
+/// the prompt bounds per-frame text and people so a verbose screen stays
+/// inside it.
+pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 4_096;
 
 async fn require_active_account(state: &CpState, user_id: &str) -> Result<()> {
     if !super::limits::account_active(&state.repositories, user_id).await? {
@@ -235,6 +243,9 @@ pub struct MediaGeneration {
     pub text: String,
     pub metadata: VertexMetadata,
     pub latency_ms: u64,
+    /// Vertex's `finishReason` for the first candidate; `MAX_TOKENS` means the
+    /// text was cut at the output ceiling and cannot be a complete document.
+    pub finish_reason: Option<String>,
     /// Durable usage-ledger identity minted before the provider request.
     /// PostgreSQL workers re-drive terminal settlement against this exact
     /// identity after a successful response.
@@ -1186,11 +1197,18 @@ pub(crate) fn parse_staged_media_response(
                 .collect::<String>()
         })
         .unwrap_or_default();
+    let finish_reason = data
+        .get("candidates")
+        .and_then(|candidates| candidates.get(0))
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     Ok(MediaGeneration {
         text,
         metadata,
         latency_ms: response.latency_ms,
         event_id: response.attempt.event_id.clone(),
+        finish_reason,
     })
 }
 
@@ -1339,7 +1357,53 @@ mod tests {
     }
 
     #[test]
-    fn storyboard_request_has_opaque_frame_ids_and_a_1024_token_ceiling() {
+    fn staged_media_response_carries_the_finish_reason() {
+        let body = serde_json::to_vec(&json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "{\"frames\":[{\"frame_id\":\"a\""}]},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4096,
+                "totalTokenCount": 4106
+            }
+        }))
+        .unwrap();
+        let response = MediaProviderStagedResponse {
+            attempt: MediaProviderAttempt {
+                number: 1,
+                identity_sha256: [1; 32],
+                request_sha256: [2; 32],
+                event_id: "vertex-attempt-test".into(),
+                requested_model: "gemini-test".into(),
+                location: "us-central1".into(),
+            },
+            http_status: 200,
+            response_sha256: sha2::Sha256::digest(&body).into(),
+            response_bytes: body,
+            latency_ms: 7,
+        };
+        let generation = parse_staged_media_response(
+            &response,
+            VertexOperation::ScreenStoryboard,
+            MAX_SCREEN_OUTPUT_TOKENS,
+        )
+        .expect("a 200 response parses");
+        assert_eq!(generation.finish_reason.as_deref(), Some("MAX_TOKENS"));
+        assert_eq!(
+            generation
+                .metadata
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(4096)
+        );
+        assert!(generation.text.starts_with("{\"frames\""));
+    }
+
+    #[test]
+    fn storyboard_request_has_opaque_frame_ids_and_a_4096_token_ceiling() {
         let frames = vec![
             MediaInput::new("frame-a", "image/jpeg", b"a"),
             MediaInput::new("frame-b", "image/jpeg", b"b"),
@@ -1351,7 +1415,8 @@ mod tests {
             false,
             MAX_SCREEN_OUTPUT_TOKENS,
         );
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1_024);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 4_096);
+        assert_eq!(MAX_SCREEN_OUTPUT_TOKENS, MAX_MEDIA_OUTPUT_TOKENS);
         assert_eq!(body["generationConfig"]["audioTimestamp"], false);
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["text"], "frame_id: frame-a");

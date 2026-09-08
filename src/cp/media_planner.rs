@@ -11,7 +11,11 @@ pub const MAX_AUDIO_WINDOW_MS: i64 = 5 * 60 * 1_000;
 pub const MAX_AUDIO_GAP_MS: i64 = 1_000;
 pub const MAX_AUDIO_BYTES: i64 = 20 * 1024 * 1024;
 pub const MAX_SCREEN_SPAN_MS: i64 = 90 * 1_000;
-pub const MAX_SCREEN_FRAMES: usize = 12;
+/// Frames per storyboard. Eight frames keep a text-dense storyboard (bounded
+/// per-frame text plus up to six labeled people per frame) comfortably inside
+/// the 4,096-token output ceiling that the daily quota reserves per call;
+/// twelve frames left no margin for meeting grids and document screens.
+pub const MAX_SCREEN_FRAMES: usize = 8;
 pub const MAX_SCREEN_BYTES: i64 = 16 * 1024 * 1024;
 pub const MAX_SCREEN_PIXELS: i64 = 24_000_000;
 
@@ -240,7 +244,8 @@ pub fn simulate_three_hours(
         audio_model_calls,
         reference_model_calls: 0,
         reserved_audio_tokens: audio_model_calls * 4_096,
-        reserved_screen_tokens: screen_model_calls * 1_024,
+        reserved_screen_tokens: screen_model_calls
+            * i64::from(super::vertex::MAX_SCREEN_OUTPUT_TOKENS),
     }
 }
 
@@ -314,9 +319,9 @@ mod tests {
         candidates.reverse();
         let plan = plan_first(&candidates);
         assert_eq!(plan.class, WorkClass::Screen);
-        assert_eq!(plan.member_job_ids.len(), 12);
+        assert_eq!(plan.member_job_ids.len(), MAX_SCREEN_FRAMES);
         assert_eq!(plan.started_ms, 0);
-        assert_eq!(plan.ended_ms, 77_001);
+        assert_eq!(plan.ended_ms, 49_001);
         assert!(plan.total_bytes <= MAX_SCREEN_BYTES);
         assert!(plan.total_pixels <= MAX_SCREEN_PIXELS);
     }

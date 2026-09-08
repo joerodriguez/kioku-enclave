@@ -1152,10 +1152,30 @@ fn lease_authorized_summary(mut summary: Value) -> Value {
     summary
 }
 
+/// Granted lease receipts are immutable idempotency records, so a receipt
+/// written before the retention policy wire string was pinned still carries
+/// serde's digit-joined spelling. Normalize it on the way out so a replayed
+/// receipt matches the contract the clients validate.
+fn normalize_recording_retention_authority(authority: &mut Value) {
+    if let Some(policy) = authority.get_mut("policy") {
+        if policy.as_str() == Some("processing_window30d") {
+            *policy = Value::String(
+                RecordingRetentionPolicy::ProcessingWindow30d
+                    .as_str()
+                    .into(),
+            );
+        }
+    }
+}
+
 fn recording_lease_response(lease_id: String, expires_at: String, mut summary: Value) -> Response {
     let recording_retention = summary
         .as_object_mut()
-        .and_then(|object| object.remove("_recording_retention_authority"));
+        .and_then(|object| object.remove("_recording_retention_authority"))
+        .map(|mut authority| {
+            normalize_recording_retention_authority(&mut authority);
+            authority
+        });
     no_store(
         Json(serde_json::json!({
             "lease_id":lease_id,
@@ -2531,6 +2551,21 @@ pub async fn drain_detach_outbox(state: &CpState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replayed_lease_receipts_normalize_the_retention_policy_spelling() {
+        let mut legacy = serde_json::json!({
+            "policy": "processing_window30d",
+            "policy_revision": 0,
+            "consent_version": 0,
+            "status": "processing_only"
+        });
+        normalize_recording_retention_authority(&mut legacy);
+        assert_eq!(legacy["policy"], "processing_window_30d");
+        let mut durable = serde_json::json!({"policy": "until_deleted", "status": "authorized"});
+        normalize_recording_retention_authority(&mut durable);
+        assert_eq!(durable["policy"], "until_deleted");
+    }
 
     #[test]
     fn batch_accounting_requires_every_event_to_be_classified() {

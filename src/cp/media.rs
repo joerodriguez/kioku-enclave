@@ -217,6 +217,7 @@ pub struct RecordingRetentionCaptureAuthority {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "retention_decision", rename_all = "snake_case")]
 pub(crate) enum RecordingMediaAuthorityDecision {
+    #[serde(rename = "processing_window_30d")]
     ProcessingWindow30d {
         capture_policy_revision: i64,
         decision_at: String,
@@ -2648,8 +2649,15 @@ struct AudioResult {
     turns: Vec<AudioTurn>,
 }
 
+/// The model reports turn offsets against the audio it heard, and its final
+/// turn routinely ends a rounded fraction of a second past the assembled
+/// window's exact length. Clamp that bounded overshoot to the window instead
+/// of discarding the whole window's transcript; anything beyond it is still
+/// an invalid model output.
+pub(crate) const AUDIO_TURN_END_TOLERANCE_MS: i64 = 2_000;
+
 pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>> {
-    let result: AudioResult = serde_json::from_str(raw)?;
+    let mut result: AudioResult = serde_json::from_str(raw)?;
     if result.turns.len() > MAX_TURNS {
         return Err(EnclaveError::InvalidRequest(
             "audio result has too many turns".into(),
@@ -2659,13 +2667,19 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
     let mut previous_start = -1;
     let mut previous_end = 0;
     let mut previous_overlap = false;
-    for turn in &result.turns {
+    for turn in &mut result.turns {
         validate_id("turn_id", &turn.turn_id)?;
         validate_id("speaker_local_id", &turn.speaker_local_id)?;
-        if !ids.insert(turn.turn_id.as_str()) {
+        if !ids.insert(turn.turn_id.clone()) {
             return Err(EnclaveError::InvalidRequest(
                 "audio result has duplicate turn_id".into(),
             ));
+        }
+        if turn.start_ms < duration_ms
+            && turn.end_ms > duration_ms
+            && turn.end_ms - duration_ms <= AUDIO_TURN_END_TOLERANCE_MS
+        {
+            turn.end_ms = duration_ms;
         }
         if turn.start_ms < 0
             || turn.end_ms <= turn.start_ms
@@ -2750,6 +2764,75 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
         previous_overlap = turn.overlap;
     }
     Ok(result.turns)
+}
+
+#[cfg(test)]
+mod audio_turn_tests {
+    use super::{parse_audio_result, AUDIO_TURN_END_TOLERANCE_MS};
+
+    fn turn(id: &str, start_ms: i64, end_ms: i64) -> String {
+        format!(
+            r#"{{"turn_id":"{id}","start_ms":{start_ms},"end_ms":{end_ms},"speaker_local_id":"S1","text":"hello there","overlap":false,"quality_flags":[]}}"#
+        )
+    }
+
+    fn result(turns: &[String]) -> String {
+        format!(r#"{{"turns":[{}]}}"#, turns.join(","))
+    }
+
+    #[test]
+    fn in_window_turns_are_returned_unchanged() {
+        let turns = parse_audio_result(
+            &result(&[turn("t1", 0, 4_000), turn("t2", 4_000, 77_000)]),
+            77_779,
+        )
+        .expect("in-window turns are valid");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].end_ms, 77_000);
+    }
+
+    #[test]
+    fn bounded_end_overshoot_is_clamped_to_the_window() {
+        let duration_ms = 77_779;
+        let turns = parse_audio_result(
+            &result(&[
+                turn("t1", 0, 40_000),
+                turn("t2", 40_000, duration_ms + 1_500),
+            ]),
+            duration_ms,
+        )
+        .expect("a rounded final turn is clamped, not rejected");
+        assert_eq!(turns[1].end_ms, duration_ms);
+        assert_eq!(turns[0].end_ms, 40_000, "earlier turns are untouched");
+    }
+
+    #[test]
+    fn end_overshoot_beyond_the_tolerance_is_still_rejected() {
+        let duration_ms = 77_779;
+        let error = parse_audio_result(
+            &result(&[turn("t1", 0, duration_ms + AUDIO_TURN_END_TOLERANCE_MS + 1)]),
+            duration_ms,
+        )
+        .expect_err("a turn well past the window is invalid model output");
+        assert!(error
+            .to_string()
+            .contains("audio turn timestamps are invalid"));
+    }
+
+    #[test]
+    fn a_turn_starting_at_or_after_the_window_end_is_rejected() {
+        let duration_ms = 77_779;
+        assert!(parse_audio_result(
+            &result(&[turn("t1", duration_ms, duration_ms + 500)]),
+            duration_ms
+        )
+        .is_err());
+        assert!(parse_audio_result(
+            &result(&[turn("t1", duration_ms + 10, duration_ms + 500)]),
+            duration_ms
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

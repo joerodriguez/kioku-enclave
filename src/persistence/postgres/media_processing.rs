@@ -484,8 +484,8 @@ async fn resolve_invalid_persisted_media_work(
     let work_state: String = work.try_get("state")?;
     let work_error: Option<String> = work.try_get("error_code")?;
     let expected_reserved_output_tokens = match class {
-        MediaProcessingClass::Audio => 4_096_i64,
-        MediaProcessingClass::Screen => 1_024_i64,
+        MediaProcessingClass::Audio => i64::from(crate::cp::vertex::MAX_MEDIA_OUTPUT_TOKENS),
+        MediaProcessingClass::Screen => i64::from(crate::cp::vertex::MAX_SCREEN_OUTPUT_TOKENS),
     };
     let safe_shape = matches!(work_state.as_str(), "retry_wait" | "failed_terminal")
         && work_error.as_deref() == Some("vertex_daily_budget")
@@ -1346,8 +1346,8 @@ impl MediaProcessingRepository for PostgresPersistence {
         };
         let claim_token = crate::cp::tokens::random_token_hex();
         let reserved_output_tokens = match class {
-            MediaProcessingClass::Audio => 4_096_i64,
-            MediaProcessingClass::Screen => 1_024_i64,
+            MediaProcessingClass::Audio => i64::from(crate::cp::vertex::MAX_MEDIA_OUTPUT_TOKENS),
+            MediaProcessingClass::Screen => i64::from(crate::cp::vertex::MAX_SCREEN_OUTPUT_TOKENS),
         };
         let mut planned_usage = planned_work_usage(&work_unit_id, class, selected.len());
         if let Some(recovery) = compatibility_recovery {
@@ -3008,7 +3008,10 @@ impl MediaProcessingRepository for PostgresPersistence {
              WHERE e.account_id=$1 \
                AND e.started_at<to_timestamp($2::double precision/1000.0) \
                AND e.ended_at>to_timestamp($3::double precision/1000.0) \
-               AND (m.processing_state IN ('queued','processing','retry_wait') OR ( \
+               AND (m.processing_state IN ('queued','processing') OR ( \
+                    m.processing_state='retry_wait' \
+                    AND NOT (coalesce(j.job_kind,'')='gemini_screen' \
+                             AND coalesce(j.error_code,'')='vertex_daily_budget')) OR ( \
                     m.processing_state='failed' \
                     AND j.processor_version=$4 \
                     AND NOT (coalesce(j.error_code,'')=ANY($5::text[])) \
@@ -3401,7 +3404,7 @@ async fn test_create_v0918_screen_budget_work(
     .await?;
     let exact_shape = sqlx::query_scalar::<_, bool>(
         "SELECT work.state='retry_wait' AND work.error_code='vertex_daily_budget' \
-                AND work.attempt_count=2 AND work.reserved_output_tokens=1024 \
+                AND work.attempt_count=2 AND work.reserved_output_tokens=4096 \
                 AND NOT work.reservation_retained AND member.ordinal=0 \
                 AND job.state='retry_wait' AND job.error_code='vertex_daily_budget' \
                 AND job.attempt_count=0 \

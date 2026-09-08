@@ -9,6 +9,11 @@ pub const RECORDING_RETENTION_CONSENT_VERSION: i64 = 1;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingRetentionPolicy {
+    /// Serde's `snake_case` rule keeps digits attached to the preceding word
+    /// (`processing_window30d`), which is not the wire string the API
+    /// contract, the database, and the Apple clients use. Pin the exact
+    /// public form; [`Self::as_str`] remains the single source of truth.
+    #[serde(rename = "processing_window_30d")]
     ProcessingWindow30d,
     UntilDeleted,
 }
@@ -221,4 +226,30 @@ pub(crate) trait RecordingRetentionRepository: Send + Sync {
         key_epoch: i64,
         policy_epoch: &str,
     ) -> Result<Option<RecordingKeyEpoch>>;
+}
+
+#[cfg(test)]
+mod policy_wire_tests {
+    use super::RecordingRetentionPolicy;
+
+    #[test]
+    fn json_form_matches_the_public_contract_string() {
+        for policy in [
+            RecordingRetentionPolicy::ProcessingWindow30d,
+            RecordingRetentionPolicy::UntilDeleted,
+        ] {
+            let json = serde_json::to_value(policy).expect("policy serializes");
+            assert_eq!(json, serde_json::Value::String(policy.as_str().to_owned()));
+            let parsed: RecordingRetentionPolicy =
+                serde_json::from_value(json).expect("public string parses back");
+            assert_eq!(parsed, policy);
+        }
+    }
+
+    #[test]
+    fn the_digit_joined_spelling_is_not_accepted() {
+        assert!(
+            serde_json::from_str::<RecordingRetentionPolicy>("\"processing_window30d\"").is_err()
+        );
+    }
 }

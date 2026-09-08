@@ -21,6 +21,14 @@
 //! form — a window that reached the 6-h cap still advances unconditionally, so
 //! backfill always marches forward through sparse spans.
 //!
+//! **Settled-evidence semantics (ADR-0034):** holding only makes sense while a
+//! tail can still grow. Once every recording in the window has ended and its
+//! media has settled, the window is complete evidence: a zero-result pass
+//! advances the cursor past the whole window (so an ended session reports
+//! `no_memory` at once and the next sweep cannot re-send the same request),
+//! and the significance floor admits any episode with real speech, so a short
+//! recording becomes a memory instead of a dropped fragment.
+//!
 //! The Vertex call sends text outside the TEE (documented caveat — see
 //! [`super::vertex`]).
 
@@ -56,14 +64,24 @@ const MAX_WINDOW_HOURS: i64 = 6;
 const MIN_WINDOW_MINUTES: i64 = 20;
 /// Session-settled runs (ADR-0034) accept any window at least this long: the
 /// session is closed evidence, so the 20-minute live-tail floor above does
-/// not apply, but a sub-minute window cannot survive the significance floor
-/// and would only burn a call.
-const SETTLED_MIN_WINDOW_MS: i64 = 60 * 1000;
+/// not apply. Short recordings are legitimate memories once their evidence is
+/// complete (see [`SETTLED_MIN_SUBSTANTIVE_UTT`]), so only a window too short
+/// to hold one spoken sentence is skipped.
+const SETTLED_MIN_WINDOW_MS: i64 = 15 * 1000;
 const UTT_CAP: usize = 4000;
 const SCR_CAP: usize = 2000;
 const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
 const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
+/// Significance floor for settled evidence: once every recording in a window
+/// has ended and all of its media is processed, one substantive utterance is
+/// enough to publish an episode, provided the spoken content is more than a
+/// stray word or two — a lone hallucinated "Thank you." over silence must not
+/// become a memory for an accidental recording. A short recording is a memory
+/// the person expects to open, not a fragment of a still-growing tail.
+/// Screen-only slivers keep the two-minute span requirement.
+const SETTLED_MIN_SUBSTANTIVE_UTT: i64 = 1;
+const SETTLED_MIN_SUBSTANTIVE_WORDS: i64 = 6;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
 /// Both an interactive finish trigger and the durable recurring backstop may
 /// inherit a cursor at the seven-day lookback floor. Walk enough proven-empty
@@ -99,9 +117,10 @@ enum SummarizeMode {
     Scheduled,
     /// A capture session just finished and every accepted media item is
     /// processed, so the tail is complete evidence rather than a growing
-    /// fragment. The window may be short and runs to now; empty output still
-    /// holds the cursor (tail-bounded semantics), so an early call can never
-    /// consume content — at worst it spends one bounded LLM call.
+    /// fragment. The window may be short and runs to now. The evidence is
+    /// settled, so a zero result advances the cursor past the window instead
+    /// of holding it (see the module docs); late or offline evidence behind
+    /// the cursor is owned by the exact-session lane.
     SessionSettled,
 }
 
@@ -135,6 +154,80 @@ fn ms(ts: &str) -> i64 {
 fn fmt_time(ts: &str) -> String {
     // HH:MM:SS slice of an ISO-8601 string.
     ts.get(11..19).unwrap_or(ts).to_string()
+}
+
+/// Significance floor for one candidate episode. Live tails keep the dense /
+/// screen-span floor so a still-growing fragment is not published early; a
+/// settled window publishes anything with real speech, while screen-only
+/// slivers still need the two-minute span.
+fn episode_is_significant(
+    substantive: i64,
+    substantive_words: i64,
+    span_minutes: f64,
+    screen_span_ms: i64,
+    settled: bool,
+) -> bool {
+    let dense = substantive >= SIG_MIN_SUBSTANTIVE_UTT
+        && substantive as f64 >= span_minutes * SIG_MIN_UTT_PER_MIN;
+    dense
+        || screen_span_ms >= SIG_MIN_SCREEN_MS
+        || (settled
+            && substantive >= SETTLED_MIN_SUBSTANTIVE_UTT
+            && substantive_words >= SETTLED_MIN_SUBSTANTIVE_WORDS)
+}
+
+/// Count the substantive utterances an episode owns and the words they
+/// carry, for the significance floor.
+fn substantive_evidence<'a>(utterances: impl Iterator<Item = &'a UttRow>) -> (i64, i64) {
+    utterances
+        .filter(|utterance| is_substantive(&utterance.text))
+        .fold((0, 0), |(count, words), utterance| {
+            (
+                count + 1,
+                words + utterance.text.split_whitespace().count() as i64,
+            )
+        })
+}
+
+/// What a forward-lane pass does with the cursor after the model returned
+/// nothing publishable for its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroResultDisposition {
+    /// The tail can still grow: keep the window unsummarized so the episode
+    /// can form once more evidence arrives (the live-tail ratchet fix).
+    Hold,
+    /// Every recording in the window has ended and its media has settled, and
+    /// the fetched evidence was not capped: the window is complete evidence,
+    /// so pass all of it. An ended session then reports `no_memory` at once
+    /// and the next sweep cannot re-send this same request.
+    AdvancePastWindow,
+    /// Ordinary settlement to the last evidence time: the window formed
+    /// episodes, or it reached the cap and must march forward regardless.
+    Settle,
+}
+
+fn zero_result_disposition(
+    nothing_to_upsert: bool,
+    tail_bounded: bool,
+    settled: bool,
+    evidence_capped: bool,
+) -> ZeroResultDisposition {
+    if !nothing_to_upsert {
+        ZeroResultDisposition::Settle
+    } else if settled {
+        // A settled tail never grows, so holding would repeat this exact
+        // request forever. Capped evidence rows may hide later rows in the
+        // window, so settle to the last fetched row instead of the window end.
+        if evidence_capped {
+            ZeroResultDisposition::Settle
+        } else {
+            ZeroResultDisposition::AdvancePastWindow
+        }
+    } else if tail_bounded {
+        ZeroResultDisposition::Hold
+    } else {
+        ZeroResultDisposition::Settle
+    }
 }
 
 /// Substantive = not empty and not a single-glyph hallucination run.
@@ -749,14 +842,11 @@ fn exact_episode_inputs(
     let mut dropped = 0;
     for (index, episode) in episodes.iter().enumerate() {
         let (utterance_ids, screenshot_ids) = &membership[index];
-        let substantive = utterance_ids
-            .iter()
-            .filter(|id| {
-                utterances_by_id
-                    .get(id)
-                    .is_some_and(|utterance| is_substantive(&utterance.text))
-            })
-            .count() as i64;
+        let (substantive, substantive_words) = substantive_evidence(
+            utterance_ids
+                .iter()
+                .filter_map(|id| utterances_by_id.get(id).copied()),
+        );
         let screenshot_times = screenshot_ids
             .iter()
             .filter_map(|id| screenshots.iter().find(|screenshot| screenshot.id == *id))
@@ -767,9 +857,15 @@ fn exact_episode_inputs(
             _ => 0,
         };
         let span_minutes = ((episode.ended - episode.started) as f64 / 60_000.0).max(1.0);
-        let dense = substantive >= SIG_MIN_SUBSTANTIVE_UTT
-            && substantive as f64 >= span_minutes * SIG_MIN_UTT_PER_MIN;
-        if !(dense || screen_span >= SIG_MIN_SCREEN_MS) {
+        // The exact-session lane only ever sees an ended session whose media
+        // has settled, so its evidence is complete by construction.
+        if !episode_is_significant(
+            substantive,
+            substantive_words,
+            span_minutes,
+            screen_span,
+            true,
+        ) {
             dropped += 1;
             continue;
         }
@@ -906,7 +1002,8 @@ async fn summarize_capture_formation_locked(
         format_epoch_millis(range_from_ms),
         format_epoch_millis(range_to_ms)
     );
-    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
+    let system_prompt =
+        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}");
     let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
     let screenshot_ids = screenshots.iter().map(|row| row.id).collect::<Vec<_>>();
     // This is deliberately not a boolean: an admitted attempt can become
@@ -1157,6 +1254,25 @@ async fn summarize_user_window(
         return Ok(serde_json::json!({ "skipped": true, "reason": "no_new_records" }));
     }
 
+    // Settled evidence changes two decisions below: the significance floor
+    // admits short recordings, and a window that forms nothing advances the
+    // cursor instead of holding for a tail that can no longer grow. The
+    // session-settled kick is gated by its caller; the recurring sweep asks
+    // once per pass so an ended recording never waits for the six-hour cap.
+    let settled = match mode {
+        SummarizeMode::SessionSettled => true,
+        SummarizeMode::Scheduled => session_tail_is_settled(state, user_id).await,
+    };
+    let evidence_capped = utterances.len() >= UTT_CAP || screenshots.len() >= SCR_CAP;
+    if settled && span_holds_recoverable_media(state, user_id, &new_from_iso, &new_to_iso).await? {
+        // Complete-looking evidence may still be waiting on media the
+        // resurrection ladder can recover. Calling the model now would either
+        // hold and re-send every tick or settle a premature `no_memory`, so
+        // wait for the ladder without spending a call; the hold predicate
+        // expires with the ladder and ignores quota-parked screen work.
+        return Ok(serde_json::json!({ "skipped": true, "reason": "recoverable_media_pending" }));
+    }
+
     // Open episodes (digests the model can extend by ref).
     let open_cutoff = new_from - OPEN_WINDOW_MS;
     let list_start = format_epoch_millis(new_from - OPEN_WINDOW_MS - 4 * 60 * 60 * 1000);
@@ -1208,7 +1324,11 @@ async fn summarize_user_window(
     // Call Vertex. Failed windows return an `error` status carrying
     // `window_to` so the sweep can skip past a window that fails
     // deterministically (see summarize_all) instead of stalling forever.
-    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
+    let system_prompt = if settled {
+        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}")
+    } else {
+        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}")
+    };
     if let Err(error) =
         reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await
     {
@@ -1419,10 +1539,8 @@ async fn summarize_user_window(
     for (i, ep) in eps.iter().enumerate() {
         let (utt_ids, scr_ids) = &membership[i];
         if ep.existing_id.is_none() {
-            let substantive = utt_ids
-                .iter()
-                .filter(|id| utt_by_id.get(id).is_some_and(|u| is_substantive(&u.text)))
-                .count() as i64;
+            let (substantive, substantive_words) =
+                substantive_evidence(utt_ids.iter().filter_map(|id| utt_by_id.get(id).copied()));
             let scr_times: Vec<i64> = scr_ids
                 .iter()
                 .filter_map(|id| screenshots.iter().find(|s| s.id == *id))
@@ -1433,9 +1551,13 @@ async fn summarize_user_window(
                 _ => 0,
             };
             let span_min = (((ep.ended - ep.started) as f64) / 60000.0).max(1.0);
-            let dense = substantive >= SIG_MIN_SUBSTANTIVE_UTT
-                && (substantive as f64) >= span_min * SIG_MIN_UTT_PER_MIN;
-            if !(dense || screen_span >= SIG_MIN_SCREEN_MS) {
+            if !episode_is_significant(
+                substantive,
+                substantive_words,
+                span_min,
+                screen_span,
+                settled,
+            ) {
                 dropped += 1;
                 continue;
             }
@@ -1460,21 +1582,33 @@ async fn summarize_user_window(
     }
 
     let cutoff_iso = format_epoch_millis(effective_cutoff);
-    if to_upsert.is_empty() && tail_bounded {
-        release_summary_claim(state, &summary_claim, None).await;
-        info!(
-            user_id,
-            dropped, "summarized nothing; holding cursor for tail to grow"
-        );
-        return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
-    }
+    let cursor =
+        match zero_result_disposition(to_upsert.is_empty(), tail_bounded, settled, evidence_capped)
+        {
+            ZeroResultDisposition::Hold => {
+                release_summary_claim(state, &summary_claim, None).await;
+                info!(
+                    user_id,
+                    dropped, "summarized nothing; holding cursor for tail to grow"
+                );
+                return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
+            }
+            ZeroResultDisposition::AdvancePastWindow => {
+                info!(
+                    user_id,
+                    dropped, "summarized nothing; settled window advances the cursor"
+                );
+                new_to_iso.clone()
+            }
+            ZeroResultDisposition::Settle => cutoff_iso.clone(),
+        };
     let ids = match state
         .repositories
         .memory_formation()
         .settle_summary_window(SummaryWindowSettlement {
             claim: summary_claim.clone(),
             episodes: to_upsert,
-            cursor: Some(cutoff_iso.clone()),
+            cursor: Some(cursor.clone()),
         })
         .await
     {
@@ -1494,7 +1628,7 @@ async fn summarize_user_window(
     Ok(serde_json::json!({
         "episodes": upserted,
         "dropped": dropped,
-        "to": cutoff_iso
+        "to": cursor
     }))
 }
 /// In-enclave episode embeddings (ADR-0004 §G.2). Episodes are born in the
@@ -1909,6 +2043,12 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
     });
 }
 
+/// Appended only when every recording in the window has ended and its media
+/// has settled (session-settled kicks, settled sweeps, and the exact-session
+/// lane). Complete evidence is not a growing fragment, so brevity alone must
+/// not suppress it.
+const SETTLED_EVIDENCE_RULE: &str = "SETTLED EVIDENCE RULE: every recording in this capture log has already ended and no further evidence will arrive for it. When the log covers only a brief span — even under a minute — return that span as one episode with its real boundaries rather than returning no episodes; brevity alone is never a reason to drop substantive speech or screen activity. Do not pad or stretch boundaries to look longer, and keep the continuity and fragmentation rules for longer logs.";
+
 const WORKFLOW_CONTINUITY_RULE: &str = "CRITICAL EXTENSION RULE: Define continuity by the person's concrete real-world objective, subject, or workflow — not by session mechanics. Continuation does NOT require the same call connection, participant, app, or document. A goodbye followed by a new greeting, a transfer, hold time, reconnect, or a call to a different person or organization is not a boundary when the person is still pursuing the same task. For example, calling a provider, then an insurer, then the provider again about one bill is ONE episode using the same OPEN EPISODE ref. Prefer EXTEND when the open episode and new log share the same real-world goal; open a NEW episode only when the goal or subject actually changes.";
 
 const SYSTEM_PROMPT: &str = r#"You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day. The episode fields must also be a useful, evidence-grounded memory of what the person needs to know or do — not a topic inventory.
@@ -2229,8 +2369,9 @@ mod tests {
     }
 
     /// ADR-0034 session-settled runs: a short window is allowed (the session
-    /// is closed evidence), but it stays tail-bounded so empty output still
-    /// holds the cursor — an early call can never consume content.
+    /// is closed evidence). It is still reported tail-bounded; whether a zero
+    /// result holds or advances is decided by [`zero_result_disposition`],
+    /// which knows the evidence is settled.
     #[test]
     fn session_settled_window_accepts_short_tail_and_stays_tail_bounded() {
         let tail = 1_000_000 * MIN;
@@ -2238,14 +2379,164 @@ mod tests {
         let (to, tail_bounded) = window_bounds(tail - 5 * MIN, tail, SETTLED_MIN_WINDOW_MS)
             .expect("a settled 5-minute recording is summarizable immediately");
         assert_eq!(to, tail);
-        assert!(
-            tail_bounded,
-            "short settled window must hold cursor on empty output"
-        );
+        assert!(tail_bounded, "a short settled window is still tail-bounded");
+
+        // A recording shorter than a minute is also offered to the model.
+        let (to, _) = window_bounds(tail - 30 * 1000, tail, SETTLED_MIN_WINDOW_MS)
+            .expect("a settled 30-second recording is summarizable immediately");
+        assert_eq!(to, tail);
 
         // Still refuses degenerate/caught-up windows.
         assert_eq!(window_bounds(tail, tail, SETTLED_MIN_WINDOW_MS), None);
         assert_eq!(window_bounds(tail + MIN, tail, SETTLED_MIN_WINDOW_MS), None);
+    }
+
+    #[test]
+    fn zero_result_holds_only_a_live_tail() {
+        use ZeroResultDisposition::{AdvancePastWindow, Hold, Settle};
+        // Live tail, nothing formed: keep growing (the ratchet fix).
+        assert_eq!(zero_result_disposition(true, true, false, false), Hold);
+        // Settled evidence, nothing formed: pass the whole window now.
+        assert_eq!(
+            zero_result_disposition(true, true, true, false),
+            AdvancePastWindow
+        );
+        assert_eq!(
+            zero_result_disposition(true, false, true, false),
+            AdvancePastWindow
+        );
+        // Capped evidence rows may hide later rows: ordinary settlement only.
+        assert_eq!(zero_result_disposition(true, true, true, true), Settle);
+        // A capped backfill window marches forward regardless.
+        assert_eq!(zero_result_disposition(true, false, false, false), Settle);
+        // Episodes formed: ordinary settlement whatever the tail state.
+        assert_eq!(zero_result_disposition(false, true, false, false), Settle);
+        assert_eq!(zero_result_disposition(false, true, true, false), Settle);
+    }
+
+    #[test]
+    fn settled_floor_admits_a_short_spoken_recording_but_not_screen_slivers() {
+        // Live tail: the dense floor still applies.
+        assert!(!episode_is_significant(1, 40, 1.0, 0, false));
+        assert!(!episode_is_significant(2, 40, 1.0, 0, false));
+        assert!(episode_is_significant(3, 40, 1.0, 0, false));
+        assert!(
+            !episode_is_significant(3, 40, 30.0, 0, false),
+            "3 turns over 30 min is sparse"
+        );
+        assert!(episode_is_significant(0, 0, 1.0, SIG_MIN_SCREEN_MS, false));
+
+        // Settled evidence: one substantive utterance with real content
+        // publishes; a stray word or two over silence does not.
+        assert!(episode_is_significant(
+            1,
+            SETTLED_MIN_SUBSTANTIVE_WORDS,
+            1.0,
+            0,
+            true
+        ));
+        assert!(!episode_is_significant(
+            1,
+            SETTLED_MIN_SUBSTANTIVE_WORDS - 1,
+            1.0,
+            0,
+            true
+        ));
+        assert!(
+            !episode_is_significant(1, 2, 1.0, 0, true),
+            "a lone \"Thank you.\" over silence is not a memory"
+        );
+        assert!(episode_is_significant(3, 9, 30.0, 0, true));
+        assert!(!episode_is_significant(0, 0, 1.0, 0, true));
+        assert!(!episode_is_significant(
+            0,
+            0,
+            1.0,
+            SIG_MIN_SCREEN_MS - 1,
+            true
+        ));
+        assert!(episode_is_significant(0, 0, 1.0, SIG_MIN_SCREEN_MS, true));
+
+        let words = |text: &str| UttRow {
+            id: 1,
+            started_at: format_epoch_millis(1_800_000_000_000),
+            speaker_label: "Me".into(),
+            language: Some("en".into()),
+            text: text.into(),
+        };
+        assert_eq!(
+            substantive_evidence([&words("Thank you.")].into_iter()),
+            (1, 2)
+        );
+        assert_eq!(
+            substantive_evidence(
+                [
+                    &words("testing the new memory formation path"),
+                    &words("!!!")
+                ]
+                .into_iter()
+            ),
+            (1, 6)
+        );
+    }
+
+    #[test]
+    fn exact_lane_keeps_a_short_settled_recording_with_one_substantive_turn() {
+        let from = 1_800_000_000_000;
+        let to = from + 60_000;
+        let utterances = vec![UttRow {
+            id: 7,
+            started_at: format_epoch_millis(from + 5_000),
+            speaker_label: "Me".into(),
+            language: Some("en".into()),
+            text: "testing the new memory formation path".into(),
+        }];
+        let parsed = json!({"episodes": [{
+            "started_at": format_epoch_millis(from),
+            "ended_at": format_epoch_millis(to),
+            "type": "note",
+            "title": "Quick test recording",
+            "summary": "- Tested memory formation",
+            "participants": ["Me"],
+            "languages": ["en"],
+            "action_items": [],
+            "substance": "normal",
+            "visual_evidence": "none",
+            "minutes": []
+        }]});
+        let (inputs, dropped) = exact_episode_inputs("model", &parsed, &utterances, &[], from, to);
+        assert_eq!(dropped, 0);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].member_utterance_ids, vec![7]);
+    }
+
+    #[test]
+    fn settled_prompts_carry_the_settled_evidence_rule() {
+        // Bound each slice to its function body so this test cannot be
+        // satisfied by its own assertion strings further down the file.
+        let source = include_str!("summarizer.rs");
+        let forward = source
+            .split("async fn summarize_user_window(")
+            .nth(1)
+            .unwrap()
+            .split("/// In-enclave episode embeddings")
+            .next()
+            .unwrap();
+        assert!(forward
+            .contains("SummarizeMode::Scheduled => session_tail_is_settled(state, user_id).await"));
+        assert!(forward.contains("let system_prompt = if settled {"));
+        assert!(forward.contains("{WORKFLOW_CONTINUITY_RULE}\\n\\n{SETTLED_EVIDENCE_RULE}"));
+        assert!(forward.contains("zero_result_disposition("));
+        assert!(forward.contains("if settled && span_holds_recoverable_media("));
+        let exact = source
+            .split("async fn summarize_capture_formation_locked(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn summarize_user(")
+            .next()
+            .unwrap();
+        assert!(exact.contains("{SETTLED_EVIDENCE_RULE}"));
+        assert!(SETTLED_EVIDENCE_RULE.contains("even under a minute"));
     }
 
     #[test]
