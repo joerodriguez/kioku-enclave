@@ -1261,7 +1261,11 @@ async fn summarize_user_window(
     // once per pass so an ended recording never waits for the six-hour cap.
     let settled = match mode {
         SummarizeMode::SessionSettled => true,
-        SummarizeMode::Scheduled => session_tail_is_settled(state, user_id).await,
+        // Bound by this window's end: a recording that ended inside the
+        // five-minute tail buffer still has evidence past `new_to`, and
+        // sending only its first minutes as "complete" would publish a
+        // fragment. That window stays live and holds instead.
+        SummarizeMode::Scheduled => session_tail_is_settled(state, user_id, new_to).await,
     };
     let evidence_capped = utterances.len() >= UTT_CAP || screenshots.len() >= SCR_CAP;
     if settled && span_holds_recoverable_media(state, user_id, &new_from_iso, &new_to_iso).await? {
@@ -1951,12 +1955,12 @@ pub fn kick_session_settled(user_id: &str) {
 
 /// Return true only when the account has no recent open capture session and no
 /// accepted media still eligible for processing.
-async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
+async fn session_tail_is_settled(state: &CpState, user_id: &str, window_end_ms: i64) -> bool {
     let cutoff = format_epoch_millis(now_ms() - 30 * 60 * 1000);
     match state
         .repositories
         .memory_formation()
-        .session_tail_is_settled(user_id, &cutoff)
+        .session_tail_is_settled(user_id, &cutoff, &format_epoch_millis(window_end_ms))
         .await
     {
         Ok(settled) => settled,
@@ -1972,7 +1976,7 @@ fn should_cross_proven_empty_window(value: &Value) -> bool {
 }
 
 async fn summarize_session_settled(state: &CpState, user_id: &str) {
-    if !session_tail_is_settled(state, user_id).await {
+    if !session_tail_is_settled(state, user_id, now_ms()).await {
         return;
     }
 
@@ -2522,8 +2526,9 @@ mod tests {
             .split("/// In-enclave episode embeddings")
             .next()
             .unwrap();
-        assert!(forward
-            .contains("SummarizeMode::Scheduled => session_tail_is_settled(state, user_id).await"));
+        assert!(forward.contains(
+            "SummarizeMode::Scheduled => session_tail_is_settled(state, user_id, new_to).await"
+        ));
         assert!(forward.contains("let system_prompt = if settled {"));
         assert!(forward.contains("{WORKFLOW_CONTINUITY_RULE}\\n\\n{SETTLED_EVIDENCE_RULE}"));
         assert!(forward.contains("zero_result_disposition("));

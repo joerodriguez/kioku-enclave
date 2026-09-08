@@ -3739,15 +3739,26 @@ impl MemoryFormationRepository for PostgresPersistence {
         Ok(())
     }
 
-    async fn session_tail_is_settled(&self, account_id: &str, recent_after: &str) -> Result<bool> {
+    async fn session_tail_is_settled(
+        &self,
+        account_id: &str,
+        recent_after: &str,
+        window_end: &str,
+    ) -> Result<bool> {
         let recent_after_ms = timestamp(recent_after, "recent session cutoff")?;
+        let window_end_ms = timestamp(window_end, "settled window end")?;
         Ok(sqlx::query_scalar::<_, bool>(
+            // A session whose horizon runs past the window end would be sent
+            // as a fragment; that tail is live for this window, not settled.
             // Screen storyboards parked on the daily Vertex budget are not
             // in-flight processing: the spoken memory forms now and the
             // storyboard joins as late evidence once the budget resets. Any
             // other queued, processing, or retrying media still settles the tail.
             "SELECT NOT EXISTS(SELECT 1 FROM capture_sessions WHERE account_id=$1 \
                     AND ended_at IS NULL AND last_event_at>=to_timestamp($2::double precision/1000.0)) \
+                AND NOT EXISTS(SELECT 1 FROM capture_sessions WHERE account_id=$1 \
+                    AND greatest(last_event_at,coalesce(ended_at,last_event_at)) \
+                        >to_timestamp($3::double precision/1000.0)) \
                 AND NOT EXISTS(SELECT 1 FROM media_objects media WHERE media.account_id=$1 \
                     AND media.deleted_at IS NULL \
                     AND (media.processing_state IN ('queued','processing') \
@@ -3759,6 +3770,7 @@ impl MemoryFormationRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(recent_after_ms)
+        .bind(window_end_ms)
         .fetch_one(self.pool())
         .await?)
     }
