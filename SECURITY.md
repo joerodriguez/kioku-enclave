@@ -73,15 +73,13 @@ outcome-save recovery.
 Topology reconciliation is governed by append-only PostgreSQL v27 authority, not by a process-local
 feature flag. The immutable image carries an explicit model, Vertex location, and compiled
 producer-contract digest. Startup and every readiness check dynamically compare those values with
-the verified signed database phase. The v0.9.31 response-schema correction includes one dark
-compatibility bridge: only verified v2 `Paused` generation 4, the exact v0.9.30 image and
-producer, unchanged production model/location, global scope, and completed generation-2
-ledgers may serve with the corrected compiled producer. This does not grant worker authority;
-a fresh signed Paused-to-Draining cycle must bind the new homogeneous image and producer
-before Active. Schema-27 readiness also permits only the verified corrected v2 Draining/g5
-with its own generation-5 backfill ledger, global scope and corrected producer. It remains
-worker-dark while backfill completes. All Draining and Active producer mismatches remain
-readiness failures.
+the verified signed database phase. There is no exception to that comparison. The v0.9.31
+response-schema correction shipped a one-release dark compatibility bridge for its exact
+`Paused` generation-4 predecessor, plus a matching corrected `Draining`/g5 readiness
+allowance; both were pinned to that package version and are retired as of v0.9.32. Schema-27
+readiness now admits only a verified `Active` or `Paused` chain whose recorded model,
+location, and compiled producer contract exactly match the running image. All Draining and
+Active producer mismatches remain readiness failures.
 Reconciliation is dormant in `Installed`, `Draining`, and
 `Paused`; only `Active` grants repository authority for claims, provider egress, durable stages,
 and publication. Legacy finalization remains available during the potentially long `Installed`

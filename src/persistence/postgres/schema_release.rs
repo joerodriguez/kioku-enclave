@@ -33,8 +33,8 @@ const RELEASE_PROTOCOL_VERSION: i64 = 1;
 ///
 /// The v0.9.31 one-release Vertex-schema bridge that once let a Paused/g4
 /// predecessor admit this producer, and its Draining/g5 redrain twin, are
-/// retired: both were pinned to `CARGO_PKG_VERSION == "0.9.31"` and are inert
-/// in every later package. Serving now requires an exact match between the
+/// retired: both were pinned to the exact package version and are inert in
+/// every later release. Serving now requires an exact match between the
 /// running model/location/producer and the signed fleet activation authority,
 /// with no version-scoped escape.
 #[cfg(test)]
@@ -2620,8 +2620,8 @@ impl PostgresPersistence {
     /// activation phase. The reconciliation implementation is intentionally
     /// dormant in `installed`; repository authority remains absent until
     /// `active`. Once draining has begun, every serving replica must carry the
-    /// exact signed model, location, and producer contract, except for the
-    /// fixed Paused/g4 schema-compatibility bridge that grants no writer lane.
+    /// exact signed model, location, and producer contract. There is no
+    /// exception: the v0.9.31 Paused/g4 schema-compatibility bridge is retired.
     pub(crate) async fn verify_reconciliation_runtime_schema(
         &self,
         reconciliation_model: Option<&str>,
@@ -2782,6 +2782,10 @@ mod tests {
     /// recomputes it and the signed fleet activation authority stores it, so a
     /// source change that alters the reconciliation request shape must fail
     /// here rather than at a production admission check.
+    /// The pair is deliberately the deployed production model and location:
+    /// the pin is meaningful only against the values the shipping image uses.
+    /// A config-only model or location change is caught at startup instead, by
+    /// the exact match against the signed fleet activation authority.
     #[test]
     fn compiled_producer_contract_matches_the_release_pin() {
         let producer =
@@ -2798,13 +2802,29 @@ mod tests {
     /// exactly the shape that let a mismatched producer serve for one release.
     #[test]
     fn no_package_version_scoped_activation_escape_remains() {
-        // Scope the scan to the non-test half so this test's own assertion
-        // strings cannot satisfy it.
-        let source = include_str!("schema_release.rs");
-        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
-        assert!(!production.contains("corrected_producer_redrain"));
-        assert!(!production.contains("paused_vertex_schema_compatibility"));
-        assert!(!production.contains("env!(\"CARGO_PKG_VERSION\")"));
+        // Scope each scan to the non-test half so this test's own assertion
+        // strings cannot satisfy it. If the split marker ever stops matching,
+        // `next()` yields the whole file, which does contain these needles, so
+        // the test fails closed rather than passing vacuously.
+        let production = |source: &'static str| {
+            source
+                .split("#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let release = production(include_str!("schema_release.rs"));
+        assert!(!release.contains("corrected_producer_redrain"));
+        assert!(!release.contains("paused_vertex_schema_compatibility"));
+        // Both halves of the serving gate, matched on the bare token so an
+        // `option_env!` or differently spaced re-introduction is caught too.
+        for source in [
+            release.as_str(),
+            production(include_str!("activation.rs")).as_str(),
+            production(include_str!("mod.rs")).as_str(),
+        ] {
+            assert!(!source.contains("CARGO_PKG_VERSION"));
+        }
     }
 
     fn activation_receipt(
