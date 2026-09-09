@@ -5587,27 +5587,49 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn postgres_control_plane_contract() {
-        let Some(fixture) = test_persistence().await else {
-            return;
-        };
-        let ControlPlaneContractFixture {
-            persistence,
-            base,
-            schema,
-        } = fixture;
-        let pool = persistence.pool().clone();
-        let outcome = tokio::spawn(Box::pin(test_real_pg_control_plane_contract_inner(
-            persistence,
-        )))
-        .await;
-        pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-            .execute(base.pool())
-            .await
-            .expect("drop isolated control-plane schema");
-        base.pool.close().await;
-        outcome.expect("real PostgreSQL control-plane contract");
+    /// One deliberately exhaustive sequential future: thousands of locals stay
+    /// live across hundreds of await points, so its poll frame is far larger
+    /// than a default test-thread stack. Heap-pinning the biggest sub-contracts
+    /// bounds the growth but cannot make the frame small, and every ordinary
+    /// addition to the contract moves it closer to the edge. An overflow here
+    /// is not a contained failure: it aborts the whole test process, skipping
+    /// every `DROP SCHEMA` cleanup and leaving orphan schemas that make later
+    /// runs fail for unrelated reasons. Poll the contract on a worker thread
+    /// with an explicit stack instead of relying on the harness default.
+    ///
+    /// This bounds only the test harness. Serving never polls this future.
+    #[test]
+    fn postgres_control_plane_contract() {
+        const CONTRACT_STACK_BYTES: usize = 64 * 1024 * 1024;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(CONTRACT_STACK_BYTES)
+            .enable_all()
+            .build()
+            .expect("control-plane contract runtime");
+        runtime.block_on(async {
+            let Some(fixture) = test_persistence().await else {
+                return;
+            };
+            let ControlPlaneContractFixture {
+                persistence,
+                base,
+                schema,
+            } = fixture;
+            let pool = persistence.pool().clone();
+            // `spawn` moves the contract onto a configured worker thread; the
+            // surrounding fixture/cleanup work stays on this small frame.
+            let outcome = tokio::spawn(Box::pin(test_real_pg_control_plane_contract_inner(
+                persistence,
+            )))
+            .await;
+            pool.close().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+                .execute(base.pool())
+                .await
+                .expect("drop isolated control-plane schema");
+            base.pool.close().await;
+            outcome.expect("real PostgreSQL control-plane contract");
+        });
     }
 }
