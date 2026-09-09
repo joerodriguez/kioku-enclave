@@ -549,12 +549,15 @@ async fn test_schema_correction_retry_cycle(
     // predecessor while it still recorded the old producer. That bridge is
     // retired, so the successor runtime must now be refused until a signed
     // redrain binds the new producer below.
+    let refused = persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+        .await
+        .expect_err("a retired bridge must not admit a mismatched Paused predecessor");
     assert!(
-        persistence
-            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
-            .await
-            .is_err(),
-        "a retired bridge must not admit a mismatched Paused predecessor"
+        refused
+            .to_string()
+            .contains("runtime does not match the signed fleet activation authority"),
+        "the Paused predecessor must be refused by the authority match, not another gate: {refused}"
     );
     assert!(
         persistence
@@ -587,12 +590,15 @@ async fn test_schema_correction_retry_cycle(
     // Draining is a migration phase, not a serving phase. The v0.9.31
     // redrain allowance that admitted this exact chain is retired, so serving
     // stays refused until the signed Active transition below.
+    let refused = persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+        .await
+        .expect_err("a retired redrain allowance must not admit a draining chain");
     assert!(
-        persistence
-            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
-            .await
-            .is_err(),
-        "a retired redrain allowance must not admit a draining chain"
+        refused
+            .to_string()
+            .contains("schema 27 requires a verified active or paused activation chain"),
+        "the draining chain must be refused by the phase gate, not another gate: {refused}"
     );
     active.generation = 6;
     active.previous_phase = "draining".into();
@@ -605,6 +611,15 @@ async fn test_schema_correction_retry_cycle(
     persistence
         .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
         .await?;
+    // Every clause of that exact match is load-bearing now that no bridge can
+    // relax it, including the location the rest of this contract holds fixed.
+    assert!(
+        persistence
+            .verify_reconciliation_runtime_schema(Some(MODEL), "us-central1", Some(&successor))
+            .await
+            .is_err(),
+        "a mismatched vertex location must not serve an active chain"
+    );
     let new_snapshot = persistence
         .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
         .await?

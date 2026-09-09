@@ -163,7 +163,19 @@ verifies the orphan-erasure catalog and distinguishes pending, complete-but-capt
 fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
 evidence is not v6 evidence and cannot authorize the new release's gates.
 
-### v0.9.31 Vertex schema correction from Paused/g4
+### v0.9.31 Vertex schema correction from Paused/g4 (historical; bridge retired in v0.9.32)
+
+The readiness bridge described below was pinned to package v0.9.31 and is **retired**. It is
+kept as the worked example of a producer-changing release. Serving now admits only a verified
+`Active` or `Paused` chain whose recorded model, location, and compiled producer contract
+exactly match the running image.
+
+**Consequence for the next producer change.** `Draining` is no longer schema-ready for serving,
+so a Paused-to-Draining cycle makes every serving replica fail startup and report `503` until
+the signed Active transition completes. Plan that cycle on the fleet-drained maintenance lane
+and treat the outage as expected, exactly as v0.9.31 did; do not reintroduce a package-version
+allowance to serve through it. An ordinary ADR-0041 compatible image rollout does not change
+the activation phase and is unaffected.
 
 Vertex rejected the nested reconciliation response schema with its outer `maxItems`
 hint. The corrected producer omits only that hint; local validation still refuses more

@@ -5602,7 +5602,10 @@ mod tests {
     fn postgres_control_plane_contract() {
         const CONTRACT_STACK_BYTES: usize = 64 * 1024 * 1024;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            // The contract asserts that lock-contending sub-tasks stay blocked.
+            // Too few workers would let such a task simply never be scheduled,
+            // turning those assertions into false passes.
+            .worker_threads(4)
             .thread_stack_size(CONTRACT_STACK_BYTES)
             .enable_all()
             .build()
@@ -5617,11 +5620,15 @@ mod tests {
                 schema,
             } = fixture;
             let pool = persistence.pool().clone();
-            // `spawn` moves the contract onto a configured worker thread; the
-            // surrounding fixture/cleanup work stays on this small frame.
-            let outcome = tokio::spawn(Box::pin(test_real_pg_control_plane_contract_inner(
-                persistence,
-            )))
+            // Construct AND poll the contract inside the spawned task. Building
+            // the future materializes the whole generator as a temporary before
+            // the `Box` move, and in debug builds that copy is routinely not
+            // elided — doing it out here would put the largest object back on
+            // this thread's default-sized stack, which is the frame the
+            // explicit worker stack exists to avoid.
+            let outcome = tokio::spawn(async move {
+                Box::pin(test_real_pg_control_plane_contract_inner(persistence)).await
+            })
             .await;
             pool.close().await;
             sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
