@@ -545,9 +545,17 @@ async fn test_schema_correction_retry_cycle(
             active.clone(),
         )?)
         .await?;
-    persistence
-        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
-        .await?;
+    // The v0.9.31 one-release bridge admitted exactly this Paused/g4
+    // predecessor while it still recorded the old producer. That bridge is
+    // retired, so the successor runtime must now be refused until a signed
+    // redrain binds the new producer below.
+    assert!(
+        persistence
+            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+            .await
+            .is_err(),
+        "a retired bridge must not admit a mismatched Paused predecessor"
+    );
     assert!(
         persistence
             .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
@@ -576,14 +584,26 @@ async fn test_schema_correction_retry_cycle(
     assert_eq!(sqlx::query_scalar::<_, String>("SELECT to_jsonb(j)::text FROM memory_reconciliation_jobs j WHERE account_id=$1 AND source_fingerprint=$2")
         .bind(ACCOUNT).bind(&old_snapshot.source_fingerprint).fetch_one(persistence.pool()).await?, retry_before,
         "redrain/backfill must not reset or discard the old attempt");
-    persistence
-        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
-        .await?;
+    // Draining is a migration phase, not a serving phase. The v0.9.31
+    // redrain allowance that admitted this exact chain is retired, so serving
+    // stays refused until the signed Active transition below.
+    assert!(
+        persistence
+            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+            .await
+            .is_err(),
+        "a retired redrain allowance must not admit a draining chain"
+    );
     active.generation = 6;
     active.previous_phase = "draining".into();
     active.requested_phase = "active".into();
     persistence
         .transition_memory_reconciliation_activation(&test_verify_activation_receipt(active)?)
+        .await?;
+    // Active with the bound successor producer is the only admitting state,
+    // and it needs no version-scoped bridge to be admitted.
+    persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
         .await?;
     let new_snapshot = persistence
         .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
