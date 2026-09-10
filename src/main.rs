@@ -1189,17 +1189,31 @@ async fn async_main() {
         .unwrap_or_else(|_| "12".into())
         .parse::<u32>()
         .unwrap_or_else(|_| panic!("POSTGRES_MAX_CONNECTIONS must be a positive integer"));
-    let postgres = Arc::new(
-        persistence::PostgresPersistence::connect(persistence::PostgresPoolConfig {
-            database_url,
-            root_ca_pem,
-            max_connections,
-            acquire_timeout: std::time::Duration::from_secs(5),
-            statement_timeout: std::time::Duration::from_secs(30),
-        })
-        .await
-        .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL: {error}")),
-    );
+    // A managed platform's direct VPC egress can take a minute or more to
+    // establish its first connections after a cold start. Failing fast there
+    // would turn a fresh revision into a crash loop, so the initial connect is
+    // retried within a bounded window; the readiness probe covers the wait.
+    let postgres = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            match persistence::PostgresPersistence::connect(persistence::PostgresPoolConfig {
+                database_url: database_url.clone(),
+                root_ca_pem: root_ca_pem.clone(),
+                max_connections,
+                acquire_timeout: std::time::Duration::from_secs(5),
+                statement_timeout: std::time::Duration::from_secs(30),
+            })
+            .await
+            {
+                Ok(persistence) => break Arc::new(persistence),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    warn!(error = %error, "PostgreSQL is not reachable yet; retrying startup connect");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(error) => panic!("Failed to connect to PostgreSQL: {error}"),
+            }
+        }
+    };
     postgres
         .verify_schema()
         .await
