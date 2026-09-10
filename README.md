@@ -1,12 +1,12 @@
 # kioku-enclave
 
-**The open-source, hardware-attested Kioku application backend.**
+**The open-source Kioku application backend.**
 
-Kioku (記憶, “memory” in Japanese) is a personal memory capture and recall system. This
-repository contains the Rust service that runs as a regional fleet inside
-[GCP Confidential Space](https://cloud.google.com/confidential-computing/confidential-space/docs/overview)
-VMs. It terminates TLS and implements identity, OAuth, capture, query, MCP, workers,
-export, and deletion in one attested binary.
+Kioku (記憶, “memory” in Japanese) is a personal memory capture and recall system. This repository contains the Rust service that runs on Google Cloud Run behind Google's managed
+HTTPS load balancer ([ADR-0044](https://github.com/joerodriguez/kioku/blob/main/docs/adr/0044-cloud-run-replaces-the-confidential-space-fleet.md)).
+It implements identity, OAuth, capture, query, MCP, workers, export, and deletion in one
+binary. The earlier Confidential Space fleet mode (`attested_vm`) is retired and its code is
+being removed.
 
 Private Cloud SQL PostgreSQL 17 is the sole production authority for accounts, structured
 memory, search indexes, quotas, jobs, claims, effect receipts, export state, and deletion
@@ -19,8 +19,7 @@ capture contract, and [RELEASING.md](RELEASING.md) for signed publication and ro
 
 ## Why this is public
 
-The running Confidential Space workload exposes a Google-signed attestation token whose
-claims include the container digest. Each immutable release publishes:
+Each immutable release publishes:
 
 - a signed annotated source tag;
 - canonical build evidence signed by a separately pinned Ed25519 key;
@@ -28,8 +27,9 @@ claims include the container digest. Each immutable release publishes:
 - an SPDX SBOM; and
 - the vulnerability-scan result.
 
-That chain makes the designated deployment auditable against this source and the designated
-builder. It is not yet independently or bit-for-bit reproducible: crate sources are not
+That chain lets anyone audit what a published image was built from. It does not prove which
+image is serving: since ADR-0044 there is no remote attestation, and the deployment
+repository's Terraform pin is the record of the serving digest. It is not yet independently or bit-for-bit reproducible: crate sources are not
 vendored, some package inputs are mutable upstream repositories, and no independent rebuild
 comparison is part of the gate.
 
@@ -37,21 +37,21 @@ comparison is part of the gate.
 
 ```text
 Mac / iPhone / MCP client
-          │ authenticated TLS
+                    │ HTTPS (Google-managed load balancer)
           ▼
-Confidential Space regional fleet
+Cloud Run service
   ├─ OAuth, capture, query, export, deletion, workers
   ├─ private TLS PostgreSQL ── structured state and fleet-wide claims
   ├─ context-bound encrypted GCS ── large media/object bytes only
-  ├─ attestation-derived credential ── KMS unwrap/wrap
+    ├─ runtime service-account credential ── KMS unwrap/wrap
   ├─ bounded content egress ── Vertex Gemini
   ├─ signed optional egress ── user-configured webhooks
   └─ content-free egress ── APNs and billing
 ```
 
 Cloud SQL and its authorized GCP/database administrators are inside the structured-plaintext
-trust boundary. Confidential Space protects application plaintext and media keys while the
-service is running; it does not turn Cloud SQL into operator-independent encryption.
+trust boundary, and the runtime service account can unwrap media keys. Nothing here is
+operator-independent encryption.
 
 Large media uses AES-256-GCM with authenticated context binding the account, logical object,
 and purpose. Moving ciphertext or wrapped key metadata to another account or object fails
@@ -90,7 +90,7 @@ The full request/response contract is in [API.md](API.md). Representative surfac
 
 | Surface | Representative paths | Authentication |
 |---|---|---|
-| Health and attestation | `/health`, `/readyz`, `/livez`, `/v1/attestation` | Health/attestation are public and content-free |
+| Health | `/health`, `/readyz`, `/livez` | Public and content-free |
 | OAuth | `/.well-known/*`, `/register`, `/authorize`, `/token`, `/oauth/*` | Protocol-specific identity validation |
 | Capture and processing | `/api/v2/capture/*` | Kioku access token or accepted Google ID token |
 | Search and MCP | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
@@ -100,19 +100,20 @@ The full request/response contract is in [API.md](API.md). Representative surfac
 
 Retired compatibility routes remain part of the published behavior. `/api/sync/batch`, the
 retired screenshot upload routes, and legacy `/v1/*` data routes authenticate before returning
-`410 Gone`; they do not read or mutate user state. `/v1/attestation` remains active.
+`410 Gone`; they do not read or mutate user state. `/v1/attestation` remains routed until the
+retired fleet mode is removed; on Cloud Run it has no attestation to return.
 
 ## Security summary
 
-- Production TLS terminates inside the attested workload. Every replica loads the same reviewed
-  certificate/key generation from fixed Secret Manager coordinates at startup. Its rustls config
-  and attestation-bound leaf fingerprint are immutable for the process lifetime; certificate
-  rotation uses the ADR-0041 staged fleet rollout, not an in-process hot swap.
-- KMS access uses a short-lived token derived from a Confidential Space attestation token and
-  Google STS. There is no metadata-service credential fallback for unwrap/decrypt.
-- The launch policy permits only `PORT` as a metadata environment override. KMS, media bucket,
-  caller identity, OAuth audiences, PostgreSQL connection budget, and TLS configuration are baked
-  into the image or loaded from fixed Secret Manager coordinates.
+- Production runs in `KIOKU_DEPLOYMENT_MODE=managed_platform`: Google's load balancer terminates
+  public TLS and the service listens for plaintext HTTP on `$PORT` inside the platform. The
+  in-process TLS path exists only for the retired `attested_vm` mode.
+- KMS access uses the runtime service account's metadata-server token; the deployment
+  repository's Terraform grants the key-encryption key to exactly that account. The
+  attestation-derived credential path exists only for the retired mode.
+- Cloud Run passes only `PORT` and `KIOKU_DEPLOYMENT_MODE`. KMS, media bucket, caller identity,
+  OAuth audiences, and the PostgreSQL connection budget are baked into the image or loaded from
+  fixed Secret Manager coordinates.
 - Serving code verifies the required PostgreSQL schema unconditionally and never runs DDL; DDL
   belongs only to the dedicated digest-pinned one-shot migrator. There is no runtime schema-mode
   key.
@@ -156,7 +157,7 @@ then performs the pinned native Linux/amd64 build, OCI quarantine, SBOM, and sca
 
 `scripts/select_build_configuration.py` reads one external current-user-owned mode-0600
 operator file without shell evaluation. The selected non-secret values are assembled through a
-BuildKit secret into the final attested image layer.
+BuildKit secret into the final image layer.
 
 Deployment-specific groups include:
 
@@ -220,22 +221,23 @@ and the final no-change Terraform plan in the deployment repository.
 
 ## Verify a running deployment
 
-1. Fetch `/v1/attestation` over a fresh TLS connection.
-2. Verify the Google signature, issuer, expiry, audience, workload claims, certificate-fingerprint
-   nonce, and `submods.container.image_digest`.
-3. Verify the signed source tag and detached local build evidence with independently pinned key
+1. Verify the signed source tag and detached local build evidence with independently pinned key
    fingerprints.
-4. Require the same digest in attestation, signed evidence, Artifact Registry, the serving fleet,
-   and the KMS digest condition.
-5. Verify `/readyz` reports PostgreSQL authority and expected schema health for every member; verify
-   `/livez` independently.
+2. Require the same digest in the signed evidence, Artifact Registry, and the deployment
+   repository's Terraform pin (`enclave_image_digest`); the deployment operator's post-apply
+   verifier checks that pin against the live Cloud Run revisions.
+3. Verify `/readyz` reports PostgreSQL authority and expected schema health; verify `/livez`
+   independently.
+
+There is no remote attestation since ADR-0044: an outside party can audit the published
+release, not observe which image is serving.
 
 ## Dependency and disclosure notes
 
 The runtime is a static binary in a `scratch` image. Dependencies are locked, included in the SBOM,
 audited, and image-scanned. Locked versions improve auditability but are not proof of reproducible
-builds. Bounded content sent to Vertex and explicitly content-enabled webhooks leaves Confidential
-Space; attestation does not cover those providers' internal execution.
+builds. Bounded content sent to Vertex and explicitly content-enabled webhooks leaves the service;
+those providers' internal execution is outside this repository's scope.
 
 Report vulnerabilities privately through the repository's
 [security advisory form](https://github.com/joerodriguez/kioku-enclave/security/advisories/new).
