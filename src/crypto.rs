@@ -163,11 +163,13 @@ pub trait KmsClient: Send + Sync {
 
 // ── Production KMS client ─────────────────────────────────────────────────────
 
-/// Cloud KMS REST client. KMS encrypt/decrypt calls always use an
-/// attestation-derived federated access token via the WIF principalSet binding.
-/// Startup fails unless `ENCLAVE_KMS_VIA_ATTESTATION=1`; there is intentionally
-/// no VM service-account metadata fallback because that would bypass the image
-/// digest attestation boundary.
+/// Cloud KMS REST client. On the attested fleet, KMS encrypt/decrypt calls
+/// always use an attestation-derived federated access token via the WIF
+/// principalSet binding: startup fails unless `ENCLAVE_KMS_VIA_ATTESTATION=1`,
+/// and there is intentionally no VM service-account metadata fallback because
+/// that would bypass the image digest attestation boundary. The managed
+/// platform deployment selects the service-account source explicitly instead
+/// of falling back to it; see [`KmsCredentialSource`].
 ///
 /// GCS operations (ciphertext blob storage) are never affected — they always
 /// use the metadata SA token because the GCS bucket is not the security
@@ -191,8 +193,23 @@ pub enum KmsCredentialSource {
     /// Managed platform: the runtime service account's own token from the
     /// metadata server. Anyone able to act as that service account can unwrap
     /// media DEKs. Selected only by `KIOKU_DEPLOYMENT_MODE=managed_platform`.
-    MetadataServiceAccount { token_url: String },
+    /// The token is cached until shortly before it expires, as the attested
+    /// source does, so a media read costs one metadata round trip per hour
+    /// rather than one per DEK unwrap.
+    MetadataServiceAccount {
+        token_url: String,
+        cache: tokio::sync::Mutex<Option<CachedServiceAccountToken>>,
+    },
 }
+
+pub struct CachedServiceAccountToken {
+    token: String,
+    expires: std::time::Instant,
+}
+
+/// Refresh this far ahead of the metadata server's stated expiry so a token
+/// handed to an in-flight KMS call cannot expire mid-request.
+const SERVICE_ACCOUNT_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 
 const METADATA_SERVICE_ACCOUNT_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
@@ -229,8 +246,8 @@ impl GcpKmsClient {
         // service-account source by an exact, explicit deployment mode.
         let credentials = if crate::managed_platform_mode() {
             KmsCredentialSource::MetadataServiceAccount {
-                token_url: std::env::var("KMS_METADATA_TOKEN_URL")
-                    .unwrap_or_else(|_| METADATA_SERVICE_ACCOUNT_TOKEN_URL.to_owned()),
+                token_url: METADATA_SERVICE_ACCOUNT_TOKEN_URL.to_owned(),
+                cache: tokio::sync::Mutex::new(None),
             }
         } else {
             if std::env::var("ENCLAVE_KMS_VIA_ATTESTATION").as_deref() != Ok("1") {
@@ -259,10 +276,17 @@ impl GcpKmsClient {
     async fn kms_token(&self) -> Result<String> {
         match &self.credentials {
             KmsCredentialSource::Attested(creds) => creds.kms_access_token().await,
-            KmsCredentialSource::MetadataServiceAccount { token_url } => {
+            KmsCredentialSource::MetadataServiceAccount { token_url, cache } => {
                 #[derive(Deserialize)]
                 struct TokenResponse {
                     access_token: String,
+                    expires_in: u64,
+                }
+                let mut guard = cache.lock().await;
+                if let Some(cached) = guard.as_ref() {
+                    if std::time::Instant::now() < cached.expires {
+                        return Ok(cached.token.clone());
+                    }
                 }
                 let token: TokenResponse = self
                     .http
@@ -274,6 +298,12 @@ impl GcpKmsClient {
                     .error_for_status()?
                     .json()
                     .await?;
+                let lifetime = Duration::from_secs(token.expires_in)
+                    .saturating_sub(SERVICE_ACCOUNT_TOKEN_REFRESH_MARGIN);
+                *guard = Some(CachedServiceAccountToken {
+                    token: token.access_token.clone(),
+                    expires: std::time::Instant::now() + lifetime,
+                });
                 Ok(token.access_token)
             }
         }
@@ -546,12 +576,16 @@ mod tests {
                 "{value:?} must not select the service-account KMS source"
             );
         }
-        std::env::set_var("KIOKU_DEPLOYMENT_MODE", "managed_platform");
-        assert!(crate::managed_platform_mode());
-
-        // On an attested deployment the metadata service account must never be
-        // able to stand in for an attestation.
-        std::env::remove_var("KIOKU_DEPLOYMENT_MODE");
+        let saved = [
+            "KMS_PROJECT",
+            "KMS_LOCATION",
+            "KMS_KEY_RING",
+            "KMS_KEY",
+            "ENCLAVE_KMS_VIA_ATTESTATION",
+            "ATTEST_STS_AUDIENCE",
+            "KIOKU_DEPLOYMENT_MODE",
+        ]
+        .map(|key| (key, std::env::var(key).ok()));
         for (key, value) in [
             ("KMS_PROJECT", "p"),
             ("KMS_LOCATION", "l"),
@@ -561,6 +595,26 @@ mod tests {
             std::env::set_var(key, value);
         }
         std::env::remove_var("ENCLAVE_KMS_VIA_ATTESTATION");
+        std::env::remove_var("ATTEST_STS_AUDIENCE");
+
+        // The managed platform needs no attestation audience and no
+        // attestation opt-in: the mode alone selects the service-account
+        // source, with the fixed metadata URL and an empty token cache.
+        std::env::set_var("KIOKU_DEPLOYMENT_MODE", "managed_platform");
+        assert!(crate::managed_platform_mode());
+        let managed =
+            GcpKmsClient::from_env().expect("managed mode constructs without attestation");
+        match &managed.credentials {
+            KmsCredentialSource::MetadataServiceAccount { token_url, cache } => {
+                assert_eq!(token_url, METADATA_SERVICE_ACCOUNT_TOKEN_URL);
+                assert!(cache.try_lock().expect("unlocked").is_none());
+            }
+            KmsCredentialSource::Attested(_) => panic!("managed mode must not attest"),
+        }
+
+        // On an attested deployment the metadata service account must never be
+        // able to stand in for an attestation.
+        std::env::remove_var("KIOKU_DEPLOYMENT_MODE");
         let error = match GcpKmsClient::from_env() {
             Ok(_) => panic!("attested mode must refuse metadata credentials"),
             Err(error) => error,
@@ -569,14 +623,11 @@ mod tests {
             error.to_string().contains("ENCLAVE_KMS_VIA_ATTESTATION"),
             "unexpected refusal: {error}"
         );
-        for key in [
-            "KMS_PROJECT",
-            "KMS_LOCATION",
-            "KMS_KEY_RING",
-            "KMS_KEY",
-            "KIOKU_DEPLOYMENT_MODE",
-        ] {
-            std::env::remove_var(key);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

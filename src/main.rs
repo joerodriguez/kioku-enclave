@@ -23,11 +23,16 @@
 //! public verifier-audience `/v1/attestation` route are intentionally public.
 //! There is no shared-secret auth fallback or auth-disable flag.
 //!
-//! Production builds fail closed unless in-enclave TLS is configured. Plain
-//! HTTP is available only from debug builds with `ENCLAVE_TEST_MODE=1`.
+//! In the attested-VM deployment, production builds fail closed unless
+//! in-enclave TLS is configured, and plain HTTP is available only from debug
+//! builds with `ENCLAVE_TEST_MODE=1`. `KIOKU_DEPLOYMENT_MODE=managed_platform`
+//! is the one release-build exception: the platform terminates public TLS at
+//! its edge and this process serves plaintext HTTP on `$PORT` (see
+//! [`managed_platform_mode`]).
 //!
-//! The enclave terminates production TLS itself (see `tls.rs` and `serve_tls`),
-//! so the attested binary is the first server-side application code to see a
+//! In the attested deployment the enclave terminates production TLS itself
+//! (see `tls.rs` and `serve_tls`), so the attested binary is the first
+//! server-side application code to see a
 //! request. `/v1/attestation` binds the live certificate fingerprint into the
 //! token nonce for verifier-side channel comparison.
 //!
@@ -154,9 +159,14 @@ const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
 
 /// Load the allowlisted image configuration assembled by the final Docker
 /// stage. The file is deliberately parsed as data rather than sourced as shell
-/// and is read before any provider/client construction. `PORT` and explicit
-/// test-only variables remain process environment inputs; all security
-/// configuration comes from the image file and overwrites ambient values.
+/// and is read before any provider/client construction. `PORT`, explicit
+/// test-only variables, and `KIOKU_DEPLOYMENT_MODE` remain process environment
+/// inputs; all other security configuration comes from the image file and
+/// overwrites ambient values. The deployment mode is deliberately not baked:
+/// it describes where an image runs, not what it is, so one published digest
+/// serves both topologies. On the attested fleet it cannot be injected (only
+/// `PORT` may be overridden through `tee-env`), and on a managed platform the
+/// principal able to set it can already replace the image or its identity.
 fn load_baked_image_configuration() {
     let configured_path = std::env::var_os("KIOKU_BAKED_CONFIG");
     if let Some(value) = configured_path.as_deref() {
@@ -1025,15 +1035,25 @@ async fn async_main() {
         .await
         .expect("bind failed");
 
-    let (keystone, cert_fingerprint) = match tls::from_env(&cp_config.base_url, &enclave_audience)
-        .await
-        .expect("TLS config")
-    {
-        Some(keystone) => {
-            let fingerprint = keystone.fingerprint_hex();
-            (Some(Arc::new(keystone)), Some(fingerprint))
+    // The deployment mode, not the baked `ENCLAVE_TLS` pin, decides who owns
+    // the certificate. The release pipeline bakes `ENCLAVE_TLS=1` into every
+    // image for the attested fleet and the loader overwrites ambient values,
+    // so consulting `tls::from_env` here on a managed platform would either
+    // handshake TLS on the platform's plaintext hop (every request fails) or
+    // crash-loop on the TLS secrets it has no reason to hold.
+    let (keystone, cert_fingerprint) = if managed_platform_mode() {
+        (None, None)
+    } else {
+        match tls::from_env(&cp_config.base_url, &enclave_audience)
+            .await
+            .expect("TLS config")
+        {
+            Some(keystone) => {
+                let fingerprint = keystone.fingerprint_hex();
+                (Some(Arc::new(keystone)), Some(fingerprint))
+            }
+            None => (None, None),
         }
-        None => (None, None),
     };
     // This public token uses a verifier-specific HTTPS audience. It must never
     // use ATTEST_STS_AUDIENCE: a WIF-audience token is an STS bearer credential.
@@ -1350,6 +1370,14 @@ async fn async_main() {
         .filter(|seconds| (1..=115).contains(seconds))
         .map(Duration::from_secs)
         .unwrap_or_else(|| panic!("DRAIN_TIMEOUT_SECONDS must be between 1 and 115"));
+    // The baked drain window is sized for the Confidential Space SIGTERM
+    // grace. A managed platform gives ten seconds before SIGKILL; a longer
+    // drain would only turn a graceful stop into a killed one.
+    let drain_timeout = if managed_platform_mode() {
+        drain_timeout.min(Duration::from_secs(8))
+    } else {
+        drain_timeout
+    };
     let shutdown = drain_on_termination(Arc::clone(&serving_lifecycle), drain_timeout);
 
     // Listen
