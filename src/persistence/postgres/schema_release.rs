@@ -39,7 +39,7 @@ const RELEASE_PROTOCOL_VERSION: i64 = 1;
 /// with no version-scoped escape.
 #[cfg(test)]
 const EXPECTED_RECONCILIATION_PRODUCER_CONTRACT: &str =
-    "sha256:3a7a8d2d0f2a5e2045524f73822663d732ed31538792f1b2d9d7341a4f323225";
+    "sha256:0e3fadcbc33df882f72be1a31a3be411a76e5af0831a410a4284c803c550ed12";
 const BACKFILL_BATCH_SIZE: i64 = 250;
 const MAX_BACKFILL_BATCHES_PER_RUN: usize = 100;
 const FLEET_RECEIPT_MAX_VALIDITY_MILLIS: i64 = 15 * 60 * 1_000;
@@ -1269,20 +1269,35 @@ async fn step_catalog_evidence_for_verification(
     allow_active_guard: bool,
 ) -> Result<String> {
     let evidence = step_catalog_evidence(connection, step_name).await?;
-    if !allow_active_guard {
-        return Ok(evidence);
-    }
-    let recognized_guards = match step_name {
-        STEP_EPISODES_COMPATIBILITY => vec![
+    let mut recognized_guards = match step_name {
+        STEP_EPISODES_COMPATIBILITY if allow_active_guard => vec![
             format!("episodes.{ACTIVE_FINALIZATION_GUARD_TRIGGER}"),
             format!("episodes.{PAGED_DELETION_EPISODE_GUARD_TRIGGER}"),
         ],
-        STEP_MEMBERS_COMPATIBILITY => vec![
+        STEP_MEMBERS_COMPATIBILITY if allow_active_guard => vec![
             format!("episode_members.{PENDING_DELETION_MEMBER_GUARD_TRIGGER}"),
             format!("episode_members.{PAGED_DELETION_MEMBER_GUARD_TRIGGER}"),
         ],
-        _ => return Ok(evidence),
+        _ => Vec::new(),
     };
+    // ADR-0045 owns additive guards in a separate, exact catalog receipt.
+    // Verify that receipt before excluding its two attachments from the
+    // frozen v26 evidence; unreceipted or changed guards still fail closed.
+    if super::current_schema_relation_exists(connection, "morning_email_schema").await? {
+        super::morning_email_schema::verify(connection).await?;
+        match step_name {
+            STEP_EPISODES_COMPATIBILITY => {
+                recognized_guards.push("episodes.kioku_morning_email_memory_delete".into())
+            }
+            STEP_ACCOUNTS_COMPATIBILITY => {
+                recognized_guards.push("accounts.kioku_morning_email_recipient_change".into())
+            }
+            _ => {}
+        }
+    }
+    if recognized_guards.is_empty() {
+        return Ok(evidence);
+    }
     // The frozen v26 digests were computed before the v27 draining guards
     // existed. A v27 reader removes only the exact recognized triggers from
     // the matching PostgreSQL JSONB projection; every other change still
@@ -2240,6 +2255,11 @@ async fn verify_release_row(
 /// active guard from v26 catalog evidence.
 #[cfg(test)]
 pub(super) async fn test_frozen_v0_9_16_verify_schema(connection: &mut PgConnection) -> Result<()> {
+    if super::current_schema_relation_exists(connection, "morning_email_schema").await? {
+        return Err(EnclaveError::Config(
+            "frozen predecessor refuses additive morning email guards".into(),
+        ));
+    }
     let state = connection_schema_state(connection).await?;
     let serving_state = classify_serving_schema(state)?;
     verify_release_row_mode(connection, serving_state, false).await?;

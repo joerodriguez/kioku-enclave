@@ -43,6 +43,8 @@ mod source_component_tests;
 pub(super) use source_component_tests::test_source_closed_components;
 
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
+/// Capture-time context in both directions also repairs offline arrival order.
+const CANDIDATE_CONTEXT_SECONDS: i64 = 8 * 60 * 60;
 const MAX_DRAFTS: i64 = 32;
 const MAX_ATOMS: i64 = 4_000;
 const MAX_SOURCE_SESSIONS: usize = 256;
@@ -229,7 +231,7 @@ fn oldest_connected_prefix_with_boundary(
     let limit = usize::try_from(draft_limit.max(0)).unwrap_or(usize::MAX);
     for (id, started_ms, ended_ms) in headers {
         if (!prefix.is_empty() || oversized)
-            && *started_ms > component_end.saturating_add(QUIET_HORIZON_SECONDS * 1_000)
+            && *started_ms > component_end.saturating_add(CANDIDATE_CONTEXT_SECONDS * 1_000)
         {
             return (prefix, oversized, Some(component_end), true);
         }
@@ -414,7 +416,7 @@ async fn outside_draft_closure(
                JOIN episodes episode ON episode.account_id=owner.account_id \
                     AND episode.id=owner.episode_id \
               WHERE utterance.account_id=$1 AND NOT (owner.episode_id=ANY($2)) \
-                AND episode.structure_state='draft' AND episode.finalized_at IS NULL \
+                AND episode.structure_state IN ('draft','reconciled') \
                 AND segment.started_at + utterance.start_offset_seconds*interval '1 second' \
                     BETWEEN to_timestamp($3::double precision/1000.0) \
                         AND to_timestamp($4::double precision/1000.0) \
@@ -427,7 +429,7 @@ async fn outside_draft_closure(
                JOIN episodes episode ON episode.account_id=owner.account_id \
                     AND episode.id=owner.episode_id \
               WHERE screenshot.account_id=$1 AND NOT (owner.episode_id=ANY($2)) \
-                AND episode.structure_state='draft' AND episode.finalized_at IS NULL \
+                AND episode.structure_state IN ('draft','reconciled') \
                 AND screenshot.captured_at BETWEEN to_timestamp($3::double precision/1000.0) \
                     AND to_timestamp($4::double precision/1000.0) \
          ) SELECT coalesce(array_agg(DISTINCT episode_id ORDER BY episode_id),'{}'::bigint[]) \
@@ -484,8 +486,8 @@ fn connected_source_sessions(
     loop {
         let before = (selected.len(), started_ms, ended_ms);
         for session in sessions {
-            if session.started_ms <= ended_ms.saturating_add(QUIET_HORIZON_SECONDS * 1_000)
-                && session.ended_ms >= started_ms.saturating_sub(QUIET_HORIZON_SECONDS * 1_000)
+            if session.started_ms <= ended_ms.saturating_add(CANDIDATE_CONTEXT_SECONDS * 1_000)
+                && session.ended_ms >= started_ms.saturating_sub(CANDIDATE_CONTEXT_SECONDS * 1_000)
             {
                 started_ms = started_ms.min(session.started_ms);
                 ended_ms = ended_ms.max(session.ended_ms);
@@ -499,9 +501,25 @@ fn connected_source_sessions(
     selected.into_values().collect()
 }
 
+fn source_sessions_are_organization_ready(sessions: &[SourceSession]) -> bool {
+    sessions
+        .iter()
+        .all(|session| session.jobs_terminal && session.media_terminal && session.formation_current)
+}
+
 fn source_sessions_are_settled(sessions: &[SourceSession]) -> bool {
     sessions.iter().all(|session| {
         session.sealed
+            && session.formation_finish_requested_ms.is_some()
+            && session.formation_seal_finalized_ms.is_some()
+            && session
+                .formation_seal_generation
+                .is_some_and(|generation| generation >= 1)
+            && session.formation_seal_source_revision == session.formation_source_revision
+            && session
+                .formation_seal_stream_maxima_sha256
+                .as_deref()
+                .is_some_and(valid_digest)
             && session.streams_settled
             && session.jobs_terminal
             && session.media_terminal
@@ -565,17 +583,7 @@ async fn verify_source_session_formation(
         };
         let complete = session.formation_state.as_deref() == Some("complete")
             && session.formation_completed_revision == Some(source_revision)
-            && session.formation_completed_outcome.is_some()
-            && session.formation_finish_requested_ms.is_some()
-            && session.formation_seal_finalized_ms.is_some()
-            && session
-                .formation_seal_generation
-                .is_some_and(|generation| generation >= 1)
-            && session.formation_seal_source_revision == Some(source_revision)
-            && session
-                .formation_seal_stream_maxima_sha256
-                .as_deref()
-                .is_some_and(valid_digest);
+            && session.formation_completed_outcome.is_some();
         let Some(completed_fingerprint) = session
             .formation_completed_source_fingerprint
             .as_deref()
@@ -644,8 +652,9 @@ async fn source_session_candidate_page(
     closure_ended_ms: i64,
     after_session_id: Option<&str>,
 ) -> Result<(Vec<String>, bool)> {
-    let neighborhood_started_ms = closure_started_ms.saturating_sub(QUIET_HORIZON_SECONDS * 1_000);
-    let neighborhood_ended_ms = closure_ended_ms.saturating_add(QUIET_HORIZON_SECONDS * 1_000);
+    let neighborhood_started_ms =
+        closure_started_ms.saturating_sub(CANDIDATE_CONTEXT_SECONDS * 1_000);
+    let neighborhood_ended_ms = closure_ended_ms.saturating_add(CANDIDATE_CONTEXT_SECONDS * 1_000);
     let mut ids = sqlx::query_scalar::<_, String>(
         "WITH candidate(id) AS ( \
              SELECT id FROM capture_sessions WHERE account_id=$1 \
@@ -1171,8 +1180,9 @@ async fn load_source_sessions(
     closure_started_ms: i64,
     closure_ended_ms: i64,
 ) -> Result<Vec<SourceSession>> {
-    let neighborhood_started_ms = closure_started_ms.saturating_sub(QUIET_HORIZON_SECONDS * 1_000);
-    let neighborhood_ended_ms = closure_ended_ms.saturating_add(QUIET_HORIZON_SECONDS * 1_000);
+    let neighborhood_started_ms =
+        closure_started_ms.saturating_sub(CANDIDATE_CONTEXT_SECONDS * 1_000);
+    let neighborhood_ended_ms = closure_ended_ms.saturating_add(CANDIDATE_CONTEXT_SECONDS * 1_000);
     let intrinsic_session_ids = sqlx::query_scalar::<_, String>(
         "SELECT id FROM capture_sessions \
           WHERE account_id=$1 \
@@ -1328,6 +1338,97 @@ async fn load_source_sessions(
         .collect()
 }
 
+/// Brief verification is providerless and pages the same source projection.
+/// Dense KEEP results must not inherit the model's 256-session input ceiling;
+/// the complete source-inventory bound still fails closed without truncation.
+async fn load_brief_source_sessions(
+    connection: &mut PgConnection,
+    account_id: &str,
+    started_ms: i64,
+    ended_ms: i64,
+) -> Result<Option<Vec<SourceSession>>> {
+    let mut sessions = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (ids, has_more) = source_session_candidate_page(
+            connection,
+            account_id,
+            started_ms,
+            ended_ms,
+            cursor.as_deref(),
+        )
+        .await?;
+        if sessions.len() + ids.len() > MAX_SOURCE_COMPONENT_INVENTORY as usize {
+            return Ok(None);
+        }
+        let next_cursor = ids.last().cloned();
+        sessions.extend(load_source_sessions_by_ids(connection, account_id, &ids).await?);
+        if !has_more {
+            return Ok(Some(sessions));
+        }
+        if next_cursor.is_none() || next_cursor == cursor {
+            return Err(EnclaveError::Store(
+                "brief source page did not advance".into(),
+            ));
+        }
+        cursor = next_cursor;
+    }
+}
+
+/// Brief readiness retains the verified source-seal and four-hour quiet contract.
+/// Prompt organization never grants this authority. Called under the topology
+/// advisory lock at claim, provider egress, and final settlement.
+pub(super) async fn brief_sources_are_settled(
+    connection: &mut PgConnection,
+    account_id: &str,
+    episode_id: i64,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_ms, \
+                ceil(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_ms \
+           FROM episodes e JOIN memory_handles h \
+             ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active' \
+          WHERE e.account_id=$1 AND e.id=$2 AND e.structure_state='reconciled'",
+    )
+    .bind(account_id)
+    .bind(episode_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let inventory = source_closed_components(connection, account_id).await?;
+    if inventory.inventory_rows > MAX_SOURCE_COMPONENT_INVENTORY
+        || inventory
+            .components
+            .iter()
+            .any(|component| component.draft_ids.contains(&episode_id))
+    {
+        return Ok(false);
+    }
+    let mut started_ms: i64 = row.try_get("started_ms")?;
+    let mut ended_ms: i64 = row.try_get("ended_ms")?;
+    for _ in 0..=MAX_SOURCE_SESSIONS {
+        let Some(mut sessions) =
+            load_brief_source_sessions(connection, account_id, started_ms, ended_ms).await?
+        else {
+            return Ok(false);
+        };
+        let before = (started_ms, ended_ms);
+        for session in &sessions {
+            started_ms = started_ms.min(session.started_ms);
+            ended_ms = ended_ms.max(session.ended_ms);
+        }
+        if before != (started_ms, ended_ms) {
+            continue;
+        }
+        verify_source_session_formation(connection, account_id, &mut sessions).await?;
+        return Ok(source_sessions_are_settled(&sessions)
+            && database_quiet_horizon(connection, ended_ms).await?);
+    }
+    Ok(false)
+}
+
 async fn read_snapshot(
     connection: &mut PgConnection,
     account_id: &str,
@@ -1339,6 +1440,15 @@ async fn read_snapshot(
         return Err(EnclaveError::InvalidRequest(
             "memory reconciliation predecessor set is invalid".into(),
         ));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE account_id=$1)",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *connection)
+    .await?
+    {
+        return Ok(None);
     }
     // Repeat the complete graph at every claim/egress/publication boundary,
     // not only at discovery. A canonical family or projection can connect a
@@ -1363,6 +1473,15 @@ async fn read_snapshot(
     {
         return Ok(None);
     }
+    for table in ["webhook_deliveries", "email_deliveries", "push_deliveries"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT episode_id FROM {table} WHERE account_id=$1 AND episode_id=ANY($2) FOR UPDATE"
+        )))
+        .bind(account_id)
+        .bind(predecessor_ids)
+        .fetch_all(&mut *connection)
+        .await?;
+    }
     let rows = sqlx::query(
         "SELECT episode.id, \
                 floor(extract(epoch FROM episode.started_at)*1000)::bigint AS started_at_ms, \
@@ -1376,17 +1495,17 @@ async fn read_snapshot(
            FROM episodes episode JOIN memory_handles handle \
              ON handle.account_id=episode.account_id AND handle.episode_id=episode.id \
           WHERE episode.account_id=$1 AND episode.id=ANY($2) \
-            AND episode.finalized_at IS NULL \
             AND episode.finalization_status NOT IN ('processing','deleting') \
             AND episode.finalization_claim_token IS NULL \
-            AND NOT EXISTS(SELECT 1 FROM episode_final_briefs brief \
-                 WHERE brief.account_id=episode.account_id AND brief.episode_id=episode.id) \
             AND NOT EXISTS(SELECT 1 FROM webhook_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id \
+                   AND delivery.state='processing') \
             AND NOT EXISTS(SELECT 1 FROM email_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id \
+                   AND delivery.state='processing') \
             AND NOT EXISTS(SELECT 1 FROM push_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id \
+                   AND delivery.state='processing') \
           ORDER BY episode.id FOR UPDATE OF episode",
     )
     .bind(account_id)
@@ -1417,7 +1536,7 @@ async fn read_snapshot(
     for row in rows {
         let structure: String = row.try_get("structure_state")?;
         let state: String = row.try_get("state")?;
-        if structure != "draft" || state != "active" {
+        if !matches!(structure.as_str(), "draft" | "reconciled") || state != "active" {
             return Ok(None);
         }
         let updated_ms = row.try_get::<Option<i64>, _>("updated_at_ms")?;
@@ -1573,13 +1692,11 @@ async fn read_snapshot(
     let cohort_started_at = isotime::format_epoch_millis(closure_started_ms);
     let cohort_ended_at = isotime::format_epoch_millis(closure_ended_ms);
     sessions.sort_by(|left, right| left.id.cmp(&right.id));
-    // This gate intentionally does not consult the summarizer cursor. The
-    // closure reads raw utterance/screenshot projections directly, expands
-    // every touching capture session to its full event horizon, and requires
-    // sealed streams plus terminal media jobs/objects. The cursor can lag
-    // without hiding accepted atoms from this snapshot.
-    let settled = source_sessions_are_settled(&sessions)
-        && database_quiet_horizon(connection, closure_ended_ms).await?;
+    // Organization requires the exact completed formation revision and terminal
+    // known media, without borrowing authority from a final source seal. The
+    // complete capture/source closure and its CAS still reject late mutations;
+    // brief_sources_are_settled independently retains the four-hour seal proof.
+    let settled = source_sessions_are_organization_ready(&sessions);
     let guard = sessions
         .iter()
         .map(|session| {
@@ -1708,17 +1825,15 @@ async fn read_keep_drafts(
            JOIN memory_handles handle ON handle.account_id=episode.account_id \
                 AND handle.episode_id=episode.id AND handle.state='active' \
           WHERE episode.account_id=$1 AND episode.id=ANY($2) \
-            AND episode.structure_state='draft' AND episode.finalized_at IS NULL \
+            AND episode.structure_state IN ('draft','reconciled') \
             AND episode.finalization_status NOT IN ('processing','deleting') \
             AND episode.finalization_claim_token IS NULL \
-            AND NOT EXISTS(SELECT 1 FROM episode_final_briefs brief \
-                 WHERE brief.account_id=episode.account_id AND brief.episode_id=episode.id) \
             AND NOT EXISTS(SELECT 1 FROM webhook_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id AND delivery.state='processing') \
             AND NOT EXISTS(SELECT 1 FROM email_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id AND delivery.state='processing') \
             AND NOT EXISTS(SELECT 1 FROM push_deliveries delivery \
-                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id) \
+                 WHERE delivery.account_id=episode.account_id AND delivery.episode_id=episode.id AND delivery.state='processing') \
           ORDER BY array_position($2::bigint[],episode.id) FOR UPDATE OF episode",
     )
     .bind(account_id)
@@ -2556,14 +2671,35 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         if component.blocked_drafts != 0 || component.atoms == 0 {
             return Ok(held_keep_promotion(Some(component.ended_ms), true));
         }
-        let headers = component
-            .draft_ids
+        // The complete source graph already proves the normal model bounds.
+        // Do not send current memories through the oversized-only quiet-seal
+        // scan before their prompt organization can run.
+        if component.draft_ids.len() <= draft_limit as usize
+            && component.atoms <= atom_limit
+            && component.sessions <= MAX_SOURCE_SESSIONS as i64
+        {
+            return Ok(OversizedKeepPromotionResult::NotOversized);
+        }
+        // Reconciled owners remain in the complete source graph for closure
+        // and model bounds. KEEP mutates only unfinished drafts: choosing those
+        // owners again would repeatedly promote an unchanged prefix and starve
+        // the remaining draft after a 32-of-33 publication.
+        let pending_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM episodes WHERE account_id=$1 AND id=ANY($2) \
+              AND structure_state='draft' AND finalized_at IS NULL ORDER BY started_at,id LIMIT $3",
+        )
+        .bind(account_id)
+        .bind(&component.draft_ids)
+        .bind(MAX_CANDIDATE_HEADERS as i64)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let headers = pending_ids
             .iter()
             .map(|id| (*id, component.started_ms, component.ended_ms))
-            .take(MAX_CANDIDATE_HEADERS)
             .collect::<Vec<_>>();
-        let (episode_ids, oversized_drafts, _component_ended_ms, boundary_complete) =
+        let (episode_ids, _pending_prefix_oversized, _component_ended_ms, boundary_complete) =
             oldest_connected_prefix_with_boundary(&headers, draft_limit);
+        let oversized_drafts = component.draft_ids.len() > draft_limit as usize;
         if episode_ids.is_empty() {
             return Ok(OversizedKeepPromotionResult::NotOversized);
         }
@@ -2783,7 +2919,7 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "archive_revision": prior_archive_revision,
                 "source_fingerprint": source_fingerprint,
                 "episode_ids": episode_ids,
-                "mutation": "structure_state:draft->reconciled",
+                "mutation": "structure_state:current->reconciled-exact-keep",
             }),
         )?;
         let result_commitment = digest_json(
@@ -3441,6 +3577,20 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 mentioned_predecessors.insert(*predecessor);
             }
             if let Some(retained) = output.retained_episode_id {
+                let prior = current
+                    .drafts
+                    .iter()
+                    .find(|draft| draft.id == retained)
+                    .ok_or_else(|| {
+                        EnclaveError::InvalidRequest("retained memory predecessor is absent".into())
+                    })?;
+                let prior_sources = prior.member_source_ids.iter().collect::<BTreeSet<_>>();
+                let next_sources = output.member_source_ids.iter().collect::<BTreeSet<_>>();
+                if prior_sources != next_sources {
+                    return Err(EnclaveError::InvalidRequest(
+                        "changed memory membership requires a successor".into(),
+                    ));
+                }
                 if output.predecessor_episode_ids.as_slice() != [retained] {
                     return Err(EnclaveError::InvalidRequest(
                         "retained memory must be a one-to-one reconciliation".into(),
@@ -3524,6 +3674,36 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             .filter(|episode_id| !retained_ids.contains(episode_id))
             .collect::<Vec<_>>();
 
+        // Native email moves to source-qualified morning coverage. Signed
+        // webhook/APNs events retain their original finalized snapshot and
+        // identity, including when the first delivery is still pending.
+        sqlx::query(
+            "UPDATE email_deliveries SET state='cancelled',claim_token=NULL,claim_until=NULL, \
+                 last_error='memory_reorganized',updated_at=clock_timestamp() \
+               WHERE account_id=$1 AND episode_id=ANY($2) AND state IN ('pending','retry_wait')",
+        )
+        .bind(&command.claim.account_id)
+        .bind(&replaced_predecessor_ids)
+        .execute(&mut *transaction)
+        .await?;
+
+        let protected_finalized_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM episodes WHERE account_id=$1 AND id=ANY($2) AND finalized_at IS NOT NULL",
+        ).bind(&command.claim.account_id).bind(&command.claim.predecessor_episode_ids)
+            .fetch_all(&mut *transaction).await?;
+        let protected_retained_ids = retained_ids
+            .iter()
+            .copied()
+            .filter(|id| protected_finalized_ids.contains(id))
+            .collect::<Vec<_>>();
+        let refreshed_predecessor_ids = command
+            .claim
+            .predecessor_episode_ids
+            .iter()
+            .copied()
+            .filter(|id| !protected_finalized_ids.contains(id))
+            .collect::<Vec<_>>();
+
         // Remove the previous active projection before inserting the exhaustive replacement.
         sqlx::query("DELETE FROM episode_members WHERE account_id=$1 AND episode_id=ANY($2)")
             .bind(&command.claim.account_id)
@@ -3532,14 +3712,14 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             .await?;
         sqlx::query("DELETE FROM episode_final_briefs WHERE account_id=$1 AND episode_id=ANY($2)")
             .bind(&command.claim.account_id)
-            .bind(&command.claim.predecessor_episode_ids)
+            .bind(&refreshed_predecessor_ids)
             .execute(&mut *transaction)
             .await?;
         sqlx::query(
             "DELETE FROM episode_screen_interpretations WHERE account_id=$1 AND episode_id=ANY($2)",
         )
         .bind(&command.claim.account_id)
-        .bind(&command.claim.predecessor_episode_ids)
+        .bind(&refreshed_predecessor_ids)
         .execute(&mut *transaction)
         .await?;
         // A strict one-to-one reconciliation retains the episode identity and its
@@ -3562,12 +3742,13 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         let mut source_owner = HashMap::<String, i64>::new();
         for output in outputs {
             let id = if let Some(id) = output.retained_episode_id {
-                sqlx::query(
+                if !protected_retained_ids.contains(&id) {
+                    sqlx::query(
                     "UPDATE episodes SET started_at=to_timestamp($3::double precision/1000.0), \
                          ended_at=to_timestamp($4::double precision/1000.0),type=$5,title=$6,summary=$7, \
                          participants=$8::jsonb,languages=$9::jsonb,action_items=$10::jsonb,model=$11, \
                          minute_summaries=$12::jsonb,minutes_text=$13,substance=$14,visual_evidence=$15, \
-                         structure_state='reconciled',embedding=NULL,finalized_at=NULL, \
+                         structure_state='reconciled',embedding=NULL,finalization_version=0, \
                          finalization_status='pending_horizon',updated_at=clock_timestamp() \
                        WHERE account_id=$1 AND id=$2",
                 )
@@ -3582,6 +3763,7 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 .bind(serde_json::to_string(&output.minute_summaries)?)
                 .bind(output.minutes_text.as_deref()).bind(&output.substance).bind(&output.visual_evidence)
                 .execute(&mut *transaction).await?;
+                }
                 id
             } else {
                 let id =
@@ -3901,9 +4083,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "memory reconciliation producer provenance changed".into(),
             ));
         }
+        // Finalized predecessor rows carry the original brief and first-send
+        // receipts. Deleting them here would cascade those protected snapshots
+        // after their source membership was safely revoked above.
         sqlx::query("DELETE FROM episodes WHERE account_id=$1 AND id=ANY($2) AND NOT (id=ANY($3))")
             .bind(&command.claim.account_id)
-            .bind(&command.claim.predecessor_episode_ids)
+            .bind(&refreshed_predecessor_ids)
             .bind(&retained_ids)
             .execute(&mut *transaction)
             .await?;
@@ -4219,6 +4404,225 @@ pub(super) fn test_provider_stage_write_with_provenance(
     Ok(stage)
 }
 
+/// Deleting a current memory also removes any historical ancestor snapshot
+/// containing its sources. Keep the durable handle/receipt coordinates, but
+/// fence pending channel disclosure and erase cached content atomically.
+pub(super) async fn scrub_ancestor_snapshots_for_deletion(
+    tx: &mut Transaction<'_, Postgres>,
+    account_id: &str,
+    episode_id: i64,
+) -> Result<()> {
+    let ancestors: Vec<i64> = sqlx::query_scalar(
+        "WITH RECURSIVE ancestors(id) AS ( \
+            SELECT predecessor_episode_id FROM memory_lineage_edges WHERE account_id=$1 AND successor_episode_id=$2 \
+            UNION SELECT edge.predecessor_episode_id FROM memory_lineage_edges edge \
+             JOIN ancestors parent ON parent.id=edge.successor_episode_id WHERE edge.account_id=$1) \
+         SELECT id FROM ancestors ORDER BY id",
+    ).bind(account_id).bind(episode_id).fetch_all(&mut **tx).await?;
+    if ancestors.is_empty() {
+        return Ok(());
+    }
+    for table in ["webhook_deliveries", "email_deliveries", "push_deliveries"] {
+        let states: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT state FROM {table} WHERE account_id=$1 AND episode_id=ANY($2) FOR UPDATE"
+        )))
+        .bind(account_id)
+        .bind(&ancestors)
+        .fetch_all(&mut **tx)
+        .await?;
+        if states.iter().any(|state| state == "processing") {
+            return Err(EnclaveError::Conflict(
+                "ancestor memory delivery is in flight".into(),
+            ));
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET state=CASE WHEN state IN ('pending','retry_wait') THEN 'cancelled' ELSE state END, \
+                 claim_token=NULL,claim_until=NULL,updated_at=clock_timestamp() WHERE account_id=$1 AND episode_id=ANY($2)"
+        ))).bind(account_id).bind(&ancestors).execute(&mut **tx).await?;
+    }
+    sqlx::query("UPDATE webhook_deliveries SET frozen_event_body=NULL WHERE account_id=$1 AND episode_id=ANY($2)")
+        .bind(account_id).bind(&ancestors).execute(&mut **tx).await?;
+    sqlx::query("UPDATE email_deliveries SET frozen_subject=NULL,frozen_text_body=NULL,frozen_html_body=NULL WHERE account_id=$1 AND episode_id=ANY($2)")
+        .bind(account_id).bind(&ancestors).execute(&mut **tx).await?;
+    // The morning-email deletion trigger also scrubs any daily snapshots that
+    // used these historical ids; it refuses an in-flight digest transactionally.
+    sqlx::query("UPDATE episodes SET finalization_status='deleting',title=NULL,summary=NULL, \
+        minute_summaries='[]',minutes_text=NULL,action_items='[]',participants='[]',embedding=NULL,updated_at=clock_timestamp() \
+        WHERE account_id=$1 AND id=ANY($2)")
+        .bind(account_id).bind(&ancestors).execute(&mut **tx).await?;
+    for table in ["episode_final_briefs", "episode_screen_interpretations"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE account_id=$1 AND episode_id=ANY($2)"
+        )))
+        .bind(account_id)
+        .bind(&ancestors)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn test_finalized_pending_channels_survive_successor(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+) -> Result<()> {
+    use crate::persistence::{
+        DeliveryRepository, FinalizationClaimRequest, FinalizationRepository,
+    };
+    const NEW_ID: i64 = 500_000_001;
+    let mut tx = persistence.pool().begin().await?;
+    let predecessor: i64 = sqlx::query_scalar(
+        "SELECT e.id FROM episodes e JOIN memory_handles h ON h.account_id=e.account_id AND h.episode_id=e.id \
+         WHERE e.account_id=$1 AND h.state='active' AND e.structure_state='reconciled' ORDER BY e.started_at,e.id LIMIT 1",
+    ).bind(account_id).fetch_one(&mut *tx).await?;
+    sqlx::query("UPDATE episodes SET finalized_at=clock_timestamp(),finalization_status='complete',finalization_version=1 \
+        WHERE account_id=$1 AND id=$2").bind(account_id).bind(predecessor).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
+        VALUES($1,$2,'Original finalized snapshot','[]','[]','[]','[]') ON CONFLICT(account_id,episode_id) \
+        DO UPDATE SET overview=excluded.overview").bind(account_id).bind(predecessor).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO webhook_subscriptions(account_id,id,name,endpoint_url,signing_secret,include_content) \
+        VALUES($1,'pending-lineage','Synthetic','https://example.com/webhook','synthetic-secret',true)")
+        .bind(account_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO webhook_deliveries(account_id,episode_id,subscription_id,delivery_version,event_id,state) \
+        VALUES($1,$2,'pending-lineage',1,'pending-lineage-event','pending')")
+        .bind(account_id).bind(predecessor).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO push_deliveries(account_id,episode_id,installation_binding,delivery_version,delivery_id,handoff_handle,collapse_id,state) \
+        VALUES($1,$2,'synthetic-installation',1,'pending-lineage-push','synthetic-handoff','synthetic-collapse','pending')")
+        .bind(account_id).bind(predecessor).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) \
+        SELECT account_id,$3,ended_at+interval '2 hours',ended_at+interval '121 minutes','meeting','Continuation','Synthetic' \
+        FROM episodes WHERE account_id=$1 AND id=$2")
+        .bind(account_id).bind(predecessor).bind(NEW_ID).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO screenshots(account_id,id,captured_at) SELECT account_id,id,started_at FROM episodes WHERE account_id=$1 AND id=$2")
+        .bind(account_id).bind(NEW_ID).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO episode_members(account_id,episode_id,record_type,record_id) VALUES($1,$2,'screenshot',$2)")
+        .bind(account_id).bind(NEW_ID).execute(&mut *tx).await?;
+    tx.commit().await?;
+    let mut tx = persistence.pool().begin().await?;
+    let authority = active_reconciliation_authority(&mut tx, account_id)
+        .await?
+        .unwrap();
+    let component = source_closed_components(&mut tx, account_id)
+        .await?
+        .components
+        .into_iter()
+        .find(|component| component.draft_ids.contains(&NEW_ID))
+        .unwrap();
+    let (snapshot, ready) = read_snapshot(
+        &mut tx,
+        account_id,
+        &component.draft_ids,
+        MAX_ATOMS,
+        &authority,
+    )
+    .await?
+    .unwrap();
+    assert!(ready);
+    assert!(snapshot.predecessor_episode_ids.contains(&predecessor));
+    tx.commit().await?;
+    let claim = persistence
+        .claim_reconciliation(&snapshot, 900)
+        .await?
+        .unwrap();
+    let guard = persistence
+        .acquire_provider_egress_guard(&claim)
+        .await?
+        .unwrap();
+    let stage = guard
+        .stage_and_release(test_provider_stage_write(
+            &snapshot,
+            "pending-channel-lineage",
+        )?)
+        .await?;
+    let published = persistence
+        .publish_reconciliation(ReconciliationPublish {
+            claim,
+            reconciliation_id: "rec_pending_channel_lineage".into(),
+            cohort_started_at: snapshot.cohort_started_at,
+            cohort_ended_at: snapshot.cohort_ended_at,
+            result_commitment: stage.result_commitment,
+        })
+        .await?;
+    assert!(matches!(
+        published,
+        ReconciliationPublishResult::Published { .. }
+    ));
+    let old_brief: String = sqlx::query_scalar(
+        "SELECT overview FROM episode_final_briefs WHERE account_id=$1 AND episode_id=$2",
+    )
+    .bind(account_id)
+    .bind(predecessor)
+    .fetch_one(persistence.pool())
+    .await?;
+    assert_eq!(old_brief, "Original finalized snapshot");
+    let webhook = persistence
+        .next_webhook_candidate(account_id)
+        .await?
+        .unwrap();
+    assert_eq!(webhook.event_id, "pending-lineage-event");
+    assert_eq!(webhook.episode.overview, "Original finalized snapshot");
+    assert_eq!(sqlx::query_scalar::<_,String>("SELECT state FROM push_deliveries WHERE account_id=$1 AND delivery_id='pending-lineage-push'")
+        .bind(account_id).fetch_one(persistence.pool()).await?,"pending");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM active_episode_members WHERE account_id=$1 AND episode_id=$2"
+        )
+        .bind(account_id)
+        .bind(predecessor)
+        .fetch_one(persistence.pool())
+        .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM memory_handles WHERE account_id=$1 AND episode_id=$2"
+        )
+        .bind(account_id)
+        .bind(predecessor)
+        .fetch_one(persistence.pool())
+        .await?,
+        "superseded"
+    );
+    let successor: i64 = sqlx::query_scalar("SELECT successor_episode_id FROM memory_lineage_edges WHERE account_id=$1 AND predecessor_episode_id=$2 LIMIT 1")
+        .bind(account_id).bind(predecessor).fetch_one(persistence.pool()).await?;
+    // The older preserved snapshot must not starve an active successor in
+    // the untargeted finalizer queue, even when its stored brief version is old.
+    let next_finalization = persistence
+        .claim_finalization(FinalizationClaimRequest {
+            account_id,
+            target_episode_id: None,
+            quiet_horizon_seconds: QUIET_HORIZON_SECONDS,
+            finalization_version: 5,
+            lease_seconds: 900,
+        })
+        .await?
+        .expect("the active successor is eligible behind its historical finalized snapshot");
+    assert_eq!(next_finalization.episode.id, successor);
+    persistence
+        .defer_finalization(&next_finalization, "pending_watermark", None, None, false)
+        .await?;
+    let mut deletion_tx = persistence.pool().begin().await?;
+    advisory_transaction_lock(&mut deletion_tx, "memory-reconciliation", account_id).await?;
+    scrub_ancestor_snapshots_for_deletion(&mut deletion_tx, account_id, successor).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM episode_final_briefs WHERE account_id=$1 AND episode_id=$2"
+        )
+        .bind(account_id)
+        .bind(predecessor)
+        .fetch_one(&mut *deletion_tx)
+        .await?,
+        0
+    );
+    assert_eq!(sqlx::query_scalar::<_,String>("SELECT state FROM webhook_deliveries WHERE account_id=$1 AND event_id='pending-lineage-event'")
+        .bind(account_id).fetch_one(&mut *deletion_tx).await?,"cancelled");
+    assert_eq!(sqlx::query_scalar::<_,String>("SELECT state FROM push_deliveries WHERE account_id=$1 AND delivery_id='pending-lineage-push'")
+        .bind(account_id).fetch_one(&mut *deletion_tx).await?,"cancelled");
+    deletion_tx.rollback().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4299,7 +4703,7 @@ mod tests {
         ];
         assert_eq!(
             oldest_connected_prefix_with_boundary(&headers, 32).0,
-            vec![10, 11]
+            vec![10, 11, 12]
         );
     }
 

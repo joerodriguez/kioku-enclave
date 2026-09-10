@@ -113,3 +113,27 @@ backfill and claim-drain completion, and `formation_quiescent`. Historical ended
 pending seals, dirty formation revisions, and nonterminal formation pages therefore remain hard
 Active blockers. The aggregate fields and schema stay stable; this staging changes only how the
 two existing composite readiness booleans combine their independently reported constituents.
+
+## ADR-0045 morning-email companion (source implementation)
+
+The candidate requires the additive morning-email contract before serving startup. A
+separately authorized release must run its digest-pinned `--migrate-postgres` role with
+`POSTGRES_MIGRATION_CONFIRM=morning-email-v28-install`. This PR does not run that operation
+against shared or production state. The base v26 and activation v27 markers do not advance.
+
+Installation takes a dedicated advisory lock and bounded table locks, refuses active legacy
+email claims/send fences, and atomically installs the legacy-sender fence, transfers only
+existing pending source eligibility, and records exact DDL/catalog digests. A retry accepts
+only that exact receipt. Serving verifies all three business tables plus all four trigger
+bodies, attachments and enabled states. Current v26 catalog verification excludes only the
+exact independently verified companion attachments; older binaries that cannot recognize
+these guards become unready. Treat installation as a coordinated compatibility boundary,
+not a rolling additive migration that promises predecessor readiness.
+
+The changed reconciliation producer commitment also requires the ordinary signed
+pause/drain/rebind/activate workflow for a matching homogeneous candidate fleet. A release
+must plan that transition together with the companion installation; the implementation does
+not weaken existing activation receipts, invent a temporary readiness bridge, or authorize
+an unsigned fleet change. Preserve delivered/ambiguous legacy email receipts. Accounts with
+no saved IANA timezone keep their consent but wait for explicit timezone selection in any
+first-party settings surface. Do not infer timezone or backfill previously unqueued history.

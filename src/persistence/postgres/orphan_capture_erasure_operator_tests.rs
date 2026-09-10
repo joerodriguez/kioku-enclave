@@ -8,7 +8,7 @@ use super::{
     },
     PostgresPersistence,
 };
-use crate::{cp::isotime, error::Result};
+use crate::{cp::isotime, error::Result, persistence::PlaybackRepository};
 
 const ACCOUNT: &str = "orphan-controller-fixture";
 
@@ -361,6 +361,15 @@ pub(super) async fn test_signed_orphan_operator(
         3
     );
 
+    for session in ["session-a", "session-b", "session-keep"] {
+        assert!(
+            persistence
+                .session_dataset(ACCOUNT, session, None)
+                .await?
+                .is_some(),
+            "exact recordings are addressable before erasure preparation"
+        );
+    }
     let prepare = test_verified_request(request.clone())?;
     // A real late cascade failure occurs after projection removal and journal
     // creation. All source rows, the protected control and the fence roll back.
@@ -404,6 +413,22 @@ pub(super) async fn test_signed_orphan_operator(
         .expect("synthetic exact signed preparation");
     assert_eq!(prepared.state, "provider_pending");
     assert!(prepared.capture_upload_fenced);
+    for session in ["session-a", "session-b"] {
+        assert!(
+            persistence
+                .session_dataset(ACCOUNT, session, None)
+                .await?
+                .is_none(),
+            "provider-pending erasure inventory must not authorize recording playback"
+        );
+    }
+    assert!(
+        persistence
+            .session_dataset(ACCOUNT, "session-keep", None)
+            .await?
+            .is_some(),
+        "the unselected recording remains addressable"
+    );
     assert_eq!(
         persistence
             .execute_orphan_capture_erasure_inner(&prepare)

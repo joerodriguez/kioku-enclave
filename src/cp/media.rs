@@ -532,7 +532,7 @@ fn validate_screen_reference(reference: &ScreenReferenceDescriptor) -> Result<()
     Ok(())
 }
 
-fn validate_id(name: &str, value: &str) -> Result<()> {
+pub(super) fn validate_id(name: &str, value: &str) -> Result<()> {
     let valid = !value.is_empty()
         && value.len() <= MAX_ID_LEN
         && value

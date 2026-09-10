@@ -578,7 +578,8 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
             state.reconciliation_producer_contract_sha256.as_ref(),
         )
         .await
-        .is_ok();
+        .is_ok()
+        && state.postgres.verify_morning_email_schema().await.is_ok();
     let activation = if schema_ready {
         state
             .postgres
@@ -1237,6 +1238,12 @@ async fn async_main() {
         .verify_schema()
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL is not release-ready: {error}"));
+    postgres
+        .verify_morning_email_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL morning email schema is not release-ready: {error}")
+        });
     let reconciliation_producer_contract = cp_config
         .vertex_reconciliation_model_requested
         .as_deref()
@@ -1534,6 +1541,7 @@ const POSTGRES_ERASURE_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ERASURE_SIGNATU
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
+    InstallMorningEmail,
     OrphanCaptureErasure,
     ExpandMemoryReconciliation,
     FinalizeMemoryReconciliation,
@@ -1566,6 +1574,7 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("morning-email-v28-install") => Ok(PostgresMigrationReleasePhase::InstallMorningEmail),
         Some(MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch)
         }
@@ -1788,6 +1797,9 @@ async fn migrate_postgres_release_schema() {
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
     let result = match phase {
+        PostgresMigrationReleasePhase::InstallMorningEmail => persistence
+            .install_morning_email_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"morning_email", "version":28})),
         PostgresMigrationReleasePhase::OrphanCaptureErasure => persistence
             .execute_orphan_capture_erasure(
                 erasure_request
@@ -1875,6 +1887,10 @@ mod postgres_migration_release_tests {
         );
         for (confirmation, expected) in [
             (
+                "morning-email-v28-install",
+                PostgresMigrationReleasePhase::InstallMorningEmail,
+            ),
+            (
                 ORPHAN_CAPTURE_ERASURE_CONFIRM,
                 PostgresMigrationReleasePhase::OrphanCaptureErasure,
             ),
@@ -1930,6 +1946,7 @@ mod postgres_migration_release_tests {
             Some("memory-reconciliation-v27-epoch-preview "),
             Some("memory-reconciliation-v27-upgrade-epoch "),
             Some("memory-reconciliation-v27-epoch-upgrade"),
+            Some("morning-email-v28-install "),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }

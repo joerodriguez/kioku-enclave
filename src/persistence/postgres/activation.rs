@@ -4264,6 +4264,9 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         let mut connection = persistence.pool().acquire().await?;
         super::schema_release::test_frozen_v0_9_16_verify_schema(&mut connection).await?;
     }
+    // Prove the historical Installed window before crossing ADR-0045's
+    // independent compatibility boundary, then exercise current delivery.
+    persistence.install_morning_email_schema().await?;
     sqlx::query(
         "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
          VALUES($1,'activation-contract@example.com','google','activation-contract-subject')",
@@ -4711,6 +4714,9 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         persistence,
     ))
     .await?;
+    // ADR-0045 includes finalized continuations in this complete component.
+    // Give the pre-drain finalized owner #4 exact evidence too; an owner with
+    // no members must remain held by the real closure guard.
     sqlx::raw_sql(
         "INSERT INTO screenshots(account_id,id,captured_at,active_app,ocr_text,source_key) \
          VALUES('activation-contract-account',100,'2026-08-31T10:00:30Z', \
@@ -4718,11 +4724,14 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
                ('activation-contract-account',101,'2026-08-31T10:04:30Z', \
                 'Notes','provider lock order peer','activation-lock-peer'), \
                ('activation-contract-account',102,'2026-08-31T10:08:30Z', \
-                'Notes','provider lock order peer','activation-lock-deletion-peer'); \
+                'Notes','provider lock order peer','activation-lock-deletion-peer'), \
+               ('activation-contract-account',103,'2026-08-31T10:06:30Z', \
+                'Notes','finalized context owner','activation-finalized-context'); \
          INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
          VALUES('activation-contract-account',1,'screenshot',100), \
                ('activation-contract-account',3,'screenshot',101), \
-               ('activation-contract-account',92,'screenshot',102);",
+               ('activation-contract-account',92,'screenshot',102), \
+               ('activation-contract-account',4,'screenshot',103);",
     )
     .execute(persistence.pool())
     .await?;
@@ -5142,9 +5151,25 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     sqlx::query(
         "INSERT INTO episodes( \
              account_id,id,started_at,ended_at,type,title,summary,structure_state,updated_at) \
-         VALUES($1,2,'2026-08-31T10:02:00Z','2026-08-31T10:03:00Z', \
+         VALUES($1,2,'2026-08-25T10:02:00Z','2026-08-25T10:03:00Z', \
                 'work','Reconciled activation fence','Allowed finalization', \
                 'reconciled',clock_timestamp())",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    // Keep this independent finalized-admission control outside the paid
+    // provider cohort: a new touching owner would invalidate its exact closure.
+    sqlx::query(
+        "INSERT INTO screenshots(account_id,id,captured_at)
+        SELECT account_id,104,started_at FROM episodes WHERE account_id=$1 AND id=2",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO episode_members(account_id,episode_id,record_type,record_id)
+        VALUES($1,2,'screenshot',104)",
     )
     .bind(ACCOUNT)
     .execute(persistence.pool())
@@ -5164,9 +5189,26 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     sqlx::query(
         "INSERT INTO episodes( \
              account_id,id,started_at,ended_at,type,title,summary,structure_state,updated_at) \
-         VALUES($1,91,clock_timestamp()-interval '5 hours 30 minutes', \
-                clock_timestamp()-interval '5 hours','work','Deletion wins fence', \
+         VALUES($1,91,'2026-08-27T10:00:00Z','2026-08-27T10:01:00Z', \
+                'work','Deletion wins fence', \
                 'A stale claim must not disclose after deletion','reconciled',clock_timestamp())",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    // This settled memory is independent of the deliberately unfinished
+    // provider-drain fixture #90. Deletion, rather than source readiness, must
+    // invalidate this claim after admission.
+    sqlx::query(
+        "INSERT INTO screenshots(account_id,id,captured_at)
+        SELECT account_id,105,started_at FROM episodes WHERE account_id=$1 AND id=91",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO episode_members(account_id,episode_id,record_type,record_id)
+        VALUES($1,91,'screenshot',105)",
     )
     .bind(ACCOUNT)
     .execute(persistence.pool())
@@ -5421,6 +5463,13 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         published,
         crate::persistence::ReconciliationPublishResult::Published { .. }
     ));
+
+    super::memory_reconciliation::test_finalized_pending_channels_survive_successor(
+        persistence,
+        ACCOUNT,
+    )
+    .await
+    .map_err(|error| EnclaveError::Store(format!("pending-channel lineage contract: {error:?}")))?;
 
     let pause_again = test_transition_authorization(
         persistence,
@@ -5798,7 +5847,14 @@ async fn test_isolated_activation_contract(base: &PostgresPersistence, epoch_onl
         .expect("connect isolated activation schema");
     let persistence = PostgresPersistence { pool };
     let outcome = async {
-        persistence.migrate().await?;
+        if epoch_only {
+            persistence.migrate().await?;
+        } else {
+            persistence
+                .migrate_to_version(super::EXPECTED_SCHEMA_VERSION)
+                .await?;
+            persistence.install_test_orphan_erasure_schema().await?;
+        }
         // This broad contract is also nested inside the exhaustive control-plane
         // future. Keep its state off that test thread's bounded stack.
         if epoch_only {

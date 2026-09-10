@@ -517,11 +517,30 @@ async fn test_schema_correction_retry_cycle(
     const ACCOUNT: &str = "activation-epoch-contract-account";
     const MODEL: &str = "gemini-3.5-flash";
     const LOCATION: &str = "global";
+    // The oversized component has completely progressed through providerless
+    // KEEP. A separate bounded component exercises paid retry preservation.
+    sqlx::query("INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary)
+        VALUES($1,34,'2026-07-03T10:00:00Z','2026-07-03T10:01:00Z','note','Synthetic retry','Preserve attempt')")
+        .bind(ACCOUNT).execute(persistence.pool()).await?;
+    sqlx::query(
+        "INSERT INTO screenshots(account_id,id,captured_at)
+        VALUES($1,34,'2026-07-03T10:00:00Z')",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO episode_members(account_id,episode_id,record_type,record_id)
+        VALUES($1,34,'screenshot',34)",
+    )
+    .bind(ACCOUNT)
+    .execute(persistence.pool())
+    .await?;
     // A known-not-billed failed attempt remains durable across the dark upgrade.
     let old_snapshot = persistence
         .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
         .await?
-        .expect("one unselected draft remains after partial KEEP");
+        .expect("the independent bounded draft is selectable after KEEP completes");
     let old_claim = persistence
         .claim_reconciliation(&old_snapshot, 900)
         .await?
@@ -781,5 +800,54 @@ async fn test_partial_keep_preserves_unselected_draft(
         (SELECT count(*) FROM memory_reconciliation_jobs WHERE account_id=$1 AND (state<>'complete' OR attempt_count<>0 OR model_attempt_count<>0))")
         .bind(account).fetch_one(persistence.pool()).await?;
     assert_eq!(counts, (32, 0, 0));
+    // Reconciled owners remain part of the complete 33-memory component. The
+    // following pass must select its unfinished suffix, never replay 1..=32.
+    let mut suffix_promoted = false;
+    for _ in 0..8 {
+        match persistence
+            .promote_oversized_source_settled_prefix(account, 14400, None, policy)
+            .await?
+        {
+            OversizedKeepPromotionResult::Promoted { episode_ids, .. } => {
+                assert_eq!(episode_ids, vec![33]);
+                suffix_promoted = true;
+                break;
+            }
+            OversizedKeepPromotionResult::Held { .. } => {}
+            OversizedKeepPromotionResult::NotOversized => {
+                panic!("the full 33-owner component remains oversized until its suffix is kept")
+            }
+        }
+    }
+    assert!(
+        suffix_promoted,
+        "bounded KEEP must finish the remaining draft"
+    );
+    let mut expected: Value = serde_json::from_str(&before)?;
+    expected["outside"]["structure_state"] = Value::String("reconciled".into());
+    assert_eq!(
+        serde_json::from_str::<Value>(&identities(persistence, account).await?)?,
+        expected,
+        "suffix KEEP changes only the remaining draft's structure state"
+    );
+    let counts: (i64,i64,i64) = sqlx::query_as("SELECT
+        (SELECT count(*) FROM episodes WHERE account_id=$1 AND structure_state='reconciled'),
+        (SELECT count(*) FROM vertex_usage_events WHERE account_id=$1),
+        (SELECT count(*) FROM memory_reconciliation_jobs WHERE account_id=$1 AND (state<>'complete' OR attempt_count<>0 OR model_attempt_count<>0))")
+        .bind(account).fetch_one(persistence.pool()).await?;
+    assert_eq!(counts, (33, 0, 0));
+    assert!(matches!(
+        persistence
+            .promote_oversized_source_settled_prefix(account, 14400, None, policy)
+            .await?,
+        OversizedKeepPromotionResult::NotOversized
+    ));
+    assert!(
+        persistence
+            .next_source_settled_cohort(account, 14400, None, 32, 4000)
+            .await?
+            .is_none(),
+        "a fully kept component must not replay without fresh draft work"
+    );
     Ok(())
 }

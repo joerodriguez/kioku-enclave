@@ -20,6 +20,26 @@ use crate::{
 use super::PostgresPersistence;
 
 const EXPORT_TABLES: &[(&str, &str, &str)] = &[
+    (
+        "episode_email_preferences",
+        "episode_email_preferences",
+        "account_id",
+    ),
+    (
+        "morning_email_schedules",
+        "morning_email_schedules",
+        "account_id",
+    ),
+    (
+        "morning_email_deliveries",
+        "morning_email_deliveries",
+        "delivery_date",
+    ),
+    (
+        "morning_email_sources",
+        "morning_email_sources",
+        "record_type,record_id",
+    ),
     ("utterances", "utterances", "id"),
     ("screenshots", "screenshots", "id"),
     ("screenshot_images", "screenshot_images", "id"),

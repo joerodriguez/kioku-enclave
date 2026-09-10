@@ -763,31 +763,39 @@ from its enabled-destination snapshot through the atomic PostgreSQL commit;
 deletion holds it through disable, delivery drain, and account removal, so a
 paused stale snapshot cannot enqueue after a successful `204`.
 
-## Episode-ready email preference
+## Morning email preference
 
-Authenticated clients read and update the account-level preference at
-`GET /api/preferences/episode-email` and `PUT /api/preferences/episode-email`.
-The update body is `{"enabled":true,"include_content":false}`; the response
-also returns the verified account email as `recipient_email` and whether the
-provider is configured as `available`. Responses are `no-store`.
+Authenticated clients use `GET /api/preferences/episode-email` and
+`PUT /api/preferences/episode-email`. The update body is
+`{"enabled":true,"include_content":false,"timezone":"Europe/Paris"}`.
+The response adds nullable `timezone` alongside `enabled`, `include_content`,
+`recipient_email`, and provider `available`; responses are `no-store`.
+Timezone must be a PostgreSQL-supported IANA timezone or alias. An omitted timezone
+preserves the saved setting. A missing timezone pauses scheduled delivery until the user
+explicitly saves one; it does not silently choose UTC or the worker's timezone.
 
-An initial completed memory creates one durable email delivery when the
-preference is enabled; recap regeneration does not enqueue another. PostgreSQL freezes the
-exact current recipient, rendered text and HTML,
-content-consent decision, and `e1_` idempotency key before its first provider
-call. Retries reuse those exact bytes. Preference disablement, content downgrade,
-or account deletion cannot pass the durable pre-send disclosure fence; changing
-the preference conflicts while an exact send is in flight.
+Enabled accounts receive at most one logical scheduled email per local delivery date,
+at or after 7 a.m., containing complete settled briefs from previous local activity days.
+Activity is dated by the last contributing evidence. Unfinished memories and briefs beyond
+the bounded 32-brief envelope defer to a later morning; no empty email is sent. A timezone
+change affects future scheduling and never reopens an existing delivery date. Existing
+subscriptions keep their content consent; enabling does not sweep previously unqueued history.
 
-Deliveries older than 24 hours and malformed, missing, exhausted, or
-capacity-limited rows are cancelled without provider I/O. Known provider
-rejections retry with bounded `Retry-After`/backoff up to ten attempts. A lost
-or otherwise ambiguous response is never resent. Provider acceptance records
-the provider's actual 2xx status and message ID. A worker sends at
-most two emails per account per sweep, uses 250-ms process-local pacing, and
-opens a process-local provider circuit for provider-wide failures. Durable PostgreSQL
-claims, lease expiry, and compare-and-set settlement prevent two horizontal workers from
-sending the same delivery.
+Content-free consent permits only a generic authenticated-app link. Full-content opt-in
+permits separate complete brief sections, their original activity times, and durable links.
+Coverage follows source identities through merge/split: sent or ambiguous coverage cannot
+be automatically resent under a successor ID. A mixed sent/unsent successor is withheld
+from automatic email, with its new source coverage recorded for a future explicit update
+policy; its full current memory remains available in the app.
+
+PostgreSQL freezes exact source/brief revisions, timezone/date, recipient, consent,
+provider idempotency key and rendered request before I/O. Known rejections may retry the
+same request under bounded backoff; an ambiguous send is never resent. Preference changes,
+recipient changes and deletion conflict while a send is in flight and cancel/scrub unsent
+snapshots otherwise. Tenant export includes schedules, coverage and daily receipts;
+deleting content scrubs retained snapshots without erasing the no-resend receipt.
+`POST /api/preferences/episode-email/test` remains an explicit test action.
+First-finalization webhook and APNs delivery are independent of this daily schedule.
 
 ## Apple ready-notification installation
 
@@ -1000,7 +1008,20 @@ AAD, plaintext length, SHA-256, codec, and container. A stale revision returns `
 The endpoint intentionally does not advertise arbitrary byte ranges because current
 segments are whole-object AES-GCM ciphertext.
 
-All three surfaces require the ordinary authenticated owner, are rate limited, and set
+`GET /api/v2/capture/sessions/{capture_session_id}/playback?at_ms=0` and
+`GET /api/v2/capture/sessions/{capture_session_id}/recordings/{recording_id}/segments/{segment_id}?projection_revision=7`
+provide the same bounded owner playback before transcription or memory creation. Session
+manifests include `capture_session_id` and omit `memory_id`; cursors cannot cross sessions
+or revisions. Session bounds include accepted early/late source events even when they extend
+the Stop timestamp. Only that account's exact session sources qualify; pending memory
+or account deletion cannot be bypassed through the session route.
+
+Playback availability follows verified retained media, independently of finalization or
+transcription state. Queued, processing, retrying and failed processing jobs can still have
+valid playable source audio. Pruned, deleted, missing or invalid media stays unavailable;
+container, hash, ownership and retention checks remain mandatory.
+
+All playback and person-memory surfaces require the ordinary authenticated owner, are rate limited, and set
 `Cache-Control: private, no-store, max-age=0` plus `Pragma: no-cache`. Segment success
 also sets canonical `Content-Type: audio/mp4` and `X-Content-Type-Options: nosniff`.
 After epoch-2 activation, playback may cover source audio still present under the

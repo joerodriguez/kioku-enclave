@@ -5,6 +5,13 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0028_morning_email.sql` installs independently receipted daily schedules, frozen
+  deliveries and source coverage. Four verified triggers fence legacy per-memory sends,
+  transfer eligible unsent work, and protect memory deletion and recipient changes.
+  It leaves the v26/v27 schema and activation receipts unchanged. The dedicated
+  `morning-email-v28-install` migrator is required before candidate startup; no
+  production migration or release is performed by the implementation PR.
+
 - `0027_orphan_capture_erasure.sql` is an independent additive erasure
   contract: durable scope/object journals, identity tombstones and predecessor-safe
   upload fencing. It does not alter the frozen v27 activation catalog or schema

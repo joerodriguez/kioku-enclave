@@ -151,6 +151,7 @@ async fn recover_expired_provider_claims(
     // the disclosed request remains terminally ambiguous rather than resent.
     advisory_transaction_lock(transaction, "email-preference", account_id).await?;
     recover_expired_email_claims(transaction, account_id).await?;
+    super::morning_email::recover_expired(transaction, account_id).await?;
     advisory_transaction_lock(transaction, "webhook-registry", account_id).await?;
     recover_expired_webhook_claims(transaction, account_id).await?;
     advisory_transaction_lock(transaction, "push-registry", "global").await?;

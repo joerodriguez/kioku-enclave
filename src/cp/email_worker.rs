@@ -1,7 +1,7 @@
 //! Transactional email outbox worker and Resend transport implementation.
 //!
-//! Processes due `email_deliveries` outbox rows for active users, enforcing per-user
-//! snapshot and current preferences, 24-hour stable idempotency keys, bounded retries,
+//! Processes due daily morning-email deliveries for active users, enforcing per-user
+//! snapshot and current preferences, stable provider idempotency keys, bounded retries,
 //! and fail-closed secret hygiene.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -250,13 +250,19 @@ async fn deliver_postgres_user_emails(
         let Some(candidate) = repository.next_email_candidate(user_id).await? else {
             break;
         };
-        let subject =
-            email_renderer::render_email_subject(&candidate.episode, candidate.include_content);
-        let (text_body, html_body) = email_renderer::render_email_body(
-            &candidate.episode,
-            candidate.include_content,
-            &state.config.web_origin,
-        );
+        let (subject, text_body, html_body) = if let Some(daily) = &candidate.daily {
+            email_renderer::render_morning_email(
+                &daily.episodes,
+                candidate.include_content,
+                &daily.delivery_date,
+                &daily.timezone,
+                &state.config.web_origin,
+            )
+        } else {
+            return Err(EnclaveError::Store(
+                "native email requires a morning digest snapshot".into(),
+            ));
+        };
         let frozen = crate::persistence::FrozenEmailDelivery {
             recipient_email: candidate.recipient_email.clone(),
             include_content: candidate.include_content,

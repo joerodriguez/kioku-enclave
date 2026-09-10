@@ -88,6 +88,35 @@ pub(crate) async fn test_source_closed_components(persistence: &PostgresPersiste
     .bind(fingerprint)
     .execute(&mut *tx)
     .await?;
+    let prompt = read_snapshot(&mut tx, ACCOUNT, &[1, 2], 4000, &authority)
+        .await?
+        .expect("current formation can organize before its seal exists");
+    assert!(prompt.1);
+    let mut preseal_sessions = load_source_sessions(
+        &mut tx,
+        ACCOUNT,
+        prompt
+            .0
+            .atoms
+            .iter()
+            .map(|atom| timestamp(&atom.started_at, "test").unwrap())
+            .min()
+            .unwrap(),
+        prompt
+            .0
+            .atoms
+            .iter()
+            .map(|atom| timestamp(&atom.ended_at, "test").unwrap())
+            .max()
+            .unwrap(),
+    )
+    .await?;
+    verify_source_session_formation(&mut tx, ACCOUNT, &mut preseal_sessions).await?;
+    assert!(source_sessions_are_organization_ready(&preseal_sessions));
+    assert!(
+        !source_sessions_are_settled(&preseal_sessions),
+        "prompt memory organization must not grant brief readiness"
+    );
     sqlx::raw_sql(
         "INSERT INTO capture_formation_seal_events(account_id,capture_session_id,seal_generation,
              source_revision,event_kind,stream_maxima_sha256,provenance)
@@ -141,11 +170,11 @@ pub(crate) async fn test_source_closed_components(persistence: &PostgresPersiste
         keep_evidence.unowned_count, 1,
         "KEEP must account for the fractional-millisecond source before a no-memory decision"
     );
-    sqlx::query("UPDATE episodes SET started_at=to_timestamp($2::double precision/1000)+interval '4 hours 0.0006 second',
-        ended_at=to_timestamp($2::double precision/1000)+interval '4 hours 0.0006 second'
+    sqlx::query("UPDATE episodes SET started_at=to_timestamp($2::double precision/1000)+interval '8 hours 0.0006 second',
+        ended_at=to_timestamp($2::double precision/1000)+interval '8 hours 0.0006 second'
         WHERE account_id=$1 AND id=3")
         .bind(ACCOUNT).bind(component.ended_ms).execute(&mut *tx).await?;
-    sqlx::query("UPDATE screenshots SET captured_at=to_timestamp($2::double precision/1000)+interval '4 hours 0.0006 second'
+    sqlx::query("UPDATE screenshots SET captured_at=to_timestamp($2::double precision/1000)+interval '8 hours 0.0006 second'
         WHERE account_id=$1 AND id=3")
         .bind(ACCOUNT).bind(component.ended_ms).execute(&mut *tx).await?;
     assert_eq!(
@@ -213,7 +242,7 @@ pub(crate) async fn test_source_closed_components(persistence: &PostgresPersiste
         .execute(&mut *tx)
         .await?;
 
-    // A finalized protected identity and its owned evidence are never drafts.
+    // A finalized memory does not schedule an organization pass by itself.
     sqlx::query(
         "UPDATE episodes SET finalized_at=clock_timestamp(),finalization_status='finalized'
         WHERE account_id=$1 AND id=3",
@@ -231,6 +260,120 @@ pub(crate) async fn test_source_closed_components(persistence: &PostgresPersiste
     assert!(read_snapshot(&mut tx, ACCOUNT, &[3], 4000, &authority)
         .await?
         .is_none());
+    // A late noon source is considered with the already-published 2 p.m.
+    // memory, even though the new row arrives after that memory finalized.
+    sqlx::raw_sql(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary)
+         SELECT account_id,10,started_at-interval '2 hours',started_at-interval '119 minutes',
+                'meeting','Continuation','Synthetic' FROM episodes
+         WHERE account_id='source-closed-components-test' AND id=3;
+         INSERT INTO screenshots(account_id,id,captured_at)
+         SELECT account_id,id,started_at FROM episodes
+         WHERE account_id='source-closed-components-test' AND id=10;
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id)
+         VALUES('source-closed-components-test',10,'screenshot',10);",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let continuation = read_snapshot(&mut tx, ACCOUNT, &[3, 10], 4000, &authority)
+        .await?
+        .expect("late evidence includes its following finalized memory");
+    assert!(
+        continuation.1,
+        "source capture time, not the new row creation time, selects context"
+    );
+    assert_eq!(continuation.0.predecessor_episode_ids, [3, 10]);
+    assert_eq!(continuation.0.atoms.len(), 2);
+    sqlx::raw_sql(
+        "UPDATE episodes new SET started_at=prior.started_at-interval '6 hours',
+             ended_at=prior.started_at-interval '359 minutes' FROM episodes prior
+         WHERE new.account_id='source-closed-components-test' AND new.id=10
+           AND prior.account_id=new.account_id AND prior.id=3;
+         UPDATE screenshots s SET captured_at=e.started_at FROM episodes e
+         WHERE s.account_id='source-closed-components-test' AND s.id=10
+           AND e.account_id=s.account_id AND e.id=10;",
+    )
+    .execute(&mut *tx)
+    .await?;
+    assert!(
+        read_snapshot(&mut tx, ACCOUNT, &[3, 10], 4000, &authority)
+            .await?
+            .is_some(),
+        "six-hour preceding activity remains inside the eight-hour candidate context"
+    );
+    sqlx::query("SAVEPOINT transitive_finalized_context")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(
+        "INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,finalized_at,finalization_status)
+         SELECT account_id,11,started_at+interval '7 hours',ended_at+interval '7 hours','meeting','Later continuation','Synthetic',clock_timestamp(),'complete'
+           FROM episodes WHERE account_id='source-closed-components-test' AND id=3;
+         INSERT INTO screenshots(account_id,id,captured_at) SELECT account_id,id,started_at FROM episodes
+           WHERE account_id='source-closed-components-test' AND id=11;
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id)
+           VALUES('source-closed-components-test',11,'screenshot',11);
+         INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,schema_version,created_at)
+         SELECT account_id,'transitive-finalized','device','install',started_at,ended_at,2,started_at FROM episodes
+           WHERE account_id='source-closed-components-test' AND id=11;"
+    ).execute(&mut *tx).await?;
+    let transitive = source_closed_components(&mut tx, ACCOUNT).await?;
+    assert!(
+        transitive
+            .components
+            .iter()
+            .any(|component| component.draft_ids == [3, 10, 11]),
+        "full source closure includes finalized ownership beyond the direct seed window"
+    );
+    let candidate_counts: (i64, i64) = sqlx::query_as(concat!(
+        include_str!("reconciliation_source_components.sql"),
+        "SELECT drafts,fresh_drafts FROM candidate_components WHERE 10=ANY(draft_ids)"
+    ))
+    .bind(ACCOUNT)
+    .fetch_one(&mut *tx)
+    .await?;
+    assert_eq!(
+        candidate_counts,
+        (3, 1),
+        "model bounds count all context owners while the v6 audit counts only fresh draft work"
+    );
+    assert!(
+        read_snapshot(&mut tx, ACCOUNT, &[3, 10, 11], 4000, &authority)
+            .await?
+            .is_some(),
+        "transitive ownership is a bounded readiness hold, not a permanent external-owner conflict"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT transitive_finalized_context")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE episodes SET structure_state='reconciled' WHERE account_id=$1 AND id=10")
+        .bind(ACCOUNT)
+        .execute(&mut *tx)
+        .await?;
+    assert!(
+        read_snapshot(&mut tx, ACCOUNT, &[3, 10], 4000, &authority)
+            .await?
+            .is_none(),
+        "unchanged published context must not repeatedly reconcile"
+    );
+    sqlx::query(
+        "INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,schema_version,created_at)
+         SELECT $1,'dense-'||n,'device','install',e.started_at,e.ended_at,2,e.started_at
+           FROM episodes e CROSS JOIN generate_series(1,257) n WHERE e.account_id=$1 AND e.id=3",
+    ).bind(ACCOUNT).execute(&mut *tx).await?;
+    let start = timestamp(&continuation.0.drafts[0].started_at, "test")?;
+    let end = timestamp(&continuation.0.drafts[0].ended_at, "test")?;
+    let dense = load_brief_source_sessions(&mut tx, ACCOUNT, start, end)
+        .await?
+        .unwrap();
+    assert_eq!(
+        dense.len(),
+        257,
+        "providerless brief verification pages beyond the model input bound"
+    );
+    assert!(
+        !source_sessions_are_settled(&dense),
+        "paging cannot manufacture missing seals"
+    );
     tx.rollback().await?;
 
     let mut tx = persistence.pool().begin().await?;

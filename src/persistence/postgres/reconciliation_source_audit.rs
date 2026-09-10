@@ -73,7 +73,7 @@ pub(super) async fn snapshot(
         "SELECT jsonb_build_object(
             'inventory_rows',(SELECT count(*) FROM inventory),
             'inventory_bounded',(SELECT count(*)<=100000 FROM inventory),
-            'candidate_drafts',coalesce(sum(drafts),0),
+            'candidate_drafts',coalesce(sum(fresh_drafts),0),
             'candidate_components',count(*),
             'max_components_per_account',coalesce((SELECT max(n) FROM (
                 SELECT count(*) n FROM candidate_components GROUP BY account_id) accounts),0),
@@ -86,4 +86,24 @@ pub(super) async fn snapshot(
     .fetch_one(connection)
     .await?;
     Ok(serde_json::from_str(&payload)?)
+}
+
+/// Private SQL-to-SQL capacity input, never part of the content-free public
+/// audit report. Each owner belongs to one complete component, so context
+/// sources are counted once even when several fresh drafts share that context.
+pub(super) async fn context_finalizer_bounds(
+    connection: &mut PgConnection,
+) -> crate::error::Result<String> {
+    Ok(sqlx::query_scalar(concat!(
+        include_str!("reconciliation_source_components.sql"),
+        "SELECT coalesce(jsonb_agg(jsonb_build_object('account_id',account_id,'atoms',atoms)), '[]'::jsonb)::text
+           FROM (SELECT component.account_id,sum(owner.atoms)::bigint AS atoms
+                   FROM candidate_components component JOIN owners owner
+                     ON owner.account_id=component.account_id AND owner.id=ANY(component.draft_ids)
+                  WHERE NOT owner.needs_organization
+                  GROUP BY component.account_id) context"
+    ))
+    .bind(Option::<&str>::None)
+    .fetch_one(connection)
+    .await?)
 }

@@ -1154,7 +1154,7 @@ account_component_counts AS MATERIALIZED (
     SELECT account.id AS account_id,coalesce(component.count,0)::bigint AS components,
            coalesce(component.reconciliation_calls,0)::bigint AS reconciliation_calls,
            (coalesce(component.successor_finalizers,0)+
-            CASE WHEN component.count>0 THEN coalesce(unowned.atoms,0) ELSE 0 END)::bigint
+            CASE WHEN component.count>0 THEN coalesce(unowned.atoms,0)+coalesce(context.atoms,0) ELSE 0 END)::bigint
                AS successor_finalizers
       FROM active_accounts account
       LEFT JOIN (
@@ -1164,6 +1164,11 @@ account_component_counts AS MATERIALIZED (
             FROM candidate_component_output_bounds GROUP BY account_id
       ) component ON component.account_id=account.id
       LEFT JOIN account_unowned_atom_counts unowned ON unowned.account_id=account.id
+      -- ADR-0045 may repartition finalized context with fresh work. The private
+      -- bound comes from the exact same complete source graph as runtime,
+      -- counts each non-fresh owner once, and excludes disconnected history.
+      LEFT JOIN jsonb_to_recordset($9::jsonb) AS context(account_id text,atoms bigint)
+        ON context.account_id=account.id
 ),
 account_finalization_needs AS MATERIALIZED (
     SELECT account.id AS account_id,count(scope.account_id)::bigint AS reconciled_needs
