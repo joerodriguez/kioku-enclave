@@ -8,11 +8,11 @@ and tightened by [ADR-0042](docs/adr/0042-postgresql-only-structured-state.md).
 
 In scope:
 
-- the public Rust service running in GCP Confidential Space;
+- the public Rust service running on Google Cloud Run in `managed_platform` mode ([ADR-0044](https://github.com/joerodriguez/kioku/blob/main/docs/adr/0044-cloud-run-replaces-the-confidential-space-fleet.md));
 - TLS, OAuth, caller authorization, validation, query, export, and deletion;
 - private Cloud SQL PostgreSQL structured state and fleet coordination;
 - per-user encrypted large-media/object bytes in GCS;
-- attestation-derived KMS authorization;
+- runtime service-account KMS authorization;
 - horizontally concurrent workers and external-provider effects;
 - signed source/image evidence and release admission.
 
@@ -200,39 +200,34 @@ consent, single-use codes, and client-bound refresh-token rotation.
 Every user-data route authenticates and authorizes the account before accessing persistence or a
 provider. Retired `/v1/*`, `/api/sync/batch`, and retired screenshot-upload routes preserve their
 published authenticate-before-`410 Gone` behavior and perform no user-state mutation or provider
-effect. `/v1/attestation` is separately public and active.
+effect. `/v1/attestation` remains routed until the retired fleet mode is removed; on Cloud Run it
+has no attestation to return.
 
 ### TLS, readiness, liveness, and drain
 
-TLS terminates in the Confidential Space workload. Every production replica loads the same exact
-reviewed certificate and key generation from fixed Secret Manager coordinates at startup. Missing,
-malformed, or mismatched TLS material fails startup. The rustls configuration and
-attestation-bound leaf fingerprint are immutable for that process; renewal is an ADR-0041 staged
-fleet rollout, and there is no in-process certificate hot-swap path. The launch policy permits only
-`PORT` as a metadata override; security-relevant infrastructure and identity coordinates are not
-launch-time choices.
+In production (`KIOKU_DEPLOYMENT_MODE=managed_platform`) public TLS terminates at Google's managed
+load balancer and the service listens for plaintext HTTP on `$PORT` inside the platform;
+certificate issuance and renewal belong to Certificate Manager. The in-process TLS path (fixed
+Secret Manager certificate coordinates, immutable rustls configuration) belongs to the retired
+`attested_vm` mode and is being removed. Cloud Run passes only `PORT` and the deployment mode;
+security-relevant infrastructure and identity coordinates are not launch-time choices.
 
 `/readyz` is content-free and requires the expected PostgreSQL schema plus serving prerequisites.
 `/livez` is independent so the platform can replace a wedged process even during a database outage.
 On SIGTERM, readiness closes first and new HTTP admissions stop. The bounded HTTP drain window
-allows admitted requests and effects to settle or release safely before exit. Background
+(clamped to the platform's termination window on Cloud Run) allows admitted requests and effects to settle or release safely before exit. Background
 schedulers remain PostgreSQL-lease-safe and may continue claiming work until process termination.
 
-### Attestation and KMS
+### KMS authorization
 
-The public attestation endpoint requests a Google-signed Confidential Space token whose audience is
-the public verifier URL and whose nonce binds the active leaf-certificate fingerprint. It never
-returns the internal STS-audience token used for KMS credentials.
+KMS access uses the runtime service account's short-lived metadata-server token. The deployment
+repository's Terraform grants the key-encryption key to exactly that account. Cloud Run presents no
+workload attestation, so the account — and therefore anyone who can act as it or deploy to the
+service — is the media-key authority. The attestation endpoint and the attestation-derived STS
+credential path belong to the retired fleet mode.
 
-KMS access uses a short-lived credential derived from an attestation token through the exact
-Workload Identity provider. There is no metadata-service KMS credential fallback. KMS IAM should
-admit only Confidential Space workloads at the approved image digest(s). ADR-0041 permits at most
-the exact predecessor/candidate pair during a compatible rollout and retires the predecessor only
-after homogeneous-candidate proof.
-
-An attestation token proves workload measurements and claims, not that an operator cannot later
-change project policy. Review all project/key IAM bindings, inherited roles, service-account
-impersonation paths, and compute/deployment authority.
+Review all project/key IAM bindings, inherited roles, service-account impersonation paths, and
+deployment authority; that review is the whole control.
 
 ### Provider input and egress controls
 
@@ -280,9 +275,7 @@ account until expiry/revocation; short lifetimes and refresh rotation limit the 
 ### T3 — Remote exploit in the service
 
 The image is a static `scratch` container with no shell or package manager, minimal launch
-overrides, bounded parsers, strict provider destinations, and locked dependencies. An exploit in the
-attested process could access plaintext and credentials available to that process; attestation is
-not a sandbox within the application.
+overrides, bounded parsers, strict provider destinations, and locked dependencies. An exploit in the process could access plaintext and credentials available to that process.
 
 ### T4 — GCS object substitution or compromise
 
@@ -297,11 +290,12 @@ Cloud SQL contains structured plaintext. Network isolation, TLS, least-privilege
 queries, account-qualified schema/queries, encrypted backups, and audited admin access reduce risk.
 They do not provide cryptographic confidentiality from authorized database administrators.
 
-### T6 — Hypervisor or memory inspection
+### T6 — Host or platform inspection
 
-Confidential Space with AMD SEV protects guest memory from ordinary host inspection and binds the
-workload measurement. Residual risks include hardware/firmware vulnerabilities, side channels,
-availability attacks, and the broader cloud control plane.
+Since ADR-0044 the service runs on Cloud Run without confidential computing: Google's platform
+and anyone with project deployment authority can inspect the running process. The residual
+protection is the ordinary managed-platform one: least-privilege identities, audit logs, and the
+plaintext boundary already stated for Cloud SQL.
 
 ### T7 — Source, dependency, or release tampering
 
@@ -340,11 +334,12 @@ and the final plan result. A failed check stops the rollout; it does not authori
 ## Residual risks
 
 - Cloud project and database administrators remain trusted for structured plaintext and policy.
-- Vertex and user-configured destinations process data outside the attested workload.
+- Vertex and user-configured destinations process data outside the service.
 - Stable account identifiers and content-free timing/usage telemetry remain linkable metadata.
-- Attestation and signed provenance do not equal independent reproducibility.
-- Confidential computing reduces host-memory exposure but cannot guarantee availability or eliminate
-  hardware/firmware/side-channel risk.
+- Signed provenance does not equal independent reproducibility, and without attestation it does
+  not prove which image is serving.
+- There is no confidential-computing boundary; the platform operator and project deployment
+  authority are trusted.
 
 ## Reporting vulnerabilities
 
