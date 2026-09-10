@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     activation::finalization_requires_reconciled, advisory_transaction_lock, duration_seconds,
-    PostgresPersistence,
+    memory_reconciliation::brief_sources_are_settled, PostgresPersistence,
 };
 
 struct PostgresFinalizationEgressGuard {
@@ -153,12 +153,31 @@ impl FinalizationRepository for PostgresPersistence {
         let mut transaction = self.pool().begin().await?;
         let require_reconciled =
             finalization_requires_reconciled(&mut transaction, account_id).await?;
-        let row = sqlx::query(
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
+        // PostgreSQL resolves table names even in a false OR branch. The
+        // dormant v26 path must not parse the v27-only formation receipt table.
+        let settled_session_filter = if require_reconciled {
+            "AND NOT EXISTS( \
+                       SELECT 1 FROM capture_sessions session \
+                       LEFT JOIN capture_formation_receipts receipt \
+                         ON receipt.account_id=session.account_id AND receipt.capture_session_id=session.id \
+                       WHERE session.account_id=e.account_id \
+                         AND session.started_at<=e.ended_at+interval '8 hours' \
+                         AND greatest(session.last_event_at,session.ended_at)>=e.started_at-interval '8 hours' \
+                         AND (receipt.seal_finalized_at IS NULL OR receipt.state<>'complete' \
+                              OR receipt.completed_revision IS DISTINCT FROM receipt.source_revision \
+                              OR greatest(session.created_at,session.ended_at)>clock_timestamp()-interval '4 hours'))"
+        } else {
+            ""
+        };
+        let claim_query = format!(
             "WITH candidate AS (\
                 SELECT e.id FROM episodes e JOIN accounts a ON a.id=e.account_id \
+                 JOIN memory_handles h ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active' \
                  WHERE e.account_id=$1 AND a.status='active' AND e.substance!='none' \
                    AND e.finalization_status!='deleting' \
                    AND (NOT $7::bool OR e.structure_state='reconciled') \
+                   {settled_session_filter} \
                    AND ($2::bigint IS NULL OR e.id=$2) \
                    AND e.ended_at<clock_timestamp()-make_interval(secs=>$3) \
                    AND a.summarized_until>=e.ended_at+interval '4 hours' \
@@ -184,25 +203,33 @@ impl FinalizationRepository for PostgresPersistence {
                     e.structure_state,e.minute_summaries::text AS stored_minute_summaries,\
                     e.minutes_text,\
                     e.identity_revision,e.finalization_attempt_count",
-        )
-        .bind(account_id)
-        .bind(target_episode_id)
-        .bind(quiet_horizon_seconds)
-        .bind(finalization_version)
-        .bind(&token)
-        .bind(duration_seconds(std::time::Duration::from_secs(
-            u64::try_from(lease_seconds).map_err(|_| {
-                EnclaveError::InvalidRequest("finalization lease is invalid".into())
-            })?,
-        ))?)
-        .bind(require_reconciled)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        );
+        // Only the audited static predicate above is interpolated; all data stays bound.
+        let row = sqlx::query(sqlx::AssertSqlSafe(claim_query))
+            .bind(account_id)
+            .bind(target_episode_id)
+            .bind(quiet_horizon_seconds)
+            .bind(finalization_version)
+            .bind(&token)
+            .bind(duration_seconds(std::time::Duration::from_secs(
+                u64::try_from(lease_seconds).map_err(|_| {
+                    EnclaveError::InvalidRequest("finalization lease is invalid".into())
+                })?,
+            ))?)
+            .bind(require_reconciled)
+            .fetch_optional(&mut *transaction)
+            .await?;
         let Some(row) = row else {
             transaction.rollback().await?;
             return Ok(None);
         };
         let episode_id: i64 = row.try_get("id")?;
+        if require_reconciled
+            && !brief_sources_are_settled(&mut transaction, account_id, episode_id).await?
+        {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
         let episode = FinalizationEpisode {
             id: episode_id,
             started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
@@ -357,7 +384,15 @@ impl FinalizationRepository for PostgresPersistence {
         .bind(require_reconciled)
         .fetch_optional(&mut *transaction)
         .await?;
-        if authoritative.is_none() {
+        if authoritative.is_none()
+            || (require_reconciled
+                && !brief_sources_are_settled(
+                    &mut transaction,
+                    &claim.account_id,
+                    claim.episode.id,
+                )
+                .await?)
+        {
             transaction.rollback().await?;
             return Ok(None);
         }
@@ -427,6 +462,12 @@ impl FinalizationRepository for PostgresPersistence {
         let mut transaction = self.pool().begin().await?;
         let require_reconciled =
             finalization_requires_reconciled(&mut transaction, &result.claim.account_id).await?;
+        advisory_transaction_lock(
+            &mut transaction,
+            "memory-reconciliation",
+            &result.claim.account_id,
+        )
+        .await?;
         let row = sqlx::query(
             "SELECT finalized_at IS NULL AS is_initial,finalization_version,identity_revision,\
                     finalization_claim_token,finalization_completed_claim_token,structure_state \
@@ -452,6 +493,18 @@ impl FinalizationRepository for PostgresPersistence {
         if require_reconciled && row.try_get::<String, _>("structure_state")? != "reconciled" {
             return Err(EnclaveError::Conflict(
                 "assigned account draft finalization requires reconciliation".into(),
+            ));
+        }
+        if require_reconciled
+            && !brief_sources_are_settled(
+                &mut transaction,
+                &result.claim.account_id,
+                result.claim.episode.id,
+            )
+            .await?
+        {
+            return Err(EnclaveError::Conflict(
+                "brief source revision is no longer settled".into(),
             ));
         }
         let current_token: Option<String> = row.try_get("finalization_claim_token")?;
@@ -512,6 +565,22 @@ impl FinalizationRepository for PostgresPersistence {
             ));
         }
         let initial: bool = row.try_get("is_initial")?;
+        let initial = initial
+            && (!require_reconciled
+                || !sqlx::query_scalar::<_, bool>(
+                    "WITH RECURSIVE ancestors(id) AS ( \
+                 SELECT predecessor_episode_id FROM memory_lineage_edges \
+                  WHERE account_id=$1 AND successor_episode_id=$2 \
+                 UNION SELECT edge.predecessor_episode_id FROM memory_lineage_edges edge \
+                  JOIN ancestors parent ON parent.id=edge.successor_episode_id \
+                  WHERE edge.account_id=$1) \
+             SELECT EXISTS(SELECT 1 FROM ancestors JOIN episodes e \
+                 ON e.account_id=$1 AND e.id=ancestors.id WHERE e.finalized_at IS NOT NULL)",
+                )
+                .bind(&result.claim.account_id)
+                .bind(result.claim.episode.id)
+                .fetch_one(&mut *transaction)
+                .await?);
 
         sqlx::query(
             "DELETE FROM episode_screen_interpretations WHERE account_id=$1 AND episode_id=$2",
@@ -613,25 +682,6 @@ impl FinalizationRepository for PostgresPersistence {
                         > 0,
                 );
             }
-            if let Some(include_content) = result.email_preference_include_content {
-                let delivery_id = format!("deliv_{}", tokens::random_token_hex());
-                deliveries += usize::from(
-                    sqlx::query(
-                        "INSERT INTO email_deliveries(\
-                            account_id,episode_id,delivery_version,delivery_id,include_content,state) \
-                         VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&result.claim.account_id)
-                    .bind(result.claim.episode.id)
-                    .bind(result.finalization_version)
-                    .bind(delivery_id)
-                    .bind(include_content)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected()
-                        > 0,
-                );
-            }
             for (binding, delivery_id, handoff_handle, collapse_id) in &result.push_destinations {
                 deliveries += usize::from(
                     sqlx::query(
@@ -680,6 +730,15 @@ impl FinalizationRepository for PostgresPersistence {
         .bind(&result.analysis_revision)
         .execute(&mut *transaction)
         .await?;
+        if let Some(include_content) = result.email_preference_include_content {
+            super::morning_email::enqueue_brief(
+                &mut transaction,
+                &result.claim.account_id,
+                result.claim.episode.id,
+                include_content,
+            )
+            .await?;
+        }
         transaction.commit().await?;
         Ok(deliveries)
     }

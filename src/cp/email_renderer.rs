@@ -200,6 +200,19 @@ pub fn render_email_body(
         );
     }
 
+    let (text, body) = render_memory_section(episode, app_base_url);
+    (
+        truncate_bytes(text, MAX_RENDERED_BYTES),
+        truncate_bytes(html_document(&episode.title, &body), MAX_RENDERED_BYTES),
+    )
+}
+
+fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (String, String) {
+    let app_url = format!(
+        "{}/app#memory/{}",
+        app_base_url.trim_end_matches('/'),
+        episode.episode_id
+    );
     // Full content: the memory title, when it happened and with whom, then the
     // Final brief exactly as the Brief page shows it.
     let title = if episode.title.trim().is_empty() {
@@ -362,10 +375,47 @@ pub fn render_email_body(
 
     body.push_str(&cta_html(&app_url));
 
-    (
-        truncate_bytes(text, MAX_RENDERED_BYTES),
-        truncate_bytes(html_document(&title, &body), MAX_RENDERED_BYTES),
-    )
+    (text, body)
+}
+
+/// One digest preserves each complete brief as its own section. A generic
+/// notification never exposes titles, activity dates, counts, or source content.
+/// Bounds are enforced before claiming; complete sections are never truncated.
+pub(crate) fn render_morning_email(
+    episodes: &[FinalizedEpisode],
+    include_content: bool,
+    delivery_date: &str,
+    timezone: &str,
+    app_base_url: &str,
+) -> (String, String, String) {
+    let subject = "Your morning memory briefs".to_owned();
+    let app_url = format!("{}/app", app_base_url.trim_end_matches('/'));
+    if !include_content {
+        let lead = "Your complete memory briefs are waiting in Kioku.";
+        let text = format!("{subject}\n\n{lead}\n\n{OPEN_IN_KIOKU}: {app_url}\n");
+        let body = format!(
+            "<div class=\"h1\">{subject}</div><p>{lead}</p>{}",
+            cta_html(&app_url)
+        );
+        let html = html_document(&subject, &body);
+        return (subject, text, html);
+    }
+    let mut text = format!("{subject} — {delivery_date} ({timezone})\n");
+    let mut body = format!(
+        "<div class=\"h1\">{subject}</div><p class=\"meta\">{} ({})</p>",
+        escape_html(delivery_date),
+        escape_html(timezone)
+    );
+    for episode in episodes {
+        let (section_text, section_html) = render_memory_section(episode, app_base_url);
+        text.push_str("\n\n");
+        text.push_str(&section_text);
+        body.push_str("<section>");
+        body.push_str(&section_html);
+        body.push_str("</section><hr>");
+    }
+    let html = html_document(&subject, &body);
+    (subject, text, html)
 }
 
 fn truncate_bytes(s: String, max_bytes: usize) -> String {
@@ -417,6 +467,48 @@ mod tests {
             ],
             open_questions: vec!["Who handles support?".into()],
         }
+    }
+
+    #[test]
+    fn morning_digest_preserves_whole_sections_without_truncation_or_content_free_disclosure() {
+        let first = sample_episode();
+        let mut second = sample_episode();
+        second.episode_id = 202;
+        second.title = "Second memory".into();
+        second.overview = "Long complete overview. ".repeat(6000);
+        let (subject, text, html) = render_morning_email(
+            &[first.clone(), second.clone()],
+            true,
+            "2026-09-10",
+            "Europe/Paris",
+            "https://app.example",
+        );
+        assert_eq!(subject, "Your morning memory briefs");
+        assert!(text.contains(&second.overview));
+        assert!(html.contains(&escape_html(&second.overview)));
+        assert!(text.contains("Final brief: Project Alpha Launch Plan"));
+        assert!(text.contains("Final brief: Second memory"));
+        assert!(text.contains("app#memory/101") && text.contains("app#memory/202"));
+        assert_eq!(html.matches("<section>").count(), 2);
+        let (_, text, html) = render_morning_email(
+            &[first, second],
+            false,
+            "2026-09-10",
+            "Europe/Paris",
+            "https://app.example",
+        );
+        for secret in [
+            "Project Alpha",
+            "Second memory",
+            "Alice",
+            "2026-09-10",
+            "Europe/Paris",
+            "Long complete",
+        ] {
+            assert!(!text.contains(secret));
+            assert!(!html.contains(secret));
+        }
+        assert!(!html.contains("#memory/"));
     }
 
     #[test]

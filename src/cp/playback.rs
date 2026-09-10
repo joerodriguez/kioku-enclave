@@ -40,6 +40,9 @@ const PLAYBACK_CURSOR_TTL_SECONDS: i64 = 5 * 60;
 const PEOPLE_MEMORIES_DEFAULT_LIMIT: usize = 25;
 const PEOPLE_MEMORIES_MAX_LIMIT: usize = 100;
 
+#[path = "session_playback.rs"]
+mod session;
+
 type HmacSha256 = Hmac<Sha256>;
 
 fn manifest_limiter() -> &'static super::limits::RateLimiter {
@@ -63,6 +66,7 @@ pub fn router() -> Router<Arc<CpState>> {
             get(memory_playback_segment),
         )
         .route("/api/v2/people/{person_id}/memories", get(person_memories))
+        .merge(session::router())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -158,7 +162,10 @@ struct PlaybackUtterance {
 #[derive(Debug, Clone, Serialize)]
 struct PlaybackManifest {
     manifest_version: u8,
-    memory_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_session_id: Option<String>,
     projection_revision: i64,
     contributing_recording_count: usize,
     timeline: PlaybackTimeline,
@@ -231,7 +238,10 @@ impl SegmentAuthority {
                 .byte_length
                 .is_some_and(|length| length > 0 && length <= MAX_AUDIO_SEGMENT_BYTES)
             && self.sha256.as_deref().is_some_and(valid_sha256)
-            && self.processing_state.as_deref() == Some("ready")
+            && matches!(
+                self.processing_state.as_deref(),
+                Some("queued" | "processing" | "ready" | "retry_wait" | "failed")
+            )
             && self.deleted_at.is_none()
             && self.object_key.is_some()
             && self.asset_id.is_some()
@@ -241,11 +251,12 @@ impl SegmentAuthority {
     fn state(&self) -> String {
         if self.deleted_at.is_some() || self.recording_state == "delete_pending" {
             "deleted".into()
+        } else if self.readable() {
+            "ready".into()
         } else {
             match self.processing_state.as_deref() {
                 Some("pruned") => "pruned".into(),
                 Some("queued" | "processing" | "retry_wait") => "pending".into(),
-                Some("ready") if self.readable() => "ready".into(),
                 _ => "unavailable".into(),
             }
         }
@@ -313,6 +324,7 @@ impl SourceAuthority {
 pub(crate) struct PlaybackDataset {
     pub(crate) owner_id: String,
     pub(crate) memory_id: i64,
+    pub(crate) capture_session_id: Option<String>,
     pub(crate) started_at: String,
     pub(crate) ended_at: String,
     pub(crate) duration_ms: i64,
@@ -567,13 +579,22 @@ async fn memory_playback_segment(
         }
         unreachable!("memory topology retry loop has a positive fixed bound")
     };
+    serve_authorized_segment(&state, &lookup_user, authority, wrapped_dek).await
+}
+
+async fn serve_authorized_segment(
+    state: &Arc<CpState>,
+    lookup_user: &str,
+    authority: SegmentAuthority,
+    wrapped_dek: Option<String>,
+) -> Response {
     let object_key = authority.object_key.as_deref().unwrap_or_default();
     let asset_id = authority.asset_id.as_deref().unwrap_or_default();
     let expected_key = match authority.retention_decision.as_str() {
         "processing_window_30d" => {
-            crate::gcs::canonical_capture_media_object_key(&lookup_user, asset_id)
+            crate::gcs::canonical_capture_media_object_key(lookup_user, asset_id)
         }
-        "until_deleted" => crate::gcs::canonical_recording_media_object_key(&lookup_user, asset_id),
+        "until_deleted" => crate::gcs::canonical_recording_media_object_key(lookup_user, asset_id),
         _ => Err(EnclaveError::Store(
             "playback segment retention authority is invalid".into(),
         )),
@@ -625,7 +646,7 @@ async fn memory_playback_segment(
             (
                 wrapped_dek,
                 media_dek,
-                crate::gcs::media_blob_context(&lookup_user, object_key),
+                crate::gcs::media_blob_context(lookup_user, object_key),
             )
         }
         "until_deleted" => {
@@ -645,7 +666,7 @@ async fn memory_playback_segment(
             let media_dek = match state
                 .repositories
                 .recording_retention()
-                .key_epoch(&lookup_user, key_epoch, policy_epoch)
+                .key_epoch(lookup_user, key_epoch, policy_epoch)
                 .await
             {
                 Ok(Some(value)) => {
@@ -671,7 +692,7 @@ async fn memory_playback_segment(
                 }
             };
             let context = match crate::gcs::recording_media_blob_context(
-                &lookup_user,
+                lookup_user,
                 object_key,
                 key_epoch,
                 policy_epoch,
@@ -964,17 +985,20 @@ fn project_manifest(dataset: &PlaybackDataset, window_start_ms: i64) -> Result<P
         .collect::<HashSet<_>>()
         .len();
     let next_cursor = (window_end_ms < dataset.duration_ms).then(|| {
-        encode_cursor(
+        encode_cursor_at(
+            &dataset_cursor_key(dataset),
             &dataset.owner_id,
             dataset.memory_id,
             dataset.projection_revision,
             window_end_ms,
+            epoch_seconds(),
         )
     });
 
     Ok(PlaybackManifest {
         manifest_version: PLAYBACK_MANIFEST_VERSION,
-        memory_id: dataset.memory_id,
+        memory_id: (dataset.memory_id > 0).then_some(dataset.memory_id),
+        capture_session_id: dataset.capture_session_id.clone(),
         projection_revision: dataset.projection_revision,
         contributing_recording_count,
         timeline: PlaybackTimeline {
@@ -999,11 +1023,13 @@ fn project_manifest(dataset: &PlaybackDataset, window_start_ms: i64) -> Result<P
 
 fn playback_window_start(dataset: &PlaybackDataset, query: &PlaybackQuery) -> Result<i64> {
     if let Some(cursor) = query.cursor.as_deref() {
-        let offset = decode_cursor(
+        let offset = decode_cursor_at(
+            &dataset_cursor_key(dataset),
             cursor,
             &dataset.owner_id,
             dataset.memory_id,
             dataset.projection_revision,
+            epoch_seconds(),
         )?;
         if offset < 0 || offset >= dataset.duration_ms {
             return Err(EnclaveError::InvalidRequest(
@@ -1094,15 +1120,14 @@ fn valid_public_id(value: &str, prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn encode_cursor(owner_id: &str, memory_id: i64, revision: i64, offset: i64) -> String {
-    encode_cursor_at(
-        playback_cursor_secret(),
-        owner_id,
-        memory_id,
-        revision,
-        offset,
-        epoch_seconds(),
-    )
+fn dataset_cursor_key(dataset: &PlaybackDataset) -> [u8; 32] {
+    let Some(session_id) = dataset.capture_session_id.as_deref() else {
+        return *playback_cursor_secret();
+    };
+    let mut mac = HmacSha256::new_from_slice(playback_cursor_secret()).expect("fixed HMAC key");
+    mac.update(b"kioku.capture-session-playback-cursor.v1\0");
+    mac.update(session_id.as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 fn encode_cursor_at(
@@ -1117,17 +1142,6 @@ fn encode_cursor_at(
     let payload = format!("{offset:x}_{expires:x}");
     let signature = cursor_signature(key, owner_id, memory_id, revision, &payload);
     format!("pb1_{payload}_{signature}")
-}
-
-fn decode_cursor(value: &str, owner_id: &str, memory_id: i64, revision: i64) -> Result<i64> {
-    decode_cursor_at(
-        playback_cursor_secret(),
-        value,
-        owner_id,
-        memory_id,
-        revision,
-        epoch_seconds(),
-    )
 }
 
 fn decode_cursor_at(
@@ -1412,8 +1426,20 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_ready_current_audio_is_readable() {
+    fn verified_source_audio_is_readable_independently_of_transcription() {
         assert!(authority("ready", false).readable());
+        for state in ["queued", "processing", "retry_wait", "failed"] {
+            let source = authority(state, false);
+            assert!(
+                source.readable(),
+                "source bytes should not wait for {state}"
+            );
+            assert_eq!(source.state(), "ready");
+        }
+        let mut unuploaded = authority("queued", false);
+        unuploaded.generation = None;
+        assert!(!unuploaded.readable());
+        assert_eq!(unuploaded.state(), "pending");
         assert_eq!(authority("pruned", false).state(), "pruned");
         assert_eq!(authority("ready", true).state(), "deleted");
         let mut wrong_backend = authority("ready", false);
@@ -1456,6 +1482,37 @@ mod tests {
         )
         .is_err());
         assert!(decode_cursor_at(&key, "pb1_bad", "owner-a", 123, 456, now).is_err());
+    }
+
+    #[test]
+    fn session_manifest_has_no_invented_memory_and_cursor_cannot_cross_sessions() {
+        let mut dataset = PlaybackDataset {
+            owner_id: "owner-a".into(),
+            memory_id: 0,
+            capture_session_id: Some("session-a".into()),
+            started_at: "2026-09-10T12:00:00.000Z".into(),
+            ended_at: "2026-09-10T12:20:00.000Z".into(),
+            duration_ms: 1_200_000,
+            projection_revision: 123,
+            segments: vec![authority("queued", false)],
+            utterances: Vec::new(),
+            sources: Vec::new(),
+        };
+        let manifest = project_manifest(&dataset, 0).unwrap();
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert!(value.get("memory_id").is_none());
+        assert_eq!(value["capture_session_id"], "session-a");
+        assert_eq!(value["availability"], "ready");
+        let query = PlaybackQuery {
+            at_ms: None,
+            cursor: manifest.next_cursor,
+        };
+        assert_eq!(playback_window_start(&dataset, &query).unwrap(), 900_000);
+        dataset.capture_session_id = Some("session-b".into());
+        assert!(playback_window_start(&dataset, &query).is_err());
+        dataset.capture_session_id = None;
+        dataset.memory_id = 123;
+        assert!(playback_window_start(&dataset, &query).is_err());
     }
 
     #[test]

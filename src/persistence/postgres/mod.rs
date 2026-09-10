@@ -20,6 +20,8 @@ mod media_processing;
 mod memory_formation;
 mod memory_reconciliation;
 mod model_usage;
+mod morning_email;
+mod morning_email_schema;
 mod notification;
 mod oauth;
 mod orphan_capture_erasure;
@@ -207,7 +209,8 @@ impl PostgresPersistence {
     #[cfg(test)]
     pub(crate) async fn migrate(&self) -> Result<()> {
         self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await?;
-        self.install_test_orphan_erasure_schema().await
+        self.install_test_orphan_erasure_schema().await?;
+        self.install_morning_email_schema().await
     }
 
     #[cfg(test)]
@@ -578,13 +581,13 @@ mod tests {
     use crate::persistence::{RecordingRetentionPolicy, RECORDING_RETENTION_CONSENT_VERSION};
     use crate::persistence::{SearchHit, SearchRequest};
 
-    struct ControlPlaneContractFixture {
-        persistence: PostgresPersistence,
-        base: PostgresPersistence,
-        schema: String,
+    pub(super) struct ControlPlaneContractFixture {
+        pub(super) persistence: PostgresPersistence,
+        pub(super) base: PostgresPersistence,
+        pub(super) schema: String,
     }
 
-    async fn test_persistence() -> Option<ControlPlaneContractFixture> {
+    pub(super) async fn test_persistence() -> Option<ControlPlaneContractFixture> {
         let contract_required =
             std::env::var("KIOKU_REQUIRE_POSTGRES_CONTRACT").as_deref() == Ok("1");
         let database_url = match std::env::var("KIOKU_TEST_POSTGRES_URL") {
@@ -908,6 +911,7 @@ mod tests {
                 SchemaReleaseStatus::AlreadyFinalized
             );
         }
+        persistence.install_morning_email_schema().await.unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -923,7 +927,7 @@ mod tests {
                 WHERE schemaname = current_schema()
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
-                      'persistence_schema_release_steps','orphan_capture_erasure_contract');
+                      'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;
@@ -941,6 +945,136 @@ mod tests {
             base,
             schema,
         })
+    }
+
+    #[tokio::test]
+    async fn session_playback_precedes_transcription_and_respects_owner_and_deletion() {
+        use crate::persistence::PlaybackRepository;
+        let Some(fixture) = test_persistence().await else {
+            return;
+        };
+        let pool = fixture.persistence.pool();
+        fixture
+            .persistence
+            .verify_morning_email_schema()
+            .await
+            .unwrap();
+        fixture
+            .persistence
+            .install_morning_email_schema()
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE email_deliveries DISABLE TRIGGER kioku_morning_email_legacy_fence",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(fixture
+            .persistence
+            .verify_morning_email_schema()
+            .await
+            .is_err());
+        sqlx::query("ALTER TABLE email_deliveries ENABLE TRIGGER kioku_morning_email_legacy_fence")
+            .execute(pool)
+            .await
+            .unwrap();
+        fixture
+            .persistence
+            .verify_morning_email_schema()
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES \
+            ('session-playback-owner','playback@example.invalid','google','session-playback-owner'); \
+            INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
+            VALUES('session-playback-owner','recording-a','device','install','2026-09-10T12:00:00Z','2026-09-10T12:01:00Z','2026-09-10T12:01:00Z',2); \
+            INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) \
+            VALUES('session-playback-owner','stream-a','recording-a','device','mic'); \
+            INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+            VALUES('session-playback-owner','event-a','device','install','recording-a','stream-a','mic',0,'2026-09-10T12:00:00Z','0','2026-09-10T12:00:00Z','2026-09-10T12:01:00Z','UTC',0,0,'asset-a',repeat('a',64),'canonical'); \
+            INSERT INTO media_objects(account_id,asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,processing_state) \
+            VALUES('session-playback-owner','asset-a','event-a','media/session-playback-owner/asset-a.enc',7,'current','audio/mp4','aac',512,repeat('a',64),'queued');")
+            .execute(pool).await.unwrap();
+        let dataset = fixture
+            .persistence
+            .session_dataset("session-playback-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .expect("recording before any episode or transcript");
+        assert_eq!(dataset.capture_session_id.as_deref(), Some("recording-a"));
+        assert_eq!(dataset.segments.len(), 1);
+        assert!(dataset.utterances.is_empty());
+        assert_eq!(
+            dataset.segments[0].processing_state.as_deref(),
+            Some("queued")
+        );
+        sqlx::query("UPDATE capture_events SET ended_at='2026-09-10T12:02:00Z' WHERE account_id='session-playback-owner' AND event_id='event-a'")
+            .execute(pool).await.unwrap();
+        let late_tail = fixture
+            .persistence
+            .session_dataset("session-playback-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            late_tail.duration_ms, 120_000,
+            "accepted tail outlives the first stop marker"
+        );
+        assert_eq!(late_tail.segments[0].timeline_end_ms, 120_000);
+        sqlx::query("UPDATE capture_events SET started_at='2026-09-10T11:59:00Z' WHERE account_id='session-playback-owner' AND event_id='event-a'")
+            .execute(pool).await.unwrap();
+        let late_head = fixture
+            .persistence
+            .session_dataset("session-playback-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(late_head.duration_ms, 180_000);
+        assert_eq!(late_head.segments[0].timeline_start_ms, 0);
+        assert!(fixture
+            .persistence
+            .session_dataset("other-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fixture
+            .persistence
+            .session_dataset("session-playback-owner", "unknown", None)
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::raw_sql("INSERT INTO episode_deletions(account_id,episode_id,state,purge,media_object_keys,utterance_ids,screenshot_ids,segment_ids,orphan_event_ids) \
+            VALUES('session-playback-owner',42,'pending','{}','[]','[]','[]','[]','[\"event-a\"]');")
+            .execute(pool).await.unwrap();
+        let deleted = fixture
+            .persistence
+            .session_dataset("session-playback-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            deleted.segments.is_empty(),
+            "session route must not restore deletion-owned bytes"
+        );
+        sqlx::query("UPDATE accounts SET status='deleting' WHERE id='session-playback-owner'")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(fixture
+            .persistence
+            .session_dataset("session-playback-owner", "recording-a", None)
+            .await
+            .unwrap()
+            .is_none());
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            fixture.schema
+        )))
+        .execute(fixture.base.pool())
+        .await
+        .unwrap();
+        fixture.base.pool().close().await;
     }
 
     #[test]
@@ -2192,14 +2326,14 @@ mod tests {
                 .settle_finalization(finalization_settlement.clone())
                 .await
                 .unwrap(),
-            3
+            2
         );
         assert_eq!(
             finalization
                 .settle_finalization(finalization_settlement)
                 .await
                 .unwrap(),
-            3
+            2
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2211,7 +2345,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap(),
-            3
+            2
         );
         assert!(matches!(
             repositories
@@ -2606,6 +2740,15 @@ mod tests {
             .await
             .unwrap();
         assert!(opted_in.enabled && opted_in.include_content);
+        let email_episode_id = sqlx::query_scalar::<_,i64>("SELECT id FROM episodes WHERE account_id=$1 AND finalization_status='complete' ORDER BY id LIMIT 1")
+            .bind(&account_id).fetch_one(&pool).await.unwrap();
+        super::morning_email::seed_candidate_for_contract(
+            &persistence,
+            &account_id,
+            email_episode_id,
+            "2000-01-01",
+        )
+        .await;
         let email_candidate = repositories
             .deliveries()
             .next_email_candidate(&account_id)
@@ -2657,7 +2800,7 @@ mod tests {
             .expect("single concurrent email claim winner");
         assert_eq!(
             sqlx::query_as::<_, (String, Option<String>, i64)>(
-                "SELECT state,claim_token,attempt_count FROM email_deliveries \
+                "SELECT state,claim_token,attempt_count FROM morning_email_deliveries \
                    WHERE account_id=$1 AND delivery_id=$2",
             )
             .bind(&account_id)
@@ -2705,7 +2848,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, String>(
-                "SELECT state FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+                "SELECT state FROM morning_email_deliveries WHERE account_id=$1 AND delivery_id=$2",
             )
             .bind(&account_id)
             .bind(&email_claim.delivery_id)
@@ -2716,9 +2859,9 @@ mod tests {
         );
 
         sqlx::query(
-            "UPDATE email_deliveries SET state='pending',attempt_count=0, \
+            "UPDATE morning_email_deliveries SET state='pending',attempt_count=0, \
                     next_attempt_at=clock_timestamp(),claim_token=NULL,claim_until=NULL, \
-                    completed_claim_token=NULL,last_error=NULL,error_code=NULL \
+                    completed_claim_token=NULL,frozen_request=NULL,first_send_at=NULL,error_code=NULL \
               WHERE account_id=$1 AND delivery_id=$2",
         )
         .bind(&account_id)
@@ -2764,7 +2907,7 @@ mod tests {
                 if message == "account has an in-flight email send"
         ));
         sqlx::query(
-            "UPDATE email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+            "UPDATE morning_email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
               WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
         )
         .bind(&account_id)
@@ -2782,7 +2925,7 @@ mod tests {
         assert_eq!(
             sqlx::query_as::<_, (String, Option<String>, i64, Option<String>, Option<String>,)>(
                 "SELECT state,error_code,attempt_count,claim_token,completed_claim_token \
-                   FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+                   FROM morning_email_deliveries WHERE account_id=$1 AND delivery_id=$2",
             )
             .bind(&account_id)
             .bind(&disclosed_email_claim.delivery_id)
@@ -4760,6 +4903,13 @@ mod tests {
             .await
             .unwrap();
 
+        super::morning_email::seed_candidate_for_contract(
+            &persistence,
+            &account_id,
+            deletion_delivery_episode_id,
+            "2000-01-02",
+        )
+        .await;
         let deletion_email_candidate = repositories
             .deliveries()
             .next_email_candidate(&account_id)
@@ -4987,7 +5137,7 @@ mod tests {
             .await
             .is_err());
         sqlx::query(
-            "UPDATE email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
+            "UPDATE morning_email_deliveries SET claim_until=clock_timestamp()-interval '1 second' \
               WHERE account_id=$1 AND delivery_id=$2 AND claim_token=$3",
         )
         .bind(&account_id)
@@ -5031,7 +5181,7 @@ mod tests {
             .unwrap());
         assert_eq!(
             sqlx::query_scalar::<_, String>(
-                "SELECT state FROM email_deliveries WHERE account_id=$1 AND delivery_id=$2",
+                "SELECT state FROM morning_email_deliveries WHERE account_id=$1 AND delivery_id=$2",
             )
             .bind(&account_id)
             .bind(&deletion_email_claim.delivery_id)
@@ -5128,14 +5278,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT (SELECT count(*) FROM email_deliveries \
-                            WHERE account_id=$1 AND state='ambiguous') + \
+                "SELECT (SELECT count(*) FROM morning_email_deliveries \
+                            WHERE account_id=$1 AND delivery_id=$2 AND state='ambiguous') + \
                         (SELECT count(*) FROM webhook_deliveries \
-                            WHERE account_id=$1 AND state='ambiguous') + \
+                            WHERE account_id=$1 AND event_id=$3 AND state='ambiguous') + \
                         (SELECT count(*) FROM push_deliveries \
-                            WHERE account_id=$1 AND state='ambiguous')",
+                            WHERE account_id=$1 AND delivery_id=$4 AND state='ambiguous')",
             )
             .bind(&account_id)
+            .bind(&deletion_email_claim.delivery_id)
+            .bind(&deletion_webhook_claim.event_id)
+            .bind(&deletion_push_claim.delivery_id)
             .fetch_one(&pool)
             .await
             .unwrap(),

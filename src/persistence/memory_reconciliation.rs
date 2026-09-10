@@ -28,7 +28,7 @@ pub(crate) fn oversized_keep_policy_commitment() -> [u8; 32] {
     digest.update(OVERSIZED_KEEP_MODEL.as_bytes());
     digest.update(MAX_OVERSIZED_KEEP_SOURCES.to_be_bytes());
     digest.update(OVERSIZED_KEEP_SOURCE_PAGE_SIZE.to_be_bytes());
-    digest.update(b"oldest-connected-prefix|max-32|exact-episode-and-member-keep|structure-state-only|no-provider|all-raw-sources-owned|formation-current");
+    digest.update(b"oldest-connected-prefix|max-32|exact-active-episode-and-member-keep|preserve-finalized-receipts|structure-state-only|no-provider|all-raw-sources-owned|formation-current|capture-context-8h-v2");
     digest.finalize().into()
 }
 
@@ -74,7 +74,8 @@ pub(crate) struct ReconciliationSnapshot {
     /// Complete connected capture-session closure whose exact formation and
     /// seal receipts are committed by `source_fingerprint`.
     pub(crate) capture_session_ids: Vec<String>,
-    /// Commitment to the complete, model-visible, source-settled projection.
+    /// Commitment to the complete, model-visible, current-formation projection.
+    /// Brief source settlement is checked independently of organization.
     pub(crate) source_fingerprint: Vec<u8>,
     /// CAS over the active owners, episode revisions, and archive revision.
     pub(crate) topology_fingerprint: Vec<u8>,
@@ -278,7 +279,7 @@ pub(crate) trait ReconciliationEgressGuard: Send {
 
 #[async_trait]
 pub(crate) trait MemoryReconciliationRepository: Send + Sync {
-    /// Promote at most `draft_limit` oldest drafts without provider egress when
+    /// Promote at most `draft_limit` oldest current memories without provider egress when
     /// their connected component or evidence set exceeds the model bounds.
     /// PostgreSQL performs the source/formation proof and exact KEEP mutation
     /// in one serializable transaction.

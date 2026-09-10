@@ -163,6 +163,18 @@ verifies the orphan-erasure catalog and distinguishes pending, complete-but-capt
 fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
 evidence is not v6 evidence and cannot authorize the new release's gates.
 
+### ADR-0045 organization producer change (source-only handoff)
+
+The ADR-0045 compiled producer is
+`sha256:0e3fadcbc33df882f72be1a31a3be411a76e5af0831a410a4284c803c550ed12`.
+It binds prompt organization with current formation, eight-hour capture context, exact-membership
+ID retention, and the revised bounded KEEP policy. An existing `Active` receipt for the predecessor
+producer rejects this image as intended. Merging these sources does not authorize a release or
+change signed activation history. A separately authorized release must use the reviewed signed
+producer-rebind and fleet-drained maintenance workflow described below, together with the
+[ADR-0045 schema handoff](docs/postgresql-schema-releases.md). Preserve the frozen activation
+checks; do not introduce a package-version allowance or reuse a predecessor producer claim.
+
 ### v0.9.31 Vertex schema correction from Paused/g4 (historical; bridge retired in v0.9.32)
 
 The readiness bridge described below was pinned to package v0.9.31 and is **retired**. It is

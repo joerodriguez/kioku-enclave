@@ -24,7 +24,7 @@ pub struct LinkDetail {
     pub why_it_matters: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalizedEpisode {
     pub episode_id: i64,
     pub title: String,

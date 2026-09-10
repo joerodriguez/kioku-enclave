@@ -11,6 +11,7 @@ use super::WebhookProviderOutcome;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EmailDeliveryCandidate {
+    pub(crate) daily: Option<DailyEmailSnapshot>,
     pub(crate) account_id: String,
     pub(crate) episode_id: i64,
     pub(crate) delivery_version: i64,
@@ -21,7 +22,17 @@ pub(crate) struct EmailDeliveryCandidate {
     pub(crate) episode: FinalizedEpisode,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct DailyEmailSnapshot {
+    pub(crate) delivery_date: String,
+    pub(crate) timezone: String,
+    pub(crate) consent_revision: String,
+    pub(crate) episodes: Vec<FinalizedEpisode>,
+    pub(crate) sources: Vec<(i64, String, i64)>,
+    pub(crate) revisions: Vec<(i64, String)>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct FrozenEmailDelivery {
     pub(crate) recipient_email: String,
     pub(crate) include_content: bool,

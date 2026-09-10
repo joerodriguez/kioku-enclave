@@ -427,10 +427,14 @@ impl BillingRepository for PostgresPersistence {
                FROM vertex_usage_coverage WHERE account_id=$1 AND period=$2 \
              ) \
              SELECT (SELECT COALESCE(sum(bytes),0)::bigint FROM tenant_rows) AS storage_bytes, \
-                    (SELECT count(*)::bigint FROM email_deliveries WHERE account_id=$1 \
+                    ((SELECT count(*)::bigint FROM email_deliveries WHERE account_id=$1 \
                        AND state='delivered' \
                        AND updated_at >= to_date($2,'YYYY-MM') \
-                       AND updated_at < to_date($2,'YYYY-MM') + interval '1 month') AS accepted_email_count, \
+                       AND updated_at < to_date($2,'YYYY-MM') + interval '1 month') + \
+                     (SELECT count(*)::bigint FROM morning_email_deliveries WHERE account_id=$1 \
+                       AND state='delivered' \
+                       AND first_send_at >= to_date($2,'YYYY-MM') \
+                       AND first_send_at < to_date($2,'YYYY-MM') + interval '1 month')) AS accepted_email_count, \
                     sequence,pending_events,lost_events,observed_at_ms \
              FROM (SELECT 1) one LEFT JOIN coverage ON true",
         )

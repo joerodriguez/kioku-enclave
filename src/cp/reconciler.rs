@@ -1,7 +1,7 @@
-//! Source-settled memory topology reconciliation.
+//! Prompt, revision-bound memory topology reconciliation.
 //!
 //! PostgreSQL discovers the complete fixed-point cohort, proves source
-//! settlement, owns claims/stages, and publishes with a topology CAS. This
+//! current formation, owns claims/stages, and publishes with a topology CAS. This
 //! module is deliberately the pure policy layer around that authority: it
 //! renders bounded evidence, validates an exhaustive model partition, selects
 //! exact one-to-one identity retention, and orchestrates at most one settled
@@ -26,12 +26,13 @@ use crate::persistence::{
 
 use super::{isotime, vertex, CpState};
 
-// v2 adds durable provider-attempt fencing and terminal conservative handling
-// for ambiguous responses. A v1 stage must never cross that policy boundary.
-const RECONCILIATION_VERSION: i64 = 2;
-const PROMPT_VERSION: i64 = 1;
+// v3 separates prompt organization from brief source settlement. Prompt v2
+// considers eight-hour capture-time continuations; validator v2 keeps an ID only
+// for exact unchanged membership. Older stages cannot cross this boundary.
+const RECONCILIATION_VERSION: i64 = 3;
+const PROMPT_VERSION: i64 = 2;
 const PARTITION_SCHEMA_VERSION: i64 = 1;
-const VALIDATOR_VERSION: i64 = 1;
+const VALIDATOR_VERSION: i64 = 2;
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
 pub(crate) const MAX_COHORT_DRAFTS: i64 = 32;
 const MAX_COHORT_ATOMS: i64 = 4_000;
@@ -51,11 +52,11 @@ const MODEL_ATTEMPTS_BEFORE_CONSERVATIVE_KEEP: i64 = 3;
 const CONSERVATIVE_MODEL: &str = "conservative-v1";
 const CONSERVATIVE_AMBIGUITY_MODEL: &str = "conservative-ambiguity-v1";
 
-const SYSTEM_PROMPT: &str = r#"You reconcile provisional personal-memory drafts after all nearby source evidence has settled.
+const SYSTEM_PROMPT: &str = r#"You organize currently available personal-memory evidence. Memories are immediately useful and may improve when more evidence arrives; brief settlement and email delivery are independent.
 
-Recording sessions are transport boundaries, never automatic memory boundaries. Group evidence by the same concrete objective, conversation, decision, or workflow. Two recordings 30 minutes apart may be one memory when the person resumed the same goal. A shared broad topic alone is not enough: separate distinct goals even when the people, application, or subject overlap. One recording may contain several memories.
+Recording sessions are transport boundaries, never automatic memory boundaries. Group evidence by the same concrete objective, conversation, decision, or workflow. Prefer extending an existing memory for a clear continuation, including a two-hour interruption or device switch. Consider preceding and following eight-hour capture-time context, including finalized memories, without treating that window as a waiting period or a maximum memory duration. Offline arrival order must not determine boundaries. A shared broad topic alone is not enough: separate distinct goals even when the people, application, or subject overlap. One recording may contain several memories.
 
-Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Prefer the existing draft partition when the evidence does not clearly justify a change. Titles, summaries, actions, people, languages, and timeline gists must be grounded in the assigned evidence. Timeline entries cite only source_ids assigned to their memory."#;
+Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Keep distinct activities separate when continuity is ambiguous. Prefer the existing memory partition when the evidence does not clearly justify a change. An already published memory cannot be deleted merely because the model considers it unimportant. Titles, summaries, actions, people, languages, and timeline gists must be grounded in the assigned evidence. Timeline entries cite only source_ids assigned to their memory."#;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +229,8 @@ pub(crate) fn producer_contract_commitment(model: &str, location: &str) -> Resul
         "response_schema": response_schema(),
         "bounds": {
             "cohort_drafts": MAX_COHORT_DRAFTS,
+            "candidate_context_seconds": 8 * 60 * 60,
+            "organization_readiness": "current-formation-without-brief-seal-v1",
             "cohort_atoms": MAX_COHORT_ATOMS,
             "outputs": MAX_OUTPUTS,
             "title_chars": MAX_TITLE_CHARS,
@@ -583,7 +586,7 @@ fn validate_partition(
                 .is_some_and(|ordinals| ordinals.as_slice() == [ordinal])
             && predecessor_sources
                 .get(&predecessor_ids[0])
-                .is_some_and(|members| members.is_subset(sources))
+                .is_some_and(|members| members == sources)
         {
             Some(predecessor_ids[0])
         } else {
@@ -951,7 +954,7 @@ async fn publish_staged(
     })
 }
 
-/// Reconcile at most one oldest, source-settled cohort for an account.
+/// Organize at most one oldest, revision-current cohort for an account.
 ///
 /// `Ok(true)` means the durable activation authority still permits legacy
 /// finalization (`Preactive`/`Installed`), or an active account has no eligible
@@ -1498,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn conservative_fallback_retains_one_to_one_id_when_adding_late_evidence() {
+    fn conservative_extension_uses_a_successor_when_membership_changes() {
         let source = snapshot(
             vec![draft(10, &["utterance:1"])],
             vec![atom(1, 1), atom(2, 2)],
@@ -1510,7 +1513,7 @@ mod tests {
             result.outputs[0].member_source_ids,
             vec!["utterance:1", "utterance:2"]
         );
-        assert_eq!(result.outputs[0].retained_episode_id, Some(10));
+        assert_eq!(result.outputs[0].retained_episode_id, None);
     }
 
     #[test]

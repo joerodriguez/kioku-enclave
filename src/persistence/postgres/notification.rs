@@ -218,6 +218,13 @@ impl NotificationRepository for PostgresPersistence {
             return Err(EnclaveError::Auth("account inactive or deleting".into()));
         }
         let email: String = account.try_get("email")?;
+        let timezone = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT timezone FROM morning_email_schedules WHERE account_id=$1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?
+        .flatten();
         let preference = sqlx::query(
             "SELECT enabled,include_content, \
                     floor(extract(epoch FROM consented_at) * 1000)::bigint AS consented_at_ms, \
@@ -229,6 +236,7 @@ impl NotificationRepository for PostgresPersistence {
         .await?;
         match preference {
             Some(row) => Ok(EpisodeEmailPreference {
+                timezone: timezone.clone(),
                 enabled: row.try_get("enabled")?,
                 include_content: row.try_get("include_content")?,
                 recipient_email: email,
@@ -242,6 +250,7 @@ impl NotificationRepository for PostgresPersistence {
                 .fetch_one(self.pool())
                 .await?;
                 Ok(EpisodeEmailPreference {
+                    timezone,
                     enabled: false,
                     include_content: false,
                     recipient_email: email,
@@ -252,13 +261,34 @@ impl NotificationRepository for PostgresPersistence {
         }
     }
 
+    #[cfg(test)]
     async fn set_email_preference(
         &self,
         account_id: &str,
         enabled: bool,
+        include_content: bool,
+    ) -> Result<EpisodeEmailPreference> {
+        self.set_email_preference_with_timezone(account_id, enabled, include_content, None)
+            .await
+    }
+
+    async fn set_email_preference_with_timezone(
+        &self,
+        account_id: &str,
+        enabled: bool,
         mut include_content: bool,
+        timezone: Option<&str>,
     ) -> Result<EpisodeEmailPreference> {
         let mut transaction = self.pool().begin().await?;
+        advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        let email = require_active_account(&mut transaction, account_id)
+            .await
+            .map_err(|error| match error {
+                EnclaveError::Auth(_) => EnclaveError::InvalidRequest(
+                    "cannot update email preferences for inactive or deleting user".into(),
+                ),
+                other => other,
+            })?;
         advisory_transaction_lock(&mut transaction, "email-preference", account_id).await?;
         let in_flight = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM email_send_fences WHERE account_id=$1)",
@@ -271,14 +301,6 @@ impl NotificationRepository for PostgresPersistence {
                 "email preference has an in-flight send".into(),
             ));
         }
-        let email = require_active_account(&mut transaction, account_id)
-            .await
-            .map_err(|error| match error {
-                EnclaveError::Auth(_) => EnclaveError::InvalidRequest(
-                    "cannot update email preferences for inactive or deleting user".into(),
-                ),
-                other => other,
-            })?;
         if !enabled {
             include_content = false;
         }
@@ -318,8 +340,43 @@ impl NotificationRepository for PostgresPersistence {
         .bind(now_ms)
         .execute(&mut *transaction)
         .await?;
+        if let Some(timezone) = timezone {
+            let valid = timezone.len() <= 100
+                && !timezone.starts_with("posix/")
+                && !timezone.starts_with("right/")
+                && !matches!(timezone, "Factory" | "posixrules")
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM pg_timezone_names WHERE name=$1)",
+                )
+                .bind(timezone)
+                .fetch_one(&mut *transaction)
+                .await?;
+            if !valid {
+                return Err(EnclaveError::InvalidRequest(
+                    "timezone must be a valid IANA timezone".into(),
+                ));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO morning_email_schedules(account_id,timezone,next_due_at) \
+             VALUES($1,$2,CASE WHEN $2::text IS NULL THEN NULL ELSE \
+                (((clock_timestamp() AT TIME ZONE $2)::date+1)+time '07:00') AT TIME ZONE $2 END) \
+             ON CONFLICT(account_id) DO UPDATE SET timezone=coalesce(EXCLUDED.timezone,morning_email_schedules.timezone), \
+               next_due_at=CASE WHEN EXCLUDED.timezone IS NOT NULL AND EXCLUDED.timezone IS DISTINCT FROM morning_email_schedules.timezone \
+                 THEN EXCLUDED.next_due_at ELSE morning_email_schedules.next_due_at END,updated_at=clock_timestamp()"
+        ).bind(account_id).bind(timezone).execute(&mut *transaction).await?;
+        // A changed consent revision invalidates every unsubmitted snapshot. A daily
+        // identity is never reopened; eligible coverage may join the next morning.
+        super::morning_email::cancel_unsent(&mut transaction, account_id, !enabled).await?;
+        let timezone = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT timezone FROM morning_email_schedules WHERE account_id=$1",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(EpisodeEmailPreference {
+            timezone,
             enabled,
             include_content,
             recipient_email: email,

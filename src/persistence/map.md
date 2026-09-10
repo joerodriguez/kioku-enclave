@@ -22,11 +22,11 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |
 | `media_processing.rs` | Media job claim, usage, screen/audio projection, owner-source classification, voice evidence, retry, and settlement contract. |
 | `memory_formation.rs` | Forward-window and exact capture-session revision/page claims, frozen bounded provider requests and stable attempt identities, turn-timed/reference-aware source evidence, evidence-free accepted-sequence tombstones, renewed deletion-fenced provider authorization and settlement, open-memory projection, explicit accounted/no-memory outcomes, atomic cursor/episode settlement, and embedding-source contract over memory text plus final-brief human values. |
-| `memory_reconciliation.rs` | Source-settled cohort snapshots, fleet leases, durable staged partitions, bounded providerless neighborhood discovery/verification, atomic active-topology publication, and content-free handle resolution contract. |
+| `memory_reconciliation.rs` | Current-formation cohort snapshots, eight-hour capture context, fleet leases, staged partitions, bounded discovery/verification, atomic active-topology publication and durable handle resolution. |
 | `model_usage.rs` | Vertex intent/outcome, billing batch claim, and coverage reconciliation contract. |
-| `notification.rs` | Webhook, email-consent, and push-installation configuration with redacted secret-bearing types. |
+| `notification.rs` | Webhook, email consent and explicit account IANA timezone, and push configuration with redacted secret-bearing types. |
 | `oauth.rs` | OAuth client, consent, authorization-code, native-session, and refresh-token transaction contract. |
-| `playback.rs` | Recording playback dataset and exact identified-person memory page/availability projection contract. |
+| `playback.rs` | Memory and exact capture-session playback datasets plus identified-person memory availability. |
 | `query.rs` | Tenant-scoped full-text/vector search over memories, structured final briefs, transcripts, and screen evidence; stable memory navigation and identified-person link projections; MCP query projections; turn-timed episode members; and feed/people/browser/screenshot reads plus capture status. |
 | `recording_retention.rs` | Retention preview/CAS, durable recording-key epoch, exact inventory, and downgrade completion. |
 | `work.rs` | Fleet active-account enumeration, summarizer cursor storage, and shared outbound-provider outcome validation. |

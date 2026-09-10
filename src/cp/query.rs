@@ -2237,6 +2237,8 @@ async fn rest_test_webhook(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateEpisodeEmailPreferenceRequest {
+    #[serde(default)]
+    timezone: Option<String>,
     enabled: bool,
     #[serde(default)]
     include_content: bool,
@@ -2260,6 +2262,7 @@ async fn rest_get_episode_email_preference(
                 "enabled": pref.enabled,
                 "include_content": pref.include_content,
                 "recipient_email": pref.recipient_email,
+                "timezone": pref.timezone,
                 "available": available,
             })),
         )
@@ -2277,7 +2280,12 @@ async fn rest_put_episode_email_preference(
     match s
         .repositories
         .notifications()
-        .set_email_preference(&user.0, req.enabled, req.include_content)
+        .set_email_preference_with_timezone(
+            &user.0,
+            req.enabled,
+            req.include_content,
+            req.timezone.as_deref(),
+        )
         .await
     {
         Ok(pref) => (
@@ -2287,6 +2295,7 @@ async fn rest_put_episode_email_preference(
                 "enabled": pref.enabled,
                 "include_content": pref.include_content,
                 "recipient_email": pref.recipient_email,
+                "timezone": pref.timezone,
                 "available": available,
             })),
         )

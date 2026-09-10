@@ -2315,6 +2315,13 @@ impl EpisodeDeletionRepository for PostgresPersistence {
             ));
         }
 
+        super::memory_reconciliation::scrub_ancestor_snapshots_for_deletion(
+            &mut transaction,
+            account_id,
+            episode_id,
+        )
+        .await?;
+
         if paged_episode_deletion_enabled(&mut transaction, activation_installed).await? {
             let other_pending_episode = sqlx::query_scalar::<_, i64>(
                 "SELECT deletion.episode_id FROM episode_deletions deletion \

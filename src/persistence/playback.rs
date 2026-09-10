@@ -14,6 +14,13 @@ pub(crate) trait PlaybackRepository: Send + Sync {
         durable_read: Option<&DurableReadFence>,
     ) -> Result<Option<PlaybackDataset>>;
 
+    async fn session_dataset(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+        durable_read: Option<&DurableReadFence>,
+    ) -> Result<Option<PlaybackDataset>>;
+
     async fn person_memories(
         &self,
         account_id: &str,

@@ -22,6 +22,8 @@ impl std::fmt::Debug for WebhookSubscription {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EpisodeEmailPreference {
+    #[serde(default)]
+    pub timezone: Option<String>,
     pub enabled: bool,
     pub include_content: bool,
     pub recipient_email: String,
@@ -89,11 +91,20 @@ pub(crate) trait NotificationRepository: Send + Sync {
 
     async fn get_email_preference(&self, account_id: &str) -> Result<EpisodeEmailPreference>;
 
+    #[cfg(test)]
     async fn set_email_preference(
         &self,
         account_id: &str,
         enabled: bool,
         include_content: bool,
+    ) -> Result<EpisodeEmailPreference>;
+
+    async fn set_email_preference_with_timezone(
+        &self,
+        account_id: &str,
+        enabled: bool,
+        include_content: bool,
+        timezone: Option<&str>,
     ) -> Result<EpisodeEmailPreference>;
 
     async fn upsert_push_installation(

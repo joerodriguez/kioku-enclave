@@ -887,6 +887,10 @@ impl PostgresPersistence {
         let source_graph = reconciliation_source_audit::snapshot(&mut transaction)
             .await
             .map_err(|_| AggregateAuditFailure::AuditFailed)?;
+        let context_bounds =
+            reconciliation_source_audit::context_finalizer_bounds(&mut transaction)
+                .await
+                .map_err(|_| AggregateAuditFailure::AuditFailed)?;
         let queried = sqlx::query(AGGREGATE_AUDIT_SQL)
             .bind(since)
             .bind(erasure_json)
@@ -899,6 +903,7 @@ impl PostgresPersistence {
                 serde_json::to_string(&source_graph)
                     .map_err(|_| AggregateAuditFailure::AuditFailed)?,
             )
+            .bind(context_bounds)
             .fetch_all(&mut *transaction)
             .await;
         let rollback = transaction.rollback().await;
@@ -994,6 +999,9 @@ async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
     let source_graph = reconciliation_source_audit::snapshot(&mut tx)
         .await
         .unwrap();
+    let context_bounds = reconciliation_source_audit::context_finalizer_bounds(&mut tx)
+        .await
+        .unwrap();
     let payload: String = sqlx::query_scalar(AGGREGATE_AUDIT_SQL)
         .bind(&since)
         .bind(serde_json::to_string(&erasure).unwrap())
@@ -1003,6 +1011,7 @@ async fn test_activation_source_isolation(persistence: &PostgresPersistence) {
         .bind(serde_json::to_string(&isolated).unwrap())
         .bind(erasure.clear_for_activation())
         .bind(serde_json::to_string(&source_graph).unwrap())
+        .bind(context_bounds)
         .fetch_one(&mut *tx)
         .await
         .unwrap();
@@ -1943,6 +1952,30 @@ async fn test_source_bounded_capacity(persistence: &PostgresPersistence, since: 
     assert_eq!(small.capacity.max_required_derived_slots, 65);
     assert_eq!(small.capacity.minimum_derived_headroom_slots, 15);
     assert!(small.gates.capacity_sufficient);
+
+    // A finalized context owner can split again with either neighboring draft.
+    // Reserve its two atoms once, without treating it as new reconciliation work.
+    sqlx::query("UPDATE episodes SET structure_state='reconciled',finalized_at=clock_timestamp(), \
+        finalization_status='complete',finalization_version=5,finalized_identity_revision=identity_revision, \
+        ended_at='2026-01-04T00:01:00Z' WHERE account_id=$1 AND id=1")
+        .bind(ACCOUNT).execute(persistence.pool()).await.unwrap();
+    let context = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(context.reconciliation.candidate_drafts, 3);
+    assert_eq!(context.source_graph.candidate_drafts, 3);
+    assert_eq!(context.capacity.projected_successor_finalizers, 8);
+    sqlx::query("UPDATE episodes SET ended_at='2026-01-02T00:01:00Z' WHERE account_id=$1 AND id=1")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await
+        .unwrap();
+    let isolated_context = persistence.aggregate_audit(since).await.unwrap();
+    assert_eq!(
+        isolated_context.capacity.projected_successor_finalizers, 6,
+        "disconnected finalized history must not consume fresh-work capacity"
+    );
+    sqlx::query("UPDATE episodes SET structure_state='draft',finalized_at=NULL, \
+        finalization_status='pending_horizon',finalization_version=NULL WHERE account_id=$1 AND id=1")
+        .bind(ACCOUNT).execute(persistence.pool()).await.unwrap();
 
     // Ordinary partitions cannot emit empty outputs, but the separate
     // providerless KEEP path preserves existing drafts and can trigger on

@@ -28,23 +28,26 @@ all_atoms AS MATERIALIZED (
            greatest(captured_at,visible_until)
       FROM screenshots WHERE ($1::text IS NULL OR account_id=$1)
 ),
+-- Include every exact active owner in the complete graph, then select only
+-- components with fresh draft work below. Filtering finalized headers by one
+-- seed's eight-hour window before session closure can omit transitive owners.
 drafts AS MATERIALIZED (
     SELECT e.account_id,e.id,e.started_at,e.ended_at,
+           (e.structure_state='draft' AND e.finalized_at IS NULL) AS needs_organization,
            e.finalization_status IN ('processing','deleting')
              OR e.finalization_claim_token IS NOT NULL
-             OR EXISTS(SELECT 1 FROM episode_final_briefs b
-                 WHERE b.account_id=e.account_id AND b.episode_id=e.id)
              OR EXISTS(SELECT 1 FROM webhook_deliveries d
-                 WHERE d.account_id=e.account_id AND d.episode_id=e.id)
+                 WHERE d.account_id=e.account_id AND d.episode_id=e.id AND d.state='processing')
              OR EXISTS(SELECT 1 FROM email_deliveries d
-                 WHERE d.account_id=e.account_id AND d.episode_id=e.id)
+                 WHERE d.account_id=e.account_id AND d.episode_id=e.id AND d.state='processing')
              OR EXISTS(SELECT 1 FROM push_deliveries d
-                 WHERE d.account_id=e.account_id AND d.episode_id=e.id) AS row_conflict
+                 WHERE d.account_id=e.account_id AND d.episode_id=e.id AND d.state='processing') AS row_conflict
       FROM episodes e JOIN memory_handles h
         ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active'
       JOIN accounts a ON a.id=e.account_id AND a.status='active'
      WHERE ($1::text IS NULL OR e.account_id=$1)
-       AND e.structure_state='draft' AND e.finalized_at IS NULL
+       AND e.structure_state IN ('draft','reconciled')
+
 ),
 header_ordered AS (
     SELECT *,max(floor(extract(epoch FROM ended_at)*1000)) OVER (
@@ -54,7 +57,7 @@ header_ordered AS (
 ),
 headers AS MATERIALIZED (
     SELECT *,sum(CASE WHEN prior_end IS NULL
-        OR floor(extract(epoch FROM started_at)*1000)>prior_end+14400000
+        OR floor(extract(epoch FROM started_at)*1000)>prior_end+28800000
         THEN 1 ELSE 0 END) OVER (PARTITION BY account_id ORDER BY started_at,id) AS header_component
       FROM header_ordered
 ),
@@ -87,7 +90,7 @@ owners AS MATERIALIZED (
     SELECT e.account_id,e.id,least(e.started_at,min(atom.started_at)) AS started_at,
            greatest(e.ended_at,max(atom.ended_at)) AS ended_at,
            count(atom.id)::bigint AS atoms,count(m.record_id)::bigint AS members,
-           h.header_component,h.row_conflict
+           h.header_component,h.row_conflict,h.needs_organization
       FROM episodes e JOIN memory_handles handle
         ON handle.account_id=e.account_id AND handle.episode_id=e.id AND handle.state='active'
       LEFT JOIN active_episode_members m ON m.account_id=e.account_id AND m.episode_id=e.id
@@ -95,7 +98,7 @@ owners AS MATERIALIZED (
         AND atom.kind=m.record_type AND atom.id=m.record_id
       LEFT JOIN headers h ON h.account_id=e.account_id AND h.id=e.id
      WHERE ($1::text IS NULL OR e.account_id=$1) AND h.id IS NOT NULL
-     GROUP BY e.account_id,e.id,h.header_component,h.row_conflict
+     GROUP BY e.account_id,e.id,h.header_component,h.row_conflict,h.needs_organization
 ),
 canonical_bridges AS MATERIALIZED (
     SELECT child.account_id,'r:'||child.event_id AS key,
@@ -124,7 +127,7 @@ ordered AS (
 ),
 components AS MATERIALIZED (
     -- One extra millisecond conservatively covers v24's floor-to-ms boundary.
-    SELECT *,sum(CASE WHEN prior_end IS NULL OR started_at>prior_end+interval '4 hours 1 millisecond'
+    SELECT *,sum(CASE WHEN prior_end IS NULL OR started_at>prior_end+interval '8 hours 1 millisecond'
         THEN 1 ELSE 0 END) OVER (PARTITION BY account_id ORDER BY started_at,ended_at,key) AS component
       FROM ordered
 ),
@@ -133,11 +136,12 @@ candidate_components AS MATERIALIZED (
            min(c.started_at) AS started_at,max(c.ended_at) AS ended_at,
            array_agg(o.id ORDER BY o.id) FILTER (WHERE o.id IS NOT NULL) AS draft_ids,
            count(o.id)::bigint AS drafts,
+           count(o.id) FILTER (WHERE o.needs_organization)::bigint AS fresh_drafts,
            count(*) FILTER (WHERE c.key LIKE 'u:%' OR c.key LIKE 's:%')::bigint AS atoms,
            count(*) FILTER (WHERE c.key LIKE 'c:%')::bigint AS sessions,
            count(o.id) FILTER (WHERE o.atoms=0 OR o.atoms<>o.members OR o.row_conflict)::bigint AS blocked_drafts
       FROM components c LEFT JOIN owners o
         ON o.account_id=c.account_id AND c.key='d:'||o.id
      GROUP BY c.account_id,c.component
-    HAVING count(o.id)>0
+    HAVING count(o.id)>0 AND bool_or(o.needs_organization)
 )
