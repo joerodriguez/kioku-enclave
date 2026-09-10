@@ -558,6 +558,18 @@ mod tests {
     /// against each other under the parallel test harness.
     #[test]
     fn deployment_mode_gates_the_kms_credential_source() {
+        // Snapshot before the first mutation so every variable is restored to
+        // what it was, not to a mid-test value.
+        let saved = [
+            "KMS_PROJECT",
+            "KMS_LOCATION",
+            "KMS_KEY_RING",
+            "KMS_KEY",
+            "ENCLAVE_KMS_VIA_ATTESTATION",
+            "ATTEST_STS_AUDIENCE",
+            "KIOKU_DEPLOYMENT_MODE",
+        ]
+        .map(|key| (key, std::env::var(key).ok()));
         for value in [
             None,
             Some(""),
@@ -576,16 +588,6 @@ mod tests {
                 "{value:?} must not select the service-account KMS source"
             );
         }
-        let saved = [
-            "KMS_PROJECT",
-            "KMS_LOCATION",
-            "KMS_KEY_RING",
-            "KMS_KEY",
-            "ENCLAVE_KMS_VIA_ATTESTATION",
-            "ATTEST_STS_AUDIENCE",
-            "KIOKU_DEPLOYMENT_MODE",
-        ]
-        .map(|key| (key, std::env::var(key).ok()));
         for (key, value) in [
             ("KMS_PROJECT", "p"),
             ("KMS_LOCATION", "l"),
