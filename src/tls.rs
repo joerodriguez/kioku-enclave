@@ -1,8 +1,11 @@
 //! In-enclave TLS termination (ADR-0001).
 //!
-//! Production startup requires the enclave to terminate TLS itself, so the
-//! attested binary is the first application code to see request plaintext.
-//! Plain HTTP is available only in an explicitly enabled debug build.
+//! On the attested fleet, production startup requires the enclave to
+//! terminate TLS itself, so the attested binary is the first application code
+//! to see request plaintext, and plain HTTP is available only in an explicitly
+//! enabled debug build. A managed-platform deployment never consults this
+//! module: the platform terminates TLS at its edge (see
+//! `crate::managed_platform_mode`).
 //!
 //! ## What this module does
 //!
