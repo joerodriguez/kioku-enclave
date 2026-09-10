@@ -84,6 +84,29 @@ pub(crate) fn test_mode_enabled() -> bool {
     cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
 }
 
+/// Where this binary is deployed, which decides two security-relevant things:
+/// who terminates public TLS, and where KMS credentials come from.
+///
+/// `attested_vm` is the historical Confidential Space deployment: the process
+/// terminates TLS itself and can only reach the KEK by presenting a hardware
+/// attestation token whose image digest matches the bound policy.
+///
+/// `managed_platform` is an ordinary managed container runtime (Cloud Run).
+/// The platform terminates public TLS at its edge and forwards plaintext HTTP
+/// over the loopback-equivalent hop, and KMS credentials come from the
+/// service account rather than an attestation. This deliberately trades the
+/// image-digest boundary for operational simplicity: anyone able to act as
+/// that service account can unwrap media DEKs. Structured state in PostgreSQL
+/// was already administrator-readable plaintext, so this narrows the
+/// remaining gap to raw media bytes rather than removing an end-to-end
+/// guarantee.
+///
+/// The exact-value check keeps `0`, `false`, or an empty variable from
+/// silently selecting the weaker mode.
+pub(crate) fn managed_platform_mode() -> bool {
+    std::env::var("KIOKU_DEPLOYMENT_MODE").as_deref() == Ok("managed_platform")
+}
+
 const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
     "KIOKU_BUILD_PROFILE",
     "KMS_PROJECT",
@@ -1334,6 +1357,15 @@ async fn async_main() {
         Some(ks) => {
             info!(addr = %addr, tls = true, "listening (in-enclave TLS termination)");
             serve_tls(listener, app, ks, shutdown).await;
+        }
+        None if managed_platform_mode() => {
+            // The platform terminates public TLS at its edge; this process
+            // must serve plaintext HTTP on $PORT or it is unreachable.
+            info!(addr = %addr, tls = false, "listening behind managed platform TLS termination");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("server error");
         }
         None if test_mode_enabled() => {
             warn!(addr = %addr, tls = false, "listening over plain HTTP in debug test mode");

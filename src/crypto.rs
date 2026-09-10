@@ -175,8 +175,27 @@ pub trait KmsClient: Send + Sync {
 pub struct GcpKmsClient {
     http: reqwest::Client,
     key_name: String, // projects/P/locations/L/keyRings/R/cryptoKeys/K
-    attestation_creds: AttestationCredentials,
+    credentials: KmsCredentialSource,
 }
+
+/// Where the bearer token for KMS encrypt/decrypt comes from.
+///
+/// The two variants are not equivalent security postures and the difference
+/// is the whole point of this type being explicit rather than a boolean.
+pub enum KmsCredentialSource {
+    /// Confidential Space: a federated token derived from a hardware
+    /// attestation whose image digest must match the KEK's principalSet
+    /// binding. The KEK is unusable by any other workload, including one run
+    /// by a project administrator.
+    Attested(AttestationCredentials),
+    /// Managed platform: the runtime service account's own token from the
+    /// metadata server. Anyone able to act as that service account can unwrap
+    /// media DEKs. Selected only by `KIOKU_DEPLOYMENT_MODE=managed_platform`.
+    MetadataServiceAccount { token_url: String },
+}
+
+const METADATA_SERVICE_ACCOUNT_TOKEN_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
 #[derive(Deserialize)]
 struct KmsEncryptResponse {
@@ -204,13 +223,24 @@ impl GcpKmsClient {
         let key_name =
             format!("projects/{project}/locations/{location}/keyRings/{key_ring}/cryptoKeys/{key}");
 
-        if std::env::var("ENCLAVE_KMS_VIA_ATTESTATION").as_deref() != Ok("1") {
-            return Err(EnclaveError::Kms(
-                "ENCLAVE_KMS_VIA_ATTESTATION must be set to 1; metadata credentials are not permitted"
-                    .into(),
-            ));
-        }
-        let attestation_creds = AttestationCredentials::from_env()?;
+        // On an attested VM the metadata service account must never be able to
+        // stand in for the attestation, so that path stays hard-refused. The
+        // managed platform has no attestation to present and selects the
+        // service-account source by an exact, explicit deployment mode.
+        let credentials = if crate::managed_platform_mode() {
+            KmsCredentialSource::MetadataServiceAccount {
+                token_url: std::env::var("KMS_METADATA_TOKEN_URL")
+                    .unwrap_or_else(|_| METADATA_SERVICE_ACCOUNT_TOKEN_URL.to_owned()),
+            }
+        } else {
+            if std::env::var("ENCLAVE_KMS_VIA_ATTESTATION").as_deref() != Ok("1") {
+                return Err(EnclaveError::Kms(
+                    "ENCLAVE_KMS_VIA_ATTESTATION must be set to 1; metadata credentials are not permitted"
+                        .into(),
+                ));
+            }
+            KmsCredentialSource::Attested(AttestationCredentials::from_env()?)
+        };
 
         Ok(Self {
             http: reqwest::Client::builder()
@@ -218,15 +248,35 @@ impl GcpKmsClient {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             key_name,
-            attestation_creds,
+            credentials,
         })
     }
 
-    /// Return an attestation-derived KMS access token for this request. The
-    /// deployment must keep the attestation-gated principalSet as the only KMS
-    /// decrypt grant and must not grant decrypt to the VM service account.
+    /// Return the KMS access token for this request, from whichever source
+    /// this deployment selected. On an attested VM the deployment must keep
+    /// the attestation-gated principalSet as the only KMS decrypt grant and
+    /// must not grant decrypt to the VM service account.
     async fn kms_token(&self) -> Result<String> {
-        self.attestation_creds.kms_access_token().await
+        match &self.credentials {
+            KmsCredentialSource::Attested(creds) => creds.kms_access_token().await,
+            KmsCredentialSource::MetadataServiceAccount { token_url } => {
+                #[derive(Deserialize)]
+                struct TokenResponse {
+                    access_token: String,
+                }
+                let token: TokenResponse = self
+                    .http
+                    .get(token_url)
+                    .header("Metadata-Flavor", "Google")
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(token.access_token)
+            }
+        }
     }
 }
 
@@ -469,5 +519,64 @@ mod tests {
         let loaded_dek = load_dek(&kms, &wrapped).await.unwrap();
         let recovered = decrypt_bound_blob(&loaded_dek, &blob, context).unwrap();
         assert_eq!(&recovered.plaintext, plaintext);
+    }
+
+    /// The weaker credential source must be reachable only by the exact
+    /// deployment-mode string, and an attested deployment must never accept
+    /// metadata credentials in its place. Both halves live in one test because
+    /// they mutate process-global environment, which would otherwise race
+    /// against each other under the parallel test harness.
+    #[test]
+    fn deployment_mode_gates_the_kms_credential_source() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("managed"),
+            Some("Managed_Platform"),
+            Some("managed_platform "),
+        ] {
+            match value {
+                Some(v) => std::env::set_var("KIOKU_DEPLOYMENT_MODE", v),
+                None => std::env::remove_var("KIOKU_DEPLOYMENT_MODE"),
+            }
+            assert!(
+                !crate::managed_platform_mode(),
+                "{value:?} must not select the service-account KMS source"
+            );
+        }
+        std::env::set_var("KIOKU_DEPLOYMENT_MODE", "managed_platform");
+        assert!(crate::managed_platform_mode());
+
+        // On an attested deployment the metadata service account must never be
+        // able to stand in for an attestation.
+        std::env::remove_var("KIOKU_DEPLOYMENT_MODE");
+        for (key, value) in [
+            ("KMS_PROJECT", "p"),
+            ("KMS_LOCATION", "l"),
+            ("KMS_KEY_RING", "r"),
+            ("KMS_KEY", "k"),
+        ] {
+            std::env::set_var(key, value);
+        }
+        std::env::remove_var("ENCLAVE_KMS_VIA_ATTESTATION");
+        let error = match GcpKmsClient::from_env() {
+            Ok(_) => panic!("attested mode must refuse metadata credentials"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("ENCLAVE_KMS_VIA_ATTESTATION"),
+            "unexpected refusal: {error}"
+        );
+        for key in [
+            "KMS_PROJECT",
+            "KMS_LOCATION",
+            "KMS_KEY_RING",
+            "KMS_KEY",
+            "KIOKU_DEPLOYMENT_MODE",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 }
