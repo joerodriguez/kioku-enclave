@@ -253,6 +253,13 @@ coordinates, and content-free claim outcomes. They must not contain transcript/O
 summaries, raw URLs with query/fragment, media bytes, embeddings, keys, tokens, provider secrets,
 database URLs, or plaintext error bodies from external services.
 
+Signup emits one content-free `signup_v1` event for every committed account creation (`created`,
+labelled `google`, `apple`, or `reviewer`) and every daily-budget refusal (`refused`): fixed
+provider/outcome literals plus the service-wide daily account count and budget, never an account
+id, email, or provider subject. The deployment repository's log-based signup metrics and refusal
+alert read `metric_schema`, `outcome`, and `provider`; the counters are informational. The
+production JSON shape and default level are pinned by a unit test.
+
 Public authentication, readiness, provider, export, and deletion failures are stable and content-
 free. Detailed provider/database errors remain inside the protected operational boundary and must
 still be redacted before logging.

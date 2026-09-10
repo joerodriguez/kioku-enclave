@@ -1261,14 +1261,24 @@ mod tests {
             }));
         }
         let mut account_id = None;
+        let mut creations = 0;
         for signup in signups {
-            let account = signup.await.unwrap().unwrap();
+            let upsert = signup.await.unwrap().unwrap();
+            let account = upsert.account;
             assert_eq!(account.email, "owner@example.com");
             match &account_id {
                 Some(expected) => assert_eq!(&account.id, expected),
                 None => account_id = Some(account.id),
             }
+            // Exactly one of the racing upserts inserts the account and spends
+            // the day's first budget unit; every other caller is a returning
+            // user of that same account.
+            if let Some(accounts_today) = upsert.signup_accounts_today {
+                assert_eq!(accounts_today, 1);
+                creations += 1;
+            }
         }
+        assert_eq!(creations, 1, "one creation across the concurrent upserts");
         let account_id = account_id.unwrap();
         assert_eq!(
             repositories
@@ -3268,11 +3278,14 @@ mod tests {
         // The same tenant-local ids may exist for different accounts. Search
         // must bind the authenticated account at every candidate and row
         // retrieval step, including vector-only matches.
-        let other_account = repositories
+        let other_signup = repositories
             .identity_sessions()
             .upsert_subject_account("other-tenant-subject", "other@example.com", 2)
             .await
             .unwrap();
+        // The refused attempt above rolled back, so it spent no budget.
+        assert_eq!(other_signup.signup_accounts_today, Some(2));
+        let other_account = other_signup.account;
         let embedding = format!(
             "[{}]",
             std::iter::repeat_n((1.0_f32 / 384.0_f32.sqrt()).to_string(), 384)
@@ -4450,7 +4463,8 @@ mod tests {
             .identity_sessions()
             .upsert_subject_account(&reviewer_subject, "reviewer@example.com", i64::MAX)
             .await
-            .unwrap();
+            .unwrap()
+            .account;
         assert_eq!(
             reviewer_account.id,
             crate::cp::tokens::derive_stable_uuid(&reviewer_subject)
@@ -5380,7 +5394,8 @@ mod tests {
                 11,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .account;
         let audio_manifest: crate::cp::media::CaptureEventManifest =
             serde_json::from_value(serde_json::json!({
                 "schema_version": 2,
@@ -5576,6 +5591,67 @@ mod tests {
         .await
         .unwrap()
         .is_none());
+
+        // Sign in with Apple creates and then recognizes an account through the
+        // same daily budget, and the receipt tells the two apart: only the
+        // creating call spends a unit and learns the day's count, a returning
+        // user needs no budget at all, and a further new subject is refused.
+        let accounts_before_apple = sqlx::query_scalar::<_, i64>(
+            "SELECT accounts FROM signup_daily WHERE day = CURRENT_DATE",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let apple_budget = accounts_before_apple + 1;
+        let apple_grant = || AppleAccountGrant {
+            subject: "apple-native-subject".into(),
+            email: "Apple-Native@Example.com".into(),
+            client_id: "com.kiokuu.app".into(),
+            refresh_token: "apple-native-refresh".into(),
+        };
+        let apple_created = repositories
+            .identity_sessions()
+            .upsert_apple_account(apple_grant(), apple_budget)
+            .await
+            .unwrap();
+        assert_eq!(apple_created.signup_accounts_today, Some(apple_budget));
+        assert_eq!(apple_created.account.email, "apple-native@example.com");
+        assert_eq!(
+            apple_created.account.id,
+            crate::cp::tokens::derive_provider_uuid("apple", "apple-native-subject")
+        );
+        let apple_returning = repositories
+            .identity_sessions()
+            .upsert_apple_account(apple_grant(), apple_budget)
+            .await
+            .unwrap();
+        assert_eq!(apple_returning.signup_accounts_today, None);
+        assert_eq!(apple_returning.account, apple_created.account);
+        assert!(matches!(
+            repositories
+                .identity_sessions()
+                .upsert_apple_account(
+                    AppleAccountGrant {
+                        subject: "apple-refused-subject".into(),
+                        email: "apple-refused@example.com".into(),
+                        client_id: "com.kiokuu.app".into(),
+                        refresh_token: "apple-refused-refresh".into(),
+                    },
+                    apple_budget,
+                )
+                .await,
+            Err(crate::error::EnclaveError::SignupLimited)
+        ));
+        assert_eq!(
+            repositories
+                .identity_sessions()
+                .account_session(&apple_created.account.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .providers,
+            vec!["apple"]
+        );
 
         Box::pin(super::activation::test_real_pg_activation_contract(
             &persistence,

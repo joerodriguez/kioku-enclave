@@ -740,6 +740,26 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+/// Log directives when `RUST_LOG` is unset. `info` is part of the observability
+/// contract: the deployment repository's log-based signup metric counts an
+/// INFO-level `signup_v1` event, so a stricter default would silently empty its
+/// dashboard.
+pub(crate) const DEFAULT_LOG_DIRECTIVES: &str = "info";
+
+/// The production structured-log configuration: one JSON object per event with
+/// tracing's fields nested under `fields`, which Cloud Run surfaces as
+/// `jsonPayload.fields.*`. The deployment repository's log-based metrics read
+/// that shape, so `cp::signup_observation_tests` pins it through this builder.
+pub(crate) fn json_log_subscriber(
+    filter: EnvFilter,
+) -> tracing_subscriber::fmt::SubscriberBuilder<
+    tracing_subscriber::fmt::format::JsonFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
+    EnvFilter,
+> {
+    tracing_subscriber::fmt().with_env_filter(filter).json()
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -908,12 +928,11 @@ async fn async_main() {
         return;
     }
     // Structured logging; RUST_LOG overrides the default.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+    json_log_subscriber(
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES)),
+    )
+    .init();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

@@ -62,7 +62,9 @@ pub(crate) use finalization::{
     FinalizationSettlement, FinalizationUtterance,
 };
 pub(crate) use gcs_media::GcsMediaObjectStore;
-pub(crate) use identity::{AccountStatus, AppleAccountGrant, IdentitySessionRepository};
+pub(crate) use identity::{
+    Account, AccountStatus, AccountUpsert, AppleAccountGrant, IdentitySessionRepository,
+};
 pub use lifecycle::AccountDeletionOperation;
 pub(crate) use lifecycle::AccountLifecycleRepository;
 pub(crate) use media_object::MediaObjectStore;

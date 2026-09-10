@@ -495,7 +495,12 @@ pub async fn require_auth(
                 .upsert_subject_account(&google_sub, &email, state.config.signup_limit_per_day)
                 .await
             {
-                Ok(user) => {
+                Ok(upsert) => {
+                    let user = super::observe_account_upsert(
+                        "google",
+                        upsert,
+                        state.config.signup_limit_per_day,
+                    );
                     req.extensions_mut().insert(AuthUser(user.id));
                     req.extensions_mut().insert(evidence);
                     next.run(req).await

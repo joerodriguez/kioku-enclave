@@ -9,6 +9,19 @@ pub(crate) struct Account {
     pub(crate) email: String,
 }
 
+/// One settled account upsert: the account, plus the day's running
+/// new-account count when this call created it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountUpsert {
+    pub(crate) account: Account,
+    /// `Some(accounts_today)` exactly when this call inserted the account and
+    /// spent one unit of the daily signup budget, reported only after that
+    /// transaction committed. Returning users and rebinds carry `None`, and a
+    /// commit whose acknowledgement is lost is retried as a returning user, so
+    /// the receipt under-counts and never over-counts.
+    pub(crate) signup_accounts_today: Option<i64>,
+}
+
 /// Lifecycle states that affect authentication admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountStatus {
@@ -61,19 +74,20 @@ pub(crate) trait IdentitySessionRepository: Send + Sync {
     ///
     /// Callers namespace non-consumer identities before this boundary. The
     /// subject, account derivation, signup-budget reservation, and identity
-    /// record are one application transaction.
+    /// record are one application transaction, and the receipt says whether
+    /// that transaction created the account.
     async fn upsert_subject_account(
         &self,
         subject: &str,
         email: &str,
         signup_limit_per_day: i64,
-    ) -> Result<Account>;
+    ) -> Result<AccountUpsert>;
 
     async fn upsert_apple_account(
         &self,
         grant: AppleAccountGrant,
         signup_limit_per_day: i64,
-    ) -> Result<Account>;
+    ) -> Result<AccountUpsert>;
 
     async fn link_apple_identity(&self, account_id: &str, grant: AppleAccountGrant) -> Result<()>;
 
