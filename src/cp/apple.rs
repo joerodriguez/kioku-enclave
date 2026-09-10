@@ -645,7 +645,9 @@ async fn web_callback(State(state): State<Arc<CpState>>, body: String) -> Respon
         .upsert_apple_account(persistence_grant(&grant), state.config.signup_limit_per_day)
         .await
     {
-        Ok(user) => user,
+        Ok(upsert) => {
+            super::observe_account_upsert("apple", upsert, state.config.signup_limit_per_day)
+        }
         Err(EnclaveError::SignupLimited) => {
             super::observe_signup_refused("apple", state.config.signup_limit_per_day);
             return oauth::signup_limited_page();
@@ -695,7 +697,9 @@ async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) ->
         .upsert_apple_account(persistence_grant(&grant), state.config.signup_limit_per_day)
         .await
     {
-        Ok(user) => user,
+        Ok(upsert) => {
+            super::observe_account_upsert("apple", upsert, state.config.signup_limit_per_day)
+        }
         Err(EnclaveError::SignupLimited) => {
             super::observe_signup_refused("apple", state.config.signup_limit_per_day);
             return (

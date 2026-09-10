@@ -979,7 +979,13 @@ async fn reviewer_login(
         )
         .await
     {
-        Ok(user) => user,
+        // The exact reviewer identity is exempt from the public daily budget,
+        // but its one-time creation still spends a budget unit, so it is
+        // observed under its own fixed literal: the signups dashboard then
+        // matches what the budget saw without mislabelling it a Google signup.
+        Ok(upsert) => {
+            super::observe_account_upsert("reviewer", upsert, s.config.signup_limit_per_day)
+        }
         Err(error) => {
             observe_reviewer_error("account_upsert", &error);
             return reviewer_json(
@@ -1414,7 +1420,9 @@ async fn google_callback(
         .upsert_subject_account(&google_sub, &email, s.config.signup_limit_per_day)
         .await
     {
-        Ok(u) => u,
+        Ok(upsert) => {
+            super::observe_account_upsert("google", upsert, s.config.signup_limit_per_day)
+        }
         Err(crate::error::EnclaveError::SignupLimited) => {
             super::observe_signup_refused("google", s.config.signup_limit_per_day);
             return signup_limited_page();

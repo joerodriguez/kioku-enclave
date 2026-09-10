@@ -4,7 +4,8 @@ use sqlx::Row;
 use crate::error::{EnclaveError, Result};
 
 use super::super::identity::{
-    Account, AccountSession, AccountStatus, AppleAccountGrant, IdentitySessionRepository,
+    Account, AccountSession, AccountStatus, AccountUpsert, AppleAccountGrant,
+    IdentitySessionRepository,
 };
 use super::{advisory_transaction_lock, PostgresPersistence};
 
@@ -72,7 +73,7 @@ impl IdentitySessionRepository for PostgresPersistence {
         subject: &str,
         email: &str,
         signup_limit_per_day: i64,
-    ) -> Result<Account> {
+    ) -> Result<AccountUpsert> {
         let provider = "google";
         let stable_id = crate::cp::tokens::derive_stable_uuid(subject);
         let mut transaction = self.pool().begin().await?;
@@ -121,13 +122,16 @@ impl IdentitySessionRepository for PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
-            return Ok(Account {
-                id: account_id,
-                email: email.to_string(),
+            return Ok(AccountUpsert {
+                account: Account {
+                    id: account_id,
+                    email: email.to_string(),
+                },
+                signup_accounts_today: None,
             });
         }
 
-        reserve_signup(&mut transaction, signup_limit_per_day).await?;
+        let accounts_today = reserve_signup(&mut transaction, signup_limit_per_day).await?;
         sqlx::query(
             "INSERT INTO accounts \
                 (id, email, status, primary_provider, primary_subject) \
@@ -150,9 +154,12 @@ impl IdentitySessionRepository for PostgresPersistence {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(Account {
-            id: stable_id,
-            email: email.to_string(),
+        Ok(AccountUpsert {
+            account: Account {
+                id: stable_id,
+                email: email.to_string(),
+            },
+            signup_accounts_today: Some(accounts_today),
         })
     }
 
@@ -160,7 +167,7 @@ impl IdentitySessionRepository for PostgresPersistence {
         &self,
         grant: AppleAccountGrant,
         signup_limit_per_day: i64,
-    ) -> Result<Account> {
+    ) -> Result<AccountUpsert> {
         let provider = "apple";
         let email = grant.email.to_lowercase();
         let stable_id = crate::cp::tokens::derive_provider_uuid(provider, &grant.subject);
@@ -184,7 +191,7 @@ impl IdentitySessionRepository for PostgresPersistence {
         .fetch_optional(&mut *transaction)
         .await?;
 
-        let (account_id, primary_email) = if let Some(row) = existing {
+        let (account_id, primary_email, signup_accounts_today) = if let Some(row) = existing {
             let status: String = row.try_get("status")?;
             if status != "active" {
                 return Err(EnclaveError::Auth("account inactive".into()));
@@ -209,7 +216,7 @@ impl IdentitySessionRepository for PostgresPersistence {
                     .await?;
                 primary_email = email.clone();
             }
-            (account_id, primary_email)
+            (account_id, primary_email, None)
         } else {
             let collision = sqlx::query(
                 "SELECT primary_provider, primary_subject, status \
@@ -221,7 +228,7 @@ impl IdentitySessionRepository for PostgresPersistence {
             if collision.is_some() {
                 return Err(EnclaveError::Conflict("provider identity collision".into()));
             }
-            reserve_signup(&mut transaction, signup_limit_per_day).await?;
+            let accounts_today = reserve_signup(&mut transaction, signup_limit_per_day).await?;
             sqlx::query(
                 "INSERT INTO accounts \
                     (id, email, status, primary_provider, primary_subject) \
@@ -241,7 +248,7 @@ impl IdentitySessionRepository for PostgresPersistence {
             .bind(&email)
             .execute(&mut *transaction)
             .await?;
-            (stable_id, email.clone())
+            (stable_id, email.clone(), Some(accounts_today))
         };
 
         sqlx::query(
@@ -258,9 +265,12 @@ impl IdentitySessionRepository for PostgresPersistence {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(Account {
-            id: account_id,
-            email: primary_email,
+        Ok(AccountUpsert {
+            account: Account {
+                id: account_id,
+                email: primary_email,
+            },
+            signup_accounts_today,
         })
     }
 

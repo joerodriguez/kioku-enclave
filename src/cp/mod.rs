@@ -47,6 +47,7 @@ pub mod voice_memory;
 pub mod voice_quality;
 pub mod webhook_worker;
 
+use crate::persistence::{Account, AccountUpsert};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,7 +67,29 @@ pub(crate) fn reviewer_identity_subject(uid: &str) -> String {
     format!("{REVIEWER_IDENTITY_SUBJECT_PREFIX}{uid}")
 }
 
-/// Content-free observation for a daily signup-budget refusal.
+/// Content-free signup observations for the deployment repository's
+/// log-based metrics (`kioku_signup_created` / `kioku_signup_refused`) and
+/// its "Kioku signups" dashboard.
+///
+/// `provider` and `outcome` are fixed low-cardinality literals and the
+/// counters are service-wide totals for the current UTC day. No account id,
+/// email, provider subject, token, or address ever enters these events, so
+/// they stay safe to export to Cloud Logging and to aggregate into metrics.
+pub(super) fn observe_signup_created(provider: &'static str, accounts_today: i64, budget: i64) {
+    tracing::info!(
+        target: "kioku::signup",
+        metric_schema = "signup_v1",
+        provider,
+        outcome = "created",
+        accounts_today,
+        budget,
+        "account created within the daily budget"
+    );
+}
+
+/// Emitted when the daily budget refuses a would-be new account. Warn level:
+/// nothing is broken, but a real person was turned away and the operator
+/// should see it.
 pub(super) fn observe_signup_refused(provider: &'static str, budget: i64) {
     tracing::warn!(
         target: "kioku::signup",
@@ -77,6 +100,20 @@ pub(super) fn observe_signup_refused(provider: &'static str, budget: i64) {
         budget,
         "signup refused by the daily budget"
     );
+}
+
+/// Unwrap a settled upsert, observing the signup when that call created the
+/// account. The repository answers only after its transaction committed, so
+/// a rolled-back insert is never counted as an account that exists.
+pub(super) fn observe_account_upsert(
+    provider: &'static str,
+    upsert: AccountUpsert,
+    budget: i64,
+) -> Account {
+    if let Some(accounts_today) = upsert.signup_accounts_today {
+        observe_signup_created(provider, accounts_today, budget);
+    }
+    upsert.account
 }
 
 pub(crate) fn bounded_http_client() -> reqwest::Client {
@@ -743,5 +780,176 @@ mod configuration_tests {
                 "accepted malformed or unreviewed quota {malformed:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod signup_observation_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::{observe_account_upsert, observe_signup_created, observe_signup_refused};
+    use crate::persistence::{Account, AccountUpsert};
+    use crate::{json_log_subscriber, DEFAULT_LOG_DIRECTIVES};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `emit` under the production JSON log configuration at its default
+    /// level and return the raw bytes the formatter wrote.
+    fn capture_raw(emit: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let subscriber =
+            json_log_subscriber(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES))
+                .with_writer(captured.clone())
+                .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// One parsed object per emitted line.
+    fn parse_events(raw: &str) -> Vec<serde_json::Value> {
+        raw.lines()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}"))
+            })
+            .collect()
+    }
+
+    fn capture(emit: impl FnOnce()) -> Vec<serde_json::Value> {
+        parse_events(&capture_raw(emit))
+    }
+
+    fn sorted_field_keys(event: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = event["fields"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The deployment repository's log-based metrics select
+    /// `jsonPayload.fields.metric_schema="signup_v1"` with
+    /// `jsonPayload.fields.outcome` of `created` or `refused`, and label by
+    /// `jsonPayload.fields.provider`: Cloud Run parses each JSON line, so
+    /// tracing's fields arrive under `fields`. Renaming a field or literal here
+    /// would silently empty the signups dashboard and mute the refusal alert,
+    /// which is worse than failing loudly, so the wire format is pinned.
+    #[test]
+    fn signup_events_serialize_the_fields_the_log_metrics_match_on() {
+        let raw = capture_raw(|| {
+            observe_signup_created("google", 7, 25);
+            observe_signup_refused("apple", 25);
+        });
+        let events = parse_events(&raw);
+        assert_eq!(events.len(), 2, "{events:?}");
+
+        let created = &events[0];
+        assert_eq!(created["target"], "kioku::signup");
+        assert_eq!(created["level"], "INFO");
+        assert_eq!(created["fields"]["metric_schema"], "signup_v1");
+        assert_eq!(created["fields"]["provider"], "google");
+        assert_eq!(created["fields"]["outcome"], "created");
+        assert_eq!(created["fields"]["accounts_today"], 7);
+        assert_eq!(created["fields"]["budget"], 25);
+
+        let refused = &events[1];
+        assert_eq!(refused["target"], "kioku::signup");
+        assert_eq!(refused["level"], "WARN");
+        assert_eq!(refused["fields"]["metric_schema"], "signup_v1");
+        assert_eq!(refused["fields"]["provider"], "apple");
+        assert_eq!(refused["fields"]["outcome"], "refused");
+        assert_eq!(refused["fields"]["accounts_today"], 25);
+        assert_eq!(refused["fields"]["budget"], 25);
+
+        // Content-free: both events carry exactly the metric fields plus the
+        // human message, so no account id, email, subject, or token can ride
+        // along.
+        for event in &events {
+            assert_eq!(
+                sorted_field_keys(event),
+                [
+                    "accounts_today",
+                    "budget",
+                    "message",
+                    "metric_schema",
+                    "outcome",
+                    "provider"
+                ]
+            );
+        }
+        assert!(!raw.contains('@'), "{raw}");
+        // The retired VM topology grepped these exact substrings out of the
+        // raw line; they still hold on the bytes the formatter writes.
+        for substring in [
+            r#""metric_schema":"signup_v1""#,
+            r#""outcome":"created""#,
+            r#""outcome":"refused""#,
+            r#""provider":"google""#,
+            r#""provider":"apple""#,
+        ] {
+            assert!(raw.contains(substring), "{substring} missing from {raw}");
+        }
+    }
+
+    #[test]
+    fn only_an_upsert_that_created_the_account_is_observed_as_a_signup() {
+        let account = Account {
+            id: "11111111-1111-4111-8111-111111111111".into(),
+            email: "owner@example.com".into(),
+        };
+        let events = capture(|| {
+            let returning = observe_account_upsert(
+                "google",
+                AccountUpsert {
+                    account: account.clone(),
+                    signup_accounts_today: None,
+                },
+                10,
+            );
+            assert_eq!(returning, account);
+            let created = observe_account_upsert(
+                "apple",
+                AccountUpsert {
+                    account: account.clone(),
+                    signup_accounts_today: Some(3),
+                },
+                10,
+            );
+            assert_eq!(created, account);
+        });
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["fields"]["provider"], "apple");
+        assert_eq!(events[0]["fields"]["outcome"], "created");
+        assert_eq!(events[0]["fields"]["accounts_today"], 3);
+        assert_eq!(events[0]["fields"]["budget"], 10);
+        // The account handed back never reaches the event.
+        let serialized = events[0].to_string();
+        assert!(!serialized.contains("owner@example.com"), "{serialized}");
+        assert!(!serialized.contains("11111111"), "{serialized}");
     }
 }
