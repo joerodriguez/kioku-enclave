@@ -23,9 +23,9 @@ struct ReaderGate {
     resume: Notify,
     settings: Mutex<Option<(String, String)>>,
 }
-static READER_GATES: OnceLock<Mutex<HashMap<(String, &'static str), Arc<ReaderGate>>>> =
-    OnceLock::new();
-fn gates() -> &'static Mutex<HashMap<(String, &'static str), Arc<ReaderGate>>> {
+type ReaderGateRegistry = HashMap<(String, &'static str), Arc<ReaderGate>>;
+static READER_GATES: OnceLock<Mutex<ReaderGateRegistry>> = OnceLock::new();
+fn gates() -> &'static Mutex<ReaderGateRegistry> {
     READER_GATES.get_or_init(Default::default)
 }
 fn arm(account: &str, stage: &'static str) -> Arc<ReaderGate> {
