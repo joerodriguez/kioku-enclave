@@ -163,6 +163,17 @@ verifies the orphan-erasure catalog and distinguishes pending, complete-but-capt
 fully restored states. Consumers must validate the exact image-selected shape; historical v2/v3
 evidence is not v6 evidence and cannot authorize the new release's gates.
 
+### Interrupted-capture recovery companion (source-only handoff)
+
+This candidate requires the independently verified v29 provenance companion. The deployment
+repository includes the standard `v29-interrupted-capture-install` operator phase and exact
+result journal, but a later authorized release must pin its reviewed migrator image before
+execution. See the [schema handoff](docs/postgresql-schema-releases.md). Installation preserves
+the base markers and signed v27 history; predecessor binaries become unready because their
+catalog verifier does not recognize the new constraint. Coordinate that compatibility boundary
+with the existing ADR-0045 transition requirements. These merged sources neither publish an
+image nor authorize installation, serving rollout, or client distribution.
+
 ### ADR-0045 organization producer change (source-only handoff)
 
 The ADR-0045 compiled producer is

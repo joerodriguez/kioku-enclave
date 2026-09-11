@@ -656,6 +656,21 @@ accepted. It records the same provisional finish request as an accepted audio ma
 with `session_finished=true`; neither call rejects a later offline outbox item merely
 because a prior quiet seal was reached.
 
+If a device stops sending without either finish marker, the recurring ten-minute
+account sweep can recover the session after **30 minutes without a newly accepted
+event**. The clock is PostgreSQL receipt time, including session creation; old device
+timestamps cannot close a newly uploaded offline recording, and duplicate retries do
+not reset that clock. Recovery records `server_inactivity_v1` internally and sets the
+provisional end to the last accepted capture horizon, not the time the sweep runs.
+It processes at most 32 eligible sessions per account per pass. Live account upload
+reservations, pending deletion, missing accepted sequence numbers, and known unsettled
+canonical media hold recovery; held sessions do not consume the eligible batch limit.
+No empty session or absent source is invented. The ordinary formation debounce and
+four-hour quiet seal still apply, and a later offline upload can reopen the exact seal
+through the same audited path. A client never needs a new recovery API. This backstop
+operates after the activation contract has drained predecessor writers and requires
+the separately installed interrupted-capture schema companion.
+
 ## Screenshot evidence bytes
 
 Cloud Capture v2 does not use the retired device-sync upload planner. Authenticated

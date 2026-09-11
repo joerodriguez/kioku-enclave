@@ -597,7 +597,7 @@ async fn upsert_session_and_stream(
     Ok(seal_reopen)
 }
 
-async fn record_provisional_finish(
+pub(super) async fn record_provisional_finish(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     capture_session_id: &str,
@@ -606,7 +606,10 @@ async fn record_provisional_finish(
 ) -> Result<()> {
     if !matches!(
         provenance,
-        "event_finish_v1" | "finish_endpoint_v1" | "legacy_client_refinish_v1"
+        "event_finish_v1"
+            | "finish_endpoint_v1"
+            | "legacy_client_refinish_v1"
+            | "server_inactivity_v1"
     ) {
         return Err(EnclaveError::Store(
             "capture finish provenance is invalid".into(),
@@ -1635,6 +1638,10 @@ async fn postgres_session_status(
 
 #[async_trait]
 impl CaptureRepository for PostgresPersistence {
+    async fn recover_inactive_sessions(&self, account_id: &str) -> Result<u64> {
+        super::capture_recovery::recover_inactive_sessions(self, account_id).await
+    }
+
     async fn preflight_event(
         &self,
         account_id: &str,

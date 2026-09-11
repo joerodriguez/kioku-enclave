@@ -580,7 +580,12 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         .await
         .is_ok()
         && state.postgres.verify_morning_email_schema().await.is_ok()
-        && state.postgres.verify_brief_sections_schema().await.is_ok();
+        && state.postgres.verify_brief_sections_schema().await.is_ok()
+        && state
+            .postgres
+            .verify_interrupted_capture_schema()
+            .await
+            .is_ok();
     let activation = if schema_ready {
         state
             .postgres
@@ -1249,6 +1254,12 @@ async fn async_main() {
         .verify_brief_sections_schema()
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL brief sections verification failed: {error}"));
+    postgres
+        .verify_interrupted_capture_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL interrupted capture schema is not release-ready: {error}")
+        });
     let reconciliation_producer_contract = cp_config
         .vertex_reconciliation_model_requested
         .as_deref()
@@ -1546,6 +1557,7 @@ const POSTGRES_ERASURE_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ERASURE_SIGNATU
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
+    InstallInterruptedCapture,
     InstallMorningEmail,
     InstallBriefSections,
     OrphanCaptureErasure,
@@ -1582,6 +1594,9 @@ fn postgres_migration_release_phase(
     match confirmation {
         Some("brief-sections-v29-install") => {
             Ok(PostgresMigrationReleasePhase::InstallBriefSections)
+        }
+        Some("interrupted-capture-v29-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallInterruptedCapture)
         }
         Some("morning-email-v28-install") => Ok(PostgresMigrationReleasePhase::InstallMorningEmail),
         Some(MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM) => {
@@ -1809,6 +1824,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallBriefSections => persistence
             .install_brief_sections_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"brief_sections", "version":29})),
+        PostgresMigrationReleasePhase::InstallInterruptedCapture => persistence
+            .install_interrupted_capture_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"interrupted_capture", "version":29})),
         PostgresMigrationReleasePhase::InstallMorningEmail => persistence
             .install_morning_email_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"morning_email", "version":28})),
@@ -1903,6 +1921,10 @@ mod postgres_migration_release_tests {
                 PostgresMigrationReleasePhase::InstallBriefSections,
             ),
             (
+                "interrupted-capture-v29-install",
+                PostgresMigrationReleasePhase::InstallInterruptedCapture,
+            ),
+            (
                 "morning-email-v28-install",
                 PostgresMigrationReleasePhase::InstallMorningEmail,
             ),
@@ -1964,6 +1986,8 @@ mod postgres_migration_release_tests {
             Some("memory-reconciliation-v27-epoch-upgrade"),
             Some("morning-email-v28-install "),
             Some("brief-sections-v29-install "),
+            Some("interrupted-capture-v29-install "),
+            Some("interrupted-capture-v29"),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }

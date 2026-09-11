@@ -9,6 +9,7 @@ mod aggregate_audit;
 mod billing;
 mod brief_sections_schema;
 mod capture;
+mod capture_recovery;
 #[cfg(test)]
 mod catalog_presence_tests;
 mod delivery_outbox;
@@ -16,6 +17,7 @@ mod entitlement;
 mod episode_deletion;
 mod finalization;
 mod identity;
+mod interrupted_capture_schema;
 mod lifecycle;
 mod media_processing;
 mod memory_formation;
