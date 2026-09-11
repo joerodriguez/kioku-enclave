@@ -5,6 +5,12 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0029_interrupted_capture_recovery.sql` adds the independently receipted
+  `server_inactivity_v1` finish provenance. The dedicated installer verifies the exact
+  old constraint and v27 activation history before widening that one CHECK. Current
+  serving verifies the companion before reconstructing the original signed catalog;
+  older binaries reject the changed catalog. Installation is a separately authorized
+  coordinated release boundary and never rewrites historical receipts or markers.
 - `0028_morning_email.sql` installs independently receipted daily schedules, frozen
   deliveries and source coverage. Four verified triggers fence legacy per-memory sends,
   transfer eligible unsent work, and protect memory deletion and recipient changes.

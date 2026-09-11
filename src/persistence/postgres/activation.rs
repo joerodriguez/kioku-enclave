@@ -699,6 +699,16 @@ async fn ensure_pristine_reserved_catalog_namespace(connection: &mut PgConnectio
 
 async fn base_catalog_evidence(connection: &mut PgConnection) -> Result<String> {
     ensure_reserved_catalog_manifest(connection).await?;
+    let evidence = sqlx::query_scalar(CATALOG_EVIDENCE_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    super::interrupted_capture_schema::original_activation_catalog(connection, evidence).await
+}
+
+#[cfg(test)]
+pub(super) async fn test_raw_base_catalog_evidence(
+    connection: &mut PgConnection,
+) -> Result<String> {
     Ok(sqlx::query_scalar(CATALOG_EVIDENCE_SQL)
         .fetch_one(connection)
         .await?)
@@ -5638,6 +5648,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         "a fresh Paused-to-Draining proof may rotate the fleet, then Active must preserve it"
     );
     super::memory_formation::test_real_pg_oversized_formation_and_neighborhood(persistence).await?;
+    super::capture_recovery::test_real_pg_interrupted_capture_recovery(persistence).await?;
     let status = persistence
         .memory_reconciliation_activation_status()
         .await?;

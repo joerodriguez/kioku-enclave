@@ -114,6 +114,29 @@ pending seals, dirty formation revisions, and nonterminal formation pages theref
 Active blockers. The aggregate fields and schema stay stable; this staging changes only how the
 two existing composite readiness booleans combine their independently reported constituents.
 
+## Interrupted-capture companion (source implementation)
+
+The candidate requires the v29 interrupted-capture companion before startup. A separately
+authorized release must first pin the reviewed candidate migrator image in the deployment
+repository, then use its standard `v29-interrupted-capture-install` phase. The backend accepts
+only `POSTGRES_MIGRATION_CONFIRM=interrupted-capture-v29-install` and emits exactly
+`{"status":"installed","feature":"interrupted_capture","version":29}`. This unsigned
+installation result cannot serve as a signed activation root.
+
+The transaction takes the exclusive v27 activation release lock and a bounded table lock,
+verifies the exact prior activation contract and provenance CHECK, then adds only
+`server_inactivity_v1` and an independently hashed companion receipt. Retries verify that
+exact state. Serving verifies the new CHECK and receipt catalog before substituting the
+exact original CHECK in the historical catalog projection; schema markers, source rows,
+and signed activation contracts/events are unchanged. Any unrelated catalog drift still
+fails verification. Older binaries cannot recognize this projection and become unready
+after installation, so this is a coordinated compatibility boundary. It does not solve or
+relax the separate ADR-0045 producer transition requirements below.
+
+No production migration, image publication, fleet operation, or client release is authorized
+by merging these sources. The sweeper runs only after the ordinary v27 drain authority is
+installed; it does not activate reconciliation or send email itself.
+
 ## ADR-0045 morning-email companion (source implementation)
 
 The candidate requires the additive morning-email contract before serving startup. A

@@ -185,4 +185,8 @@ pub(crate) trait CaptureRepository: Send + Sync {
         account_id: &str,
         capture_session_id: &str,
     ) -> Result<Option<CaptureSessionStatus>>;
+
+    /// Recover a bounded batch of interrupted sessions using database receipt
+    /// inactivity, preserving provisional finish and late-upload semantics.
+    async fn recover_inactive_sessions(&self, account_id: &str) -> Result<u64>;
 }

@@ -1843,6 +1843,16 @@ pub async fn summarize_all(state: &CpState) {
     let failing = FAILING.get_or_init(|| Mutex::new(HashMap::new()));
 
     for id in ids {
+        // Durable recovery does not depend on a client finish hint surviving a
+        // crash. Run before formation even when the forward cursor is caught up.
+        if let Err(error) = state
+            .repositories
+            .captures()
+            .recover_inactive_sessions(&id)
+            .await
+        {
+            warn!(user_id = %id, error = %error, "interrupted capture recovery deferred");
+        }
         for _ in 0..SPARSE_LOOKBACK_MAX_WINDOWS {
             match summarize_user(state, &id).await {
                 // Empty spans perform no model work and are safe to traverse
