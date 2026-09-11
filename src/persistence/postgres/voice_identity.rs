@@ -1,7 +1,9 @@
 //! PostgreSQL voice leases, session-local continuity and erasure recomputation.
 use super::{
-    activation::lock_activation_contract_key_share_if_installed, advisory_transaction_lock,
-    allocate_content_id, current_schema_relation_exists, PostgresPersistence,
+    activation::lock_activation_contract_key_share_if_installed,
+    advisory_transaction_lock, allocate_content_id, current_schema_relation_exists,
+    speaker_identity::{refresh_episode_speaker_projections, SpeakerProjectionTarget},
+    PostgresPersistence,
 };
 use crate::{
     cp::{
@@ -84,6 +86,66 @@ async fn lock_account(tx: &mut Transaction<'_, Postgres>, account: &str) -> Resu
             == Some("active"),
     )
 }
+/// Refresh every memory reached by the changed identity, including stored
+/// reservations/participants whose last source was removed by erasure. This is
+/// only reachability: the canonical projector owns labels, acceptance and fences.
+/// Callers hold the activation/account memory lock ladder in this transaction.
+pub(super) async fn refresh_affected_speaker_projections(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+    clusters: &[i64],
+    profiles: &[i64],
+    people: &[i64],
+) -> Result<()> {
+    let targets =
+        affected_speaker_projection_targets(tx, account, clusters, profiles, people).await?;
+    refresh_episode_speaker_projections(tx, account, &targets, &[]).await?;
+    Ok(())
+}
+
+async fn affected_speaker_projection_targets(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+    clusters: &[i64],
+    profiles: &[i64],
+    people: &[i64],
+) -> Result<Vec<SpeakerProjectionTarget>> {
+    if clusters.is_empty() && profiles.is_empty() && people.is_empty() {
+        return Ok(Vec::new());
+    }
+    let episodes: Vec<i64> = sqlx::query_scalar(
+        "SELECT member.episode_id FROM episode_members member \
+           JOIN utterances u ON u.account_id=member.account_id AND u.id=member.record_id \
+           JOIN speaker_observations observation ON observation.account_id=u.account_id \
+                AND observation.id=u.speaker_observation_id \
+           LEFT JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id \
+                AND cluster.id=observation.cluster_id \
+           LEFT JOIN voice_profiles profile ON profile.account_id=cluster.account_id \
+                AND profile.id=cluster.voice_profile_id \
+          WHERE member.account_id=$1 AND member.record_type='utterance' \
+            AND (observation.cluster_id=ANY($2::bigint[]) \
+              OR cluster.voice_profile_id=ANY($3::bigint[]) \
+              OR observation.person_id=ANY($4::bigint[]) \
+              OR cluster.person_id=ANY($4::bigint[]) OR profile.person_id=ANY($4::bigint[])) \
+         UNION SELECT slot.episode_id FROM episode_speaker_slots slot \
+          WHERE slot.account_id=$1 AND (slot.speaker_cluster_id=ANY($2::bigint[]) \
+              OR slot.voice_profile_id=ANY($3::bigint[])) \
+         UNION SELECT participant.episode_id FROM episode_participants participant \
+          WHERE participant.account_id=$1 AND participant.person_id=ANY($4::bigint[]) \
+         ORDER BY episode_id",
+    )
+    .bind(account)
+    .bind(clusters)
+    .bind(profiles)
+    .bind(people)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(episodes
+        .into_iter()
+        .map(SpeakerProjectionTarget::current)
+        .collect())
+}
+
 async fn controls_admit(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
@@ -317,6 +379,7 @@ async fn persist_sample(
     let Some(cluster) = cluster else {
         return Ok(vec!["unassigned"]);
     };
+    let cluster_id: i64 = cluster.try_get("id")?;
     let state: String = cluster.try_get("attribution_state")?;
     if state == "owner_transmit" || diagnostics.decision == SampleDecision::Quarantine {
         return Ok(vec!["unassigned"]);
@@ -376,13 +439,14 @@ async fn persist_sample(
     {
         sqlx::query("UPDATE voice_profiles SET status='quarantined',updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2").bind(account).bind(profile).execute(&mut **tx).await?;
         append_revision(tx, account, profile, "person_binding_conflict").await?;
+        refresh_affected_speaker_projections(tx, account, &[cluster_id], &[profile], &[]).await?;
         return Ok(vec!["person_binding_conflict"]);
     }
     let propagated = current_person.is_none() && cluster_person.is_some();
     if propagated {
         sqlx::query("UPDATE voice_profiles SET person_id=$3,updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2").bind(account).bind(profile).bind(cluster_person).execute(&mut **tx).await?;
     }
-    sqlx::query("UPDATE speaker_clusters SET voice_profile_id=$3,attribution_state=CASE WHEN attribution_state='request_local' THEN 'anonymous_profile' ELSE attribution_state END,updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2").bind(account).bind(cluster.try_get::<i64,_>("id")?).bind(profile).execute(&mut **tx).await?;
+    sqlx::query("UPDATE speaker_clusters SET voice_profile_id=$3,attribution_state=CASE WHEN attribution_state='request_local' THEN 'anonymous_profile' ELSE attribution_state END,updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2").bind(account).bind(cluster_id).bind(profile).execute(&mut **tx).await?;
     sqlx::query("UPDATE voice_samples SET voice_profile_id=$3 WHERE account_id=$1 AND id=$2")
         .bind(account)
         .bind(sample_id)
@@ -408,6 +472,7 @@ async fn persist_sample(
     } else if propagated {
         append_revision(tx, account, profile, "person_propagation").await?;
     }
+    refresh_affected_speaker_projections(tx, account, &[cluster_id], &[profile], &[]).await?;
     let mut outcomes = vec![if created { "new_profile" } else { "matched" }];
     if propagated {
         outcomes.push("person_propagated");
@@ -478,6 +543,13 @@ pub(super) async fn recompute_profile(
     append_revision(tx, account, profile, reason).await
 }
 
+/// Identity reachability is captured before source cascades remove named
+/// observations that never needed an anonymous slot reservation.
+pub(super) struct VoiceErasureAffected {
+    profiles: Vec<i64>,
+    targets: Vec<SpeakerProjectionTarget>,
+}
+
 /// Remove every sample derived from a deleted event, including multi-event
 /// observations anchored in a surviving event, before source-row cascades lose
 /// that provenance. The caller holds the ordinary deletion lock ladder.
@@ -485,21 +557,31 @@ pub(super) async fn erase_event_samples(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
     events: &[String],
-) -> Result<Vec<i64>> {
+) -> Result<VoiceErasureAffected> {
     let sample_ids:Vec<i64>=sqlx::query_scalar("SELECT s.id FROM voice_samples s JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id WHERE s.account_id=$1 AND (o.event_id=ANY($2::text[]) OR EXISTS(SELECT 1 FROM speaker_observation_sources source WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND source.event_id=ANY($2::text[]))) ORDER BY s.id").bind(account).bind(events).fetch_all(&mut **tx).await?;
     let profiles:Vec<i64>=sqlx::query_scalar("SELECT profile_id FROM voice_sample_profile_assignments WHERE account_id=$1 AND sample_id=ANY($2::bigint[]) UNION SELECT voice_profile_id AS profile_id FROM voice_samples WHERE account_id=$1 AND id=ANY($2::bigint[]) AND voice_profile_id IS NOT NULL ORDER BY profile_id").bind(account).bind(&sample_ids).fetch_all(&mut **tx).await?;
+    let mut targets = affected_speaker_projection_targets(tx, account, &[], &profiles, &[]).await?;
+    let source_memories: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT member.episode_id FROM episode_members member JOIN utterances u ON u.account_id=member.account_id AND u.id=member.record_id JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id WHERE member.account_id=$1 AND member.record_type='utterance' AND (o.event_id=ANY($2::text[]) OR EXISTS(SELECT 1 FROM speaker_observation_sources source WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND source.event_id=ANY($2::text[]))) ORDER BY member.episode_id").bind(account).bind(events).fetch_all(&mut **tx).await?;
+    targets.extend(
+        source_memories
+            .into_iter()
+            .map(SpeakerProjectionTarget::current),
+    );
+    targets.sort_by_key(|target| target.episode_id);
+    targets.dedup_by_key(|target| target.episode_id);
     sqlx::query("DELETE FROM voice_samples WHERE account_id=$1 AND id=ANY($2::bigint[])")
         .bind(account)
         .bind(&sample_ids)
         .execute(&mut **tx)
         .await?;
-    Ok(profiles)
+    Ok(VoiceErasureAffected { profiles, targets })
 }
 pub(super) async fn recompute_erased_profiles(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
-    profiles: &[i64],
+    affected: &VoiceErasureAffected,
 ) -> Result<()> {
+    let profiles = &affected.profiles;
     // Revision metadata/history survives, but erased biometrics must not.
     // Exact historical membership is unavailable, so redact every previous
     // centroid for each affected profile before appending the recomputed state.
@@ -507,6 +589,7 @@ pub(super) async fn recompute_erased_profiles(
     for profile in profiles {
         recompute_profile(tx, account, *profile, "erasure_recompute").await?;
     }
+    refresh_episode_speaker_projections(tx, account, &affected.targets, &[]).await?;
     Ok(())
 }
 
@@ -533,6 +616,49 @@ pub(super) mod tests {
         sqlx::query("INSERT INTO speaker_observation_sources(account_id,speaker_observation_id,event_id,window_start_ms,window_end_ms,event_start_ms,event_end_ms) VALUES($1,$2,$3,0,4000,0,4000)").bind(account).bind(observation).bind(event).execute(repo.pool()).await.unwrap();
         sqlx::query("INSERT INTO voice_embedding_jobs(account_id,id,speaker_observation_id,embedding_space,state) VALUES($1,$2,$2,$3,'pending')").bind(account).bind(observation).bind(EMBEDDING_SPACE).execute(repo.pool()).await.unwrap();
     }
+    pub(crate) async fn seed_voice_memory(
+        repo: &PostgresPersistence,
+        account: &str,
+        observation: i64,
+        episode: i64,
+    ) {
+        sqlx::query("INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) VALUES($1,$2,now(),now()+interval '4 seconds',4,'mic')").bind(account).bind(observation).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds,end_offset_seconds,text,speaker_label,speaker_observation_id) VALUES($1,$2,$2,0,4,'Synthetic fixture','Original source label',$2)").bind(account).bind(observation).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO episodes(account_id,id,started_at,ended_at,identity_revision) VALUES($1,$2,now(),now()+interval '4 seconds',7) ON CONFLICT DO NOTHING").bind(account).bind(episode).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO episode_members(account_id,episode_id,record_type,record_id) VALUES($1,$2,'utterance',$3)").bind(account).bind(episode).bind(observation).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO memory_archive_state(account_id,revision) VALUES($1,9) ON CONFLICT(account_id) DO UPDATE SET revision=9").bind(account).execute(repo.pool()).await.unwrap();
+    }
+
+    async fn projected_people(repo: &PostgresPersistence, account: &str, episode: i64) -> Vec<i64> {
+        sqlx::query_scalar("SELECT person_id FROM episode_participants WHERE account_id=$1 AND episode_id=$2 AND state='active' AND person_id IS NOT NULL ORDER BY person_id")
+            .bind(account).bind(episode).fetch_all(repo.pool()).await.unwrap()
+    }
+
+    async fn assert_projection_source_unchanged(repo: &PostgresPersistence, account: &str) {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT revision FROM memory_archive_state WHERE account_id=$1"
+            )
+            .bind(account)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            9,
+            "speaker projection refresh must not advance archive revision"
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT bool_and(identity_revision=7) FROM episodes WHERE account_id=$1"
+            )
+            .bind(account)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            "speaker projection refresh must not advance memory identity revisions"
+        );
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(speaker_label='Original source label') FROM utterances WHERE account_id=$1").bind(account).fetch_one(repo.pool()).await.unwrap(), "speaker projection refresh must preserve frozen source labels");
+    }
+
     fn embedding(index: usize) -> Vec<f32> {
         let mut e = vec![0.; 256];
         e[index] = 1.;
@@ -566,6 +692,188 @@ pub(super) mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn voice_speaker_projection_attachment_and_propagation_refresh_every_memory() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "voice-speaker-propagation";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for i in 1..=2 {
+            seed_voice_observation(repo, ACCOUNT, "session", &format!("event-{i}"), i, i).await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            if i == 1 {
+                sqlx::query("INSERT INTO episode_speaker_slots(account_id,id,episode_id,speaker_cluster_id,slot_ordinal) VALUES($1,100,1,1,5)").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+            }
+            let claim = claim_one(repo, ACCOUNT).await;
+            repo.settle_voice_embedding(
+                &claim,
+                outcome(
+                    0,
+                    if i == 1 {
+                        SampleDecision::Enroll
+                    } else {
+                        SampleDecision::MatchOnly
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let profile: i64 = sqlx::query_scalar(
+            "SELECT voice_profile_id FROM speaker_clusters WHERE account_id=$1 AND id=1",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(sqlx::query_as::<_,(i64,i64)>("SELECT episode_id,slot_ordinal FROM episode_speaker_slots WHERE account_id=$1 AND voice_profile_id=$2 AND status='active' ORDER BY episode_id").bind(ACCOUNT).bind(profile).fetch_all(repo.pool()).await.unwrap(), vec![(1,5),(2,0)], "voice attachment must synchronously upgrade existing cluster reservations and project every attached memory");
+        sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,1,'Synthetic Person','identified')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        seed_voice_observation(repo, ACCOUNT, "session", "event-3", 3, 3).await;
+        seed_voice_memory(repo, ACCOUNT, 3, 3).await;
+        sqlx::query("UPDATE speaker_clusters SET person_id=1,attribution_state='person_bound' WHERE account_id=$1 AND id=3").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        let claim = claim_one(repo, ACCOUNT).await;
+        repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::MatchOnly))
+            .await
+            .unwrap();
+        for episode in 1..=3 {
+            assert_eq!(projected_people(repo,ACCOUNT,episode).await, vec![1], "profile person propagation must refresh all previously attached memories before any reader prepares them");
+        }
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM episode_participants WHERE account_id=$1 AND state='active' AND derivation_version=2").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),3,"voice writer must persist current participant projections");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn voice_speaker_projection_conflict_commits_quarantine_and_preserves_direct_people() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "voice-speaker-conflict";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        seed_voice_observation(repo, ACCOUNT, "session", "event-1", 1, 1).await;
+        seed_voice_memory(repo, ACCOUNT, 1, 1).await;
+        sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,1,'Synthetic One','identified'),($1,2,'Synthetic Two','identified')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        let first = claim_one(repo, ACCOUNT).await;
+        repo.settle_voice_embedding(&first, outcome(0, SampleDecision::Enroll))
+            .await
+            .unwrap();
+        let profile: i64 = sqlx::query_scalar(
+            "SELECT voice_profile_id FROM speaker_clusters WHERE account_id=$1 AND id=1",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        for i in 2..=3 {
+            seed_voice_observation(repo, ACCOUNT, "session", &format!("event-{i}"), i, i).await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            // Historical already-shared profiles can hold contradictory direct
+            // people. Quarantine must retain both independently valid names.
+            sqlx::query("UPDATE speaker_clusters SET person_id=$3,attribution_state='person_bound',voice_profile_id=$4 WHERE account_id=$1 AND id=$2").bind(ACCOUNT).bind(i).bind(i-1).bind(profile).execute(repo.pool()).await.unwrap();
+            let claim = claim_one(repo, ACCOUNT).await;
+            repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::MatchOnly))
+                .await
+                .unwrap();
+            if i == 2 {
+                assert_eq!(projected_people(repo, ACCOUNT, 1).await, vec![1]);
+            }
+        }
+        assert!(projected_people(repo,ACCOUNT,1).await.is_empty(), "profile quarantine must synchronously remove stale profile-derived person links from earlier memories");
+        assert_eq!(
+            projected_people(repo, ACCOUNT, 2).await,
+            vec![1],
+            "quarantine refresh must preserve valid first direct identity"
+        );
+        assert_eq!(projected_people(repo,ACCOUNT,3).await,vec![2],"quarantine refresh must preserve a different valid direct identity without aborting safety maintenance");
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT status='quarantined' FROM voice_profiles WHERE account_id=$1 AND id=$2"
+            )
+            .bind(ACCOUNT)
+            .bind(profile)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            "speaker ambiguity must not roll back biometric quarantine"
+        );
+        assert!(sqlx::query_scalar::<_,bool>("SELECT state='ready' AND lease_token IS NULL FROM voice_embedding_jobs WHERE account_id=$1 AND id=3").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),"quarantine projection refresh must release its settled voice lease");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn voice_speaker_projection_erasure_refreshes_surviving_and_source_empty_memories() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "voice-speaker-erasure";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for i in 1..=2 {
+            seed_voice_observation(repo, ACCOUNT, "session", &format!("event-{i}"), i, i).await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            if i == 1 {
+                sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,1,'Synthetic Person','identified')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+                sqlx::query("UPDATE speaker_clusters SET person_id=1,attribution_state='person_bound' WHERE account_id=$1 AND id=1").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+            }
+            let claim = claim_one(repo, ACCOUNT).await;
+            repo.settle_voice_embedding(
+                &claim,
+                outcome(
+                    0,
+                    if i == 1 {
+                        SampleDecision::Enroll
+                    } else {
+                        SampleDecision::MatchOnly
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(projected_people(repo, ACCOUNT, 2).await, vec![1]);
+        // Historical contradictory direct evidence must not abort erasure.
+        sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,2,'Different Direct Person','identified')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        sqlx::query("UPDATE speaker_observations SET person_id=2 WHERE account_id=$1 AND id=2")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE speaker_clusters SET person_id=1,attribution_state='person_bound' WHERE account_id=$1 AND id=2").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        let mut tx = repo.pool().begin().await.unwrap();
+        lock_account(&mut tx, ACCOUNT).await.unwrap();
+        let profiles = erase_event_samples(&mut tx, ACCOUNT, &["event-1".into()])
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM capture_events WHERE account_id=$1 AND event_id='event-1'")
+            .bind(ACCOUNT)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        recompute_erased_profiles(&mut tx, ACCOUNT, &profiles)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(projected_people(repo,ACCOUNT,2).await.is_empty(),"erasure quarantine must synchronously clear profile-derived people in all surviving memories");
+        assert!(
+            projected_people(repo, ACCOUNT, 1).await.is_empty(),
+            "erasure must clear cached named participants after their last observation disappears"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM episode_participants WHERE account_id=$1 AND episode_id=2 AND state='active' AND participant_key LIKE 'voice_profile:%' AND person_id IS NULL").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),1,"erasure must retain an anonymous persisted participant for surviving voice evidence");
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(status='quarantined' AND octet_length(centroid)=0) FROM voice_profiles WHERE account_id=$1").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),"speaker refresh must not roll back biometric erasure");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
     #[tokio::test]
     async fn leases_expiry_fences_and_cas_are_provider_free() {
         let Some(fixture) = super::super::tests::test_persistence().await else {
@@ -1096,7 +1404,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            profiles,
+            profiles.profiles,
             vec![1, 2, 3],
             "erasure must include historical assignments and legacy direct profile links"
         );

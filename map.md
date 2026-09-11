@@ -57,9 +57,9 @@ write, or SQLite reference implementation.
 | [docs/](docs/map.md) | Architecture decisions, including the PostgreSQL-only structured-state decision. |
 | [eval/](eval/map.md) | Public, content-free voice/identity evaluation contracts and fixtures; restricted media remains outside Git. |
 | [README.md](README.md) | Product architecture, public boundaries, verification, configuration, and deployment overview. |
-| [API.md](API.md) | Stable authenticated API behavior, retries, privacy, export, deletion, playback, and provider-effect semantics. |
+| [API.md](API.md) | Stable authenticated API behavior, canonical current speaker labels and participant links, retries, privacy, export, deletion, playback, and provider-effect semantics. |
 | [SECURITY.md](SECURITY.md) | Trust model, data boundaries, threats, mitigations, release posture, and residual risks. |
-| [RELEASING.md](RELEASING.md) | Local signed release and ADR-0041 staged zero-unavailable rollout runbook. |
+| [RELEASING.md](RELEASING.md) | Local signed release and ADR-0041 staged zero-unavailable rollout runbook, with ADR-0048 phase, preparation and predecessor-writer boundaries. |
 | [TASKS.md](TASKS.md) | Current cleanup evidence, required gates, and preserved product activation blockers. |
 | [Dockerfile](Dockerfile) | Pinned static Linux/amd64 scratch image for Confidential Space; no SQLite extension workaround. |
 | `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` | Pinned Rust feature, dependency, and toolchain boundary. |

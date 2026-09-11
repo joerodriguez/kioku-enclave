@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use crate::{
     cp::isotime,
@@ -17,7 +17,24 @@ use crate::{
     },
 };
 
-use super::PostgresPersistence;
+use super::{
+    speaker_identity::{
+        load_episode_participant_details, prepare_account_speaker_projections,
+        speaker_identity_join, SpeakerMemoryScope, SpeakerUtteranceAlias,
+    },
+    PostgresPersistence,
+};
+
+// Only reviewed static SQL reaches this helper; values remain bound parameters.
+fn speaker_query(
+    statement: &'static str,
+    memory: SpeakerMemoryScope,
+) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(statement.replace(
+        "{speaker_identity}",
+        &speaker_identity_join(SpeakerUtteranceAlias::U, memory),
+    ))
+}
 
 const EXPORT_TABLES: &[(&str, &str, &str)] = &[
     (
@@ -165,6 +182,7 @@ fn export_projection(table: &str) -> &'static str {
 }
 
 async fn postgres_export(persistence: &PostgresPersistence, account_id: &str) -> Result<Value> {
+    prepare_account_speaker_projections(persistence, account_id).await?;
     let mut export = serde_json::Map::new();
     let mut transaction = persistence.pool().begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -175,10 +193,18 @@ async fn postgres_export(persistence: &PostgresPersistence, account_id: &str) ->
         // rows lose the shared-database tenant key and backend-only generated
         // search projection before they cross the public export boundary.
         let projection = export_projection(table);
-        let statement = format!(
-            "SELECT (to_jsonb(export_row)-'account_id'-'search_document')::text AS row_json \
-               FROM (SELECT {projection} FROM {table} WHERE account_id=$1 ORDER BY {order}) export_row"
-        );
+        let statement = if *table == "utterances" {
+            let identity =
+                speaker_identity_join(SpeakerUtteranceAlias::U, SpeakerMemoryScope::LatestActive);
+            format!("SELECT ((to_jsonb(u)-'account_id'-'search_document') || \
+                     jsonb_build_object('speaker_label',speaker_identity.speaker_label))::text AS row_json \
+                     FROM utterances u {identity} WHERE u.account_id=$1 ORDER BY u.id")
+        } else {
+            format!(
+                "SELECT (to_jsonb(export_row)-'account_id'-'search_document')::text AS row_json \
+                   FROM (SELECT {projection} FROM {table} WHERE account_id=$1 ORDER BY {order}) export_row"
+            )
+        };
         let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(statement))
             .bind(account_id)
             .fetch_all(&mut *transaction)
@@ -381,6 +407,7 @@ fn screenshot_from_row(row: &sqlx::postgres::PgRow, score: Option<f64>) -> Resul
 impl PostgresPersistence {
     async fn enrich_utterance_hits(
         &self,
+        connection: &mut PgConnection,
         account_id: &str,
         ids: &[i64],
         scores: &HashMap<i64, f64>,
@@ -388,11 +415,13 @@ impl PostgresPersistence {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(account_id, "search", connection).await;
+        let rows = sqlx::query(speaker_query(
             r#"WITH latest_episode AS (
                    SELECT DISTINCT ON (m.account_id,m.record_id)
                           m.account_id,m.record_id,e.id AS episode_id,e.title
-                     FROM episode_members m
+                     FROM active_episode_members m
                      JOIN episodes e
                        ON e.account_id=m.account_id AND e.id=m.episode_id
                     WHERE m.account_id=$1 AND m.record_type='utterance'
@@ -400,8 +429,7 @@ impl PostgresPersistence {
                     ORDER BY m.account_id,m.record_id,e.started_at DESC,e.id DESC
                )
                SELECT u.id,u.text,
-                      CASE WHEN c.attribution_state='owner_transmit' THEN 'Me'
-                           ELSE coalesce(p.display_name,u.speaker_label) END AS speaker_label,
+                      speaker_identity.speaker_label,
                       u.start_offset_seconds,u.end_offset_seconds,
                       floor(extract(epoch FROM coalesce(
                           o.started_at,
@@ -411,15 +439,8 @@ impl PostgresPersistence {
                           o.started_at,
                           s.started_at + u.start_offset_seconds * interval '1 second'
                       ))*1000)::bigint AS source_at_ms,
-                      CASE WHEN c.attribution_state='owner_transmit' THEN NULL
-                           ELSE p.id END AS person_id,
-                      CASE
-                        WHEN c.attribution_state='owner_transmit' THEN 'owner_source_role'
-                        WHEN p.id IS NOT NULL THEN 'direct_identity_evidence'
-                        WHEN c.attribution_state='anonymous_profile' THEN 'verified_voice'
-                        WHEN c.attribution_state IN ('request_local','unsegmented') THEN 'context_inferred'
-                        ELSE NULL
-                      END AS attribution_kind,
+                      speaker_identity.person_id,
+                      speaker_identity.attribution_kind,
                       linked.episode_id AS memory_id,linked.episode_id,
                       linked.title AS episode_title
                  FROM utterances u
@@ -427,19 +448,15 @@ impl PostgresPersistence {
                    ON s.account_id=u.account_id AND s.id=u.audio_segment_id
                  LEFT JOIN speaker_observations o
                    ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
-                 LEFT JOIN speaker_clusters c
-                   ON c.account_id=o.account_id AND c.id=o.cluster_id
-                 LEFT JOIN people p
-                   ON p.account_id=u.account_id
-                  AND p.id=coalesce(o.person_id,c.person_id)
-                  AND p.status='identified'
                  LEFT JOIN latest_episode linked
                    ON linked.account_id=u.account_id AND linked.record_id=u.id
+                 {speaker_identity}
                 WHERE u.account_id=$1 AND u.id=ANY($2)"#,
-        )
+            SpeakerMemoryScope::Episode("linked.episode_id"),
+        ))
         .bind(account_id)
         .bind(ids)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *connection)
         .await?;
         let hits = rows
             .iter()
@@ -453,6 +470,7 @@ impl PostgresPersistence {
 
     async fn utterance_fts_ids(
         &self,
+        connection: &mut PgConnection,
         account_id: &str,
         request: &SearchRequest,
         row_limit: i64,
@@ -460,7 +478,7 @@ impl PostgresPersistence {
     ) -> Result<Vec<i64>> {
         let from = bound(&request.time_start)?;
         let to = bound(&request.time_end)?;
-        Ok(sqlx::query_scalar::<_, i64>(
+        Ok(sqlx::query_scalar::<_, i64>(speaker_query(
             r#"WITH q AS (
                    SELECT websearch_to_tsquery('simple',$2) AS exact,
                           to_tsquery('simple',coalesce((
@@ -478,12 +496,7 @@ impl PostgresPersistence {
                    ON s.account_id=u.account_id AND s.id=u.audio_segment_id
                  LEFT JOIN speaker_observations o
                    ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
-                 LEFT JOIN speaker_clusters c
-                   ON c.account_id=o.account_id AND c.id=o.cluster_id
-                 LEFT JOIN people p
-                   ON p.account_id=u.account_id
-                  AND p.id=coalesce(o.person_id,c.person_id)
-                  AND p.status='identified'
+                 {speaker_identity}
                  CROSS JOIN q
                 WHERE u.account_id=$1 AND u.search_document @@ q.broad
                   AND ($3::bigint IS NULL OR
@@ -494,17 +507,14 @@ impl PostgresPersistence {
                        coalesce(o.started_at,
                            s.started_at + u.start_offset_seconds * interval '1 second')
                          <=to_timestamp($4::double precision/1000.0))
-                  AND ($5::text IS NULL OR lower(CASE
-                       WHEN c.attribution_state='owner_transmit' THEN 'Me'
-                       ELSE coalesce(p.display_name,u.speaker_label) END)=lower($5))
+                  AND ($5::text IS NULL OR lower(speaker_identity.speaker_label)=lower($5))
                 ORDER BY (u.search_document @@ q.exact) DESC,
                          ts_rank_cd(u.search_document,q.exact) DESC,
                          ts_rank_cd(u.search_document,q.broad) DESC,
                          coalesce(o.started_at,
                              s.started_at + u.start_offset_seconds * interval '1 second') DESC,
                          u.id DESC
-                LIMIT $6 OFFSET $7"#,
-        )
+                LIMIT $6 OFFSET $7"#, SpeakerMemoryScope::LatestActive))
         .bind(account_id)
         .bind(&request.query)
         .bind(from)
@@ -512,12 +522,29 @@ impl PostgresPersistence {
         .bind(request.speaker.as_deref())
         .bind(row_limit)
         .bind(offset)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *connection)
         .await?)
     }
 
     async fn search_utterances(
         &self,
+        account_id: &str,
+        request: &SearchRequest,
+    ) -> Result<Vec<SearchHit>> {
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let hits = self
+            .search_utterances_in_snapshot(&mut transaction, account_id, request)
+            .await?;
+        transaction.commit().await?;
+        Ok(hits)
+    }
+
+    async fn search_utterances_in_snapshot(
+        &self,
+        connection: &mut PgConnection,
         account_id: &str,
         request: &SearchRequest,
     ) -> Result<Vec<SearchHit>> {
@@ -530,22 +557,15 @@ impl PostgresPersistence {
             let Some(speaker) = request.speaker.as_deref() else {
                 return Ok(Vec::new());
             };
-            let ids = sqlx::query_scalar::<_, i64>(
+            let ids = sqlx::query_scalar::<_, i64>(speaker_query(
                 r#"SELECT u.id
                      FROM utterances u
                      JOIN audio_segments s
                        ON s.account_id=u.account_id AND s.id=u.audio_segment_id
                      LEFT JOIN speaker_observations o
                        ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
-                     LEFT JOIN speaker_clusters c
-                       ON c.account_id=o.account_id AND c.id=o.cluster_id
-                     LEFT JOIN people p
-                       ON p.account_id=u.account_id
-                      AND p.id=coalesce(o.person_id,c.person_id)
-                      AND p.status='identified'
-                    WHERE u.account_id=$1 AND lower(CASE
-                          WHEN c.attribution_state='owner_transmit' THEN 'Me'
-                          ELSE coalesce(p.display_name,u.speaker_label) END)=lower($2)
+                 {speaker_identity}
+                    WHERE u.account_id=$1 AND lower(speaker_identity.speaker_label)=lower($2)
                       AND ($3::bigint IS NULL OR
                            coalesce(o.started_at,
                                s.started_at + u.start_offset_seconds * interval '1 second')
@@ -558,47 +578,43 @@ impl PostgresPersistence {
                                  s.started_at + u.start_offset_seconds * interval '1 second') DESC,
                              u.id DESC
                     LIMIT $5 OFFSET $6"#,
-            )
+                SpeakerMemoryScope::LatestActive,
+            ))
             .bind(account_id)
             .bind(speaker)
             .bind(from)
             .bind(to)
             .bind(row_limit)
             .bind(offset)
-            .fetch_all(self.pool())
+            .fetch_all(&mut *connection)
             .await?;
             return self
-                .enrich_utterance_hits(account_id, &ids, &HashMap::new())
+                .enrich_utterance_hits(connection, account_id, &ids, &HashMap::new())
                 .await;
         }
 
         let Some(embedding) = request.query_embedding.as_deref() else {
             let ids = self
-                .utterance_fts_ids(account_id, request, row_limit, offset)
+                .utterance_fts_ids(connection, account_id, request, row_limit, offset)
                 .await?;
             return self
-                .enrich_utterance_hits(account_id, &ids, &HashMap::new())
+                .enrich_utterance_hits(connection, account_id, &ids, &HashMap::new())
                 .await;
         };
 
         let candidate_limit = candidate_limit(request)?;
         let fts = self
-            .utterance_fts_ids(account_id, request, candidate_limit, 0)
+            .utterance_fts_ids(connection, account_id, request, candidate_limit, 0)
             .await?;
         let vector = vector_literal(embedding)?;
-        let nearest = sqlx::query(
+        let nearest = sqlx::query(speaker_query(
             r#"SELECT u.id,(u.embedding <=> $2::vector)::double precision AS distance
                  FROM utterances u
                  JOIN audio_segments s
                    ON s.account_id=u.account_id AND s.id=u.audio_segment_id
                  LEFT JOIN speaker_observations o
                    ON o.account_id=u.account_id AND o.id=u.speaker_observation_id
-                 LEFT JOIN speaker_clusters c
-                   ON c.account_id=o.account_id AND c.id=o.cluster_id
-                 LEFT JOIN people p
-                   ON p.account_id=u.account_id
-                  AND p.id=coalesce(o.person_id,c.person_id)
-                  AND p.status='identified'
+                 {speaker_identity}
                 WHERE u.account_id=$1 AND u.embedding IS NOT NULL
                   AND ($3::bigint IS NULL OR
                        coalesce(o.started_at,
@@ -608,19 +624,18 @@ impl PostgresPersistence {
                        coalesce(o.started_at,
                            s.started_at + u.start_offset_seconds * interval '1 second')
                          <=to_timestamp($4::double precision/1000.0))
-                  AND ($5::text IS NULL OR lower(CASE
-                       WHEN c.attribution_state='owner_transmit' THEN 'Me'
-                       ELSE coalesce(p.display_name,u.speaker_label) END)=lower($5))
+                  AND ($5::text IS NULL OR lower(speaker_identity.speaker_label)=lower($5))
                 ORDER BY u.embedding <=> $2::vector,u.id
                 LIMIT $6"#,
-        )
+            SpeakerMemoryScope::LatestActive,
+        ))
         .bind(account_id)
         .bind(vector)
         .bind(from)
         .bind(to)
         .bind(request.speaker.as_deref())
         .bind(candidate_limit)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *connection)
         .await?
         .into_iter()
         .map(|row| Ok((row.try_get("id")?, row.try_get("distance")?)))
@@ -635,7 +650,8 @@ impl PostgresPersistence {
         }
         let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
         let scores: HashMap<i64, f64> = ranked.into_iter().collect();
-        self.enrich_utterance_hits(account_id, &ids, &scores).await
+        self.enrich_utterance_hits(connection, account_id, &ids, &scores)
+            .await
     }
 
     async fn screenshot_fts_ids(
@@ -1178,42 +1194,6 @@ fn top_three(counts: Option<&HashMap<String, i64>>) -> Vec<String> {
         .collect()
 }
 
-fn participant_detail_from_row(row: &sqlx::postgres::PgRow) -> Result<Value> {
-    let participant_key: String = row.try_get("participant_key")?;
-    let attribution_kind: String = row.try_get("attribution_kind")?;
-    let person_name: Option<String> = row.try_get("display_name")?;
-    let claimed_name: Option<String> = row.try_get("source_claimed_name")?;
-    let slot = row.try_get::<Option<i64>, _>("slot_ordinal")?;
-    let owner = participant_key == "owner"
-        || matches!(
-            attribution_kind.as_str(),
-            "owner" | "owner_presentation" | "owner_source_role"
-        );
-    let display_name = if owner {
-        "Me".to_owned()
-    } else if let Some(name) = person_name {
-        name
-    } else if let Some(name) = claimed_name {
-        name
-    } else if let Some(slot) = slot {
-        let slot = i32::try_from(slot)
-            .map_err(|_| EnclaveError::Store("episode speaker slot is out of range".into()))?;
-        format!(
-            "Unknown speaker {}",
-            crate::cp::identity::format_slot_ordinal(slot)
-        )
-    } else {
-        "Unknown speaker".to_owned()
-    };
-    Ok(json!({
-        "participant_key": participant_key,
-        "display_name": display_name,
-        "person_id": if owner { None } else { row.try_get::<Option<i64>, _>("public_person_id")? },
-        "attribution_kind": attribution_kind,
-        "state": row.try_get::<String, _>("state")?,
-    }))
-}
-
 async fn require_identified_person(
     persistence: &PostgresPersistence,
     account_id: &str,
@@ -1292,22 +1272,31 @@ async fn postgres_person_statements(
 ) -> Result<PersonStatementPage> {
     let row_limit = i64::try_from(limit.saturating_add(1))
         .map_err(|_| EnclaveError::InvalidRequest("people page limit is too large".into()))?;
-    let rows = sqlx::query(
+    let rows = sqlx::query(speaker_query(
         "SELECT s.id,s.transcript_text,s.event_id, \
                 floor(extract(epoch FROM s.started_at)*1000)::bigint AS started_at_ms, \
                 floor(extract(epoch FROM s.ended_at)*1000)::bigint AS ended_at_ms, \
                 linked.id AS episode_id,linked.title AS episode_title \
-           FROM speaker_observations s LEFT JOIN LATERAL ( \
-                SELECT e.id,e.title FROM utterances u JOIN episode_members m \
-                  ON m.account_id=u.account_id AND m.record_type='utterance' AND m.record_id=u.id \
-                 JOIN episodes e ON e.account_id=m.account_id AND e.id=m.episode_id \
-                 WHERE u.account_id=s.account_id \
-                   AND u.source_key='cloud-v2:'||s.event_id||':'||s.turn_id \
-                   AND e.substance!='none' \
-                 ORDER BY e.started_at DESC,e.id DESC LIMIT 1) linked ON true \
-          WHERE s.account_id=$1 AND s.person_id=$2 \
+           FROM speaker_observations s \
+           LEFT JOIN LATERAL ( \
+               SELECT source.id FROM utterances source \
+                WHERE source.account_id=s.account_id AND (source.speaker_observation_id=s.id \
+                   OR (source.speaker_observation_id IS NULL \
+                       AND source.source_key='cloud-v2:'||s.event_id||':'||s.turn_id)) \
+                ORDER BY (source.speaker_observation_id=s.id) DESC NULLS LAST,source.id DESC LIMIT 1 \
+           ) source_utterance ON TRUE \
+           CROSS JOIN LATERAL (SELECT source_utterance.id,s.account_id, \
+               s.id AS speaker_observation_id,'Speaker'::text AS speaker_label) u \
+           {speaker_identity} \
+           LEFT JOIN LATERAL (SELECT e.id,e.title FROM active_episode_members member \
+               JOIN episodes e ON e.account_id=member.account_id AND e.id=member.episode_id \
+               WHERE member.account_id=s.account_id AND member.record_type='utterance' \
+                 AND member.record_id=source_utterance.id AND e.substance<>'none' \
+               ORDER BY e.started_at DESC,e.id DESC LIMIT 1) linked ON TRUE \
+          WHERE s.account_id=$1 AND speaker_identity.person_id=$2 \
             AND ($3::bigint IS NULL OR s.id<$3) ORDER BY s.id DESC LIMIT $4",
-    )
+        SpeakerMemoryScope::None,
+    ))
     .bind(account_id)
     .bind(person_id)
     .bind(before_id)
@@ -1365,6 +1354,7 @@ impl MemoryQueryRepository for PostgresPersistence {
             + usize::from(wants_episodes);
         let mut hits = Vec::new();
         if wants_utterances {
+            prepare_account_speaker_projections(self, account_id).await?;
             hits.extend(self.search_utterances(account_id, &request).await?);
         }
         if wants_screenshots {
@@ -1394,6 +1384,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                 "episode continuation is incomplete".into(),
             ));
         }
+        prepare_account_speaker_projections(self, account_id).await?;
         let fetch_limit = request.limit + i64::from(request.probe_for_more);
         // A topology publish may replace several episode rows at once. Keep
         // the page, its screenshot facets, low-signal count, and the revision
@@ -1505,35 +1496,11 @@ impl MemoryQueryRepository for PostgresPersistence {
             .iter()
             .filter_map(|episode| episode.get("id").and_then(Value::as_i64))
             .collect::<Vec<_>>();
-        let participant_rows = if ids.is_empty() {
-            Vec::new()
-        } else {
-            sqlx::query(
-                "SELECT p.episode_id,p.participant_key,p.attribution_kind,p.state, \
-                        CASE WHEN p.participant_key='owner' OR p.attribution_kind IN \
-                             ('owner','owner_presentation','owner_source_role') \
-                             THEN NULL ELSE pe.id END AS public_person_id, \
-                        pe.display_name,p.source_claimed_name,s.slot_ordinal \
-                   FROM episode_participants p LEFT JOIN people pe \
-                     ON pe.account_id=p.account_id AND pe.id=p.person_id \
-                    AND pe.status='identified' \
-                   LEFT JOIN episode_speaker_slots s \
-                     ON s.account_id=p.account_id AND s.id=p.speaker_slot_id \
-                  WHERE p.account_id=$1 AND p.episode_id=ANY($2) \
-                    AND p.state='active' ORDER BY p.episode_id,p.id",
-            )
-            .bind(account_id)
-            .bind(&ids)
-            .fetch_all(&mut *transaction)
-            .await?
-        };
-        let mut participant_details: HashMap<i64, Vec<Value>> = HashMap::new();
-        for row in &participant_rows {
-            participant_details
-                .entry(row.try_get("episode_id")?)
-                .or_default()
-                .push(participant_detail_from_row(row)?);
-        }
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(account_id, "list", &mut transaction)
+            .await;
+        let mut participant_details =
+            load_episode_participant_details(&mut transaction, account_id, &ids).await?;
         let facet_rows = if ids.is_empty() {
             Vec::new()
         } else {
@@ -1636,44 +1603,39 @@ impl MemoryQueryRepository for PostgresPersistence {
     }
 
     async fn feed(&self, account_id: &str, request: &MemoryFeedRequest) -> Result<MemoryFeedPage> {
+        prepare_account_speaker_projections(self, account_id).await?;
         let limit = request.limit.min(200);
         let row_limit = i64::try_from(limit)
             .map_err(|_| EnclaveError::InvalidRequest("feed limit is too large".into()))?;
         let from = bound(&request.from)?;
         let to = bound(&request.to)?;
         let before = bound(&request.before)?;
-        let utterance_rows = sqlx::query(
-            "SELECT u.id,CASE WHEN c.attribution_state='owner_transmit' THEN 'Me' \
-                              ELSE coalesce(p.display_name,u.speaker_label) END AS speaker_label, \
-                    u.text,u.source_key, \
-                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
-                    CASE WHEN c.attribution_state='owner_transmit' THEN 'owner_source_role' \
-                         WHEN p.id IS NOT NULL THEN 'direct_identity_evidence' \
-                         WHEN c.attribution_state='anonymous_profile' THEN 'verified_voice' \
-                         WHEN c.attribution_state IN ('request_local','unsegmented') THEN 'context_inferred' \
-                         ELSE NULL END AS attribution_kind, \
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let utterance_rows = sqlx::query(speaker_query(
+            "SELECT u.id,speaker_identity.speaker_label,u.text,u.source_key, \
+                    speaker_identity.person_id,speaker_identity.attribution_kind, \
                     floor(extract(epoch FROM (s.started_at + make_interval(secs => u.start_offset_seconds)))*1000)::bigint AS at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o \
                  ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
-               LEFT JOIN speaker_clusters c \
-                 ON c.account_id=o.account_id AND c.id=o.cluster_id \
-               LEFT JOIN people p \
-                 ON p.account_id=u.account_id AND p.id=coalesce(o.person_id,c.person_id) \
-                AND p.status='identified' \
+               {speaker_identity} \
               WHERE u.account_id=$1 \
                 AND ($2::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)>=to_timestamp($2::double precision/1000.0)) \
                 AND ($3::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)<=to_timestamp($3::double precision/1000.0)) \
                 AND ($4::bigint IS NULL OR s.started_at + make_interval(secs => u.start_offset_seconds)<to_timestamp($4::double precision/1000.0)) \
               ORDER BY at_ms DESC LIMIT $5",
-        )
+            SpeakerMemoryScope::LatestActive,
+        ))
         .bind(account_id)
         .bind(from)
         .bind(to)
         .bind(before)
         .bind(row_limit)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let mut records = utterance_rows
             .iter()
@@ -1716,7 +1678,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(to)
         .bind(before)
         .bind(row_limit)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         for row in &screenshot_rows {
             let raw: Option<String> = row.try_get("ocr_text")?;
@@ -1761,10 +1723,13 @@ impl MemoryQueryRepository for PostgresPersistence {
             .filter(|record| record.kind == "screenshot")
             .map(|record| record.id)
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(account_id, "feed", &mut transaction)
+            .await;
         let membership_rows = sqlx::query(
             "SELECT DISTINCT ON (m.account_id,m.record_type,m.record_id) \
                     m.record_type,m.record_id,e.id AS episode_id \
-               FROM episode_members m JOIN episodes e \
+               FROM active_episode_members m JOIN episodes e \
                  ON e.account_id=m.account_id AND e.id=m.episode_id \
               WHERE m.account_id=$1 AND e.substance!='none' \
                 AND ((m.record_type='utterance' AND m.record_id=ANY($2)) \
@@ -1774,7 +1739,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(account_id)
         .bind(&utterance_ids)
         .bind(&screenshot_ids)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let memberships = membership_rows
             .iter()
@@ -1794,6 +1759,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         let next_before = (records.len() == limit)
             .then(|| records.last().map(|record| record.at.clone()))
             .flatten();
+        transaction.commit().await?;
         Ok(MemoryFeedPage {
             records,
             next_before,
@@ -1805,13 +1771,14 @@ impl MemoryQueryRepository for PostgresPersistence {
         account_id: &str,
         request: &McpTranscriptSearchRequest,
     ) -> Result<Value> {
+        prepare_account_speaker_projections(self, account_id).await?;
         let effective_limit = request
             .limit
             .clamp(1, crate::cp::mcp_safety::MAX_MINIMIZED_PAGE_SIZE);
         let from = bound(&request.from)?;
         let to = bound(&request.to)?;
-        let rows = sqlx::query(
-            "SELECT u.id,u.text,u.speaker_label, \
+        let rows = sqlx::query(speaker_query(
+            "SELECT u.id,u.text,speaker_identity.speaker_label, \
                     floor(extract(epoch FROM (s.started_at + \
                         u.start_offset_seconds * interval '1 second'))*1000)::bigint \
                         AS started_at_ms, \
@@ -1820,6 +1787,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                         AS ended_at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               {speaker_identity} \
               WHERE u.account_id=$1 AND strpos(lower(u.text),lower($2))>0 \
                 AND ($3::bigint IS NULL OR (s.started_at + \
                     u.start_offset_seconds * interval '1 second') \
@@ -1829,7 +1797,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                     <=to_timestamp($4::double precision/1000.0)) \
               ORDER BY (s.started_at + u.start_offset_seconds * interval '1 second') DESC, \
                        u.id DESC LIMIT $5",
-        )
+            SpeakerMemoryScope::LatestActive,
+        ))
         .bind(account_id)
         .bind(&request.query)
         .bind(from)
@@ -1876,6 +1845,7 @@ impl MemoryQueryRepository for PostgresPersistence {
     }
 
     async fn mcp_context(&self, account_id: &str, request: &McpContextRequest) -> Result<Value> {
+        prepare_account_speaker_projections(self, account_id).await?;
         let effective_limit = request
             .limit
             .unwrap_or(crate::cp::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE)
@@ -1889,8 +1859,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                 EnclaveError::InvalidRequest("MCP context window is too large".into())
             })?;
         let half_window_ms = window_ms / 2;
-        let rows = sqlx::query(
-            "SELECT u.id,u.text,u.speaker_label,u.language,s.source_type, \
+        let rows = sqlx::query(speaker_query(
+            "SELECT u.id,u.text,speaker_identity.speaker_label,u.language,s.source_type, \
                     floor(extract(epoch FROM (s.started_at + \
                         u.start_offset_seconds * interval '1 second'))*1000)::bigint \
                         AS started_at_ms, \
@@ -1899,13 +1869,15 @@ impl MemoryQueryRepository for PostgresPersistence {
                         AS ended_at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               {speaker_identity} \
               WHERE u.account_id=$1 \
                 AND abs(floor(extract(epoch FROM (s.started_at + \
                     u.start_offset_seconds * interval '1 second'))*1000)::bigint-$2)<=$3 \
               ORDER BY abs(floor(extract(epoch FROM (s.started_at + \
                     u.start_offset_seconds * interval '1 second'))*1000)::bigint-$2),u.id \
               LIMIT $4",
-        )
+            SpeakerMemoryScope::LatestActive,
+        ))
         .bind(account_id)
         .bind(center_ms)
         .bind(half_window_ms)
@@ -1964,6 +1936,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         account_id: &str,
         request: &McpTimeRangeRequest,
     ) -> Result<Value> {
+        prepare_account_speaker_projections(self, account_id).await?;
         let effective_limit = request
             .limit
             .unwrap_or(crate::cp::mcp_safety::DEFAULT_MINIMIZED_PAGE_SIZE)
@@ -1978,6 +1951,10 @@ impl MemoryQueryRepository for PostgresPersistence {
             ));
         }
 
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
         let counts = sqlx::query(
             "SELECT \
                 (SELECT count(*) FROM utterances u JOIN audio_segments s \
@@ -1996,7 +1973,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(account_id)
         .bind(from_ms)
         .bind(to_ms)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *transaction)
         .await?;
         let utterance_count = counts.try_get::<i64, _>("utterance_count")?;
         let screenshot_count = counts.try_get::<i64, _>("screenshot_count")?;
@@ -2015,7 +1992,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(account_id)
         .bind(from_ms)
         .bind(to_ms)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let languages = language_rows
             .iter()
@@ -2032,19 +2009,20 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(account_id)
         .bind(from_ms)
         .bind(to_ms)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let apps_seen = app_rows
             .iter()
             .map(|row| row.try_get::<String, _>("active_app").map_err(Into::into))
             .collect::<Result<Vec<_>>>()?;
 
-        let rows = sqlx::query(
-            "SELECT u.id,u.text,u.speaker_label, \
+        let rows = sqlx::query(speaker_query(
+            "SELECT u.id,u.text,speaker_identity.speaker_label, \
                     floor(extract(epoch FROM (s.started_at + \
                         u.start_offset_seconds * interval '1 second'))*1000)::bigint AS at_ms \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
+               {speaker_identity} \
               WHERE u.account_id=$1 \
                 AND (s.started_at + u.start_offset_seconds * interval '1 second') \
                     >=to_timestamp($2::double precision/1000.0) \
@@ -2052,13 +2030,15 @@ impl MemoryQueryRepository for PostgresPersistence {
                     <to_timestamp($3::double precision/1000.0) \
               ORDER BY (s.started_at + u.start_offset_seconds * interval '1 second'),u.id \
               LIMIT $4",
-        )
+            SpeakerMemoryScope::LatestActive,
+        ))
         .bind(account_id)
         .bind(from_ms)
         .bind(to_ms)
         .bind(limit(effective_limit)?)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         let raw = rows
             .iter()
             .map(|row| {
@@ -2293,8 +2273,13 @@ impl MemoryQueryRepository for PostgresPersistence {
     }
 
     async fn episode_members(&self, account_id: &str, episode_id: i64) -> Result<Value> {
-        let utterance_rows = sqlx::query(
-            "SELECT u.id,u.speaker_label,u.language,u.text,u.source_key, \
+        prepare_account_speaker_projections(self, account_id).await?;
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let utterance_rows = sqlx::query(speaker_query(
+            "SELECT u.id,speaker_identity.speaker_label,u.language,u.text,u.source_key, \
                     floor(extract(epoch FROM coalesce( \
                         o.started_at, \
                         s.started_at + (u.start_offset_seconds * interval '1 second') \
@@ -2303,25 +2288,21 @@ impl MemoryQueryRepository for PostgresPersistence {
                         o.ended_at, \
                         s.started_at + (u.end_offset_seconds * interval '1 second') \
                     ))*1000)::bigint AS ended_at_ms, \
-                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
-                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.display_name END AS display_name, \
-                    c.attribution_state \
+                    speaker_identity.person_id,speaker_identity.display_name, \
+                    speaker_identity.attribution_kind \
                FROM episode_members m JOIN utterances u \
                  ON u.account_id=m.account_id AND u.id=m.record_id \
                JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o \
                  ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
-               LEFT JOIN speaker_clusters c \
-                 ON c.account_id=o.account_id AND c.id=o.cluster_id \
-               LEFT JOIN people p \
-                 ON p.account_id=u.account_id AND p.id=coalesce(o.person_id,c.person_id) \
-                AND p.status='identified' \
+               {speaker_identity} \
               WHERE m.account_id=$1 AND m.episode_id=$2 AND m.record_type='utterance'",
-        )
+            SpeakerMemoryScope::Episode("m.episode_id"),
+        ))
         .bind(account_id)
         .bind(episode_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let mut members = utterance_rows
             .iter()
@@ -2329,24 +2310,10 @@ impl MemoryQueryRepository for PostgresPersistence {
                 let timestamp = required_timestamp(row, "started_at_ms")?;
                 let speaker_label: String = row.try_get("speaker_label")?;
                 let person_id: Option<i64> = row.try_get("person_id")?;
-                let person_name: Option<String> = row.try_get("display_name")?;
-                let attribution = row.try_get::<Option<String>, _>("attribution_state")?;
-                let display_name =
-                    if person_id.is_none() && attribution.as_deref() == Some("owner_transmit") {
-                        "Me".to_owned()
-                    } else {
-                        person_name.unwrap_or_else(|| speaker_label.clone())
-                    };
-                let attribution_kind = if person_id.is_some() {
-                    "direct_identity_evidence"
-                } else {
-                    match attribution.as_deref() {
-                        Some("owner_transmit") => "owner_source_role",
-                        Some("anonymous_profile") => "verified_voice",
-                        Some("request_local" | "unsegmented") => "context_inferred",
-                        _ => "unavailable",
-                    }
-                };
+                let display_name: String = row.try_get("display_name")?;
+                let attribution_kind = row
+                    .try_get::<Option<String>, _>("attribution_kind")?
+                    .unwrap_or_else(|| "unavailable".to_owned());
                 Ok((
                     timestamp.clone(),
                     json!({
@@ -2401,7 +2368,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(episode_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         for row in &screenshot_rows {
             let timestamp = required_timestamp(row, "captured_at_ms")?;
@@ -2464,27 +2431,15 @@ impl MemoryQueryRepository for PostgresPersistence {
             .map(|(_, value)| value)
             .collect::<Vec<_>>();
 
-        let participant_rows = sqlx::query(
-            "SELECT p.participant_key,p.attribution_kind,p.state, \
-                    CASE WHEN p.participant_key='owner' OR p.attribution_kind IN \
-                         ('owner','owner_presentation','owner_source_role') \
-                         THEN NULL ELSE pe.id END AS public_person_id, \
-                    pe.display_name,p.source_claimed_name,s.slot_ordinal \
-               FROM episode_participants p LEFT JOIN people pe \
-                 ON pe.account_id=p.account_id AND pe.id=p.person_id \
-                AND pe.status='identified' \
-               LEFT JOIN episode_speaker_slots s \
-                 ON s.account_id=p.account_id AND s.id=p.speaker_slot_id \
-              WHERE p.account_id=$1 AND p.episode_id=$2 AND p.state='active' ORDER BY p.id",
-        )
-        .bind(account_id)
-        .bind(episode_id)
-        .fetch_all(self.pool())
-        .await?;
-        let participant_details = participant_rows
-            .iter()
-            .map(participant_detail_from_row)
-            .collect::<Result<Vec<_>>>()?;
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(account_id, "members", &mut transaction)
+            .await;
+        let participant_details =
+            load_episode_participant_details(&mut transaction, account_id, &[episode_id])
+                .await?
+                .remove(&episode_id)
+                .unwrap_or_default();
+        transaction.commit().await?;
 
         Ok(json!({
             "episode_id": episode_id,
@@ -2569,7 +2524,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                     count(DISTINCT f.id)::bigint AS fact_count, \
                     floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
                FROM people p LEFT JOIN voice_profiles v \
-                 ON v.account_id=p.account_id AND v.person_id=p.id \
+                 ON v.account_id=p.account_id AND v.person_id=p.id AND v.status<>'quarantined' \
                 AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
                      WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
                        AND r.status IN ('quarantined','superseded','split')) \
@@ -2617,7 +2572,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                     count(DISTINCT f.id)::bigint AS fact_count, \
                     floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
                FROM people p LEFT JOIN voice_profiles v \
-                 ON v.account_id=p.account_id AND v.person_id=p.id \
+                 ON v.account_id=p.account_id AND v.person_id=p.id AND v.status<>'quarantined' \
                 AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
                      WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
                        AND r.status IN ('quarantined','superseded','split')) \
@@ -2663,7 +2618,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                          ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active \
                        JOIN voice_profiles v \
                          ON v.account_id=a.account_id AND v.id=a.profile_id \
-                      WHERE v.account_id=$1 AND v.person_id=$2 AND s.accepted \
+                      WHERE v.account_id=$1 AND v.person_id=$2 AND v.status<>'quarantined' AND s.accepted \
                         AND s.eligibility='enroll' AND NOT s.outlier \
                         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
                              WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \

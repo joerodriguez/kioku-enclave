@@ -38,6 +38,9 @@ impl PostgresPersistence {
         if memory_id <= 0 && capture_session_id.is_none() {
             return Ok(None);
         }
+        if capture_session_id.is_some() {
+            super::speaker_identity::prepare_account_speaker_projections(self, account_id).await?;
+        }
         let mut transaction = self.pool.begin().await?;
         let deletion_inventory =
             super::activation::lock_activation_contract_key_share_if_installed(&mut transaction)
@@ -169,20 +172,38 @@ impl PostgresPersistence {
             });
         }
 
-        let utterance_rows = sqlx::query(
+        if capture_session_id.is_none() {
+            super::speaker_identity::refresh_episode_speaker_projections(
+                &mut transaction,
+                account_id,
+                &[super::speaker_identity::SpeakerProjectionTarget::current(
+                    memory_id,
+                )],
+                &[],
+            )
+            .await?;
+        }
+        let identity = super::speaker_identity::speaker_identity_join(
+            super::speaker_identity::SpeakerUtteranceAlias::U,
+            if capture_session_id.is_some() {
+                super::speaker_identity::SpeakerMemoryScope::LatestActive
+            } else {
+                super::speaker_identity::SpeakerMemoryScope::Episode("$2")
+            },
+        );
+        let utterance_query = format!(
             "SELECT u.id,u.speaker_observation_id, \
                     floor(extract(epoch FROM o.started_at)*1000)::bigint observation_started_ms, \
                     floor(extract(epoch FROM o.ended_at)*1000)::bigint observation_ended_ms, \
                     floor(extract(epoch FROM s.started_at)*1000)::bigint segment_started_ms, \
-                    u.start_offset_seconds,u.end_offset_seconds,u.text,u.speaker_label, \
+                    u.start_offset_seconds,u.end_offset_seconds,u.text,speaker_identity.speaker_label, \
                     COALESCE(o.overlap,false) overlap, \
-                    CASE WHEN c.attribution_state='owner_transmit' THEN NULL ELSE p.id END AS person_id, \
-                    p.display_name,c.attribution_state \
+                    speaker_identity.person_id,speaker_identity.display_name, \
+                    speaker_identity.attribution_kind AS attribution_state \
                FROM utterances u \
                JOIN audio_segments s ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
-               LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id \
-               LEFT JOIN people p ON p.account_id=u.account_id AND p.id=COALESCE(o.person_id,c.person_id) AND p.status='identified' \
+               {identity} \
               WHERE u.account_id=$1 AND ( \
                 ($3::text IS NULL AND EXISTS(SELECT 1 FROM episode_members em WHERE em.account_id=u.account_id \
                   AND em.episode_id=$2 AND em.record_type='utterance' AND em.record_id=u.id)) OR \
@@ -191,12 +212,13 @@ impl PostgresPersistence {
                   WHERE ss.account_id=u.account_id AND ss.speaker_observation_id=u.speaker_observation_id \
                     AND ce.capture_session_id=$3))) \
               ORDER BY COALESCE(o.started_at,s.started_at),u.id LIMIT 40001",
-        )
-        .bind(account_id)
-        .bind(memory_id)
-        .bind(capture_session_id)
-        .fetch_all(&mut *transaction)
-        .await?;
+        );
+        let utterance_rows = sqlx::query(sqlx::AssertSqlSafe(utterance_query))
+            .bind(account_id)
+            .bind(memory_id)
+            .bind(capture_session_id)
+            .fetch_all(&mut *transaction)
+            .await?;
         if utterance_rows.len() > 40_000 {
             return Err(EnclaveError::Store(
                 "playback transcript bound exceeded".into(),
@@ -228,16 +250,7 @@ impl PostgresPersistence {
                 overlap: row.try_get("overlap")?,
                 person_id,
                 display_name: row.try_get("display_name")?,
-                attribution_state: if person_id.is_some() {
-                    Some("direct_identity_evidence".into())
-                } else {
-                    attribution.map(|state| match state.as_str() {
-                        "owner_transmit" => "owner_source_role".into(),
-                        "anonymous_profile" => "verified_voice".into(),
-                        "request_local" | "unsegmented" => "context_inferred".into(),
-                        _ => "unavailable".into(),
-                    })
-                },
+                attribution_state: attribution,
             });
         }
 
@@ -348,30 +361,40 @@ impl PlaybackRepository for PostgresPersistence {
         durable_read: Option<&DurableReadFence>,
     ) -> Result<PersonMemoriesPage> {
         crate::gcs::validate_user_id(account_id)?;
+        super::speaker_identity::prepare_account_speaker_projections(self, account_id).await?;
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM people WHERE account_id=$1 AND id=$2 AND status='identified')",
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *transaction)
         .await?;
         if !exists {
             return Err(EnclaveError::NotFound);
         }
         let fence_revision = durable_read.map(|fence| fence.policy_revision);
         let fence_epoch = durable_read.map(|fence| fence.policy_epoch.as_str());
-        let rows = sqlx::query(
+        let identity = super::speaker_identity::speaker_identity_join(
+            super::speaker_identity::SpeakerUtteranceAlias::U,
+            super::speaker_identity::SpeakerMemoryScope::Episode("e.id"),
+        );
+        let legacy = super::speaker_identity::legacy_participant_eligible_sql("e", "ep");
+        let query = format!(
             "SELECT e.id,e.title,e.summary, \
                     floor(extract(epoch FROM e.started_at)*1000)::bigint started_at_ms, \
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint ended_at_ms, \
-                    count(DISTINCT u.id) FILTER (WHERE o.person_id=$2) attributed_count, \
-                    min(floor(extract(epoch FROM o.started_at)*1000)::bigint) FILTER (WHERE o.person_id=$2) first_attributed_ms, \
+                    count(DISTINCT u.id) FILTER (WHERE speaker_identity.person_id=$2) attributed_count, \
+                    min(floor(extract(epoch FROM o.started_at)*1000)::bigint) FILTER (WHERE speaker_identity.person_id=$2) first_attributed_ms, \
                     count(DISTINCT ce.capture_session_id) source_recordings, \
-                    min(u.id) FILTER (WHERE o.person_id=$2) playback_utterance_id, \
+                    min(u.id) FILTER (WHERE speaker_identity.person_id=$2) playback_utterance_id, \
                     count(DISTINCT src.event_id) source_count, \
                     count(DISTINCT src.event_id) FILTER (WHERE mo.processing_state IN ('queued','processing','ready','retry_wait','failed') AND mo.deleted_at IS NULL \
                       AND mo.object_backend='current' AND mo.object_generation>0 AND mo.mime_type IN ('audio/m4a','audio/mp4') \
-                      AND mo.codec='aac' AND mo.byte_length BETWEEN 1 AND $5 AND mo.sha256 ~ '^[0-9a-fA-F]{64}$' \
+                      AND mo.codec='aac' AND mo.byte_length BETWEEN 1 AND $5 AND mo.sha256 ~ '^[0-9a-fA-F]{{64}}$' \
                       AND ((COALESCE(ra.retention_decision,'processing_window_30d')='processing_window_30d' \
                             AND COALESCE(ra.storage_backend,'processing')='processing' AND COALESCE(ra.recording_state,'processing_only')='processing_only') \
                         OR (ra.retention_decision='until_deleted' AND ra.storage_backend='recordings' AND ra.recording_state='durable' \
@@ -382,27 +405,35 @@ impl PlaybackRepository for PostgresPersistence {
                     count(DISTINCT src.event_id) FILTER (WHERE mo.deleted_at IS NOT NULL AND mo.processing_state<>'pruned') deleted_count, \
                     count(DISTINCT src.event_id) FILTER (WHERE mo.processing_state='pruned') pruned_count \
                FROM episodes e \
-               JOIN episode_participants ep ON ep.account_id=e.account_id AND ep.episode_id=e.id \
                LEFT JOIN episode_members em ON em.account_id=e.account_id AND em.episode_id=e.id AND em.record_type='utterance' \
                LEFT JOIN utterances u ON u.account_id=em.account_id AND u.id=em.record_id \
+               {identity} \
                LEFT JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
                LEFT JOIN speaker_observation_sources src ON src.account_id=o.account_id AND src.speaker_observation_id=o.id \
                LEFT JOIN capture_events ce ON ce.account_id=src.account_id AND ce.event_id=src.event_id \
                LEFT JOIN media_objects mo ON mo.account_id=src.account_id AND mo.event_id=src.event_id \
                LEFT JOIN recording_media_authority ra ON ra.account_id=mo.account_id AND ra.asset_id=mo.asset_id \
-              WHERE e.account_id=$1 AND ep.person_id=$2 AND ep.state='active' AND e.substance<>'none' \
+              WHERE e.account_id=$1 AND e.substance<>'none' \
                 AND ($3::bigint IS NULL OR e.id<$3) \
-              GROUP BY e.id,e.title,e.summary,e.started_at,e.ended_at ORDER BY e.id DESC LIMIT $4",
-        )
-        .bind(account_id)
-        .bind(person_id)
-        .bind(before_id)
-        .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
-        .bind(MAX_AUDIO_SEGMENT_BYTES)
-        .bind(fence_revision)
-        .bind(fence_epoch)
-        .fetch_all(self.pool())
-        .await?;
+              GROUP BY e.account_id,e.id,e.title,e.summary,e.started_at,e.ended_at \
+              HAVING count(DISTINCT u.id) FILTER (WHERE speaker_identity.person_id=$2)>0 \
+                 OR EXISTS(SELECT 1 FROM episode_participants ep \
+                      WHERE ep.account_id=e.account_id AND ep.episode_id=e.id AND ep.person_id=$2 \
+                        AND ep.participant_key<>'owner' \
+                        AND ep.attribution_kind NOT IN ('owner','owner_presentation','owner_source_role') AND {legacy}) \
+              ORDER BY e.id DESC LIMIT $4",
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(account_id)
+            .bind(person_id)
+            .bind(before_id)
+            .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
+            .bind(MAX_AUDIO_SEGMENT_BYTES)
+            .bind(fence_revision)
+            .bind(fence_epoch)
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         let mut memories = Vec::with_capacity(rows.len());
         for row in rows {
             let started_ms = epoch_millis(&row, "started_at_ms")?;

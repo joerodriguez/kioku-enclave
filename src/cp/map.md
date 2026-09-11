@@ -21,7 +21,6 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `email_renderer.rs` | Pure escaped text/HTML morning digest rendering, with distinct complete briefs under content consent and generic app links otherwise. |
 | `email_worker.rs` | PostgreSQL-claimed daily Resend delivery with frozen requests, bounded retry, disclosure fences, ambiguity no-resend, and horizontally safe settlement. |
 | `finalizer.rs` | Restartable complete-brief worker with separate four-hour source-settlement checks at claim, egress and settlement. Finalization creates source coverage for morning email and independent initial webhook/APNs events. |
-| `identity.rs` | Identity facade and account/session projections. |
 | `isotime.rs` | RFC 3339 UTC parsing, formatting, and arithmetic. |
 | `limits.rs` | Volatile request rate limiting plus PostgreSQL fleet admission, quota, concurrency, and Vertex reservation use. |
 | `mcp_safety.rs` | MCP query/projection boundary, pagination limits, restricted-data refusal, URL minimization, and recursive response redaction. |
@@ -75,3 +74,6 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
   correctness boundary for horizontal workers.
 
 `finalizer.rs` also authors bounded, evidence-validated content-specific brief sections (bullets/text/tasks/actual decisions). `email_renderer.rs` and webhook snapshots share these ordered sections while preserving content-consent fences and legacy envelopes.
+
+Current speaker presentation and base-26 slot lettering are implemented once in the PostgreSQL
+`speaker_identity` module; the former unused Rust slot formatter has been removed.

@@ -4204,6 +4204,59 @@ async fn test_real_pg_historical_draining_scope(
     Ok(())
 }
 
+/// Minimal signed Active authority for standalone writer contracts. The
+/// account may exist but must have no source work before this helper runs.
+/// Reuses the reviewed release/backfill and signed transition protocol.
+#[cfg(test)]
+pub(super) async fn test_activate_speaker_writer_account(
+    persistence: &PostgresPersistence,
+    account: &str,
+) -> Result<()> {
+    persistence
+        .install_memory_reconciliation_activation_schema()
+        .await?;
+    test_advance_activation_until_complete(persistence, false).await?;
+    let draining = test_transition_authorization(
+        persistence,
+        1,
+        "installed",
+        "draining",
+        0,
+        vec![account.into()],
+        false,
+    )
+    .await?;
+    persistence
+        .transition_memory_reconciliation_activation(&draining)
+        .await?;
+    test_advance_activation_until_complete(persistence, true).await?;
+    let active = test_transition_authorization(
+        persistence,
+        2,
+        "draining",
+        "active",
+        0,
+        vec![account.into()],
+        false,
+    )
+    .await?;
+    persistence
+        .transition_memory_reconciliation_activation(&active)
+        .await?;
+    let producer = crate::cp::reconciler::producer_contract_commitment(
+        "gemini-reconciliation-v1",
+        "us-central1",
+    )?;
+    persistence
+        .verify_reconciliation_runtime_schema(
+            Some("gemini-reconciliation-v1"),
+            "us-central1",
+            Some(&producer),
+        )
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistence) -> Result<()> {
     use crate::persistence::{

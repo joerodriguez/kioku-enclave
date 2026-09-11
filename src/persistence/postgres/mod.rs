@@ -41,6 +41,11 @@ mod query;
 mod reconciliation_source_audit;
 mod recording_retention;
 mod schema_release;
+mod speaker_identity;
+#[cfg(test)]
+mod speaker_query_contract;
+#[cfg(test)]
+mod speaker_writer_contract;
 mod voice_identity;
 mod voice_identity_schema;
 #[cfg(test)]
