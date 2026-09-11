@@ -52,9 +52,11 @@ fn human_date(y: i64, mo: i64, d: i64) -> String {
     format!("{month} {d}, {y}")
 }
 
-/// Human-readable UTC instant, e.g. `Jul 30, 2026, 10:31 UTC`. The enclave
-/// holds no per-account time zone, so the zone is stated instead of guessed.
-/// Unparseable input is returned unchanged rather than dropped.
+/// Human-readable UTC instant, e.g. `Jul 30, 2026, 10:31 UTC`. Brief timestamps
+/// are rendered in UTC with the zone stated: the account's morning-email zone
+/// (which follows the recording device) schedules delivery but does not reach
+/// this renderer, so nothing is guessed. Unparseable input is returned
+/// unchanged rather than dropped.
 pub fn human_utc(timestamp: &str) -> String {
     match isotime::parse_epoch_millis(timestamp) {
         Some(ms) => {
