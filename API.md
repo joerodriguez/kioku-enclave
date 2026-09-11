@@ -4,8 +4,9 @@ This is the stable capture contract for the pure-Swift macOS and iOS clients.
 Clients capture bounded audio or screenshots, attach authoritative device-time
 and foreground/browser context, and upload them to the attested enclave. All
 transcription, OCR, diarization, indexing, and summarization run in the cloud.
-WeSpeaker profile learning and voice matching are offline evaluation capabilities,
-not part of the serving capture pipeline.
+WeSpeaker profile learning and same-session voice continuity run inside the enclave for
+an operator-selected account cohort, defaulting to none. Retained source audio is required;
+voiceprints are never sent to a provider or returned by an API.
 
 The capture pipeline is a core product behavior. It is not controlled by a
 Kioku feature flag. Apple recording, Screen Recording, and Automation
@@ -1151,6 +1152,16 @@ these routes. Silence-removal percentages shown by the dashboard are planning sc
 over complete rate-card-modeled uncached audio-input cost, not measured silence or realized
 savings.
 
+## Account export
+
+Authenticated `GET /api/export` returns a tenant-qualified, repeatable-read JSON snapshot
+of current structured rows and media inventory metadata. Voice samples, profiles,
+revisions, and representatives use explicit metadata projections: `embedding` and
+`centroid` bytes never appear. Sample diagnostics, eligibility, versions, profile status,
+and assignment/revision lineage remain available. Operator voice cohort/pause state is
+excluded. Export does not fetch retained GCS media bytes; byte-complete media export is
+still a separate activation gate. A database failure never returns partial success.
+
 ## Account-deletion status
 
 `DELETE /api/account` begins or retries account deletion. It returns `202` until
@@ -1212,20 +1223,27 @@ rows or owned media generations remain.
 - Gemini 3.5 Flash receives a bounded decrypted asset from inside the enclave
   for transcription/diarization or screenshot understanding. This is an
   explicit Vertex processing boundary, not enclave-only inference.
-- Speaker names are opaque-person claims, never identity keys. Explicit audio
-  self-identification binds its own turn; repeated exact active-speaker frames
-  may bind only when exactly one non-overlapping system-audio turn spans them.
-  Roster/context names and the bounded spelling vocabulary sent to Gemini are
-  never proof of identity. Two people with the same normalized display name
-  remain distinct. One-to-three-second samples are match-only; overlap, music,
-  echo, silence, clipping, and low-purity samples quarantine. At least three
-  seconds of clean speech is required for enrollment, and profiles use a
-  versioned medoid/trimmed centroid with outlier rejection. The offline
-  voice-evaluation path can use WeSpeaker embeddings to measure later-turn
-  matching; serving does not currently execute that path. Gemini never receives
-  voiceprints or acts as a biometric identifier. Gemini request-local speaker
-  IDs may group turns only inside their source work unit; unmatched IDs are
-  displayed as `Unidentified voice`, not persisted as apparent people.
+- A separate lease worker computes pinned WeSpeaker embeddings from retained encrypted
+  source spans. It compares only the same embedding space, scorer version, capture session,
+  and acoustic domain. A cosine score of at least 0.60 and a runner-up margin of at least
+  0.08 permits attachment; below 0.45 an enrollment-eligible sample may create an anonymous
+  profile. Other samples remain unassigned. One-to-three-second samples can match but
+  never create or update a representative; overlap and failed quality gates quarantine.
+  Profiles use a medoid and normalized trimmed centroid, with 0.50 outlier rejection.
+  Owner-transmit clusters retain their existing attribution and do not create profiles.
+  Direct person evidence may propagate through a profile; competing person bindings
+  quarantine it without overwriting either person. This Phase 1 path does not add owner
+  enrollment, cross-memory matching, name fusion, or remove the existing normalized-name
+  reuse in self-introduction processing. Gemini never receives voiceprints.
+- Voice controls are persisted operator state: cohort `none`, `explicit`, or `all`, plus
+  Pause. Only the digest-pinned migrator changes them. This is a documented Phase 1
+  deviation from ADR-0048's signed-Pause design: these controls have no Ed25519 receipt.
+  Already claimed batches may finish computing after Pause, but their settlement rechecks
+  the controls and cannot commit a new binding. Each sweep filters accounts before
+  per-account work; expired media is terminalized
+  without fetching it. Missing or invalid model weights disable the worker and preserve
+  readiness. Metrics use `voice_identity_v1` with literal outcomes/cohorts/latency buckets,
+  no account labels, content, embeddings, or scores.
 - Profile reconciliation retains append-only revisions and sample-assignment
   history. A merge proposal is accepted only across the same embedding space,
   scorer, acoustic domain, and nonconflicting identity; a split is anonymous
@@ -1242,7 +1260,12 @@ rows or owned media generations remain.
   activation gate is satisfied, an account may affirmatively retain original source audio
   until deletion in the separate encrypted recordings bucket; screenshots remain on the
   30-day policy. Account export
-  includes profile proposals, revisions, and sample-assignment lineage. Account
+  includes profile metadata, revisions, and sample-assignment lineage, without embedding
+  or centroid bytes. Episode capture erasure recomputes affected profiles in the same
+  transaction or quarantines them when no accepted enrollment sample remains; historical
+  revision centroid bytes are also erased while lineage metadata remains. The
+  ADR-0036 recording-retention downgrade currently removes no samples, so it does not
+  trigger profile recomputation in Phase 1. Account
   deletion removes raw objects, derived records, profiles, lineage, credentials,
   and all account-owned PostgreSQL rows. For every exact GCS object name, deletion lists,
   deletes, and verifies the absence of all live and noncurrent generations.

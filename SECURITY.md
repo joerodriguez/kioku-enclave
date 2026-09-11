@@ -163,10 +163,32 @@ it does not establish structured authority.
 The image binds one live media bucket. Recordings and other live media domains derive only from the
 same reviewed object boundary. Never reuse removed database/index/archive bucket names for media.
 
+### Voice identity serving
+
+A separate bounded worker runs SHA-256-pinned WeSpeaker inside the application for the
+PostgreSQL-selected cohort (default none). It decrypts only exact retained GCS generations;
+embeddings remain in application memory and private PostgreSQL, never in provider calls,
+API responses, logs, or metrics. Same-session, same-domain matching uses fixed thresholds,
+quality gates, append-only assignments/revisions, and conflict quarantine. Lease-token CAS,
+account/deletion fencing, and the reconciliation lock order protect settlement. Episode
+capture erasure recomputes representatives atomically or quarantines empty profiles, and
+redacts historical centroid bytes while preserving revision metadata. Orphan erasure treats
+a complete expired voice lease as having no authority, even while processing is paused or
+the model is unavailable; live or malformed leases still refuse erasure.
+
+The digest-pinned migrator owns cohort/pause controls; Phase 1 deliberately uses database
+operator authorization rather than the ADR's Ed25519 Pause receipt. Model absence disables
+voice work without changing readiness. The existing recording-retention downgrade removes
+no voice samples and therefore triggers no profile recompute; owner enrollment and broader
+identity fusion remain later phases. This adds biometric inference inside the existing
+application/private Cloud SQL trust boundary and no new plaintext recipient.
+
 ### Export and deletion
 
 Export is an authenticated, tenant-qualified, repeatable-read JSON snapshot of selected
-PostgreSQL rows, including media inventory metadata. It does not fetch GCS object bytes; full
+PostgreSQL rows, including media inventory metadata. The four voice sample/profile/revision/
+representative projections explicitly omit embedding and centroid bytes. Operator cohort state
+is not account content and is not exported. It does not fetch GCS object bytes; full
 media-byte export remains an activation blocker. It must not expose another account's row or
 misrepresent a failed read as partial success. Export failures are content-free.
 

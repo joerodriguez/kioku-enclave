@@ -94,7 +94,7 @@ RUN mkdir -p /models \
     && echo "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b  /models/model.safetensors" | sha256sum -c - \
     && echo "1e98ea05b0de579fcaad3d625b62ea55647142ed674d5f5ebf1440e4bbbb6f23  /models/MODEL_CARD.md" | sha256sum -c -
 
-# WeSpeaker ResNet34-LM (VoxCeleb) for the explicit offline voice-evaluation CLI.
+# WeSpeaker ResNet34-LM (VoxCeleb) for cohort-gated serving and offline evaluation.
 # The Rust binary supplies decoding, Kaldi fbank, inference, and matching; no
 # Python, sherpa process, or dynamic ONNX runtime is present in the image.
 RUN mkdir -p /models/voice \
