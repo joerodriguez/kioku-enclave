@@ -41,6 +41,10 @@ mod query;
 mod reconciliation_source_audit;
 mod recording_retention;
 mod schema_release;
+mod voice_identity;
+mod voice_identity_schema;
+#[cfg(test)]
+mod voice_worker_contract;
 mod work;
 
 use std::str::FromStr;
@@ -252,7 +256,8 @@ impl PostgresPersistence {
         self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await?;
         self.install_test_orphan_erasure_schema().await?;
         self.install_morning_email_schema().await?;
-        self.install_brief_sections_schema().await
+        self.install_brief_sections_schema().await?;
+        self.install_voice_identity_schema().await
     }
 
     #[cfg(test)]
@@ -955,6 +960,7 @@ mod tests {
         }
         persistence.install_morning_email_schema().await.unwrap();
         persistence.install_brief_sections_schema().await.unwrap();
+        persistence.install_voice_identity_schema().await.unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -970,7 +976,8 @@ mod tests {
                 WHERE schemaname = current_schema()
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
-                      'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema');
+                      'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema', \
+                      'voice_identity_schema','voice_identity_controls');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;

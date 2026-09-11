@@ -43,8 +43,10 @@ pub mod voice_eval;
 pub mod voice_eval_assets;
 pub mod voice_eval_evidence;
 pub mod voice_eval_similarity;
+pub(crate) mod voice_identity;
 pub mod voice_memory;
 pub mod voice_quality;
+pub(crate) mod voice_worker;
 pub mod webhook_worker;
 
 use crate::persistence::{Account, AccountUpsert};
@@ -527,7 +529,7 @@ impl CpConfig {
     }
 }
 
-fn is_stable_uuid(value: &str) -> bool {
+pub(crate) fn is_stable_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
@@ -563,6 +565,7 @@ pub struct CpState {
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
+    pub voice: Option<Arc<voice_memory::VoiceEngine>>,
 }
 
 /// The stable machine-readable reason a failed PostgreSQL-backed read reports.

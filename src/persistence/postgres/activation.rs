@@ -4292,6 +4292,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     // independent compatibility boundary, then exercise current delivery.
     persistence.install_morning_email_schema().await?;
     persistence.install_brief_sections_schema().await?;
+    persistence.install_voice_identity_schema().await?;
     sqlx::query(
         "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
          VALUES($1,'activation-contract@example.com','google','activation-contract-subject')",

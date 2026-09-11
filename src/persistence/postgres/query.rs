@@ -152,6 +152,18 @@ const EXPORT_TABLES: &[(&str, &str, &str)] = &[
     ("person_facts", "person_facts", "person_id,id"),
 ];
 
+// Voice metadata is an explicit allow-list: a later biometric column cannot
+// silently become public merely because it was added to an internal table.
+fn export_projection(table: &str) -> &'static str {
+    match table {
+        "voice_samples" => "id,speaker_observation_id,voice_profile_id,embedding_space,channel_domain,quality_score,diagnostics,quality_version,scorer_version,eligibility,duration_ms,speech_ratio,snr_proxy_db,clipping_ratio,silence_ratio,embedding_norm,outlier,similarity,decision_margin,accepted,embedding_job_id,created_at",
+        "voice_profiles" => "id,person_id,label,embedding_space,channel_domain,sample_count,scorer_version,representative_kind,medoid_sample_id,status,created_at,updated_at",
+        "voice_profile_revisions" => "id,profile_id,status,derivation_version,scorer_version,representative_kind,sample_count,medoid_sample_id,person_id,proposal_id,predecessor_revision_id,reason_code,active,created_at",
+        "voice_profile_representatives" => "id,profile_id,channel_domain,sample_count,medoid_sample_id,scorer_version,created_at,updated_at",
+        _ => "*",
+    }
+}
+
 async fn postgres_export(persistence: &PostgresPersistence, account_id: &str) -> Result<Value> {
     let mut export = serde_json::Map::new();
     let mut transaction = persistence.pool().begin().await?;
@@ -162,9 +174,10 @@ async fn postgres_export(persistence: &PostgresPersistence, account_id: &str) ->
         // Identifiers come only from the reviewed static table above. Product
         // rows lose the shared-database tenant key and backend-only generated
         // search projection before they cross the public export boundary.
+        let projection = export_projection(table);
         let statement = format!(
             "SELECT (to_jsonb(export_row)-'account_id'-'search_document')::text AS row_json \
-               FROM (SELECT * FROM {table} WHERE account_id=$1 ORDER BY {order}) export_row"
+               FROM (SELECT {projection} FROM {table} WHERE account_id=$1 ORDER BY {order}) export_row"
         );
         let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(statement))
             .bind(account_id)
@@ -2779,6 +2792,67 @@ impl MemoryQueryRepository for PostgresPersistence {
         }
         require_identified_person(self, account_id, person_id).await?;
         postgres_person_statements(self, account_id, person_id, before_id, limit).await
+    }
+}
+
+#[cfg(test)]
+mod voice_export_tests {
+    use super::*;
+    #[tokio::test]
+    async fn voice_export_has_metadata_without_biometric_bytes() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        sqlx::raw_sql(r#"
+            INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES('voice-export','synthetic@example.test','google','voice-export');
+            INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,schema_version) VALUES('voice-export','session','device','install',now(),now(),2);
+            INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) VALUES('voice-export','stream','session','device','mic');
+            INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition)
+            VALUES('voice-export','event','device','install','session','stream','mic',0,now(),'0',now(),now(),'UTC',0,0,'asset',repeat('a',64),'canonical');
+            INSERT INTO speaker_observations(account_id,id,event_id,turn_id,speaker_local_id,started_at,ended_at,transcript_text) VALUES('voice-export',1,'event','turn','speaker',now(),now(),'Synthetic test');
+            INSERT INTO voice_profiles(account_id,id,label,embedding_space,channel_domain,centroid,sample_count) VALUES('voice-export',1,'voice-profile-1','test-space','test-domain',decode('cafe','hex'),1);
+            INSERT INTO voice_samples(account_id,id,speaker_observation_id,voice_profile_id,embedding_space,channel_domain,embedding,quality_score) VALUES('voice-export',1,1,1,'test-space','test-domain',decode('cafe','hex'),1);
+            INSERT INTO voice_profile_revisions(account_id,id,profile_id,status,derivation_version,scorer_version,representative_kind,centroid,sample_count,reason_code) VALUES('voice-export',1,1,'tentative',1,2,'medoid_trimmed_centroid',decode('cafe','hex'),1,'created');
+            INSERT INTO voice_profile_representatives(account_id,id,profile_id,channel_domain,centroid,sample_count) VALUES('voice-export',1,1,'test-domain',decode('cafe','hex'),1);
+        "#).execute(repo.pool()).await.unwrap();
+        let export = postgres_export(repo, "voice-export").await.unwrap();
+        for table in [
+            "voice_samples",
+            "voice_profiles",
+            "voice_profile_revisions",
+            "voice_profile_representatives",
+        ] {
+            let rows = export[table].as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "voice export fixture must exercise every voice table"
+            );
+            let row = &rows[0];
+            assert_eq!(row["id"], 1, "voice metadata must remain exportable");
+            let bytea_columns: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid=to_regclass($1) AND atttypid='bytea'::regtype AND NOT attisdropped")
+                .bind(table).fetch_all(repo.pool()).await.unwrap();
+            for column in bytea_columns {
+                assert!(
+                    row.get(&column).is_none(),
+                    "voice export must omit biometric bytea keys: {table}.{column}"
+                );
+            }
+            assert!(row.get("account_id").is_none());
+        }
+        assert!(
+            export.get("voice_identity_controls").is_none(),
+            "operator cohort state must not be exported"
+        );
+        fixture.persistence.pool().close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            fixture.schema
+        )))
+        .execute(fixture.base.pool())
+        .await
+        .unwrap();
     }
 }
 

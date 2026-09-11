@@ -1609,6 +1609,8 @@ async fn purge_paged_events(
         }
     }
 
+    let affected_voice_profiles =
+        super::voice_identity::erase_event_samples(transaction, account_id, &event_ids).await?;
     let deleted =
         sqlx::query("DELETE FROM capture_events WHERE account_id=$1 AND event_id=ANY($2::text[])")
             .bind(account_id)
@@ -1616,6 +1618,12 @@ async fn purge_paged_events(
             .execute(&mut **transaction)
             .await?
             .rows_affected();
+    super::voice_identity::recompute_erased_profiles(
+        transaction,
+        account_id,
+        &affected_voice_profiles,
+    )
+    .await?;
     if usize::try_from(deleted).ok() != Some(event_ids.len()) {
         return Err(EnclaveError::Conflict(
             "episode deletion capture purge was not exact".into(),
@@ -2887,11 +2895,23 @@ impl EpisodeDeletionRepository for PostgresPersistence {
                     ));
                 }
             }
+            let affected_voice_profiles = super::voice_identity::erase_event_samples(
+                &mut transaction,
+                account_id,
+                &orphan_events,
+            )
+            .await?;
             sqlx::query("DELETE FROM capture_events WHERE account_id=$1 AND event_id=ANY($2)")
                 .bind(account_id)
                 .bind(&orphan_events)
                 .execute(&mut *transaction)
                 .await?;
+            super::voice_identity::recompute_erased_profiles(
+                &mut transaction,
+                account_id,
+                &affected_voice_profiles,
+            )
+            .await?;
         }
         if !affected_work_ids.is_empty() {
             // A nonterminal aggregate is no longer an exact provider input

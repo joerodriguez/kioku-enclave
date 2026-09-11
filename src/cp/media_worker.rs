@@ -327,30 +327,47 @@ fn validate_storyboard_result(
         })
         .collect()
 }
+pub(crate) async fn load_retained_media(
+    media_objects: &dyn crate::persistence::MediaObjectStore,
+    kms: &dyn crate::crypto::KmsClient,
+    user_id: &str,
+    object_key: &str,
+    object_generation: i64,
+    byte_length: i64,
+    sha256: &str,
+) -> Result<Vec<u8>> {
+    let stored = media_objects
+        .get_current_generation(object_key, object_generation)
+        .await?;
+    if stored.generation != object_generation {
+        return Err(EnclaveError::NotFound);
+    }
+    let dek = crate::crypto::load_dek(kms, &stored.wrapped_dek_b64).await?;
+    let context = crate::gcs::media_blob_context(user_id, object_key);
+    let media = crate::crypto::decrypt_bound_blob(&dek, &stored.ciphertext, &context)?.plaintext;
+    if i64::try_from(media.len()).ok() != Some(byte_length)
+        || !format!("{:x}", Sha256::digest(&media)).eq_ignore_ascii_case(sha256)
+    {
+        return Err(EnclaveError::Crypto("raw media commitment mismatch".into()));
+    }
+    Ok(media)
+}
+
 async fn load_job_media(
     state: &CpState,
     user_id: &str,
     job: &MediaProcessingJob,
 ) -> Result<Vec<u8>> {
-    let stored = state
-        .repositories
-        .media_objects()
-        .get_current_generation(&job.object_key, job.object_generation)
-        .await?;
-    if stored.generation != job.object_generation {
-        return Err(EnclaveError::Crypto(
-            "raw media generation changed after admission".into(),
-        ));
-    }
-    let dek = crate::crypto::load_dek(state.kms.as_ref(), &stored.wrapped_dek_b64).await?;
-    let context = crate::gcs::media_blob_context(user_id, &job.object_key);
-    let media = crate::crypto::decrypt_bound_blob(&dek, &stored.ciphertext, &context)?.plaintext;
-    if i64::try_from(media.len()).ok() != Some(job.byte_length)
-        || !format!("{:x}", Sha256::digest(&media)).eq_ignore_ascii_case(&job.sha256)
-    {
-        return Err(EnclaveError::Crypto("raw media commitment mismatch".into()));
-    }
-    Ok(media)
+    load_retained_media(
+        state.repositories.media_objects(),
+        state.kms.as_ref(),
+        user_id,
+        &job.object_key,
+        job.object_generation,
+        job.byte_length,
+        &job.sha256,
+    )
+    .await
 }
 
 fn media_usage(claim: &MediaProcessingClaim, generation: &vertex::MediaGeneration) -> Value {

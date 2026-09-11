@@ -135,6 +135,11 @@ fn refuse_scope() -> EnclaveError {
 }
 
 pub(super) async fn require_quiescent(connection: &mut PgConnection, account: &str) -> Result<()> {
+    // Voice inference may be disabled or paused after a worker crashes. A
+    // well-formed expired lease has lost all settlement authority; requiring
+    // that worker to restart would wedge erasure. Callers hold the ordinary
+    // account/reconciliation fence, so it cannot be reclaimed during erasure.
+    // Malformed/incomplete triples and every live lease still fail closed.
     let busy = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM capture_upload_intents WHERE account_id=$1) \
           OR EXISTS(SELECT 1 FROM recording_delivery_reservations WHERE account_id=$1) \
@@ -147,7 +152,9 @@ pub(super) async fn require_quiescent(connection: &mut PgConnection, account: &s
           OR EXISTS(SELECT 1 FROM media_processing_jobs WHERE account_id=$1 AND (state='processing' \
              OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_until IS NOT NULL)) \
           OR EXISTS(SELECT 1 FROM voice_embedding_jobs WHERE account_id=$1 AND (state='processing' \
-             OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_until IS NOT NULL)) \
+             OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_until IS NOT NULL) \
+             AND NOT (state='processing' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL \
+                      AND lease_until<=clock_timestamp())) \
           OR EXISTS(SELECT 1 FROM summary_window_claims WHERE account_id=$1 AND (state='processing' \
              OR claim_token IS NOT NULL OR claim_until IS NOT NULL)) \
           OR EXISTS(SELECT 1 FROM capture_formation_receipts WHERE account_id=$1 AND (state='processing' \
@@ -328,4 +335,69 @@ async fn account_provider_names(connection: &mut PgConnection, account: &str) ->
         return Err(refuse_scope());
     }
     Ok(sha256_label(&row.try_get::<Vec<u8>, _>("digest")?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{VoiceCohort, VoiceEmbeddingOutcome, VoiceIdentityRepository};
+    #[tokio::test]
+    async fn expired_voice_lease_cannot_wedge_paused_orphan_erasure() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        repo.install_memory_reconciliation_activation_schema()
+            .await
+            .unwrap();
+        let account = "orphan-voice-lease";
+        super::super::voice_identity::tests::seed_voice_observation(
+            repo, account, "session", "event", 1, 1,
+        )
+        .await;
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        require_quiescent(&mut repo.pool().acquire().await.unwrap(), account)
+            .await
+            .expect("otherwise idle orphan fixture is quiescent");
+        let claim = repo
+            .claim_voice_embeddings(account, "crashed-worker")
+            .await
+            .unwrap()
+            .claims
+            .remove(0);
+        let mut connection = repo.pool().acquire().await.unwrap();
+        assert!(
+            require_quiescent(&mut connection, account).await.is_err(),
+            "live voice lease must block orphan erasure"
+        );
+        repo.set_voice_identity_paused(true).await.unwrap();
+        sqlx::query("UPDATE voice_embedding_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE account_id=$1").bind(account).execute(&mut *connection).await.unwrap();
+        assert!(
+            require_quiescent(&mut connection, account).await.is_ok(),
+            "expired voice lease must not wedge paused orphan erasure"
+        );
+        assert!(
+            !repo
+                .settle_voice_embedding(&claim, VoiceEmbeddingOutcome::Retry)
+                .await
+                .unwrap(),
+            "expired voice lease must have no settlement authority"
+        );
+        sqlx::query("UPDATE voice_embedding_jobs SET lease_owner=NULL,lease_token=NULL,lease_until=NULL WHERE account_id=$1").bind(account).execute(&mut *connection).await.unwrap();
+        assert!(
+            require_quiescent(&mut connection, account).await.is_err(),
+            "malformed processing authority must fail closed"
+        );
+        drop(connection);
+        repo.pool().close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            fixture.schema
+        )))
+        .execute(fixture.base.pool())
+        .await
+        .unwrap();
+    }
 }
