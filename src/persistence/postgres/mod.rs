@@ -3762,8 +3762,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Even a malformed legacy owner row carrying a person ID must remain
-        // inert at every public navigation surface.
+        // A stale legacy owner cache entry has no supporting owner observation.
+        // Observed memories must omit it rather than merge it into the live graph.
         sqlx::query(
             "INSERT INTO episode_participants \
              (account_id,id,episode_id,participant_key,person_id,attribution_kind) \
@@ -3954,10 +3954,13 @@ mod tests {
             1
         );
         assert_eq!(
-            episode_page.episodes[0]["participant_details"][1]["display_name"],
-            "Me"
+            episode_page.episodes[0]["participant_details"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "observed episode list must omit the unsupported cached owner"
         );
-        assert!(episode_page.episodes[0]["participant_details"][1]["person_id"].is_null());
         let evidence = repositories
             .memory_queries()
             .episode_members(&account_id, 1)
@@ -3966,8 +3969,11 @@ mod tests {
         assert_eq!(evidence["member_count"], 2);
         assert_eq!(evidence["participant_details"][0]["display_name"], "Lynn");
         assert_eq!(evidence["participant_details"][0]["person_id"], 1);
-        assert_eq!(evidence["participant_details"][1]["display_name"], "Me");
-        assert!(evidence["participant_details"][1]["person_id"].is_null());
+        assert_eq!(
+            evidence["participant_details"].as_array().unwrap().len(),
+            1,
+            "observed episode members must omit the unsupported cached owner"
+        );
         assert_eq!(
             evidence["members"][0]["started_at"],
             "2026-08-27T12:00:00.000Z"
