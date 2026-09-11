@@ -30,8 +30,9 @@ activation-capable image is dormant in `Installed`; signed `Draining` attaches d
 completes bounded
 source/claim ledgers; `Active` enables repository-authorized egress; `Paused` stops egress without
 restoring legacy finalization. Immutable image evidence binds the exact
-model/location/compiled producer contract, and readiness refuses an incompatible rollback once
-draining begins. A shared/exclusive transaction advisory lock makes activation absence probes atomic
+model/location/compiled producer contract; since ADR-0046 the running image registers that
+producer at startup as the release authority for its claims, and readiness requires a verified
+`Active` or `Paused` chain rather than a producer match. A shared/exclusive transaction advisory lock makes activation absence probes atomic
 with v27 installation and transitions; revision-bound formation pages and independently verified
 providerless neighborhood scans keep dense sessions/components live without truncating evidence.
 One normal signed release image performs install/backfill and then rolls homogeneously while the

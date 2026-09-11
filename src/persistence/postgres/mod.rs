@@ -111,6 +111,13 @@ fn classify_serving_schema(state: InstalledSchemaState) -> Result<ServingSchemaS
 #[derive(Clone)]
 pub(crate) struct PostgresPersistence {
     pool: PgPool,
+    /// The producer this process runs, registered by serving startup after the
+    /// release-readiness checks (ADR-0046). Absent in the migrator and in
+    /// harnesses that never claim reconciliation work; `None` falls back to the
+    /// signed activation authority's recorded producer.
+    runtime_reconciliation_producer: std::sync::Arc<
+        std::sync::RwLock<Option<crate::persistence::RuntimeReconciliationProducer>>,
+    >,
 }
 
 pub(crate) struct PostgresPoolConfig {
@@ -155,11 +162,11 @@ impl PostgresPersistence {
         let options =
             PgConnectOptions::from_str("postgresql://kioku-test:unused@127.0.0.1:1/kioku_test")
                 .expect("static test PostgreSQL URL");
-        Self {
-            pool: PgPoolOptions::new()
+        Self::with_pool(
+            PgPoolOptions::new()
                 .max_connections(1)
                 .connect_lazy_with(options),
-        }
+        )
     }
 
     pub(crate) async fn connect(config: PostgresPoolConfig) -> Result<Self> {
@@ -199,11 +206,42 @@ impl PostgresPersistence {
             })
             .connect_with(options)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::with_pool(pool))
+    }
+
+    /// Wraps an already connected pool. The runtime producer starts absent and
+    /// is registered by serving startup only.
+    pub(crate) fn with_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            runtime_reconciliation_producer: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Registers the producer this process runs. Serving calls this exactly
+    /// once, after `verify_reconciliation_runtime_schema` admitted the image;
+    /// every clone of this handle observes the registration.
+    pub(crate) fn register_runtime_reconciliation_producer(
+        &self,
+        producer: crate::persistence::RuntimeReconciliationProducer,
+    ) {
+        *self
+            .runtime_reconciliation_producer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(producer);
+    }
+
+    pub(crate) fn runtime_reconciliation_producer(
+        &self,
+    ) -> Option<crate::persistence::RuntimeReconciliationProducer> {
+        self.runtime_reconciliation_producer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Build a complete disposable contract database. Production releases use
@@ -651,7 +689,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("connect isolated control-plane schema");
-        let persistence = PostgresPersistence { pool };
+        let persistence = PostgresPersistence::with_pool(pool);
         let schema_was_installed = sqlx::query_scalar::<_, bool>(
             "SELECT to_regclass(format('%I.%I',current_schema(),'persistence_schema')) IS NOT NULL",
         )

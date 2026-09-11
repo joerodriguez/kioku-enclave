@@ -613,6 +613,10 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
                 "formation_backfill_complete": activation.formation_backfill_complete,
                 "finalization_claim_drain_complete": activation.finalization_claim_drain_complete,
             })),
+            "runtime_producer_contract_sha256": state
+                .postgres
+                .runtime_reconciliation_producer()
+                .map(|producer| producer.producer_contract_label()),
         })),
     )
         .into_response()
@@ -1293,6 +1297,22 @@ async fn async_main() {
         .unwrap_or_else(|error| {
             panic!("memory reconciliation runtime is not release-ready: {error}")
         });
+    // ADR-0046: the reviewed image is the release authority for the producer it
+    // runs. Register it once so every claim, provider attempt, stage, and
+    // publication of this process binds this exact producer, whatever producer
+    // the signed activation history recorded.
+    if let (Some(reconciliation_model), Some(producer_contract_sha256)) = (
+        cp_config.vertex_reconciliation_model_requested.as_deref(),
+        reconciliation_producer_contract.as_ref(),
+    ) {
+        postgres.register_runtime_reconciliation_producer(
+            persistence::RuntimeReconciliationProducer {
+                producer_contract_sha256: producer_contract_sha256.to_vec(),
+                reconciliation_model: reconciliation_model.to_owned(),
+                vertex_location: cp_config.vertex_location.clone(),
+            },
+        );
+    }
     let media_objects: Arc<dyn persistence::MediaObjectStore> = Arc::new(
         persistence::GcsMediaObjectStore::new(Arc::clone(&application_media_gcs)),
     );

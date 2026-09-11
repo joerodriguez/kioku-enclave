@@ -7,9 +7,11 @@ expand during the ADR-0041 mixed-fleet window. The additive v27 activation contr
 reconciliation egress dark through install/drain, attaches legacy/deletion guards at signed
 Draining, and enables topology publication only from a signed Active generation with exact
 fleet-image, source-completeness, and provider-contract fences. Pause is forward-only. The
-one-release v0.9.31 Paused/g4 readiness bridge and its corrected Draining/g5 twin are retired:
-serving admits only a verified Active or Paused chain whose recorded model, location, and
-producer contract exactly match the running image.
+one-release v0.9.31 Paused/g4 readiness bridge and its corrected Draining/g5 twin are retired.
+Serving admits a verified Active or Paused chain for any activation-capable image: since
+ADR-0046 the running model, location, and producer contract are the reviewed image's own,
+registered at startup and bound into every claim, while the chain's recorded producer is
+signed history.
 Only the explicit
 release migrator applies the append-only files under `migrations/`.
 
@@ -19,7 +21,7 @@ release migrator applies the append-only files under `migrations/`.
 | `catalog_presence_tests.rs` | Synthetic cached-connection absence/install/drop visibility after an actual cross-connection release-lock wait; wrong-kind activation/erasure relations must fail closed. No owner data. |
 | `aggregate_audit.rs` / `aggregate_audit.sql` / `aggregate_audit_fixture.json` | Fixed, content-free v6 PostgreSQL aggregate snapshot in one repeatable-read/read-only transaction. Preserves raw unfinished-source diagnostics, prior source-isolation counts and all provider/lease, quota, capacity, reconciliation, finalization and activation gates. Fresh-work counts remain distinct from full context owner bounds; successor capacity includes nonfresh context atoms once per account from the same complete graph, excluding disconnected history. Owner eligibility requires the shared source-closed runtime proof; it does not claim unfinished captures are complete or restored. Historical v2–v5 evidence must not be relabeled v6. |
 | `activation_source_isolation.sql` | Bounded metadata-only source/draft closure for owner-prelaunch activation while retaining v0.9.24 serving safety. Includes event and projection intervals, unowned/draft-owned atoms and non-temporal member ownership; refuses held-source cross-session families, recent/open/unaccounted debt, empty/conflicting candidates and inventory overflow. No IDs, content, source completion, mutation, erasure or runtime bypass. |
-| `schema_release.rs` | Session-locked online v24-to-v26 release plus phase-aware v27 serving verification: marker-preserving expansion, exact per-step catalog evidence, concurrent indexes, baked-anchor Ed25519 fleet/activation authorization, and immutable model/location/producer readiness binding. |
+| `schema_release.rs` | Session-locked online v24-to-v26 release plus phase-aware v27 serving verification: marker-preserving expansion, exact per-step catalog evidence, concurrent indexes, baked-anchor Ed25519 fleet/activation authorization, and activation-capable readiness for the reviewed image (ADR-0046). |
 | `activation.rs` | Append-only v27 install/backfill/drain/activate/pause/resume authority, shared/exclusive release-lock serialization before schema probes, sticky scope, durable candidate-fleet image identity, exact catalog/receipt verification, database guard installation, claim drain, and runtime/repository gates. Installed backfill clears bounded expired terminal media ownership only for quiescent accounts. Draining backfill materializes bounded signed-scope assignments even for empty accounts; a distinct migrator repair accepts only the exact already-committed Draining authority and complete current-generation ledgers. Lifecycle fencing preserves deletion/admission; no history, quota, content, signed event, or schema identity is rewritten. |
 | `activation_epoch.rs` / `activation_epoch_catalog.sql` | One-time signed v1 Draining/g1 to v2 Draining/g2 upgrade, frozen-history verification, rollback-only catalog proposal with a distinct physical readback connection, and exact namespace evidence including attached indexes and standalone types. Synthetic PG tests reject partial/tampered catalogs, wrong prior authority, partial commit and replay, prove historical bytes remain unchanged, and exercise partial providerless KEEP. The internal transition method is migrator-only; it must not become reachable from serving routes. New CLI Draining-to-Active requires ordinary v2 g3 or later. |
 | `admission.rs` | Fleet token buckets and crash-recoverable concurrency leases. |

@@ -34,6 +34,7 @@ use std::sync::Arc;
 pub(crate) use activation::{
     ActiveReconciliationAuthority, MemoryReconciliationActivationPhase,
     MemoryReconciliationActivationRepository, MemoryReconciliationActivationStatus,
+    RuntimeReconciliationProducer,
 };
 pub(crate) use admission::{AdmissionRepository, FleetAdmissionLease};
 pub(crate) use billing::BillingRepository;

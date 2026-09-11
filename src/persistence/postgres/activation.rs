@@ -1477,11 +1477,17 @@ pub(super) async fn finalization_requires_reconciled(
     Ok(false)
 }
 
-/// Returns the exact signed active producer only after atomically assigning an
-/// eligible account. Claim, provider attempt, stage, and publish bind all fields.
+/// Returns the active reconciliation authority only after atomically assigning
+/// an eligible account. The generation and scope are the signed activation
+/// state; the producer, model, and location are the registered runtime
+/// producer of this process (ADR-0046), falling back to the values recorded by
+/// the signed authority only when no runtime producer was registered (the
+/// migrator and harnesses). Claim, provider attempt, stage, and publish bind all
+/// fields, so every replica of one image stamps the same producer.
 pub(super) async fn active_reconciliation_authority(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     account_id: &str,
+    runtime_producer: Option<&crate::persistence::RuntimeReconciliationProducer>,
 ) -> Result<Option<ActiveReconciliationAuthority>> {
     let Some(state) = lock_contract_key_share(transaction).await? else {
         return Ok(None);
@@ -1504,6 +1510,14 @@ pub(super) async fn active_reconciliation_authority(
         .bind(state.generation)
         .execute(&mut **transaction)
         .await?;
+    }
+    if let Some(runtime) = runtime_producer {
+        return Ok(Some(ActiveReconciliationAuthority {
+            generation: state.generation,
+            producer_contract_sha256: runtime.producer_contract_sha256.clone(),
+            reconciliation_model: runtime.reconciliation_model.clone(),
+            vertex_location: runtime.vertex_location.clone(),
+        }));
     }
     let producer_label = state
         .reconciliation_producer_contract_sha256
@@ -5041,9 +5055,11 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     // A source transaction which already follows KEY SHARE -> account lock
     // makes guard acquisition wait before it can take any episode row lock.
     let mut source_first = persistence.pool().begin().await?;
-    assert!(active_reconciliation_authority(&mut source_first, ACCOUNT)
-        .await?
-        .is_some());
+    assert!(
+        active_reconciliation_authority(&mut source_first, ACCOUNT, None)
+            .await?
+            .is_some()
+    );
     super::advisory_transaction_lock(&mut source_first, "memory-reconciliation", ACCOUNT).await?;
     let guard_persistence = persistence.clone();
     let guard_claim = claim.clone();
@@ -5072,7 +5088,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     let (mutation_ready_tx, mutation_ready_rx) = tokio::sync::oneshot::channel();
     let mut mutation_task = tokio::spawn(async move {
         let mut transaction = mutation_persistence.pool().begin().await?;
-        let authority = active_reconciliation_authority(&mut transaction, ACCOUNT).await?;
+        let authority = active_reconciliation_authority(&mut transaction, ACCOUNT, None).await?;
         mutation_ready_tx.send(()).map_err(|_| {
             EnclaveError::Store("provider mutation barrier receiver disappeared".into())
         })?;
@@ -5144,14 +5160,15 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
         model_attempts_before_replay,
     );
 
-    assert!(persistence
+    // ADR-0046: the running image's model and location are its own; a verified
+    // Active chain admits any activation-capable image.
+    persistence
         .verify_reconciliation_runtime_schema(
             Some("different-model"),
             "us-central1",
             Some(&producer_contract),
         )
-        .await
-        .is_err());
+        .await?;
     assert!(sqlx::query(
         "UPDATE episodes SET finalized_at=clock_timestamp() \
           WHERE account_id=$1 AND id=1",
@@ -5316,7 +5333,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     .await?;
     let mut provider_guard = persistence.pool().begin().await?;
     assert!(
-        active_reconciliation_authority(&mut provider_guard, ACCOUNT)
+        active_reconciliation_authority(&mut provider_guard, ACCOUNT, None)
             .await?
             .is_some()
     );
@@ -5365,9 +5382,11 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     );
     persistence.verify_schema().await?;
     let mut paused_egress = persistence.pool().begin().await?;
-    assert!(active_reconciliation_authority(&mut paused_egress, ACCOUNT)
-        .await?
-        .is_none());
+    assert!(
+        active_reconciliation_authority(&mut paused_egress, ACCOUNT, None)
+            .await?
+            .is_none()
+    );
     paused_egress.rollback().await?;
     assert!(persistence
         .verify_reconciliation_runtime_schema(None, "us-central1", None,)
@@ -5858,7 +5877,7 @@ async fn test_isolated_activation_contract(base: &PostgresPersistence, epoch_onl
         .connect_with(options)
         .await
         .expect("connect isolated activation schema");
-    let persistence = PostgresPersistence { pool };
+    let persistence = PostgresPersistence::with_pool(pool);
     let outcome = async {
         if epoch_only {
             persistence.migrate().await?;

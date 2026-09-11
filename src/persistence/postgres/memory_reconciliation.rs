@@ -2654,7 +2654,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
             .await?;
-        let Some(authority) = active_reconciliation_authority(&mut transaction, account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(held_keep_promotion(None, false));
         };
@@ -3101,7 +3106,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             .map(|value| timestamp(value, "held reconciliation component end"))
             .transpose()?;
         let mut transaction = self.pool().begin().await?;
-        let Some(authority) = active_reconciliation_authority(&mut transaction, account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -3134,7 +3144,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
-        let Some(authority) = active_reconciliation_authority(&mut transaction, account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(false);
         };
@@ -3167,8 +3182,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
-        let Some(authority) =
-            active_reconciliation_authority(&mut transaction, &claim.account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            &claim.account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -3238,8 +3257,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
             .await?;
-        let Some(authority) =
-            active_reconciliation_authority(&mut transaction, &snapshot.account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            &snapshot.account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -3332,8 +3355,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
-        let Some(authority) =
-            active_reconciliation_authority(&mut transaction, &claim.account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            &claim.account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -3362,8 +3389,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         staged: ReconciliationStageWrite,
     ) -> Result<StagedReconciliation> {
         let mut transaction = self.pool().begin().await?;
-        let Some(authority) =
-            active_reconciliation_authority(&mut transaction, &claim.account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            &claim.account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Err(EnclaveError::Conflict(
                 "memory reconciliation activation is no longer active".into(),
@@ -3437,8 +3468,12 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
             .await?;
-        let Some(authority) =
-            active_reconciliation_authority(&mut transaction, &command.claim.account_id).await?
+        let Some(authority) = active_reconciliation_authority(
+            &mut transaction,
+            &command.claim.account_id,
+            self.runtime_reconciliation_producer().as_ref(),
+        )
+        .await?
         else {
             return Err(EnclaveError::Conflict(
                 "memory reconciliation activation is no longer active".into(),
@@ -4500,7 +4535,7 @@ pub(super) async fn test_finalized_pending_channels_survive_successor(
         .bind(account_id).bind(NEW_ID).execute(&mut *tx).await?;
     tx.commit().await?;
     let mut tx = persistence.pool().begin().await?;
-    let authority = active_reconciliation_authority(&mut tx, account_id)
+    let authority = active_reconciliation_authority(&mut tx, account_id, None)
         .await?
         .unwrap();
     let component = source_closed_components(&mut tx, account_id)

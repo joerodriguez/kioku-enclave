@@ -138,7 +138,7 @@ async fn postgres_orphan_erasure_deadline_contract() {
         .connect_with(options)
         .await
         .unwrap();
-    let persistence = PostgresPersistence { pool: pool.clone() };
+    let persistence = PostgresPersistence::with_pool(pool.clone());
     let outcome =
         tokio::spawn(async move { Box::pin(test_transaction_deadlines(&persistence)).await }).await;
     pool.close().await;
