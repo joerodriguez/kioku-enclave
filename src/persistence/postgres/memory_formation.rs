@@ -2065,15 +2065,20 @@ impl MemoryFormationRepository for PostgresPersistence {
         let mut connection = self.pool.acquire().await?;
         let formation_receipts_installed =
             capture_formation_contract_installed(&mut connection).await?;
+        let identity = super::speaker_identity::speaker_identity_join(
+            super::speaker_identity::SpeakerUtteranceAlias::U,
+            super::speaker_identity::SpeakerMemoryScope::None,
+        );
         let utterance_sql = if formation_receipts_installed {
-            "SELECT u.id,floor(extract(epoch FROM coalesce(\
+            format!("SELECT u.id,floor(extract(epoch FROM coalesce(\
                         o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')\
                     ))*1000)::bigint AS started_at_ms,\
-                    u.speaker_label,u.language,u.text \
+                    speaker_identity.speaker_label,u.language,u.text \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o \
                  ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
+               {identity} \
               WHERE u.account_id=$1 \
                 AND coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')) \
                     >=to_timestamp($2::double precision/1000.0) \
@@ -2094,16 +2099,17 @@ impl MemoryFormationRepository for PostgresPersistence {
                                   AND source.speaker_observation_id=o.id \
                                   AND source.event_id=coalesce(event.canonical_event_id,event.event_id)))) \
               ORDER BY coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')),u.id \
-              LIMIT $4"
+              LIMIT $4")
         } else {
-            "SELECT u.id,floor(extract(epoch FROM coalesce(\
+            format!("SELECT u.id,floor(extract(epoch FROM coalesce(\
                         o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')\
                     ))*1000)::bigint AS started_at_ms,\
-                    u.speaker_label,u.language,u.text \
+                    speaker_identity.speaker_label,u.language,u.text \
                FROM utterances u JOIN audio_segments s \
                  ON s.account_id=u.account_id AND s.id=u.audio_segment_id \
                LEFT JOIN speaker_observations o \
                  ON o.account_id=u.account_id AND o.id=u.speaker_observation_id \
+               {identity} \
               WHERE u.account_id=$1 \
                 AND coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')) \
                     >=to_timestamp($2::double precision/1000.0) \
@@ -2113,9 +2119,9 @@ impl MemoryFormationRepository for PostgresPersistence {
                       WHERE owner.account_id=u.account_id AND owner.record_type='utterance' \
                         AND owner.record_id=u.id) \
               ORDER BY coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')),u.id \
-              LIMIT $4"
+              LIMIT $4")
         };
-        let utterances = sqlx::query(utterance_sql)
+        let utterances = sqlx::query(sqlx::AssertSqlSafe(utterance_sql))
             .bind(account_id)
             .bind(from_ms)
             .bind(to_ms)
@@ -2619,14 +2625,18 @@ impl MemoryFormationRepository for PostgresPersistence {
                 "capture formation page commitment changed".into(),
             ));
         }
-        let utterance_rows = sqlx::query(
+        let identity = super::speaker_identity::speaker_identity_join(
+            super::speaker_identity::SpeakerUtteranceAlias::Utterance,
+            super::speaker_identity::SpeakerMemoryScope::None,
+        );
+        let utterance_query = format!(
             "WITH evidence_events AS ( \
                  SELECT DISTINCT coalesce(canonical_event_id,event_id) AS event_id \
                    FROM capture_events WHERE account_id=$1 AND capture_session_id=$2) \
              SELECT DISTINCT utterance.id, \
                     floor(extract(epoch FROM coalesce(observation.started_at, \
                          segment.started_at+utterance.start_offset_seconds*interval '1 second'))*1000)::bigint \
-                         AS started_at_ms,utterance.speaker_label,utterance.language,utterance.text \
+                         AS started_at_ms,speaker_identity.speaker_label,utterance.language,utterance.text \
                FROM evidence_events evidence \
                JOIN speaker_observations observation ON observation.account_id=$1 \
                     AND (observation.event_id=evidence.event_id OR EXISTS( \
@@ -2638,14 +2648,16 @@ impl MemoryFormationRepository for PostgresPersistence {
                     AND utterance.speaker_observation_id=observation.id \
                JOIN audio_segments segment ON segment.account_id=utterance.account_id \
                     AND segment.id=utterance.audio_segment_id \
+               {identity} \
               WHERE utterance.id=ANY($3) \
               ORDER BY started_at_ms,utterance.id",
-        )
-        .bind(&claim.account_id)
-        .bind(&claim.capture_session_id)
-        .bind(&page.provider_utterance_ids)
-        .fetch_all(&mut *transaction)
-        .await?;
+        );
+        let utterance_rows = sqlx::query(sqlx::AssertSqlSafe(utterance_query))
+            .bind(&claim.account_id)
+            .bind(&claim.capture_session_id)
+            .bind(&page.provider_utterance_ids)
+            .fetch_all(&mut *transaction)
+            .await?;
         let screenshot_rows = sqlx::query(
             "WITH evidence_events AS ( \
                  SELECT DISTINCT coalesce(canonical_event_id,event_id) AS event_id \
@@ -3294,6 +3306,16 @@ impl MemoryFormationRepository for PostgresPersistence {
             }
             ids.push(id);
         }
+        super::speaker_identity::refresh_episode_speaker_projections(
+            &mut transaction,
+            &settlement.claim.account_id,
+            &ids.iter()
+                .copied()
+                .map(super::speaker_identity::SpeakerProjectionTarget::current)
+                .collect::<Vec<_>>(),
+            &[],
+        )
+        .await?;
         let page_outcome = if !ids.is_empty() {
             "memories"
         } else if page.provider_utterance_ids.is_empty()
@@ -3641,6 +3663,16 @@ impl MemoryFormationRepository for PostgresPersistence {
             }
             ids.push(id);
         }
+        super::speaker_identity::refresh_episode_speaker_projections(
+            &mut transaction,
+            &settlement.claim.account_id,
+            &ids.iter()
+                .copied()
+                .map(super::speaker_identity::SpeakerProjectionTarget::current)
+                .collect::<Vec<_>>(),
+            &[],
+        )
+        .await?;
         let window_from_ms = timestamp(&settlement.claim.from, "summary window start")?;
         let window_to_ms = timestamp(&settlement.claim.to, "summary window end")?;
         for (ordinal, episode_id) in ids.iter().enumerate() {

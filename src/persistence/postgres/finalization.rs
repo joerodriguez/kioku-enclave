@@ -248,34 +248,49 @@ impl FinalizationRepository for PostgresPersistence {
         };
         let input_identity_revision: i64 = row.try_get("identity_revision")?;
         let attempt_count: i64 = row.try_get("finalization_attempt_count")?;
-        let utterances = sqlx::query(
+        super::speaker_identity::refresh_episode_speaker_projections(
+            &mut transaction,
+            account_id,
+            &[super::speaker_identity::SpeakerProjectionTarget::current(
+                episode_id,
+            )],
+            &[],
+        )
+        .await?;
+        let identity = super::speaker_identity::speaker_identity_join(
+            super::speaker_identity::SpeakerUtteranceAlias::U,
+            super::speaker_identity::SpeakerMemoryScope::Episode("$2"),
+        );
+        let utterance_query = format!(
             "SELECT u.id,\
                     floor(extract(epoch FROM (a.started_at + \
                         make_interval(secs=>u.start_offset_seconds)))*1000)::bigint AS at_ms,\
-                    u.speaker_label,a.source_type,u.text \
+                    speaker_identity.speaker_label,a.source_type,u.text \
                FROM episode_members m JOIN utterances u \
                  ON u.account_id=m.account_id AND u.id=m.record_id \
                JOIN audio_segments a ON a.account_id=u.account_id AND a.id=u.audio_segment_id \
+               {identity} \
               WHERE m.account_id=$1 AND m.episode_id=$2 AND m.record_type='utterance' \
               ORDER BY a.started_at,u.start_offset_seconds,u.id",
-        )
-        .bind(account_id)
-        .bind(episode_id)
-        .fetch_all(&mut *transaction)
-        .await?
-        .into_iter()
-        .map(|row| {
-            let at_ms = row.try_get("at_ms")?;
-            Ok(FinalizationUtterance {
-                id: row.try_get("id")?,
-                at: isotime::format_epoch_millis(at_ms),
-                at_ms,
-                speaker: row.try_get("speaker_label")?,
-                source_type: row.try_get("source_type")?,
-                text: row.try_get("text")?,
+        );
+        let utterances = sqlx::query(sqlx::AssertSqlSafe(utterance_query))
+            .bind(account_id)
+            .bind(episode_id)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let at_ms = row.try_get("at_ms")?;
+                Ok(FinalizationUtterance {
+                    id: row.try_get("id")?,
+                    at: isotime::format_epoch_millis(at_ms),
+                    at_ms,
+                    speaker: row.try_get("speaker_label")?,
+                    source_type: row.try_get("source_type")?,
+                    text: row.try_get("text")?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let screenshots = sqlx::query(
             "SELECT s.id,floor(extract(epoch FROM s.captured_at)*1000)::bigint AS captured_at_ms,\
                     s.active_app,s.window_title,s.url,s.ocr_text,s.salient_ocr_text,s.is_duplicate,\

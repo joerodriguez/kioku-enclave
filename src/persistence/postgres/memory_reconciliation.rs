@@ -389,6 +389,54 @@ async fn read_atoms(
         .collect()
 }
 
+// Raw atom context remains the version-one source commitment above. Apply the
+// current identity graph only to the presentation returned to the organizer,
+// after both fingerprints are fixed; stored provider requests remain immutable.
+async fn present_atom_speakers(
+    connection: &mut PgConnection,
+    account_id: &str,
+    atoms: &mut [ReconciliationEvidenceAtom],
+) -> Result<()> {
+    let ids = atoms
+        .iter()
+        .filter(|atom| atom.record_type == "utterance")
+        .map(|atom| atom.record_id)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let identity = super::speaker_identity::speaker_identity_join(
+        super::speaker_identity::SpeakerUtteranceAlias::Utterance,
+        super::speaker_identity::SpeakerMemoryScope::LatestActive,
+    );
+    let query = format!("SELECT utterance.id,left(concat('[',speaker_identity.speaker_label,'] ',utterance.text),8000) AS context FROM utterances utterance {identity} WHERE utterance.account_id=$1 AND utterance.id=ANY($2)");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(account_id)
+        .bind(ids)
+        .fetch_all(connection)
+        .await?;
+    let contexts = rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<i64, _>("id")?,
+                row.try_get::<String, _>("context")?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    for atom in atoms
+        .iter_mut()
+        .filter(|atom| atom.record_type == "utterance")
+    {
+        atom.context = contexts.get(&atom.record_id).cloned().ok_or_else(|| {
+            EnclaveError::Conflict(
+                "reconciliation source presentation changed during selection".into(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct OutsideDraftClosure {
     episode_ids: Vec<i64>,
@@ -1751,6 +1799,7 @@ async fn read_snapshot(
             "episode_revisions": drafts.iter().map(|draft| (&draft.id,&draft.updated_at,draft.identity_revision)).collect::<Vec<_>>(),
         }),
     )?;
+    present_atom_speakers(connection, account_id, &mut atoms).await?;
     Ok(Some((
         ReconciliationSnapshot {
             account_id: account_id.to_owned(),
@@ -3105,6 +3154,9 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         let resume_after_component_ended_ms = resume_after_component_ended_at
             .map(|value| timestamp(value, "held reconciliation component end"))
             .transpose()?;
+        // Historical memories need durable letters before organizer context is
+        // selected. Preparation commits before the source snapshot/claim locks.
+        super::speaker_identity::prepare_account_speaker_projections(self, account_id).await?;
         let mut transaction = self.pool().begin().await?;
         let Some(authority) = active_reconciliation_authority(
             &mut transaction,
@@ -3739,7 +3791,14 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             .filter(|id| !protected_finalized_ids.contains(id))
             .collect::<Vec<_>>();
 
-        // Remove the previous active projection before inserting the exhaustive replacement.
+        let inherited_speaker_slots = super::speaker_identity::snapshot_speaker_slot_reservations(
+            &mut transaction,
+            &command.claim.account_id,
+            &command.claim.predecessor_episode_ids,
+        )
+        .await?;
+
+        // Remove the previous active membership before inserting its replacement.
         sqlx::query("DELETE FROM episode_members WHERE account_id=$1 AND episode_id=ANY($2)")
             .bind(&command.claim.account_id)
             .bind(&command.claim.predecessor_episode_ids)
@@ -3757,23 +3816,16 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         .bind(&refreshed_predecessor_ids)
         .execute(&mut *transaction)
         .await?;
-        // A strict one-to-one reconciliation retains the episode identity and its
-        // exact identity projections. Changed topology receives new episode ids;
-        // those successors are reprojected below only from their assigned
-        // utterances' durable speaker/identity evidence.
-        sqlx::query("DELETE FROM episode_participants WHERE account_id=$1 AND episode_id=ANY($2)")
-            .bind(&command.claim.account_id)
-            .bind(&replaced_predecessor_ids)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("DELETE FROM episode_speaker_slots WHERE account_id=$1 AND episode_id=ANY($2)")
+        // Keep predecessor reservations until successor projection transfers their
+        // ordinals. Retained memories keep their row IDs; ordinary retired-draft
+        // cleanup below may then cascade the transferred predecessor rows.
+        sqlx::query("UPDATE episode_participants SET state='superseded',updated_at=clock_timestamp() WHERE account_id=$1 AND episode_id=ANY($2)")
             .bind(&command.claim.account_id)
             .bind(&replaced_predecessor_ids)
             .execute(&mut *transaction)
             .await?;
 
         let mut successor_ids = Vec::with_capacity(outputs.len());
-        let mut new_successor_ids = Vec::new();
         let mut source_owner = HashMap::<String, i64>::new();
         for output in outputs {
             let id = if let Some(id) = output.retained_episode_id {
@@ -3822,7 +3874,6 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 .bind(output.model.as_deref()).bind(serde_json::to_string(&output.minute_summaries)?)
                 .bind(output.minutes_text.as_deref()).bind(&output.substance).bind(&output.visual_evidence)
                 .execute(&mut *transaction).await?;
-                new_successor_ids.push(id);
                 id
             };
             successor_ids.push(id);
@@ -3892,167 +3943,23 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             }
         }
 
-        let speaker_evidence = if new_successor_ids.is_empty() {
-            Vec::new()
-        } else {
-            sqlx::query(
-                "SELECT member.episode_id,observation.cluster_id AS speaker_cluster_id, \
-                        cluster.voice_profile_id,cluster.attribution_state, \
-                        observation.direct_evidence_id IS NOT NULL AS has_direct_identity, \
-                        CASE WHEN observation_person.status='identified' \
-                             THEN observation.person_id END AS observation_person_id, \
-                        CASE WHEN cluster_person.status='identified' \
-                             THEN cluster.person_id END AS cluster_person_id, \
-                        CASE WHEN profile_person.status='identified' \
-                             THEN profile.person_id END AS profile_person_id \
-                   FROM episode_members member \
-                   JOIN utterances utterance ON utterance.account_id=member.account_id \
-                        AND utterance.id=member.record_id \
-                   JOIN speaker_observations observation ON observation.account_id=utterance.account_id \
-                        AND observation.id=utterance.speaker_observation_id \
-                   LEFT JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id \
-                        AND cluster.id=observation.cluster_id \
-                   LEFT JOIN voice_profiles profile ON profile.account_id=cluster.account_id \
-                        AND profile.id=cluster.voice_profile_id \
-                   LEFT JOIN people observation_person ON observation_person.account_id=observation.account_id \
-                        AND observation_person.id=observation.person_id \
-                   LEFT JOIN people cluster_person ON cluster_person.account_id=cluster.account_id \
-                        AND cluster_person.id=cluster.person_id \
-                   LEFT JOIN people profile_person ON profile_person.account_id=profile.account_id \
-                        AND profile_person.id=profile.person_id \
-                  WHERE member.account_id=$1 AND member.episode_id=ANY($2) \
-                    AND member.record_type='utterance' \
-                  ORDER BY member.episode_id,cluster.voice_profile_id,observation.cluster_id,observation.id",
+        let speaker_targets = outputs
+            .iter()
+            .zip(&successor_ids)
+            .map(
+                |(output, id)| super::speaker_identity::SpeakerProjectionTarget {
+                    episode_id: *id,
+                    inherit_from: output.predecessor_episode_ids.clone(),
+                },
             )
-            .bind(&command.claim.account_id)
-            .bind(&new_successor_ids)
-            .fetch_all(&mut *transaction)
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(AssignedSpeakerEvidence {
-                    episode_id: row.try_get("episode_id")?,
-                    voice_profile_id: row.try_get("voice_profile_id")?,
-                    speaker_cluster_id: row.try_get("speaker_cluster_id")?,
-                    attribution_state: row.try_get("attribution_state")?,
-                    has_direct_identity: row.try_get("has_direct_identity")?,
-                    observation_person_id: row.try_get("observation_person_id")?,
-                    cluster_person_id: row.try_get("cluster_person_id")?,
-                    profile_person_id: row.try_get("profile_person_id")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-        };
-        let speaker_projections = rebuilt_speaker_projections(&speaker_evidence)?;
-        if !speaker_projections.is_empty() {
-            sqlx::query(
-                "INSERT INTO content_id_counters(account_id,entity_kind,next_id) \
-                 SELECT $1,'episode_speaker_slot',coalesce(max(id),0)+1 \
-                   FROM episode_speaker_slots WHERE account_id=$1 \
-                 ON CONFLICT(account_id,entity_kind) DO UPDATE SET \
-                   next_id=greatest(content_id_counters.next_id,excluded.next_id)",
-            )
-            .bind(&command.claim.account_id)
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                "INSERT INTO content_id_counters(account_id,entity_kind,next_id) \
-                 SELECT $1,'episode_participant',coalesce(max(id),0)+1 \
-                   FROM episode_participants WHERE account_id=$1 \
-                 ON CONFLICT(account_id,entity_kind) DO UPDATE SET \
-                   next_id=greatest(content_id_counters.next_id,excluded.next_id)",
-            )
-            .bind(&command.claim.account_id)
-            .execute(&mut *transaction)
-            .await?;
-
-            let mut slot_ordinals = HashMap::<i64, i64>::new();
-            let mut participants =
-                BTreeMap::<(i64, String), (Option<i64>, Option<i64>, String, u8)>::new();
-            for projection in speaker_projections {
-                let slot_id = if projection.voice_profile_id.is_some()
-                    || projection.speaker_cluster_id.is_some()
-                {
-                    let slot_id = allocate_content_id(
-                        &mut transaction,
-                        &command.claim.account_id,
-                        "episode_speaker_slot",
-                    )
-                    .await?;
-                    let ordinal = slot_ordinals.entry(projection.episode_id).or_default();
-                    sqlx::query(
-                        "INSERT INTO episode_speaker_slots( \
-                             account_id,id,episode_id,voice_profile_id,speaker_cluster_id,slot_ordinal) \
-                         VALUES($1,$2,$3,$4,$5,$6)",
-                    )
-                    .bind(&command.claim.account_id)
-                    .bind(slot_id)
-                    .bind(projection.episode_id)
-                    .bind(projection.voice_profile_id)
-                    .bind(projection.speaker_cluster_id)
-                    .bind(*ordinal)
-                    .execute(&mut *transaction)
-                    .await?;
-                    *ordinal += 1;
-                    Some(slot_id)
-                } else {
-                    None
-                };
-                let priority = match projection.attribution_kind.as_str() {
-                    "owner_source_role" | "direct_identity_evidence" => 3,
-                    "verified_voice" => 2,
-                    _ => 1,
-                };
-                let key = (projection.episode_id, projection.participant_key);
-                let candidate = (
-                    projection.person_id,
-                    slot_id,
-                    projection.attribution_kind,
-                    priority,
-                );
-                match participants.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(candidate);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry)
-                        if priority > entry.get().3 =>
-                    {
-                        entry.insert(candidate);
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
-                }
-            }
-            let evidence = serde_json::to_string(&json!({
-                "derivation": "assigned_utterance_identity",
-                "reconciliation_id": command.reconciliation_id,
-            }))?;
-            for ((episode_id, participant_key), (person_id, slot_id, attribution_kind, _)) in
-                participants
-            {
-                let participant_id = allocate_content_id(
-                    &mut transaction,
-                    &command.claim.account_id,
-                    "episode_participant",
-                )
-                .await?;
-                sqlx::query(
-                    "INSERT INTO episode_participants( \
-                         account_id,id,episode_id,participant_key,person_id,speaker_slot_id, \
-                         attribution_kind,evidence) \
-                     VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)",
-                )
-                .bind(&command.claim.account_id)
-                .bind(participant_id)
-                .bind(episode_id)
-                .bind(participant_key)
-                .bind(person_id)
-                .bind(slot_id)
-                .bind(attribution_kind)
-                .bind(&evidence)
-                .execute(&mut *transaction)
-                .await?;
-            }
-        }
+            .collect::<Vec<_>>();
+        super::speaker_identity::refresh_episode_speaker_projections(
+            &mut transaction,
+            &command.claim.account_id,
+            &speaker_targets,
+            &inherited_speaker_slots,
+        )
+        .await?;
         // Formation fingerprints intentionally bind ownership as a boolean.
         // Refresh after topology mutation so any true->false transition bumps
         // the exact source revision before this transaction becomes visible.
@@ -4246,119 +4153,6 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             archive_revision: revision,
         })
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AssignedSpeakerEvidence {
-    episode_id: i64,
-    voice_profile_id: Option<i64>,
-    speaker_cluster_id: Option<i64>,
-    attribution_state: Option<String>,
-    has_direct_identity: bool,
-    observation_person_id: Option<i64>,
-    cluster_person_id: Option<i64>,
-    profile_person_id: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RebuiltSpeakerProjection {
-    episode_id: i64,
-    voice_profile_id: Option<i64>,
-    speaker_cluster_id: Option<i64>,
-    person_id: Option<i64>,
-    participant_key: String,
-    attribution_kind: String,
-}
-
-#[derive(Default)]
-struct SpeakerProjectionAccumulator {
-    person_ids: BTreeSet<i64>,
-    owner_source: bool,
-    direct_identity: bool,
-}
-
-fn rebuilt_speaker_projections(
-    evidence: &[AssignedSpeakerEvidence],
-) -> Result<Vec<RebuiltSpeakerProjection>> {
-    // Profile identity is the stable slot when present; otherwise the exact
-    // request-local cluster is the slot. A legacy observation with neither can
-    // still project an explicitly identified Person, but never an inferred name.
-    let mut slots = BTreeMap::<(i64, u8, i64), SpeakerProjectionAccumulator>::new();
-    for row in evidence {
-        let row_people = [
-            row.observation_person_id,
-            row.cluster_person_id,
-            row.profile_person_id,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<BTreeSet<_>>();
-        if row_people.len() > 1 {
-            return Err(EnclaveError::Store(
-                "assigned utterance has conflicting identified speaker evidence".into(),
-            ));
-        }
-        let slot_key = if let Some(profile_id) = row.voice_profile_id {
-            (row.episode_id, 0, profile_id)
-        } else if let Some(cluster_id) = row.speaker_cluster_id {
-            (row.episode_id, 1, cluster_id)
-        } else if let Some(person_id) = row_people.first() {
-            (row.episode_id, 2, *person_id)
-        } else {
-            continue;
-        };
-        let slot = slots.entry(slot_key).or_default();
-        slot.person_ids.extend(row_people);
-        slot.owner_source |= row.attribution_state.as_deref() == Some("owner_transmit");
-        slot.direct_identity |=
-            row.has_direct_identity || row.attribution_state.as_deref() == Some("person_bound");
-    }
-
-    slots
-        .into_iter()
-        .map(|((episode_id, kind, source_id), evidence)| {
-            if evidence.person_ids.len() > 1 {
-                return Err(EnclaveError::Store(
-                    "assigned speaker has conflicting identified people".into(),
-                ));
-            }
-            let person_id = (!evidence.owner_source)
-                .then(|| evidence.person_ids.first().copied())
-                .flatten();
-            let (voice_profile_id, speaker_cluster_id) = match kind {
-                0 => (Some(source_id), None),
-                1 => (None, Some(source_id)),
-                2 => (None, None),
-                _ => unreachable!("speaker projection kind is locally constructed"),
-            };
-            let participant_key = if evidence.owner_source {
-                "owner".to_owned()
-            } else if let Some(person_id) = person_id {
-                format!("person:{person_id}")
-            } else if let Some(profile_id) = voice_profile_id {
-                format!("voice_profile:{profile_id}")
-            } else {
-                format!("speaker_cluster:{source_id}")
-            };
-            let attribution_kind = if evidence.owner_source {
-                "owner_source_role"
-            } else if evidence.direct_identity {
-                "direct_identity_evidence"
-            } else if voice_profile_id.is_some() && person_id.is_some() {
-                "verified_voice"
-            } else {
-                "context_inferred"
-            };
-            Ok(RebuiltSpeakerProjection {
-                episode_id,
-                voice_profile_id,
-                speaker_cluster_id,
-                person_id,
-                participant_key,
-                attribution_kind: attribution_kind.to_owned(),
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -4663,8 +4457,8 @@ mod tests {
     use super::{
         connected_source_sessions, digest_json, ensure_no_external_owners,
         ensure_source_session_bound, held_keep_promotion, oldest_connected_prefix_with_boundary,
-        partition_commitment, rebuilt_speaker_projections, source_id, source_sessions_are_settled,
-        valid_digest, validate_resolution_graph, AssignedSpeakerEvidence, SourceSession,
+        partition_commitment, source_id, source_sessions_are_settled, valid_digest,
+        validate_resolution_graph, SourceSession,
     };
     use crate::persistence::{
         reconciliation_outputs_commitment, OversizedKeepPromotionResult, ReconciledMemoryWrite,
@@ -4901,89 +4695,40 @@ mod tests {
     }
 
     #[test]
-    fn changed_topology_rebuilds_only_durable_speaker_identity_projections() {
-        let projections = rebuilt_speaker_projections(&[
-            AssignedSpeakerEvidence {
-                episode_id: 101,
-                voice_profile_id: Some(7),
-                speaker_cluster_id: Some(70),
-                attribution_state: Some("anonymous_profile".into()),
-                has_direct_identity: false,
-                observation_person_id: Some(9),
-                cluster_person_id: Some(9),
-                profile_person_id: Some(9),
-            },
-            AssignedSpeakerEvidence {
-                episode_id: 101,
-                voice_profile_id: None,
-                speaker_cluster_id: Some(71),
-                attribution_state: Some("owner_transmit".into()),
-                has_direct_identity: false,
-                observation_person_id: Some(99),
-                cluster_person_id: None,
-                profile_person_id: None,
-            },
-            AssignedSpeakerEvidence {
-                episode_id: 102,
-                voice_profile_id: None,
-                speaker_cluster_id: Some(72),
-                attribution_state: Some("request_local".into()),
-                has_direct_identity: false,
-                observation_person_id: None,
-                cluster_person_id: None,
-                profile_person_id: None,
-            },
-        ])
-        .unwrap();
-        assert_eq!(projections.len(), 3);
-        assert!(projections.iter().any(|projection| {
-            projection.episode_id == 101
-                && projection.voice_profile_id == Some(7)
-                && projection.speaker_cluster_id.is_none()
-                && projection.person_id == Some(9)
-                && projection.participant_key == "person:9"
-                && projection.attribution_kind == "verified_voice"
-        }));
-        assert!(projections.iter().any(|projection| {
-            projection.episode_id == 101
-                && projection.participant_key == "owner"
-                && projection.person_id.is_none()
-                && projection.attribution_kind == "owner_source_role"
-        }));
-        assert!(projections.iter().any(|projection| {
-            projection.episode_id == 102
-                && projection.participant_key == "speaker_cluster:72"
-                && projection.person_id.is_none()
-                && projection.attribution_kind == "context_inferred"
-        }));
-    }
-
-    #[test]
-    fn conflicting_identified_speaker_evidence_fails_closed() {
-        let error = rebuilt_speaker_projections(&[AssignedSpeakerEvidence {
-            episode_id: 101,
-            voice_profile_id: Some(7),
-            speaker_cluster_id: Some(70),
-            attribution_state: Some("person_bound".into()),
-            has_direct_identity: true,
-            observation_person_id: Some(9),
-            cluster_person_id: Some(10),
-            profile_person_id: None,
-        }])
-        .unwrap_err();
-        assert!(error.to_string().contains("conflicting identified"));
-    }
-
-    #[test]
-    fn publication_preserves_retained_identity_and_rebuilds_new_successors() {
-        let adapter = include_str!("memory_reconciliation.rs");
-        assert!(adapter.contains("replaced_predecessor_ids"));
-        assert!(adapter.contains("new_successor_ids"));
-        assert!(adapter.contains("JOIN speaker_observations observation"));
-        assert!(adapter.contains("THEN observation.person_id END"));
-        assert!(adapter.contains("'episode_speaker_slot'"));
-        assert!(adapter.contains("'episode_participant'"));
-        assert!(adapter.contains("\"derivation\": \"assigned_utterance_identity\""));
+    fn publication_transfers_slots_before_retirement_and_refreshes_every_successor() {
+        let production = include_str!("memory_reconciliation.rs")
+            .split_once("    async fn publish_reconciliation(")
+            .expect("publisher implementation exists")
+            .1
+            .split_once("    async fn resolve_memory_handle(")
+            .expect("publisher ends before handle resolution")
+            .0;
+        assert!(
+            !production.contains("DELETE FROM episode_speaker_slots"),
+            "publication must retain predecessor reservations through successor transfer"
+        );
+        assert!(
+            production.contains("snapshot_speaker_slot_reservations"),
+            "publication must snapshot speaker reservations before topology changes"
+        );
+        assert!(
+            production.contains("outputs.iter().zip(&successor_ids)")
+                || production.contains(".zip(&successor_ids)"),
+            "publication must refresh retained and replacement successors together"
+        );
+        assert!(
+            production.contains("refresh_episode_speaker_projections"),
+            "publication must use the shared speaker projection"
+        );
+        assert!(
+            production
+                .find("refresh_episode_speaker_projections")
+                .unwrap()
+                < production
+                    .find("DELETE FROM episodes WHERE account_id=$1 AND id=ANY($2)")
+                    .unwrap(),
+            "publication must transfer speaker reservations before ordinary retired-draft cleanup"
+        );
     }
 
     #[test]

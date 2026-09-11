@@ -588,13 +588,11 @@ validated against the assembled window; source timestamps, URLs, and literal
 device context always remain authoritative.
 
 Gemini `speaker_local_id` values are request-local turn-grouping hints, not
-durable speaker identities. The structured store therefore never exposes an unmatched
-local ID such as `speaker_0`: it uses `Unidentified voice` instead. Within one
-work unit, unresolved sibling turns may inherit a name or independent voice
-profile label only when the same local ID has exactly one nonconflicting
-resolution. The enclave abstains when different resolutions conflict, and it
-never carries a Gemini local ID across work-unit boundaries. Schema migration
-applies the same rule to historical exact local-ID fallbacks.
+durable speaker identities. Existing source normalization removes exact local IDs such
+as `speaker_0` from legacy fallback text. Public speaker presentation is derived from
+the current observation/cluster/profile/person graph as described below; it never treats
+a plausible stored speaker name or a private profile label as identity evidence.
+The enclave never carries a Gemini local ID across work-unit boundaries.
 
 Storyboard inputs use each event ID as an opaque `frame_id`. A response is
 rejected atomically if any expected ID is missing, duplicated, or replaced by
@@ -918,6 +916,39 @@ Newly finalized/refinalized memory vectors include only final-brief human string
 older vectors remain search-complete through the final-brief lexical branch until a
 separate bounded refresh is reviewed.
 
+### Current speaker labels and memory slots
+
+Transcript members, feed, search and its speaker filters, playback, existing MCP tools,
+and utterance export use one current graph derivation. Owner-source attribution renders
+`Me` and never exposes a public person ID. Accepted direct identified-person evidence,
+or an identified person attached to a non-quarantined voice profile, renders that
+person's current display name. Otherwise a durable per-memory slot renders `Speaker A`,
+`Speaker B`, and so on; a turn without a memory slot renders `Speaker`. Profile identity
+has priority over the request-local cluster when selecting a slot. Letters follow initial
+first speech and remain reserved across later evidence and retained-memory revisions.
+Replacement memories inherit eligible predecessor letters with new account-global row
+IDs; genuine merges resolve ordinal collisions deterministically by first speech.
+
+A stored `utterances.speaker_label` is used only when the observation is absent. A
+quarantined profile cannot supply a person's name; independently valid direct evidence
+still applies. `anonymous_profile` produces `verified_voice` attribution even without
+an identified person. Member `speaker_label` and `display_name` agree. Participant details
+are re-derived from the same current graph; stale named projections are never a fallback
+for observed but unresolved turns. Only structurally legacy memories without observed
+assigned turns or graph-derived participant history can use legacy participant rows.
+Current person-memory links and recent statements apply the same accepted identity and
+owner-suppression policy. Recurring unnamed People entries remain a later phase.
+
+Existing archive projections are prepared in bounded transactions before public reads.
+The first complete account preparation remains proportional to archive size; search
+finishes preparation before speaker filtering, and export before opening its snapshot.
+Candidate selection and enrichment for utterance search use one read-only repeatable
+snapshot. Feed labels, screenshot rows, and memory association share one snapshot too.
+Episode/member participant details share their accompanying read snapshot.
+Preparation does not alter raw source labels, `identity_revision`, frozen provider
+requests, brief schemas, or existing generated brief text. Later brief label maps and
+identity-revision invalidation are separate work; no bulk regeneration is triggered.
+
 ### Content-specific final briefs
 
 Episode list/detail and memory search return `final_brief.overview` plus nullable
@@ -1159,7 +1190,9 @@ of current structured rows and media inventory metadata. Voice samples, profiles
 revisions, and representatives use explicit metadata projections: `embedding` and
 `centroid` bytes never appear. Sample diagnostics, eligibility, versions, profile status,
 and assignment/revision lineage remain available. Operator voice cohort/pause state is
-excluded. Export does not fetch retained GCS media bytes; byte-complete media export is
+excluded. Utterance export replaces only the returned speaker label with the same
+current graph derivation used by recall; raw stored source rows remain unchanged.
+Export does not fetch retained GCS media bytes; byte-complete media export is
 still a separate activation gate. A database failure never returns partial success.
 
 ## Account-deletion status

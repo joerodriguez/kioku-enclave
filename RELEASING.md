@@ -190,6 +190,26 @@ See [the schema handoff](docs/postgresql-schema-releases.md) for exact input lim
 output shapes and immutable companion verification. No production operation is authorized
 by merging the implementation source.
 
+Phase 1 source alone does not satisfy ADR-0048's first-release boundary: Phase 2
+owner classification must also be implemented and verified before that release.
+Canonical labels use existing PostgreSQL slots and participants; no additional schema
+installation is needed for the reader follow-on. Preparation repairs historical memories
+in transactions of at most 128 memories before opening a read snapshot. Its first account
+scan is proportional to archive size; later reads still scan per-memory graph/projection
+signatures in one transaction so an old writer's additional members cannot hide behind a completed-version marker.
+Preparation obeys persistent account, episode, and orphan-erasure fences.
+
+Retire predecessor topology writers before allowing replacement publication with the new
+image if previously displayed letters must transfer across the rollout. Signature repair
+can detect added members or changed projections, but cannot recover slot history already
+deleted by a predecessor writer. New writers snapshot and transfer matching reservations
+before ordinary retired-draft cleanup; the successor retains the inherited letters. Retained
+memories keep their own reservation history. Genuine merges resolve duplicate predecessor letters by
+current first speech and append collision losers; ordinary revisions and profile attachment
+preserve existing letters. Unowned pre-memory organizer inputs use `Speaker` until a memory
+has durable slots. Current display labels do not alter raw source fingerprints, historical
+briefs, frozen provider requests, or identity revisions in Phase 1.
+
 ### Producer or model changes are ordinary releases (ADR-0046)
 
 Since ADR-0046 the running reconciliation producer contract, model, and Vertex location are
