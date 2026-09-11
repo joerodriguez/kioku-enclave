@@ -4697,9 +4697,12 @@ mod tests {
     #[test]
     fn publication_transfers_slots_before_retirement_and_refreshes_every_successor() {
         let production = include_str!("memory_reconciliation.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+            .split_once("    async fn publish_reconciliation(")
+            .expect("publisher implementation exists")
+            .1
+            .split_once("    async fn resolve_memory_handle(")
+            .expect("publisher ends before handle resolution")
+            .0;
         assert!(
             !production.contains("DELETE FROM episode_speaker_slots"),
             "publication must retain predecessor reservations through successor transfer"
