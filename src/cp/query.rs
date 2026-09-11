@@ -2362,6 +2362,7 @@ async fn rest_test_episode_email(
         episode_type: None,
         participants: Vec::new(),
         overview: "".into(),
+        sections: None,
         decisions: Vec::new(),
         action_items: Vec::new(),
         important_links: Vec::new(),

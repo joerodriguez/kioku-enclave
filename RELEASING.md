@@ -525,3 +525,25 @@ GCS, or starting a removed archive runtime.
 During a compatible rollout, rollback may return traffic to the still-admitted predecessor only
 while its schema remains compatible and before its KMS admission is retired. After retirement,
 re-admission is a new reviewed saved plan with the same availability and readback checks.
+
+## Dynamic brief sections companion (v29)
+
+The candidate requires a nullable JSONB `episode_final_briefs.sections` column and its
+receipted check constraint. Before serving this source, use the reviewed digest-pinned
+PostgreSQL migrator with the exact confirmation `brief-sections-v29-install`.
+This is an additive companion: it does not change the frozen v26/v27 markers, receipts,
+activation state, existing brief rows, or finalization version. Serving/readiness only
+verify the installed contract and never execute DDL. Installation takes a bounded lock,
+rejects an unreceipted preexisting column, and is idempotent only for the exact receipt.
+The implementation PR performs no production migration/publication/deployment. Coordinate
+website publication and iOS distribution in the separately authorized release session;
+existing briefs retain legacy grouping until an explicit regeneration.
+
+This additive schema is a **finalizer writer compatibility boundary**, not an unrestricted
+rolling/rollback contract. Quiesce and drain predecessor finalization claims, install
+v29 with the reviewed migrator, and cut over homogeneously before allowing dynamic brief
+writes. Predecessor workers must not resume afterward: a legitimate identity-triggered
+refinalization by old code can update legacy fields while retaining stale sections.
+After any dynamic write, rollback requires a sections-aware predecessor or a separately
+reviewed compatibility repair that clears/fences sections while finalizers remain stopped.
+Do not infer rollback safety from the unchanged base/activation catalog receipts.

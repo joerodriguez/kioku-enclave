@@ -56,3 +56,5 @@ release migrator applies the append-only files under `migrations/`.
 No adapter reads a filesystem or GCS database, and no route can choose a structured-state
 implementation. Real PostgreSQL contracts—not alternate-backend parity—are the release authority
 for tenant isolation, type/time-zone behavior, search, concurrency, restart, export, and deletion.
+
+`brief_sections_schema.rs` installs/verifies the additive v29 sections column and receipt without modifying base/activation catalog contracts. Finalization writes sections atomically; query/search/embedding and immutable delivery snapshots preserve them.

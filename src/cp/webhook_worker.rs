@@ -411,6 +411,7 @@ async fn deliver_postgres_user_webhooks(
             data["participants"] = json!(details.participants);
             data["final_brief"] = json!({
                 "overview": details.overview,
+                "sections": details.sections,
                 "decisions": details.decisions,
                 "action_items": details.action_items,
                 "important_links": details.important_links,

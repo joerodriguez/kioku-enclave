@@ -51,6 +51,10 @@ pub(super) fn episode_from_row(row: &sqlx::postgres::PgRow) -> Result<FinalizedE
         episode_type: row.try_get("episode_type")?,
         participants: parse_json(row.try_get("participants")?, "participants")?,
         overview: row.try_get("overview")?,
+        sections: row
+            .try_get::<Option<String>, _>("sections")?
+            .map(|raw| parse_json(raw, "sections"))
+            .transpose()?,
         decisions: parse_json::<Vec<DecisionDetail>>(row.try_get("decisions")?, "decisions")?,
         action_items: parse_json::<Vec<ActionItemDetail>>(
             row.try_get("action_items")?,
@@ -549,7 +553,7 @@ impl DeliveryRepository for PostgresPersistence {
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
                     floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms, \
                     e.type AS episode_type,e.title,e.participants::text AS participants, \
-                    b.overview,b.decisions::text AS decisions,b.action_items::text AS action_items, \
+                    b.overview,b.sections::text AS sections,b.decisions::text AS decisions,b.action_items::text AS action_items, \
                     b.important_links::text AS important_links,b.open_questions::text AS open_questions \
                FROM webhook_deliveries d JOIN accounts a ON a.id=d.account_id \
                JOIN webhook_subscriptions s ON s.account_id=d.account_id AND s.id=d.subscription_id \

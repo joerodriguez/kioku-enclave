@@ -71,3 +71,5 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
   and cannot report completion before PostgreSQL and GCS converge.
 - Process-local pacing/circuits are only accelerators; PostgreSQL claims are the service-wide
   correctness boundary for horizontal workers.
+
+`finalizer.rs` also authors bounded, evidence-validated content-specific brief sections (bullets/text/tasks/actual decisions). `email_renderer.rs` and webhook snapshots share these ordered sections while preserving content-consent fences and legacy envelopes.

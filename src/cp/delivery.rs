@@ -34,6 +34,8 @@ pub struct FinalizedEpisode {
     pub episode_type: Option<String>,
     pub participants: Vec<String>,
     pub overview: String,
+    #[serde(default)]
+    pub(crate) sections: Option<Vec<super::finalizer::BriefSection>>,
     pub decisions: Vec<DecisionDetail>,
     pub action_items: Vec<ActionItemDetail>,
     pub important_links: Vec<LinkDetail>,

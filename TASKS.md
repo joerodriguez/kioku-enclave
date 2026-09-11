@@ -1,3 +1,11 @@
+# Content-specific brief sections (2026-09-11)
+
+- [x] Add bounded LLM-authored, evidence-backed sections; retain truthful semantic compatibility projections and legacy in-flight output handling.
+- [x] Persist sections atomically and return/search/export them; preserve consented email/webhook parity.
+- [x] Implement separately receipted v29 migration and mandatory serving verification without rewriting base/activation contracts.
+- [x] Pass the full local gate: 454 Rust tests passed, one preexisting intentional ignore, PostgreSQL 17 contracts, formatting and all-target Clippy; independent review findings resolved.
+- [ ] Separately authorize and perform v29 installation, drained homogeneous finalizer cutover, and coordinated backend/web/iPhone release.
+
 # Memory playback and speaker projection repair
 
 - [x] Bound public playback revisions to JavaScript's exact integer range so an unchanged

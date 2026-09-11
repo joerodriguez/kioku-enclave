@@ -579,7 +579,8 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         )
         .await
         .is_ok()
-        && state.postgres.verify_morning_email_schema().await.is_ok();
+        && state.postgres.verify_morning_email_schema().await.is_ok()
+        && state.postgres.verify_brief_sections_schema().await.is_ok();
     let activation = if schema_ready {
         state
             .postgres
@@ -1244,6 +1245,10 @@ async fn async_main() {
         .unwrap_or_else(|error| {
             panic!("PostgreSQL morning email schema is not release-ready: {error}")
         });
+    postgres
+        .verify_brief_sections_schema()
+        .await
+        .unwrap_or_else(|error| panic!("PostgreSQL brief sections verification failed: {error}"));
     let reconciliation_producer_contract = cp_config
         .vertex_reconciliation_model_requested
         .as_deref()
@@ -1542,6 +1547,7 @@ const POSTGRES_ERASURE_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ERASURE_SIGNATU
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
     InstallMorningEmail,
+    InstallBriefSections,
     OrphanCaptureErasure,
     ExpandMemoryReconciliation,
     FinalizeMemoryReconciliation,
@@ -1574,6 +1580,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("brief-sections-v29-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallBriefSections)
+        }
         Some("morning-email-v28-install") => Ok(PostgresMigrationReleasePhase::InstallMorningEmail),
         Some(MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM) => {
             Ok(PostgresMigrationReleasePhase::PreviewMemoryReconciliationEpoch)
@@ -1797,6 +1806,9 @@ async fn migrate_postgres_release_schema() {
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
     let result = match phase {
+        PostgresMigrationReleasePhase::InstallBriefSections => persistence
+            .install_brief_sections_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"brief_sections", "version":29})),
         PostgresMigrationReleasePhase::InstallMorningEmail => persistence
             .install_morning_email_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"morning_email", "version":28})),
@@ -1887,6 +1899,10 @@ mod postgres_migration_release_tests {
         );
         for (confirmation, expected) in [
             (
+                "brief-sections-v29-install",
+                PostgresMigrationReleasePhase::InstallBriefSections,
+            ),
+            (
                 "morning-email-v28-install",
                 PostgresMigrationReleasePhase::InstallMorningEmail,
             ),
@@ -1947,6 +1963,7 @@ mod postgres_migration_release_tests {
             Some("memory-reconciliation-v27-upgrade-epoch "),
             Some("memory-reconciliation-v27-epoch-upgrade"),
             Some("morning-email-v28-install "),
+            Some("brief-sections-v29-install "),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }
