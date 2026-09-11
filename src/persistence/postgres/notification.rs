@@ -341,10 +341,7 @@ impl NotificationRepository for PostgresPersistence {
         .execute(&mut *transaction)
         .await?;
         if let Some(timezone) = timezone {
-            let valid = timezone.len() <= 100
-                && !timezone.starts_with("posix/")
-                && !timezone.starts_with("right/")
-                && !matches!(timezone, "Factory" | "posixrules")
+            let valid = super::morning_email::plausible_timezone_name(timezone)
                 && sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM pg_timezone_names WHERE name=$1)",
                 )

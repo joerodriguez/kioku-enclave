@@ -164,5 +164,6 @@ the same cohort under their own producer-keyed job rows; the second publication 
 as a topology conflict and expires with its lease (see `RELEASING.md`, ADR-0046). Existing
 activation receipts are not weakened and no
 readiness bridge exists. Preserve delivered/ambiguous legacy email receipts. Accounts with
-no saved IANA timezone keep their consent but wait for explicit timezone selection in any
-first-party settings surface. Do not infer timezone or backfill previously unqueued history.
+no saved IANA timezone keep their consent; since v0.9.37 the enclave follows the recording
+device's zone (newest capture event), so only an account that never recorded waits for a
+settings save. Do not backfill previously unqueued history.

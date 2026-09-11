@@ -338,12 +338,102 @@ async fn continue_assembly(
     }
 }
 
+/// Names PostgreSQL knows but that are not user-facing IANA zones. Shared by the
+/// explicit preference save and the recording-device follower.
+pub(super) fn plausible_timezone_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && !name.starts_with("posix/")
+        && !name.starts_with("right/")
+        && !matches!(name, "Factory" | "posixrules")
+}
+
+/// The morning email follows the device the account records with (owner
+/// decision 2026-09-11, amending ADR-0045's "collect the zone explicitly"): a
+/// schedule with no zone is bootstrapped from the newest capture event, and a
+/// recording received after the schedule's last change re-follows the device,
+/// so an explicit settings save (any save bumps the schedule) wins only until
+/// the next recording. Delivery stays at 07:00 local. Following can only bring
+/// the due time forward to the next local morning, never push it out, so two
+/// devices disagreeing about the zone cannot starve delivery. Events whose
+/// device clock is more than a day ahead are ignored, and an offline backlog
+/// recorded more than a day before an explicit save cannot override it. Device
+/// zone names PostgreSQL does not know are warned about and ignored. Accounts
+/// that never enabled email have no schedule row and are untouched.
+pub(super) async fn follow_recording_timezone(
+    tx: &mut Transaction<'_>,
+    account_id: &str,
+) -> Result<Option<String>> {
+    let Some(row) = sqlx::query(
+        "SELECT e.timezone_id AS device_timezone,s.timezone, \
+                (e.received_at>s.updated_at AND e.started_at>s.updated_at-interval '1 day') AS newer \
+           FROM morning_email_schedules s \
+           JOIN LATERAL (SELECT timezone_id,received_at,started_at FROM capture_events \
+                          WHERE account_id=s.account_id \
+                            AND started_at<=clock_timestamp()+interval '1 day' \
+                          ORDER BY started_at DESC,event_id DESC LIMIT 1) e ON true \
+          WHERE s.account_id=$1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let device: String = row.try_get("device_timezone")?;
+    let current: Option<String> = row.try_get("timezone")?;
+    let newer: bool = row.try_get("newer")?;
+    if current.as_deref() == Some(device.as_str()) || (current.is_some() && !newer) {
+        return Ok(None);
+    }
+    let known = plausible_timezone_name(&device)
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_timezone_names WHERE name=$1)",
+        )
+        .bind(&device)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !known {
+        tracing::warn!(
+            timezone = %device,
+            "recording device reports a timezone PostgreSQL does not know; morning email keeps its schedule"
+        );
+        return Ok(None);
+    }
+    // The next 07:00 in the device zone: today if it has not passed, else
+    // tomorrow. LEAST ignores a NULL (unscheduled) due time and never delays an
+    // already scheduled morning.
+    sqlx::query(
+        "UPDATE morning_email_schedules SET timezone=$2, \
+            next_due_at=LEAST(next_due_at, \
+              CASE WHEN (clock_timestamp() AT TIME ZONE $2)::time<time '07:00' \
+                   THEN ((clock_timestamp() AT TIME ZONE $2)::date+time '07:00') AT TIME ZONE $2 \
+                   ELSE (((clock_timestamp() AT TIME ZONE $2)::date+1)+time '07:00') AT TIME ZONE $2 END), \
+            updated_at=clock_timestamp() WHERE account_id=$1",
+    )
+    .bind(account_id)
+    .bind(&device)
+    .execute(&mut **tx)
+    .await?;
+    tracing::info!(
+        timezone = %device,
+        bootstrapped = current.is_none(),
+        "morning email follows the recording device timezone"
+    );
+    Ok(Some(device))
+}
+
 pub(super) async fn next_candidate(
     repository: &PostgresPersistence,
     account_id: &str,
 ) -> Result<Option<EmailDeliveryCandidate>> {
     let mut tx = repository.pool().begin().await?;
     lock_account(&mut tx, account_id).await?;
+    // Following is best effort: a transient failure here must not cost the
+    // account its pending delivery for this sweep.
+    if let Err(error) = follow_recording_timezone(&mut tx, account_id).await {
+        tracing::warn!(error = %error, "could not follow the recording device timezone");
+    }
     // A definitive rejection may retry only its frozen request and only inside
     // the provider idempotency window. Never rebuild a possibly submitted body.
     let expired = sqlx::query_scalar::<_,String>("UPDATE morning_email_deliveries SET state='failed',error_code='retry_window_expired',updated_at=clock_timestamp() \
@@ -708,6 +798,214 @@ mod tests {
         sqlx::query("UPDATE morning_email_deliveries SET delivery_date=(SELECT min(delivery_date)-1 FROM morning_email_deliveries WHERE account_id=$1) WHERE account_id=$1 AND delivery_date=(SELECT max(delivery_date) FROM morning_email_deliveries WHERE account_id=$1)")
             .bind(account).execute(repo.pool()).await.unwrap();
         due(repo, account).await;
+    }
+
+    async fn recording(repo: &PostgresPersistence, account: &str, n: i64, zone: &str) {
+        // One capture session/stream/event per recording; `received_at` is
+        // the server clock, so a later recording is newer than any earlier
+        // schedule change made in this test.
+        sqlx::query("INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version,created_at) \
+            VALUES($1,$2,'device','install',clock_timestamp(),clock_timestamp(),clock_timestamp(),2,clock_timestamp())")
+            .bind(account).bind(format!("session-{n}")).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) VALUES($1,$2,$3,'device','mac_screen')")
+            .bind(account).bind(format!("stream-{n}")).bind(format!("session-{n}")).execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
+            source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition,received_at) \
+            VALUES($1,$2,'device','install',$3,$4,'mac_screen',1,clock_timestamp(),'0',clock_timestamp(),clock_timestamp(),$5,0,0,$6,repeat('a',64),'canonical',clock_timestamp())")
+            .bind(account).bind(format!("event-{n}")).bind(format!("session-{n}")).bind(format!("stream-{n}")).bind(zone).bind(format!("asset-{n}"))
+            .execute(repo.pool()).await.unwrap();
+    }
+    async fn schedule_timezone(
+        repo: &PostgresPersistence,
+        account: &str,
+    ) -> Option<Option<String>> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT timezone FROM morning_email_schedules WHERE account_id=$1",
+        )
+        .bind(account)
+        .fetch_optional(repo.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn schedule_state(repo: &PostgresPersistence, account: &str) -> (String, String) {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT next_due_at::text,updated_at::text FROM morning_email_schedules WHERE account_id=$1",
+        )
+        .bind(account)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap()
+    }
+    async fn next_local_morning(repo: &PostgresPersistence, zone: &str) -> String {
+        sqlx::query_scalar::<_, String>(
+            "SELECT (CASE WHEN (clock_timestamp() AT TIME ZONE $1)::time<time '07:00' \
+                THEN ((clock_timestamp() AT TIME ZONE $1)::date+time '07:00') AT TIME ZONE $1 \
+                ELSE (((clock_timestamp() AT TIME ZONE $1)::date+1)+time '07:00') AT TIME ZONE $1 END)::text",
+        )
+        .bind(zone)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap()
+    }
+    async fn due_now(repo: &PostgresPersistence, account: &str) {
+        sqlx::query("UPDATE morning_email_schedules SET next_due_at=clock_timestamp()-interval '1 minute' WHERE account_id=$1")
+            .bind(account).execute(repo.pool()).await.unwrap();
+    }
+
+    /// The morning email follows the recording device: a missing zone is
+    /// bootstrapped from the newest recording, later recordings re-follow the
+    /// device, an explicit save wins until the next recording, unknown device
+    /// zones are ignored, following never delays an already scheduled morning,
+    /// and accounts without email have no schedule at all.
+    #[tokio::test]
+    async fn real_postgres_morning_email_follows_recording_device() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        account(repo, "tz-owner").await;
+        account(repo, "tz-silent").await;
+        let pref = repo
+            .set_email_preference("tz-owner", true, false)
+            .await
+            .unwrap();
+        assert_eq!(pref.timezone, None);
+        assert_eq!(schedule_timezone(repo, "tz-owner").await, Some(None));
+        // No recording yet: the sweep leaves the schedule paused.
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(schedule_timezone(repo, "tz-owner").await, Some(None));
+        // The first recording bootstraps the zone and schedules the next local morning.
+        recording(repo, "tz-owner", 1, "Europe/Berlin").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Europe/Berlin".into()))
+        );
+        let (due, _) = schedule_state(repo, "tz-owner").await;
+        assert_eq!(due, next_local_morning(repo, "Europe/Berlin").await);
+        // A later recording elsewhere moves the schedule with the device, and
+        // only ever brings the due time forward.
+        recording(repo, "tz-owner", 2, "America/New_York").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("America/New_York".into()))
+        );
+        let (due_after_move, _) = schedule_state(repo, "tz-owner").await;
+        let earlier: bool = sqlx::query_scalar("SELECT $1::timestamptz<=$2::timestamptz")
+            .bind(&due_after_move)
+            .bind(&due)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        assert!(earlier, "following never delays a scheduled morning");
+        // Two devices disagreeing about the zone flip the schedule but cannot
+        // push the due time out: after the follow step alone, an already due
+        // morning is still due (the sweep then consumes it as usual).
+        due_now(repo, "tz-owner").await;
+        recording(repo, "tz-owner", 3, "Europe/Berlin").await;
+        let mut tx = repo.pool().begin().await.unwrap();
+        assert_eq!(
+            follow_recording_timezone(&mut tx, "tz-owner")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Europe/Berlin")
+        );
+        tx.commit().await.unwrap();
+        let still_due: bool = sqlx::query_scalar(
+            "SELECT next_due_at<=clock_timestamp() FROM morning_email_schedules WHERE account_id=$1",
+        )
+        .bind("tz-owner")
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert!(
+            still_due,
+            "a zone flip must not starve an already due delivery"
+        );
+        assert!(
+            next_candidate(repo, "tz-owner").await.unwrap().is_none(),
+            "no settled briefs yet"
+        );
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Europe/Berlin".into()))
+        );
+        // An explicit save is newer than every recording and therefore wins,
+        // and any save (even one omitting the zone) counts as the last change.
+        let pref = repo
+            .set_email_preference_with_timezone("tz-owner", true, false, Some("UTC"))
+            .await
+            .unwrap();
+        assert_eq!(pref.timezone.as_deref(), Some("UTC"));
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("UTC".into()))
+        );
+        repo.set_email_preference("tz-owner", true, true)
+            .await
+            .unwrap();
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("UTC".into()))
+        );
+        // ...until the next recording, which re-follows the device.
+        recording(repo, "tz-owner", 4, "Asia/Tokyo").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Asia/Tokyo".into()))
+        );
+        // Device zone names PostgreSQL does not know, and non-IANA aliases, are ignored.
+        recording(repo, "tz-owner", 5, "Mars/Olympus").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Asia/Tokyo".into()))
+        );
+        recording(repo, "tz-owner", 6, "posix/Europe/Paris").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Asia/Tokyo".into()))
+        );
+        // The same zone again is a no-op: neither the due time nor the change
+        // marker moves.
+        let before = schedule_state(repo, "tz-owner").await;
+        recording(repo, "tz-owner", 7, "Asia/Tokyo").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(before, schedule_state(repo, "tz-owner").await);
+        // A device clock far in the future never pins the zone.
+        sqlx::query("INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version,created_at) \
+            VALUES($1,'session-future','device','install',clock_timestamp(),clock_timestamp(),clock_timestamp(),2,clock_timestamp())")
+            .bind("tz-owner").execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) VALUES($1,'stream-future','session-future','device','mac_screen')")
+            .bind("tz-owner").execute(repo.pool()).await.unwrap();
+        sqlx::query("INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
+            source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition,received_at) \
+            VALUES($1,'event-future','device','install','session-future','stream-future','mac_screen',1,clock_timestamp(),'0', \
+                   clock_timestamp()+interval '30 days',clock_timestamp()+interval '30 days','Pacific/Auckland',0,0,'asset-future',repeat('a',64),'canonical',clock_timestamp())")
+            .bind("tz-owner").execute(repo.pool()).await.unwrap();
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Asia/Tokyo".into()))
+        );
+        recording(repo, "tz-owner", 8, "Europe/Berlin").await;
+        assert!(next_candidate(repo, "tz-owner").await.unwrap().is_none());
+        assert_eq!(
+            schedule_timezone(repo, "tz-owner").await,
+            Some(Some("Europe/Berlin".into())),
+            "a sane recording after a future-clocked one is still followed"
+        );
+        // Recording without ever enabling email creates no schedule.
+        recording(repo, "tz-silent", 9, "Europe/Berlin").await;
+        assert!(next_candidate(repo, "tz-silent").await.unwrap().is_none());
+        assert_eq!(schedule_timezone(repo, "tz-silent").await, None);
     }
 
     #[tokio::test]

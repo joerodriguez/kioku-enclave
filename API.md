@@ -786,7 +786,14 @@ Authenticated clients use `GET /api/preferences/episode-email` and
 The response adds nullable `timezone` alongside `enabled`, `include_content`,
 `recipient_email`, and provider `available`; responses are `no-store`.
 Timezone must be a PostgreSQL-supported IANA timezone or alias. An omitted timezone
-preserves the saved setting. A missing timezone pauses scheduled delivery until the user
+preserves the saved setting. The account does not have to set one: the enclave follows
+the recording device. A schedule with no zone is filled from the account's newest
+capture event, and a recording received after the last change re-follows the device's
+`timezone_id`, so a saved zone wins only until the next recording (delivery stays at
+07:00 local; a followed zone can only bring the next morning forward, never delay it, and
+any settings save counts as the last change). Only an account that enabled email and has
+never recorded, or whose device reports a zone PostgreSQL does not know, waits: a missing
+timezone pauses scheduled delivery until the user
 explicitly saves one; it does not silently choose UTC or the worker's timezone.
 
 Enabled accounts receive at most one logical scheduled email per local delivery date,
