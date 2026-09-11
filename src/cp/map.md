@@ -41,7 +41,9 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `sync.rs` | Compatibility tombstones plus current account export, persistent-reviewer deletion refusal, and restartable ordinary-account deletion status/routes with deletion-owned outbound-claim recovery and a durable pre-billing-fence admission phase. |
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
 | `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas, content-free usage metadata, and explicit model routing for separately qualified reconciliation. |
-| `voice_memory.rs` | Pure-Rust audio decoding, fbank, and pinned WeSpeaker inference used by explicit voice-evaluation tooling. |
+| `voice_memory.rs` | Pure-Rust audio decoding, fbank, and hash-pinned WeSpeaker inference shared by serving and explicit voice evaluation. |
+| `voice_identity.rs` | Pure f32x256 codec, channel domains, checked source slices, conservative continuity decisions, and medoid/trimmed-centroid math. |
+| `voice_worker.rs` | Separate 20-second voice-job lease loop, cohort filtering, at most four concurrent accounts/CPU tasks, 180-second batches, retained-media decoding cache, and content-free metrics. |
 | `voice_quality.rs` | Versioned enrollment/matching quality policy and robust representative selection. |
 | `voice_eval.rs` | Public voice/identity/diarization scoring contract and real-corpus release classification. |
 | `voice_eval_assets.rs` | Offline, hash-bound licensed-corpus derivation outside Git. |

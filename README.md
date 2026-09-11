@@ -72,8 +72,9 @@ reporting the whole service healthy.
 - Receives bounded audio, screenshot evidence, application/window/display state, browser
   metadata, and metadata-only screen references from Kioku clients.
 - Runs bounded Vertex transcription, screenshot understanding, and episode summarization,
-  plus in-enclave text embedding. WeSpeaker voice matching remains an offline evaluation path,
-  not a serving-time capability.
+  plus in-enclave text embedding. A separate WeSpeaker worker learns anonymous voices and
+  matches within the same capture session and acoustic domain for an operator-selected cohort
+  (default `none`), using retained media only.
 - Serves search, feed, episodes, people, MCP, export, account deletion, retention settings,
   and owner-authorized playback surfaces.
 - Runs horizontally safe media, summarization, email, push, and webhook workers.
@@ -206,7 +207,8 @@ phase remains `Installed`, then supplies a fresh signed `Draining` receipt provi
 before PostgreSQL attaches legacy-finalization/deletion guards and drains claims. `Active` alone
 advances marker 27 and permits provider egress. `Paused` is a forward-only kill switch: it stops new
 assignment, provider egress, and publication without restoring legacy draft finalization. There is
-no tag-specific activation rule or runtime feature flag.
+no tag-specific activation rule or process-local reconciliation feature flag. Voice identity
+uses its separate PostgreSQL cohort and pause controls, installed by the v30 companion migrator.
 
 `scripts/release.sh` snapshots all release assets read-only, verifies the external evidence key,
 tag signer, source archive, exact OCI digest, SBOM, scan, and selected configuration, then publishes

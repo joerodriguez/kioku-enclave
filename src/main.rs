@@ -581,6 +581,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         .is_ok()
         && state.postgres.verify_morning_email_schema().await.is_ok()
         && state.postgres.verify_brief_sections_schema().await.is_ok()
+        && state.postgres.verify_voice_identity_schema().await.is_ok()
         && state
             .postgres
             .verify_interrupted_capture_schema()
@@ -1102,6 +1103,7 @@ async fn async_main() {
     // warm-up: ~470 MB of weights, seconds) so the first MCP query doesn't
     // eat the cold start; absence is non-fatal (FTS-only mode).
     let embedding_engine = embedding::EmbeddingEngine::from_env();
+    let voice_engine = cp::voice_memory::VoiceEngine::from_env();
 
     // Production always reads the credential from Secret Manager. It is never
     // accepted as a launch-time environment override, which keeps it out of
@@ -1259,6 +1261,12 @@ async fn async_main() {
         .await
         .unwrap_or_else(|error| panic!("PostgreSQL brief sections verification failed: {error}"));
     postgres
+        .verify_voice_identity_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL voice identity schema is not release-ready: {error}")
+        });
+    postgres
         .verify_interrupted_capture_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1351,6 +1359,7 @@ async fn async_main() {
         push_transport,
         config: cp_config,
         embedding: embedding_engine,
+        voice: voice_engine,
     });
 
     // Billing detach is part of account-deletion completion.
@@ -1360,6 +1369,7 @@ async fn async_main() {
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
     cp::query::spawn_episode_delete_worker(Arc::clone(&cp_state));
     cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
+    cp::voice_worker::spawn_scheduler(Arc::clone(&cp_state));
     cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
     cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
     cp::retention::spawn_reconciler(Arc::clone(&cp_state));
@@ -1574,9 +1584,15 @@ const POSTGRES_ACTIVATION_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ACTIVATION_S
 const ORPHAN_CAPTURE_ERASURE_CONFIRM: &str = "orphan-capture-erasure-v1";
 const POSTGRES_ERASURE_REQUEST_ENV: &str = "POSTGRES_MIGRATION_ERASURE_REQUEST";
 const POSTGRES_ERASURE_SIGNATURE_ENV: &str = "POSTGRES_MIGRATION_ERASURE_SIGNATURE";
+const VOICE_IDENTITY_COHORT_ENV: &str = "VOICE_IDENTITY_COHORT";
+const VOICE_IDENTITY_ACCOUNT_IDS_ENV: &str = "VOICE_IDENTITY_ACCOUNT_IDS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
+    InstallVoiceIdentity,
+    SetVoiceIdentityCohort,
+    PauseVoiceIdentity,
+    ResumeVoiceIdentity,
     InstallInterruptedCapture,
     InstallMorningEmail,
     InstallBriefSections,
@@ -1612,6 +1628,14 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("voice-identity-v30-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallVoiceIdentity)
+        }
+        Some("voice-identity-cohort-set") => {
+            Ok(PostgresMigrationReleasePhase::SetVoiceIdentityCohort)
+        }
+        Some("voice-identity-pause") => Ok(PostgresMigrationReleasePhase::PauseVoiceIdentity),
+        Some("voice-identity-resume") => Ok(PostgresMigrationReleasePhase::ResumeVoiceIdentity),
         Some("brief-sections-v29-install") => {
             Ok(PostgresMigrationReleasePhase::InstallBriefSections)
         }
@@ -1659,6 +1683,31 @@ fn postgres_migration_release_phase(
             Err("POSTGRES_MIGRATION_CONFIRM must authorize the exact reviewed schema release phase")
         }
     }
+}
+
+fn voice_identity_cohort_request(
+    cohort: Option<&str>,
+    account_ids: Option<&str>,
+) -> Result<(persistence::VoiceCohort, Vec<String>), &'static str> {
+    let cohort = persistence::VoiceCohort::parse(cohort.unwrap_or_default())
+        .map_err(|_| "VOICE_IDENTITY_COHORT must be none, explicit, or all")?;
+    let mut ids: Vec<String> = match account_ids {
+        None | Some("") => Vec::new(),
+        Some(value) => value.split(',').map(|id| id.trim().to_owned()).collect(),
+    };
+    if ids.len() > 1024 || ids.iter().any(|id| !cp::is_stable_uuid(id)) {
+        return Err(
+            "VOICE_IDENTITY_ACCOUNT_IDS must contain at most 1024 comma-separated stable UUIDs",
+        );
+    }
+    if (cohort == persistence::VoiceCohort::Explicit) == ids.is_empty() {
+        return Err(
+            "VOICE_IDENTITY_ACCOUNT_IDS is required for explicit cohort and forbidden for none/all",
+        );
+    }
+    ids.sort();
+    ids.dedup();
+    Ok((cohort, ids))
 }
 
 fn postgres_memory_reconciliation_transition_authorized(
@@ -1785,6 +1834,16 @@ async fn migrate_postgres_release_schema() {
     let confirmation = std::env::var("POSTGRES_MIGRATION_CONFIRM").ok();
     let phase = postgres_migration_release_phase(confirmation.as_deref())
         .unwrap_or_else(|error| panic!("{error}"));
+    let voice_cohort = if phase == PostgresMigrationReleasePhase::SetVoiceIdentityCohort {
+        let cohort = std::env::var(VOICE_IDENTITY_COHORT_ENV).ok();
+        let ids = std::env::var(VOICE_IDENTITY_ACCOUNT_IDS_ENV).ok();
+        Some(
+            voice_identity_cohort_request(cohort.as_deref(), ids.as_deref())
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
+    } else {
+        None
+    };
     let finalization_receipt = match phase {
         PostgresMigrationReleasePhase::FinalizeMemoryReconciliation => {
             let raw_receipt = std::env::var(POSTGRES_FINALIZATION_RECEIPT_ENV).ok();
@@ -1841,6 +1900,19 @@ async fn migrate_postgres_release_schema() {
     .await
     .unwrap_or_else(|error| panic!("PostgreSQL migrator connection failed: {error}"));
     let result = match phase {
+        PostgresMigrationReleasePhase::InstallVoiceIdentity => persistence
+            .install_voice_identity_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"voice_identity", "version":30})),
+        PostgresMigrationReleasePhase::SetVoiceIdentityCohort => {
+            let (cohort, ids) = voice_cohort.as_ref().expect("voice cohort was validated before PostgreSQL connection");
+            persistence.set_voice_identity_cohort(*cohort, ids).await
+                .map(|revision| serde_json::json!({"status":"applied", "feature":"voice_identity", "cohort":cohort.as_str(), "explicit_accounts":ids.len(), "revision":revision}))
+        }
+        PostgresMigrationReleasePhase::PauseVoiceIdentity | PostgresMigrationReleasePhase::ResumeVoiceIdentity => {
+            let paused = phase == PostgresMigrationReleasePhase::PauseVoiceIdentity;
+            persistence.set_voice_identity_paused(paused).await
+                .map(|revision| serde_json::json!({"status":"applied", "feature":"voice_identity", "paused":paused, "revision":revision}))
+        }
         PostgresMigrationReleasePhase::InstallBriefSections => persistence
             .install_brief_sections_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"brief_sections", "version":29})),
@@ -1915,8 +1987,9 @@ async fn migrate_postgres_release_schema() {
 mod postgres_migration_release_tests {
     use super::{
         postgres_memory_reconciliation_activation_receipt, postgres_migration_release_phase,
-        postgres_schema_finalization_receipt, PostgresMigrationReleasePhase,
-        MEMORY_RECONCILIATION_ACTIVATE_CONFIRM, MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
+        postgres_schema_finalization_receipt, voice_identity_cohort_request,
+        PostgresMigrationReleasePhase, MEMORY_RECONCILIATION_ACTIVATE_CONFIRM,
+        MEMORY_RECONCILIATION_ACTIVATION_BACKFILL_CONFIRM,
         MEMORY_RECONCILIATION_ACTIVATION_DRAIN_CONFIRM,
         MEMORY_RECONCILIATION_ACTIVATION_INSTALL_CONFIRM,
         MEMORY_RECONCILIATION_DRAINING_REPAIR_CONFIRM, MEMORY_RECONCILIATION_EPOCH_PREVIEW_CONFIRM,
@@ -1936,6 +2009,22 @@ mod postgres_migration_release_tests {
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
         for (confirmation, expected) in [
+            (
+                "voice-identity-v30-install",
+                PostgresMigrationReleasePhase::InstallVoiceIdentity,
+            ),
+            (
+                "voice-identity-cohort-set",
+                PostgresMigrationReleasePhase::SetVoiceIdentityCohort,
+            ),
+            (
+                "voice-identity-pause",
+                PostgresMigrationReleasePhase::PauseVoiceIdentity,
+            ),
+            (
+                "voice-identity-resume",
+                PostgresMigrationReleasePhase::ResumeVoiceIdentity,
+            ),
             (
                 "brief-sections-v29-install",
                 PostgresMigrationReleasePhase::InstallBriefSections,
@@ -2008,9 +2097,71 @@ mod postgres_migration_release_tests {
             Some("brief-sections-v29-install "),
             Some("interrupted-capture-v29-install "),
             Some("interrupted-capture-v29"),
+            Some("voice-identity-v30-install "),
+            Some("voice-identity-v30"),
+            Some("voice-identity-cohort"),
+            Some("voice-identity-pause "),
+            Some("voice-identity-resume "),
         ] {
             assert!(postgres_migration_release_phase(refused).is_err());
         }
+    }
+
+    #[test]
+    fn voice_cohort_inputs_are_bounded_and_content_free() {
+        use crate::persistence::VoiceCohort;
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        assert_eq!(
+            voice_identity_cohort_request(Some("none"), None).unwrap(),
+            (VoiceCohort::None, vec![])
+        );
+        assert_eq!(
+            voice_identity_cohort_request(Some("all"), Some("")).unwrap(),
+            (VoiceCohort::All, vec![])
+        );
+        assert_eq!(
+            voice_identity_cohort_request(
+                Some("explicit"),
+                Some(&format!(" {second}, {first},{second} "))
+            )
+            .unwrap(),
+            (VoiceCohort::Explicit, vec![first.into(), second.into()]),
+            "voice cohort parser must normalize an explicit UUID list"
+        );
+        for (cohort, ids) in [
+            (None, None),
+            (Some("all "), None),
+            (Some("owner"), None),
+            (Some("explicit"), None),
+            (Some("explicit"), Some("")),
+            (Some("none"), Some(first)),
+            (Some("all"), Some(first)),
+            (Some("explicit"), Some("owner-account")),
+            (Some("explicit"), Some("11111111111141118111111111111111")),
+        ] {
+            assert!(
+                voice_identity_cohort_request(cohort, ids).is_err(),
+                "invalid cohort input must be refused"
+            );
+        }
+        assert!(
+            voice_identity_cohort_request(Some("explicit"), Some(&format!("{first},"))).is_err()
+        );
+        let bound = vec![first; 1024].join(",");
+        assert!(voice_identity_cohort_request(Some("explicit"), Some(&bound)).is_ok());
+        assert!(
+            voice_identity_cohort_request(Some("explicit"), Some(&format!("{bound},{first}")))
+                .is_err(),
+            "voice cohort is bounded to 1024 supplied IDs"
+        );
+        let error =
+            voice_identity_cohort_request(Some("explicit"), Some("private-invalid-account"))
+                .unwrap_err();
+        assert!(
+            !error.contains("private-invalid-account"),
+            "operator error must not echo supplied account IDs"
+        );
     }
 
     #[test]

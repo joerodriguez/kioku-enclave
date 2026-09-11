@@ -17,6 +17,8 @@ release migrator applies the append-only files under `migrations/`.
 
 | File | Responsibility |
 |---|---|
+| `voice_worker_contract.rs` | Test-only real PostgreSQL/encrypted fake-GCS serving exercise, decoded-cache reuse and provider-free missing-media expiry. |
+| `voice_identity.rs` | Bounded retention-gated voice leases, capture-session continuity, robust representatives, profile/person conflict quarantine, and same-transaction sample-erasure recomputation with historical biometric-payload redaction. Planned v27 deletion inventory fences voice writes across member-purge gaps; legacy-safe catalog probes and monotonic counter bootstrapping preserve older lineage. |
 | `mod.rs` | TLS PostgreSQL pool construction, UTC/statement-timeout policy, schema marker primitives, fresh current-schema catalog presence probes, disposable test ladder, and shared transaction helpers. |
 | `catalog_presence_tests.rs` | Synthetic cached-connection absence/install/drop visibility after an actual cross-connection release-lock wait; wrong-kind activation/erasure relations must fail closed. No owner data. |
 | `aggregate_audit.rs` / `aggregate_audit.sql` / `aggregate_audit_fixture.json` | Fixed, content-free v6 PostgreSQL aggregate snapshot in one repeatable-read/read-only transaction. Preserves raw unfinished-source diagnostics, prior source-isolation counts and all provider/lease, quota, capacity, reconciliation, finalization and activation gates. Fresh-work counts remain distinct from full context owner bounds; successor capacity includes nonfresh context atoms once per account from the same complete graph, excluding disconnected history. Owner eligibility requires the shared source-closed runtime proof; it does not claim unfinished captures are complete or restored. Historical v2–v5 evidence must not be relabeled v6. |
@@ -55,6 +57,7 @@ release migrator applies the append-only files under `migrations/`.
 | `playback.rs` | Tenant-qualified memory/session timelines, pre-transcription exact encrypted-source availability, late-event bounds, deletion fences and identified-person projections. |
 | `query.rs` | PostgreSQL full-text/pgvector retrieval and hybrid fusion across memories, final briefs, transcripts, and screen evidence; batched stable memory/identified-person navigation; turn-timed episode members; feed/people/evidence projections; MCP query shapes; and capture status. |
 | `recording_retention.rs` | Retention preview/CAS, key epochs, exact media inventory, and downgrade reconciliation. |
+| `voice_identity_schema.rs` | Exact v30 SQL/catalog receipt for operator cohort/pause controls, sample uniqueness and claim index; dedicated migrator install/mutations, default-off seed, bounded stable-UUID scope and serialized revisions. Startup/readiness are read-only. Controls and receipt are excluded from fixture truncation. |
 | `work.rs` | Fleet active-account enumeration and PostgreSQL-backed summarizer cursor storage. |
 
 No adapter reads a filesystem or GCS database, and no route can choose a structured-state

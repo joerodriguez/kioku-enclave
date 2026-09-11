@@ -2167,11 +2167,12 @@ impl MediaProcessingRepository for PostgresPersistence {
             sqlx::query(
                 "INSERT INTO voice_embedding_jobs \
                  (account_id,id,speaker_observation_id,embedding_space,state) \
-                 VALUES($1,$2,$3,'wespeaker-resnet34-lm-v1','pending')",
+                 VALUES($1,$2,$3,$4,'pending')",
             )
             .bind(account_id)
             .bind(embedding_job_id)
             .bind(speaker_observation_id)
+            .bind(crate::cp::voice_memory::EMBEDDING_SPACE)
             .execute(&mut *transaction)
             .await?;
 

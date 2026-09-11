@@ -175,6 +175,21 @@ companion release: pin the migrator, run the phase, pin serving (see below). The
 sources neither publish an image nor authorize installation, serving rollout, or client
 distribution.
 
+### Voice identity companion (ADR-0048 Phase 1)
+
+Before candidate serving, a separately authorized release runs the digest-pinned migrator
+with `POSTGRES_MIGRATION_CONFIRM=voice-identity-v30-install`. Verify `/readyz` after the
+serving rollout, then use `voice-identity-cohort-set` with `VOICE_IDENTITY_COHORT=explicit`
+and the owner's stable account UUID in `VOICE_IDENTITY_ACCOUNT_IDS`. Observe content-free
+`voice_identity_v1` metrics before any cohort expansion. The default cohort is `none`.
+Use `voice-identity-pause` and `voice-identity-resume` through that same migrator; these
+operator phases are intentionally not the signed Pause described in ADR-0048 §8.1.
+Each sweep reads the controls; an already claimed bounded batch may finish computing,
+but settlement rechecks the controls and refuses a new binding after Pause commits.
+See [the schema handoff](docs/postgresql-schema-releases.md) for exact input limits,
+output shapes and immutable companion verification. No production operation is authorized
+by merging the implementation source.
+
 ### Producer or model changes are ordinary releases (ADR-0046)
 
 Since ADR-0046 the running reconciliation producer contract, model, and Vertex location are

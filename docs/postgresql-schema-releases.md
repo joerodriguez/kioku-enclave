@@ -114,6 +114,45 @@ pending seals, dirty formation revisions, and nonterminal formation pages theref
 Active blockers. The aggregate fields and schema stay stable; this staging changes only how the
 two existing composite readiness booleans combine their independently reported constituents.
 
+## ADR-0048 voice identity companion (source implementation)
+
+Before serving this candidate, a separately authorized release runs the reviewed
+digest-pinned `--migrate-postgres` role with the exact confirmation below. Installation
+records the SHA-256 of immutable `0030_voice_identity.sql` bytes and a targeted catalog
+digest covering controls, receipt structure, sample uniqueness and the claim index.
+Serving startup and `/readyz` verify that receipt and the controls singleton without DDL.
+An idempotent install accepts only the exact receipt; an unreceipted table or either
+index is refused. Base v26 and signed v27 markers/history remain unchanged, with no
+new triggers on capture or memory source tables.
+
+| `POSTGRES_MIGRATION_CONFIRM` | Inputs and result |
+|---|---|
+| `voice-identity-v30-install` | Seeds `cohort=none`, `paused=false`, `revision=0`; emits `{"status":"installed","feature":"voice_identity","version":30}`. |
+| `voice-identity-cohort-set` | Requires `VOICE_IDENTITY_COHORT=none`, `explicit`, or `all`; explicit requires `VOICE_IDENTITY_ACCOUNT_IDS` containing 1–1024 comma-separated stable UUIDs. Other cohorts require no IDs. IDs are sorted/deduplicated; output contains only cohort, count and revision. |
+| `voice-identity-pause` | Sets pause without changing cohort or discarding evidence; output contains pause state and revision. |
+| `voice-identity-resume` | Clears pause for the existing cohort; output contains pause state and revision. |
+
+Control mutations serialize under the companion advisory lock, verify the exact installed
+contract and increment the revision atomically. Controls are operator state and are neither
+tenant content for erasure nor exported. They are not serving-process environment flags.
+The worker takes one controls snapshot per sweep and filters active accounts before
+per-account SQL. An already claimed bounded batch may finish computing, but settlement
+rechecks the controls and refuses new bindings after Pause or a cohort exclusion commits.
+Existing claims remain protected by lease ownership and compare-and-set settlement.
+
+Phase 1 deliberately uses these operator-run digest-pinned migrator phases instead of the
+Ed25519 signed Pause described in ADR-0048 §8.1. The voice controls do not reuse or weaken
+the signed memory-reconciliation activation chain. This is a documented Phase 1 deviation,
+not a signed activation receipt or authorization to advance that chain.
+
+After the separately authorized release installs the companion and rolls the reviewed
+serving source, enable only the owner's account using `VOICE_IDENTITY_COHORT=explicit`,
+verify `/readyz`, and watch content-free `metric_schema="voice_identity_v1"` events.
+Only retained pending jobs are eligible for the bounded initial backfill; the worker
+terminalizes expired raw-media jobs without provider fetches. Cohort expansion still
+requires ADR-0048 acceptance. Merging this source neither installs production schema nor
+publishes an image, enables a cohort, or deploys serving.
+
 ## Interrupted-capture companion (source implementation)
 
 The candidate requires the v29 interrupted-capture companion before startup. A separately

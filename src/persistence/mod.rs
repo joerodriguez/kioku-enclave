@@ -27,6 +27,7 @@ mod playback;
 mod postgres;
 mod query;
 mod recording_retention;
+mod voice_identity;
 mod work;
 
 use std::sync::Arc;
@@ -132,6 +133,7 @@ pub(crate) use recording_retention::{
     RecordingRetentionPreference, RecordingRetentionPreview, RecordingRetentionRepository,
     RECORDING_RETENTION_CONSENT_VERSION,
 };
+pub(crate) use voice_identity::*;
 pub(crate) use work::{
     EmailProviderOutcome, PushProviderOutcome, WebhookProviderOutcome, WorkRepository,
 };
@@ -164,6 +166,7 @@ pub(crate) struct RepositorySet {
     memory_reconciliation: Arc<dyn MemoryReconciliationRepository>,
     model_usage: Arc<dyn ModelUsageRepository>,
     work: Arc<dyn WorkRepository>,
+    voice_identity: Arc<dyn VoiceIdentityRepository>,
 }
 
 impl RepositorySet {
@@ -194,6 +197,7 @@ impl RepositorySet {
             memory_reconciliation: Arc::clone(&persistence)
                 as Arc<dyn MemoryReconciliationRepository>,
             model_usage: Arc::clone(&persistence) as Arc<dyn ModelUsageRepository>,
+            voice_identity: Arc::clone(&persistence) as Arc<dyn VoiceIdentityRepository>,
             work: persistence,
         }
     }
@@ -290,5 +294,9 @@ impl RepositorySet {
 
     pub(crate) fn work(&self) -> &dyn WorkRepository {
         self.work.as_ref()
+    }
+
+    pub(crate) fn voice_identity(&self) -> &dyn VoiceIdentityRepository {
+        self.voice_identity.as_ref()
     }
 }

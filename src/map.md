@@ -23,7 +23,7 @@ main.rs
 
 | Path | Responsibility |
 |---|---|
-| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email and interrupted-capture companion installs, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
+| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email, interrupted-capture and voice-identity companion installs, voice cohort/pause operator phases, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
 | `attestation.rs` | Bounded Confidential Space launcher protocol, internal attestation-derived STS/KMS credential path, and separately audience-bound public attestation tokens. |
 | `auth.rs` | Google service-account ID-token verification retained for authenticated `410 Gone` compatibility routes. |
 | [`cp/`](cp/map.md) | Product API, OAuth, capture, query, MCP, retention, export/deletion, inference, and horizontally coordinated workers. |
@@ -57,3 +57,4 @@ main.rs
   capacity.
 
 Serving startup/readiness verify the additive brief-sections v29 companion; only the explicit `brief-sections-v29-install` migrator phase may install it.
+Serving startup/readiness also verify the v30 voice-identity companion. Its cohort defaults to `none`; only digest-pinned migrator phases change cohort or pause state.

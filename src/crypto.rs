@@ -384,6 +384,9 @@ pub async fn load_dek(kms: &dyn KmsClient, wrapped_b64: &str) -> Result<Dek> {
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+pub(crate) use tests::FakeKms;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -393,12 +396,12 @@ mod tests {
 
     /// In-memory fake: XOR-"encrypts" with a fixed key byte so the roundtrip
     /// tests without any network calls.
-    struct FakeKms {
+    pub(crate) struct FakeKms {
         store: Mutex<HashMap<String, Vec<u8>>>,
     }
 
     impl FakeKms {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 store: Mutex::new(HashMap::new()),
             }

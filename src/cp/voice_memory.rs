@@ -6,7 +6,7 @@
 //! boundaries; this module independently fingerprints each sufficiently long
 //! turn without owning structured persistence.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use kaldi_native_fbank::{
     fbank::{FbankComputer, FbankOptions},
     online::{FeatureComputer, OnlineFeature},
 };
+use sha2::{Digest, Sha256};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -35,6 +36,7 @@ pub(crate) const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
 pub(crate) const MATCH_THRESHOLD: f32 = 0.60;
 pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.45;
 pub(crate) const MIN_DECISION_MARGIN: f32 = 0.08;
+const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct VoiceEngine {
     model: Arc<TypedRunnableModel>,
@@ -45,15 +47,40 @@ pub struct EmbeddedTurn {
 }
 
 impl VoiceEngine {
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.is_file() {
-            return Err(EnclaveError::Config(format!(
-                "voice model not found at {}",
-                path.display()
-            )));
+    /// Model selection is immutable for this process. Cohort and pause remain
+    /// PostgreSQL operator state; an unavailable model never affects readiness.
+    pub fn from_env() -> Option<Arc<Self>> {
+        let path = std::env::var_os("VOICE_MODEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    std::env::var_os("EMBED_MODEL_DIR").unwrap_or_else(|| "/models".into()),
+                )
+                .join("voice/wespeaker_en_voxceleb_resnet34_LM.onnx")
+            });
+        match Self::load(&path) {
+            Ok(engine) => Some(Arc::new(engine)),
+            Err(_) => {
+                tracing::warn!(target: "kioku::voice", metric_schema = "voice_identity_v1",
+                    outcome = "model_unavailable", "voice worker is unavailable");
+                None
+            }
         }
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_MODEL_BYTES {
+            return Err(EnclaveError::Config(
+                "voice model exceeds size bound".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_MODEL_BYTES + 1).read_to_end(&mut bytes)?;
+        verify_model_bytes(&bytes)?;
+        // Parse the bytes whose digest was checked, avoiding a path reopen race.
         let model = tract_onnx::onnx()
-            .model_for_path(path)
+            .model_for_read(&mut Cursor::new(bytes))
             .and_then(|model| model.into_optimized())
             .and_then(|model| model.into_runnable())
             .map_err(|error| EnclaveError::Embedding(format!("load voice model: {error}")))?;
@@ -74,7 +101,7 @@ impl VoiceEngine {
             let end = end
                 .min(samples.len())
                 .min(start.saturating_add(MAX_TURN_SAMPLES));
-            let chunk = &samples[start..end];
+            let chunk = samples.get(start..end).unwrap_or(&[]);
             let diagnostics = voice_quality::diagnose(chunk, turn.overlap, &turn.quality_flags);
             let embedding = if diagnostics.decision == SampleDecision::NoEmbedding {
                 None
@@ -130,9 +157,25 @@ impl VoiceEngine {
             .to_plain_array_view::<f32>()
             .map_err(|error| EnclaveError::Embedding(format!("voice output: {error}")))?;
         let mut embedding: Vec<f32> = view.iter().copied().collect();
+        if embedding.len() != 256 {
+            return Err(EnclaveError::Embedding(
+                "voice embedding dimension mismatch".into(),
+            ));
+        }
         voice_quality::normalize(&mut embedding)?;
         Ok(embedding)
     }
+}
+
+fn verify_model_bytes(bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 > MAX_MODEL_BYTES
+        || format!("{:x}", Sha256::digest(bytes)) != MODEL_SHA256
+    {
+        return Err(EnclaveError::Config(
+            "voice model commitment mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32>> {
@@ -265,6 +308,36 @@ fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_model_rejects_unpinned_bytes_before_parsing() {
+        assert!(
+            verify_model_bytes(b"untrusted model").is_err(),
+            "voice model must reject bytes outside the pinned commitment"
+        );
+    }
+
+    #[test]
+    fn voice_model_real_inference_is_normalized_when_configured() {
+        let Some(path) = std::env::var_os("VOICE_MODEL_PATH") else {
+            return;
+        };
+        let engine = VoiceEngine::load(Path::new(&path)).expect("pinned voice model loads");
+        let samples = (0..TARGET_SAMPLE_RATE as usize * 3)
+            .map(|i| {
+                (i as f32 * 440.0 * std::f32::consts::TAU / TARGET_SAMPLE_RATE as f32).sin() * 0.2
+            })
+            .collect::<Vec<_>>();
+        let vector = engine
+            .embed_samples(&samples)
+            .expect("real voice inference succeeds");
+        assert_eq!(vector.len(), 256, "real voice embedding has 256 dimensions");
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.0001,
+            "real voice embedding has unit norm"
+        );
+    }
 
     #[test]
     fn linear_resampling_preserves_endpoints_and_expected_length() {

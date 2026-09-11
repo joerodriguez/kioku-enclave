@@ -5,6 +5,13 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0030_voice_identity.sql` installs the independently receipted, default-off voice
+  cohort/pause singleton, observation/version sample uniqueness, and claim index.
+  Only `voice-identity-v30-install` installs it; the digest-pinned migrator's
+  `voice-identity-cohort-set`, `voice-identity-pause`, and `voice-identity-resume`
+  phases mutate operator controls. The companion preserves base/activation history
+  and adds no source triggers. Controls are operator state, outside tenant export
+  and erasure. SQL bytes become immutable once installed anywhere.
 - `0029_interrupted_capture_recovery.sql` adds the independently receipted
   `server_inactivity_v1` finish provenance. The dedicated installer verifies the exact
   old constraint and v27 activation history before widening that one CHECK. Current
