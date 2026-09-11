@@ -645,12 +645,12 @@ impl FinalizationRepository for PostgresPersistence {
         }
         sqlx::query(
             "INSERT INTO episode_final_briefs(\
-                account_id,episode_id,overview,decisions,action_items,important_links,open_questions) \
-             VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb) \
+                account_id,episode_id,overview,decisions,action_items,important_links,open_questions,sections) \
+             VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb) \
              ON CONFLICT(account_id,episode_id) DO UPDATE SET overview=excluded.overview,\
                 decisions=excluded.decisions,action_items=excluded.action_items,\
                 important_links=excluded.important_links,open_questions=excluded.open_questions,\
-                created_at=clock_timestamp()",
+                sections=excluded.sections,created_at=clock_timestamp()",
         )
         .bind(&result.claim.account_id)
         .bind(result.claim.episode.id)
@@ -659,6 +659,7 @@ impl FinalizationRepository for PostgresPersistence {
         .bind(&result.action_items_json)
         .bind(&result.important_links_json)
         .bind(&result.open_questions_json)
+        .bind(&result.sections_json)
         .execute(&mut *transaction)
         .await?;
 

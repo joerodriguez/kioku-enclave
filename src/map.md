@@ -55,3 +55,5 @@ main.rs
   requires the persisted, hash-verified homogeneous-fleet activation receipt and `Active` phase. Liveness remains
   process-local so ADR-0041 can rotate certificates or replace fleet members with zero unavailable
   capacity.
+
+Serving startup/readiness verify the additive brief-sections v29 companion; only the explicit `brief-sections-v29-install` migrator phase may install it.

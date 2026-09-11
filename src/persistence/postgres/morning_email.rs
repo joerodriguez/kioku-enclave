@@ -95,7 +95,7 @@ async fn load_episode(
         floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
         floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
         floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms, \
-        b.overview,b.decisions::text AS decisions,b.action_items::text AS action_items, \
+        b.overview,b.sections::text AS sections,b.decisions::text AS decisions,b.action_items::text AS action_items, \
         b.important_links::text AS important_links,b.open_questions::text AS open_questions \
         FROM episodes e JOIN episode_final_briefs b ON b.account_id=e.account_id AND b.episode_id=e.id \
         JOIN memory_handles h ON h.account_id=e.account_id AND h.episode_id=e.id AND h.state='active' \

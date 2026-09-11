@@ -93,6 +93,7 @@ pub(crate) struct FinalizationSettlement {
     pub(crate) minutes_text: String,
     pub(crate) action_items_json: String,
     pub(crate) overview: String,
+    pub(crate) sections_json: Option<String>,
     pub(crate) decisions_json: String,
     pub(crate) important_links_json: String,
     pub(crate) open_questions_json: String,

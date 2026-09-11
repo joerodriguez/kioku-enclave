@@ -142,3 +142,5 @@ receipted expand declared compatible by the candidate.
   Draining-to-Active and Active/Paused transitions preserve it exactly, while
   Paused-to-Draining may establish a freshly proved homogeneous fleet for the
   next cycle.
+
+- `0029_dynamic_brief_sections.sql` adds nullable, array-checked brief sections through a separately receipted explicit migrator; NULL preserves legacy rows and frozen base/activation contracts remain unchanged.

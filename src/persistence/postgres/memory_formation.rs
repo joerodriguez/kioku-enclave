@@ -3696,7 +3696,7 @@ impl MemoryFormationRepository for PostgresPersistence {
             "SELECT e.id,concat_ws(E'\\n',e.title,e.summary,e.minutes_text,fb.overview, \
                     (SELECT string_agg(value #>> '{}',E'\\n' ORDER BY ordinal) \
                        FROM jsonb_path_query( \
-                         fb.decisions||fb.action_items||fb.important_links||fb.open_questions, \
+                         fb.decisions||fb.action_items||fb.important_links||fb.open_questions||coalesce(fb.sections,'[]'::jsonb), \
                          'strict $.** ? (@.type() == \"string\")' \
                        ) WITH ORDINALITY AS strings(value,ordinal))) AS text \
                FROM episodes e LEFT JOIN episode_final_briefs fb \

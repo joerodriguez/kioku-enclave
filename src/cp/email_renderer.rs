@@ -1,9 +1,9 @@
 //! Pure subject, plain-text, and HTML rendering for native memory emails.
 //!
 //! The email speaks the same language as the Kioku apps. A finalized *memory*
-//! has a *Final brief* made of an overview plus Decisions, Action items,
-//! Important links, and Open questions — the section names and order of the
-//! iPhone and web Brief pages — and the content-free subject matches the
+//! has a *Final brief* made of an overview, content-specific ordered sections,
+//! and Important links, with fixed groups only for legacy briefs. The
+//! iPhone and web use the same content; the content-free subject matches the
 //! iPhone push alert ("Your memory is ready.").
 //!
 //! Enforces exact isolation between notification-only (default) and full-content
@@ -229,7 +229,8 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         text_parts.push(format!("Participants: {}", episode.participants.join(", ")));
     }
 
-    let has_brief = !episode.overview.is_empty()
+    let has_brief = episode.sections.as_ref().is_some_and(|s| !s.is_empty())
+        || !episode.overview.is_empty()
         || !episode.decisions.is_empty()
         || !episode.action_items.is_empty()
         || !episode.important_links.is_empty()
@@ -241,14 +242,40 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         text_parts.push(episode.overview.clone());
     }
 
-    if !episode.decisions.is_empty() {
+    if let Some(sections) = &episode.sections {
+        for section in sections {
+            text_parts.push(format!("\n{}", section.title));
+            for item in &section.items {
+                let meta = [item.owner.as_deref(), item.due_at.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let prefix = if section.kind == super::finalizer::BriefSectionKind::Text {
+                    ""
+                } else {
+                    "• "
+                };
+                text_parts.push(format!(
+                    "{prefix}{}{}",
+                    item.text,
+                    if meta.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {meta}")
+                    }
+                ));
+            }
+        }
+    }
+    if episode.sections.is_none() && !episode.decisions.is_empty() {
         text_parts.push("\nDecisions".to_string());
         for d in &episode.decisions {
             text_parts.push(format!("• {}", d.text));
         }
     }
 
-    if !episode.action_items.is_empty() {
+    if episode.sections.is_none() && !episode.action_items.is_empty() {
         text_parts.push("\nAction items".to_string());
         for a in &episode.action_items {
             let mut meta = Vec::new();
@@ -273,7 +300,7 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         }
     }
 
-    if !episode.open_questions.is_empty() {
+    if episode.sections.is_none() && !episode.open_questions.is_empty() {
         text_parts.push("\nOpen questions".to_string());
         for q in &episode.open_questions {
             text_parts.push(format!("• {}", q));
@@ -313,7 +340,36 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         ));
     }
 
-    if !episode.decisions.is_empty() {
+    if let Some(sections) = &episode.sections {
+        for section in sections {
+            body.push_str(&format!(
+                r#"<div class="group-title">{}</div>"#,
+                escape_html(&section.title)
+            ));
+            let text_kind = section.kind == super::finalizer::BriefSectionKind::Text;
+            if !text_kind {
+                body.push_str("<ul>");
+            }
+            for item in &section.items {
+                let tag = if text_kind { "p" } else { "li" };
+                let meta = [item.owner.as_deref(), item.due_at.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                body.push_str(&format!(
+                    "<{tag}>{}{}{}</{tag}>",
+                    escape_html(&item.text),
+                    if meta.is_empty() { "" } else { " — " },
+                    escape_html(&meta)
+                ));
+            }
+            if !text_kind {
+                body.push_str("</ul>");
+            }
+        }
+    }
+    if episode.sections.is_none() && !episode.decisions.is_empty() {
         body.push_str(r#"<div class="group-title">Decisions</div><ul>"#);
         for d in &episode.decisions {
             body.push_str(&format!("<li>{}</li>", escape_html(&d.text)));
@@ -321,7 +377,7 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         body.push_str("</ul>");
     }
 
-    if !episode.action_items.is_empty() {
+    if episode.sections.is_none() && !episode.action_items.is_empty() {
         body.push_str(r#"<div class="group-title">Action items</div><ul>"#);
         for a in &episode.action_items {
             let owner = if !a.owner.is_empty() {
@@ -365,7 +421,7 @@ fn render_memory_section(episode: &FinalizedEpisode, app_base_url: &str) -> (Str
         body.push_str("</ul>");
     }
 
-    if !episode.open_questions.is_empty() {
+    if episode.sections.is_none() && !episode.open_questions.is_empty() {
         body.push_str(r#"<div class="group-title">Open questions</div><ul>"#);
         for q in &episode.open_questions {
             body.push_str(&format!("<li>{}</li>", escape_html(q)));
@@ -445,6 +501,7 @@ mod tests {
             episode_type: Some("meeting".into()),
             participants: vec!["Alice".into(), "Bob <script>alert(1)</script>".into()],
             overview: "Discussed launch timelines & deployment steps.".into(),
+            sections: None,
             decisions: vec![DecisionDetail {
                 text: "Ship v1 on Monday & Friday".into(),
             }],
@@ -467,6 +524,39 @@ mod tests {
             ],
             open_questions: vec!["Who handles support?".into()],
         }
+    }
+
+    #[test]
+    fn dynamic_sections_render_in_order_escape_and_suppress_legacy_groups() {
+        let mut episode = sample_episode();
+        episode.sections = Some(serde_json::from_value(serde_json::json!([
+            {"title":"Core <concepts>","kind":"text","items":[{"text":"<script>example</script>","evidence":[{"record_type":"utterance","record_id":1}]}]},
+            {"title":"What to bring","kind":"tasks","items":[{"text":"Spare clothes","owner":"Parent & child","due_at":"Tomorrow","evidence":[{"record_type":"utterance","record_id":2}]}]}
+        ])).unwrap());
+        let (_, text, html) = render_morning_email(
+            std::slice::from_ref(&episode),
+            true,
+            "2026-09-11",
+            "UTC",
+            "https://example.test",
+        );
+        assert!(text.contains("Core <concepts>\n<script>example</script>"));
+        assert!(text.contains("• Spare clothes — Parent & child · Tomorrow"));
+        assert!(html.contains("Core &lt;concepts&gt;"));
+        assert!(html.contains("<p>&lt;script&gt;example&lt;/script&gt;</p>"));
+        assert!(!html.contains("<script>"));
+        assert!(!text.contains("\nDecisions"));
+        assert!(!text.contains("\nAction items"));
+        assert!(!text.contains("\nOpen questions"));
+        let (_, hidden_text, hidden_html) = render_morning_email(
+            &[episode],
+            false,
+            "2026-09-11",
+            "UTC",
+            "https://example.test",
+        );
+        assert!(!hidden_text.contains("Spare clothes"));
+        assert!(!hidden_html.contains("Core"));
     }
 
     #[test]

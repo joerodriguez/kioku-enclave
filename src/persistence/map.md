@@ -34,3 +34,5 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 
 The media port is intentionally separate from structured repositories so useful domain fakes can
 exercise handler/worker behavior without coupling to SQLx or making GCS an alternate database.
+
+`FinalizationSettlement.sections_json` carries nullable ordered brief sections atomically with the existing brief; NULL is legacy and an empty array is a summary-only brief.

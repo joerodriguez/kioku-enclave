@@ -291,6 +291,7 @@ fn final_brief_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Value>> {
         .map(|overview| {
             Ok(json!({
                 "overview": overview,
+                "sections": row.try_get::<Option<String>, _>("brief_sections")?.map(|raw| json_array_from_text(&raw, "sections")).transpose()?,
                 "decisions": optional_json_array(row, "brief_decisions")?,
                 "action_items": optional_json_array(row, "brief_action_items")?,
                 "important_links": optional_json_array(row, "brief_important_links")?,
@@ -912,7 +913,7 @@ impl PostgresPersistence {
                           concat_ws(' ',fb.overview,coalesce((
                               SELECT string_agg(value #>> '{}',' ' ORDER BY ordinal)
                                 FROM jsonb_path_query(
-                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions,
+                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions||coalesce(fb.sections,'[]'::jsonb),
                                     'strict $.** ? (@.type() == "string")')
                                      WITH ORDINALITY AS strings(value,ordinal)
                           ),'')) AS brief_text
@@ -980,14 +981,14 @@ impl PostgresPersistence {
                           e.search_document AS memory_vector,
                           concat_ws(' ',e.title,e.summary,e.minutes_text) AS memory_text,
                           fb.overview AS brief_overview,
-                          fb.decisions::text AS brief_decisions,
+                          fb.sections::text AS brief_sections,fb.decisions::text AS brief_decisions,
                           fb.action_items::text AS brief_action_items,
                           fb.important_links::text AS brief_important_links,
                           fb.open_questions::text AS brief_open_questions,
                           concat_ws(' ',fb.overview,coalesce((
                               SELECT string_agg(value #>> '{}',' ' ORDER BY ordinal)
                                 FROM jsonb_path_query(
-                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions,
+                                    fb.decisions||fb.action_items||fb.important_links||fb.open_questions||coalesce(fb.sections,'[]'::jsonb),
                                     'strict $.** ? (@.type() == "string")')
                                      WITH ORDINALITY AS strings(value,ordinal)
                           ),'')) AS brief_text
@@ -1003,7 +1004,7 @@ impl PostgresPersistence {
                SELECT v.id,v.title,v.summary,v.minute_summaries::text AS minute_summaries,
                       floor(extract(epoch FROM v.started_at)*1000)::bigint AS started_at_ms,
                       floor(extract(epoch FROM v.ended_at)*1000)::bigint AS ended_at_ms,
-                      v.brief_overview,v.brief_decisions,v.brief_action_items,
+                      v.brief_overview,v.brief_sections,v.brief_decisions,v.brief_action_items,
                       v.brief_important_links,v.brief_open_questions,
                       CASE WHEN btrim($2)='' THEN 'memory'
                            ELSE coalesce(matched.source,'semantic') END AS match_source,
@@ -1408,7 +1409,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                        AND m.episode_id=e.id AND m.record_type='utterance') AS utterance_count, \
                     (SELECT count(*) FROM episode_members m WHERE m.account_id=e.account_id \
                        AND m.episode_id=e.id AND m.record_type='screenshot') AS screenshot_count, \
-                    fb.overview,fb.decisions::text AS decisions, \
+                    fb.overview,fb.sections::text AS brief_sections,fb.decisions::text AS decisions, \
                     fb.action_items::text AS brief_action_items, \
                     fb.important_links::text AS important_links,fb.open_questions::text AS open_questions \
                FROM episodes e LEFT JOIN episode_final_briefs fb \
@@ -1442,6 +1443,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                 .map(|overview| {
                     Ok::<_, EnclaveError>(json!({
                         "overview": overview,
+                        "sections": row.try_get::<Option<String>, _>("brief_sections")?.map(|raw| json_array_from_text(&raw, "sections")).transpose()?,
                         "decisions": postgres_json_array(row, "decisions")?,
                         "action_items": postgres_json_array(row, "brief_action_items")?,
                         "important_links": postgres_json_array(row, "important_links")?,

@@ -880,7 +880,7 @@ screenshots plus the effective mode:
 ```
 
 Memory matching covers title, summary, minute gists, vector similarity, and the
-human values in a structured final brief (overview, decisions, actions, links, and
+human values in a structured final brief (overview, dynamic sections, decisions, actions, links, and
 questions). Screenshot matching covers OCR, app/window/URL context, screen observations,
 and memory-specific screen interpretations. `match_source` and a bounded `match_text`
 explain screen hits, including semantic-only matches. Evidence in an existing memory
@@ -894,6 +894,29 @@ and `Pragma: no-cache` because transcript and screen evidence is owner-private c
 Newly finalized/refinalized memory vectors include only final-brief human string values;
 older vectors remain search-complete through the final-brief lexical branch until a
 separate bounded refresh is reviewed.
+
+### Content-specific final briefs
+
+Episode list/detail and memory search return `final_brief.overview` plus nullable
+`final_brief.sections`: ordered `{title, kind, items}` objects. Each item has plain
+`text`, episode-bound `evidence` (`record_type`, `record_id`), and optional task-only
+`owner`/`due_at`. Kinds are `bullets`, `text`, `tasks`, and `decisions` (actual choices,
+rendered as bullets). The LLM chooses useful headings/order for the recorded activity;
+facts are not forced into Decisions and no next steps are invented to fill a template.
+
+Limits: eight sections; 80-character title; twelve items per section; 2000-character
+item text; one to sixteen valid evidence records per item; 160-character task metadata.
+Malformed, over-bound or ungrounded sections fail finalization before settlement.
+Important links still select exact deterministic URL candidates. Headings/content are
+plain text and must be escaped by HTML consumers.
+
+Missing/null `sections` preserves legacy groups; `[]` means an intentional summary-only
+brief. Legacy `decisions`/`action_items` remain projections of only corresponding
+semantic kinds. Dynamic sections are included in lexical/vector source text, export,
+and content-consented webhook/email snapshots. Notification-only output stays content-free.
+Existing briefs remain unchanged until explicitly regenerated; no bulk regeneration is
+triggered by this change. Candidate startup requires the separately installed v29
+brief-sections companion schema (see RELEASING.md).
 
 `GET /api/episodes` keeps its existing `participants` name array and also returns
 `participant_details` on every memory row. Each detail includes display and

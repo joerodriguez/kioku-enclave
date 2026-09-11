@@ -7,6 +7,7 @@ mod activation;
 mod admission;
 mod aggregate_audit;
 mod billing;
+mod brief_sections_schema;
 mod capture;
 #[cfg(test)]
 mod catalog_presence_tests;
@@ -210,7 +211,8 @@ impl PostgresPersistence {
     pub(crate) async fn migrate(&self) -> Result<()> {
         self.migrate_to_version(EXPECTED_SCHEMA_VERSION).await?;
         self.install_test_orphan_erasure_schema().await?;
-        self.install_morning_email_schema().await
+        self.install_morning_email_schema().await?;
+        self.install_brief_sections_schema().await
     }
 
     #[cfg(test)]
@@ -912,6 +914,7 @@ mod tests {
             );
         }
         persistence.install_morning_email_schema().await.unwrap();
+        persistence.install_brief_sections_schema().await.unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -927,7 +930,7 @@ mod tests {
                 WHERE schemaname = current_schema()
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
-                      'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema');
+                      'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;
@@ -2284,6 +2287,7 @@ mod tests {
             minutes_text: "Reviewed PostgreSQL".into(),
             action_items_json: "[]".into(),
             overview: "The persistence boundary is complete.".into(),
+            sections_json: Some(r#"[{"title":"Core concepts","kind":"bullets","items":[{"text":"Source evidence remains grounded","evidence":[{"record_type":"utterance","record_id":1}]}]}]"#.into()),
             decisions_json: "[]".into(),
             important_links_json: "[]".into(),
             open_questions_json: "[]".into(),
@@ -3729,6 +3733,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let sections = serde_json::json!([{"title":"Core concepts","kind":"bullets","items":[{"text":"Orbital dynamics explained","evidence":[{"record_type":"utterance","record_id":1}]}]}]);
+        sqlx::query(
+            "UPDATE episode_final_briefs SET sections=$2::jsonb WHERE account_id=$1 AND episode_id=1",
+        )
+        .bind(&account_id)
+        .bind(sections.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
         let enriched_embedding_sources = repositories
             .memory_formation()
             .episode_embedding_sources(&account_id, &[1])
@@ -3736,6 +3749,9 @@ mod tests {
             .unwrap();
         assert_eq!(enriched_embedding_sources.len(), 1);
         assert!(enriched_embedding_sources[0].text.contains("Ready"));
+        assert!(enriched_embedding_sources[0]
+            .text
+            .contains("Orbital dynamics explained"));
         assert!(enriched_embedding_sources[0].text.contains("Ship"));
         assert!(!enriched_embedding_sources[0].text.contains("action_items"));
 
@@ -3744,7 +3760,7 @@ mod tests {
             .search(
                 &account_id,
                 &SearchRequest {
-                    query: "Ship".into(),
+                    query: "Orbital".into(),
                     speaker: None,
                     time_start: None,
                     time_end: None,
@@ -3759,6 +3775,7 @@ mod tests {
         let final_brief_hits = serde_json::to_value(&final_brief_hits).unwrap();
         assert_eq!(final_brief_hits[0]["memory_id"], 1);
         assert_eq!(final_brief_hits[0]["match_source"], "brief");
+        assert_eq!(final_brief_hits[0]["final_brief"]["sections"], sections);
         assert_eq!(
             final_brief_hits[0]["final_brief"]["action_items"][0],
             "Ship"
@@ -3876,6 +3893,10 @@ mod tests {
         assert_eq!(episode_page.episodes[0]["member_count"], 2);
         assert_eq!(episode_page.episodes[0]["top_domains"][0], "example.com");
         assert_eq!(episode_page.episodes[0]["final_brief"]["overview"], "Ready");
+        assert_eq!(
+            episode_page.episodes[0]["final_brief"]["sections"],
+            sections
+        );
         assert_eq!(
             episode_page.episodes[0]["participant_details"][0]["person_id"],
             1
