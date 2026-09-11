@@ -72,14 +72,18 @@ outcome-save recovery.
 
 Topology reconciliation is governed by append-only PostgreSQL v27 authority, not by a process-local
 feature flag. The immutable image carries an explicit model, Vertex location, and compiled
-producer-contract digest. Startup and every readiness check dynamically compare those values with
-the verified signed database phase. There is no exception to that comparison. The v0.9.31
-response-schema correction shipped a one-release dark compatibility bridge for its exact
-`Paused` generation-4 predecessor, plus a matching corrected `Draining`/g5 readiness
-allowance; both were pinned to that package version and are retired as of v0.9.32. Schema-27
-readiness now admits only a verified `Active` or `Paused` chain whose recorded model,
-location, and compiled producer contract exactly match the running image. All Draining and
-Active producer mismatches remain readiness failures.
+producer-contract digest; image assembly recomputes that digest and refuses a mismatch, and
+startup refuses a baked label that differs from the binary. Since ADR-0046 the running image
+is the release authority for the producer it runs: serving registers its producer at startup
+and binds it into every claim, provider attempt, stage, and publication, while the signed
+activation history records the producer signed at activation and remains the signed Pause
+kill switch. Startup and every readiness check still require a verified `Active` or `Paused`
+chain and an activation-capable image; `Draining` remains unready for every image. The trust
+root for what serves is the deployment repository's reviewed digest pin and Cloud Run IAM
+(ADR-0044), not attestation. The v0.9.31 response-schema correction shipped a one-release dark
+compatibility bridge for its exact `Paused` generation-4 predecessor, plus a matching
+corrected `Draining`/g5 readiness allowance; both were pinned to that package version and are
+retired as of v0.9.32, and no version-scoped allowance exists.
 Reconciliation is dormant in `Installed`, `Draining`, and
 `Paused`; only `Active` grants repository authority for claims, provider egress, durable stages,
 and publication. Legacy finalization remains available during the potentially long `Installed`

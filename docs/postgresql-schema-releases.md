@@ -153,10 +153,16 @@ exact independently verified companion attachments; older binaries that cannot r
 these guards become unready. Treat installation as a coordinated compatibility boundary,
 not a rolling additive migration that promises predecessor readiness.
 
-The changed reconciliation producer commitment also requires the ordinary signed
-pause/drain/rebind/activate workflow for a matching homogeneous candidate fleet. A release
-must plan that transition together with the companion installation; the implementation does
-not weaken existing activation receipts, invent a temporary readiness bridge, or authorize
-an unsigned fleet change. Preserve delivered/ambiguous legacy email receipts. Accounts with
+The changed reconciliation producer commitment needs no signed transition since ADR-0046:
+the reviewed image registers its own producer at startup and the signed activation history
+is not a serving gate. Release order for this companion on the Cloud Run topology: pin the
+migrator to the candidate digest and apply, execute `morning-email-v28-install` once, then
+pin serving to the same digest and apply. The currently serving pre-v28 image stops
+finalizing as soon as the companion is installed and cannot start new instances, so keep the
+serving pin ready to apply immediately. During the rollout overlap both revisions may claim
+the same cohort under their own producer-keyed job rows; the second publication is refused
+as a topology conflict and expires with its lease (see `RELEASING.md`, ADR-0046). Existing
+activation receipts are not weakened and no
+readiness bridge exists. Preserve delivered/ambiguous legacy email receipts. Accounts with
 no saved IANA timezone keep their consent but wait for explicit timezone selection in any
 first-party settings surface. Do not infer timezone or backfill previously unqueued history.

@@ -1197,9 +1197,7 @@ async fn test_real_pg_aggregate_audit_isolated(base: &PostgresPersistence) {
         .connect_with(migration_options)
         .await
         .expect("connect isolated aggregate-audit schema");
-    let migration_persistence = PostgresPersistence {
-        pool: migration_pool,
-    };
+    let migration_persistence = PostgresPersistence::with_pool(migration_pool);
     migration_persistence.migrate().await.unwrap();
     migration_persistence.pool.close().await;
 
@@ -1215,7 +1213,7 @@ async fn test_real_pg_aggregate_audit_isolated(base: &PostgresPersistence) {
         .connect_with(audit_options)
         .await
         .expect("connect strict isolated aggregate-audit schema");
-    let persistence = PostgresPersistence { pool: audit_pool };
+    let persistence = PostgresPersistence::with_pool(audit_pool);
     Box::pin(test_real_pg_aggregate_audit_inner(&persistence, true)).await;
     persistence.pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

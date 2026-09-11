@@ -131,7 +131,7 @@ async fn postgres_catalog_presence_after_release_lock_contract() {
         .connect_with(options)
         .await
         .unwrap();
-    let persistence = PostgresPersistence { pool: pool.clone() };
+    let persistence = PostgresPersistence::with_pool(pool.clone());
     let outcome = tokio::spawn(async move { catalog_visibility(&persistence).await }).await;
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

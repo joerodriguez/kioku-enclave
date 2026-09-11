@@ -34,9 +34,11 @@ const RELEASE_PROTOCOL_VERSION: i64 = 1;
 /// The v0.9.31 one-release Vertex-schema bridge that once let a Paused/g4
 /// predecessor admit this producer, and its Draining/g5 redrain twin, are
 /// retired: both were pinned to the exact package version and are inert in
-/// every later release. Serving now requires an exact match between the
-/// running model/location/producer and the signed fleet activation authority,
-/// with no version-scoped escape.
+/// every later release. Since ADR-0046 the running model/location/producer is
+/// the reviewed image's own (registered at startup), and the signed fleet
+/// activation authority records the producer that was signed at activation as
+/// history; serving requires a verified Active or Paused chain, not an exact
+/// producer match, and there is still no version-scoped escape.
 #[cfg(test)]
 const EXPECTED_RECONCILIATION_PRODUCER_CONTRACT: &str =
     "sha256:0e3fadcbc33df882f72be1a31a3be411a76e5af0831a410a4284c803c550ed12";
@@ -2639,9 +2641,14 @@ impl PostgresPersistence {
     /// Verifies that this immutable image is compatible with the durable
     /// activation phase. The reconciliation implementation is intentionally
     /// dormant in `installed`; repository authority remains absent until
-    /// `active`. Once draining has begun, every serving replica must carry the
-    /// exact signed model, location, and producer contract. There is no
-    /// exception: the v0.9.31 Paused/g4 schema-compatibility bridge is retired.
+    /// `active`. Once draining has begun, every serving replica must be an
+    /// activation-capable image carrying an explicit model, location, and
+    /// producer contract. Since ADR-0046 those values are the image's own: the
+    /// reviewed image digest pinned by the deployment repository authorizes the
+    /// running producer, and the signed authority's recorded producer is the
+    /// history of what was signed at activation, not a serving gate. The
+    /// v0.9.31 Paused/g4 schema-compatibility bridge stays retired; no
+    /// version-scoped allowance exists or is needed.
     pub(crate) async fn verify_reconciliation_runtime_schema(
         &self,
         reconciliation_model: Option<&str>,
@@ -2666,23 +2673,23 @@ impl PostgresPersistence {
             MemoryReconciliationActivationPhase::Draining
             | MemoryReconciliationActivationPhase::Active
             | MemoryReconciliationActivationPhase::Paused => {
-                let (Some(reconciliation_model), Some(producer_contract_sha256)) =
-                    (reconciliation_model, producer_contract_sha256)
-                else {
+                if reconciliation_model.is_none() || producer_contract_sha256.is_none() {
                     return Err(EnclaveError::Config(
                         "draining or activated reconciliation requires an activation-capable image"
                             .into(),
                     ));
-                };
-                if activation.reconciliation_model.as_deref() != Some(reconciliation_model)
-                    || activation.vertex_location.as_deref() != Some(vertex_location)
-                    || activation
-                        .reconciliation_producer_contract_sha256
-                        .as_deref()
-                        != Some(sha256_label(producer_contract_sha256).as_str())
+                }
+                if vertex_location.is_empty() {
+                    return Err(EnclaveError::Config(
+                        "activated reconciliation requires an explicit Vertex location".into(),
+                    ));
+                }
+                if activation.reconciliation_producer_contract_sha256.is_none()
+                    || activation.reconciliation_model.is_none()
+                    || activation.vertex_location.is_none()
                 {
                     return Err(EnclaveError::Config(
-                        "runtime does not match the signed fleet activation authority".into(),
+                        "signed activation authority lacks its producer history".into(),
                     ));
                 }
             }

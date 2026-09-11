@@ -549,12 +549,18 @@ async fn test_schema_correction_retry_cycle(
         .release_reconciliation(&old_claim, Some(0), "provider_not_billed", false, true)
         .await?;
     let successor = crate::cp::reconciler::producer_contract_commitment(MODEL, LOCATION)?;
+    // ADR-0046: the successor image is admitted by a verified Active chain even
+    // though the signed history still records the predecessor producer. The
+    // running producer is the reviewed image's own, not a signed field.
+    persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+        .await?;
     assert!(
         persistence
-            .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
+            .verify_reconciliation_runtime_schema(None, LOCATION, None)
             .await
             .is_err(),
-        "the compatibility bridge never admits old Active"
+        "an activation-incapable image must still be refused by an active chain"
     );
     active.generation = 4;
     active.previous_phase = "active".into();
@@ -565,19 +571,12 @@ async fn test_schema_correction_retry_cycle(
         )?)
         .await?;
     // The v0.9.31 one-release bridge admitted exactly this Paused/g4
-    // predecessor while it still recorded the old producer. That bridge is
-    // retired, so the successor runtime must now be refused until a signed
-    // redrain binds the new producer below.
-    let refused = persistence
+    // predecessor while it still recorded the old producer. Since ADR-0046 no
+    // bridge is needed: a verified Paused chain admits the successor image, and
+    // the phase gate below, not a producer match, keeps its workers dormant.
+    persistence
         .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
-        .await
-        .expect_err("a retired bridge must not admit a mismatched Paused predecessor");
-    assert!(
-        refused
-            .to_string()
-            .contains("runtime does not match the signed fleet activation authority"),
-        "the Paused predecessor must be refused by the authority match, not another gate: {refused}"
-    );
+        .await?;
     assert!(
         persistence
             .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
@@ -625,19 +624,23 @@ async fn test_schema_correction_retry_cycle(
     persistence
         .transition_memory_reconciliation_activation(&test_verify_activation_receipt(active)?)
         .await?;
-    // Active with the bound successor producer is the only admitting state,
-    // and it needs no version-scoped bridge to be admitted.
+    // Active admits the successor image without any version-scoped bridge.
     persistence
         .verify_reconciliation_runtime_schema(Some(MODEL), LOCATION, Some(&successor))
         .await?;
-    // Every clause of that exact match is load-bearing now that no bridge can
-    // relax it, including the location the rest of this contract holds fixed.
+    // ADR-0046: a differently configured location is the image's own choice as
+    // well; only an activation-incapable image or an empty location is refused.
+    // Whether the producer corresponds to (model, location) is proven by the
+    // baked-label check at startup, not here.
+    persistence
+        .verify_reconciliation_runtime_schema(Some(MODEL), "us-central1", Some(&successor))
+        .await?;
     assert!(
         persistence
-            .verify_reconciliation_runtime_schema(Some(MODEL), "us-central1", Some(&successor))
+            .verify_reconciliation_runtime_schema(Some(MODEL), "", Some(&successor))
             .await
             .is_err(),
-        "a mismatched vertex location must not serve an active chain"
+        "an empty vertex location must not serve an active chain"
     );
     let new_snapshot = persistence
         .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
@@ -652,6 +655,83 @@ async fn test_schema_correction_retry_cycle(
         .await?
         .unwrap();
     assert_eq!(new_claim.activation_generation, 6);
+    assert_eq!(new_claim.producer_contract_sha256, successor.to_vec());
+    // ADR-0046: once a runtime producer is registered, claims bind that exact
+    // producer, model, and location regardless of the signed history. Release
+    // the claim first so the registered producer can be observed on a fresh one.
+    persistence
+        .release_reconciliation(&new_claim, Some(0), "runtime_producer_probe", false, true)
+        .await?;
+    let runtime = crate::persistence::RuntimeReconciliationProducer {
+        producer_contract_sha256: vec![0xab; 32],
+        reconciliation_model: "gemini-runtime-probe".into(),
+        vertex_location: "europe-west4".into(),
+    };
+    persistence.register_runtime_reconciliation_producer(runtime.clone());
+    assert_eq!(
+        persistence.runtime_reconciliation_producer(),
+        Some(runtime.clone())
+    );
+    // The producer is part of the cohort fingerprint, so a snapshot read under
+    // the signed producer is refused under the registered one: a claim never
+    // silently carries a stale producer across a registration.
+    assert!(
+        persistence
+            .claim_reconciliation(&new_snapshot, 900)
+            .await?
+            .is_none(),
+        "a snapshot fingerprinted under another producer must not be claimable"
+    );
+    let runtime_snapshot = persistence
+        .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
+        .await?
+        .expect("the released draft is selectable again under the runtime producer");
+    assert_ne!(
+        runtime_snapshot.source_fingerprint,
+        new_snapshot.source_fingerprint
+    );
+    let runtime_claim = persistence
+        .claim_reconciliation(&runtime_snapshot, 900)
+        .await?
+        .expect("the released draft is claimable under the runtime producer");
+    assert_eq!(runtime_claim.activation_generation, 6);
+    assert_eq!(
+        runtime_claim.producer_contract_sha256,
+        runtime.producer_contract_sha256
+    );
+    assert_eq!(
+        runtime_claim.reconciliation_model,
+        runtime.reconciliation_model
+    );
+    assert_eq!(runtime_claim.vertex_location, runtime.vertex_location);
+    persistence
+        .release_reconciliation(
+            &runtime_claim,
+            Some(0),
+            "runtime_producer_probe",
+            false,
+            true,
+        )
+        .await?;
+    persistence.register_runtime_reconciliation_producer(
+        crate::persistence::RuntimeReconciliationProducer {
+            producer_contract_sha256: successor.to_vec(),
+            reconciliation_model: MODEL.into(),
+            vertex_location: LOCATION.into(),
+        },
+    );
+    let new_snapshot = persistence
+        .next_source_settled_cohort(ACCOUNT, 14400, None, 32, 4000)
+        .await?
+        .expect("the draft is selectable again under the successor producer");
+    assert_ne!(
+        new_snapshot.source_fingerprint,
+        old_snapshot.source_fingerprint
+    );
+    let new_claim = persistence
+        .claim_reconciliation(&new_snapshot, 900)
+        .await?
+        .expect("the draft is claimable again under the successor producer");
     assert_eq!(new_claim.producer_contract_sha256, successor.to_vec());
     let guard = persistence
         .acquire_provider_egress_guard(&new_claim)

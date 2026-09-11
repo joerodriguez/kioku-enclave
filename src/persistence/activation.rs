@@ -54,6 +54,34 @@ pub(crate) struct ActiveReconciliationAuthority {
     pub(crate) vertex_location: String,
 }
 
+/// The reconciliation producer this process actually runs: the compiled
+/// producer contract plus the configured model and location. Serving registers
+/// it once at startup (ADR-0046). The signed activation authority records the
+/// producer that was signed when reconciliation was activated; that is history
+/// and the pause kill switch, not the release authority for the running
+/// producer, which is the reviewed image digest pinned by the deployment
+/// repository. Claims, provider attempts, stages, and publication bind the
+/// registered runtime producer so every replica of one image agrees with itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeReconciliationProducer {
+    pub(crate) producer_contract_sha256: Vec<u8>,
+    pub(crate) reconciliation_model: String,
+    pub(crate) vertex_location: String,
+}
+
+impl RuntimeReconciliationProducer {
+    /// The `sha256:<hex>` label of the registered producer contract.
+    pub(crate) fn producer_contract_label(&self) -> String {
+        use std::fmt::Write as _;
+        let mut label = String::with_capacity(7 + self.producer_contract_sha256.len() * 2);
+        label.push_str("sha256:");
+        for byte in &self.producer_contract_sha256 {
+            let _ = write!(&mut label, "{byte:02x}");
+        }
+        label
+    }
+}
+
 #[async_trait]
 pub(crate) trait MemoryReconciliationActivationRepository: Send + Sync {
     /// Returns a verified, content-free projection of the append-only

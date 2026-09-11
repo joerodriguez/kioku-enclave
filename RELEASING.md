@@ -170,35 +170,59 @@ repository includes the standard `v29-interrupted-capture-install` operator phas
 result journal, but a later authorized release must pin its reviewed migrator image before
 execution. See the [schema handoff](docs/postgresql-schema-releases.md). Installation preserves
 the base markers and signed v27 history; predecessor binaries become unready because their
-catalog verifier does not recognize the new constraint. Coordinate that compatibility boundary
-with the existing ADR-0045 transition requirements. These merged sources neither publish an
-image nor authorize installation, serving rollout, or client distribution.
+catalog verifier does not recognize the new constraint. Since ADR-0046 this is an ordinary
+companion release: pin the migrator, run the phase, pin serving (see below). These merged
+sources neither publish an image nor authorize installation, serving rollout, or client
+distribution.
 
-### ADR-0045 organization producer change (source-only handoff)
+### Producer or model changes are ordinary releases (ADR-0046)
 
-The ADR-0045 compiled producer is
+Since ADR-0046 the running reconciliation producer contract, model, and Vertex location are
+the reviewed image's own. Serving registers its compiled producer at startup and every claim,
+provider attempt, stage, and publication binds that registered producer; the signed activation
+authority records the producer that was signed when reconciliation was activated as history and
+keeps the signed Pause kill switch. A release that changes the producer therefore needs no
+signed pause, drain, redrain, or activate transition and no fleet or client evidence: bump the
+version, build with an operator configuration whose `MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256`
+is the new compiled label (image assembly recomputes and refuses a mismatch), publish, and pin
+the digest in the deployment repository. Serving still requires a verified `Active` or `Paused`
+chain and an activation-capable image; `Draining` remains a migration phase. Staged provider
+results carry the producer that produced them, so a producer change re-infers stale stages and
+never publishes under a mismatched contract. The ADR-0045 compiled producer is
 `sha256:0e3fadcbc33df882f72be1a31a3be411a76e5af0831a410a4284c803c550ed12`.
-It binds prompt organization with current formation, eight-hour capture context, exact-membership
-ID retention, and the revised bounded KEEP policy. An existing `Active` receipt for the predecessor
-producer rejects this image as intended. Merging these sources does not authorize a release or
-change signed activation history. A separately authorized release must use the reviewed signed
-producer-rebind and fleet-drained maintenance workflow described below, together with the
-[ADR-0045 schema handoff](docs/postgresql-schema-releases.md). Preserve the frozen activation
-checks; do not introduce a package-version allowance or reuse a predecessor producer claim.
+
+An additive schema companion (such as the ADR-0045 morning-email v28 install) is run by the
+digest-pinned migrator before the serving pin, see
+[the schema handoff](docs/postgresql-schema-releases.md); `/readyz` reports
+`runtime_producer_contract_sha256` so an operator can confirm what a revision runs.
+
+Two consequences to plan for:
+
+- **Rollout overlap.** For the length of a Cloud Run rollout the predecessor and candidate
+  revisions share the database while running different producers. The producer is part of the
+  cohort fingerprint, so each revision keys the same cohort under its own job row and both may
+  spend one provider attempt; the second publication is refused as a topology conflict and its
+  row expires with its five-minute lease. Nothing is corrupted or published under the wrong
+  contract. Keep the overlap short: let Cloud Run move traffic to the candidate and let the
+  predecessor instances drain rather than keeping both revisions serving.
+- **Pause and Resume.** The signed Pause and Resume transitions must preserve the producer,
+  model, location, and candidate digest recorded by the prior signed Active event, which may be
+  older than what the running image reports. Build the Resume receipt from the signed history,
+  not from the candidate image. Letting Paused-to-Active carry the running producer is a
+  possible later change; it is not required to pause or resume today.
 
 ### v0.9.31 Vertex schema correction from Paused/g4 (historical; bridge retired in v0.9.32)
 
 The readiness bridge described below was pinned to package v0.9.31 and is **retired**. It is
-kept as the worked example of a producer-changing release. Serving now admits only a verified
-`Active` or `Paused` chain whose recorded model, location, and compiled producer contract
-exactly match the running image.
+kept as the worked example of what a producer-changing release used to require. Since
+ADR-0046 serving admits a verified `Active` or `Paused` chain for any activation-capable
+image and the running image's own model, location, and compiled producer contract are the
+release authority (see above), so no such cycle is needed for a producer change.
 
-**Consequence for the next producer change.** `Draining` is no longer schema-ready for serving,
-so a Paused-to-Draining cycle makes every serving replica fail startup and report `503` until
-the signed Active transition completes. Plan that cycle on the fleet-drained maintenance lane
-and treat the outage as expected, exactly as v0.9.31 did; do not reintroduce a package-version
-allowance to serve through it. An ordinary ADR-0041 compatible image rollout does not change
-the activation phase and is unaffected.
+**Draining is still a migration phase.** It is not schema-ready for serving, so a signed
+Paused-to-Draining cycle (only ever needed for a scope change now) makes every serving replica
+report `503` until the signed Active transition completes; treat that as a planned outage and
+do not reintroduce a package-version allowance to serve through it.
 
 Vertex rejected the nested reconciliation response schema with its outer `maxItems`
 hint. The corrected producer omits only that hint; local validation still refuses more
@@ -366,8 +390,9 @@ occurs only in the documented Paused window, with permanent erased-identity barr
    A subsequent empty pass proves completion. The release, lifecycle, and reconciliation fences
    serialize assignment with deletion and preserve all existing sticky assignments. This metadata
    operation never requires provider/finalization work or modifies memories.
-   A runtime whose model/location/producer does not match the signed authority is unready from
-   `Draining` onward, and the frozen predecessor verifier refuses the added guards.
+   A runtime is unready in `Draining` whatever its producer (ADR-0046 admits any
+   activation-capable image only from a verified `Active` or `Paused` chain), and the frozen
+   predecessor verifier refuses the added guards.
    An episode-finalization request already authorized before the transition may finish HTTP and its
    terminal usage write while Draining waits on the database fence. The subsequent bounded claim
    drain may discard that paid result before parsing; the stale claim must fail settlement and the
