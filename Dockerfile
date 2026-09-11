@@ -50,7 +50,7 @@
 #     -t kioku-enclave:local .
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM rust:1.97.1-slim@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS builder
+FROM rust:1.98.0-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS builder
 
 WORKDIR /build
 
