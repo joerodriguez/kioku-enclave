@@ -24,7 +24,6 @@ use crate::persistence::{
     ScreenMediaSettlement,
 };
 
-use super::media::parse_audio_result;
 use super::media_planner::{self, SourceInterval, WorkClass};
 use super::{isotime, vertex, CpState};
 
@@ -224,9 +223,11 @@ fn audio_schema() -> Value {
                                 "properties": {
                                     "predicate":{"type":"STRING","enum":["role","organization","relationship","preference","responsibility","contact","location","other"]},
                                     "value":{"type":"STRING"},
-                                    "evidence":{"type":"STRING"}
+                                    "evidence":{"type":"STRING"},
+                                    "confidence":{"type":"NUMBER", "minimum":0, "maximum":1},
+                                    "replacement_of":{"type":"STRING", "nullable":true}
                                 },
-                                "required":["predicate","value","evidence"]
+                                "required":["predicate","value","evidence","confidence"]
                             }
                         }
                     },
@@ -517,7 +518,7 @@ async fn authorize_and_send_media(
 }
 
 async fn settle_staged_media(
-    state: &CpState,
+    repositories: &crate::persistence::RepositorySet,
     user_id: &str,
     claim: &MediaProcessingClaim,
     response: MediaProviderStagedResponse,
@@ -537,23 +538,25 @@ async fn settle_staged_media(
             let disposition = mapped_provider_disposition(failure.disposition);
             let settlement = match disposition {
                 MediaFailureDisposition::RetryableNotBilled => {
-                    super::model_usage::settle_not_billed_required(
-                        state,
-                        user_id,
-                        &response.attempt.event_id,
-                        response.http_status,
-                    )
-                    .await
+                    repositories
+                        .model_usage()
+                        .settle_not_billed(
+                            user_id,
+                            &response.attempt.event_id,
+                            response.http_status,
+                        )
+                        .await
                 }
                 MediaFailureDisposition::AmbiguousTerminal
                 | MediaFailureDisposition::ConfirmedInvalid => {
-                    super::model_usage::settle_ambiguous_required(
-                        state,
-                        user_id,
-                        &response.attempt.event_id,
-                        Some(response.http_status),
-                    )
-                    .await
+                    repositories
+                        .model_usage()
+                        .settle_ambiguous(
+                            user_id,
+                            &response.attempt.event_id,
+                            Some(response.http_status),
+                        )
+                        .await
                 }
                 MediaFailureDisposition::RetryableBeforeEgress => Err(EnclaveError::Store(
                     "staged provider response was classified before egress".into(),
@@ -568,17 +571,14 @@ async fn settle_staged_media(
         }
     };
 
-    if let Err(error) = super::model_usage::settle_response_required(
-        state,
-        user_id,
-        &generation.event_id,
-        &generation.metadata,
-    )
-    .await
+    if let Err(error) = repositories
+        .model_usage()
+        .settle_response(user_id, &generation.event_id, &generation.metadata)
+        .await
     {
         return Err(MediaWorkFailure::staged(error, response.attempt));
     }
-    let repository = state.repositories.media_processing();
+    let repository = repositories.media_processing();
     if let Err(error) = repository
         .settle_usage(MediaUsageSettlement {
             claim: claim.clone(),
@@ -628,8 +628,12 @@ async fn settle_staged_media(
                     response.attempt.clone(),
                 )
             })?;
-        let turns = parse_audio_result(&generation.text, window_end.saturating_sub(window_start))
-            .map_err(|error| {
+        let turns = super::media::parse_audio_result_for_contract(
+            &generation.text,
+            window_end.saturating_sub(window_start),
+            response.attempt.result_contract_version,
+        )
+        .map_err(|error| {
             MediaWorkFailure::provider(
                 error,
                 MediaFailureDisposition::ConfirmedInvalid,
@@ -689,13 +693,28 @@ async fn settle_staged_media(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn test_recover_staged_media(
+    repositories: &crate::persistence::RepositorySet,
+    account: &str,
+    claim: &MediaProcessingClaim,
+) -> Result<()> {
+    let response = claim
+        .staged_response
+        .clone()
+        .ok_or_else(|| EnclaveError::Store("test requires a durable staged response".into()))?;
+    settle_staged_media(repositories, account, claim, response)
+        .await
+        .map_err(|failure| failure.error)
+}
+
 async fn process_work_unit(
     state: &CpState,
     user_id: &str,
     claim: &MediaProcessingClaim,
 ) -> std::result::Result<(), MediaWorkFailure> {
     if let Some(response) = claim.staged_response.clone() {
-        return settle_staged_media(state, user_id, claim, response).await;
+        return settle_staged_media(&state.repositories, user_id, claim, response).await;
     }
     let work = MediaWorkUnit {
         jobs: claim.jobs.iter().map(MediaJob::from).collect(),
@@ -710,7 +729,7 @@ async fn process_work_unit(
         let (window, _sources, _duration_ms) = assemble_audio_window(&work.jobs, &media)?;
         let candidate_names = repository.candidate_name_vocabulary(user_id).await?;
         let prompt = format!(
-            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). A bare name is self_identification only when it answers a preceding request for that speaker's name. Never mark a speaker as self_identification merely because they repeat, spell, correct, or expand another speaker's name: after A answers 'Sarah', if B says 'Sarah Babetski', B's statement is a third_party_mention whose speaker_name_subject_turn_id points to A's turn, not B's identity. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. When speaker_name is populated, you MUST set speaker_name_kind ('self_identification' when the speaker identifies themselves, 'vocative_address' when addressing someone, 'third_party_mention' when mentioning someone), speaker_name_subject_turn_id (the turn_id of the speaker who is identified or named), and speaker_name_target_turn_id (for vocative_address, the turn_id of the speaker being addressed). A bare name is self_identification only when it answers a preceding request for that speaker's name. Never mark a speaker as self_identification merely because they repeat, spell, correct, or expand another speaker's name: after A answers 'Sarah', if B says 'Sarah Babetski', B's statement is a third_party_mention whose speaker_name_subject_turn_id points to A's turn, not B's identity. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence and required per-fact confidence from 0 to 1. Set replacement_of to the exact previous value only when the literal statement explicitly says that role or organization ended or was replaced; otherwise omit it or use null, including concurrent roles. Include both values in its literal evidence. Never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
             work.jobs[0].stream_kind,
             serde_json::to_string(&candidate_names)?
         );
@@ -770,7 +789,7 @@ async fn process_work_unit(
     };
     let response =
         authorize_and_send_media(state, user_id, claim, reserved_output_tokens, prepared).await?;
-    settle_staged_media(state, user_id, claim, response).await
+    settle_staged_media(&state.repositories, user_id, claim, response).await
 }
 fn assemble_audio_window(
     jobs: &[MediaJob],
@@ -1151,13 +1170,13 @@ mod tests {
             + settle_start;
         let settle = &source[settle_start..settle_end];
         let parse = settle.find("parse_staged_media_response(").unwrap();
-        let required_usage = settle.find("settle_response_required(").unwrap();
+        let required_usage = settle.find(".settle_response(").unwrap();
         let durable_usage = settle.find(".settle_usage(").unwrap();
         let projection = settle.find(".settle_audio(").unwrap();
         assert!(parse < required_usage);
         assert!(required_usage < durable_usage);
         assert!(durable_usage < projection);
-        assert_eq!(settle.matches("settle_response_required(").count(), 1);
+        assert_eq!(settle.matches(".settle_response(").count(), 1);
         assert_eq!(settle.matches("&generation.event_id").count(), 1);
     }
 }

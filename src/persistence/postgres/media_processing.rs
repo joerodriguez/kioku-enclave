@@ -18,8 +18,7 @@ use crate::{
     },
     error::{EnclaveError, Result},
     persistence::{
-        is_owner_source_audio, is_supported_self_identification, media_provider_attempt_identity,
-        names_form_refinement, prefer_claimed_display_name, vertex_attempt_event_id,
+        is_owner_source_audio, media_provider_attempt_identity, vertex_attempt_event_id,
         AudioMediaSettlement, MediaFailureDisposition, MediaFailurePolicy, MediaPersonEvidence,
         MediaProcessingClaim, MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository,
         MediaProviderAttempt, MediaProviderStagedResponse, MediaUsageSettlement,
@@ -40,7 +39,7 @@ use super::{
     PostgresPersistence,
 };
 
-const PROMPT_VERSION: i64 = 3;
+const PROMPT_VERSION: i64 = 4;
 // Vertex generation has a hard 120-second request timeout. Refresh the exact
 // durable work and job leases immediately before provider egress so deletion
 // can conservatively treat either live lease as an in-flight disclosure
@@ -48,10 +47,16 @@ const PROMPT_VERSION: i64 = 3;
 const PROVIDER_EGRESS_LEASE_SECONDS: f64 = 15.0 * 60.0;
 const PROVIDER_JOURNAL_VERSION: i64 = 1;
 
+fn legacy_media_result_contract() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderAttemptJournalEntry {
     number: i64,
+    #[serde(default = "legacy_media_result_contract")]
+    result_contract_version: u32,
     identity_sha256: String,
     request_sha256: String,
     event_id: String,
@@ -192,6 +197,7 @@ fn validate_provider_attempt(
         media_provider_attempt_identity(account_id, work_unit_id, attempt.number, &request_sha256);
     if identity_sha256 != expected_identity
         || attempt.event_id != vertex_attempt_event_id(&identity_sha256)
+        || !matches!(attempt.result_contract_version, 1 | 2)
     {
         return Err(EnclaveError::Store(
             "media provider journal identity commitment is invalid".into(),
@@ -199,6 +205,7 @@ fn validate_provider_attempt(
     }
     Ok(MediaProviderAttempt {
         number: attempt.number,
+        result_contract_version: attempt.result_contract_version,
         identity_sha256,
         request_sha256,
         event_id: attempt.event_id.clone(),
@@ -1728,6 +1735,7 @@ impl MediaProcessingRepository for PostgresPersistence {
         }
         journal.attempts.push(ProviderAttemptJournalEntry {
             number: attempt.number,
+            result_contract_version: attempt.result_contract_version,
             identity_sha256: digest_hex(&attempt.identity_sha256),
             request_sha256: digest_hex(&attempt.request_sha256),
             event_id: attempt.event_id.clone(),
@@ -2099,8 +2107,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             command.claim.jobs[0].audio_route.as_deref(),
         );
         let mut cluster_ids = HashMap::<String, i64>::new();
-        let mut resolved_people = HashMap::<String, (i64, String)>::new();
-        let mut changed_people = HashSet::<i64>::new();
+        let mut observation_ids = HashMap::<String, i64>::new();
         for turn in &command.turns {
             let projected = media_planner::project_interval(&sources, turn.start_ms, turn.end_ms);
             let anchor = projected.first().expect("validated projection");
@@ -2184,185 +2191,12 @@ impl MediaProcessingRepository for PostgresPersistence {
             .execute(&mut *transaction)
             .await?;
 
-            let inherited_person = resolved_people.get(&turn.speaker_local_id).cloned();
-            let accepted_name = (!owner_source_audio
-                && is_supported_self_identification(turn, &command.turns))
-            .then(|| {
-                turn.speaker_name
-                    .as_deref()
-                    .zip(turn.speaker_name_confidence)
-            })
-            .flatten()
-            .filter(|(name, _)| {
-                inherited_person
-                    .as_ref()
-                    .is_none_or(|(_, display)| names_form_refinement(display, name))
-            });
-            let mut person_id = inherited_person.as_ref().map(|(id, _)| *id);
-            let mut speaker_label = if owner_source_audio {
-                "Me".to_owned()
+            observation_ids.insert(turn.turn_id.clone(), speaker_observation_id);
+            let speaker_label = if owner_source_audio {
+                "Me"
             } else {
-                inherited_person
-                    .as_ref()
-                    .map(|(_, display)| display.clone())
-                    .unwrap_or_else(|| "Unidentified voice".to_owned())
+                "Unidentified voice"
             };
-            if let Some((name, confidence)) = accepted_name {
-                let normalized = normalize_name(name);
-                let (id, display_name) = match inherited_person {
-                    Some((id, current_display)) => {
-                        let display_name = if prefer_claimed_display_name(&current_display, name) {
-                            let refined = name.trim().to_owned();
-                            sqlx::query(
-                                "UPDATE people SET display_name=$3,normalized_name=$4,updated_at=now() \
-                                 WHERE account_id=$1 AND id=$2 AND status='identified'",
-                            )
-                            .bind(account_id)
-                            .bind(id)
-                            .bind(&refined)
-                            .bind(&normalized)
-                            .execute(&mut *transaction)
-                            .await?;
-                            sqlx::query(
-                                "UPDATE utterances u SET speaker_label=$3 \
-                                 FROM speaker_observations s \
-                                 WHERE u.account_id=$1 AND s.account_id=u.account_id \
-                                   AND s.id=u.speaker_observation_id AND s.cluster_id=$2",
-                            )
-                            .bind(account_id)
-                            .bind(cluster_id)
-                            .bind(&refined)
-                            .execute(&mut *transaction)
-                            .await?;
-                            refined
-                        } else {
-                            current_display
-                        };
-                        (id, display_name)
-                    }
-                    None => {
-                        let existing = sqlx::query_as::<_, (i64, String)>(
-                            "SELECT c.person_id,COALESCE(p.display_name,c.name) \
-                             FROM person_name_claims c JOIN people p \
-                               ON p.account_id=c.account_id AND p.id=c.person_id \
-                             WHERE c.account_id=$1 AND c.normalized_name=$2 \
-                               AND c.status='accepted' AND c.person_id IS NOT NULL \
-                               AND p.status='identified' \
-                             ORDER BY c.id DESC LIMIT 1",
-                        )
-                        .bind(account_id)
-                        .bind(&normalized)
-                        .fetch_optional(&mut *transaction)
-                        .await?
-                        .filter(|(candidate_id, _)| {
-                            resolved_people
-                                .values()
-                                .all(|(assigned_id, _)| assigned_id != candidate_id)
-                        });
-                        if let Some(existing) = existing {
-                            existing
-                        } else {
-                            let id =
-                                allocate_content_id(&mut transaction, account_id, "person").await?;
-                            let display_name = name.trim().to_owned();
-                            sqlx::query(
-                                "INSERT INTO people(account_id,id,display_name,normalized_name,status) \
-                                 VALUES($1,$2,$3,$4,'identified')",
-                            )
-                            .bind(account_id)
-                            .bind(id)
-                            .bind(&display_name)
-                            .bind(&normalized)
-                            .execute(&mut *transaction)
-                            .await?;
-                            (id, display_name)
-                        }
-                    }
-                };
-                changed_people.insert(id);
-                resolved_people.insert(turn.speaker_local_id.clone(), (id, display_name.clone()));
-                let evidence_id =
-                    allocate_content_id(&mut transaction, account_id, "identity_evidence").await?;
-                let evidence = json!({
-                    "work_unit_id": command.claim.work_unit_id,
-                    "event_id": anchor.event_id,
-                    "turn_id": turn.turn_id,
-                    "evidence": turn.speaker_name_evidence,
-                });
-                sqlx::query(
-                    "INSERT INTO identity_evidence \
-                     (account_id,id,person_id,source_event_id,observed_at,speaker_observation_id, \
-                      kind,claimed_name,evidence,score,status) \
-                     VALUES($1,$2,$3,$4,to_timestamp($5::double precision/1000.0),$6, \
-                            'audio_self_identification',$7,$8::jsonb,$9,'accepted')",
-                )
-                .bind(account_id)
-                .bind(evidence_id)
-                .bind(id)
-                .bind(&anchor.event_id)
-                .bind(turn_start)
-                .bind(speaker_observation_id)
-                .bind(name)
-                .bind(serde_json::to_string(&evidence)?)
-                .bind(confidence)
-                .execute(&mut *transaction)
-                .await?;
-                let claim_id =
-                    allocate_content_id(&mut transaction, account_id, "person_name_claim").await?;
-                sqlx::query(
-                    "INSERT INTO person_name_claims \
-                     (account_id,id,person_id,name,normalized_name,source_event_id,speaker_observation_id, \
-                      observed_at,evidence_kind,evidence,confidence,status) \
-                     VALUES($1,$2,$3,$4,$5,$6,$7,to_timestamp($8::double precision/1000.0), \
-                            'audio_self_identification',$9::jsonb,$10,'accepted')",
-                )
-                .bind(account_id)
-                .bind(claim_id)
-                .bind(id)
-                .bind(name)
-                .bind(&normalized)
-                .bind(&anchor.event_id)
-                .bind(speaker_observation_id)
-                .bind(turn_start)
-                .bind(serde_json::to_string(&evidence)?)
-                .bind(confidence)
-                .execute(&mut *transaction)
-                .await?;
-                sqlx::query(
-                    "UPDATE speaker_observations SET person_id=$3,direct_evidence_id=$4 \
-                     WHERE account_id=$1 AND id=$2",
-                )
-                .bind(account_id)
-                .bind(speaker_observation_id)
-                .bind(id)
-                .bind(evidence_id)
-                .execute(&mut *transaction)
-                .await?;
-                sqlx::query(
-                    "UPDATE speaker_clusters SET person_id=$3,attribution_state='person_bound',updated_at=now() \
-                     WHERE account_id=$1 AND id=$2",
-                )
-                .bind(account_id)
-                .bind(cluster_id)
-                .bind(id)
-                .execute(&mut *transaction)
-                .await?;
-                person_id = Some(id);
-                speaker_label = display_name;
-            } else if let Some(id) = person_id {
-                // A work-unit speaker already resolved by stronger direct
-                // evidence remains that opaque person on sibling turns, but a
-                // rejected/conflicting name supplies no new direct edge.
-                sqlx::query(
-                    "UPDATE speaker_observations SET person_id=$3 \
-                     WHERE account_id=$1 AND id=$2 AND person_id IS NULL",
-                )
-                .bind(account_id)
-                .bind(speaker_observation_id)
-                .bind(id)
-                .execute(&mut *transaction)
-                .await?;
-            }
             let utterance_id =
                 allocate_content_id(&mut transaction, account_id, "utterance").await?;
             sqlx::query(
@@ -2378,43 +2212,21 @@ impl MediaProcessingRepository for PostgresPersistence {
             .bind(turn.end_ms as f64 / 1_000.0)
             .bind(&turn.text)
             .bind(turn.language.as_deref())
-            .bind(&speaker_label)
+            .bind(speaker_label)
             .bind(format!("cloud-v2:{}:{}", anchor.event_id, turn.turn_id))
             .bind(speaker_observation_id)
             .execute(&mut *transaction)
             .await?;
-            if let Some(person_id) = person_id {
-                for fact in &turn.person_facts {
-                    let fact_id =
-                        allocate_content_id(&mut transaction, account_id, "person_fact").await?;
-                    let evidence = json!({
-                        "work_unit_id": command.claim.work_unit_id,
-                        "event_id": anchor.event_id,
-                        "turn_id": turn.turn_id,
-                        "evidence": fact.evidence,
-                    });
-                    sqlx::query(
-                        "INSERT INTO person_facts \
-                         (account_id,id,person_id,predicate,value,evidence,derivation_version,status, \
-                          source_event_id,speaker_observation_id,observed_at,literal_evidence,confidence) \
-                         VALUES($1,$2,$3,$4,$5,$6::jsonb,1,'active',$7,$8, \
-                                to_timestamp($9::double precision/1000.0),$10,1.0)",
-                    )
-                    .bind(account_id)
-                    .bind(fact_id)
-                    .bind(person_id)
-                    .bind(&fact.predicate)
-                    .bind(&fact.value)
-                    .bind(serde_json::to_string(&evidence)?)
-                    .bind(&anchor.event_id)
-                    .bind(speaker_observation_id)
-                    .bind(turn_start)
-                    .bind(&fact.evidence)
-                    .execute(&mut *transaction)
-                    .await?;
-                }
-            }
         }
+        super::identity_fusion::record_audio(
+            &mut transaction,
+            account_id,
+            &command.claim,
+            &command.turns,
+            &observation_ids,
+            owner_source_audio,
+        )
+        .await?;
         // An accepted identity/name can affect previously formed memories on
         // other clusters or profiles; refresh their projections before commit.
         refresh_affected_speaker_projections(
@@ -2422,7 +2234,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             account_id,
             &cluster_ids.values().copied().collect::<Vec<_>>(),
             &[],
-            &changed_people.into_iter().collect::<Vec<_>>(),
+            &[],
         )
         .await?;
         mark_capture_formation_dirty(
@@ -2615,38 +2427,15 @@ impl MediaProcessingRepository for PostgresPersistence {
                 .bind(person.confidence)
                 .execute(&mut *transaction)
                 .await?;
-                if person.name.split_whitespace().count() >= 2 && person.confidence >= 0.90 {
-                    let claim_id =
-                        allocate_content_id(&mut transaction, account_id, "person_name_claim")
-                            .await?;
-                    sqlx::query(
-                        "INSERT INTO person_name_claims \
-                         (account_id,id,name,normalized_name,source_event_id,observed_at,evidence_kind, \
-                          evidence,confidence,status) \
-                         VALUES($1,$2,$3,$4,$5,to_timestamp($6::double precision/1000.0),$7, \
-                                $8::jsonb,$9,$10)",
-                    )
-                    .bind(account_id)
-                    .bind(claim_id)
-                    .bind(&person.name)
-                    .bind(normalize_name(&person.name))
-                    .bind(&job.event_id)
-                    .bind(captured_at)
-                    .bind(if person.is_active_speaker {
-                        "screen_active_speaker"
-                    } else {
-                        "screen_visible_name"
-                    })
-                    .bind(serde_json::to_string(&evidence)?)
-                    .bind(person.confidence)
-                    .bind(if person.is_active_speaker {
-                        "probationary"
-                    } else {
-                        "proposed"
-                    })
-                    .execute(&mut *transaction)
-                    .await?;
-                }
+                super::identity_fusion::record_screen(
+                    &mut transaction,
+                    account_id,
+                    evidence_id,
+                    observation_id,
+                    person.is_active_speaker,
+                    result.content_type == "meeting",
+                )
+                .await?;
             }
         }
         mark_capture_formation_dirty(
@@ -2787,6 +2576,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             {
                 journal.attempts.push(ProviderAttemptJournalEntry {
                     number: attempt.number,
+                    result_contract_version: attempt.result_contract_version,
                     identity_sha256: digest_hex(&attempt.identity_sha256),
                     request_sha256: digest_hex(&attempt.request_sha256),
                     event_id: attempt.event_id.clone(),
@@ -4870,6 +4660,11 @@ pub(super) async fn test_begin_media_provider_attempt(
     }
     Ok(MediaProviderAttempt {
         number: claim.provider_attempt_number,
+        result_contract_version: if claim.class == MediaProcessingClass::Audio {
+            2
+        } else {
+            1
+        },
         identity_sha256,
         request_sha256,
         event_id: invocation.event_id,
@@ -6026,31 +5821,170 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn staged_legacy_audio_recovers_once_without_resending_or_inventing_facts() {
+        use crate::persistence::{GcsMediaObjectStore, RepositorySet};
+        use std::sync::Arc;
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = Arc::new(PostgresPersistence::with_pool(
+            fixture.persistence.pool().clone(),
+        ));
+        const ACCOUNT: &str = "legacy-audio-worker-recovery";
+        super::super::voice_identity::tests::seed_voice_observation(
+            &repo,
+            ACCOUNT,
+            "planner-session",
+            "bootstrap",
+            100,
+            100,
+        )
+        .await;
+        sqlx::query("INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) VALUES($1,'planner-mic','planner-session','planner-device','mic',0)").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        test_insert_audio_job_fixture(&repo, ACCOUNT, "saved-audio", "planner-mic", "mic", 0, 600)
+            .await
+            .unwrap();
+        let claim = repo
+            .claim(
+                ACCOUNT,
+                MediaProcessingClass::Audio,
+                "2099-01-01T00:00:00.000Z",
+                300,
+                128,
+            )
+            .await
+            .unwrap()
+            .expect("legacy audio admission");
+        let mut attempt = test_begin_media_provider_attempt(&repo, &claim)
+            .await
+            .unwrap();
+        attempt.result_contract_version = 1;
+        repo.authorize_provider_attempt(&claim, 4096, &attempt)
+            .await
+            .unwrap();
+        let turns = json!({"turns":[{"turn_id":"legacy-turn","speaker_local_id":"speaker","start_ms":0,"end_ms":4000,"text":"I work at Example","language":null,"person_facts":[{"predicate":"organization","value":"Example","evidence":"I work at Example"}]}]});
+        let response_bytes=serde_json::to_vec(&json!({"candidates":[{"content":{"parts":[{"text":turns.to_string()}]},"finishReason":"STOP"}]})).unwrap();
+        repo.stage_provider_response(
+            &claim,
+            &MediaProviderStagedResponse {
+                attempt: attempt.clone(),
+                http_status: 200,
+                response_sha256: Sha256::digest(&response_bytes).into(),
+                response_bytes,
+                latency_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+        // Historical journals truly omitted this field; recovery must bind the
+        // original result contract instead of the current request schema.
+        sqlx::query("UPDATE media_work_units SET usage_json=usage_json #- '{provider_attempts,0,result_contract_version}' WHERE account_id=$1 AND id=$2").bind(ACCOUNT).bind(&claim.work_unit_id).execute(repo.pool()).await.unwrap();
+        test_expire_media_claim(&repo, &claim).await.unwrap();
+        let recovered = repo
+            .claim(
+                ACCOUNT,
+                MediaProcessingClass::Audio,
+                "2000-01-01T00:00:00.000Z",
+                300,
+                128,
+            )
+            .await
+            .unwrap()
+            .expect("saved paid response must be reclaimable");
+        assert_eq!(
+            recovered
+                .staged_response
+                .as_ref()
+                .unwrap()
+                .attempt
+                .result_contract_version,
+            1,
+            "reclaimed historical response must retain its original parse contract"
+        );
+        let repositories = RepositorySet::postgres(
+            Arc::clone(&repo),
+            Arc::new(GcsMediaObjectStore::new(Arc::new(
+                crate::gcs::FakeGcs::new(),
+            ))),
+        );
+        let result =
+            crate::cp::media_worker::test_recover_staged_media(&repositories, ACCOUNT, &recovered)
+                .await;
+        assert!(result.is_ok(),"the actual staged worker must settle legacy paid transcription under its recorded contract: {result:?}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM utterances WHERE account_id=$1 AND text='I work at Example'"
+            )
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            1,
+            "saved audio must produce exactly one transcript"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM person_fact_candidates WHERE account_id=$1").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),0,"legacy unscored facts must not receive invented confidence during real worker recovery");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM vertex_usage_events WHERE account_id=$1"
+            )
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            1,
+            "saved response recovery must not admit or resend a second provider attempt"
+        );
+        assert!(
+            repo.claim(
+                ACCOUNT,
+                MediaProcessingClass::Audio,
+                "2099-01-01T00:00:00.000Z",
+                300,
+                128
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "settled legacy work must not be claimable for regeneration"
+        );
+        repo.pool().close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            fixture.schema
+        )))
+        .execute(fixture.base.pool())
+        .await
+        .unwrap();
+        fixture.base.pool().close().await;
+    }
+
+    #[tokio::test]
     async fn media_speaker_projection_accepted_name_refreshes_existing_profile_memories() {
-        use super::super::voice_identity::tests::{seed_voice_memory, seed_voice_observation};
+        use super::super::identity_fusion_contract::{intro, reduce, seed};
         use crate::cp::media::AudioTurn;
+        use crate::cp::voice_quality::{self, SampleDecision};
+        use crate::persistence::{VoiceCohort, VoiceEmbeddingOutcome, VoiceIdentityRepository};
         let Some(fixture) = super::super::tests::test_persistence().await else {
             return;
         };
         let repo = &fixture.persistence;
         const ACCOUNT: &str = "media-speaker-refresh";
-        seed_voice_observation(repo, ACCOUNT, "planner-session", "prior-event", 100, 100).await;
-        seed_voice_memory(repo, ACCOUNT, 100, 100).await;
-        sqlx::query("INSERT INTO people(account_id,id,display_name,normalized_name,status) VALUES($1,100,'Sam','sam','identified')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
-        sqlx::query("INSERT INTO voice_profiles(account_id,id,person_id,label,embedding_space,channel_domain,centroid) VALUES($1,100,100,'synthetic-voice',$2,'macos:builtin_mic',''::bytea)").bind(ACCOUNT).bind(crate::cp::voice_memory::EMBEDDING_SPACE).execute(repo.pool()).await.unwrap();
-        sqlx::query("UPDATE speaker_clusters SET voice_profile_id=100,attribution_state='anonymous_profile' WHERE account_id=$1 AND id=100").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
-        sqlx::query("INSERT INTO person_name_claims(account_id,id,person_id,name,normalized_name,source_event_id,speaker_observation_id,observed_at,evidence_kind,evidence,confidence,status) VALUES($1,100,100,'Sam','sam','prior-event',100,now(),'audio_self_identification','{}',0.99,'accepted')").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
-        let mut tx = repo.pool().begin().await.unwrap();
-        lock_activation_contract_key_share_if_installed(&mut tx)
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
             .await
             .unwrap();
-        advisory_transaction_lock(&mut tx, "memory-reconciliation", ACCOUNT)
-            .await
-            .unwrap();
-        refresh_affected_speaker_projections(&mut tx, ACCOUNT, &[100], &[], &[])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
+        for id in 100..=102 {
+            seed(repo, ACCOUNT, id, 100, "macos:builtin_mic").await;
+        }
+        intro(repo, ACCOUNT, 100, "Sam", false).await;
+        reduce(repo, ACCOUNT, &[100]).await;
+        let person: i64 = sqlx::query_scalar(
+            "SELECT person_id FROM voice_profiles WHERE account_id=$1 AND id=100",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,schema_version) VALUES($1,'planner-session','planner-device','planner-install',now(),now(),1)").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
         let before:String=sqlx::query_scalar("SELECT evidence->>'speaker_signature' FROM episode_participants WHERE account_id=$1 AND episode_id=100 AND state='active'").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap();
 
         sqlx::query("INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) VALUES($1,'planner-mic','planner-session','planner-device','mic',0)").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
@@ -6073,8 +6007,8 @@ mod tests {
             .unwrap();
         repo.settle_usage(MediaUsageSettlement {claim:claim.clone(),provider_attempt:attempt.clone(),usage:json!({"work_unit_id":claim.work_unit_id,"reservation_state":"reserved","actual_output_tokens":64,"outcome":"model_returned"})}).await.unwrap();
         let turns = [
-            ("name", "Sam", 0, 1000),
-            ("refine", "Sam Smith", 1100, 2100),
+            ("name", "Sam", 0, 4000),
+            ("refine", "Sam Smith", 4100, 8100),
         ]
         .into_iter()
         .map(|(turn_id, name, start_ms, end_ms)| AudioTurn {
@@ -6104,14 +6038,52 @@ mod tests {
         .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, String>(
-                "SELECT display_name FROM people WHERE account_id=$1 AND id=100"
+                "SELECT display_name FROM people WHERE account_id=$1 AND id=$2"
             )
             .bind(ACCOUNT)
+            .bind(person)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            "Sam",
+            "a new spoken name must not reuse a person before an actual voice match"
+        );
+        let batch = repo
+            .claim_voice_embeddings(ACCOUNT, "synthetic-name-match")
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.claims.len(),
+            2,
+            "both named source turns must enter actual voice settlement"
+        );
+        for claim in batch.claims {
+            let mut diagnostics = voice_quality::diagnose(&vec![0.1; 64000], false, &[]);
+            diagnostics.decision = SampleDecision::Enroll;
+            let mut embedding = vec![0.; 256];
+            embedding[0] = 1.;
+            repo.settle_voice_embedding(
+                &claim,
+                VoiceEmbeddingOutcome::Sample {
+                    embedding,
+                    diagnostics,
+                    channel_domain: "macos:builtin_mic".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT display_name FROM people WHERE account_id=$1 AND id=$2"
+            )
+            .bind(ACCOUNT)
+            .bind(person)
             .fetch_one(repo.pool())
             .await
             .unwrap(),
             "Sam Smith",
-            "accepted media self-identification must refine its existing person"
+            "accepted media self-identification must refine only its voice-matched existing person"
         );
         let after:String=sqlx::query_scalar("SELECT evidence->>'speaker_signature' FROM episode_participants WHERE account_id=$1 AND episode_id=100 AND state='active'").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap();
         assert_ne!(after,before,"accepted media name changes must synchronously refresh previously formed profile-linked memories");
@@ -6153,6 +6125,7 @@ mod tests {
             media_provider_attempt_identity("account", "work", 1, &request_sha256);
         ProviderAttemptJournalEntry {
             number: 1,
+            result_contract_version: 1,
             identity_sha256: digest_hex(&identity_sha256),
             request_sha256: digest_hex(&request_sha256),
             event_id: vertex_attempt_event_id(&identity_sha256),
@@ -6166,6 +6139,50 @@ mod tests {
             response_b64: None,
             latency_ms: None,
         }
+    }
+
+    #[test]
+    fn provider_journal_preserves_the_recorded_result_contract() {
+        let mut legacy = serde_json::to_value(attempt_entry("admitted")).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("result_contract_version");
+        let parsed = serde_json::from_value::<ProviderAttemptJournalEntry>(legacy);
+        assert!(
+            parsed.is_ok(),
+            "a historical journal entry must retain its original result interpretation"
+        );
+        assert_eq!(
+            validate_provider_attempt("account", "work", &parsed.unwrap())
+                .unwrap()
+                .result_contract_version,
+            1,
+            "an absent historical result version must mean the original contract"
+        );
+        let mut scored = attempt_entry("admitted");
+        scored.result_contract_version = 2;
+        let mut usage = json!({});
+        persist_provider_journal(
+            &mut usage,
+            &ProviderAttemptJournal {
+                attempts: vec![scored],
+            },
+        )
+        .unwrap();
+        let mut recovered = provider_journal(&usage).unwrap().attempts.remove(0);
+        assert_eq!(
+            validate_provider_attempt("account", "work", &recovered)
+                .unwrap()
+                .result_contract_version,
+            2,
+            "reclaim must preserve the frozen scored-fact contract"
+        );
+        recovered.result_contract_version = 3;
+        assert!(
+            validate_provider_attempt("account", "work", &recovered).is_err(),
+            "unsupported recorded result versions must never silently downgrade"
+        );
     }
 
     #[test]

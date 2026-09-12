@@ -20,6 +20,7 @@ pub mod dlp;
 pub mod email_renderer;
 pub mod email_worker;
 pub mod finalizer;
+pub(crate) mod identity_fusion;
 pub mod isotime;
 pub mod limits;
 pub(crate) mod mcp_safety;

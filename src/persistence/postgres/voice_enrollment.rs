@@ -88,9 +88,19 @@ pub(super) async fn erase_samples(
         .bind(account).bind(samples).fetch_all(&mut **tx).await?;
     let clusters:Vec<i64>=sqlx::query_scalar("SELECT DISTINCT o.cluster_id FROM speaker_observations o JOIN voice_samples sample ON sample.account_id=o.account_id AND sample.speaker_observation_id=o.id WHERE sample.account_id=$1 AND sample.id=ANY($2::bigint[]) AND o.cluster_id IS NOT NULL ORDER BY o.cluster_id")
         .bind(account).bind(samples).fetch_all(&mut **tx).await?;
-    let targets =
+    let events: Vec<String> = sqlx::query_scalar("SELECT o.event_id FROM speaker_observations o JOIN voice_samples s ON s.account_id=o.account_id AND s.speaker_observation_id=o.id WHERE s.account_id=$1 AND s.id=ANY($2::bigint[]) UNION SELECT part.event_id FROM speaker_observation_sources part JOIN voice_samples s ON s.account_id=part.account_id AND s.speaker_observation_id=part.speaker_observation_id WHERE s.account_id=$1 AND s.id=ANY($2::bigint[])")
+        .bind(account).bind(samples).fetch_all(&mut **tx).await?;
+    let name_profiles =
+        super::identity_fusion::profiles_depending_on_events(tx, account, &events).await?;
+    let fact_people =
+        super::identity_fusion::fact_people_depending_on_events(tx, account, &events).await?;
+    let mut targets =
         voice_identity::affected_speaker_projection_targets(tx, account, &clusters, &profiles, &[])
             .await?;
+    targets.extend(
+        voice_identity::affected_speaker_projection_targets(tx, account, &[], &name_profiles, &[])
+            .await?,
+    );
     owner_voice::clear_sample_attribution(tx, account, samples).await?;
     sqlx::query("DELETE FROM voice_samples WHERE account_id=$1 AND id=ANY($2::bigint[])")
         .bind(account)
@@ -102,7 +112,12 @@ pub(super) async fn erase_samples(
     voice_identity::recompute_erased_profiles(
         tx,
         account,
-        &voice_identity::VoiceErasureAffected { profiles, targets },
+        &voice_identity::VoiceErasureAffected {
+            profiles,
+            name_profiles,
+            fact_people,
+            targets,
+        },
     )
     .await?;
     Ok(())

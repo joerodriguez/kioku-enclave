@@ -7,7 +7,7 @@ LEFT JOIN LATERAL (
                op.id AS observation_person_id,cp.id AS cluster_person_id,
                pp.id AS profile_person_id,op.display_name AS observation_name,
                cp.display_name AS cluster_name,CASE WHEN pp.status='identified' THEN pp.display_name END AS profile_name,
-               coalesce(op.id IS NOT NULL AND cp.id IS NOT NULL AND op.id<>cp.id,false)
+               (coalesce(op.id IS NOT NULL AND cp.id IS NOT NULL AND op.id<>cp.id,false) OR coalesce(binding.status='quarantined',false))
                    AS identity_conflict,
                __MEMORY__ AS episode_id
           FROM (SELECT 1) anchor
@@ -17,14 +17,16 @@ LEFT JOIN LATERAL (
           LEFT JOIN voice_profiles vp ON vp.account_id=o.account_id
             AND vp.id=coalesce(o.voice_profile_id,CASE WHEN NOT coalesce(c.profile_updates_quarantined,false)
                 AND NOT coalesce(c.owner,false) THEN c.voice_profile_id END)
+          LEFT JOIN profile_name_bindings binding ON binding.account_id=vp.account_id AND binding.profile_id=vp.id
+          LEFT JOIN person_name_claims current_name ON current_name.account_id=binding.account_id AND current_name.id=binding.current_claim_id AND current_name.status='accepted'
           LEFT JOIN people op ON op.account_id=o.account_id AND op.id=o.person_id
-            AND op.status='identified' AND nullif(btrim(op.display_name),'') IS NOT NULL
+            AND binding.profile_id IS NULL AND op.status='identified' AND nullif(btrim(op.display_name),'') IS NOT NULL
           LEFT JOIN people cp ON cp.account_id=c.account_id AND cp.id=c.person_id
             AND NOT coalesce(c.profile_updates_quarantined,false)
-            AND cp.status='identified' AND nullif(btrim(cp.display_name),'') IS NOT NULL
+            AND binding.profile_id IS NULL AND cp.status='identified' AND nullif(btrim(cp.display_name),'') IS NOT NULL
           LEFT JOIN people pp ON pp.account_id=vp.account_id AND pp.id=vp.person_id
             AND vp.status<>'quarantined' AND (
-                (pp.status='identified' AND nullif(btrim(pp.display_name),'') IS NOT NULL)
+                (pp.status='identified' AND nullif(btrim(pp.display_name),'') IS NOT NULL AND (binding.profile_id IS NULL OR (binding.status='accepted' AND current_name.id IS NOT NULL AND binding.person_id=pp.id)))
                 OR (pp.status='recurring' AND vp.status='stable' AND vp.sample_count>0
                     AND EXISTS(SELECT 1 FROM identity_evidence recurring_evidence
                         WHERE recurring_evidence.account_id=pp.account_id AND recurring_evidence.person_id=pp.id

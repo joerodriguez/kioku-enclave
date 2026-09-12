@@ -1111,6 +1111,11 @@ async fn prepare_media_request(
     .map_err(VertexGenerationFailure::before_egress)?;
     let attempt = MediaProviderAttempt {
         number: attempt_number,
+        result_contract_version: if matches!(operation, VertexOperation::AudioWindow) {
+            2
+        } else {
+            1
+        },
         identity_sha256,
         request_sha256,
         event_id: invocation.event_id,
@@ -1373,6 +1378,7 @@ mod tests {
         let response = MediaProviderStagedResponse {
             attempt: MediaProviderAttempt {
                 number: 1,
+                result_contract_version: 1,
                 identity_sha256: [1; 32],
                 request_sha256: [2; 32],
                 event_id: "vertex-attempt-test".into(),

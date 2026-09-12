@@ -72,7 +72,7 @@ pub(crate) use lifecycle::AccountLifecycleRepository;
 pub(crate) use media_object::MediaObjectStore;
 pub(crate) use media_processing::{
     is_owner_source_audio, is_supported_self_identification, media_provider_attempt_identity,
-    names_form_refinement, prefer_claimed_display_name, AudioMediaSettlement,
+    names_form_refinement, prefer_claimed_display_name, semantic_name_parts, AudioMediaSettlement,
     MediaFailureDisposition, MediaFailurePolicy, MediaPersonEvidence, MediaProcessingClaim,
     MediaProcessingClass, MediaProcessingJob, MediaProcessingRepository, MediaProviderAttempt,
     MediaProviderStagedResponse, MediaScreenProjection, MediaUsageSettlement,

@@ -167,3 +167,5 @@ receipted expand declared compatible by the candidate.
   next cycle.
 
 - `0029_dynamic_brief_sections.sql` adds nullable, array-checked brief sections through a separately receipted explicit migrator; NULL preserves legacy rows and frozen base/activation contracts remain unchanged.
+
+- `0033_identity_fusion.sql`: source-qualified name inputs, independent current name bindings, append-only claim provenance and scored unbound fact candidates with canonical temporal comparison keys.

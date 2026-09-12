@@ -104,6 +104,8 @@ pub(super) async fn assign_sample(
         };
         sqlx::query("UPDATE speaker_observations SET person_id=$3,owner_evidence_id=$4 WHERE account_id=$1 AND id=$2")
             .bind(account).bind(observation).bind(owner).bind(evidence).execute(&mut **tx).await?;
+        super::identity_fusion::retire_introduction_people(tx, account, profile, Some(owner))
+            .await?;
     }
     Ok(())
 }

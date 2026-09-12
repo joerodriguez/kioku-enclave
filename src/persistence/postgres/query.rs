@@ -38,6 +38,18 @@ fn speaker_query(
 
 const EXPORT_TABLES: &[(&str, &str, &str)] = &[
     (
+        "identity_name_inputs",
+        "identity_name_inputs",
+        "evidence_id",
+    ),
+    (
+        "profile_name_bindings",
+        "profile_name_bindings",
+        "profile_id",
+    ),
+    ("profile_name_claims", "profile_name_claims", "claim_id"),
+    ("person_fact_candidates", "person_fact_candidates", "id"),
+    (
         "episode_email_preferences",
         "episode_email_preferences",
         "account_id",
@@ -2556,7 +2568,9 @@ impl MemoryQueryRepository for PostgresPersistence {
             ));
         }
         let mut transaction = people_snapshot(self, account_id).await?;
-        let rows = sqlx::query(
+        let fact_authority =
+            super::identity_fusion::public_fact_authority(&mut transaction).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT p.id,p.status,CASE WHEN p.status='recurring' THEN 'Unnamed voice' ELSE p.display_name END display_name, \
                     count(DISTINCT v.id)::bigint AS voice_profile_count, \
                     count(DISTINCT f.id)::bigint AS fact_count, \
@@ -2567,7 +2581,7 @@ impl MemoryQueryRepository for PostgresPersistence {
                      WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
                        AND r.status IN ('quarantined','superseded','split')) \
                LEFT JOIN person_facts f ON f.account_id=p.account_id \
-                 AND f.person_id=p.id AND f.status='active' \
+                 AND f.person_id=p.id AND f.status='active' AND ({fact_authority}) \
               WHERE p.account_id=$1 AND p.status=$5 \
                 AND (p.status='recurring' OR nullif(btrim(p.display_name),'') IS NOT NULL) AND p.id>$2 \
                 AND ($3::text IS NULL OR lower(p.display_name) LIKE '%'||lower($3)||'%' \
@@ -2575,8 +2589,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                        WHERE n.account_id=p.account_id AND n.person_id=p.id \
                          AND n.status IN ('accepted','probationary') \
                          AND lower(n.name) LIKE '%'||lower($3)||'%')) \
-              GROUP BY p.account_id,p.id ORDER BY p.id LIMIT $4",
-        )
+              GROUP BY p.account_id,p.id ORDER BY p.id LIMIT $4"
+        )))
         .bind(account_id)
         .bind(request.after_id)
         .bind(query)
@@ -2626,7 +2640,9 @@ impl MemoryQueryRepository for PostgresPersistence {
 
     async fn person_profile(&self, account_id: &str, person_id: i64) -> Result<PersonProfile> {
         let mut transaction = people_snapshot(self, account_id).await?;
-        let row = sqlx::query(
+        let fact_authority =
+            super::identity_fusion::public_fact_authority(&mut transaction).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT p.id,p.status,CASE WHEN p.status='recurring' THEN 'Unnamed voice' ELSE p.display_name END display_name, \
                     count(DISTINCT v.id)::bigint AS voice_profile_count, \
                     count(DISTINCT f.id)::bigint AS fact_count, \
@@ -2637,10 +2653,10 @@ impl MemoryQueryRepository for PostgresPersistence {
                      WHERE r.account_id=v.account_id AND r.profile_id=v.id AND r.active \
                        AND r.status IN ('quarantined','superseded','split')) \
                LEFT JOIN person_facts f ON f.account_id=p.account_id \
-                 AND f.person_id=p.id AND f.status='active' \
+                 AND f.person_id=p.id AND f.status='active' AND ({fact_authority}) \
               WHERE p.account_id=$1 AND p.id=$2 AND p.status IN ('identified','recurring') AND (p.status='recurring' OR nullif(btrim(p.display_name),'') IS NOT NULL) \
-              GROUP BY p.account_id,p.id",
-        )
+              GROUP BY p.account_id,p.id"
+        )))
         .bind(account_id)
         .bind(person_id)
         .fetch_optional(&mut *transaction)
@@ -2767,15 +2783,15 @@ impl MemoryQueryRepository for PostgresPersistence {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let fact_rows = sqlx::query(
+        let fact_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT id,predicate,value,status,evidence::text AS evidence_json,source_event_id, \
                     speaker_observation_id, \
                     floor(extract(epoch FROM observed_at)*1000)::bigint AS observed_at_ms, \
                     literal_evidence,confidence,supersedes_id, \
                     floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms \
-               FROM person_facts WHERE account_id=$1 AND person_id=$2 \
-              ORDER BY coalesce(observed_at,created_at) DESC,id DESC LIMIT 200",
-        )
+               FROM person_facts f WHERE account_id=$1 AND person_id=$2 AND ({fact_authority}) \
+              ORDER BY coalesce(observed_at,created_at) DESC,id DESC LIMIT 200"
+        )))
         .bind(account_id)
         .bind(person_id)
         .fetch_all(&mut *transaction)

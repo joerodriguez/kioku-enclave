@@ -23,7 +23,7 @@ main.rs
 
 | Path | Responsibility |
 |---|---|
-| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email, interrupted-capture and voice-identity companion installs, voice cohort/pause operator phases, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
+| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email, interrupted-capture, voice-identity and name-evidence companion installs, voice cohort/pause operator phases, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
 | `attestation.rs` | Bounded Confidential Space launcher protocol, internal attestation-derived STS/KMS credential path, and separately audience-bound public attestation tokens. |
 | `auth.rs` | Google service-account ID-token verification retained for authenticated `410 Gone` compatibility routes. |
 | [`cp/`](cp/map.md) | Product API, OAuth, capture, query, MCP, retention, export/deletion, inference, and horizontally coordinated workers. |

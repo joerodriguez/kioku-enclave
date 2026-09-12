@@ -107,7 +107,7 @@ pub(crate) struct Merge {
     pub minimum_score: f32,
     pub minimum_margin: f32,
 }
-pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
+pub(crate) fn acoustic_pairs(profiles: &[Profile]) -> Vec<Merge> {
     if profiles.len() > MAX_PROFILES {
         return Vec::new();
     }
@@ -122,7 +122,7 @@ pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
         let Some(right) = profiles.iter().find(|p| p.id == right_id) else {
             continue;
         };
-        if !eligible(right) || (named(left) && named(right) && left.person != right.person) {
+        if !eligible(right) {
             continue;
         }
         let Some((reverse, reverse_score, reverse_margin)) = nearest(right, profiles) else {
@@ -140,6 +140,25 @@ pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
     }
     pairs.sort_by_key(|pair| (pair.left, pair.right));
     pairs
+}
+
+/// Acoustic qualification remains visible to name-conflict handling; identity
+/// permission is a separate filter and never changes the competitor population.
+pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
+    acoustic_pairs(profiles)
+        .into_iter()
+        .filter(|pair| {
+            let left = profiles
+                .iter()
+                .find(|p| p.id == pair.left)
+                .expect("acoustic member");
+            let right = profiles
+                .iter()
+                .find(|p| p.id == pair.right)
+                .expect("acoustic member");
+            !(named(left) && named(right) && left.person != right.person)
+        })
+        .collect()
 }
 
 #[cfg(test)]
