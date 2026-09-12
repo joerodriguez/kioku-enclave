@@ -69,19 +69,53 @@ fn is_bare_name_evidence(evidence: &str, claimed_name: &str) -> bool {
 }
 
 fn is_explicit_self_identification(evidence: &str, claimed_name: &str) -> bool {
-    let mut evidence = semantic_name_parts(evidence);
+    let opens_quote = |word: &str| {
+        word.chars()
+            .take_while(|character| !character.is_alphanumeric())
+            .any(|character| matches!(character, '"' | '“' | '”' | '\'' | '‘' | '’'))
+    };
+    let mut raw = evidence.trim_start();
+    while let Some((first, rest)) = raw.split_once(char::is_whitespace) {
+        if opens_quote(first)
+            || !matches!(
+                semantic_name_parts(first).first().map(String::as_str),
+                Some(
+                    "hi" | "hello"
+                        | "hey"
+                        | "yes"
+                        | "yeah"
+                        | "yep"
+                        | "um"
+                        | "uh"
+                        | "well"
+                        | "actually"
+                )
+            )
+        {
+            break;
+        }
+        raw = rest.trim_start();
+    }
+    let evidence = semantic_name_parts(raw);
     let claimed_name = semantic_name_parts(claimed_name);
     if claimed_name.is_empty() {
         return false;
     }
-    while evidence.first().is_some_and(|part| {
-        matches!(
-            part.as_str(),
-            "hi" | "hello" | "hey" | "yes" | "yeah" | "yep" | "um" | "uh" | "well" | "actually"
-        )
-    }) {
-        evidence.remove(0);
-    }
+    // Keep punctuation until the candidate introduction span has been checked:
+    // removing greetings must not turn reported speech into the narrator's name.
+    let unquoted_span = |word_count| {
+        let mut seen = 0;
+        for word in raw.split_whitespace() {
+            if opens_quote(word) {
+                return false;
+            }
+            seen += semantic_name_parts(word).len();
+            if seen >= word_count {
+                return true;
+            }
+        }
+        false
+    };
     const PREFIXES: &[&[&str]] = &[
         &["my", "name", "is"],
         &["my", "full", "name", "is"],
@@ -91,56 +125,76 @@ fn is_explicit_self_identification(evidence: &str, claimed_name: &str) -> bool {
         &["im"],
         &["call", "me"],
         &["i", "go", "by"],
-        &["this", "is"],
-        &["it's"],
-        &["it’s"],
-        &["the", "name", "is"],
     ];
     PREFIXES.iter().any(|prefix| {
-        evidence.len() == prefix.len() + claimed_name.len()
+        evidence.len() >= prefix.len() + claimed_name.len()
+            && unquoted_span(prefix.len() + claimed_name.len())
             && evidence
                 .iter()
                 .take(prefix.len())
                 .map(String::as_str)
                 .eq(prefix.iter().copied())
-            && evidence[prefix.len()..] == claimed_name
+            && evidence[prefix.len()..prefix.len() + claimed_name.len()] == claimed_name
     }) || (evidence.len() == claimed_name.len() + 1
+        && unquoted_span(evidence.len())
         && evidence[..claimed_name.len()] == claimed_name
         && evidence.last().is_some_and(|part| part == "speaking"))
 }
 
 fn is_name_request(text: &str) -> bool {
-    let text = text.to_lowercase();
-    let asks_question = text.contains('?')
-        || text.starts_with("who ")
-        || text.starts_with("what ")
-        || text.starts_with("how ");
-    asks_question
-        && [
-            "name",
-            "called",
-            "call you",
-            "who are you",
-            "nombre",
-            "llamas",
-            "nom",
-            "appelles",
-            "heiß",
-            "heiss",
-            "nome",
-            "chiami",
-            "名前",
-            "お名前",
-            "이름",
-        ]
-        .iter()
-        .any(|needle| text.contains(needle))
+    let mut words = semantic_name_parts(text);
+    while words
+        .first()
+        .is_some_and(|word| matches!(word.as_str(), "please" | "hi" | "hello"))
+    {
+        words.remove(0);
+    }
+    while words
+        .last()
+        .is_some_and(|word| matches!(word.as_str(), "please" | "again"))
+    {
+        words.pop();
+    }
+    matches!(
+        words.join(" ").as_str(),
+        "what is your name"
+            | "what's your name"
+            | "what’s your name"
+            | "may i ask your name"
+            | "can i have your name"
+            | "could you tell me your name"
+            | "what should i call you"
+            | "how should i address you"
+            | "who are you"
+            | "cuál es tu nombre"
+            | "cómo te llamas"
+            | "quel est votre nom"
+            | "quel est ton nom"
+            | "comment vous appelez-vous"
+            | "comment tu t'appelles"
+            | "comment tu t’appelles"
+            | "wie heißt du"
+            | "wie heisst du"
+            | "wie ist dein name"
+            | "come ti chiami"
+            | "qual è il tuo nome"
+            | "qual é seu nome"
+            | "お名前は"
+            | "お名前は何ですか"
+            | "이름이 뭐예요"
+            | "성함이 어떻게 되세요"
+    )
 }
 
 pub(crate) fn is_supported_self_identification(turn: &AudioTurn, turns: &[AudioTurn]) -> bool {
     if turn.speaker_name_kind.as_deref() != Some("self_identification")
         || turn.speaker_name_subject_turn_id.as_deref() != Some(turn.turn_id.as_str())
         || turn.overlap
+        || turns.iter().any(|other| {
+            other.turn_id != turn.turn_id
+                && other.start_ms < turn.end_ms
+                && other.end_ms > turn.start_ms
+        })
     {
         return false;
     }
@@ -154,12 +208,15 @@ pub(crate) fn is_supported_self_identification(turn: &AudioTurn, turns: &[AudioT
     if !confidence.is_finite() || confidence < 0.90 {
         return false;
     }
-    if is_explicit_self_identification(evidence, name)
-        || is_explicit_self_identification(&turn.text, name)
-    {
+    let literal = semantic_name_parts(&turn.text);
+    let quoted = semantic_name_parts(evidence);
+    if quoted.is_empty() || !literal.windows(quoted.len()).any(|words| words == quoted) {
+        return false;
+    }
+    if is_explicit_self_identification(&turn.text, name) {
         return true;
     }
-    if !is_bare_name_evidence(evidence, name) {
+    if !is_bare_name_evidence(evidence, name) || !is_bare_name_evidence(&turn.text, name) {
         return false;
     }
 
@@ -169,14 +226,19 @@ pub(crate) fn is_supported_self_identification(turn: &AudioTurn, turns: &[AudioT
     // second self-identification merely because the model mislabeled it.
     turns
         .iter()
-        .filter(|candidate| {
+        .filter(|candidate| candidate.turn_id != turn.turn_id && candidate.end_ms <= turn.start_ms)
+        .max_by_key(|candidate| (candidate.end_ms, candidate.start_ms))
+        .is_some_and(|candidate| {
             candidate.speaker_local_id != turn.speaker_local_id
-                && candidate.end_ms <= turn.start_ms
                 && turn.start_ms - candidate.end_ms <= 8_000
                 && !candidate.overlap
+                && !turns.iter().any(|other| {
+                    other.turn_id != candidate.turn_id
+                        && other.start_ms < candidate.end_ms
+                        && other.end_ms > candidate.start_ms
+                })
+                && is_name_request(&candidate.text)
         })
-        .max_by_key(|candidate| candidate.end_ms)
-        .is_some_and(|candidate| is_name_request(&candidate.text))
 }
 
 /// A single diarized speaker on an explicitly local-transmit source is the
@@ -258,6 +320,9 @@ pub(crate) const MAX_MEDIA_PROVIDER_JOURNAL_BYTES: usize = 768 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MediaProviderAttempt {
     pub(crate) number: i64,
+    /// Frozen with the request: 1 is the original media contract; 2 requires
+    /// scored audio facts. A staged response never infers this from its body.
+    pub(crate) result_contract_version: u32,
     pub(crate) identity_sha256: [u8; 32],
     pub(crate) request_sha256: [u8; 32],
     pub(crate) event_id: String,
@@ -514,6 +579,118 @@ mod tests {
             Some("My wife is Sarah Babetski"),
         )];
         assert!(!is_supported_self_identification(&turns[0], &turns));
+    }
+
+    #[test]
+    fn self_identification_requires_literal_own_nonoverlapping_evidence() {
+        let mut turns = vec![turn(
+            "intro",
+            "sam",
+            0,
+            2_000,
+            "We can start now",
+            Some("Sam"),
+            Some("My name is Sam"),
+        )];
+        assert!(
+            !is_supported_self_identification(&turns[0], &turns),
+            "fabricated introduction evidence must not name an unrelated spoken turn"
+        );
+        for reported in [
+            "He said, \"My name is Sam\"",
+            "\"My name is Sam\", she read",
+            "Hello, \"My name is Sam\", she read",
+            "Hello, My name is \"Sam\", she read",
+            "Hello, (“My name is Sam”), she read",
+        ] {
+            turns[0].text = reported.into();
+            assert!(
+                !is_supported_self_identification(&turns[0], &turns),
+                "reported or quoted introductions must not identify the narrator"
+            );
+        }
+        for reported in [
+            "This is Sam, my colleague",
+            "It's Sam, my colleague",
+            "The name is Sam, my colleague",
+        ] {
+            turns[0].text = reported.into();
+            turns[0].speaker_name_evidence = Some("Sam".into());
+            assert!(
+                !is_supported_self_identification(&turns[0], &turns),
+                "third-party presentations must not identify the introducing speaker"
+            );
+        }
+        turns[0].speaker_name_evidence = Some("My name is Sam".into());
+        turns[0].text = "My name is Sam".into();
+        assert!(
+            is_supported_self_identification(&turns[0], &turns),
+            "literal own-turn introductions must remain accepted"
+        );
+        let mut other = turn("overlap", "alex", 1_000, 3_000, "Hello", None, None);
+        other.overlap = true;
+        turns.push(other);
+        assert!(
+            !is_supported_self_identification(&turns[0], &turns),
+            "overlap on another turn must still prevent direct name acceptance"
+        );
+    }
+
+    #[test]
+    fn bare_name_answer_requires_the_immediate_question_about_its_speaker() {
+        let mut turns = vec![
+            turn(
+                "question",
+                "alex",
+                0,
+                1_000,
+                "What is her name?",
+                None,
+                None,
+            ),
+            turn(
+                "answer",
+                "sam",
+                1_100,
+                2_000,
+                "Sam",
+                Some("Sam"),
+                Some("Sam"),
+            ),
+        ];
+        assert!(
+            !is_supported_self_identification(&turns[1], &turns),
+            "a third-party name question must not identify the answering speaker"
+        );
+        turns[0].text = "Did someone call you?".into();
+        assert!(
+            !is_supported_self_identification(&turns[1], &turns),
+            "a question about a caller must not identify the answering speaker"
+        );
+        turns[0].text = "What is your name?".into();
+        assert!(
+            is_supported_self_identification(&turns[1], &turns),
+            "a direct immediate own-name answer must remain accepted"
+        );
+        turns[1].text = "Sam is my friend".into();
+        assert!(
+            !is_supported_self_identification(&turns[1], &turns),
+            "a name excerpt must not turn a third-party answer into self-identification"
+        );
+        turns[1].text = "Sam".into();
+        turns.push(turn(
+            "intervening",
+            "sam",
+            1_010,
+            1_090,
+            "One moment",
+            None,
+            None,
+        ));
+        assert!(
+            !is_supported_self_identification(&turns[1], &turns),
+            "intervening speech must break the immediate name-answer connection"
+        );
     }
 
     #[test]

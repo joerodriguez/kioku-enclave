@@ -75,3 +75,5 @@ implementation. Real PostgreSQL contracts—not alternate-backend parity—are t
 for tenant isolation, type/time-zone behavior, search, concurrency, restart, export, and deletion.
 
 `brief_sections_schema.rs` installs/verifies the additive v29 sections column and receipt without modifying base/activation catalog contracts. Finalization writes sections atomically; query/search/embedding and immutable delivery snapshots preserve them.
+
+`media_processing.rs` records each provider result contract with its immutable attempt, defaults historical journal entries to the original contract, and persists actual supplied fact confidence.

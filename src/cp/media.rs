@@ -2672,6 +2672,8 @@ pub struct PersonFact {
     pub predicate: String,
     pub value: String,
     pub evidence: String,
+    #[serde(default)]
+    pub confidence: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -2687,7 +2689,21 @@ struct AudioResult {
 /// an invalid model output.
 pub(crate) const AUDIO_TURN_END_TOLERANCE_MS: i64 = 2_000;
 
+#[cfg(test)]
 pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>> {
+    parse_audio_result_for_contract(raw, duration_ms, 2)
+}
+
+pub(crate) fn parse_audio_result_for_contract(
+    raw: &str,
+    duration_ms: i64,
+    contract_version: u32,
+) -> Result<Vec<AudioTurn>> {
+    if !matches!(contract_version, 1 | 2) {
+        return Err(EnclaveError::InvalidRequest(
+            "audio result contract is unsupported".into(),
+        ));
+    }
     let mut result: AudioResult = serde_json::from_str(raw)?;
     if result.turns.len() > MAX_TURNS {
         return Err(EnclaveError::InvalidRequest(
@@ -2699,6 +2715,11 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
     let mut previous_end = 0;
     let mut previous_overlap = false;
     for turn in &mut result.turns {
+        if contract_version == 1 {
+            // Preserve already-paid legacy transcription without inventing a
+            // score or invoking the provider again to recover unscored facts.
+            turn.person_facts.clear();
+        }
         validate_id("turn_id", &turn.turn_id)?;
         validate_id("speaker_local_id", &turn.speaker_local_id)?;
         if !ids.insert(turn.turn_id.clone()) {
@@ -2759,6 +2780,9 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
                     || fact.value.len() > 2_000
                     || fact.evidence.trim().is_empty()
                     || fact.evidence.len() > 2_000
+                    || fact
+                        .confidence
+                        .is_none_or(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
             })
         {
             return Err(EnclaveError::InvalidRequest(
@@ -2800,6 +2824,54 @@ pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>>
 #[cfg(test)]
 mod audio_turn_tests {
     use super::{parse_audio_result, AUDIO_TURN_END_TOLERANCE_MS};
+
+    #[test]
+    fn scored_facts_require_explicit_bounded_confidence() {
+        let mut value = serde_json::json!({"turns":[{"turn_id":"turn","speaker_local_id":"speaker","start_ms":0,"end_ms":1000,"text":"I work at Example","language":null,"person_facts":[{"predicate":"organization","value":"Example","evidence":"I work at Example","confidence":0.63}]}]});
+        let parsed = parse_audio_result(&value.to_string(), 1000).unwrap();
+        assert_eq!(
+            parsed[0].person_facts[0].confidence,
+            Some(0.63),
+            "fact parsing must preserve the actual supplied confidence"
+        );
+        value["turns"][0]["person_facts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("confidence");
+        assert!(
+            parse_audio_result(&value.to_string(), 1000).is_err(),
+            "a new audio contract must reject unscored facts"
+        );
+        for invalid in [-0.01, 1.01] {
+            value["turns"][0]["person_facts"][0]["confidence"] = serde_json::json!(invalid);
+            assert!(
+                parse_audio_result(&value.to_string(), 1000).is_err(),
+                "fact confidence must stay inside the declared probability range"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_paid_audio_keeps_transcription_without_inventing_fact_scores() {
+        let value = serde_json::json!({"turns":[{"turn_id":"turn","speaker_local_id":"speaker","start_ms":0,"end_ms":1000,"text":"I work at Example","language":null,"person_facts":[{"predicate":"organization","value":"Example","evidence":"I work at Example"}]}]});
+        let legacy = super::parse_audio_result_for_contract(&value.to_string(), 1000, 1).unwrap();
+        assert_eq!(
+            legacy[0].text, "I work at Example",
+            "a recorded legacy contract must retain its already-paid transcription"
+        );
+        assert!(
+            legacy[0].person_facts.is_empty(),
+            "legacy replay must never manufacture confidence for unscored facts"
+        );
+        assert!(
+            super::parse_audio_result_for_contract(&value.to_string(), 1000, 2).is_err(),
+            "missing confidence must not silently downgrade a new recorded contract"
+        );
+        assert!(
+            super::parse_audio_result_for_contract(&value.to_string(), 1000, 3).is_err(),
+            "unknown audio result contracts must not be interpreted as legacy"
+        );
+    }
 
     fn turn(id: &str, start_ms: i64, end_ms: i64) -> String {
         format!(

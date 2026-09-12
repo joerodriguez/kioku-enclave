@@ -48,10 +48,16 @@ const PROMPT_VERSION: i64 = 3;
 const PROVIDER_EGRESS_LEASE_SECONDS: f64 = 15.0 * 60.0;
 const PROVIDER_JOURNAL_VERSION: i64 = 1;
 
+fn legacy_media_result_contract() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderAttemptJournalEntry {
     number: i64,
+    #[serde(default = "legacy_media_result_contract")]
+    result_contract_version: u32,
     identity_sha256: String,
     request_sha256: String,
     event_id: String,
@@ -192,6 +198,7 @@ fn validate_provider_attempt(
         media_provider_attempt_identity(account_id, work_unit_id, attempt.number, &request_sha256);
     if identity_sha256 != expected_identity
         || attempt.event_id != vertex_attempt_event_id(&identity_sha256)
+        || !matches!(attempt.result_contract_version, 1 | 2)
     {
         return Err(EnclaveError::Store(
             "media provider journal identity commitment is invalid".into(),
@@ -199,6 +206,7 @@ fn validate_provider_attempt(
     }
     Ok(MediaProviderAttempt {
         number: attempt.number,
+        result_contract_version: attempt.result_contract_version,
         identity_sha256,
         request_sha256,
         event_id: attempt.event_id.clone(),
@@ -1728,6 +1736,7 @@ impl MediaProcessingRepository for PostgresPersistence {
         }
         journal.attempts.push(ProviderAttemptJournalEntry {
             number: attempt.number,
+            result_contract_version: attempt.result_contract_version,
             identity_sha256: digest_hex(&attempt.identity_sha256),
             request_sha256: digest_hex(&attempt.request_sha256),
             event_id: attempt.event_id.clone(),
@@ -2385,6 +2394,12 @@ impl MediaProcessingRepository for PostgresPersistence {
             .await?;
             if let Some(person_id) = person_id {
                 for fact in &turn.person_facts {
+                    let Some(confidence) = fact
+                        .confidence
+                        .filter(|score| score.is_finite() && (0.0..=1.0).contains(score))
+                    else {
+                        continue;
+                    };
                     let fact_id =
                         allocate_content_id(&mut transaction, account_id, "person_fact").await?;
                     let evidence = json!({
@@ -2398,7 +2413,7 @@ impl MediaProcessingRepository for PostgresPersistence {
                          (account_id,id,person_id,predicate,value,evidence,derivation_version,status, \
                           source_event_id,speaker_observation_id,observed_at,literal_evidence,confidence) \
                          VALUES($1,$2,$3,$4,$5,$6::jsonb,1,'active',$7,$8, \
-                                to_timestamp($9::double precision/1000.0),$10,1.0)",
+                                to_timestamp($9::double precision/1000.0),$10,$11)",
                     )
                     .bind(account_id)
                     .bind(fact_id)
@@ -2410,6 +2425,7 @@ impl MediaProcessingRepository for PostgresPersistence {
                     .bind(speaker_observation_id)
                     .bind(turn_start)
                     .bind(&fact.evidence)
+                    .bind(confidence)
                     .execute(&mut *transaction)
                     .await?;
                 }
@@ -2787,6 +2803,7 @@ impl MediaProcessingRepository for PostgresPersistence {
             {
                 journal.attempts.push(ProviderAttemptJournalEntry {
                     number: attempt.number,
+                    result_contract_version: attempt.result_contract_version,
                     identity_sha256: digest_hex(&attempt.identity_sha256),
                     request_sha256: digest_hex(&attempt.request_sha256),
                     event_id: attempt.event_id.clone(),
@@ -4870,6 +4887,11 @@ pub(super) async fn test_begin_media_provider_attempt(
     }
     Ok(MediaProviderAttempt {
         number: claim.provider_attempt_number,
+        result_contract_version: if claim.class == MediaProcessingClass::Audio {
+            2
+        } else {
+            1
+        },
         identity_sha256,
         request_sha256,
         event_id: invocation.event_id,
@@ -6153,6 +6175,7 @@ mod tests {
             media_provider_attempt_identity("account", "work", 1, &request_sha256);
         ProviderAttemptJournalEntry {
             number: 1,
+            result_contract_version: 1,
             identity_sha256: digest_hex(&identity_sha256),
             request_sha256: digest_hex(&request_sha256),
             event_id: vertex_attempt_event_id(&identity_sha256),
@@ -6166,6 +6189,50 @@ mod tests {
             response_b64: None,
             latency_ms: None,
         }
+    }
+
+    #[test]
+    fn provider_journal_preserves_the_recorded_result_contract() {
+        let mut legacy = serde_json::to_value(attempt_entry("admitted")).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("result_contract_version");
+        let parsed = serde_json::from_value::<ProviderAttemptJournalEntry>(legacy);
+        assert!(
+            parsed.is_ok(),
+            "a historical journal entry must retain its original result interpretation"
+        );
+        assert_eq!(
+            validate_provider_attempt("account", "work", &parsed.unwrap())
+                .unwrap()
+                .result_contract_version,
+            1,
+            "an absent historical result version must mean the original contract"
+        );
+        let mut scored = attempt_entry("admitted");
+        scored.result_contract_version = 2;
+        let mut usage = json!({});
+        persist_provider_journal(
+            &mut usage,
+            &ProviderAttemptJournal {
+                attempts: vec![scored],
+            },
+        )
+        .unwrap();
+        let mut recovered = provider_journal(&usage).unwrap().attempts.remove(0);
+        assert_eq!(
+            validate_provider_attempt("account", "work", &recovered)
+                .unwrap()
+                .result_contract_version,
+            2,
+            "reclaim must preserve the frozen scored-fact contract"
+        );
+        recovered.result_contract_version = 3;
+        assert!(
+            validate_provider_attempt("account", "work", &recovered).is_err(),
+            "unsupported recorded result versions must never silently downgrade"
+        );
     }
 
     #[test]
