@@ -74,6 +74,8 @@ pub(crate) struct CaptureSessionStatus {
     pub(crate) processing: CaptureSessionProcessing,
     pub(crate) evidence: CaptureSessionEvidence,
     pub(crate) memories: Vec<CaptureSessionMemory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enrollment: Option<super::CaptureEnrollmentStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +153,13 @@ pub(crate) trait CaptureRepository: Send + Sync {
     async fn install_media_dek(&self, account_id: &str, candidate_wrapped: &str) -> Result<String>;
 
     async fn commit_event(&self, command: CaptureCommit) -> Result<CaptureCommitResult>;
+
+    /// Cheap read before batch billing; commit rechecks under the account lock.
+    async fn preflight_reference_batch_enrollment(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+    ) -> Result<()>;
 
     async fn commit_reference_batch(
         &self,

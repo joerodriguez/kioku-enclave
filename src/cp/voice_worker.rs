@@ -262,9 +262,6 @@ async fn sweep(state: &Arc<CpState>) {
             return;
         }
     };
-    if controls.paused || controls.cohort == VoiceCohort::None {
-        return;
-    }
     let accounts = match state.repositories.work().active_account_ids().await {
         Ok(accounts) => accounts,
         Err(_) => {
@@ -273,23 +270,41 @@ async fn sweep(state: &Arc<CpState>) {
         }
     };
     let mut tasks = JoinSet::new();
-    for account_id in accounts.into_iter().filter(|id| controls.admits(id)) {
+    for account_id in accounts {
         if tasks.len() >= MAX_ACCOUNTS {
             let _ = tasks.join_next().await;
         }
         let state = Arc::clone(state);
         let cohort = controls.cohort;
+        let infer = controls.admits(&account_id) && state.voice.is_some();
         tasks.spawn(async move {
-            process_account(&state, &account_id, cohort).await;
+            if state
+                .repositories
+                .voice_identity()
+                .maintain_owner_voice_enrollment(&account_id)
+                .await
+                .is_err()
+            {
+                metric(cohort, "enrollment_maintenance_failed", 1, "none");
+            }
+            if infer {
+                process_account(&state, &account_id, cohort).await;
+                if state
+                    .repositories
+                    .voice_identity()
+                    .maintain_owner_voice_enrollment(&account_id)
+                    .await
+                    .is_err()
+                {
+                    metric(cohort, "enrollment_maintenance_failed", 1, "none");
+                }
+            }
         });
     }
     while tasks.join_next().await.is_some() {}
 }
 
 pub fn spawn_scheduler(state: Arc<CpState>) {
-    if state.voice.is_none() {
-        return;
-    }
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_SECONDS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

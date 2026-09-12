@@ -2067,7 +2067,7 @@ const WORKFLOW_CONTINUITY_RULE: &str = "CRITICAL EXTENSION RULE: Define continui
 
 const SYSTEM_PROMPT: &str = r#"You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day. The episode fields must also be a useful, evidence-grounded memory of what the person needs to know or do — not a topic inventory.
 
-The log format: timestamped utterances as "HH:MM:SS [speaker|lang] text" (speaker "Me" is the device owner; "Speaker N" are diarized other voices); "[screen] App — Title <url>" lines for what was on screen; "[screen-text]" OCR excerpts.
+The log format: timestamped utterances as "HH:MM:SS [speaker|lang] text" (speaker "Me" is the device owner; other supplied labels are established names or stable slots such as "Speaker A"); "[screen] App — Title <url>" lines for what was on screen; "[screen-text]" OCR excerpts.
 
 Episode types: meeting | lesson | call | coding | browsing | break | other
 
@@ -2077,7 +2077,7 @@ PRINCIPLES (in priority order):
 1. EXTEND vs NEW. For each episode you output, set "episode_ref" to the "E<n>" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or "") to open a NEW episode. A continuous activity is exactly ONE episode. For an extension, preserve still-valid concrete takeaways and current actions/requirements from the open-episode digest while incorporating the new evidence.
 2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between "Me" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only "Me" speaking sporadically + screen activity → coding/browsing per the apps.
 3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit "Break"/"Idle"/"Misc" filler. A break is the silence between episodes — leave it out.
-4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified ("Ana (Speaker 2)"); keep bare "Speaker N" otherwise. People search their archive BY NAME. Repeated or mirrored transcript rows are corroboration, not separate statements or takeaways.
+4. ATTENDEES: use only the supplied speaker labels for people actually speaking in the episode; never list a mentioned name as an attendee. Do not rename speakers from names spoken aloud or visible on screen. A solo speaker saying "send Sarah the contract" has only that supplied speaker as an attendee, not Sarah. Repeated or mirrored transcript rows are corroboration, not separate statements or takeaways.
 5. Titles identify the activity, purpose, and people when known ("Spanish lesson with Ana: past tense"). Do not make a title a comma-separated sample of topics, and never use a generic title.
 6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.
 7. SUMMARY QUALITY. summary is 1–10 Markdown bullets, one per line and each beginning "- ". Every bullet must state a concrete takeaway, instruction, requirement, decision, result, constraint, or fact that helps the device owner remember or act. Prioritize, in order: (a) steps or requirements directed at the owner, (b) decisions, commitments, owners, deadlines and dates, (c) exact amounts, limits, logistics and named resources, services or URLs, (d) substantive outcomes or explanations. Omit greetings, atmosphere and promotional color before compressing any high-value detail. Never write topic-inventory prose such as "X was discussed", "information was provided/shared", "details about X", or "the conversation covered X"; state the actual detail instead. Do not pad to reach a bullet count.
@@ -2089,11 +2089,27 @@ PRINCIPLES (in priority order):
 12. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.
 13. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.
 
-Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"<ISO>","ended_at":"<ISO>","type":"<type>","title":"...","summary":"- concrete takeaway\n- concrete requirement","participants":["Me","Ana (Speaker 2)"],"languages":["fr"],"action_items":[],"substance":"normal","visual_evidence":"none","minutes":[{"start":"<ISO>","gist":"..."}]}]}"#;
+Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"<ISO>","ended_at":"<ISO>","type":"<type>","title":"...","summary":"- concrete takeaway\n- concrete requirement","participants":["Me","Speaker B"],"languages":["fr"],"action_items":[],"substance":"normal","visual_evidence":"none","minutes":[{"start":"<ISO>","gist":"..."}]}]}"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_memory_attendees_are_supplied_speakers_not_mentioned_names() {
+        assert!(
+            SYSTEM_PROMPT.contains("never list a mentioned name as an attendee"),
+            "first-memory prompt must prohibit turning a mentioned name into an attendee"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("only the supplied speaker labels"),
+            "attendees must use the supplied graph identity"
+        );
+        assert!(
+            !SYSTEM_PROMPT.contains("Ana (Speaker 2)"),
+            "the output example must not teach inferred speaker renaming"
+        );
+    }
 
     #[test]
     fn exact_late_revision_always_creates_a_new_draft() {

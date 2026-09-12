@@ -29,7 +29,7 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `playback.rs` | Memory and exact capture-session playback datasets plus identified-person memory availability. |
 | `query.rs` | Tenant-scoped full-text/vector search over memories, structured final briefs, transcripts, and screen evidence; stable memory navigation and identified-person link projections; MCP query projections; turn-timed episode members; and feed/people/browser/screenshot reads plus capture status. |
 | `recording_retention.rs` | Retention preview/CAS, durable recording-key epoch, exact inventory, and downgrade completion. |
-| `voice_identity.rs` | Versioned source/claim/sample outcomes, operator cohort snapshots, and durable voice identity repository contract. |
+| `voice_identity.rs` | Versioned source/claim/sample outcomes, operator cohort snapshots, closed enrollment states/reasons, current domain recognition and atomic Forget/maintenance repository contracts. |
 | `work.rs` | Fleet active-account enumeration, summarizer cursor storage, and shared outbound-provider outcome validation. |
 | [`postgres/`](postgres/map.md) | The only structured-state implementation: bounded SQLx pool plus every repository adapter. |
 

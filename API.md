@@ -2,9 +2,9 @@
 
 This is the stable capture contract for the pure-Swift macOS and iOS clients.
 Clients capture bounded audio or screenshots, attach authoritative device-time
-and foreground/browser context, and upload them to the attested enclave. All
+and foreground/browser context, and upload them to the Kioku Cloud Run service. All
 transcription, OCR, diarization, indexing, and summarization run in the cloud.
-WeSpeaker profile learning and same-session voice continuity run inside the enclave for
+WeSpeaker profile learning, explicit owner enrollment, and same-session voice continuity run inside Kioku for
 an operator-selected account cohort, defaulting to none. Retained source audio is required;
 voiceprints are never sent to a provider or returned by an API.
 
@@ -23,7 +23,7 @@ recording lease.
 
 ## Authentication and transport
 
-- Production requests use HTTPS terminated inside the attested enclave.
+- Production requests use HTTPS through Google's managed load balancer to the Kioku service.
 - Send `Authorization: Bearer <token>` using either a Kioku access token or an
   accepted Google ID token. Apple login always yields an ordinary Kioku access token.
 - Never put user IDs in a path, header, or manifest. The server derives the
@@ -196,6 +196,44 @@ interval, then rechecks the current durable retention preference under the accou
 lifecycle lock. Missing, stale, revoked, out-of-interval, or malformed authority falls
 back to the ordinary 30-day processing path. Durable storage unavailability never becomes
 a claimed durable acknowledgement.
+
+`enrollment` is optional and accepts only `"owner_voice"`. An explicit owner recording
+also carries `enrollment_revision`, the nonnegative integer returned by
+`GET /api/voice/enrollment` when the user reviewed its disclosure. Native clients freeze
+both fields with the recording purpose and preserve them through durable upload/recovery.
+Ordinary events omit both fields and retain their existing serialization and replay digest.
+The first **accepted** event fixes whether a session is an owner enrollment; reserving or
+attempting an upload does not. Eligible enrollment is one microphone stream (`mic` or
+`ios_mic`), device/install, and acoustic domain. A later missing marker, second stream or
+device, route change, or marker added after an ordinary start makes enrollment inconclusive.
+Those otherwise valid audio events are still accepted for ordinary memory processing.
+Existing stream-identity and conflicting-replay checks still apply. A screen-reference
+batch naming a designated enrollment session is rejected with `400` without changing any
+audio acknowledgement or sequence.
+
+Only the first three minutes of the accepted acoustic timeline can enroll the owner;
+longer audio is still acknowledged and processed as ordinary recording. The result waits
+for the session's relevant work to settle. At least 90% of observed speech must belong to
+one voice, with a clean enrollment-quality sample of at least three seconds and no overlap
+in accepted samples. A no-speech, low-quality, mixed, expired, or otherwise inconclusive
+attempt never prevents an ordinary useful memory. Late accepted source changes are
+rechecked against the session's source/seal revision.
+
+Forget advances the account's enrollment revision and fences older attempts, including
+offline sessions that had no accepted event yet. Missing revision means zero only while
+the account is still at revision zero. A stale or missing-after-Forget revision yields
+inconclusive enrollment while preserving ordinary audio acceptance. Fresh explicit
+re-recording uses the current revision. An accepted event's marker/revision cannot be
+changed during replay.
+
+A native client may retry an **unaccepted** marked event without both enrollment fields
+only when a `400` response explicitly identifies either field as unknown. It durably
+downgrades the rest of that session and reports enrollment unavailable, preserving all
+event/session/stream/asset IDs, media, timestamps, and sequence numbers. The predecessor
+server returns only the generic `manifest is not valid capture schema v2 JSON`; that
+response cannot identify an unsupported enrollment field and must not trigger stripping.
+The server accepting these fields therefore precedes marked clients. Other errors and
+ambiguous transport outcomes keep the normal retry contract.
 
 `media_disposition` is `canonical` or `reference`; omission means `canonical`
 for compatibility. Canonical events require `media`, forbid `reference`, and
@@ -670,6 +708,54 @@ through the same audited path. A client never needs a new recovery API. This bac
 operates after the activation contract has drained predecessor writers and requires
 the separately installed interrupted-capture schema companion.
 
+## My voice
+
+Authenticated `GET /api/voice/enrollment` returns the current owner's recognition status:
+
+```json
+{
+  "enrollment_revision": 2,
+  "domains": [{"channel_domain": "ios:builtin_mic", "recognized": true}],
+  "latest_attempt": {
+    "state": "inconclusive",
+    "reason": "no_dominant_voice",
+    "channel_domain": "ios:builtin_mic",
+    "updated_at": "2026-09-12T12:00:00Z"
+  }
+}
+```
+
+`recognized` means a current usable owner profile still has accepted support. It is
+independent of the latest attempt, so a failed or unfinished re-recording does not hide
+an earlier successful profile. Domains are deterministically ordered and preserve the
+existing platform/route mapper (`ios:builtin_mic`, `macos:bluetooth_headset`, and so on).
+Unknown routes remain isolated. `latest_attempt` is nullable; its domain may also be null.
+States are `recording`, `processing`, `enrolled`, `inconclusive`, and `expired`.
+Reasons are content-free: `marker_missing`, `marker_after_ordinary_start`,
+`unsupported_stream`, `multiple_streams`, `multiple_devices`, `route_changed`,
+`enrollment_revoked`, `no_speech`, `no_eligible_sample`, `no_dominant_voice`,
+`overlapping_speech`, `raw_media_expired`, `source_deleted`, `forgotten`,
+`processing_failed`, or `source_changed` (or null).
+
+Authenticated `DELETE /api/voice/enrollment` forgets saved owner profiles across domains,
+including owner samples, representatives, historical biometric values and owner evidence,
+and fences earlier pending enrollment. It preserves ordinary audio, transcripts, memories,
+and other people's profiles. It returns the same status shape with the current withdrawal
+revision. Repeating DELETE is safe; the revision can advance again. No account ID or
+owner/person/profile/sample ID is accepted or returned. Both routes send
+`Cache-Control: private, no-store, max-age=0`; unavailable storage returns `503`
+`enclave_unavailable`, never an empty successful status. Forget remains available while
+voice matching is paused or the model is unavailable.
+
+All capture-session status routes optionally include
+`enrollment: {state, reason, channel_domain}`. Voice enrollment and the memory's `stage`
+are independent; clients keep checking a recording/processing enrollment after a memory
+becomes ready or resolves to no-memory. Ordinary sessions omit `enrollment`.
+
+Web Re-record opens the fixed `kioku://my-voice/re-record` native handoff. It contains no
+account token and opens disclosure for the signed-in account; it never starts recording.
+The user still chooses Start in the native app.
+
 ## Screenshot evidence bytes
 
 Cloud Capture v2 does not use the retired device-sync upload planner. Authenticated
@@ -919,8 +1005,13 @@ separate bounded refresh is reviewed.
 ### Current speaker labels and memory slots
 
 Transcript members, feed, search and its speaker filters, playback, existing MCP tools,
-and utterance export use one current graph derivation. Owner-source attribution renders
-`Me` and never exposes a public person ID. Accepted direct identified-person evidence,
+and utterance export use one current graph derivation. An accepted observation-level
+owner voice match renders `Me` with `owner_voice` attribution and never exposes a public
+person ID. The route-based `owner_source_role` fallback applies only when that acoustic
+domain has no usable enrolled owner profile. Pending, unmatched, and no-embedding turns
+cannot regain that fallback in an enrolled domain. A mixed diarization cluster uses each
+observation's actual assignment; one owner match does not make its unmatched siblings Me.
+Accepted direct identified-person evidence,
 or an identified person attached to a non-quarantined voice profile, renders that
 person's current display name. Otherwise a durable per-memory slot renders `Speaker A`,
 `Speaker B`, and so on; a turn without a memory slot renders `Speaker`. Profile identity
@@ -1257,16 +1348,20 @@ rows or owned media generations remain.
   for transcription/diarization or screenshot understanding. This is an
   explicit Vertex processing boundary, not enclave-only inference.
 - A separate lease worker computes pinned WeSpeaker embeddings from retained encrypted
-  source spans. It compares only the same embedding space, scorer version, capture session,
-  and acoustic domain. A cosine score of at least 0.60 and a runner-up margin of at least
+  source spans. It compares only the same embedding space, scorer version, and acoustic
+  domain, trying usable owner profiles first, then same-session continuity. A cosine
+  score of at least 0.60 and a runner-up margin of at least
   0.08 permits attachment; below 0.45 an enrollment-eligible sample may create an anonymous
   profile. Other samples remain unassigned. One-to-three-second samples can match but
   never create or update a representative; overlap and failed quality gates quarantine.
   Profiles use a medoid and normalized trimmed centroid, with 0.50 outlier rejection.
-  Owner-transmit clusters retain their existing attribution and do not create profiles.
+  Ordinary route hints never create an owner profile; owner enrollment requires the
+  explicit marked-session evidence described above. Mixed owner/non-owner clusters retain
+  per-observation assignments while their contributions are excluded from profile updates.
   Direct person evidence may propagate through a profile; competing person bindings
-  quarantine it without overwriting either person. This Phase 1 path does not add owner
-  enrollment, cross-memory matching, name fusion, or remove the existing normalized-name
+  quarantine it without overwriting either person. Phase 2 adds owner enrollment and
+  owner-first matching; it does not yet add account-wide non-owner matching, name fusion,
+  or remove the existing normalized-name
   reuse in self-introduction processing. Gemini never receives voiceprints.
 - Voice controls are persisted operator state: cohort `none`, `explicit`, or `all`, plus
   Pause. Only the digest-pinned migrator changes them. This is a documented Phase 1
@@ -1275,7 +1370,8 @@ rows or owned media generations remain.
   the controls and cannot commit a new binding. Each sweep filters accounts before
   per-account work; expired media is terminalized
   without fetching it. Missing or invalid model weights disable the worker and preserve
-  readiness. Metrics use `voice_identity_v1` with literal outcomes/cohorts/latency buckets,
+  readiness. Enrollment privacy maintenance is independent of matching/model availability.
+  Metrics use `voice_identity_v1` with literal outcomes/cohorts/latency buckets,
   no account labels, content, embeddings, or scores.
 - Profile reconciliation retains append-only revisions and sample-assignment
   history. A merge proposal is accepted only across the same embedding space,
@@ -1297,8 +1393,10 @@ rows or owned media generations remain.
   or centroid bytes. Episode capture erasure recomputes affected profiles in the same
   transaction or quarantines them when no accepted enrollment sample remains; historical
   revision centroid bytes are also erased while lineage metadata remains. The
-  ADR-0036 recording-retention downgrade currently removes no samples, so it does not
-  trigger profile recomputation in Phase 1. Account
+  explicit recording-audio downgrade also erases affected voice samples and recomputes
+  profiles. Natural raw expiry expires owner-enrollment provenance and its biometric
+  contributions; it does not broaden the ordinary non-owner derived-sample retention rule.
+  Account
   deletion removes raw objects, derived records, profiles, lineage, credentials,
   and all account-owned PostgreSQL rows. For every exact GCS object name, deletion lists,
   deletes, and verifies the absence of all live and noncurrent generations.

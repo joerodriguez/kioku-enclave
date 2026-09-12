@@ -4319,9 +4319,6 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     }
     persistence.verify_schema().await?;
     persistence.verify_schema().await?;
-    test_real_pg_terminal_media_claim_repair(persistence).await?;
-    super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
-    test_real_pg_seal_and_tombstone_contract(persistence).await?;
     let producer_contract = crate::cp::reconciler::producer_contract_commitment(
         "gemini-reconciliation-v1",
         "us-central1",
@@ -4346,6 +4343,10 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     persistence.install_morning_email_schema().await?;
     persistence.install_brief_sections_schema().await?;
     persistence.install_voice_identity_schema().await?;
+    persistence.install_voice_enrollment_schema().await?;
+    test_real_pg_terminal_media_claim_repair(persistence).await?;
+    super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
+    test_real_pg_seal_and_tombstone_contract(persistence).await?;
     sqlx::query(
         "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
          VALUES($1,'activation-contract@example.com','google','activation-contract-subject')",

@@ -17,6 +17,10 @@ const MAX_COMMITTED_ROWS: i64 = 100_000;
 // catches unintended FK cascade/SET NULL effects and content changes.
 const CONTENT_PARTITIONS: &[(&str, &str)] = &[
     ("capture_sessions", "($2->'sessions') ? t.id"),
+    (
+        "voice_enrollment_sessions",
+        "($2->'sessions') ? t.capture_session_id",
+    ),
     ("capture_streams", "($2->'streams') ? t.id"),
     ("capture_events", "($2->'events') ? t.event_id"),
     ("media_objects", "($2->'events') ? t.event_id"),

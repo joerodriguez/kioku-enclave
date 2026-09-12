@@ -97,6 +97,15 @@ pub(crate) enum VoiceEmbeddingOutcome {
 }
 #[async_trait]
 pub(crate) trait VoiceIdentityRepository: Send + Sync {
+    async fn owner_voice_enrollment_status(
+        &self,
+        account_id: &str,
+    ) -> Result<OwnerVoiceEnrollmentStatus>;
+    async fn forget_owner_voice_enrollment(
+        &self,
+        account_id: &str,
+    ) -> Result<OwnerVoiceEnrollmentStatus>;
+    async fn maintain_owner_voice_enrollment(&self, account_id: &str) -> Result<()>;
     async fn voice_identity_controls(&self) -> Result<VoiceIdentityControls>;
     async fn claim_voice_embeddings(
         &self,
@@ -109,4 +118,135 @@ pub(crate) trait VoiceIdentityRepository: Send + Sync {
         claim: &VoiceEmbeddingClaim,
         outcome: VoiceEmbeddingOutcome,
     ) -> Result<bool>;
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VoiceEnrollmentState {
+    Recording,
+    Processing,
+    Enrolled,
+    Inconclusive,
+    Expired,
+}
+
+impl VoiceEnrollmentState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::Processing => "processing",
+            Self::Enrolled => "enrolled",
+            Self::Inconclusive => "inconclusive",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "recording" => Ok(Self::Recording),
+            "processing" => Ok(Self::Processing),
+            "enrolled" => Ok(Self::Enrolled),
+            "inconclusive" => Ok(Self::Inconclusive),
+            "expired" => Ok(Self::Expired),
+            _ => Err(crate::error::EnclaveError::Store(
+                "invalid voice enrollment state".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VoiceEnrollmentReason {
+    MarkerMissing,
+    MarkerAfterOrdinaryStart,
+    UnsupportedStream,
+    MultipleStreams,
+    MultipleDevices,
+    RouteChanged,
+    EnrollmentRevoked,
+    NoSpeech,
+    NoEligibleSample,
+    NoDominantVoice,
+    OverlappingSpeech,
+    RawMediaExpired,
+    SourceDeleted,
+    Forgotten,
+    ProcessingFailed,
+    SourceChanged,
+}
+
+impl VoiceEnrollmentReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkerMissing => "marker_missing",
+            Self::MarkerAfterOrdinaryStart => "marker_after_ordinary_start",
+            Self::UnsupportedStream => "unsupported_stream",
+            Self::MultipleStreams => "multiple_streams",
+            Self::MultipleDevices => "multiple_devices",
+            Self::RouteChanged => "route_changed",
+            Self::EnrollmentRevoked => "enrollment_revoked",
+            Self::NoSpeech => "no_speech",
+            Self::NoEligibleSample => "no_eligible_sample",
+            Self::NoDominantVoice => "no_dominant_voice",
+            Self::OverlappingSpeech => "overlapping_speech",
+            Self::RawMediaExpired => "raw_media_expired",
+            Self::SourceDeleted => "source_deleted",
+            Self::Forgotten => "forgotten",
+            Self::ProcessingFailed => "processing_failed",
+            Self::SourceChanged => "source_changed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "marker_missing" => Ok(Self::MarkerMissing),
+            "marker_after_ordinary_start" => Ok(Self::MarkerAfterOrdinaryStart),
+            "unsupported_stream" => Ok(Self::UnsupportedStream),
+            "multiple_streams" => Ok(Self::MultipleStreams),
+            "multiple_devices" => Ok(Self::MultipleDevices),
+            "route_changed" => Ok(Self::RouteChanged),
+            "enrollment_revoked" => Ok(Self::EnrollmentRevoked),
+            "no_speech" => Ok(Self::NoSpeech),
+            "no_eligible_sample" => Ok(Self::NoEligibleSample),
+            "no_dominant_voice" => Ok(Self::NoDominantVoice),
+            "overlapping_speech" => Ok(Self::OverlappingSpeech),
+            "raw_media_expired" => Ok(Self::RawMediaExpired),
+            "source_deleted" => Ok(Self::SourceDeleted),
+            "forgotten" => Ok(Self::Forgotten),
+            "processing_failed" => Ok(Self::ProcessingFailed),
+            "source_changed" => Ok(Self::SourceChanged),
+            _ => Err(crate::error::EnclaveError::Store(
+                "invalid voice enrollment reason".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct CaptureEnrollmentStatus {
+    pub(crate) state: VoiceEnrollmentState,
+    pub(crate) reason: Option<VoiceEnrollmentReason>,
+    pub(crate) channel_domain: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct OwnerVoiceEnrollmentAttempt {
+    pub(crate) state: VoiceEnrollmentState,
+    pub(crate) reason: Option<VoiceEnrollmentReason>,
+    pub(crate) channel_domain: Option<String>,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct OwnerVoiceDomainStatus {
+    pub(crate) channel_domain: String,
+    pub(crate) recognized: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct OwnerVoiceEnrollmentStatus {
+    pub(crate) enrollment_revision: i64,
+    pub(crate) domains: Vec<OwnerVoiceDomainStatus>,
+    pub(crate) latest_attempt: Option<OwnerVoiceEnrollmentAttempt>,
 }
