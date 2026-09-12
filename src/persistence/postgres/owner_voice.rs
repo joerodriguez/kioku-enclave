@@ -50,7 +50,10 @@ pub(super) async fn owner_profiles(
     space: &str,
     scorer: i64,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
-    let rows=sqlx::query("SELECT p.id,p.centroid FROM voice_profiles p JOIN people owner ON owner.account_id=p.account_id AND owner.id=p.person_id AND owner.status='owner' WHERE p.account_id=$1 AND p.channel_domain=$2 AND p.embedding_space=$3 AND p.scorer_version=$4 AND p.status<>'quarantined' AND p.sample_count>0 ORDER BY p.id")
+    let fence = voice_identity::source_fence(tx).await?;
+    let retained = voice_identity::RETAINED;
+    let withdrawn = voice_identity::WITHDRAWN;
+    let rows=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT p.id,p.centroid FROM voice_profiles p JOIN people owner ON owner.account_id=p.account_id AND owner.id=p.person_id AND owner.status='owner' WHERE p.account_id=$1 AND p.channel_domain=$2 AND p.embedding_space=$3 AND p.scorer_version=$4 AND p.status<>'quarantined' AND p.sample_count>0 AND NOT EXISTS(SELECT 1 FROM voice_sample_profile_assignments assignment JOIN voice_samples s ON s.account_id=assignment.account_id AND s.id=assignment.sample_id JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id WHERE assignment.account_id=p.account_id AND assignment.profile_id=p.id AND assignment.active AND (NOT ({retained}) OR ({fence}) OR ({withdrawn}))) ORDER BY p.id")))
         .bind(account).bind(domain).bind(space).bind(scorer).fetch_all(&mut **tx).await?;
     rows.into_iter()
         .map(|r| Ok((r.try_get("id")?, r.try_get("centroid")?)))

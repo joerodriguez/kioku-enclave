@@ -287,6 +287,15 @@ async fn sweep(state: &Arc<CpState>) {
             {
                 metric(cohort, "enrollment_maintenance_failed", 1, "none");
             }
+            if state
+                .repositories
+                .voice_identity()
+                .maintain_voice_profiles(&account_id)
+                .await
+                .is_err()
+            {
+                metric(cohort, "profile_maintenance_failed", 1, "none");
+            }
             if infer {
                 process_account(&state, &account_id, cohort).await;
                 if state
@@ -297,6 +306,15 @@ async fn sweep(state: &Arc<CpState>) {
                     .is_err()
                 {
                     metric(cohort, "enrollment_maintenance_failed", 1, "none");
+                }
+                if state
+                    .repositories
+                    .voice_identity()
+                    .maintain_voice_profiles(&account_id)
+                    .await
+                    .is_err()
+                {
+                    metric(cohort, "profile_maintenance_failed", 1, "none");
                 }
             }
         });

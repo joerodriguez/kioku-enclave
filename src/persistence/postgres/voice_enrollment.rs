@@ -76,7 +76,7 @@ pub(super) async fn status(
     Ok(status)
 }
 
-async fn erase_samples(
+pub(super) async fn erase_samples(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
     samples: &[i64],
@@ -97,13 +97,14 @@ async fn erase_samples(
         .bind(samples)
         .execute(&mut **tx)
         .await?;
+    // Clear source-cluster fallbacks before the canonical projection refresh.
+    owner_voice::refresh_clusters(tx, account, &clusters).await?;
     voice_identity::recompute_erased_profiles(
         tx,
         account,
         &voice_identity::VoiceErasureAffected { profiles, targets },
     )
     .await?;
-    owner_voice::refresh_clusters(tx, account, &clusters).await?;
     Ok(())
 }
 
@@ -247,8 +248,8 @@ pub(super) async fn maintain(repo: &PostgresPersistence, account: &str) -> Resul
         tx.commit().await?;
         return Ok(());
     }
-    // Natural raw expiry removes only dependent owner biometrics; ordinary
-    // non-owner sample retention remains the Phase 1 policy. A partially
+    // Owner maintenance settles enrollment status as well as its biometrics.
+    // General voice maintenance also expires non-owner samples. A partially
     // surviving enrollment may still recognize its domain after recomputation.
     let expired_events:Vec<String>=sqlx::query_scalar("SELECT DISTINCT e.event_id FROM voice_enrollment_sessions enrollment JOIN capture_events e ON e.account_id=enrollment.account_id AND e.capture_session_id=enrollment.capture_session_id LEFT JOIN media_objects m ON m.account_id=e.account_id AND m.event_id=e.event_id WHERE enrollment.account_id=$1 AND enrollment.designated AND (enrollment.state<>'expired' OR EXISTS(SELECT 1 FROM voice_samples sample JOIN speaker_observations o ON o.account_id=sample.account_id AND o.id=sample.speaker_observation_id JOIN voice_profiles profile ON profile.account_id=sample.account_id AND profile.id=sample.voice_profile_id JOIN people owner ON owner.account_id=profile.account_id AND owner.id=profile.person_id AND owner.status='owner' WHERE o.account_id=e.account_id AND (o.event_id=e.event_id OR EXISTS(SELECT 1 FROM speaker_observation_sources source WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND source.event_id=e.event_id)))) AND e.media_disposition='canonical' AND (enrollment.timeline_cutoff_at IS NULL OR e.started_at<enrollment.timeline_cutoff_at) AND (m.event_id IS NULL OR m.deleted_at IS NOT NULL OR m.processing_state='pruned' OR (m.retain_until IS NOT NULL AND m.retain_until<=clock_timestamp())) ORDER BY e.event_id LIMIT 1024")
         .bind(account).fetch_all(&mut *tx).await?;
