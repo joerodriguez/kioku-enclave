@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{cp::media::AudioTurn, error::Result};
 
-fn semantic_name_parts(value: &str) -> Vec<String> {
+pub(crate) fn semantic_name_parts(value: &str) -> Vec<String> {
     value
         .split_whitespace()
         .map(|part| {

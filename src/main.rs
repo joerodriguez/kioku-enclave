@@ -587,6 +587,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
             .verify_voice_enrollment_schema()
             .await
             .is_ok()
+        && state.postgres.verify_identity_fusion_schema().await.is_ok()
         && state
             .postgres
             .verify_voice_recurrence_schema()
@@ -1283,6 +1284,12 @@ async fn async_main() {
             panic!("PostgreSQL voice enrollment schema is not release-ready: {error}")
         });
     postgres
+        .verify_identity_fusion_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL identity fusion schema is not release-ready: {error}")
+        });
+    postgres
         .verify_voice_recurrence_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1615,6 +1622,7 @@ enum PostgresMigrationReleasePhase {
     InstallVoiceIdentity,
     InstallVoiceEnrollment,
     InstallVoiceRecurrence,
+    InstallIdentityFusion,
     SetVoiceIdentityCohort,
     PauseVoiceIdentity,
     ResumeVoiceIdentity,
@@ -1653,6 +1661,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("identity-fusion-v33-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallIdentityFusion)
+        }
         Some("voice-recurrence-v32-install") => {
             Ok(PostgresMigrationReleasePhase::InstallVoiceRecurrence)
         }
@@ -1937,6 +1948,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallVoiceEnrollment => persistence
             .install_voice_enrollment_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"voice_enrollment", "version":31})),
+        PostgresMigrationReleasePhase::InstallIdentityFusion => persistence
+            .install_identity_fusion_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"identity_fusion", "version":33})),
         PostgresMigrationReleasePhase::InstallVoiceRecurrence => persistence
             .install_voice_recurrence_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"voice_recurrence", "version":32})),
@@ -2046,6 +2060,10 @@ mod postgres_migration_release_tests {
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
         for (confirmation, expected) in [
+            (
+                "identity-fusion-v33-install",
+                PostgresMigrationReleasePhase::InstallIdentityFusion,
+            ),
             (
                 "voice-recurrence-v32-install",
                 PostgresMigrationReleasePhase::InstallVoiceRecurrence,

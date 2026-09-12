@@ -385,7 +385,15 @@ pub(super) async fn refresh_episode_speaker_projections(
         return Ok(report);
     }
     super::owner_voice::prepare_domains(tx, account_id).await?;
-    let changed_profiles = super::voice_recurrence::refresh(tx, account_id).await?;
+    let profile_ids:Vec<i64>=sqlx::query_scalar("SELECT DISTINCT o.voice_profile_id FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id WHERE m.account_id=$1 AND m.episode_id=ANY($2::bigint[]) AND m.record_type='utterance' AND o.voice_profile_id IS NOT NULL")
+        .bind(account_id).bind(targets.iter().map(|target|target.episode_id).collect::<Vec<_>>()).fetch_all(&mut **tx).await?;
+    let admitted = super::voice_identity::controls_admit(tx, account_id)
+        .await?
+        .0;
+    let mut changed_profiles =
+        super::identity_fusion::reconcile_profiles(tx, account_id, &profile_ids, admitted).await?;
+    super::identity_fusion::enrich_facts(tx, account_id, admitted).await?;
+    changed_profiles.extend(super::voice_recurrence::refresh(tx, account_id).await?);
     let mut targets = targets.to_vec();
     if !changed_profiles.is_empty() {
         let affected = super::voice_identity::affected_speaker_projection_targets(

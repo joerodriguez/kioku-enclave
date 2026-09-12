@@ -77,3 +77,14 @@ for tenant isolation, type/time-zone behavior, search, concurrency, restart, exp
 `brief_sections_schema.rs` installs/verifies the additive v29 sections column and receipt without modifying base/activation catalog contracts. Finalization writes sections atomically; query/search/embedding and immutable delivery snapshots preserve them.
 
 `media_processing.rs` records each provider result contract with its immutable attempt, defaults historical journal entries to the original contract, and persists actual supplied fact confidence.
+
+
+`identity_fusion_schema.rs` installs/verifies the direct v33 name/fact companion through the existing migrator.
+
+`identity_fusion.rs` records source/subject-qualified audio names and scored unbound facts after all turns exist; screen evidence retains its exact visual observation. Its bounded reducer revalidates retained current attribution, holds conflicting names independently of acoustics, and enriches temporal facts; public reads recheck candidate authority ahead of maintenance.
+
+`identity_fusion_contract.rs` exercises synthetic same-name separation, grounded forward vocatives, audio/screen arrival convergence, current frame/voter authority, bounded maintenance fairness, name-only acoustic collision holds, atomic erasure projections, actual fact confidence, temporal replacement, tenant export and account cascade in PostgreSQL.
+
+Name-source erasure captures remote target profiles before frame/voter cascades, independently of biometric erasure targets. Sample withdrawal applies the same dependency refresh. Fact candidate admission stays paged while complete SQL history reconstruction uses stored canonical comparison keys, so large histories still replace and restore every surviving support.
+
+The paged and ordinary episode member purge capture name/fact dependencies before screenshot/utterance/member cascades. Erasure carries explicit fact-person targets independently of the candidate queue, so a deleted replacement restores surviving history in that transaction.

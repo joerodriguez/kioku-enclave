@@ -625,3 +625,8 @@ The reviewed source also requires `voice-recurrence-v32-install`, after v31, thr
 its existing dedicated PostgreSQL migrator. It installs only the additive proposal,
 membership and reservation companion; startup/readiness verify its selective receipt.
 No serving process applies DDL. Source merge does not publish an image or run this command.
+
+The Phase 4 source likewise requires `identity-fusion-v33-install` after v32 in that
+same companion lane. It adds typed name evidence, separate binding/claim state and scored
+fact candidates. Historical staged responses keep their recorded interpretation; source
+delivery does not run the installer or change the serving image.

@@ -1,3 +1,20 @@
+# ADR-0048 name evidence fusion (2026-09-12)
+
+- [x] Implement typed grounded name evidence, exact screen joins, independent vocative
+      votes and corroboration, deterministic versioned bindings and name-only conflicts.
+- [x] Remove account-wide name reuse; preserve opaque people across acoustic domains,
+      temporary introduction retirement and reciprocal same-name collision holds.
+- [x] Persist actual scored fact candidates with current-authority public reads,
+      bounded enrichment and explicit temporal role/organization replacement history.
+- [x] Add the direct v33 companion to startup/readiness, export, erasure and the existing CLI.
+- [x] Verify synthetic contracts, compiling production reversals and independent reviews.
+- [x] Pass the exhaustive PostgreSQL/model gate on final reviewed source: 589 passed,
+      zero failures, one existing manual probe ignored; formatting and strict all-target
+      Clippy passed. The first attempt passed tests but failed two mechanical lints;
+      both were independently reviewed and the complete corrected-source rerun passed.
+- [ ] Merge the backend and exact existing operator mapping through reviewed PRs.
+- [ ] Complete Phase 5 graph-driven briefs and Phase 6 real owner acceptance.
+
 # ADR-0048 automatic profile reconciliation (2026-09-12)
 
 - [x] Implement v32 proposal/member/slot provenance, reciprocal complete-population
@@ -10,7 +27,7 @@
 - [x] Pass the exhaustive PostgreSQL/model/Clippy gate on the final reviewed source:
       560 passed, zero failures, one pre-existing manual probe ignored; formatting
       and strict all-target Clippy pass. Exact restored source hashes are recorded.
-- [ ] Deliver through a normal reviewed PR and add the exact existing operator mapping.
+- [x] Merge reviewed backend #519 (`20d9776f`) and operator #532 (`cfa8d893`).
 - [ ] Complete Phase 4 name fusion, Phase 5 identity-driven briefs and Phase 6 real
       owner acceptance. No release or production result is claimed here.
 

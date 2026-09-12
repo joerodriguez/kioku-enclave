@@ -1012,9 +1012,9 @@ person ID. The route-based `owner_source_role` fallback applies only when that a
 domain has no usable enrolled owner profile. Pending, unmatched, and no-embedding turns
 cannot regain that fallback in an enrolled domain. A mixed diarization cluster uses each
 observation's actual assignment; one owner match does not make its unmatched siblings Me.
-Accepted direct identified-person evidence,
-or an identified person attached to a non-quarantined voice profile, renders that
-person's current display name. Otherwise a durable per-memory slot renders `Speaker A`,
+Accepted direct identified-person evidence renders its own turn's name. Once a voice has
+a name binding, only its current accepted binding can supply the profile's name; a held
+binding suppresses older direct and cluster names while acoustic matching continues. Otherwise a durable per-memory slot renders `Speaker A`,
 `Speaker B`, and so on; a turn without a memory slot renders `Speaker`. Profile identity
 has priority over the request-local cluster when selecting a slot. Letters follow initial
 first speech and remain reserved across later evidence and retained-memory revisions.
@@ -1022,8 +1022,8 @@ Replacement memories inherit eligible predecessor letters with new account-globa
 IDs; genuine merges resolve ordinal collisions deterministically by first speech.
 
 A stored `utterances.speaker_label` is used only when the observation is absent. A
-quarantined profile cannot supply a person's name; independently valid direct evidence
-still applies. `anonymous_profile` produces `verified_voice` attribution even without
+quarantined acoustic profile cannot supply a person's name. A quarantined name binding
+also suppresses direct-name fallback on its assigned turns. `anonymous_profile` produces `verified_voice` attribution even without
 an identified person. Member `speaker_label` and `display_name` agree. Participant details
 are re-derived from the same current graph; stale named projections are never a fallback
 for observed but unresolved turns. Only structurally legacy memories without observed
@@ -1121,6 +1121,29 @@ not user-authored contact data. Recurring detail instead has empty voice labels,
 aliases and facts, plain-language continuity coverage, and its attributed statements.
 Existing REST speaker text filtering keeps its canonical-label behavior; recurring
 person navigation uses opaque IDs.
+
+Name evidence is scoped to an actual voice and its retained source. An explicit own-turn
+self-introduction requires at least 0.90 confidence and no overlapping turn. A full active
+speaker screen name requires three independent frames across two turns or memories, each
+joined to exactly one remote system-audio turn in the same device/session. Vocative names
+require three addressing turns across two memories and two current addressing voices,
+without a competing name holding one third of the votes. Visible attendee context only
+corroborates a probationary candidate across two current memories; mentions and vocabulary
+never bind alone. Names never join people across voices or acoustic domains.
+
+Conflicting accepted names, including a same-name pair proposed for acoustic merging, hold
+the name binding and preserve separate person IDs. Decisions append claim history; unchanged
+evidence and either audio/screen arrival order converge without duplicate decisions.
+Withdrawal, erasure and retention expiry remove unsupported names even while matching is
+paused. Voice sample additions and these name projections leave source and archive IDs intact.
+
+Fact candidates retain their literal source and supplied confidence until the source voice
+has an accepted person. Public facts recheck current attribution even before bounded
+enrichment reaches a changed candidate. Explicit, grounded employer/role replacements
+retire earlier support into temporal history; concurrent roles do not imply replacement.
+Already-paid historical audio retains its transcript under its recorded result contract,
+without inventing confidence for old unscored facts. Export includes typed name inputs,
+current bindings, claim lineage and fact candidates; account/source erasure covers them.
 
 Large histories are available without growing the profile response:
 

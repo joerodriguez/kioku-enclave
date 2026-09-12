@@ -1223,6 +1223,23 @@ async fn purge_paged_members(
         .iter()
         .map(|row| row.try_get::<i64, _>("record_id"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let utterance_ids = record_types
+        .iter()
+        .zip(&record_ids)
+        .filter_map(|(kind, id)| (kind == "utterance").then_some(*id))
+        .collect::<Vec<_>>();
+    let screenshot_ids = record_types
+        .iter()
+        .zip(&record_ids)
+        .filter_map(|(kind, id)| (kind == "screenshot").then_some(*id))
+        .collect::<Vec<_>>();
+    let name_erasure = super::voice_identity::capture_projection_erasure(
+        transaction,
+        account_id,
+        &utterance_ids,
+        &screenshot_ids,
+    )
+    .await?;
     let deleted_members = sqlx::query(
         "DELETE FROM episode_members member USING \
              unnest($3::text[],$4::bigint[]) page(record_type,record_id) \
@@ -1241,16 +1258,6 @@ async fn purge_paged_members(
             "episode deletion member inventory changed before purge".into(),
         ));
     }
-    let utterance_ids = record_types
-        .iter()
-        .zip(&record_ids)
-        .filter_map(|(kind, id)| (kind == "utterance").then_some(*id))
-        .collect::<Vec<_>>();
-    let screenshot_ids = record_types
-        .iter()
-        .zip(&record_ids)
-        .filter_map(|(kind, id)| (kind == "screenshot").then_some(*id))
-        .collect::<Vec<_>>();
     if !utterance_ids.is_empty() {
         let deleted = sqlx::query("DELETE FROM utterances WHERE account_id=$1 AND id=ANY($2)")
             .bind(account_id)
@@ -1277,6 +1284,8 @@ async fn purge_paged_members(
             ));
         }
     }
+    super::voice_identity::recompute_erased_profiles(transaction, account_id, &name_erasure)
+        .await?;
     let mut segment_ids = rows
         .iter()
         .filter_map(|row| {
@@ -2829,6 +2838,13 @@ impl EpisodeDeletionRepository for PostgresPersistence {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let name_erasure = super::voice_identity::capture_projection_erasure(
+            &mut transaction,
+            account_id,
+            &utterance_ids,
+            &screenshot_ids,
+        )
+        .await?;
         if !utterance_ids.is_empty() {
             sqlx::query(
                 "DELETE FROM episode_members WHERE account_id=$1 AND record_type='utterance' \
@@ -2859,6 +2875,12 @@ impl EpisodeDeletionRepository for PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
         }
+        super::voice_identity::recompute_erased_profiles(
+            &mut transaction,
+            account_id,
+            &name_erasure,
+        )
+        .await?;
         if !segment_ids.is_empty() {
             sqlx::query(
                 "DELETE FROM audio_segments s WHERE s.account_id=$1 AND s.id=ANY($2) \
@@ -3794,6 +3816,15 @@ pub(super) async fn test_real_pg_paged_episode_deletion_contract(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn test_purge_paged_identity_members(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account: &str,
+    episode: i64,
+) -> Result<()> {
+    purge_paged_members(transaction, account, episode).await
 }
 
 #[cfg(test)]

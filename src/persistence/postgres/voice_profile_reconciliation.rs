@@ -13,7 +13,7 @@ use crate::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct Member {
     sample: i64,
@@ -150,6 +150,62 @@ async fn population(tx: &mut Transaction<'_, Postgres>, account: &str) -> Result
     Ok(candidates)
 }
 
+pub(super) struct NamePairSnapshot {
+    pub(super) pairs: Vec<(i64, i64)>,
+    pub(super) complete: bool,
+    pub(super) commitment: String,
+    pub(super) people: BTreeMap<i64, Option<i64>>,
+}
+
+/// Uses the reconciler's complete current acoustic population before its
+/// distinct-person permission veto. Binding-induced revisions/statuses are
+/// excluded from this commitment so a hold cannot trigger its own successor.
+pub(super) async fn name_pair_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+) -> Result<NamePairSnapshot> {
+    let candidates = population(tx, account).await?;
+    let complete = candidates.len() <= policy::MAX_PROFILES
+        && candidates.iter().all(|c| c.policy.membership_complete);
+    let profiles = candidates
+        .iter()
+        .map(|c| c.policy.clone())
+        .collect::<Vec<_>>();
+    let pairs = policy::acoustic_pairs(&profiles)
+        .into_iter()
+        .map(|p| (p.left, p.right))
+        .collect();
+    let commitment = digest(
+        &json!({"policy":policy::POLICY_VERSION,"profiles":candidates.iter().map(|c| {
+        json!([c.policy.id,c.policy.space,c.policy.scorer,c.policy.domain,c.policy.centroid,c.policy.samples,
+            c.policy.membership_complete,matches!(c.policy.person_status.as_deref(),Some("owner"|"quarantined")),membership(c)])
+    }).collect::<Vec<_>>()}),
+    );
+    Ok(NamePairSnapshot {
+        pairs,
+        complete,
+        commitment,
+        people: candidates
+            .iter()
+            .map(|c| (c.policy.id, c.bound_person))
+            .collect(),
+    })
+}
+
+async fn held_name_profiles(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+) -> Result<BTreeSet<i64>> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT profile_id FROM profile_name_bindings WHERE account_id=$1 AND status='quarantined'",
+    )
+    .bind(account)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect())
+}
+
 pub(super) async fn adopt_current_policy(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
@@ -248,6 +304,20 @@ async fn apply(
     expected_left: &Candidate,
     expected_right: &Candidate,
 ) -> Result<Option<i64>> {
+    // Re-evaluate current names before the exact application recheck, including
+    // peer changes since the scheduling pass. Holds leave acoustic competitors.
+    let name_changed = super::identity_fusion::reconcile_profiles(
+        tx,
+        account,
+        &[expected_left.policy.id, expected_right.policy.id],
+        true,
+    )
+    .await?;
+    store::refresh_affected_speaker_projections(tx, account, &[], &name_changed, &[]).await?;
+    let held = held_name_profiles(tx, account).await?;
+    if held.contains(&expected_left.policy.id) || held.contains(&expected_right.policy.id) {
+        return Ok(None);
+    }
     // Re-read exact revisions and memberships even though normal workers hold
     // the account lock: a saved proposal can never authorize a later graph.
     let current = population(tx, account).await?;
@@ -350,7 +420,7 @@ async fn apply(
     super::owner_voice::refresh_clusters(tx, account, &clusters).await?;
     store::recompute_profile(tx, account, result, "proposal_result").await?;
     super::voice_recurrence::refresh(tx, account).await?;
-    let result_revision = revision(tx, account, result, proposal, false).await?;
+
     store::refresh_affected_speaker_projections(
         tx,
         account,
@@ -361,6 +431,7 @@ async fn apply(
     .await?;
     sqlx::query("UPDATE voice_profile_proposal_slots p SET applied_status=s.status FROM episode_speaker_slots s WHERE p.account_id=$1 AND p.proposal_id=$2 AND s.account_id=p.account_id AND s.id=p.slot_id").bind(account).bind(proposal).execute(&mut **tx).await?;
     let (slot_count, slots_hash) = slot_commitment(tx, account, proposal).await?;
+    let result_revision = revision(tx, account, result, proposal, false).await?;
     let result_candidate = load(tx, account, result)
         .await?
         .ok_or_else(|| crate::error::EnclaveError::Config("proposal result is absent".into()))?;
@@ -604,6 +675,8 @@ pub(super) async fn reconcile(
     account: &str,
 ) -> Result<Vec<&'static str>> {
     let mut outcomes = Vec::new();
+    let changed = super::identity_fusion::reconcile_profiles(tx, account, &[], true).await?;
+    store::refresh_affected_speaker_projections(tx, account, &[], &changed, &[]).await?;
     let applied:Vec<i64>=sqlx::query_scalar("SELECT id FROM voice_profile_proposals WHERE account_id=$1 AND state='applied' ORDER BY updated_at,id LIMIT $2")
         .bind(account).bind(policy::MAX_PROPOSALS as i64).fetch_all(&mut **tx).await?;
     for proposal in applied {
@@ -624,13 +697,16 @@ pub(super) async fn reconcile(
         }
         // All profiles remain acoustic competitors. Only scheduling filters a
         // pair whose complete assigned support exceeds the application bound.
+        let held = held_name_profiles(tx, account).await?;
         let Some(pair) = policy::merge_pairs(&profiles).into_iter().find(|pair| {
-            candidates
-                .iter()
-                .filter(|c| c.policy.id == pair.left || c.policy.id == pair.right)
-                .map(|c| c.members.len())
-                .sum::<usize>()
-                <= policy::MAX_SAMPLES
+            !held.contains(&pair.left)
+                && !held.contains(&pair.right)
+                && candidates
+                    .iter()
+                    .filter(|c| c.policy.id == pair.left || c.policy.id == pair.right)
+                    .map(|c| c.members.len())
+                    .sum::<usize>()
+                    <= policy::MAX_SAMPLES
         }) else {
             break;
         };

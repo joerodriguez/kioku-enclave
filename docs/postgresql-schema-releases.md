@@ -125,6 +125,11 @@ An idempotent install accepts only the exact receipt; an unreceipted table or ei
 index is refused. Base v26 and signed v27 markers/history remain unchanged, with no
 new triggers on capture or memory source tables.
 
+Phase 4 adds the direct v33 name/fact companion. Typed evidence, current profile name
+bindings, append-only claim links and fact candidates participate in tenant export and
+erasure. The owned catalog receipt is verified at startup/readiness; prior receipts remain
+unchanged and only the exact existing migrator lane installs the tables.
+
 Phase 3 adds the direct v32 profile reconciliation companion. It owns proposal, sample
 membership and original slot-reservation rows, two proposal foreign keys on existing
 lineage tables, and its own selective catalog receipt. Serving startup/readiness verify
@@ -139,6 +144,7 @@ and complete-session orphan erasure, while its schema receipt remains operator s
 
 | `POSTGRES_MIGRATION_CONFIRM` | Inputs and result |
 |---|---|
+| `identity-fusion-v33-install` | Installs the direct name/fact companion; emits `{"status":"installed","feature":"identity_fusion","version":33}`. Requires v32 and preserves prior receipts. |
 | `voice-recurrence-v32-install` | Installs the direct proposal/member/slot companion; emits `{"status":"installed","feature":"voice_recurrence","version":32}`. Requires v31 and preserves prior receipts. |
 | `owner-enrollment-v31-install` | Installs the direct owner-enrollment companion and withdrawal revision; emits `{"status":"installed","feature":"voice_enrollment","version":31}`. Requires the installed v30 companion. |
 | `voice-identity-v30-install` | Seeds `cohort=none`, `paused=false`, `revision=0`; emits `{"status":"installed","feature":"voice_identity","version":30}`. |

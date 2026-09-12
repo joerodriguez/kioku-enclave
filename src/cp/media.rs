@@ -2674,6 +2674,8 @@ pub struct PersonFact {
     pub evidence: String,
     #[serde(default)]
     pub confidence: Option<f64>,
+    #[serde(default)]
+    pub replacement_of: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2780,6 +2782,9 @@ pub(crate) fn parse_audio_result_for_contract(
                     || fact.value.len() > 2_000
                     || fact.evidence.trim().is_empty()
                     || fact.evidence.len() > 2_000
+                    || fact.replacement_of.as_ref().is_some_and(|value| {
+                        value.is_empty() || value.len() > 2_000 || value.bytes().any(|b| b == 0)
+                    })
                     || fact
                         .confidence
                         .is_none_or(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
