@@ -125,8 +125,15 @@ An idempotent install accepts only the exact receipt; an unreceipted table or ei
 index is refused. Base v26 and signed v27 markers/history remain unchanged, with no
 new triggers on capture or memory source tables.
 
+Phase 2 adds the direct v31 owner-enrollment companion. It records the account's
+monotonic withdrawal revision, first accepted enrollment session and per-turn owner
+links. Startup and readiness verify both v30 and v31; the dedicated install preserves
+all earlier receipts. The new account-owned enrollment metadata participates in export
+and complete-session orphan erasure, while its schema receipt remains operator state.
+
 | `POSTGRES_MIGRATION_CONFIRM` | Inputs and result |
 |---|---|
+| `owner-enrollment-v31-install` | Installs the direct owner-enrollment companion and withdrawal revision; emits `{"status":"installed","feature":"voice_enrollment","version":31}`. Requires the installed v30 companion. |
 | `voice-identity-v30-install` | Seeds `cohort=none`, `paused=false`, `revision=0`; emits `{"status":"installed","feature":"voice_identity","version":30}`. |
 | `voice-identity-cohort-set` | Requires `VOICE_IDENTITY_COHORT=none`, `explicit`, or `all`; explicit requires `VOICE_IDENTITY_ACCOUNT_IDS` containing 1–1024 comma-separated stable UUIDs. Other cohorts require no IDs. IDs are sorted/deduplicated; output contains only cohort, count and revision. |
 | `voice-identity-pause` | Sets pause without changing cohort or discarding evidence; output contains pause state and revision. |

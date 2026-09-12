@@ -9,6 +9,9 @@ mod aggregate_audit;
 mod billing;
 mod brief_sections_schema;
 mod capture;
+mod capture_enrollment;
+#[cfg(test)]
+mod capture_enrollment_contract;
 mod capture_recovery;
 #[cfg(test)]
 mod catalog_presence_tests;
@@ -36,16 +39,24 @@ mod orphan_capture_erasure_operator_tests;
 mod orphan_capture_erasure_scope;
 #[cfg(test)]
 mod orphan_capture_erasure_tests;
+mod owner_enrollment_policy;
+mod owner_voice;
 mod playback;
 mod query;
 mod reconciliation_source_audit;
 mod recording_retention;
+#[cfg(test)]
+mod recording_voice_retention_contract;
 mod schema_release;
 mod speaker_identity;
 #[cfg(test)]
 mod speaker_query_contract;
 #[cfg(test)]
 mod speaker_writer_contract;
+mod voice_enrollment;
+#[cfg(test)]
+mod voice_enrollment_contract;
+mod voice_enrollment_schema;
 mod voice_identity;
 mod voice_identity_schema;
 #[cfg(test)]
@@ -262,7 +273,8 @@ impl PostgresPersistence {
         self.install_test_orphan_erasure_schema().await?;
         self.install_morning_email_schema().await?;
         self.install_brief_sections_schema().await?;
-        self.install_voice_identity_schema().await
+        self.install_voice_identity_schema().await?;
+        self.install_voice_enrollment_schema().await
     }
 
     #[cfg(test)]
@@ -966,6 +978,7 @@ mod tests {
         persistence.install_morning_email_schema().await.unwrap();
         persistence.install_brief_sections_schema().await.unwrap();
         persistence.install_voice_identity_schema().await.unwrap();
+        persistence.install_voice_enrollment_schema().await.unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -982,7 +995,7 @@ mod tests {
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
                       'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema', \
-                      'voice_identity_schema','voice_identity_controls');
+                      'voice_identity_schema','voice_identity_controls','voice_enrollment_schema');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;

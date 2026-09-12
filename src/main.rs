@@ -584,6 +584,11 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         && state.postgres.verify_voice_identity_schema().await.is_ok()
         && state
             .postgres
+            .verify_voice_enrollment_schema()
+            .await
+            .is_ok()
+        && state
+            .postgres
             .verify_interrupted_capture_schema()
             .await
             .is_ok();
@@ -1267,6 +1272,12 @@ async fn async_main() {
             panic!("PostgreSQL voice identity schema is not release-ready: {error}")
         });
     postgres
+        .verify_voice_enrollment_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL voice enrollment schema is not release-ready: {error}")
+        });
+    postgres
         .verify_interrupted_capture_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1380,6 +1391,7 @@ async fn async_main() {
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
         .merge(cp::media::router())
+        .merge(cp::voice_enrollment::router())
         .merge(cp::playback::router())
         .merge(cp::retention::router())
         .merge(cp::push::router())
@@ -1590,6 +1602,7 @@ const VOICE_IDENTITY_ACCOUNT_IDS_ENV: &str = "VOICE_IDENTITY_ACCOUNT_IDS";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PostgresMigrationReleasePhase {
     InstallVoiceIdentity,
+    InstallVoiceEnrollment,
     SetVoiceIdentityCohort,
     PauseVoiceIdentity,
     ResumeVoiceIdentity,
@@ -1628,6 +1641,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("owner-enrollment-v31-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallVoiceEnrollment)
+        }
         Some("voice-identity-v30-install") => {
             Ok(PostgresMigrationReleasePhase::InstallVoiceIdentity)
         }
@@ -1903,6 +1919,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallVoiceIdentity => persistence
             .install_voice_identity_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"voice_identity", "version":30})),
+        PostgresMigrationReleasePhase::InstallVoiceEnrollment => persistence
+            .install_voice_enrollment_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"voice_enrollment", "version":31})),
         PostgresMigrationReleasePhase::SetVoiceIdentityCohort => {
             let (cohort, ids) = voice_cohort.as_ref().expect("voice cohort was validated before PostgreSQL connection");
             persistence.set_voice_identity_cohort(*cohort, ids).await
@@ -2010,6 +2029,10 @@ mod postgres_migration_release_tests {
         );
         for (confirmation, expected) in [
             (
+                "owner-enrollment-v31-install",
+                PostgresMigrationReleasePhase::InstallVoiceEnrollment,
+            ),
+            (
                 "voice-identity-v30-install",
                 PostgresMigrationReleasePhase::InstallVoiceIdentity,
             ),
@@ -2097,6 +2120,8 @@ mod postgres_migration_release_tests {
             Some("brief-sections-v29-install "),
             Some("interrupted-capture-v29-install "),
             Some("interrupted-capture-v29"),
+            Some("owner-enrollment-v31-install "),
+            Some("owner-enrollment-v31"),
             Some("voice-identity-v30-install "),
             Some("voice-identity-v30"),
             Some("voice-identity-cohort"),

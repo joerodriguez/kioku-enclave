@@ -2093,6 +2093,11 @@ impl MediaProcessingRepository for PostgresPersistence {
             command.claim.jobs[0].audio_role.as_deref(),
             distinct_speakers,
         );
+        let acoustic_domain = crate::cp::voice_identity::channel_domain(
+            &command.claim.jobs[0].stream_kind,
+            command.claim.jobs[0].audio_role.as_deref(),
+            command.claim.jobs[0].audio_route.as_deref(),
+        );
         let mut cluster_ids = HashMap::<String, i64>::new();
         let mut resolved_people = HashMap::<String, (i64, String)>::new();
         let mut changed_people = HashSet::<i64>::new();
@@ -2111,14 +2116,15 @@ impl MediaProcessingRepository for PostgresPersistence {
                 };
                 sqlx::query(
                     "INSERT INTO speaker_clusters \
-                     (account_id,id,work_unit_id,speaker_local_id,attribution_state) \
-                     VALUES($1,$2,$3,$4,$5)",
+                     (account_id,id,work_unit_id,speaker_local_id,attribution_state,channel_domain) \
+                     VALUES($1,$2,$3,$4,$5,$6)",
                 )
                 .bind(account_id)
                 .bind(id)
                 .bind(&command.claim.work_unit_id)
                 .bind(&turn.speaker_local_id)
                 .bind(initial)
+                .bind(&acoustic_domain)
                 .execute(&mut *transaction)
                 .await?;
                 cluster_ids.insert(turn.speaker_local_id.clone(), id);

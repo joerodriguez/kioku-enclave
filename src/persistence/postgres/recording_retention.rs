@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 
 use crate::{
     cp::isotime,
@@ -17,6 +17,42 @@ use crate::{
 };
 
 use super::{advisory_transaction_lock, PostgresPersistence};
+
+/// Retention mutations share the source/identity gate before their own lock.
+/// Keep the account row last, matching orphan erasure, so FK writes from a
+/// concurrent preview/key install cannot invert an owner-withdrawal lock.
+async fn lock_retention_account(tx: &mut Transaction<'_, Postgres>, account: &str) -> Result<()> {
+    super::activation::lock_activation_contract_key_share_if_installed(tx).await?;
+    advisory_transaction_lock(tx, "memory-reconciliation", account).await?;
+    advisory_transaction_lock(tx, "recording-retention", account).await?;
+    let active: Option<bool> =
+        sqlx::query_scalar("SELECT status='active' FROM accounts WHERE id=$1 FOR UPDATE")
+            .bind(account)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if active != Some(true) {
+        return Err(EnclaveError::Auth("account inactive or deleting".into()));
+    }
+    Ok(())
+}
+
+/// Snapshot source reachability while recording authority still exists. Both
+/// logical withdrawal and physical completion call this idempotent erasure.
+async fn erase_downgraded_voice_samples(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+) -> Result<()> {
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT m.event_id FROM recording_media_authority ra \
+         JOIN media_objects m ON m.account_id=ra.account_id AND m.asset_id=ra.asset_id \
+         WHERE ra.account_id=$1 AND ra.storage_backend='recordings' ORDER BY m.event_id",
+    )
+    .bind(account)
+    .fetch_all(&mut **tx)
+    .await?;
+    let affected = super::voice_identity::erase_event_samples(tx, account, &events).await?;
+    super::voice_identity::recompute_erased_profiles(tx, account, &affected).await
+}
 
 fn timestamp(row: &sqlx::postgres::PgRow, name: &str) -> Result<String> {
     Ok(isotime::format_epoch_millis(row.try_get::<i64, _>(name)?))
@@ -251,7 +287,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
             &inventory.inventory_fingerprint,
         );
         let mut transaction = self.pool().begin().await?;
-        advisory_transaction_lock(&mut transaction, "recording-retention", account_id).await?;
+        lock_retention_account(&mut transaction, account_id).await?;
         let current = load_preference(&mut *transaction, account_id).await?;
         if current.revision != expected_revision || current.operation_state.is_some() {
             return Err(EnclaveError::Conflict(
@@ -331,7 +367,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
         let operation_id = format!("rrc_{}", crate::cp::tokens::random_token_hex());
         let proposed_epoch = format!("rpe_{}", crate::cp::tokens::random_token_hex());
         let mut transaction = self.pool().begin().await?;
-        advisory_transaction_lock(&mut transaction, "recording-retention", account_id).await?;
+        lock_retention_account(&mut transaction, account_id).await?;
         if let Some(row) = sqlx::query(
             "SELECT request_fingerprint,operation_id,resulting_policy policy,resulting_revision revision,state, \
                     floor(extract(epoch FROM updated_at)*1000)::bigint updated_at_ms \
@@ -446,6 +482,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
                 .bind(account_id)
                 .execute(&mut *transaction)
                 .await?;
+            erase_downgraded_voice_samples(&mut transaction, account_id).await?;
         }
         let row = sqlx::query(
             "INSERT INTO recording_retention_changes \
@@ -520,7 +557,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
             return Err(EnclaveError::NotFound);
         }
         let mut transaction = self.pool().begin().await?;
-        advisory_transaction_lock(&mut transaction, "recording-retention", account_id).await?;
+        lock_retention_account(&mut transaction, account_id).await?;
         let row = sqlx::query(
             "SELECT resulting_policy policy,resulting_revision revision,state, \
                     floor(extract(epoch FROM updated_at)*1000)::bigint updated_at_ms \
@@ -551,6 +588,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
                 "recording retention deletion fence changed".into(),
             ));
         }
+        erase_downgraded_voice_samples(&mut transaction, account_id).await?;
         sqlx::query(
             "UPDATE media_objects m SET processing_state='pruned',object_generation=NULL,deleted_at=now() \
               WHERE m.account_id=$1 AND EXISTS (SELECT 1 FROM recording_media_authority ra \
@@ -602,7 +640,7 @@ impl RecordingRetentionRepository for PostgresPersistence {
             ));
         }
         let mut transaction = self.pool().begin().await?;
-        advisory_transaction_lock(&mut transaction, "recording-retention", account_id).await?;
+        lock_retention_account(&mut transaction, account_id).await?;
         let preference = load_preference(&mut *transaction, account_id).await?;
         if preference.policy != RecordingRetentionPolicy::UntilDeleted
             || preference.revision != policy_revision

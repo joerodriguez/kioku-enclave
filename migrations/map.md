@@ -5,6 +5,12 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0031_voice_enrollment.sql` adds the account withdrawal revision, first-accepted
+  enrollment session metadata, owner singleton and per-observation voice/evidence
+  links through the direct `owner-enrollment-v31-install` companion. Its receipt
+  verifies only its owned catalog and leaves prior base/activation history intact.
+  Serving verifies this companion; no enrollment start or rollout state machine
+  is introduced.
 - `0030_voice_identity.sql` installs the independently receipted, default-off voice
   cohort/pause singleton, observation/version sample uniqueness, and claim index.
   Only `voice-identity-v30-install` installs it; the digest-pinned migrator's

@@ -38,6 +38,14 @@ pub(super) fn speaker_identity_join(
     include_str!("speaker_identity.sql")
         .replace("__UTTERANCE__", alias)
         .replace("__MEMORY__", &memory)
+        .replace(
+            "__EMBEDDING_SPACE__",
+            crate::cp::voice_memory::EMBEDDING_SPACE,
+        )
+        .replace(
+            "__SCORER_VERSION__",
+            &crate::cp::voice_quality::SCORER_VERSION.to_string(),
+        )
 }
 
 /// Static aliases only. Legacy participants are eligible only when no assigned
@@ -308,7 +316,8 @@ async fn episode_fence_sql(tx: &mut Transaction<'_, Postgres>) -> Result<String>
 // appending members or deleting/replacing slots during a mixed release.
 fn projection_signature_sql() -> &'static str {
     "encode(sha256(convert_to(jsonb_build_array(\
-      (SELECT coalesce(jsonb_agg(jsonb_build_array(u.id,u.speaker_observation_id,o.started_at,o.cluster_id,o.person_id,o.direct_evidence_id,c.voice_profile_id,c.person_id,c.attribution_state,v.person_id,v.status,op.status,op.display_name,cp.status,cp.display_name,vp.status,vp.display_name) ORDER BY u.id),'[]'::jsonb) FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id LEFT JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id LEFT JOIN voice_profiles v ON v.account_id=c.account_id AND v.id=c.voice_profile_id LEFT JOIN people op ON op.account_id=o.account_id AND op.id=o.person_id LEFT JOIN people cp ON cp.account_id=c.account_id AND cp.id=c.person_id LEFT JOIN people vp ON vp.account_id=v.account_id AND vp.id=v.person_id WHERE m.account_id=e.account_id AND m.episode_id=e.id AND m.record_type='utterance'),\
+      (SELECT coalesce(jsonb_agg(jsonb_build_array(u.id,u.speaker_observation_id,o.started_at,o.cluster_id,o.person_id,o.direct_evidence_id,o.voice_profile_id,o.voice_sample_id,o.owner_evidence_id,c.voice_profile_id,c.person_id,c.attribution_state,c.owner,c.profile_updates_quarantined,c.channel_domain,v.person_id,v.status,v.sample_count,owner_evidence.status,owner_sample.accepted,op.status,op.display_name,cp.status,cp.display_name,vp.status,vp.display_name) ORDER BY u.id),'[]'::jsonb) FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id LEFT JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id LEFT JOIN voice_profiles v ON v.account_id=c.account_id AND v.id=coalesce(o.voice_profile_id,c.voice_profile_id) LEFT JOIN identity_evidence owner_evidence ON owner_evidence.account_id=o.account_id AND owner_evidence.id=o.owner_evidence_id LEFT JOIN voice_samples owner_sample ON owner_sample.account_id=o.account_id AND owner_sample.id=o.voice_sample_id LEFT JOIN people op ON op.account_id=o.account_id AND op.id=o.person_id LEFT JOIN people cp ON cp.account_id=c.account_id AND cp.id=c.person_id LEFT JOIN people vp ON vp.account_id=v.account_id AND vp.id=v.person_id WHERE m.account_id=e.account_id AND m.episode_id=e.id AND m.record_type='utterance'),\
+      (SELECT coalesce(jsonb_agg(jsonb_build_array(owner_profile.id,owner_profile.channel_domain,owner_profile.status,owner_profile.sample_count,owner_profile.embedding_space,owner_profile.scorer_version) ORDER BY owner_profile.id),'[]'::jsonb) FROM voice_profiles owner_profile JOIN people owner ON owner.account_id=owner_profile.account_id AND owner.id=owner_profile.person_id AND owner.status='owner' WHERE owner_profile.account_id=e.account_id),\
       (SELECT coalesce(jsonb_agg(jsonb_build_array(s.id,s.voice_profile_id,s.speaker_cluster_id,s.slot_ordinal,s.status) ORDER BY s.id),'[]'::jsonb) FROM episode_speaker_slots s WHERE s.account_id=e.account_id AND s.episode_id=e.id),\
       (SELECT coalesce(jsonb_agg(jsonb_build_array(p.id,p.participant_key,p.person_id,p.speaker_slot_id,p.attribution_kind,p.state,p.derivation_version,p.source_claimed_name) ORDER BY p.id),'[]'::jsonb) FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id)\
     )::text,'UTF8')),'hex')"
@@ -354,7 +363,7 @@ fn key_columns(key: SpeakerVoiceKey) -> (Option<i64>, Option<i64>) {
 }
 fn priority(kind: &str) -> u8 {
     match kind {
-        "owner_source_role" | "direct_identity_evidence" => 3,
+        "owner_voice" | "owner_source_role" | "direct_identity_evidence" => 3,
         "verified_voice" => 2,
         _ => 1,
     }
@@ -373,6 +382,7 @@ pub(super) async fn refresh_episode_speaker_projections(
     if targets.is_empty() || !account_writable(tx, account_id).await? {
         return Ok(report);
     }
+    super::owner_voice::prepare_domains(tx, account_id).await?;
     let fence = episode_fence_sql(tx).await?;
     let ids = targets
         .iter()
@@ -480,6 +490,7 @@ pub(super) async fn prepare_speaker_projection_page(
         tx.commit().await?;
         return Ok(SpeakerPreparationPage::default());
     }
+    super::owner_voice::prepare_domains(&mut tx, account_id).await?;
     let fence = episode_fence_sql(&mut tx).await?;
     let sql=format!("SELECT e.id FROM episodes e WHERE e.account_id=$1 AND ($2::bigint[] IS NULL OR e.id=ANY($2)) AND ($3::bigint IS NULL OR e.id>$3) AND ({fence}) AND (EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id AND p.derivation_version=2) OR EXISTS(SELECT 1 FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id LEFT JOIN people person ON person.account_id=o.account_id AND person.id=o.person_id AND person.status='identified' AND nullif(btrim(person.display_name),'') IS NOT NULL WHERE m.account_id=e.account_id AND m.episode_id=e.id AND m.record_type='utterance' AND (c.id IS NOT NULL OR person.id IS NOT NULL OR EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id)))) AND NOT EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id AND p.derivation_version=2 AND p.evidence->>'speaker_signature'={signature}) ORDER BY e.id LIMIT $4",signature=projection_signature_sql());
     let mut ids = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
@@ -599,7 +610,7 @@ pub(super) async fn load_episode_participant_details(
             let owner = key == "owner"
                 || matches!(
                     kind.as_str(),
-                    "owner" | "owner_presentation" | "owner_source_role"
+                    "owner" | "owner_presentation" | "owner_source_role" | "owner_voice"
                 );
             let name = if owner {
                 "Me".to_owned()

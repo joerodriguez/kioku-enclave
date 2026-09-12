@@ -244,6 +244,12 @@ impl RecordingMediaAuthorityDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureEnrollmentKind {
+    OwnerVoice,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureEventManifest {
@@ -279,6 +285,10 @@ pub struct CaptureEventManifest {
     pub route_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_retention: Option<RecordingRetentionCaptureAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment: Option<CaptureEnrollmentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_revision: Option<i64>,
 }
 
 impl CaptureEventManifest {
@@ -1117,6 +1127,11 @@ fn validate_reference_batch(
     let mut manifest_digests = Vec::with_capacity(request.events.len());
     for event in &request.events {
         event.validate()?;
+        if event.enrollment.is_some() || event.enrollment_revision.is_some() {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batches do not admit voice enrollment".into(),
+            ));
+        }
         if event.stream_kind != StreamKind::MacScreen
             || event.media_disposition != MediaDisposition::Reference
         {
@@ -1323,6 +1338,19 @@ async fn upload_screen_reference_batch(
             )
         }
     };
+    if let Err(error) = state
+        .repositories
+        .captures()
+        .preflight_reference_batch_enrollment(&user_id, &request.events[0].capture_session_id)
+        .await
+    {
+        return capture_error_response_for_route(
+            "screen_reference_batch",
+            started_at,
+            manifest,
+            error,
+        );
+    }
     let concurrency_holder = format!("{}:{:032x}", request.batch_id, rand::random::<u128>());
     let _batch_permit = match limits::try_acquire_concurrency(
         &state.repositories,
@@ -3105,5 +3133,89 @@ mod lost_response_adoption_tests {
             .await,
             Err(EnclaveError::Conflict(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod enrollment_manifest_tests {
+    use super::*;
+
+    const LEGACY: &str = r#"{"schema_version":2,"event_id":"event","device_id":"device","install_id":"install","capture_session_id":"session","stream_id":"stream","stream_kind":"mic","sequence":0,"source_wall_at":"2026-09-01T12:00:00Z","source_monotonic_ns":0,"started_at":"2026-09-01T12:00:00Z","ended_at":"2026-09-01T12:00:04Z","timezone_id":"UTC","utc_offset_minutes":0,"clock_uncertainty_ms":0,"context":null,"audio_role":"ambient","audio_route":"builtin_mic"}"#;
+
+    #[test]
+    fn enrollment_manifest_preserves_unmarked_bytes_and_binds_marker_revision() {
+        let mut manifest: CaptureEventManifest = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(
+            serde_json::to_string(&manifest).unwrap(),
+            LEGACY,
+            "absent enrollment fields must preserve existing serialized receipt bytes"
+        );
+        let ordinary = manifest_digest(&manifest).unwrap();
+        manifest.enrollment = Some(CaptureEnrollmentKind::OwnerVoice);
+        manifest.enrollment_revision = Some(0);
+        let marked = manifest_digest(&manifest).unwrap();
+        assert_ne!(
+            marked, ordinary,
+            "enrollment designation must participate in the capture digest"
+        );
+        manifest.enrollment_revision = Some(1);
+        assert_ne!(
+            manifest_digest(&manifest).unwrap(),
+            marked,
+            "withdrawal revision must participate in the capture digest"
+        );
+        let roundtrip: CaptureEventManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.enrollment,
+            Some(CaptureEnrollmentKind::OwnerVoice)
+        );
+        assert_eq!(roundtrip.enrollment_revision, Some(1));
+        let mut invalid: serde_json::Value = serde_json::from_str(LEGACY).unwrap();
+        invalid["enrollment"] = json!("other_voice");
+        assert!(
+            serde_json::from_value::<CaptureEventManifest>(invalid).is_err(),
+            "enrollment marker must be a closed vocabulary"
+        );
+    }
+
+    #[test]
+    fn enrollment_reference_batch_marker_is_rejected_before_admission() {
+        let mut event: CaptureEventManifest = serde_json::from_str(LEGACY).unwrap();
+        event.stream_kind = StreamKind::MacScreen;
+        event.media_disposition = MediaDisposition::Reference;
+        event.audio_role = None;
+        event.audio_route = None;
+        event.reference = Some(serde_json::from_value(json!({
+            "canonical_event_id":"canonical", "canonical_asset_id":"asset", "canonical_media_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "perceptual_hash":"0000000000000000", "hamming_distance":0,"pixel_change_ratio":0.0,"context_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","dedupe_version":1
+        })).unwrap());
+        event.context = Some(serde_json::from_value(json!({"capture_status":"stable"})).unwrap());
+        let mut request = ScreenReferenceBatchRequest {
+            schema_version: 1,
+            batch_id: "batch".into(),
+            events: vec![event],
+        };
+        request.batch_id = reference_batch_id(&request.events).unwrap();
+        // The valid baseline is required so a different schema error cannot pass this regression.
+        validate_reference_batch(&request).unwrap();
+        request.events[0].enrollment = Some(CaptureEnrollmentKind::OwnerVoice);
+        assert!(
+            validate_reference_batch(&request)
+                .err()
+                .expect("enrollment refused")
+                .to_string()
+                .contains("do not admit voice enrollment"),
+            "marked batches must fail at the enrollment boundary"
+        );
+        request.events[0].enrollment = None;
+        request.events[0].enrollment_revision = Some(0);
+        assert!(
+            validate_reference_batch(&request)
+                .err()
+                .expect("enrollment refused")
+                .to_string()
+                .contains("do not admit voice enrollment"),
+            "revision-only batches must fail at the enrollment boundary"
+        );
     }
 }

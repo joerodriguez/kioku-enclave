@@ -38,6 +38,7 @@ pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub(crate) mod voice_enrollment;
 pub mod voice_eval;
 pub mod voice_eval_assets;
 pub mod voice_eval_evidence;

@@ -1,7 +1,9 @@
 LEFT JOIN LATERAL (
     WITH RECURSIVE basis AS (
-        SELECT o.id AS observation_id,c.id AS speaker_cluster_id,c.voice_profile_id,
-               coalesce(c.attribution_state='owner_transmit',false) AS owner_source,
+        SELECT o.id AS observation_id,c.id AS speaker_cluster_id,vp.id AS voice_profile_id,
+               (owner_match.valid OR (coalesce(c.attribution_state='owner_transmit',false)
+                   AND NOT owner_domain.recognized)) AS owner_source,
+               owner_match.valid AS owner_voice,
                op.id AS observation_person_id,cp.id AS cluster_person_id,
                pp.id AS profile_person_id,op.display_name AS observation_name,
                cp.display_name AS cluster_name,pp.display_name AS profile_name,
@@ -12,14 +14,44 @@ LEFT JOIN LATERAL (
           LEFT JOIN speaker_observations o
             ON o.account_id=__UTTERANCE__.account_id AND o.id=__UTTERANCE__.speaker_observation_id
           LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id
-          LEFT JOIN voice_profiles vp ON vp.account_id=c.account_id AND vp.id=c.voice_profile_id
+          LEFT JOIN voice_profiles vp ON vp.account_id=o.account_id
+            AND vp.id=coalesce(o.voice_profile_id,CASE WHEN NOT coalesce(c.profile_updates_quarantined,false)
+                AND NOT coalesce(c.owner,false) THEN c.voice_profile_id END)
           LEFT JOIN people op ON op.account_id=o.account_id AND op.id=o.person_id
             AND op.status='identified' AND nullif(btrim(op.display_name),'') IS NOT NULL
           LEFT JOIN people cp ON cp.account_id=c.account_id AND cp.id=c.person_id
+            AND NOT coalesce(c.profile_updates_quarantined,false)
             AND cp.status='identified' AND nullif(btrim(cp.display_name),'') IS NOT NULL
           LEFT JOIN people pp ON pp.account_id=vp.account_id AND pp.id=vp.person_id
             AND vp.status<>'quarantined' AND pp.status='identified'
             AND nullif(btrim(pp.display_name),'') IS NOT NULL
+          CROSS JOIN LATERAL (
+              SELECT EXISTS(SELECT 1 FROM voice_profiles owner_profile
+                  JOIN people owner ON owner.account_id=owner_profile.account_id
+                    AND owner.id=owner_profile.person_id AND owner.status='owner'
+                  WHERE owner_profile.account_id=o.account_id
+                    AND owner_profile.channel_domain=c.channel_domain
+                    AND owner_profile.embedding_space='__EMBEDDING_SPACE__'
+                    AND owner_profile.scorer_version=__SCORER_VERSION__
+                    AND owner_profile.status<>'quarantined' AND owner_profile.sample_count>0) recognized
+          ) owner_domain
+          CROSS JOIN LATERAL (
+              SELECT EXISTS(SELECT 1 FROM identity_evidence evidence
+                  JOIN people owner ON owner.account_id=evidence.account_id
+                    AND owner.id=evidence.person_id AND owner.status='owner'
+                  JOIN voice_samples sample ON sample.account_id=evidence.account_id
+                    AND sample.id=o.voice_sample_id AND sample.speaker_observation_id=o.id
+                    AND sample.voice_profile_id=vp.id AND sample.accepted
+                  WHERE evidence.account_id=o.account_id AND evidence.id=o.owner_evidence_id
+                    AND evidence.speaker_observation_id=o.id AND evidence.person_id=o.person_id
+                    AND evidence.voice_profile_id=vp.id AND vp.person_id=owner.id
+                    AND evidence.kind IN ('owner_enrollment','owner_voice') AND evidence.status='accepted'
+                    AND evidence.evidence->>'voice_sample_id'=sample.id::text
+                    AND vp.status<>'quarantined' AND vp.sample_count>0
+                    AND vp.embedding_space='__EMBEDDING_SPACE__' AND vp.scorer_version=__SCORER_VERSION__
+                    AND sample.embedding_space=vp.embedding_space AND sample.scorer_version=vp.scorer_version
+                    AND sample.channel_domain=vp.channel_domain) valid
+          ) owner_match
     ), resolved AS (
         -- Direct evidence is independently authoritative. A propagated profile
         -- person cannot override it; conflicting direct sources abstain.
@@ -28,7 +60,7 @@ LEFT JOIN LATERAL (
                     ELSE coalesce(observation_person_id,cluster_person_id,profile_person_id) END AS person_id,
                CASE WHEN owner_source OR identity_conflict THEN NULL
                     ELSE coalesce(observation_name,cluster_name,profile_name) END AS person_name,
-               CASE WHEN owner_source THEN 'owner_source_role'
+               CASE WHEN owner_voice THEN 'owner_voice' WHEN owner_source THEN 'owner_source_role'
                     WHEN NOT identity_conflict AND coalesce(observation_person_id,cluster_person_id) IS NOT NULL
                         THEN 'direct_identity_evidence'
                     WHEN voice_profile_id IS NOT NULL THEN 'verified_voice'

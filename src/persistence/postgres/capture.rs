@@ -217,8 +217,10 @@ async fn validate_new_event_admission(
     let Some(session) = session else {
         return Ok(());
     };
-    if session.try_get::<String, _>("device_id")? != manifest.device_id
-        || session.try_get::<String, _>("install_id")? != manifest.install_id
+    if (session.try_get::<String, _>("device_id")? != manifest.device_id
+        || session.try_get::<String, _>("install_id")? != manifest.install_id)
+        && !super::capture_enrollment::admits_new_device_stream(connection, account_id, manifest)
+            .await?
     {
         return Err(EnclaveError::Conflict(
             "capture session ID was reused across devices or installs".into(),
@@ -452,8 +454,14 @@ async fn upsert_session_and_stream(
     .fetch_optional(&mut **transaction)
     .await?;
     let session_ended = if let Some(session) = session {
-        if session.try_get::<String, _>("device_id")? != manifest.device_id
-            || session.try_get::<String, _>("install_id")? != manifest.install_id
+        if (session.try_get::<String, _>("device_id")? != manifest.device_id
+            || session.try_get::<String, _>("install_id")? != manifest.install_id)
+            && !super::capture_enrollment::admits_new_device_stream(
+                transaction,
+                account_id,
+                manifest,
+            )
+            .await?
         {
             return Err(EnclaveError::Conflict(
                 "capture session ID was reused across devices or installs".into(),
@@ -1040,6 +1048,13 @@ async fn insert_event(
         MediaDisposition::Reference => {}
     }
     let committed_at_ms = timestamp(&command.committed_at, "committed_at")?;
+    let session_was_new: bool = !sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM capture_sessions WHERE account_id=$1 AND id=$2)",
+    )
+    .bind(&command.account_id)
+    .bind(&manifest.capture_session_id)
+    .fetch_one(&mut **transaction)
+    .await?;
     let seal_reopen = upsert_session_and_stream(transaction, &command.account_id, manifest).await?;
     let sequence_used = if capture_formation_contract_installed(transaction).await? {
         sqlx::query_scalar::<_, bool>(
@@ -1434,6 +1449,13 @@ async fn insert_event(
         )
         .await?;
     }
+    super::capture_enrollment::record_event(
+        transaction,
+        &command.account_id,
+        manifest,
+        session_was_new,
+    )
+    .await?;
     Ok(CaptureCommitResult {
         duplicate: false,
         committed_through_sequence,
@@ -1633,6 +1655,12 @@ async fn postgres_session_status(
             top_contexts,
         },
         memories,
+        enrollment: super::capture_enrollment::status(
+            &mut *persistence.pool().acquire().await?,
+            account_id,
+            capture_session_id,
+        )
+        .await?,
     }))
 }
 
@@ -1790,6 +1818,19 @@ impl CaptureRepository for PostgresPersistence {
         Ok(result)
     }
 
+    async fn preflight_reference_batch_enrollment(
+        &self,
+        account_id: &str,
+        capture_session_id: &str,
+    ) -> Result<()> {
+        super::capture_enrollment::refuse_reference_batch(
+            &mut *self.pool().acquire().await?,
+            account_id,
+            capture_session_id,
+        )
+        .await
+    }
+
     async fn commit_reference_batch(
         &self,
         command: ReferenceBatchCommit,
@@ -1808,6 +1849,19 @@ impl CaptureRepository for PostgresPersistence {
         )
         .await?;
         require_active_account(&mut transaction, &command.account_id).await?;
+        for manifest in &command.events {
+            if manifest.enrollment.is_some() || manifest.enrollment_revision.is_some() {
+                return Err(EnclaveError::InvalidRequest(
+                    "reference batches do not admit voice enrollment".into(),
+                ));
+            }
+            super::capture_enrollment::refuse_reference_batch(
+                &mut transaction,
+                &command.account_id,
+                &manifest.capture_session_id,
+            )
+            .await?;
+        }
         let mut new_count = 0usize;
         let mut duplicate_count = 0usize;
         let mut committed_through_sequence = -1;

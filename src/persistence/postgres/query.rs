@@ -85,6 +85,11 @@ const EXPORT_TABLES: &[(&str, &str, &str)] = &[
         "reconciliation_id,record_type,record_id",
     ),
     ("capture_sessions", "capture_sessions", "created_at,id"),
+    (
+        "voice_enrollment_sessions",
+        "voice_enrollment_sessions",
+        "created_at,capture_session_id",
+    ),
     ("capture_streams", "capture_streams", "created_at,id"),
     ("capture_events", "capture_events", "started_at,event_id"),
     (
@@ -173,6 +178,7 @@ const EXPORT_TABLES: &[(&str, &str, &str)] = &[
 // silently become public merely because it was added to an internal table.
 fn export_projection(table: &str) -> &'static str {
     match table {
+        "voice_enrollment_sessions" => "capture_session_id,designated,enrollment_revision,state,reason,channel_domain,timeline_started_at,timeline_cutoff_at,created_at,updated_at",
         "voice_samples" => "id,speaker_observation_id,voice_profile_id,embedding_space,channel_domain,quality_score,diagnostics,quality_version,scorer_version,eligibility,duration_ms,speech_ratio,snr_proxy_db,clipping_ratio,silence_ratio,embedding_norm,outlier,similarity,decision_margin,accepted,embedding_job_id,created_at",
         "voice_profiles" => "id,person_id,label,embedding_space,channel_domain,sample_count,scorer_version,representative_kind,medoid_sample_id,status,created_at,updated_at",
         "voice_profile_revisions" => "id,profile_id,status,derivation_version,scorer_version,representative_kind,sample_count,medoid_sample_id,person_id,proposal_id,predecessor_revision_id,reason_code,active,created_at",
