@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn enrollment_policy_never_enrolls_an_embedding_crossing_the_capture_cutoff() {
         let crossing = speech(2, Some(1), 175_000, 205_000);
-        assert!(matches!(decide(&[crossing.clone()],0),Err(VoiceEnrollmentReason::NoEligibleSample)),"a five-second clipped interval cannot enroll its thirty-second embedding that includes post-cutoff audio");
+        assert!(matches!(decide(std::slice::from_ref(&crossing),0),Err(VoiceEnrollmentReason::NoEligibleSample)),"a five-second clipped interval cannot enroll its thirty-second embedding that includes post-cutoff audio");
         let valid = speech(1, Some(1), 0, 10_000);
         assert_eq!(decide(&[valid,crossing],0).unwrap().samples,vec![(1,1)],"crossing speech belongs in dominance but its untrimmed embedding must stay outside enrollment evidence");
     }
