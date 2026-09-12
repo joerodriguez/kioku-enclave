@@ -336,6 +336,58 @@ async fn owner_enrollment_forget_erases_historical_biometrics_and_fences_queued_
 }
 
 #[tokio::test]
+async fn stored_owner_matching_holds_expired_support_beyond_the_cleanup_page() {
+    let Some(fixture) = super::tests::test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "owner-cleanup-backlog";
+    repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+        .await
+        .unwrap();
+    turn(repo, account, "old", 1, 1).await;
+    repo.settle_voice_embedding(
+        &claim(repo, account).await,
+        sample(1, SampleDecision::Quarantine),
+    )
+    .await
+    .unwrap();
+    turn(repo, account, "queued", 4, 4).await;
+    repo.settle_voice_embedding(
+        &claim(repo, account).await,
+        sample(0, SampleDecision::MatchOnly),
+    )
+    .await
+    .unwrap();
+    // A realistic retained-derivation backlog: older policy samples of one
+    // expired source precede the ordinary owner-voice contribution by ID.
+    sqlx::query("INSERT INTO voice_samples(account_id,id,speaker_observation_id,embedding_space,channel_domain,embedding,quality_score,diagnostics,quality_version,scorer_version,eligibility,accepted,embedding_job_id) SELECT s.account_id,copy.id,s.speaker_observation_id,s.embedding_space,s.channel_domain,s.embedding,s.quality_score,s.diagnostics,copy.id,s.scorer_version,s.eligibility,s.accepted,s.embedding_job_id FROM voice_samples s CROSS JOIN generate_series(10,508) copy(id) WHERE s.account_id=$1 AND s.speaker_observation_id=1").bind(account).execute(repo.pool()).await.unwrap();
+    enroll(repo, account, "enrollment", 2).await;
+    turn(repo, account, "ordinary", 3, 3).await;
+    embed(repo, account, 0).await;
+    sqlx::query("UPDATE media_objects SET retain_until=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND event_id IN ('event-1','event-3')").bind(account).execute(repo.pool()).await.unwrap();
+    repo.maintain_owner_voice_enrollment(account).await.unwrap();
+    repo.maintain_voice_profiles(account).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_,Option<i64>>("SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=4").bind(account).fetch_one(repo.pool()).await.unwrap(),None,
+        "stored matching must hold an owner centroid with expired support beyond the cleanup page");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=3"
+        )
+        .bind(account)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap(),
+        1,
+        "the expiry fixture must leave the stale owner contribution beyond the first page"
+    );
+    repo.maintain_voice_profiles(account).await.unwrap();
+    assert!(sqlx::query_scalar::<_,bool>("SELECT o.owner_evidence_id IS NOT NULL FROM speaker_observations o WHERE o.account_id=$1 AND o.id=4").bind(account).fetch_one(repo.pool()).await.unwrap(),
+        "stored matching may resume after the owner centroid has been recomputed from retained support");
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
 async fn owner_enrollment_raw_expiry_recomputes_partial_then_complete_support() {
     let Some(fixture) = super::tests::test_persistence().await else {
         return;
@@ -354,6 +406,8 @@ async fn owner_enrollment_raw_expiry_recomputes_partial_then_complete_support() 
     repo.maintain_owner_voice_enrollment(account).await.unwrap();
     let profile = owner_profile(repo, account).await;
     sqlx::query("UPDATE media_objects SET retain_until=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND event_id='event-1'").bind(account).execute(repo.pool()).await.unwrap();
+    repo.owner_voice_enrollment_status(account).await.unwrap();
+    repo.maintain_voice_profiles(account).await.unwrap();
     let partial = repo.owner_voice_enrollment_status(account).await.unwrap();
     assert_eq!(
         partial.latest_attempt.as_ref().unwrap().reason,

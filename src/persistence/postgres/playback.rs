@@ -361,13 +361,14 @@ impl PlaybackRepository for PostgresPersistence {
         durable_read: Option<&DurableReadFence>,
     ) -> Result<PersonMemoriesPage> {
         crate::gcs::validate_user_id(account_id)?;
+        super::voice_identity::maintain_profiles(self, account_id).await?;
         super::speaker_identity::prepare_account_speaker_projections(self, account_id).await?;
         let mut transaction = self.pool().begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *transaction)
             .await?;
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM people WHERE account_id=$1 AND id=$2 AND status='identified')",
+            "SELECT EXISTS(SELECT 1 FROM people WHERE account_id=$1 AND id=$2 AND status IN ('identified','recurring'))",
         )
         .bind(account_id)
         .bind(person_id)

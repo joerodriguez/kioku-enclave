@@ -1,4 +1,4 @@
-//! PostgreSQL voice leases, session-local continuity and erasure recomputation.
+//! PostgreSQL voice leases, scoped continuity, retained-sample reconsideration and erasure.
 use super::{
     activation::lock_activation_contract_key_share_if_installed,
     advisory_transaction_lock, allocate_content_id, current_schema_relation_exists,
@@ -22,18 +22,21 @@ use sqlx::{Postgres, Row, Transaction};
 
 // o is a speaker observation. Every source must be retained, including the
 // canonical inventory row. Missing inventory is expiry, never a provider read.
-const RETAINED: &str = "EXISTS(SELECT 1 FROM speaker_observation_sources s WHERE s.account_id=o.account_id AND s.speaker_observation_id=o.id) AND NOT EXISTS(SELECT 1 FROM speaker_observation_sources s LEFT JOIN media_objects m ON m.account_id=s.account_id AND m.event_id=s.event_id WHERE s.account_id=o.account_id AND s.speaker_observation_id=o.id AND (m.event_id IS NULL OR m.deleted_at IS NOT NULL OR m.processing_state='pruned' OR m.object_generation IS NULL OR m.object_generation<=0 OR m.object_backend IS DISTINCT FROM 'current' OR (m.retain_until IS NOT NULL AND m.retain_until<=clock_timestamp()))) AND NOT EXISTS(SELECT 1 FROM speaker_observation_sources source JOIN media_objects retained_media ON retained_media.account_id=source.account_id AND retained_media.event_id=source.event_id JOIN recording_media_authority authority ON authority.account_id=retained_media.account_id AND authority.asset_id=retained_media.asset_id AND authority.storage_backend='recordings' WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND NOT EXISTS(SELECT 1 FROM recording_retention_preferences preference WHERE preference.account_id=authority.account_id AND preference.policy='until_deleted' AND preference.revision=authority.retention_policy_revision AND preference.policy_epoch=authority.retention_policy_epoch AND preference.revocation_cutoff IS NULL))";
+pub(super) const RETAINED: &str = "EXISTS(SELECT 1 FROM speaker_observation_sources s WHERE s.account_id=o.account_id AND s.speaker_observation_id=o.id) AND NOT EXISTS(SELECT 1 FROM speaker_observation_sources s LEFT JOIN media_objects m ON m.account_id=s.account_id AND m.event_id=s.event_id WHERE s.account_id=o.account_id AND s.speaker_observation_id=o.id AND (m.event_id IS NULL OR m.deleted_at IS NOT NULL OR m.processing_state='pruned' OR m.object_generation IS NULL OR m.object_generation<=0 OR m.object_backend IS DISTINCT FROM 'current' OR (m.retain_until IS NOT NULL AND m.retain_until<=clock_timestamp()))) AND NOT EXISTS(SELECT 1 FROM speaker_observation_sources source JOIN media_objects retained_media ON retained_media.account_id=source.account_id AND retained_media.event_id=source.event_id JOIN recording_media_authority authority ON authority.account_id=retained_media.account_id AND authority.asset_id=retained_media.asset_id AND authority.storage_backend='recordings' WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND NOT EXISTS(SELECT 1 FROM recording_retention_preferences preference WHERE preference.account_id=authority.account_id AND preference.policy='until_deleted' AND preference.revision=authority.retention_policy_revision AND preference.policy_epoch=authority.retention_policy_epoch AND preference.revocation_cutoff IS NULL))";
 const FENCED: &str = "EXISTS(SELECT 1 FROM utterances u JOIN episode_members member ON member.account_id=u.account_id AND member.record_type='utterance' AND member.record_id=u.id JOIN episode_deletions d ON d.account_id=member.account_id AND d.episode_id=member.episode_id AND d.state='pending' WHERE u.account_id=o.account_id AND u.speaker_observation_id=o.id) OR EXISTS(SELECT 1 FROM orphan_capture_erasure_operations operation WHERE operation.account_id=o.account_id AND operation.capture_upload_fenced) OR EXISTS(SELECT 1 FROM speaker_observation_sources s JOIN capture_events e ON e.account_id=s.account_id AND e.event_id=s.event_id WHERE s.account_id=o.account_id AND s.speaker_observation_id=o.id AND (EXISTS(SELECT 1 FROM episode_deletions d WHERE d.account_id=e.account_id AND d.state='pending' AND (d.orphan_event_ids ? e.event_id OR d.orphan_event_ids ? coalesce(e.canonical_event_id,e.event_id))) OR EXISTS(SELECT 1 FROM orphan_capture_erasure_sessions erased WHERE erased.account_id=e.account_id AND erased.capture_session_id=e.capture_session_id)))";
 // A withdrawn designated source never gets another biometric sample, even if
 // another explicit session has since enrolled a fresh profile in this domain.
 const ENROLLMENT_REVOKED: &str = "EXISTS(SELECT 1 FROM capture_events event JOIN voice_enrollment_sessions enrollment ON enrollment.account_id=event.account_id AND enrollment.capture_session_id=event.capture_session_id JOIN accounts account ON account.id=enrollment.account_id WHERE event.account_id=o.account_id AND event.event_id=o.event_id AND enrollment.designated AND (enrollment.enrollment_revision<>account.enrollment_revision OR enrollment.state='expired' OR enrollment.reason IN ('forgotten','enrollment_revoked')))";
+// Already-published retained samples survive a partially expired enrollment.
+// Only explicit withdrawal/revision mismatch invalidates all its contributions.
+pub(super) const WITHDRAWN: &str = "EXISTS(SELECT 1 FROM capture_events event JOIN voice_enrollment_sessions enrollment ON enrollment.account_id=event.account_id AND enrollment.capture_session_id=event.capture_session_id JOIN accounts account ON account.id=enrollment.account_id WHERE event.account_id=o.account_id AND event.event_id=o.event_id AND enrollment.designated AND (enrollment.enrollment_revision<>account.enrollment_revision OR enrollment.reason IN ('forgotten','enrollment_revoked')))";
 const DUE: &str = "j.state IN ('pending','retry_wait','processing') AND (j.next_attempt_at IS NULL OR j.next_attempt_at<=clock_timestamp()) AND (j.lease_until IS NULL OR j.lease_until<=clock_timestamp())";
 
 // Unlike legacy orphan_event_ids, the paged event/root inventory survives
 // utterance/member purge and remains authoritative between deletion ticks.
 const PAGED_FENCED: &str = "EXISTS(SELECT 1 FROM capture_events e JOIN persistence_feature_episode_deletion_events planned ON planned.account_id=e.account_id AND (planned.event_id=e.event_id OR planned.event_id=coalesce(e.canonical_event_id,e.event_id) OR planned.root_event_id=coalesce(e.canonical_event_id,e.event_id)) JOIN episode_deletions d ON d.account_id=planned.account_id AND d.episode_id=planned.episode_id AND d.state='pending' WHERE e.account_id=o.account_id AND (e.event_id=o.event_id OR EXISTS(SELECT 1 FROM speaker_observation_sources source WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND source.event_id=e.event_id)))";
 
-async fn source_fence(tx: &mut Transaction<'_, Postgres>) -> Result<String> {
+pub(super) async fn source_fence(tx: &mut sqlx::PgConnection) -> Result<String> {
     // Probe the current schema after the shared release lock, so a v26 writer
     // cannot cache table absence across a concurrent v27 installation.
     if current_schema_relation_exists(tx, "persistence_feature_episode_deletion_events").await? {
@@ -227,6 +230,9 @@ impl VoiceIdentityRepository for PostgresPersistence {
     async fn maintain_owner_voice_enrollment(&self, account_id: &str) -> Result<()> {
         super::voice_enrollment::maintain(self, account_id).await
     }
+    async fn maintain_voice_profiles(&self, account_id: &str) -> Result<()> {
+        maintain_profiles(self, account_id).await
+    }
     async fn claim_voice_embeddings(
         &self,
         account: &str,
@@ -379,6 +385,64 @@ impl VoiceIdentityRepository for PostgresPersistence {
     }
 }
 
+/// Source erasure is independent of inference, Pause and cohort admission.
+/// Reconsideration rotates through ready jobs without fetching media or changing
+/// their embedding result, lease, attempts, or source observations.
+pub(super) async fn maintain_profiles(repo: &PostgresPersistence, account: &str) -> Result<()> {
+    let mut tx = repo.pool().begin().await?;
+    if !lock_account(&mut tx, account).await? {
+        return Err(EnclaveError::NotFound);
+    }
+    let fence = source_fence(&mut tx).await?;
+    let expired: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT s.id FROM voice_samples s JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id WHERE s.account_id=$1 AND NOT ({fence}) AND (NOT ({RETAINED}) OR ({WITHDRAWN})) ORDER BY s.id LIMIT 500"
+    ))).bind(account).fetch_all(&mut *tx).await?;
+    super::voice_enrollment::erase_samples(&mut tx, account, &expired).await?;
+    let (admitted, cohort) = controls_admit(&mut tx, account).await?;
+    let mut outcomes = Vec::new();
+    if admitted {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT s.id,s.speaker_observation_id,s.embedding,s.embedding_space,s.scorer_version,s.channel_domain,s.eligibility,j.id job_id FROM voice_samples s JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id JOIN voice_embedding_jobs j ON j.account_id=s.account_id AND j.id=s.embedding_job_id AND j.speaker_observation_id=s.speaker_observation_id AND j.state='ready' WHERE s.account_id=$1 AND s.accepted AND s.voice_profile_id IS NULL AND s.eligibility IN ('enroll','match_only') AND s.embedding_space=$2 AND s.quality_version=$3 AND s.scorer_version=$4 AND NOT EXISTS(SELECT 1 FROM voice_sample_profile_assignments a WHERE a.account_id=s.account_id AND a.sample_id=s.id AND a.active) AND ({RETAINED}) AND NOT ({fence}) AND NOT ({ENROLLMENT_REVOKED}) ORDER BY j.updated_at,s.id LIMIT 16"
+        ))).bind(account).bind(EMBEDDING_SPACE).bind(QUALITY_VERSION).bind(SCORER_VERSION).fetch_all(&mut *tx).await?;
+        for row in rows {
+            let space: String = row.try_get("embedding_space")?;
+            let domain: String = row.try_get("channel_domain")?;
+            let embedding =
+                voice_identity::decode_embedding(&row.try_get::<Vec<u8>, _>("embedding")?)?;
+            let eligibility = if row.try_get::<String, _>("eligibility")? == "enroll" {
+                SampleDecision::Enroll
+            } else {
+                SampleDecision::MatchOnly
+            };
+            outcomes.extend(
+                assign_stored_sample(
+                    &mut tx,
+                    &VoiceMatchContext {
+                        account,
+                        observation: row.try_get("speaker_observation_id")?,
+                        space: &space,
+                        scorer: row.try_get("scorer_version")?,
+                    },
+                    row.try_get("id")?,
+                    &embedding,
+                    eligibility,
+                    &domain,
+                )
+                .await?,
+            );
+            sqlx::query("UPDATE voice_embedding_jobs SET updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2 AND state='ready'")
+                .bind(account).bind(row.try_get::<i64,_>("job_id")?).execute(&mut *tx).await?;
+        }
+    }
+    let changed_profiles = super::voice_recurrence::refresh(&mut tx, account).await?;
+    refresh_affected_speaker_projections(&mut tx, account, &[], &changed_profiles, &[]).await?;
+    tx.commit().await?;
+    for outcome in outcomes {
+        observe_identity(cohort, outcome);
+    }
+    Ok(())
+}
+
 async fn persist_sample(
     tx: &mut Transaction<'_, Postgres>,
     claim: &VoiceEmbeddingClaim,
@@ -409,7 +473,39 @@ async fn persist_sample(
     let diagnostics_json = serde_json::to_string(&diagnostics)?;
     sqlx::query("INSERT INTO voice_samples(account_id,id,speaker_observation_id,embedding_space,channel_domain,embedding,quality_score,diagnostics,quality_version,scorer_version,eligibility,duration_ms,speech_ratio,snr_proxy_db,clipping_ratio,silence_ratio,embedding_norm,accepted,embedding_job_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$7,$13,$14,$15,1.0,$16,$17)").bind(account).bind(sample_id).bind(claim.speaker_observation_id).bind(&claim.embedding_space).bind(domain).bind(bytes).bind(diagnostics.speech_ratio).bind(&diagnostics_json).bind(claim.quality_version).bind(claim.scorer_version).bind(eligibility).bind(diagnostics.duration_ms).bind(diagnostics.snr_proxy_db).bind(diagnostics.clipping_ratio).bind(diagnostics.silence_ratio).bind(diagnostics.decision!=SampleDecision::Quarantine).bind(claim.id).execute(&mut **tx).await?;
     sqlx::query("UPDATE speaker_observations SET voice_eligibility=$3,voice_diagnostics=$4::jsonb WHERE account_id=$1 AND id=$2").bind(account).bind(claim.speaker_observation_id).bind(eligibility).bind(diagnostics_json).execute(&mut **tx).await?;
-    let cluster=sqlx::query("SELECT c.id,c.attribution_state,c.person_id,e.capture_session_id FROM speaker_observations o JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id WHERE o.account_id=$1 AND o.id=$2 FOR UPDATE OF c").bind(account).bind(claim.speaker_observation_id).fetch_optional(&mut **tx).await?;
+    assign_stored_sample(
+        tx,
+        &VoiceMatchContext {
+            account,
+            observation: claim.speaker_observation_id,
+            space: &claim.embedding_space,
+            scorer: claim.scorer_version,
+        },
+        sample_id,
+        embedding,
+        diagnostics.decision,
+        domain,
+    )
+    .await
+}
+
+struct VoiceMatchContext<'a> {
+    account: &'a str,
+    observation: i64,
+    space: &'a str,
+    scorer: i64,
+}
+
+async fn assign_stored_sample(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &VoiceMatchContext<'_>,
+    sample_id: i64,
+    embedding: &[f32],
+    eligibility: SampleDecision,
+    domain: &str,
+) -> Result<Vec<&'static str>> {
+    let account = context.account;
+    let cluster=sqlx::query("SELECT c.id,c.attribution_state,c.person_id,e.capture_session_id FROM speaker_observations o JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id WHERE o.account_id=$1 AND o.id=$2 FOR UPDATE OF c").bind(account).bind(context.observation).fetch_optional(&mut **tx).await?;
     let Some(cluster) = cluster else {
         return Ok(vec!["unassigned"]);
     };
@@ -417,17 +513,12 @@ async fn persist_sample(
     let state: String = cluster.try_get("attribution_state")?;
     let session: String = cluster.try_get("capture_session_id")?;
     sqlx::query("UPDATE speaker_clusters SET channel_domain=$3 WHERE account_id=$1 AND id=$2 AND channel_domain IS DISTINCT FROM $3").bind(account).bind(cluster_id).bind(domain).execute(&mut **tx).await?;
-    if diagnostics.decision == SampleDecision::Quarantine {
+    if eligibility == SampleDecision::Quarantine {
         return Ok(vec!["unassigned"]);
     }
-    let owner_candidates = super::owner_voice::owner_profiles(
-        tx,
-        account,
-        domain,
-        &claim.embedding_space,
-        claim.scorer_version,
-    )
-    .await?;
+    let owner_candidates =
+        super::owner_voice::owner_profiles(tx, account, domain, context.space, context.scorer)
+            .await?;
     let owner_scores = owner_candidates
         .iter()
         .map(|(id, bytes)| {
@@ -452,20 +543,18 @@ async fn persist_sample(
     let (decision, best, margin) = if owner_match {
         (owner_decision, owner_best, owner_margin)
     } else {
-        let candidates=sqlx::query("SELECT p.id,p.centroid FROM voice_profiles p LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.channel_domain=$4 AND p.status<>'quarantined' AND coalesce(person.status,'')<>'owner' AND EXISTS(SELECT 1 FROM voice_sample_profile_assignments a JOIN voice_samples s ON s.account_id=a.account_id AND s.id=a.sample_id JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id WHERE a.account_id=p.account_id AND a.profile_id=p.id AND a.active AND e.capture_session_id=$5) ORDER BY p.id").bind(account).bind(&claim.embedding_space).bind(claim.scorer_version).bind(domain).bind(&session).fetch_all(&mut **tx).await?;
-        let scores = candidates
-            .iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<i64, _>("id")?,
-                    voice_quality::cosine(
-                        embedding,
-                        &voice_identity::decode_embedding(&row.try_get::<Vec<u8>, _>("centroid")?)?,
-                    ),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        voice_identity::decide_continuity(&scores, diagnostics.decision)
+        let session_scores =
+            nonowner_candidate_scores(tx, context, embedding, domain, Some(&session)).await?;
+        let session_decision = voice_identity::decide_continuity(&session_scores, eligibility);
+        let account_scores = if !enrollment
+            && session_scores.len() <= voice_identity::MAX_CANDIDATE_PROFILES
+            && !matches!(session_decision.0, ContinuityDecision::Match(_))
+        {
+            nonowner_candidate_scores(tx, context, embedding, domain, None).await?
+        } else {
+            Vec::new()
+        };
+        voice_identity::decide_scoped_continuity(&session_scores, &account_scores, eligibility)
     };
     sqlx::query(
         "UPDATE voice_samples SET similarity=$3,decision_margin=$4 WHERE account_id=$1 AND id=$2",
@@ -486,7 +575,7 @@ async fn persist_sample(
         ContinuityDecision::Match(id) => (id, false),
         ContinuityDecision::Create => {
             let id = allocate_voice_id(tx, account, "voice_profile").await?;
-            sqlx::query("INSERT INTO voice_profiles(account_id,id,person_id,label,embedding_space,channel_domain,centroid,scorer_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(account).bind(id).bind(cluster_person).bind(format!("voice-profile-{id}")).bind(&claim.embedding_space).bind(domain).bind(voice_identity::encode_embedding(embedding)?).bind(claim.scorer_version).execute(&mut **tx).await?;
+            sqlx::query("INSERT INTO voice_profiles(account_id,id,person_id,label,embedding_space,channel_domain,centroid,scorer_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)").bind(account).bind(id).bind(cluster_person).bind(format!("voice-profile-{id}")).bind(context.space).bind(domain).bind(voice_identity::encode_embedding(embedding)?).bind(context.scorer).execute(&mut **tx).await?;
             (id, true)
         }
     };
@@ -514,14 +603,14 @@ async fn persist_sample(
     super::owner_voice::assign_sample(
         tx,
         account,
-        claim.speaker_observation_id,
+        context.observation,
         sample_id,
         profile,
         owner_match.then_some("owner_voice"),
     )
     .await?;
     super::owner_voice::refresh_clusters(tx, account, &[cluster_id]).await?;
-    if diagnostics.decision == SampleDecision::Enroll {
+    if eligibility == SampleDecision::Enroll {
         recompute_profile(
             tx,
             account,
@@ -552,6 +641,67 @@ async fn persist_sample(
     Ok(outcomes)
 }
 
+/// A NULL session selects stable account-wide profiles. Both scopes hold any
+/// centroid with expired/withdrawn contributions until maintenance recomputes it.
+/// In-progress owner-enrollment candidates stay private to their recording.
+async fn nonowner_candidate_scores(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &VoiceMatchContext<'_>,
+    embedding: &[f32],
+    domain: &str,
+    session: Option<&str>,
+) -> Result<Vec<(i64, f32)>> {
+    let fence = source_fence(tx).await?;
+    let sql = format!(
+        "SELECT p.id,p.centroid FROM voice_profiles p \
+         LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id \
+         WHERE p.account_id=$1 AND p.embedding_space=$2 AND p.scorer_version=$3 \
+         AND p.channel_domain=$4 AND p.status<>'quarantined' AND coalesce(person.status,'')<>'owner' \
+         AND EXISTS(SELECT 1 FROM voice_profile_revisions revision WHERE revision.account_id=p.account_id \
+           AND revision.profile_id=p.id AND revision.active AND revision.status=p.status) \
+         AND (($5::text IS NULL AND p.status='stable') OR EXISTS( \
+           SELECT 1 FROM voice_sample_profile_assignments a \
+           JOIN voice_samples s ON s.account_id=a.account_id AND s.id=a.sample_id \
+           JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id \
+           JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id \
+           WHERE a.account_id=p.account_id AND a.profile_id=p.id AND a.active AND e.capture_session_id=$5)) \
+         AND NOT EXISTS(SELECT 1 FROM voice_sample_profile_assignments a \
+           JOIN voice_samples s ON s.account_id=a.account_id AND s.id=a.sample_id \
+           JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id \
+           WHERE a.account_id=p.account_id AND a.profile_id=p.id AND a.active \
+             AND (NOT ({RETAINED}) OR ({fence}))) \
+         AND ($5::text IS NOT NULL OR NOT EXISTS(SELECT 1 FROM voice_sample_profile_assignments a \
+           JOIN voice_samples s ON s.account_id=a.account_id AND s.id=a.sample_id \
+           JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id \
+           JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id \
+           JOIN voice_enrollment_sessions enrollment ON enrollment.account_id=e.account_id \
+             AND enrollment.capture_session_id=e.capture_session_id \
+           WHERE a.account_id=p.account_id AND a.profile_id=p.id AND a.active \
+             AND enrollment.designated AND enrollment.state<>'enrolled')) \
+         ORDER BY p.id LIMIT $6"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(context.account)
+        .bind(context.space)
+        .bind(context.scorer)
+        .bind(domain)
+        .bind(session)
+        .bind((voice_identity::MAX_CANDIDATE_PROFILES + 1) as i64)
+        .fetch_all(&mut **tx)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("id")?,
+                voice_quality::cosine(
+                    embedding,
+                    &voice_identity::decode_embedding(&row.try_get::<Vec<u8>, _>("centroid")?)?,
+                ),
+            ))
+        })
+        .collect()
+}
+
 fn observe_identity(cohort: VoiceCohort, outcome: &'static str) {
     tracing::info!(target: "kioku::voice", metric_schema="voice_identity_v1", cohort=cohort.as_str(), outcome, count=1_u64, "voice identity outcome");
 }
@@ -562,7 +712,7 @@ pub(super) async fn append_revision(
     profile: i64,
     reason: &str,
 ) -> Result<()> {
-    let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM voice_profile_revisions r JOIN voice_profiles p ON p.account_id=r.account_id AND p.id=r.profile_id WHERE p.account_id=$1 AND p.id=$2 AND r.active AND r.status=p.status AND r.scorer_version=p.scorer_version AND r.representative_kind=p.representative_kind AND r.centroid=p.centroid AND r.sample_count=p.sample_count AND r.medoid_sample_id IS NOT DISTINCT FROM p.medoid_sample_id AND r.person_id IS NOT DISTINCT FROM p.person_id)").bind(account).bind(profile).fetch_one(&mut **tx).await?;
+    let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM voice_profile_revisions r JOIN voice_profiles p ON p.account_id=r.account_id AND p.id=r.profile_id WHERE p.account_id=$1 AND p.id=$2 AND r.active AND r.derivation_version=$3 AND r.status=p.status AND r.scorer_version=p.scorer_version AND r.representative_kind=p.representative_kind AND r.centroid=p.centroid AND r.sample_count=p.sample_count AND r.medoid_sample_id IS NOT DISTINCT FROM p.medoid_sample_id AND r.person_id IS NOT DISTINCT FROM p.person_id)").bind(account).bind(profile).bind(voice_identity::IDENTITY_DERIVATION_VERSION).fetch_one(&mut **tx).await?;
     if unchanged {
         return Ok(());
     }
@@ -575,7 +725,7 @@ pub(super) async fn append_revision(
     .await?;
     sqlx::query("UPDATE voice_profile_revisions SET active=false WHERE account_id=$1 AND profile_id=$2 AND active").bind(account).bind(profile).execute(&mut **tx).await?;
     let id = allocate_voice_id(tx, account, "voice_profile_revision").await?;
-    sqlx::query("INSERT INTO voice_profile_revisions(account_id,id,profile_id,status,derivation_version,scorer_version,representative_kind,centroid,sample_count,medoid_sample_id,person_id,predecessor_revision_id,reason_code) SELECT account_id,$3,id,status,1,scorer_version,representative_kind,centroid,sample_count,medoid_sample_id,person_id,$4,$5 FROM voice_profiles WHERE account_id=$1 AND id=$2").bind(account).bind(profile).bind(id).bind(predecessor).bind(reason).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO voice_profile_revisions(account_id,id,profile_id,status,derivation_version,scorer_version,representative_kind,centroid,sample_count,medoid_sample_id,person_id,predecessor_revision_id,reason_code) SELECT account_id,$3,id,status,$6,scorer_version,representative_kind,centroid,sample_count,medoid_sample_id,person_id,$4,$5 FROM voice_profiles WHERE account_id=$1 AND id=$2").bind(account).bind(profile).bind(id).bind(predecessor).bind(reason).bind(voice_identity::IDENTITY_DERIVATION_VERSION).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -585,9 +735,9 @@ pub(super) async fn recompute_profile(
     profile: i64,
     reason: &str,
 ) -> Result<()> {
-    let rows=sqlx::query("SELECT s.id,s.embedding FROM voice_samples s JOIN voice_sample_profile_assignments a ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active JOIN voice_profiles p ON p.account_id=a.account_id AND p.id=a.profile_id WHERE s.account_id=$1 AND a.profile_id=$2 AND s.accepted AND s.eligibility='enroll' AND NOT EXISTS(SELECT 1 FROM speaker_observations observation JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id AND cluster.id=observation.cluster_id WHERE observation.account_id=s.account_id AND observation.id=s.speaker_observation_id AND cluster.profile_updates_quarantined) AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain ORDER BY s.id").bind(account).bind(profile).fetch_all(&mut **tx).await?;
+    let rows=sqlx::query("SELECT s.id,s.speaker_observation_id,s.embedding FROM voice_samples s JOIN voice_sample_profile_assignments a ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active JOIN voice_profiles p ON p.account_id=a.account_id AND p.id=a.profile_id WHERE s.account_id=$1 AND a.profile_id=$2 AND s.accepted AND s.eligibility='enroll' AND s.quality_version=$3 AND NOT EXISTS(SELECT 1 FROM speaker_observations observation JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id AND cluster.id=observation.cluster_id WHERE observation.account_id=s.account_id AND observation.id=s.speaker_observation_id AND cluster.profile_updates_quarantined) AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain ORDER BY s.id").bind(account).bind(profile).bind(QUALITY_VERSION).fetch_all(&mut **tx).await?;
     let samples = rows
-        .into_iter()
+        .iter()
         .map(|r| {
             Ok((
                 r.try_get::<i64, _>("id")?,
@@ -597,7 +747,13 @@ pub(super) async fn recompute_profile(
         .collect::<Result<Vec<_>>>()?;
     if let Some(rep) = voice_identity::representative(&samples)? {
         let bytes = voice_identity::encode_embedding(&rep.centroid)?;
-        sqlx::query("UPDATE voice_profiles SET centroid=$3,sample_count=$4,medoid_sample_id=$5,updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2").bind(account).bind(profile).bind(&bytes).bind(rep.sample_count).bind(rep.medoid_sample_id).execute(&mut **tx).await?;
+        let observations = rows
+            .iter()
+            .filter(|row| rep.retained_sample_ids.contains(&row.get::<i64, _>("id")))
+            .map(|row| row.get::<i64, _>("speaker_observation_id"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let stable = observations.len() >= voice_identity::MIN_STABLE_OBSERVATIONS;
+        sqlx::query("UPDATE voice_profiles p SET centroid=$3,sample_count=$4,medoid_sample_id=$5,status=CASE WHEN p.status='quarantined' OR EXISTS(SELECT 1 FROM people person WHERE person.account_id=p.account_id AND person.id=p.person_id AND person.status='owner') THEN p.status WHEN $6 THEN 'stable' ELSE 'tentative' END,updated_at=clock_timestamp() WHERE p.account_id=$1 AND p.id=$2").bind(account).bind(profile).bind(&bytes).bind(rep.sample_count).bind(rep.medoid_sample_id).bind(stable).execute(&mut **tx).await?;
         let id = allocate_voice_id(tx, account, "voice_profile_representative").await?;
         sqlx::query("INSERT INTO voice_profile_representatives(account_id,id,profile_id,channel_domain,centroid,sample_count,medoid_sample_id,scorer_version) SELECT account_id,$3,id,channel_domain,centroid,sample_count,medoid_sample_id,scorer_version FROM voice_profiles WHERE account_id=$1 AND id=$2 ON CONFLICT(account_id,profile_id,channel_domain) DO UPDATE SET centroid=excluded.centroid,sample_count=excluded.sample_count,medoid_sample_id=excluded.medoid_sample_id,scorer_version=excluded.scorer_version,updated_at=clock_timestamp()").bind(account).bind(profile).bind(id).execute(&mut **tx).await?;
     } else {
@@ -769,6 +925,257 @@ pub(super) mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn ready_unassigned_samples_are_reconsidered_without_inference_and_respect_pause() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "stored-reconsideration";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        seed_voice_observation(repo, ACCOUNT, "earlier", "earlier-event", 1, 1).await;
+        seed_voice_memory(repo, ACCOUNT, 1, 1).await;
+        repo.settle_voice_embedding(
+            &claim_one(repo, ACCOUNT).await,
+            outcome(0, SampleDecision::MatchOnly),
+        )
+        .await
+        .unwrap();
+        for i in 2..=4 {
+            seed_voice_observation(repo, ACCOUNT, "later", &format!("later-{i}"), i, i).await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            repo.settle_voice_embedding(
+                &claim_one(repo, ACCOUNT).await,
+                outcome(0, SampleDecision::Enroll),
+            )
+            .await
+            .unwrap();
+        }
+        let before: Vec<(i64,String,i64,Option<String>)> = sqlx::query_as("SELECT id,state,attempt_count,lease_token FROM voice_embedding_jobs WHERE account_id=$1 ORDER BY id").bind(ACCOUNT).fetch_all(repo.pool()).await.unwrap();
+        repo.set_voice_identity_paused(true).await.unwrap();
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Option<i64>>("SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=1").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), None,
+            "Pause must freeze stored-sample identity bindings");
+        repo.set_voice_identity_paused(false).await.unwrap();
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(voice_profile_id IS NOT NULL) AND count(DISTINCT voice_profile_id)=1 FROM voice_samples WHERE account_id=$1").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),
+            "a stored ready sample must join the later stable voice without another embedding");
+        let after: Vec<(i64,String,i64,Option<String>)> = sqlx::query_as("SELECT id,state,attempt_count,lease_token FROM voice_embedding_jobs WHERE account_id=$1 ORDER BY id").bind(ACCOUNT).fetch_all(repo.pool()).await.unwrap();
+        assert_eq!(
+            before, after,
+            "reconsideration must preserve terminal jobs, attempts and leases"
+        );
+        let lineage: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM voice_samples WHERE account_id=$1),(SELECT count(*) FROM voice_sample_profile_assignments WHERE account_id=$1),(SELECT count(*) FROM voice_profile_revisions WHERE account_id=$1)").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap();
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert_eq!(sqlx::query_as::<_,(i64,i64,i64)>("SELECT (SELECT count(*) FROM voice_samples WHERE account_id=$1),(SELECT count(*) FROM voice_sample_profile_assignments WHERE account_id=$1),(SELECT count(*) FROM voice_profile_revisions WHERE account_id=$1)").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),lineage,
+            "reconsideration must be idempotent and MatchOnly must not grow the centroid");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn paused_maintenance_erases_expired_nonowner_biometrics_and_preserves_sources() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "nonowner-expiry";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for i in 1..=3 {
+            seed_voice_observation(repo, ACCOUNT, "recording", &format!("event-{i}"), i, i).await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            repo.settle_voice_embedding(
+                &claim_one(repo, ACCOUNT).await,
+                outcome(0, SampleDecision::Enroll),
+            )
+            .await
+            .unwrap();
+        }
+        let profile: i64 = sqlx::query_scalar("SELECT id FROM voice_profiles WHERE account_id=$1")
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        repo.set_voice_identity_paused(true).await.unwrap();
+        sqlx::query("UPDATE media_objects SET retain_until=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND event_id='event-1'").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM voice_samples WHERE account_id=$1")
+                .bind(ACCOUNT)
+                .fetch_one(repo.pool())
+                .await
+                .unwrap(),
+            2,
+            "expired nonowner biometric samples must be erased while paused"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM episode_speaker_slots WHERE account_id=$1 AND episode_id=1 AND status='active' AND voice_profile_id=$2").bind(ACCOUNT).bind(profile).fetch_one(repo.pool()).await.unwrap(),0,
+            "expiry must remove stale profile slots before any lazy read");
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM episode_participants WHERE account_id=$1 AND episode_id=1 AND state='active' AND participant_key=$2").bind(ACCOUNT).bind(format!("voice_profile:{profile}")).fetch_one(repo.pool()).await.unwrap(),0,
+            "expiry must remove stale profile participants before any lazy read");
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT status,sample_count FROM voice_profiles WHERE account_id=$1 AND id=$2"
+            )
+            .bind(ACCOUNT)
+            .bind(profile)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            ("tentative".into(), 2),
+            "expired support must withdraw stability and recompute the surviving representative"
+        );
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(octet_length(centroid)=0) FROM voice_profile_revisions WHERE account_id=$1 AND NOT active").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),
+            "expiry must redact historical biometric payloads");
+        sqlx::query("UPDATE media_objects SET retain_until=clock_timestamp()-interval '1 second' WHERE account_id=$1").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert_eq!(sqlx::query_as::<_,(String,i64,i32)>("SELECT status,sample_count,octet_length(centroid) FROM voice_profiles WHERE account_id=$1 AND id=$2").bind(ACCOUNT).bind(profile).fetch_one(repo.pool()).await.unwrap(),("quarantined".into(),0,0),
+            "complete expiry must clear and quarantine the empty profile");
+        assert_eq!(sqlx::query_as::<_,(i64,i64,i64)>("SELECT (SELECT count(*) FROM capture_events WHERE account_id=$1),(SELECT count(*) FROM utterances WHERE account_id=$1),(SELECT count(*) FROM episode_members WHERE account_id=$1)").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(),(3,3,3),
+            "biometric expiry must preserve source records and memory topology");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn stable_nonowner_profiles_match_across_recordings_without_match_only_growth() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "recurring-scope";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for i in 1..=3 {
+            seed_voice_observation(
+                repo,
+                ACCOUNT,
+                "first-recording",
+                &format!("event-{i}"),
+                i,
+                i,
+            )
+            .await;
+            seed_voice_memory(repo, ACCOUNT, i, i).await;
+            let claim = claim_one(repo, ACCOUNT).await;
+            repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::Enroll))
+                .await
+                .unwrap();
+            let states: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT status,sample_count FROM voice_profiles WHERE account_id=$1 ORDER BY id",
+            )
+            .bind(ACCOUNT)
+            .fetch_all(repo.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                states,
+                vec![(if i == 3 { "stable" } else { "tentative" }.to_owned(), i)],
+                "three distinct clean observations must establish one stable profile"
+            );
+        }
+        let profile: i64 = sqlx::query_scalar("SELECT id FROM voice_profiles WHERE account_id=$1")
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        let revisions_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM voice_profile_revisions WHERE account_id=$1")
+                .bind(ACCOUNT)
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        seed_voice_observation(repo, ACCOUNT, "second-recording", "event-4", 4, 4).await;
+        seed_voice_memory(repo, ACCOUNT, 4, 4).await;
+        let claim = claim_one(repo, ACCOUNT).await;
+        repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::MatchOnly))
+            .await
+            .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Option<i64>>("SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=4")
+            .bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), Some(profile),
+            "a new recording must reuse a matching stable account voice before creating another profile");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT sample_count FROM voice_profiles WHERE account_id=$1 AND id=$2"
+            )
+            .bind(ACCOUNT)
+            .bind(profile)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            3,
+            "cross-recording match-only attachment must not grow the representative"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM voice_profile_revisions WHERE account_id=$1"
+            )
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            revisions_before
+        );
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(derivation_version=2) FROM voice_profile_revisions WHERE account_id=$1")
+            .bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), "stability decisions must record their derivation version");
+        assert_projection_source_unchanged(repo, ACCOUNT).await;
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn global_voice_matching_refuses_expired_support_and_a_different_domain() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "recurring-retained-domain";
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for i in 1..=3 {
+            seed_voice_observation(
+                repo,
+                ACCOUNT,
+                "first-recording",
+                &format!("event-{i}"),
+                i,
+                i,
+            )
+            .await;
+            let claim = claim_one(repo, ACCOUNT).await;
+            repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::Enroll))
+                .await
+                .unwrap();
+        }
+        seed_voice_observation(repo, ACCOUNT, "other-domain", "event-4", 4, 4).await;
+        sqlx::query("UPDATE capture_events SET audio_route='wired_headset' WHERE account_id=$1 AND event_id='event-4'")
+            .bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        let claim = claim_one(repo, ACCOUNT).await;
+        let mut sample = outcome(0, SampleDecision::MatchOnly);
+        if let VoiceEmbeddingOutcome::Sample { channel_domain, .. } = &mut sample {
+            *channel_domain = "macos:wired_headset".into();
+        }
+        repo.settle_voice_embedding(&claim, sample).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Option<i64>>("SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=4")
+            .bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), None,
+            "account-wide matching must never cross acoustic domains");
+        sqlx::query("UPDATE media_objects SET retain_until=clock_timestamp()-interval '1 second' WHERE account_id=$1 AND event_id='event-1'")
+            .bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        seed_voice_observation(repo, ACCOUNT, "expired-support", "event-5", 5, 5).await;
+        let claim = claim_one(repo, ACCOUNT).await;
+        repo.settle_voice_embedding(&claim, outcome(0, SampleDecision::MatchOnly))
+            .await
+            .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,Option<i64>>("SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND speaker_observation_id=5")
+            .bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), None,
+            "an expired centroid contribution must block global matching before maintenance runs");
+        cleanup(fixture).await;
+    }
+
     #[tokio::test]
     async fn voice_speaker_projection_attachment_and_propagation_refresh_every_memory() {
         let Some(fixture) = super::super::tests::test_persistence().await else {

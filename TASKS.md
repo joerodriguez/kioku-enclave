@@ -1,3 +1,15 @@
+# ADR-0048 cross-memory matching and recurring People (2026-09-12)
+
+- [x] Match against compatible stable account-wide voices after session continuity, with three clean observations for stability and bounded provider-free stored-sample reconsideration.
+- [x] Erase expired/withdrawn non-owner support independently of Pause and recompute before projecting labels.
+- [x] Promote stable voices at three current memories or twenty minutes of union speech; preserve opaque IDs and Speaker letters, current context, and complete withdrawal despite candidate overflow.
+- [x] Add separately paged identified/recurring People routes with coherent read snapshots and owner/private-status exclusion.
+- [x] Resolve independent foundation and People review findings; ten recurrence/label production reversals reach named semantic assertions and exact restored tests pass, alongside earlier scope and maintenance proofs.
+- [x] Pass full PostgreSQL/model verification:545passed, one existing manual probe ignored; formatting and strict all-target Clippy pass. Independent final composed review has no unresolved finding.
+- [ ] Merge this source slice through the normal reviewed PR path; coordinated client source is in downstream PR528.
+- [ ] Finish Phase3 automatic proposals, exact append-only reversal, bimodal quarantine and current-policy adoption of stored assigned profiles.
+- [ ] Finish Phase4 name fusion, Phase5 identity-driven summaries and Phase6 real owner acceptance. Synthetic verification does not establish production acceptance.
+
 # Content-specific brief sections (2026-09-11)
 
 - [x] Add bounded LLM-authored, evidence-backed sections; retain truthful semantic compatibility projections and legacy in-flight output handling.

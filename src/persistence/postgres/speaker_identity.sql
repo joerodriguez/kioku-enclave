@@ -6,7 +6,7 @@ LEFT JOIN LATERAL (
                owner_match.valid AS owner_voice,
                op.id AS observation_person_id,cp.id AS cluster_person_id,
                pp.id AS profile_person_id,op.display_name AS observation_name,
-               cp.display_name AS cluster_name,pp.display_name AS profile_name,
+               cp.display_name AS cluster_name,CASE WHEN pp.status='identified' THEN pp.display_name END AS profile_name,
                coalesce(op.id IS NOT NULL AND cp.id IS NOT NULL AND op.id<>cp.id,false)
                    AS identity_conflict,
                __MEMORY__ AS episode_id
@@ -23,8 +23,13 @@ LEFT JOIN LATERAL (
             AND NOT coalesce(c.profile_updates_quarantined,false)
             AND cp.status='identified' AND nullif(btrim(cp.display_name),'') IS NOT NULL
           LEFT JOIN people pp ON pp.account_id=vp.account_id AND pp.id=vp.person_id
-            AND vp.status<>'quarantined' AND pp.status='identified'
-            AND nullif(btrim(pp.display_name),'') IS NOT NULL
+            AND vp.status<>'quarantined' AND (
+                (pp.status='identified' AND nullif(btrim(pp.display_name),'') IS NOT NULL)
+                OR (pp.status='recurring' AND vp.status='stable' AND vp.sample_count>0
+                    AND EXISTS(SELECT 1 FROM identity_evidence recurring_evidence
+                        WHERE recurring_evidence.account_id=pp.account_id AND recurring_evidence.person_id=pp.id
+                          AND recurring_evidence.voice_profile_id=vp.id AND recurring_evidence.kind='voice_recurrence'
+                          AND recurring_evidence.status='accepted')))
           CROSS JOIN LATERAL (
               SELECT EXISTS(SELECT 1 FROM voice_profiles owner_profile
                   JOIN people owner ON owner.account_id=owner_profile.account_id
@@ -102,6 +107,6 @@ LEFT JOIN LATERAL (
     )
     SELECT speaker_label,speaker_label AS display_name,person_id,attribution_kind,episode_id,
            voice_profile_id,speaker_cluster_id,slot_ordinal,participant_key,owner_source,
-           identity_conflict,observation_id
+           identity_conflict,observation_id,person_name
       FROM presented
 ) AS speaker_identity ON TRUE

@@ -271,8 +271,45 @@ pub(crate) struct McpTimeRangeRequest {
     pub(crate) limit: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicPersonStatus {
+    #[default]
+    Identified,
+    Recurring,
+}
+impl PublicPersonStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identified => "identified",
+            Self::Recurring => "recurring",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct PersonRecurrence {
+    pub(crate) memory_count: i64,
+    pub(crate) first_heard_at: String,
+    pub(crate) last_heard_at: String,
+    pub(crate) contexts: Vec<RecurringVoiceContext>,
+    pub(crate) co_participants: Vec<RecurringVoiceCoParticipant>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct RecurringVoiceContext {
+    pub(crate) label: String,
+    pub(crate) memory_count: i64,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct RecurringVoiceCoParticipant {
+    pub(crate) person_id: i64,
+    pub(crate) display_name: String,
+    pub(crate) memory_count: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PeopleListRequest {
+    pub(crate) kind: PublicPersonStatus,
     pub(crate) after_id: i64,
     pub(crate) limit: usize,
     pub(crate) query: Option<String>,
@@ -286,6 +323,8 @@ pub(crate) struct PeopleListPage {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub(crate) struct PersonSummary {
+    pub(crate) status: PublicPersonStatus,
+    pub(crate) recurrence: Option<PersonRecurrence>,
     pub(crate) id: i64,
     pub(crate) display_name: String,
     pub(crate) voice_profile_count: i64,

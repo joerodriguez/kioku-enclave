@@ -131,10 +131,50 @@ pub(crate) fn decide_continuity(
     (decision, Some(best), Some(margin))
 }
 
+/// Candidate scopes are complete or held, never truncated to choose a winner.
+pub(crate) const MAX_CANDIDATE_PROFILES: usize = 512;
+pub(crate) const MIN_STABLE_OBSERVATIONS: usize = 3;
+pub(crate) const IDENTITY_DERIVATION_VERSION: i64 = 2;
+
+/// Same-recording continuity has priority. If it cannot decide, compare the
+/// complete union with account-wide stable candidates before creating anything.
+/// A broader empty scope must never erase a narrower scope's ambiguity.
+pub(crate) fn decide_scoped_continuity(
+    session_scores: &[(i64, f32)],
+    account_scores: &[(i64, f32)],
+    eligibility: SampleDecision,
+) -> (ContinuityDecision, Option<f32>, Option<f32>) {
+    if session_scores.len() > MAX_CANDIDATE_PROFILES {
+        return (ContinuityDecision::Abstain, None, None);
+    }
+    let session = decide_continuity(session_scores, eligibility);
+    if matches!(session.0, ContinuityDecision::Match(_)) {
+        return session;
+    }
+    if account_scores.len() > MAX_CANDIDATE_PROFILES {
+        return (ContinuityDecision::Abstain, None, None);
+    }
+    let mut combined = std::collections::BTreeMap::new();
+    for &(id, score) in session_scores.iter().chain(account_scores) {
+        if !score.is_finite()
+            || combined
+                .insert(id, score)
+                .is_some_and(|previous| previous != score)
+        {
+            return (ContinuityDecision::Abstain, None, None);
+        }
+    }
+    if combined.len() > MAX_CANDIDATE_PROFILES {
+        return (ContinuityDecision::Abstain, None, None);
+    }
+    decide_continuity(&combined.into_iter().collect::<Vec<_>>(), eligibility)
+}
+
 pub(crate) struct Representative {
     pub medoid_sample_id: i64,
     pub centroid: Vec<f32>,
     pub sample_count: i64,
+    pub retained_sample_ids: Vec<i64>,
 }
 pub(crate) fn representative(samples: &[(i64, Vec<f32>)]) -> Result<Option<Representative>> {
     if samples.is_empty() {
@@ -186,6 +226,7 @@ pub(crate) fn representative(samples: &[(i64, Vec<f32>)]) -> Result<Option<Repre
         medoid_sample_id: medoid.0,
         centroid,
         sample_count: accepted.len() as i64,
+        retained_sample_ids: accepted.iter().map(|(id, _)| *id).collect(),
     }))
 }
 
@@ -241,12 +282,76 @@ mod tests {
         );
     }
     #[test]
+    fn scoped_continuity_checks_account_before_creation_and_keeps_earlier_ambiguity() {
+        assert_eq!(
+            decide_scoped_continuity(&[], &[(7, 0.75)], SampleDecision::Enroll).0,
+            ContinuityDecision::Match(7),
+            "a new recording must check the account before creating a duplicate voice"
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.7), (2, 0.66)], &[], SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "an empty global scope must preserve same-recording ambiguity"
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.7), (2, 0.66)], &[(3, 0.9)], SampleDecision::Enroll).0,
+            ContinuityDecision::Match(3)
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.7)], &[(2, 0.99)], SampleDecision::Enroll).0,
+            ContinuityDecision::Match(1),
+            "confident same-recording continuity must retain scope priority"
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.44)], &[(1, 0.44), (2, 0.3)], SampleDecision::Enroll)
+                .0,
+            ContinuityDecision::Create
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[], &[], SampleDecision::MatchOnly).0,
+            ContinuityDecision::Abstain
+        );
+    }
+
+    #[test]
+    fn scoped_continuity_holds_overflow_and_deduplicates_the_same_profile() {
+        let overflow = (0..=MAX_CANDIDATE_PROFILES)
+            .map(|i| (i as i64, 0.1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decide_scoped_continuity(&[], &overflow, SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "a partial account candidate population must not create a voice"
+        );
+        assert_eq!(
+            decide_scoped_continuity(&overflow, &[], SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "a partial session candidate population must not create a voice"
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.55)], &[(1, 0.55), (2, 0.7)], SampleDecision::Enroll)
+                .0,
+            ContinuityDecision::Match(2)
+        );
+        assert_eq!(
+            decide_scoped_continuity(&[(1, 0.55)], &[(1, 0.75)], SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "conflicting scores for one profile must hold the decision"
+        );
+    }
+
+    #[test]
     fn representative_trims_outlier_and_breaks_medoid_ties_by_id() {
         let rep = representative(&[(2, axis(0)), (1, axis(0)), (3, axis(1))])
             .unwrap()
             .unwrap();
         assert_eq!(rep.medoid_sample_id, 1);
         assert_eq!(rep.centroid, axis(0));
+        assert_eq!(
+            rep.retained_sample_ids,
+            vec![1, 2],
+            "stability must use only the exact trimmed representative members"
+        );
         assert_eq!(
             rep.sample_count, 2,
             "outliers must not contribute to centroid sample count"

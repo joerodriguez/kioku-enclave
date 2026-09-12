@@ -1214,6 +1214,8 @@ struct CaptureSessionListQuery {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeopleListQuery {
+    #[serde(default)]
+    kind: crate::persistence::PublicPersonStatus,
     after_id: Option<i64>,
     limit: Option<usize>,
     q: Option<String>,
@@ -2098,6 +2100,7 @@ async fn list_people(
         .list_people(
             &user.0,
             &PeopleListRequest {
+                kind: query.kind,
                 after_id,
                 limit,
                 query: search,

@@ -24,7 +24,7 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `isotime.rs` | RFC 3339 UTC parsing, formatting, and arithmetic. |
 | `limits.rs` | Volatile request rate limiting plus PostgreSQL fleet admission, quota, concurrency, and Vertex reservation use. |
 | `mcp_safety.rs` | MCP query/projection boundary, pagination limits, restricted-data refusal, URL minimization, and recursive response redaction. |
-| `media.rs` | Optional receipt-bound owner-enrollment marker/revision, prebilling reference-batch refusal and enrollment session status; Cloud Capture ingestion, reference batching, exact live-media admission with session-aware upload identity, encryption, and transactional receipt/session settlement. |
+| `media.rs` | Closed identified/recurring People list query kind with independent pagination; optional receipt-bound owner-enrollment marker/revision, prebilling reference-batch refusal and enrollment session status; Cloud Capture ingestion, reference batching, exact live-media admission with session-aware upload identity, encryption, and transactional receipt/session settlement. |
 | `media_planner.rs` | Deterministic bounded audio/screen processing work-unit planning. |
 | `media_worker.rs` | PostgreSQL-claimed media processing, KMS/GCS/Vertex work, result projection, voice work, bounded retry/resurrection, and retention cleanup. |
 | `model_usage.rs` | Durable Vertex intent/outcome accounting, usage delivery, coverage reconciliation, and final pre-fence account-deletion settlement that conservatively closes any deletion-owned `started` intent and classifies an idempotent already-active fence. |
@@ -41,9 +41,9 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `tokens.rs` | JWT/PKCE/opaque-token primitives and account-, lease-, retention-, and revision-bound capabilities. |
 | `vertex.rs` | Bounded Vertex Gemini adapter with strict schemas, content-free usage metadata, and explicit model routing for separately qualified reconciliation. |
 | `voice_memory.rs` | Pure-Rust audio decoding, fbank, and hash-pinned WeSpeaker inference shared by serving and explicit voice evaluation. |
-| `voice_identity.rs` | Pure f32x256 codec, channel domains, checked source slices, conservative continuity decisions, and medoid/trimmed-centroid math. |
+| `voice_identity.rs` | Pure f32x256 codec, channel domains, checked source slices, bounded same-recording/account scope decisions that preserve ambiguity, and medoid/trimmed-centroid math with exact retained membership for stability. |
 | `voice_enrollment.rs` | Authenticated owner-voice status and Forget routes through the voice repository; current recognition is independent of the latest recording attempt, and HTTP responses are private and uncacheable. |
-| `voice_worker.rs` | Separate 20-second voice-job lease loop, cohort filtering for new bindings, independent owner enrollment/expiry maintenance even without a model, at most four concurrent accounts/CPU tasks, 180-second batches, retained-media decoding cache, and content-free metrics. |
+| `voice_worker.rs` | Separate 20-second voice-job lease loop, cohort filtering for new bindings, independent owner enrollment plus general biometric expiry and stored-sample reconsideration even without a model, at most four concurrent accounts/CPU tasks, 180-second batches, retained-media decoding cache, and content-free metrics. |
 | `voice_quality.rs` | Versioned enrollment/matching quality policy and robust representative selection. |
 | `voice_eval.rs` | Public voice/identity/diarization scoring contract and real-corpus release classification. |
 | `voice_eval_assets.rs` | Offline, hash-bound licensed-corpus derivation outside Git. |

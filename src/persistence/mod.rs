@@ -123,7 +123,8 @@ pub(crate) use query::{
     McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedPage,
     MemoryFeedRecord, MemoryFeedRequest, MemoryQueryRepository, PeopleListPage, PeopleListRequest,
     PersonEvidencePage, PersonEvidenceView, PersonFactView, PersonNameView, PersonProfile,
-    PersonStatementPage, PersonStatementView, PersonSummary, ScreenshotMediaLocator, SearchHit,
+    PersonRecurrence, PersonStatementPage, PersonStatementView, PersonSummary, PublicPersonStatus,
+    RecurringVoiceCoParticipant, RecurringVoiceContext, ScreenshotMediaLocator, SearchHit,
     SearchRequest,
 };
 pub(crate) use recording_retention::{

@@ -106,6 +106,8 @@ pub(crate) trait VoiceIdentityRepository: Send + Sync {
         account_id: &str,
     ) -> Result<OwnerVoiceEnrollmentStatus>;
     async fn maintain_owner_voice_enrollment(&self, account_id: &str) -> Result<()>;
+    /// Provider-free expiry and bounded reconsideration of stored unassigned samples.
+    async fn maintain_voice_profiles(&self, account_id: &str) -> Result<()>;
     async fn voice_identity_controls(&self) -> Result<VoiceIdentityControls>;
     async fn claim_voice_embeddings(
         &self,
