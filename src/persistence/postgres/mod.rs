@@ -59,6 +59,7 @@ mod voice_enrollment_contract;
 mod voice_enrollment_schema;
 mod voice_identity;
 mod voice_identity_schema;
+mod voice_recurrence;
 #[cfg(test)]
 mod voice_worker_contract;
 mod work;
@@ -4003,6 +4004,7 @@ mod tests {
             .list_people(
                 &account_id,
                 &PeopleListRequest {
+                    kind: crate::persistence::PublicPersonStatus::Identified,
                     after_id: 0,
                     limit: 50,
                     query: Some("lynn".into()),

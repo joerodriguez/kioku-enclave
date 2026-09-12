@@ -36,7 +36,7 @@ const DUE: &str = "j.state IN ('pending','retry_wait','processing') AND (j.next_
 // utterance/member purge and remains authoritative between deletion ticks.
 const PAGED_FENCED: &str = "EXISTS(SELECT 1 FROM capture_events e JOIN persistence_feature_episode_deletion_events planned ON planned.account_id=e.account_id AND (planned.event_id=e.event_id OR planned.event_id=coalesce(e.canonical_event_id,e.event_id) OR planned.root_event_id=coalesce(e.canonical_event_id,e.event_id)) JOIN episode_deletions d ON d.account_id=planned.account_id AND d.episode_id=planned.episode_id AND d.state='pending' WHERE e.account_id=o.account_id AND (e.event_id=o.event_id OR EXISTS(SELECT 1 FROM speaker_observation_sources source WHERE source.account_id=o.account_id AND source.speaker_observation_id=o.id AND source.event_id=e.event_id)))";
 
-pub(super) async fn source_fence(tx: &mut Transaction<'_, Postgres>) -> Result<String> {
+pub(super) async fn source_fence(tx: &mut sqlx::PgConnection) -> Result<String> {
     // Probe the current schema after the shared release lock, so a v26 writer
     // cannot cache table absence across a concurrent v27 installation.
     if current_schema_relation_exists(tx, "persistence_feature_episode_deletion_events").await? {
@@ -388,7 +388,7 @@ impl VoiceIdentityRepository for PostgresPersistence {
 /// Source erasure is independent of inference, Pause and cohort admission.
 /// Reconsideration rotates through ready jobs without fetching media or changing
 /// their embedding result, lease, attempts, or source observations.
-async fn maintain_profiles(repo: &PostgresPersistence, account: &str) -> Result<()> {
+pub(super) async fn maintain_profiles(repo: &PostgresPersistence, account: &str) -> Result<()> {
     let mut tx = repo.pool().begin().await?;
     if !lock_account(&mut tx, account).await? {
         return Err(EnclaveError::NotFound);
@@ -434,6 +434,8 @@ async fn maintain_profiles(repo: &PostgresPersistence, account: &str) -> Result<
                 .bind(account).bind(row.try_get::<i64,_>("job_id")?).execute(&mut *tx).await?;
         }
     }
+    let changed_profiles = super::voice_recurrence::refresh(&mut tx, account).await?;
+    refresh_affected_speaker_projections(&mut tx, account, &[], &changed_profiles, &[]).await?;
     tx.commit().await?;
     for outcome in outcomes {
         observe_identity(cohort, outcome);

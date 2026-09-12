@@ -12,7 +12,7 @@ use crate::{
         McpContextRequest, McpTimeRangeRequest, McpTranscriptSearchRequest, MemoryFeedPage,
         MemoryFeedRecord, MemoryFeedRequest, MemoryQueryRepository, PeopleListPage,
         PeopleListRequest, PersonEvidencePage, PersonEvidenceView, PersonFactView, PersonNameView,
-        PersonProfile, PersonStatementPage, PersonStatementView, PersonSummary,
+        PersonProfile, PersonStatementPage, PersonStatementView, PersonSummary, PublicPersonStatus,
         ScreenshotMediaLocator, SearchHit, SearchRequest,
     },
 };
@@ -1200,18 +1200,33 @@ fn top_three(counts: Option<&HashMap<String, i64>>) -> Vec<String> {
         .collect()
 }
 
-async fn require_identified_person(
+// Prepare mutable graph projections first; all public metadata and enrichment then
+// observe the same read-only snapshot, including concurrent naming or withdrawal.
+async fn people_snapshot(
     persistence: &PostgresPersistence,
+    account_id: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    super::voice_identity::maintain_profiles(persistence, account_id).await?;
+    prepare_account_speaker_projections(persistence, account_id).await?;
+    let mut transaction = persistence.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await?;
+    Ok(transaction)
+}
+
+async fn require_public_person(
+    connection: &mut PgConnection,
     account_id: &str,
     person_id: i64,
 ) -> Result<()> {
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM people \
-          WHERE account_id=$1 AND id=$2 AND status='identified')",
+          WHERE account_id=$1 AND id=$2 AND status IN ('identified','recurring'))",
     )
     .bind(account_id)
     .bind(person_id)
-    .fetch_one(persistence.pool())
+    .fetch_one(&mut *connection)
     .await?;
     if exists {
         Ok(())
@@ -1221,7 +1236,7 @@ async fn require_identified_person(
 }
 
 async fn postgres_person_evidence(
-    persistence: &PostgresPersistence,
+    connection: &mut PgConnection,
     account_id: &str,
     person_id: i64,
     before_id: Option<i64>,
@@ -1240,7 +1255,7 @@ async fn postgres_person_evidence(
     .bind(person_id)
     .bind(before_id)
     .bind(row_limit)
-    .fetch_all(persistence.pool())
+    .fetch_all(&mut *connection)
     .await?;
     let mut evidence = rows
         .iter()
@@ -1270,7 +1285,7 @@ async fn postgres_person_evidence(
 }
 
 async fn postgres_person_statements(
-    persistence: &PostgresPersistence,
+    connection: &mut PgConnection,
     account_id: &str,
     person_id: i64,
     before_id: Option<i64>,
@@ -1307,7 +1322,7 @@ async fn postgres_person_statements(
     .bind(person_id)
     .bind(before_id)
     .bind(row_limit)
-    .fetch_all(persistence.pool())
+    .fetch_all(&mut *connection)
     .await?;
     let mut statements = rows
         .iter()
@@ -2524,8 +2539,14 @@ impl MemoryQueryRepository for PostgresPersistence {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        if request.kind == PublicPersonStatus::Recurring && query.is_some() {
+            return Err(EnclaveError::InvalidRequest(
+                "recurring people cannot be searched by name".into(),
+            ));
+        }
+        let mut transaction = people_snapshot(self, account_id).await?;
         let rows = sqlx::query(
-            "SELECT p.id,p.display_name, \
+            "SELECT p.id,p.status,CASE WHEN p.status='recurring' THEN 'Unnamed voice' ELSE p.display_name END display_name, \
                     count(DISTINCT v.id)::bigint AS voice_profile_count, \
                     count(DISTINCT f.id)::bigint AS fact_count, \
                     floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
@@ -2536,8 +2557,8 @@ impl MemoryQueryRepository for PostgresPersistence {
                        AND r.status IN ('quarantined','superseded','split')) \
                LEFT JOIN person_facts f ON f.account_id=p.account_id \
                  AND f.person_id=p.id AND f.status='active' \
-              WHERE p.account_id=$1 AND p.status='identified' \
-                AND p.display_name IS NOT NULL AND p.id>$2 \
+              WHERE p.account_id=$1 AND p.status=$5 \
+                AND (p.status='recurring' OR nullif(btrim(p.display_name),'') IS NOT NULL) AND p.id>$2 \
                 AND ($3::text IS NULL OR lower(p.display_name) LIKE '%'||lower($3)||'%' \
                   OR EXISTS (SELECT 1 FROM person_name_claims n \
                        WHERE n.account_id=p.account_id AND n.person_id=p.id \
@@ -2549,12 +2570,15 @@ impl MemoryQueryRepository for PostgresPersistence {
         .bind(request.after_id)
         .bind(query)
         .bind(row_limit)
-        .fetch_all(self.pool())
+        .bind(request.kind.as_str())
+        .fetch_all(&mut *transaction)
         .await?;
         let mut people = rows
             .iter()
             .map(|row| {
                 Ok(PersonSummary {
+                    status: request.kind,
+                    recurrence: None,
                     id: row.try_get("id")?,
                     display_name: row.try_get("display_name")?,
                     voice_profile_count: row.try_get("voice_profile_count")?,
@@ -2565,6 +2589,24 @@ impl MemoryQueryRepository for PostgresPersistence {
             .collect::<Result<Vec<_>>>()?;
         let next_cursor = (people.len() > request.limit).then(|| people[request.limit - 1].id);
         people.truncate(request.limit);
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(
+            account_id,
+            "people-list",
+            &mut transaction,
+        )
+        .await;
+        for person in &mut people {
+            if person.status == PublicPersonStatus::Recurring {
+                let (count, recurrence) =
+                    super::voice_recurrence::summary(&mut transaction, account_id, person.id)
+                        .await?;
+                person.voice_profile_count = count;
+                person.fact_count = 0;
+                person.recurrence = Some(recurrence);
+            }
+        }
+        transaction.commit().await?;
         Ok(PeopleListPage {
             people,
             next_cursor,
@@ -2572,8 +2614,9 @@ impl MemoryQueryRepository for PostgresPersistence {
     }
 
     async fn person_profile(&self, account_id: &str, person_id: i64) -> Result<PersonProfile> {
+        let mut transaction = people_snapshot(self, account_id).await?;
         let row = sqlx::query(
-            "SELECT p.id,p.display_name, \
+            "SELECT p.id,p.status,CASE WHEN p.status='recurring' THEN 'Unnamed voice' ELSE p.display_name END display_name, \
                     count(DISTINCT v.id)::bigint AS voice_profile_count, \
                     count(DISTINCT f.id)::bigint AS fact_count, \
                     floor(extract(epoch FROM p.updated_at)*1000)::bigint AS updated_at_ms \
@@ -2584,17 +2627,31 @@ impl MemoryQueryRepository for PostgresPersistence {
                        AND r.status IN ('quarantined','superseded','split')) \
                LEFT JOIN person_facts f ON f.account_id=p.account_id \
                  AND f.person_id=p.id AND f.status='active' \
-              WHERE p.account_id=$1 AND p.id=$2 AND p.status='identified' \
+              WHERE p.account_id=$1 AND p.id=$2 AND p.status IN ('identified','recurring') AND (p.status='recurring' OR nullif(btrim(p.display_name),'') IS NOT NULL) \
               GROUP BY p.account_id,p.id",
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *transaction)
         .await?;
         let Some(row) = row else {
             return Err(EnclaveError::NotFound);
         };
-        let person = PersonSummary {
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(
+            account_id,
+            "people-detail",
+            &mut transaction,
+        )
+        .await;
+        let recurring = row.try_get::<String, _>("status")? == "recurring";
+        let mut person = PersonSummary {
+            status: if recurring {
+                PublicPersonStatus::Recurring
+            } else {
+                PublicPersonStatus::Identified
+            },
+            recurrence: None,
             id: row.try_get("id")?,
             display_name: row.try_get("display_name")?,
             voice_profile_count: row.try_get("voice_profile_count")?,
@@ -2602,6 +2659,34 @@ impl MemoryQueryRepository for PostgresPersistence {
             updated_at: required_timestamp(&row, "updated_at_ms")?,
         };
 
+        if recurring {
+            let (count, recurrence) =
+                super::voice_recurrence::summary(&mut transaction, account_id, person_id).await?;
+            person.voice_profile_count = count;
+            person.fact_count = 0;
+            person.recurrence = Some(recurrence);
+            let result = PersonProfile {
+                person,
+                voice_labels: Vec::new(),
+                voice_coverage:
+                    "This voice has been heard across your memories. Its name is not known yet."
+                        .into(),
+                aliases: Vec::new(),
+                facts: Vec::new(),
+                evidence: Vec::new(),
+                recent_statements: postgres_person_statements(
+                    &mut transaction,
+                    account_id,
+                    person_id,
+                    None,
+                    100,
+                )
+                .await?
+                .statements,
+            };
+            transaction.commit().await?;
+            return Ok(result);
+        }
         let voice_labels = sqlx::query_scalar::<_, String>(
             "SELECT v.label FROM voice_profiles v \
               WHERE v.account_id=$1 AND v.person_id=$2 AND v.status<>'quarantined' \
@@ -2611,7 +2696,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let coverage = sqlx::query(
             "SELECT (SELECT count(*)::bigint FROM voice_profiles v \
@@ -2632,7 +2717,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *transaction)
         .await?;
         let stable_profiles: i64 = coverage.try_get("stable_profiles")?;
         let accepted_samples: i64 = coverage.try_get("accepted_samples")?;
@@ -2654,7 +2739,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let aliases = alias_rows
             .iter()
@@ -2682,7 +2767,7 @@ impl MemoryQueryRepository for PostgresPersistence {
         )
         .bind(account_id)
         .bind(person_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *transaction)
         .await?;
         let facts = fact_rows
             .iter()
@@ -2706,12 +2791,14 @@ impl MemoryQueryRepository for PostgresPersistence {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let evidence = postgres_person_evidence(self, account_id, person_id, None, 100)
+        let evidence = postgres_person_evidence(&mut transaction, account_id, person_id, None, 100)
             .await?
             .evidence;
-        let recent_statements = postgres_person_statements(self, account_id, person_id, None, 100)
-            .await?
-            .statements;
+        let recent_statements =
+            postgres_person_statements(&mut transaction, account_id, person_id, None, 100)
+                .await?
+                .statements;
+        transaction.commit().await?;
         Ok(PersonProfile {
             person,
             voice_labels,
@@ -2735,8 +2822,20 @@ impl MemoryQueryRepository for PostgresPersistence {
                 "people page bounds are invalid".into(),
             ));
         }
-        require_identified_person(self, account_id, person_id).await?;
-        postgres_person_evidence(self, account_id, person_id, before_id, limit).await
+        let mut transaction = people_snapshot(self, account_id).await?;
+        require_public_person(&mut transaction, account_id, person_id).await?;
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(
+            account_id,
+            "people-evidence",
+            &mut transaction,
+        )
+        .await;
+        let page =
+            postgres_person_evidence(&mut transaction, account_id, person_id, before_id, limit)
+                .await?;
+        transaction.commit().await?;
+        Ok(page)
     }
 
     async fn person_statements(
@@ -2751,8 +2850,20 @@ impl MemoryQueryRepository for PostgresPersistence {
                 "people page bounds are invalid".into(),
             ));
         }
-        require_identified_person(self, account_id, person_id).await?;
-        postgres_person_statements(self, account_id, person_id, before_id, limit).await
+        let mut transaction = people_snapshot(self, account_id).await?;
+        require_public_person(&mut transaction, account_id, person_id).await?;
+        #[cfg(test)]
+        super::speaker_query_contract::reader_checkpoint(
+            account_id,
+            "people-statements",
+            &mut transaction,
+        )
+        .await;
+        let page =
+            postgres_person_statements(&mut transaction, account_id, person_id, before_id, limit)
+                .await?;
+        transaction.commit().await?;
+        Ok(page)
     }
 }
 

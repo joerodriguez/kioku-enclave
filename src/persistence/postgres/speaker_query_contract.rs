@@ -18,17 +18,17 @@ use std::{
 use tokio::sync::Notify;
 
 #[derive(Default)]
-struct ReaderGate {
-    reached: Notify,
-    resume: Notify,
-    settings: Mutex<Option<(String, String)>>,
+pub(super) struct ReaderGate {
+    pub(super) reached: Notify,
+    pub(super) resume: Notify,
+    pub(super) settings: Mutex<Option<(String, String)>>,
 }
 type ReaderGateRegistry = HashMap<(String, &'static str), Arc<ReaderGate>>;
 static READER_GATES: OnceLock<Mutex<ReaderGateRegistry>> = OnceLock::new();
 fn gates() -> &'static Mutex<ReaderGateRegistry> {
     READER_GATES.get_or_init(Default::default)
 }
-fn arm(account: &str, stage: &'static str) -> Arc<ReaderGate> {
+pub(super) fn arm(account: &str, stage: &'static str) -> Arc<ReaderGate> {
     let gate = Arc::new(ReaderGate::default());
     assert!(gates()
         .lock()

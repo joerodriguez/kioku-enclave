@@ -125,6 +125,7 @@ struct Evidence {
     key: Option<SpeakerVoiceKey>,
     cluster_id: Option<i64>,
     person_id: Option<i64>,
+    has_accepted_name: bool,
     participant_key: Option<String>,
     attribution: Option<String>,
     owner: bool,
@@ -154,6 +155,7 @@ async fn evidence(
                     .or_else(|| cluster.map(SpeakerVoiceKey::Cluster)),
                 cluster_id: cluster,
                 person_id: row.try_get("person_id")?,
+                has_accepted_name: row.try_get::<Option<String>, _>("person_name")?.is_some(),
                 participant_key: row.try_get("participant_key")?,
                 attribution: row.try_get("attribution_kind")?,
                 owner: row.try_get("owner_source")?,
@@ -180,7 +182,7 @@ fn voice_groups(evidence: &[Evidence]) -> Vec<VoiceGroup> {
             needs_slot: false,
         });
         group.first = group.first.min((row.started_ms, row.utterance_id));
-        group.needs_slot |= !row.owner && row.person_id.is_none();
+        group.needs_slot |= !row.owner && !row.has_accepted_name;
         group.aliases.extend(row.cluster_id);
     }
     let mut groups = groups.into_values().collect::<Vec<_>>();
@@ -383,6 +385,26 @@ pub(super) async fn refresh_episode_speaker_projections(
         return Ok(report);
     }
     super::owner_voice::prepare_domains(tx, account_id).await?;
+    let changed_profiles = super::voice_recurrence::refresh(tx, account_id).await?;
+    let mut targets = targets.to_vec();
+    if !changed_profiles.is_empty() {
+        let affected = super::voice_identity::affected_speaker_projection_targets(
+            tx,
+            account_id,
+            &[],
+            &changed_profiles,
+            &[],
+        )
+        .await?;
+        for target in affected {
+            if !targets
+                .iter()
+                .any(|existing| existing.episode_id == target.episode_id)
+            {
+                targets.push(target);
+            }
+        }
+    }
     let fence = episode_fence_sql(tx).await?;
     let ids = targets
         .iter()
@@ -716,6 +738,7 @@ mod tests {
             key: Some(key),
             cluster_id: Some(cluster),
             person_id: person,
+            has_accepted_name: person.is_some(),
             participant_key: None,
             attribution: None,
             owner,
@@ -731,6 +754,12 @@ mod tests {
             groups[1].aliases,
             BTreeSet::from([2, 9]),
             "profile grouping must retain every cluster alias for successor inheritance"
+        );
+        let mut recurring = row(4, 40, SpeakerVoiceKey::Profile(10), 10, Some(7), false);
+        recurring.has_accepted_name = false;
+        assert!(
+            voice_groups(&[recurring])[0].needs_slot,
+            "a linkable recurring person still needs a memory-local anonymous slot"
         );
     }
 

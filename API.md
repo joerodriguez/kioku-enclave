@@ -993,7 +993,8 @@ and memory-specific screen interpretations. `match_source` and a bounded `match_
 explain screen hits, including semantic-only matches. Evidence in an existing memory
 carries both the stable `memory_id` and compatibility alias `episode_id`; evidence still
 being organized remains searchable but omits navigation fields. `person_id` is emitted
-only for an identified, non-owner person, so it always resolves as a safe People link.
+only for an identified or recurring non-owner person. Recurring links retain the
+memory-local Speaker letter; the opaque ID resolves to the unnamed People page.
 A valid response with three empty arrays is a real zero-match result; an unavailable
 PostgreSQL read returns non-2xx and must not be interpreted as an empty archive.
 Every search response, including an error, is marked `Cache-Control: private, no-store`
@@ -1028,7 +1029,8 @@ are re-derived from the same current graph; stale named projections are never a 
 for observed but unresolved turns. Only structurally legacy memories without observed
 assigned turns or graph-derived participant history can use legacy participant rows.
 Current person-memory links and recent statements apply the same accepted identity and
-owner-suppression policy. Recurring unnamed People entries remain a later phase.
+owner-suppression policy. Recurring unnamed People entries use opaque IDs while
+keeping their existing per-memory Speaker letters.
 
 Existing archive projections are prepared in bounded transactions before public reads.
 The first complete account preparation remains proportional to archive size; search
@@ -1065,23 +1067,31 @@ brief-sections companion schema (see RELEASING.md).
 
 `GET /api/episodes` keeps its existing `participants` name array and also returns
 `participant_details` on every memory row. Each detail includes display and
-attribution metadata; `person_id` is present only for an identified non-owner
+attribution metadata; `person_id` is present only for an identified or recurring non-owner
 person and is otherwise `null`. The server loads these details in one
 tenant-qualified batch for the page, so archive name chips never infer identity
 from display-text equality.
 
 ## People learned automatically
 
-`GET /api/v2/people?after_id=0&limit=50&q=john` returns identified people in
-stable opaque-ID order. `limit` is 1–100, `after_id` is the prior page's
-`next_cursor`, and optional `q` matches a display name or supported alias.
-Unnamed/tentative voices are not returned:
+`GET /api/v2/people?kind=identified&after_id=0&limit=50&q=john` returns people
+in ascending opaque-ID order. `kind` is the closed enum `identified|recurring`,
+defaulting to `identified`. Each kind has an independent `after_id` cursor; a
+non-null `next_cursor` is the last returned ID, never the lookahead row.
+`limit` is 1–100. Optional `q` matches an identified display name or supported
+alias; a nonblank query with `kind=recurring` returns `400`.
+List, detail, evidence and statement pages prepare current identity projections, then
+read public eligibility and response data in one read-only repeatable-read snapshot.
+Concurrent naming or withdrawal is visible on the next request without mixing pages.
+Owner, unknown/tentative and quarantined people are not returned:
 
 ```json
 {
   "people": [{
     "id": 7,
     "display_name": "John Garcia",
+    "status": "identified",
+    "recurrence": null,
     "voice_profile_count": 1,
     "fact_count": 2,
     "updated_at": "2026-07-31T18:04:12.000Z"
@@ -1090,13 +1100,27 @@ Unnamed/tentative voices are not returned:
 }
 ```
 
+Recurring summaries have `status="recurring"`, presentation `display_name="Unnamed voice"`,
+zero `fact_count`, and a required non-null `recurrence` object with `memory_count`,
+RFC3339 `first_heard_at` / `last_heard_at`, `contexts`, and `co_participants`.
+The source population is retained accepted attribution in current memories. Contexts
+contain at most three `{label,memory_count}` app summaries, ordered by descending
+count then label; co-participants contain at most three identified non-owner
+`{person_id,display_name,memory_count}` entries, ordered by descending count then ID.
+Recurring people qualify through a stable voice plus three distinct current memories
+or twenty minutes of union speech, so `memory_count` can be below three. These
+presentation names are never stored as accepted names or used as identity joins.
+
 `GET /api/v2/people/{person_id}` returns supported aliases, human-readable
 voice coverage, current and superseded temporal facts, identity evidence, and
 up to 100 recent attributed statements with source event/time and episode
 navigation. Each name/fact/evidence item includes its state, confidence,
 observed time, literal evidence, and source event/turn. Raw embeddings and score
 vectors never appear. Clients should present facts as learned observations,
-not user-authored contact data. Existing REST search supports speaker filtering.
+not user-authored contact data. Recurring detail instead has empty voice labels,
+aliases and facts, plain-language continuity coverage, and its attributed statements.
+Existing REST speaker text filtering keeps its canonical-label behavior; recurring
+person navigation uses opaque IDs.
 
 Large histories are available without growing the profile response:
 
@@ -1107,12 +1131,12 @@ Large histories are available without growing the profile response:
   event and optional episode ID/title for navigation.
 
 `limit` is 1–100. Omit `before_id` for the first page; pass the returned
-positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
-person returns `404`. Unknown query fields return `400`.
+positive `next_cursor` as the next `before_id`. Identified and recurring people resolve;
+a missing, owner, unknown/tentative or quarantined person returns `404`. Unknown query fields return `400`.
 
 Utterance records from `GET /api/feed` use the same link rule as search and
 playback: additive `person_id` appears only when attribution resolves to an
-identified non-owner person. `attribution_kind` is included when known; owner,
+identified or recurring non-owner person. `attribution_kind` is included when known; owner,
 unknown, tentative, and quarantined identities remain text-only because they
 never receive a linkable person ID.
 
@@ -1155,7 +1179,7 @@ using display text as identity.
 attributed to that exact person ID, newest first. Each row includes the attributed
 utterance count, contributing recording count, truthful aggregate audio availability,
 and optional `playback_start_ms` / `playback_utterance_id` deep-link coordinates.
-`limit` is 1–100. The person must be identified; display-name equality is never used
+`limit` is 1–100. The person must be identified or recurring; display-name equality is never used
 as a join key.
 
 `GET /api/v2/memories/{memory_id}/playback?at_ms=0` returns a version-1,
@@ -1370,7 +1394,9 @@ rows or owned media generations remain.
   the controls and cannot commit a new binding. Each sweep filters accounts before
   per-account work; expired media is terminalized
   without fetching it. Missing or invalid model weights disable the worker and preserve
-  readiness. Enrollment privacy maintenance is independent of matching/model availability.
+  readiness. All biometric expiry maintenance is independent of Pause/cohort/model availability.
+  Retained ready unassigned samples are reconsidered in bounded fair batches without
+  new inference; new bindings still require the locked cohort/Pause decision.
   Metrics use `voice_identity_v1` with literal outcomes/cohorts/latency buckets,
   no account labels, content, embeddings, or scores.
 - Profile reconciliation retains append-only revisions and sample-assignment
