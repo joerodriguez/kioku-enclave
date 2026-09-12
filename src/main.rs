@@ -589,6 +589,11 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
             .is_ok()
         && state
             .postgres
+            .verify_voice_recurrence_schema()
+            .await
+            .is_ok()
+        && state
+            .postgres
             .verify_interrupted_capture_schema()
             .await
             .is_ok();
@@ -1278,6 +1283,12 @@ async fn async_main() {
             panic!("PostgreSQL voice enrollment schema is not release-ready: {error}")
         });
     postgres
+        .verify_voice_recurrence_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL voice recurrence schema is not release-ready: {error}")
+        });
+    postgres
         .verify_interrupted_capture_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1603,6 +1614,7 @@ const VOICE_IDENTITY_ACCOUNT_IDS_ENV: &str = "VOICE_IDENTITY_ACCOUNT_IDS";
 enum PostgresMigrationReleasePhase {
     InstallVoiceIdentity,
     InstallVoiceEnrollment,
+    InstallVoiceRecurrence,
     SetVoiceIdentityCohort,
     PauseVoiceIdentity,
     ResumeVoiceIdentity,
@@ -1641,6 +1653,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("voice-recurrence-v32-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallVoiceRecurrence)
+        }
         Some("owner-enrollment-v31-install") => {
             Ok(PostgresMigrationReleasePhase::InstallVoiceEnrollment)
         }
@@ -1922,6 +1937,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallVoiceEnrollment => persistence
             .install_voice_enrollment_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"voice_enrollment", "version":31})),
+        PostgresMigrationReleasePhase::InstallVoiceRecurrence => persistence
+            .install_voice_recurrence_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"voice_recurrence", "version":32})),
         PostgresMigrationReleasePhase::SetVoiceIdentityCohort => {
             let (cohort, ids) = voice_cohort.as_ref().expect("voice cohort was validated before PostgreSQL connection");
             persistence.set_voice_identity_cohort(*cohort, ids).await
@@ -2029,6 +2047,10 @@ mod postgres_migration_release_tests {
         );
         for (confirmation, expected) in [
             (
+                "voice-recurrence-v32-install",
+                PostgresMigrationReleasePhase::InstallVoiceRecurrence,
+            ),
+            (
                 "owner-enrollment-v31-install",
                 PostgresMigrationReleasePhase::InstallVoiceEnrollment,
             ),
@@ -2102,8 +2124,9 @@ mod postgres_migration_release_tests {
             ),
         ] {
             assert_eq!(
-                postgres_migration_release_phase(Some(confirmation)).unwrap(),
-                expected
+                postgres_migration_release_phase(Some(confirmation)).ok(),
+                Some(expected),
+                "reviewed companion and activation confirmations must parse exactly: {confirmation}"
             );
         }
         for refused in [
@@ -2120,6 +2143,8 @@ mod postgres_migration_release_tests {
             Some("brief-sections-v29-install "),
             Some("interrupted-capture-v29-install "),
             Some("interrupted-capture-v29"),
+            Some("voice-recurrence-v32-install "),
+            Some("voice-recurrence-v32"),
             Some("owner-enrollment-v31-install "),
             Some("owner-enrollment-v31"),
             Some("voice-identity-v30-install "),

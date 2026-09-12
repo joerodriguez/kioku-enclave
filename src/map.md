@@ -58,3 +58,5 @@ main.rs
 
 Serving startup/readiness verify the additive brief-sections v29 companion; only the explicit `brief-sections-v29-install` migrator phase may install it.
 Serving startup/readiness also verify the v30 voice-identity companion. Its cohort defaults to `none`; only digest-pinned migrator phases change cohort or pause state.
+
+Serving startup/readiness verify the direct v32 voice-recurrence proposal companion; only `voice-recurrence-v32-install` applies its DDL.

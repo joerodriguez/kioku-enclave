@@ -1399,14 +1399,27 @@ rows or owned media generations remain.
   new inference; new bindings still require the locked cohort/Pause decision.
   Metrics use `voice_identity_v1` with literal outcomes/cohorts/latency buckets,
   no account labels, content, embeddings, or scores.
-- Profile reconciliation retains append-only revisions and sample-assignment
-  history. A merge proposal is accepted only across the same embedding space,
-  scorer, acoustic domain, and nonconflicting identity; a split is anonymous
-  unless identity-aware correction has resolved it. Applied proposals replace
-  the current derived labels without mutating source turns and are reversible
-  only while doing so cannot orphan later samples. Superseded/split profiles
-  are excluded from matching and People coverage. Similarity-driven proposal
-  generation remains disabled until its versioned real-corpus gates pass.
+- Profile maintenance uses derivation version 3. Up to 16 older assigned profiles per
+  sweep adopt the current policy from complete retained samples, without new inference;
+  owner and already-quarantined profiles are never revived by this pass. Cross-memory
+  matching and recurring People require the current derivation. Two separated modes with
+  at least three clean observations each, each at least one quarter of clean support,
+  quarantine a profile for matching; they never trigger an automatic split.
+- Automatic merge policy version 1 compares only compatible stable profiles and preserves
+  every compatible runner-up, including owner, oversized and pending-adoption candidates.
+  Adoption examines complete retained support independently of proposal-size bounds.
+  Every clean observation on each side must choose the other profile at the ordinary
+  0.60 score and 0.08 margin; different identified person IDs conflict regardless of name.
+  The complete decision is bounded to 64 profiles, 256 assigned samples per proposal and
+  four proposals per sweep; an incomplete population cannot authorize a merge. Oversized
+  pairs remain competitors but do not block later applicable pairs.
+  Proposals commit exact revisions, assignment predecessors and original speaker-letter
+  reservations. Results recompute from samples, preserve the earliest shared-memory
+  letter, and never modify source turns or memory membership. A new competitor can
+  trigger reversal only while the exact applied revision, complete sample membership,
+  reservations and identity evidence remain unchanged. Later samples or source erasure
+  hold reversal; historical assignments and revisions are never reactivated. These
+  operations use the existing account/cohort/Pause locks and content-free outcome metrics.
 - Facts may be learned from every confidently attributed turn, not only an
   introduction. Facts retain source event/turn, observed time, literal evidence,
   confidence, derivation version, and temporal supersession history.
@@ -1415,7 +1428,8 @@ rows or owned media generations remain.
   activation gate is satisfied, an account may affirmatively retain original source audio
   until deletion in the separate encrypted recordings bucket; screenshots remain on the
   30-day policy. Account export
-  includes profile metadata, revisions, and sample-assignment lineage, without embedding
+  includes profile metadata, revisions, proposal/member/letter-reservation metadata and
+  sample-assignment lineage, without embedding
   or centroid bytes. Episode capture erasure recomputes affected profiles in the same
   transaction or quarantines them when no accepted enrollment sample remains; historical
   revision centroid bytes are also erased while lineage metadata remains. The

@@ -125,6 +125,12 @@ An idempotent install accepts only the exact receipt; an unreceipted table or ei
 index is refused. Base v26 and signed v27 markers/history remain unchanged, with no
 new triggers on capture or memory source tables.
 
+Phase 3 adds the direct v32 profile reconciliation companion. It owns proposal, sample
+membership and original slot-reservation rows, two proposal foreign keys on existing
+lineage tables, and its own selective catalog receipt. Serving startup/readiness verify
+v32; only the exact install command runs DDL. Proposal rows are tenant metadata covered
+by export and account erasure. Installation is separate from source delivery.
+
 Phase 2 adds the direct v31 owner-enrollment companion. It records the account's
 monotonic withdrawal revision, first accepted enrollment session and per-turn owner
 links. Startup and readiness verify both v30 and v31; the dedicated install preserves
@@ -133,6 +139,7 @@ and complete-session orphan erasure, while its schema receipt remains operator s
 
 | `POSTGRES_MIGRATION_CONFIRM` | Inputs and result |
 |---|---|
+| `voice-recurrence-v32-install` | Installs the direct proposal/member/slot companion; emits `{"status":"installed","feature":"voice_recurrence","version":32}`. Requires v31 and preserves prior receipts. |
 | `owner-enrollment-v31-install` | Installs the direct owner-enrollment companion and withdrawal revision; emits `{"status":"installed","feature":"voice_enrollment","version":31}`. Requires the installed v30 companion. |
 | `voice-identity-v30-install` | Seeds `cohort=none`, `paused=false`, `revision=0`; emits `{"status":"installed","feature":"voice_identity","version":30}`. |
 | `voice-identity-cohort-set` | Requires `VOICE_IDENTITY_COHORT=none`, `explicit`, or `all`; explicit requires `VOICE_IDENTITY_ACCOUNT_IDS` containing 1–1024 comma-separated stable UUIDs. Other cohorts require no IDs. IDs are sorted/deduplicated; output contains only cohort, count and revision. |

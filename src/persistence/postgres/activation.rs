@@ -4344,6 +4344,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     persistence.install_brief_sections_schema().await?;
     persistence.install_voice_identity_schema().await?;
     persistence.install_voice_enrollment_schema().await?;
+    persistence.install_voice_recurrence_schema().await?;
     test_real_pg_terminal_media_claim_repair(persistence).await?;
     super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
     test_real_pg_seal_and_tombstone_contract(persistence).await?;

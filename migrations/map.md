@@ -5,6 +5,10 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0032_voice_recurrence.sql` adds tenant-owned profile reconciliation proposals,
+  exact assignment membership and original letter reservations through the direct
+  `voice-recurrence-v32-install` companion. Its selective receipt preserves earlier
+  schema receipts; serving verifies the owned tables and two proposal foreign keys.
 - `0031_voice_enrollment.sql` adds the account withdrawal revision, first-accepted
   enrollment session metadata, owner singleton and per-observation voice/evidence
   links through the direct `owner-enrollment-v31-install` companion. Its receipt

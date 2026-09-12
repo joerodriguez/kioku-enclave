@@ -134,7 +134,7 @@ pub(crate) fn decide_continuity(
 /// Candidate scopes are complete or held, never truncated to choose a winner.
 pub(crate) const MAX_CANDIDATE_PROFILES: usize = 512;
 pub(crate) const MIN_STABLE_OBSERVATIONS: usize = 3;
-pub(crate) const IDENTITY_DERIVATION_VERSION: i64 = 2;
+pub(crate) const IDENTITY_DERIVATION_VERSION: i64 = 3;
 
 /// Same-recording continuity has priority. If it cannot decide, compare the
 /// complete union with account-wide stable candidates before creating anything.

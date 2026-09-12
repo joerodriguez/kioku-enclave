@@ -43,7 +43,8 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 | `voice_memory.rs` | Pure-Rust audio decoding, fbank, and hash-pinned WeSpeaker inference shared by serving and explicit voice evaluation. |
 | `voice_identity.rs` | Pure f32x256 codec, channel domains, checked source slices, bounded same-recording/account scope decisions that preserve ambiguity, and medoid/trimmed-centroid math with exact retained membership for stability. |
 | `voice_enrollment.rs` | Authenticated owner-voice status and Forget routes through the voice repository; current recognition is independent of the latest recording attempt, and HTTP responses are private and uncacheable. |
-| `voice_worker.rs` | Separate 20-second voice-job lease loop, cohort filtering for new bindings, independent owner enrollment plus general biometric expiry and stored-sample reconsideration even without a model, at most four concurrent accounts/CPU tasks, 180-second batches, retained-media decoding cache, and content-free metrics. |
+| `voice_worker.rs` | Separate 20-second voice-job lease loop, cohort filtering for new bindings, independent owner enrollment plus general biometric expiry, stored-sample reconsideration and automatic profile proposals/reversal even without a model, at most four concurrent accounts/CPU tasks, 180-second batches, retained-media decoding cache, and content-free metrics. |
+| `voice_reconciliation.rs` | Pure reciprocal complete-population profile reconciliation and separated-mode quarantine policy; names never join acoustic identities. |
 | `voice_quality.rs` | Versioned enrollment/matching quality policy and robust representative selection. |
 | `voice_eval.rs` | Public voice/identity/diarization scoring contract and real-corpus release classification. |
 | `voice_eval_assets.rs` | Offline, hash-bound licensed-corpus derivation outside Git. |

@@ -618,3 +618,10 @@ refinalization by old code can update legacy fields while retaining stale sectio
 After any dynamic write, rollback requires a sections-aware predecessor or a separately
 reviewed compatibility repair that clears/fences sections while finalizers remain stopped.
 Do not infer rollback safety from the unchanged base/activation catalog receipts.
+
+### ADR-0048 profile reconciliation companion
+
+The reviewed source also requires `voice-recurrence-v32-install`, after v31, through
+its existing dedicated PostgreSQL migrator. It installs only the additive proposal,
+membership and reservation companion; startup/readiness verify its selective receipt.
+No serving process applies DDL. Source merge does not publish an image or run this command.

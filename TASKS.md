@@ -1,3 +1,19 @@
+# ADR-0048 automatic profile reconciliation (2026-09-12)
+
+- [x] Implement v32 proposal/member/slot provenance, reciprocal complete-population
+      merging, exact reversal, mixed-mode quarantine and current-policy adoption.
+- [x] Pass real PostgreSQL apply/reversal, stale/deletion/identity refusal,
+      source/letter preservation, tenant/export/erasure and fourteen semantic
+      production-reversal groups (nineteen focused runs, twenty-two named assertions).
+- [x] Resolve six independent review findings, including complete competitors and
+      sample bounds independent of scheduling/adoption.
+- [x] Pass the exhaustive PostgreSQL/model/Clippy gate on the final reviewed source:
+      560 passed, zero failures, one pre-existing manual probe ignored; formatting
+      and strict all-target Clippy pass. Exact restored source hashes are recorded.
+- [ ] Deliver through a normal reviewed PR and add the exact existing operator mapping.
+- [ ] Complete Phase 4 name fusion, Phase 5 identity-driven briefs and Phase 6 real
+      owner acceptance. No release or production result is claimed here.
+
 # ADR-0048 cross-memory matching and recurring People (2026-09-12)
 
 - [x] Match against compatible stable account-wide voices after session continuity, with three clean observations for stability and bounded provider-free stored-sample reconsideration.
@@ -6,8 +22,10 @@
 - [x] Add separately paged identified/recurring People routes with coherent read snapshots and owner/private-status exclusion.
 - [x] Resolve independent foundation and People review findings; ten recurrence/label production reversals reach named semantic assertions and exact restored tests pass, alongside earlier scope and maintenance proofs.
 - [x] Pass full PostgreSQL/model verification:545passed, one existing manual probe ignored; formatting and strict all-target Clippy pass. Independent final composed review has no unresolved finding.
-- [ ] Merge this source slice through the normal reviewed PR path; coordinated client source is in downstream PR528.
-- [ ] Finish Phase3 automatic proposals, exact append-only reversal, bimodal quarantine and current-policy adoption of stored assigned profiles.
+- [x] Merge the matching/People source in #518 (`8780f100`); downstream client #528 is merged at `d13959ef` (web287, iPhone226).
+- [x] Implement and verify Phase3 automatic proposals, exact append-only reversal,
+      bimodal quarantine and current-policy adoption of stored assigned profiles;
+      reviewed delivery is recorded in the section above.
 - [ ] Finish Phase4 name fusion, Phase5 identity-driven summaries and Phase6 real owner acceptance. Synthetic verification does not establish production acceptance.
 
 # Content-specific brief sections (2026-09-11)

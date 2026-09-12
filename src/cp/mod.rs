@@ -46,6 +46,7 @@ pub mod voice_eval_similarity;
 pub(crate) mod voice_identity;
 pub mod voice_memory;
 pub mod voice_quality;
+pub(crate) mod voice_reconciliation;
 pub(crate) mod voice_worker;
 pub mod webhook_worker;
 

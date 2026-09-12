@@ -114,6 +114,17 @@ const EXPORT_TABLES: &[(&str, &str, &str)] = &[
     ),
     ("people", "people", "display_name,id"),
     ("voice_profiles", "voice_profiles", "person_id,id"),
+    ("voice_profile_proposals", "voice_profile_proposals", "id"),
+    (
+        "voice_profile_proposal_samples",
+        "voice_profile_proposal_samples",
+        "proposal_id,sample_id",
+    ),
+    (
+        "voice_profile_proposal_slots",
+        "voice_profile_proposal_slots",
+        "proposal_id,slot_id",
+    ),
     (
         "voice_samples",
         "voice_samples",
