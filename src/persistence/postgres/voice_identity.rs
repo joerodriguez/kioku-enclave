@@ -63,6 +63,7 @@ pub(super) async fn allocate_voice_id(
         "person" => "people",
         "identity_evidence" => "identity_evidence",
         "voice_profile" => "voice_profiles",
+        "voice_profile_proposal" => "voice_profile_proposals",
         "voice_sample" => "voice_samples",
         "voice_profile_revision" => "voice_profile_revisions",
         "voice_profile_representative" => "voice_profile_representatives",
@@ -401,6 +402,7 @@ pub(super) async fn maintain_profiles(repo: &PostgresPersistence, account: &str)
     let (admitted, cohort) = controls_admit(&mut tx, account).await?;
     let mut outcomes = Vec::new();
     if admitted {
+        super::voice_profile_reconciliation::adopt_current_policy(&mut tx, account).await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT s.id,s.speaker_observation_id,s.embedding,s.embedding_space,s.scorer_version,s.channel_domain,s.eligibility,j.id job_id FROM voice_samples s JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id JOIN voice_embedding_jobs j ON j.account_id=s.account_id AND j.id=s.embedding_job_id AND j.speaker_observation_id=s.speaker_observation_id AND j.state='ready' WHERE s.account_id=$1 AND s.accepted AND s.voice_profile_id IS NULL AND s.eligibility IN ('enroll','match_only') AND s.embedding_space=$2 AND s.quality_version=$3 AND s.scorer_version=$4 AND NOT EXISTS(SELECT 1 FROM voice_sample_profile_assignments a WHERE a.account_id=s.account_id AND a.sample_id=s.id AND a.active) AND ({RETAINED}) AND NOT ({fence}) AND NOT ({ENROLLMENT_REVOKED}) ORDER BY j.updated_at,s.id LIMIT 16"
         ))).bind(account).bind(EMBEDDING_SPACE).bind(QUALITY_VERSION).bind(SCORER_VERSION).fetch_all(&mut *tx).await?;
@@ -433,6 +435,9 @@ pub(super) async fn maintain_profiles(repo: &PostgresPersistence, account: &str)
             sqlx::query("UPDATE voice_embedding_jobs SET updated_at=clock_timestamp() WHERE account_id=$1 AND id=$2 AND state='ready'")
                 .bind(account).bind(row.try_get::<i64,_>("job_id")?).execute(&mut *tx).await?;
         }
+    }
+    if admitted {
+        outcomes.extend(super::voice_profile_reconciliation::reconcile(&mut tx, account).await?);
     }
     let changed_profiles = super::voice_recurrence::refresh(&mut tx, account).await?;
     refresh_affected_speaker_projections(&mut tx, account, &[], &changed_profiles, &[]).await?;
@@ -658,7 +663,7 @@ async fn nonowner_candidate_scores(
          WHERE p.account_id=$1 AND p.embedding_space=$2 AND p.scorer_version=$3 \
          AND p.channel_domain=$4 AND p.status<>'quarantined' AND coalesce(person.status,'')<>'owner' \
          AND EXISTS(SELECT 1 FROM voice_profile_revisions revision WHERE revision.account_id=p.account_id \
-           AND revision.profile_id=p.id AND revision.active AND revision.status=p.status) \
+           AND revision.profile_id=p.id AND revision.active AND revision.status=p.status AND ($5::text IS NOT NULL OR revision.derivation_version=$7)) \
          AND (($5::text IS NULL AND p.status='stable') OR EXISTS( \
            SELECT 1 FROM voice_sample_profile_assignments a \
            JOIN voice_samples s ON s.account_id=a.account_id AND s.id=a.sample_id \
@@ -687,6 +692,7 @@ async fn nonowner_candidate_scores(
         .bind(domain)
         .bind(session)
         .bind((voice_identity::MAX_CANDIDATE_PROFILES + 1) as i64)
+        .bind(voice_identity::IDENTITY_DERIVATION_VERSION)
         .fetch_all(&mut **tx)
         .await?;
     rows.into_iter()
@@ -735,7 +741,7 @@ pub(super) async fn recompute_profile(
     profile: i64,
     reason: &str,
 ) -> Result<()> {
-    let rows=sqlx::query("SELECT s.id,s.speaker_observation_id,s.embedding FROM voice_samples s JOIN voice_sample_profile_assignments a ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active JOIN voice_profiles p ON p.account_id=a.account_id AND p.id=a.profile_id WHERE s.account_id=$1 AND a.profile_id=$2 AND s.accepted AND s.eligibility='enroll' AND s.quality_version=$3 AND NOT EXISTS(SELECT 1 FROM speaker_observations observation JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id AND cluster.id=observation.cluster_id WHERE observation.account_id=s.account_id AND observation.id=s.speaker_observation_id AND cluster.profile_updates_quarantined) AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain ORDER BY s.id").bind(account).bind(profile).bind(QUALITY_VERSION).fetch_all(&mut **tx).await?;
+    let rows=sqlx::query("SELECT s.id,s.speaker_observation_id,s.embedding FROM voice_samples s JOIN voice_sample_profile_assignments a ON a.account_id=s.account_id AND a.sample_id=s.id AND a.active JOIN voice_profiles p ON p.account_id=a.account_id AND p.id=a.profile_id JOIN speaker_observations observation ON observation.account_id=s.account_id AND observation.id=s.speaker_observation_id LEFT JOIN speaker_clusters cluster ON cluster.account_id=observation.account_id AND cluster.id=observation.cluster_id WHERE s.account_id=$1 AND a.profile_id=$2 AND s.accepted AND s.eligibility='enroll' AND s.quality_version=$3 AND NOT coalesce(cluster.profile_updates_quarantined,false) AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain ORDER BY s.id").bind(account).bind(profile).bind(QUALITY_VERSION).fetch_all(&mut **tx).await?;
     let samples = rows
         .iter()
         .map(|r| {
@@ -745,6 +751,14 @@ pub(super) async fn recompute_profile(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let bimodal = crate::cp::voice_reconciliation::has_distinct_modes(&samples)?;
+    if bimodal {
+        sqlx::query("UPDATE voice_profiles SET status='quarantined' WHERE account_id=$1 AND id=$2")
+            .bind(account)
+            .bind(profile)
+            .execute(&mut **tx)
+            .await?;
+    }
     if let Some(rep) = voice_identity::representative(&samples)? {
         let bytes = voice_identity::encode_embedding(&rep.centroid)?;
         let observations = rows
@@ -768,7 +782,13 @@ pub(super) async fn recompute_profile(
         .execute(&mut **tx)
         .await?;
     }
-    append_revision(tx, account, profile, reason).await
+    append_revision(
+        tx,
+        account,
+        profile,
+        if bimodal { "bimodal_support" } else { reason },
+    )
+    .await
 }
 
 /// Identity reachability is captured before source cascades remove named
@@ -1120,7 +1140,7 @@ pub(super) mod tests {
             .unwrap(),
             revisions_before
         );
-        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(derivation_version=2) FROM voice_profile_revisions WHERE account_id=$1")
+        assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(derivation_version=3) FROM voice_profile_revisions WHERE account_id=$1")
             .bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap(), "stability decisions must record their derivation version");
         assert_projection_source_unchanged(repo, ACCOUNT).await;
         cleanup(fixture).await;

@@ -34,7 +34,7 @@ pub(super) async fn support(
     let sql = format!("WITH qualified AS (
       SELECT DISTINCT p.id profile,o.id observation,e.capture_session_id timeline,o.started_at,o.ended_at,m.episode_id
       FROM voice_profiles p
-      JOIN voice_profile_revisions revision ON revision.account_id=p.account_id AND revision.profile_id=p.id AND revision.active AND revision.status='stable'
+      JOIN voice_profile_revisions revision ON revision.account_id=p.account_id AND revision.profile_id=p.id AND revision.active AND revision.status='stable' AND revision.derivation_version=$6
       JOIN voice_sample_profile_assignments assignment ON assignment.account_id=p.account_id AND assignment.profile_id=p.id AND assignment.active
       JOIN voice_samples s ON s.account_id=assignment.account_id AND s.id=assignment.sample_id AND s.voice_profile_id=p.id AND s.accepted AND s.eligibility IN ('enroll','match_only')
       JOIN speaker_observations o ON o.account_id=s.account_id AND o.id=s.speaker_observation_id AND o.voice_profile_id=p.id AND o.voice_sample_id=s.id
@@ -61,6 +61,7 @@ pub(super) async fn support(
         .bind(EMBEDDING_SPACE)
         .bind(SCORER_VERSION)
         .bind(QUALITY_VERSION)
+        .bind(crate::cp::voice_identity::IDENTITY_DERIVATION_VERSION)
         .fetch_all(&mut *tx)
         .await?;
     rows.into_iter()
