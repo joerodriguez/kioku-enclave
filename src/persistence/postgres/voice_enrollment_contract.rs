@@ -515,6 +515,15 @@ async fn owner_enrollment_forget_then_fresh_enrollment_rejects_old_lease_and_lat
     designate(repo, account, "queued", 0).await;
     let old = claim(repo, account).await;
     repo.forget_owner_voice_enrollment(account).await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT state='failed' AND error_code='enrollment_revoked' AND lease_owner IS NULL AND lease_token IS NULL AND lease_until IS NULL FROM voice_embedding_jobs WHERE account_id=$1 AND id=$2")
+            .bind(account)
+            .bind(old.id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+        "Forget must cancel the designated in-flight lease before admitting a fresh enrollment"
+    );
     turn(repo, account, "fresh", 3, 3).await;
     designate(repo, account, "fresh", 1).await;
     embed(repo, account, 0).await;
@@ -569,7 +578,7 @@ async fn owner_enrollment_pause_blocks_new_bindings_and_post_cutoff_work_does_no
     embed(repo, account, 0).await;
     turn(repo, account, "recording", 30, 30).await;
     sqlx::query("UPDATE media_processing_jobs SET state='failed_terminal' WHERE account_id=$1 AND event_id='event-30'").bind(account).execute(repo.pool()).await.unwrap();
-    sqlx::query("INSERT INTO capture_upload_intents(account_id,event_id,token,asset_id,object_key,manifest_digest,expires_at) VALUES($1,'unrelated-upload',$1,'unrelated-asset','processing/unrelated',repeat('a',64),clock_timestamp()+interval '10 minutes')")
+    sqlx::query("INSERT INTO capture_upload_intents(account_id,event_id,token,asset_id,object_key,manifest_digest,expires_at) VALUES($1,'unrelated-upload',$1,'unrelated-asset','raw/'||$1||'/unrelated-asset.enc',repeat('a',64),clock_timestamp()+interval '10 minutes')")
         .bind(account).execute(repo.pool()).await.unwrap();
     // Keep a deliberate gap only after the first three minutes. Its ordinary
     // media and voice jobs retain their own independent terminal/pending state.

@@ -167,7 +167,13 @@ mod tests {
             speech(2, Some(1), 90_000, 180_000),
             speech(3, Some(2), 180_000, 360_000),
         ];
-        let before = decide(&spans, 0).unwrap();
+        let before =
+            decide(&spans, 0).expect("the first three minutes contain one eligible dominant voice");
+        assert_eq!(
+            (before.group, before.share, before.samples.clone()),
+            (1, 1.0, vec![(1, 1), (2, 2)]),
+            "only the complete first-three-minute window may contribute enrollment samples"
+        );
         spans.reverse();
         let after = decide(&spans, 0).unwrap();
         assert_eq!(
@@ -179,9 +185,9 @@ mod tests {
     #[test]
     fn enrollment_policy_does_not_count_duplicate_time_twice() {
         let spans = [
-            speech(1, Some(1), 0, 80_000),
-            speech(1, Some(1), 0, 80_000),
-            speech(2, Some(2), 80_000, 100_000),
+            speech(1, Some(1), 0, 85_000),
+            speech(1, Some(1), 0, 85_000),
+            speech(2, Some(2), 85_000, 100_000),
         ];
         assert!(
             matches!(
