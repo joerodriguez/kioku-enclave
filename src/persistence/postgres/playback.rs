@@ -68,13 +68,11 @@ impl PostgresPersistence {
         let Some(memory) = memory else {
             return Ok(None);
         };
-        let started_ms = epoch_millis(&memory, "started_at_ms")?;
-        let ended_ms = epoch_millis(&memory, "ended_at_ms")?;
-        if ended_ms <= started_ms {
+        let memory_started_ms = epoch_millis(&memory, "started_at_ms")?;
+        let memory_ended_ms = epoch_millis(&memory, "ended_at_ms")?;
+        if memory_ended_ms <= memory_started_ms {
             return Err(EnclaveError::Store("memory interval is malformed".into()));
         }
-        let started_at = isotime::format_epoch_millis(started_ms);
-        let ended_at = isotime::format_epoch_millis(ended_ms);
         let fence_revision = durable_read.map(|fence| fence.policy_revision);
         let fence_epoch = durable_read.map(|fence| fence.policy_epoch.as_str());
 
@@ -125,6 +123,26 @@ impl PostgresPersistence {
                 .bind(account_id).bind(&scoped_event_ids).fetch_all(&mut *transaction).await?;
             blocked_events.extend(normalized);
         }
+        // A memory's own interval is content-derived (first to last spoken words), but
+        // its member audio events are whole capture segments that usually start before
+        // the first word and end after the last. The playback timeline must cover every
+        // member segment: a segment outside the declared timeline is refused by clients,
+        // and a segment clamped to the origin would seek early by the clipped pre-roll.
+        // Only the timeline moves; memory bounds, membership, and labels are unchanged.
+        let mut origin_ms = memory_started_ms;
+        let mut end_ms = memory_ended_ms;
+        for row in &segment_rows {
+            let event_id: String = row.try_get("event_id")?;
+            if blocked_events.contains(&event_id) {
+                continue;
+            }
+            origin_ms = origin_ms.min(epoch_millis(row, "event_started_ms")?);
+            end_ms = end_ms.max(epoch_millis(row, "event_ended_ms")?);
+        }
+        let started_ms = origin_ms;
+        let ended_ms = end_ms;
+        let started_at = isotime::format_epoch_millis(started_ms);
+        let ended_at = isotime::format_epoch_millis(ended_ms);
         let mut segments = Vec::with_capacity(segment_rows.len());
         for row in segment_rows {
             let capture_session_id: String = row.try_get("capture_session_id")?;
@@ -407,6 +425,7 @@ impl PlaybackRepository for PostgresPersistence {
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint ended_at_ms, \
                     count(DISTINCT u.id) FILTER (WHERE speaker_identity.person_id=$2) attributed_count, \
                     min(floor(extract(epoch FROM o.started_at)*1000)::bigint) FILTER (WHERE speaker_identity.person_id=$2) first_attributed_ms, \
+                    min(floor(extract(epoch FROM ce.started_at)*1000)::bigint) FILTER (WHERE ce.stream_kind IN ('mic','system_audio','ios_mic')) first_audio_ms, \
                     count(DISTINCT ce.capture_session_id) source_recordings, \
                     min(u.id) FILTER (WHERE speaker_identity.person_id=$2) playback_utterance_id, \
                     count(DISTINCT src.event_id) source_count, \
@@ -454,6 +473,11 @@ impl PlaybackRepository for PostgresPersistence {
         let mut memories = Vec::with_capacity(rows.len());
         for row in rows {
             let started_ms = epoch_millis(&row, "started_at_ms")?;
+            // The playback timeline origin is the earliest member audio event when that
+            // precedes the memory's content-derived start (see load_playback_dataset).
+            let first_audio_ms: Option<i64> = row.try_get("first_audio_ms")?;
+            let timeline_origin_ms =
+                first_audio_ms.map_or(started_ms, |first| first.min(started_ms));
             let first_attributed_ms: Option<i64> = row.try_get("first_attributed_ms")?;
             let source_count = row.try_get("source_count")?;
             let ready_count = row.try_get("ready_count")?;
@@ -487,7 +511,7 @@ impl PlaybackRepository for PostgresPersistence {
                     pruned_count,
                 ),
                 playback_start_ms: first_attributed_ms
-                    .map(|first| first.saturating_sub(started_ms).max(0)),
+                    .map(|first| first.saturating_sub(timeline_origin_ms).max(0)),
                 playback_utterance_id: row.try_get("playback_utterance_id")?,
             });
         }

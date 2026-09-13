@@ -1259,7 +1259,13 @@ owner-only playback window. A window covers at most 15 minutes, 128 source segme
 1,000 utterances, and 4,000 ordered source spans. The response contains opaque
 recording, track, and segment IDs; a memory-relative wall-clock timeline; separate
 mic/system/iPhone tracks; transcript rows; source-span seek coordinates; availability;
-and a positive `projection_revision`. It never exposes a provider object name,
+and a positive `projection_revision`. The timeline covers every member audio segment in
+full: its `started_at` is the earlier of the memory's `started_at` and the earliest
+member segment start, and its `ended_at` the later of the memory's `ended_at` and the
+latest member segment end, so `timeline.started_at` may precede the memory's own
+`started_at` by the recording's pre-roll and every segment and utterance coordinate
+lies within `[0, duration_ms]`. Person-memory `playback_start_ms` uses the same
+origin. It never exposes a provider object name,
 generation, wrapped key, or media key. The revision is bounded to JavaScript's exact
 integer range so browser clients can echo it without numeric rounding. Pass only one of
 `at_ms` or the returned opaque
