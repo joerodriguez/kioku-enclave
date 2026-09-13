@@ -1163,6 +1163,131 @@ mod tests {
         fixture.base.pool().close().await;
     }
 
+    #[tokio::test]
+    async fn memory_playback_timeline_covers_member_audio_segments() {
+        use crate::persistence::PlaybackRepository;
+        let Some(fixture) = test_persistence().await else {
+            return;
+        };
+        let pool = fixture.persistence.pool();
+        // The memory's content interval (12:00:10 .. 12:00:50) sits strictly inside its
+        // one member audio segment (12:00:00 .. 12:01:00). The segment must fit the
+        // declared timeline, and the utterance at 12:00:10 must be placed relative to
+        // the audio start, or every seek on that segment lands early by the pre-roll.
+        sqlx::raw_sql("INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES \
+            ('timeline-owner','timeline@example.invalid','google','timeline-owner'); \
+            INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version) \
+            VALUES('timeline-owner','recording-t','device','install','2026-09-13T12:00:00Z','2026-09-13T12:01:00Z','2026-09-13T12:01:00Z',2); \
+            INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) \
+            VALUES('timeline-owner','stream-t','recording-t','device','ios_mic'); \
+            INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+            VALUES('timeline-owner','event-t','device','install','recording-t','stream-t','ios_mic',0,'2026-09-13T12:00:00Z','0','2026-09-13T12:00:00Z','2026-09-13T12:01:00Z','UTC',0,0,'asset-t',repeat('b',64),'canonical'); \
+            INSERT INTO media_objects(account_id,asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,processing_state) \
+            VALUES('timeline-owner','asset-t','event-t','media/timeline-owner/asset-t.enc',3,'current','audio/mp4','aac',512,repeat('b',64),'ready'); \
+            INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary,updated_at) \
+            VALUES('timeline-owner',7,'2026-09-13T12:00:10Z','2026-09-13T12:00:50Z','work','Trimmed memory','content interval',now()); \
+            INSERT INTO audio_segments(account_id,id,started_at,ended_at,duration_seconds,source_type) \
+            VALUES('timeline-owner',1,'2026-09-13T12:00:00Z','2026-09-13T12:01:00Z',60,'mic'); \
+            INSERT INTO people(account_id,id,display_name,normalized_name,status) \
+            VALUES('timeline-owner',1,'Lynn','lynn','identified'); \
+            INSERT INTO speaker_observations(account_id,id,person_id,event_id,turn_id,speaker_local_id,started_at,ended_at,transcript_text,language,voice_eligibility) \
+            VALUES('timeline-owner',1,1,'event-t','turn-t','speaker-1','2026-09-13T12:00:10Z','2026-09-13T12:00:15Z','first words','en','enroll'); \
+            INSERT INTO speaker_observation_sources(account_id,speaker_observation_id,event_id,window_start_ms,window_end_ms,event_start_ms,event_end_ms) \
+            VALUES('timeline-owner',1,'event-t',10000,15000,10000,15000); \
+            INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds,end_offset_seconds,text,speaker_label,source_key,speaker_observation_id) \
+            VALUES('timeline-owner',1,1,10,15,'first words','Lynn','cloud-v2:event-t:turn-t',1); \
+            INSERT INTO episode_members(account_id,episode_id,record_type,record_id) \
+            VALUES('timeline-owner',7,'utterance',1);")
+            .execute(pool).await.unwrap();
+        let dataset = fixture
+            .persistence
+            .dataset("timeline-owner", 7, None)
+            .await
+            .unwrap()
+            .expect("memory with one member audio segment");
+        assert_eq!(dataset.started_at, "2026-09-13T12:00:00.000Z");
+        assert_eq!(dataset.ended_at, "2026-09-13T12:01:00.000Z");
+        assert_eq!(
+            dataset.duration_ms, 60_000,
+            "the timeline covers the whole member segment, not only the content interval"
+        );
+        assert_eq!(dataset.segments.len(), 1);
+        assert_eq!(dataset.segments[0].timeline_start_ms, 0);
+        assert_eq!(dataset.segments[0].timeline_end_ms, 60_000);
+        assert!(
+            dataset.segments[0].timeline_end_ms <= dataset.duration_ms,
+            "a member segment must never extend past the declared timeline"
+        );
+        assert_eq!(dataset.utterances.len(), 1);
+        assert_eq!(
+            dataset.utterances[0].timeline_start_ms, 10_000,
+            "utterances are placed relative to the audio start, not the content start"
+        );
+        assert_eq!(dataset.utterances[0].timeline_end_ms, 15_000);
+        let person_page = fixture
+            .persistence
+            .person_memories("timeline-owner", 1, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(person_page.memories.len(), 1);
+        assert_eq!(person_page.memories[0].memory_id, 7);
+        assert_eq!(
+            person_page.memories[0].playback_start_ms,
+            Some(10_000),
+            "person-memory deep links use the same timeline origin as the manifest"
+        );
+        // A memory that starts before its first member audio keeps its own origin and
+        // widens only the end; the utterance keeps its memory-relative coordinate.
+        sqlx::query("UPDATE episodes SET started_at='2026-09-13T11:59:55Z' WHERE account_id='timeline-owner' AND id=7")
+            .execute(pool).await.unwrap();
+        let end_only = fixture
+            .persistence
+            .dataset("timeline-owner", 7, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(end_only.started_at, "2026-09-13T11:59:55.000Z");
+        assert_eq!(end_only.duration_ms, 65_000);
+        assert_eq!(end_only.segments[0].timeline_start_ms, 5_000);
+        assert_eq!(end_only.segments[0].timeline_end_ms, 65_000);
+        assert_eq!(end_only.utterances[0].timeline_start_ms, 15_000);
+        // An earlier member event that a pending deletion owns is excluded from the
+        // timeline bounds exactly as it is excluded from the segments.
+        sqlx::raw_sql("INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition) \
+            VALUES('timeline-owner','event-t0','device','install','recording-t','stream-t','ios_mic',1,'2026-09-13T11:50:00Z','0','2026-09-13T11:50:00Z','2026-09-13T11:52:00Z','UTC',0,0,'asset-t0',repeat('c',64),'canonical'); \
+            INSERT INTO speaker_observations(account_id,id,event_id,turn_id,speaker_local_id,started_at,ended_at,transcript_text,language,voice_eligibility) \
+            VALUES('timeline-owner',2,'event-t0','turn-t0','speaker-2','2026-09-13T11:50:30Z','2026-09-13T11:50:35Z','earlier words','en','enroll'); \
+            INSERT INTO speaker_observation_sources(account_id,speaker_observation_id,event_id,window_start_ms,window_end_ms,event_start_ms,event_end_ms) \
+            VALUES('timeline-owner',2,'event-t0',30000,35000,30000,35000); \
+            INSERT INTO utterances(account_id,id,audio_segment_id,start_offset_seconds,end_offset_seconds,text,speaker_label,source_key,speaker_observation_id) \
+            VALUES('timeline-owner',2,1,30,35,'earlier words','Unidentified voice','cloud-v2:event-t0:turn-t0',2); \
+            INSERT INTO episode_members(account_id,episode_id,record_type,record_id) VALUES('timeline-owner',7,'utterance',2); \
+            INSERT INTO episode_deletions(account_id,episode_id,state,purge,media_object_keys,utterance_ids,screenshot_ids,segment_ids,orphan_event_ids) \
+            VALUES('timeline-owner',99,'pending','{}','[]','[]','[]','[]','[\"event-t0\"]');")
+            .execute(pool).await.unwrap();
+        let blocked = fixture
+            .persistence
+            .dataset("timeline-owner", 7, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocked.started_at, "2026-09-13T11:59:55.000Z",
+            "a deletion-owned member event never widens the timeline"
+        );
+        assert_eq!(blocked.segments.len(), 1);
+        assert_eq!(blocked.segments[0].event_id, "event-t");
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            fixture.schema
+        )))
+        .execute(fixture.base.pool())
+        .await
+        .unwrap();
+        fixture.base.pool().close().await;
+    }
+
     #[test]
     fn serving_accepts_only_the_receipted_expand_or_finalized_schema() {
         assert_eq!(
