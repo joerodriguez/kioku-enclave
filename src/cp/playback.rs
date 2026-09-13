@@ -1052,10 +1052,16 @@ pub(crate) fn projection_revision(
     segments: &[SegmentAuthority],
     utterances: &[UtteranceAuthority],
     sources: &[SourceAuthority],
+    identity_revisions: &[(i64, i64)],
 ) -> i64 {
     let mut digest = Sha256::new();
-    digest.update(b"kioku.playback-projection.v1\0");
+    digest.update(b"kioku.playback-projection.v2\0");
     digest.update(memory_id.to_be_bytes());
+    digest.update((identity_revisions.len() as u64).to_be_bytes());
+    for (id, revision) in identity_revisions {
+        digest.update(id.to_be_bytes());
+        digest.update(revision.to_be_bytes());
+    }
     digest.update(started_at.as_bytes());
     digest.update([0]);
     digest.update(ended_at.as_bytes());
@@ -1081,6 +1087,18 @@ pub(crate) fn projection_revision(
         digest.update(utterance.timeline_end_ms.to_be_bytes());
         digest.update(utterance.text.as_bytes());
         digest.update([0]);
+        // Presentation changes invalidate the existing projection cursor;
+        // source IDs, track coordinates and archive routing stay independent.
+        for value in [
+            utterance.fallback_label.as_str(),
+            utterance.display_name.as_deref().unwrap_or(""),
+            utterance.attribution_state.as_deref().unwrap_or(""),
+        ] {
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+        digest.update(utterance.person_id.unwrap_or_default().to_be_bytes());
+        digest.update([u8::from(utterance.overlap)]);
     }
     for source in sources {
         digest.update(source.observation_id.to_be_bytes());
@@ -1516,12 +1534,91 @@ mod tests {
     }
 
     #[test]
+    fn identity_presentation_changes_invalidate_playback_without_changing_source_coordinates() {
+        let original = UtteranceAuthority {
+            utterance_id: 1,
+            observation_id: Some(2),
+            timeline_start_ms: 100,
+            timeline_end_ms: 4100,
+            text: "Unchanged transcript".into(),
+            fallback_label: "Speaker A".into(),
+            overlap: false,
+            person_id: None,
+            display_name: None,
+            attribution_state: Some("context_inferred".into()),
+        };
+        let revision = |utterance: &UtteranceAuthority| {
+            projection_revision(
+                1,
+                "2026-08-27T12:00:00.000Z",
+                "2026-08-27T12:01:00.000Z",
+                &[],
+                std::slice::from_ref(utterance),
+                &[],
+                &[],
+            )
+        };
+        let before = revision(&original);
+        let mut changes = Vec::new();
+        let mut named = original.clone();
+        named.display_name = Some("Ana".into());
+        changes.push(named);
+        let mut recurring = original.clone();
+        recurring.person_id = Some(20);
+        changes.push(recurring);
+        let mut owner = original.clone();
+        owner.fallback_label = "Me".into();
+        changes.push(owner);
+        let mut kind = original.clone();
+        kind.attribution_state = Some("owner_voice".into());
+        changes.push(kind);
+        for changed in changes {
+            assert_ne!(revision(&changed),before,"playback revision must include current name, person, owner label and attribution meaning");
+            assert_eq!(
+                (
+                    changed.utterance_id,
+                    changed.observation_id,
+                    changed.timeline_start_ms,
+                    changed.timeline_end_ms,
+                    &changed.text
+                ),
+                (
+                    original.utterance_id,
+                    original.observation_id,
+                    original.timeline_start_ms,
+                    original.timeline_end_ms,
+                    &original.text
+                )
+            );
+        }
+        assert_eq!(revision(&original), before);
+    }
+
+    #[test]
+    fn identity_presentation_playback_tracks_each_memory_revision_not_only_the_maximum() {
+        let revision = |revisions: &[(i64, i64)]| {
+            projection_revision(0, "start", "end", &[], &[], &[], revisions)
+        };
+        assert_ne!(
+            revision(&[(1, 9), (2, 2)]),
+            revision(&[(1, 9), (2, 3)]),
+            "a session projection must notice a lower-revision memory changing"
+        );
+        assert_ne!(
+            revision(&[(1, 9), (2, 2)]),
+            revision(&[(1, 9), (3, 2)]),
+            "a session projection must bind each revision to its memory"
+        );
+    }
+
+    #[test]
     fn projection_revisions_round_trip_through_javascript_numbers() {
         let revision = projection_revision(
             123,
             "2026-08-27T12:00:00.000Z",
             "2026-08-27T12:01:00.000Z",
             &[authority("ready", false)],
+            &[],
             &[],
             &[],
         );

@@ -15,6 +15,7 @@ mod episode_deletion;
 mod finalization;
 mod gcs_media;
 mod identity;
+pub(crate) mod identity_presentation;
 mod lifecycle;
 mod media_object;
 mod media_processing;
@@ -60,8 +61,8 @@ pub(crate) use episode_deletion::{
 };
 pub(crate) use finalization::{
     FinalizationClaim, FinalizationClaimRequest, FinalizationEgressGuard, FinalizationEpisode,
-    FinalizationRepository, FinalizationRequest, FinalizationScreenResult, FinalizationScreenshot,
-    FinalizationSettlement, FinalizationUtterance,
+    FinalizationReason, FinalizationRepository, FinalizationRequest, FinalizationScreenResult,
+    FinalizationScreenshot, FinalizationSettlement, FinalizationUtterance,
 };
 pub(crate) use gcs_media::GcsMediaObjectStore;
 pub(crate) use identity::{
@@ -79,9 +80,12 @@ pub(crate) use media_processing::{
     ScreenMediaSettlement, MAX_MEDIA_PROVIDER_ATTEMPTS, MAX_MEDIA_PROVIDER_JOURNAL_BYTES,
     MAX_MEDIA_PROVIDER_RESPONSE_BYTES,
 };
+#[cfg(test)]
+pub(crate) use memory_formation::capture_formation_response_schema_v1;
 pub(crate) use memory_formation::{
-    capture_formation_response_schema_v1, parse_capture_formation_provider_response,
-    CaptureFormationClaim, CaptureFormationProviderRequest, CaptureFormationProviderResponse,
+    capture_formation_response_schema, capture_formation_response_schema_v2,
+    parse_capture_formation_provider_response, CaptureFormationClaim,
+    CaptureFormationProviderRequest, CaptureFormationProviderResponse,
     CaptureFormationRetryDisposition, CaptureFormationSettlement, EpisodeEmbeddingSource,
     EpisodeEmbeddingWrite, MemoryFormationRepository, OpenEpisode, SummaryScreenshot,
     SummaryUtterance, SummaryWindowClaim, SummaryWindowSettlement,

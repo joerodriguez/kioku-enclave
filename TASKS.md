@@ -1,3 +1,22 @@
+# ADR-0048 one identity source (2026-09-13)
+
+- [x] Implement immutable per-field maps, current label projection, transaction-coalesced
+      semantic revisions and successful identity-refresh throttling in direct v34.
+- [x] Freeze a provider-wide namespace for forward context and organizer requests;
+      preserve original durable requests, staged maps and retained finalized text maps.
+- [x] Integrate list/detail, search, capture status, person memories, playback and outbound
+      freeze; fence delayed embeddings against the exact current resolved input.
+- [x] Pass the complete real PostgreSQL/model gate on the final reviewed source:
+      614 passed, zero failures, one existing manual probe ignored; formatting and
+      strict all-target Clippy passed (1608.29 seconds). Earlier failed attempts and
+      corrected fixtures/lints retain separate evidence; the final full rerun passed.
+- [x] Independently review implementation and source-specific semantic reversals:
+      39 compiling proof runs cover 38 distinct reversal models with exact restoration.
+- Backend source is delivered through this reviewed PR; web/iPhone/operator source
+  delivery and both merged refs are tracked in the monorepo Phase 5 progress record.
+- [ ] Complete Phase 6 real owner-archive and ADR-0016 acceptance with content-free evidence.
+      Synthetic verification does not establish owner accuracy or production behavior.
+
 # ADR-0048 name evidence fusion (2026-09-12)
 
 - [x] Implement typed grounded name evidence, exact screen joins, independent vocative
@@ -12,7 +31,7 @@
       zero failures, one existing manual probe ignored; formatting and strict all-target
       Clippy passed. The first attempt passed tests but failed two mechanical lints;
       both were independently reviewed and the complete corrected-source rerun passed.
-- [ ] Merge the backend and exact existing operator mapping through reviewed PRs.
+- [x] Merge backend #520 (`ebef7b350235`) and operator #533 (`4f11ed760e6f`).
 - [ ] Complete Phase 5 graph-driven briefs and Phase 6 real owner acceptance.
 
 # ADR-0048 automatic profile reconciliation (2026-09-12)

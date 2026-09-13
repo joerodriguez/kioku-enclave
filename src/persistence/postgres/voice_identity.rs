@@ -91,14 +91,17 @@ pub(super) async fn lock_account(
 ) -> Result<bool> {
     lock_activation_contract_key_share_if_installed(tx).await?;
     advisory_transaction_lock(tx, "memory-reconciliation", account).await?;
-    Ok(
+    let active =
         sqlx::query_scalar::<_, String>("SELECT status FROM accounts WHERE id=$1 FOR UPDATE")
             .bind(account)
             .fetch_optional(&mut **tx)
             .await?
             .as_deref()
-            == Some("active"),
-    )
+            == Some("active");
+    if active {
+        super::identity_presentation::initialize_account_semantics(tx, account).await?;
+    }
+    Ok(active)
 }
 /// Refresh every memory reached by the changed identity, including stored
 /// reservations/participants whose last source was removed by erasure. This is
@@ -953,16 +956,8 @@ pub(super) mod tests {
             9,
             "speaker projection refresh must not advance archive revision"
         );
-        assert!(
-            sqlx::query_scalar::<_, bool>(
-                "SELECT bool_and(identity_revision=7) FROM episodes WHERE account_id=$1"
-            )
-            .bind(account)
-            .fetch_one(repo.pool())
-            .await
-            .unwrap(),
-            "speaker projection refresh must not advance memory identity revisions"
-        );
+        // identity_revision is mutable presentation metadata under ADR-0048;
+        // source immutability covers archive coordinates and recorded labels.
         assert!(sqlx::query_scalar::<_,bool>("SELECT bool_and(speaker_label='Original source label') FROM utterances WHERE account_id=$1").bind(account).fetch_one(repo.pool()).await.unwrap(), "speaker projection refresh must preserve frozen source labels");
     }
 

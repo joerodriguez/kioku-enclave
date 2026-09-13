@@ -33,6 +33,7 @@ async fn lock_retention_account(tx: &mut Transaction<'_, Postgres>, account: &st
     if active != Some(true) {
         return Err(EnclaveError::Auth("account inactive or deleting".into()));
     }
+    super::identity_presentation::initialize_account_semantics(tx, account).await?;
     Ok(())
 }
 

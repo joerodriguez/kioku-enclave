@@ -6095,8 +6095,8 @@ mod tests {
             .fetch_one(repo.pool())
             .await
             .unwrap(),
-            7,
-            "media speaker refresh must not advance memory identity revision"
+            9,
+            "initial binding and the later accepted name refinement must each advance identity revision"
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>(

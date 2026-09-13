@@ -78,5 +78,11 @@ claim ownership afterward, and treat an ambiguous outcome as no-resend.
 
 `finalizer.rs` also authors bounded, evidence-validated content-specific brief sections (bullets/text/tasks/actual decisions). `email_renderer.rs` and webhook snapshots share these ordered sections while preserving content-consent fences and legacy envelopes.
 
+Current formation and organizer output omit model-owned participants; their prompts preserve
+the exact supplied graph labels. Already admitted capture requests retain the immutable v1 schema;
+new capture authoring uses v2.
+
 Current speaker presentation and base-26 slot lettering are implemented once in the PostgreSQL
 `speaker_identity` module; the former unused Rust slot formatter has been removed.
+
+Summarizer and organizer prompts use exact graph labels and omit model-authored attendees. Capture v1 requests recover byte-for-byte; current v2 requests and organizer stages freeze their authoring namespace. Finalizer preserves reused raw timelines and playback includes labels plus the ordered per-memory identity revision vector in its ordinary projection hash.

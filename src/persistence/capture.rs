@@ -55,6 +55,7 @@ pub(crate) struct CaptureSessionProcessing {
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct CaptureSessionMemory {
     pub(crate) id: i64,
+    pub(crate) identity_revision: i64,
     pub(crate) title: Option<String>,
     pub(crate) started_at: String,
     pub(crate) ended_at: String,

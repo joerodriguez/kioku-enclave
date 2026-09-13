@@ -93,6 +93,7 @@ const CONTENT_PARTITIONS: &[(&str, &str)] = &[
     ("voice_profiles", "false"),
     ("voice_profile_proposals", "false"),
     ("identity_name_inputs", "false"),
+    ("episode_identity_presentations", "false"),
     ("profile_name_bindings", "false"),
     ("profile_name_claims", "false"),
     ("person_fact_candidates", "false"),

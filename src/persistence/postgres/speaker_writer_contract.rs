@@ -93,6 +93,7 @@ async fn form_capture(repo: &PostgresPersistence, account: &str, count: i64) -> 
         .expect("source-settled synthetic capture claim");
     let commitment = claim.page_source_commitment.clone();
     let settlement = CaptureFormationSettlement {
+        authored_labels: Default::default(),
         claim,
         episodes: (1..=count).map(|id| draft(None, vec![id], true)).collect(),
     };
@@ -131,6 +132,7 @@ async fn speaker_writer_summary_settlement_persists_and_extends_slots_before_rea
         .unwrap()
         .unwrap();
     let settlement = SummaryWindowSettlement {
+        authored_labels: Default::default(),
         claim,
         episodes: vec![draft(None, vec![1], false)],
         cursor: None,
@@ -157,6 +159,7 @@ async fn speaker_writer_summary_settlement_persists_and_extends_slots_before_rea
         .unwrap();
     let ids = repo
         .settle_summary_window(SummaryWindowSettlement {
+            authored_labels: Default::default(),
             claim,
             episodes: vec![draft(Some(first), vec![2], false)],
             cursor: None,
@@ -220,8 +223,8 @@ async fn speaker_writer_summary_and_capture_contexts_use_live_identity_before_me
             .iter()
             .map(|turn| turn.speaker_label.as_str())
             .collect::<Vec<_>>(),
-        vec!["Synthetic Person", "Me", "Speaker"],
-        "forward summary context must use accepted names, owner Me and bare unowned Speaker"
+        vec!["Synthetic Person", "Me", "Speaker A"],
+        "forward summary context must use accepted names, owner Me and the frozen anonymous Speaker A namespace"
     );
     let claim = repo
         .claim_capture_formation(ACCOUNT, 900)
@@ -241,8 +244,8 @@ async fn speaker_writer_summary_and_capture_contexts_use_live_identity_before_me
             .iter()
             .map(|turn| turn.speaker_label.as_str())
             .collect::<Vec<_>>(),
-        vec!["Synthetic Person", "Me", "Speaker"],
-        "capture summary context must use accepted names, owner Me and bare unowned Speaker"
+        vec!["Synthetic Person", "Me", "Speaker A"],
+        "capture summary context must use accepted names, owner Me and the frozen anonymous Speaker A namespace"
     );
     cleanup(fixture).await;
 }
@@ -262,6 +265,7 @@ async fn speaker_writer_finalizer_claim_uses_persisted_memory_speaker_labels() {
         .unwrap();
     let episode = repo
         .settle_summary_window(SummaryWindowSettlement {
+            authored_labels: Default::default(),
             claim,
             episodes: vec![draft(None, vec![1], false)],
             cursor: None,
@@ -374,6 +378,11 @@ async fn speaker_writer_identity_presentation_preserves_reconciliation_fingerpri
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        after.drafts[0].identity_revision,
+        before.drafts[0].identity_revision + 1,
+        "an accepted name must advance identity while preserving raw source commitments"
+    );
     assert_eq!(after.source_fingerprint,before.source_fingerprint,"speaker presentation changes must not alter the established reconciliation source fingerprint");
     assert_eq!(
         after.topology_fingerprint, before.topology_fingerprint,
@@ -450,5 +459,584 @@ async fn speaker_writer_reconciliation_replacement_inherits_cluster_alias_reserv
     // Transfer completes before ordinary draft cleanup cascades predecessor
     // slots. Future revisions use the successor's new persisted reservations.
     assert!(sqlx::query_scalar::<_,bool>("SELECT NOT EXISTS(SELECT 1 FROM episodes WHERE account_id=$1 AND id=ANY($2)) AND (SELECT count(*) FROM memory_handles WHERE account_id=$1 AND episode_id=ANY($2) AND state='superseded')=cardinality($2::bigint[])").bind(ACCOUNT).bind(&predecessors).fetch_one(repo.pool()).await.unwrap(),"replacement publication must retain superseded handles without resurrecting obsolete draft content");
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_formation_freezes_actual_local_speakers_and_keeps_old_minute_maps() {
+    use crate::persistence::{MinuteBucket, SummaryUtterance};
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "identity-formation-writer";
+    seed_turn(repo, account, 1).await;
+    seed_turn(repo, account, 2).await;
+    let (utterances, _) = repo
+        .summary_evidence(account, FROM, TO, 500, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        utterances
+            .iter()
+            .map(|u| u.speaker_label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Speaker A", "Speaker B"],
+        "formation must supply distinct graph-bound anonymous labels before any memory exists"
+    );
+    let labels = SummaryUtterance::authored_labels(&utterances);
+    assert_eq!(labels.labels[0].utterance_ids, vec![1]);
+    let claim = repo
+        .claim_summary_window(account, FROM, TO, TO, 900)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut first = draft(None, vec![1, 2], false);
+    first.title = "Speaker A and Speaker B planned work".into();
+    first.minute_summaries = Some(vec![MinuteBucket {
+        start: FROM.into(),
+        gist: "Speaker A planned work".into(),
+    }]);
+    let ids = repo
+        .settle_summary_window(SummaryWindowSettlement {
+            claim,
+            authored_labels: labels.clone(),
+            episodes: vec![first],
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    let episode = ids[0];
+    let mut tx = repo.pool().begin().await.unwrap();
+    let stored:String=sqlx::query_scalar("SELECT minute_labels::text FROM episode_identity_presentations WHERE account_id=$1 AND episode_id=$2").bind(account).bind(episode).fetch_one(&mut *tx).await.unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(
+        stored[FROM],
+        serde_json::to_value(&labels).unwrap(),
+        "formation must persist exactly the label map used by its authoring input"
+    );
+    // A later authored bucket may use a different namespace. Keep the old
+    // bucket's map while adopting the new title/action and minute maps.
+    let mut later = labels.clone();
+    later.labels[0].label = "Speaker B".into();
+    later.labels[1].label = "Speaker A".into();
+    let later_start = "2026-08-01T10:05:00.000Z";
+    sqlx::query("UPDATE episodes SET minute_summaries=minute_summaries||$3::jsonb WHERE account_id=$1 AND id=$2").bind(account).bind(episode).bind(serde_json::json!([{"start":later_start,"gist":"Speaker A agreed"}]).to_string()).execute(&mut *tx).await.unwrap();
+    super::identity_presentation::save_formation_labels(
+        &mut tx,
+        account,
+        episode,
+        &later,
+        &[MinuteBucket {
+            start: later_start.into(),
+            gist: "Speaker A agreed".into(),
+        }],
+    )
+    .await
+    .unwrap();
+    let maps:String=sqlx::query_scalar("SELECT minute_labels::text FROM episode_identity_presentations WHERE account_id=$1 AND episode_id=$2").bind(account).bind(episode).fetch_one(&mut *tx).await.unwrap();
+    let maps: serde_json::Value = serde_json::from_str(&maps).unwrap();
+    assert_eq!(maps[FROM],stored[FROM],"retained minute buckets must keep their original authoring maps when a later namespace is saved");
+    assert_eq!(maps[later_start], serde_json::to_value(&later).unwrap());
+    tx.rollback().await.unwrap();
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_forward_context_separates_local_memory_namespaces() {
+    use crate::persistence::{MemoryQueryRepository, SummaryUtterance};
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "identity-context-writer";
+    for id in 1..=3 {
+        seed_turn(repo, account, id).await;
+    }
+    let claim = repo
+        .claim_summary_window(account, FROM, TO, TO, 900)
+        .await
+        .unwrap()
+        .unwrap();
+    let ids = repo
+        .settle_summary_window(SummaryWindowSettlement {
+            claim,
+            authored_labels: Default::default(),
+            episodes: vec![draft(None, vec![1], false), draft(None, vec![2], false)],
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    let mut tx = repo.pool().begin().await.unwrap();
+    for (episode, utterance) in ids.iter().zip([1, 2]) {
+        let labels = super::identity_presentation::authored_labels(
+            &mut tx,
+            account,
+            Some(*episode),
+            &[utterance],
+        )
+        .await
+        .unwrap();
+        assert_eq!(labels.labels[0].label, "Speaker A");
+        sqlx::query("UPDATE episodes SET title='Speaker A planned work',summary='Speaker A said \"Speaker A agrees\"' WHERE account_id=$1 AND id=$2")
+            .bind(account).bind(episode).execute(&mut *tx).await.unwrap();
+        super::identity_presentation::save_formation_labels(
+            &mut tx,
+            account,
+            *episode,
+            &labels,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let (mut new, _) = repo
+        .summary_evidence(account, FROM, TO, 500, 500)
+        .await
+        .unwrap();
+    assert_eq!(new.len(), 1);
+    assert_eq!(new[0].id, 3);
+    let open = repo
+        .open_episodes(account, FROM, TO, 100, &mut new)
+        .await
+        .unwrap();
+    assert_eq!(
+        new[0].speaker_label, "Speaker C",
+        "new evidence and open memories must share one collision-free authoring namespace"
+    );
+    assert_eq!(open[0].title, "Speaker A planned work");
+    assert_eq!(
+        open[1].title, "Speaker B planned work",
+        "a local Speaker A in another memory must be projected through its own frozen anchors"
+    );
+    assert_eq!(
+        open[1].summary.as_deref(),
+        Some("Speaker B said \"Speaker A agrees\"")
+    );
+    let labels = SummaryUtterance::authored_labels(&new);
+    assert_eq!(labels.labels[0].utterance_ids, vec![3]);
+    assert_eq!(open[1].authored_labels.labels[0].utterance_ids, vec![2]);
+    sqlx::query("UPDATE episode_identity_presentations SET timeline_labels='{\"labels\":[]}' WHERE account_id=$1 AND episode_id=$2")
+        .bind(account).bind(ids[1]).execute(repo.pool()).await.unwrap();
+    let unbound = repo
+        .open_episodes(account, FROM, TO, 100, &mut new)
+        .await
+        .unwrap();
+    assert_eq!(
+        unbound[1].title, "Speaker planned work",
+        "unmapped historical context must not borrow a different voice's reserved slot"
+    );
+    let page = repo
+        .list_episodes(
+            account,
+            &crate::persistence::EpisodeListRequest {
+                from: None,
+                to: None,
+                limit: 50,
+                include_low: true,
+                episode_id: Some(ids[1]),
+                before_started_at: None,
+                before_id: None,
+                probe_for_more: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.episodes[0]["title"], "Speaker A planned work",
+        "neutral provider context must not rewrite or invent a public historical authoring map"
+    );
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_embedding_cas_rejects_late_identity_and_source_results() {
+    use crate::persistence::{EpisodeEmbeddingWrite, EpisodeListRequest, MemoryQueryRepository};
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "identity-embedding-writer";
+    seed_turn(repo, account, 1).await;
+    let (utterances, _) = repo
+        .summary_evidence(account, FROM, TO, 500, 500)
+        .await
+        .unwrap();
+    let labels = crate::persistence::SummaryUtterance::authored_labels(&utterances);
+    let claim = repo
+        .claim_summary_window(account, FROM, TO, TO, 900)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut input = draft(None, vec![1], false);
+    input.title = "Speaker A planned work".into();
+    let id = repo
+        .settle_summary_window(SummaryWindowSettlement {
+            claim,
+            authored_labels: labels,
+            episodes: vec![input],
+            cursor: None,
+        })
+        .await
+        .unwrap()[0];
+    let old = repo
+        .episode_embedding_sources(account, &[id])
+        .await
+        .unwrap()
+        .remove(0);
+    // A local letter change is intentionally not a semantic identity change,
+    // but it changes the encoder input and must still reject the old result.
+    let revision_before: i64 =
+        sqlx::query_scalar("SELECT identity_revision FROM episodes WHERE account_id=$1 AND id=$2")
+            .bind(account)
+            .bind(id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE episode_speaker_slots SET slot_ordinal=1 WHERE account_id=$1 AND episode_id=$2",
+    )
+    .bind(account)
+    .bind(id)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    let relabelled = repo
+        .episode_embedding_sources(account, &[id])
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(relabelled.text.contains("Speaker B planned work"));
+    assert_ne!(
+        old.source_revision, relabelled.source_revision,
+        "the commitment must include the actual resolved encoder text"
+    );
+    repo.write_episode_embeddings(
+        account,
+        &[EpisodeEmbeddingWrite {
+            id,
+            source_revision: old.source_revision.clone(),
+            embedding: vec![0.0; 384],
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(sqlx::query_scalar::<_,bool>("SELECT embedding IS NULL AND identity_revision=$3 FROM episodes WHERE account_id=$1 AND id=$2").bind(account).bind(id).bind(revision_before).fetch_one(repo.pool()).await.unwrap(),"a slot-only relabelling must reject the late vector without inventing an identity revision");
+    sqlx::query(
+        "INSERT INTO people(account_id,id,display_name,status) VALUES($1,20,'Ana','identified')",
+    )
+    .bind(account)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=20,attribution_state='person_bound' WHERE account_id=$1 AND id=1").bind(account).execute(repo.pool()).await.unwrap();
+    repo.list_episodes(
+        account,
+        &EpisodeListRequest {
+            from: None,
+            to: None,
+            limit: 50,
+            include_low: true,
+            episode_id: Some(id),
+            before_started_at: None,
+            before_id: None,
+            probe_for_more: false,
+        },
+    )
+    .await
+    .unwrap();
+    repo.write_episode_embeddings(
+        account,
+        &[EpisodeEmbeddingWrite {
+            id,
+            source_revision: old.source_revision,
+            embedding: vec![0.0; 384],
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT embedding IS NULL FROM episodes WHERE account_id=$1 AND id=$2"
+        )
+        .bind(account)
+        .bind(id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap(),
+        "a late encoder result must not overwrite a newer identity projection"
+    );
+    let current = repo
+        .episode_embedding_sources(account, &[id])
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        current.text.contains("Ana planned work"),
+        "embedding input must use current authored-label presentation"
+    );
+    let before: String =
+        sqlx::query_scalar("SELECT updated_at::text FROM episodes WHERE account_id=$1 AND id=$2")
+            .bind(account)
+            .bind(id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+    repo.write_episode_embeddings(
+        account,
+        &[EpisodeEmbeddingWrite {
+            id,
+            source_revision: current.source_revision,
+            embedding: vec![0.0; 384],
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(sqlx::query_scalar::<_,bool>("SELECT embedding IS NOT NULL AND updated_at::text=$3 FROM episodes WHERE account_id=$1 AND id=$2").bind(account).bind(id).bind(before).fetch_one(repo.pool()).await.unwrap(),"derived embedding writes must preserve source timestamps");
+    let prior = repo
+        .episode_embedding_sources(account, &[id])
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query(
+        "UPDATE episodes SET title='A new objective',embedding=NULL WHERE account_id=$1 AND id=$2",
+    )
+    .bind(account)
+    .bind(id)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    repo.write_episode_embeddings(
+        account,
+        &[EpisodeEmbeddingWrite {
+            id,
+            source_revision: prior.source_revision,
+            embedding: vec![0.0; 384],
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT embedding IS NULL FROM episodes WHERE account_id=$1 AND id=$2"
+        )
+        .bind(account)
+        .bind(id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap(),
+        "a late encoder result must not overwrite newer authored source text"
+    );
+    sqlx::query("INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) VALUES($1,$2,'Original brief','[]','[]','[]','[]')").bind(account).bind(id).execute(repo.pool()).await.unwrap();
+    let before_brief = repo
+        .episode_embedding_sources(account, &[id])
+        .await
+        .unwrap()
+        .remove(0);
+    let mut finalizer = repo.pool().begin().await.unwrap();
+    super::advisory_transaction_lock(&mut finalizer, "memory-reconciliation", account)
+        .await
+        .unwrap();
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *finalizer)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM episodes WHERE account_id=$1 AND id=$2 FOR UPDATE")
+        .bind(account)
+        .bind(id)
+        .fetch_one(&mut *finalizer)
+        .await
+        .unwrap();
+    let writer_repo = repo.clone();
+    let writer = tokio::spawn(async move {
+        writer_repo
+            .write_episode_embeddings(
+                account,
+                &[EpisodeEmbeddingWrite {
+                    id,
+                    source_revision: before_brief.source_revision,
+                    embedding: vec![0.0; 384],
+                }],
+            )
+            .await
+    });
+    let mut blocked = false;
+    for _ in 0..200 {
+        blocked = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(blocker)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        blocked,
+        "the writer must actually wait behind the concurrent finalizer"
+    );
+    sqlx::query("UPDATE episode_final_briefs SET overview='A newly completed brief' WHERE account_id=$1 AND episode_id=$2").bind(account).bind(id).execute(&mut *finalizer).await.unwrap();
+    sqlx::query("UPDATE episodes SET title=title WHERE account_id=$1 AND id=$2")
+        .bind(account)
+        .bind(id)
+        .execute(&mut *finalizer)
+        .await
+        .unwrap();
+    finalizer.commit().await.unwrap();
+    writer.await.unwrap().unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT embedding IS NULL FROM episodes WHERE account_id=$1 AND id=$2"
+        )
+        .bind(account)
+        .bind(id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap(),
+        "the comparison after a lock wait must see the new separately stored brief"
+    );
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_reconciliation_preserves_finalized_retained_maps() {
+    use crate::persistence::{
+        identity_presentation::AuthoredLabelMap, EpisodeListRequest, MemoryQueryRepository,
+    };
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "identity-retained-finalized-map";
+    sqlx::query("INSERT INTO accounts(id,email,primary_provider,primary_subject) VALUES($1,'synthetic@example.test','google',$1)").bind(account).execute(repo.pool()).await.unwrap();
+    super::activation::test_activate_speaker_writer_account(repo, account)
+        .await
+        .unwrap();
+    let ids = form_capture(repo, account, 2).await;
+    let retained = ids[1];
+    let mut tx = repo.pool().begin().await.unwrap();
+    let original =
+        super::identity_presentation::authored_labels(&mut tx, account, Some(retained), &[2])
+            .await
+            .unwrap();
+    assert_eq!(original.labels[0].label, "Speaker A");
+    sqlx::query("UPDATE episodes SET title='Speaker A kept the plan',summary='Speaker A kept the summary',action_items='[\"Speaker A will follow up\"]',minute_summaries='[{\"start\":\"minute\",\"gist\":\"Speaker A kept the minute\"}]',minutes_text='Speaker A kept the minute',structure_state='reconciled',finalized_at=clock_timestamp(),finalization_status='complete' WHERE account_id=$1 AND id=$2").bind(account).bind(retained).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE episode_identity_presentations SET timeline_labels=$3::jsonb,action_labels=$3::jsonb,brief_labels=$3::jsonb,minute_labels=jsonb_build_object('minute',$3::jsonb) WHERE account_id=$1 AND episode_id=$2").bind(account).bind(retained).bind(serde_json::to_string(&original).unwrap()).execute(&mut *tx).await.unwrap();
+    let old_maps:String=sqlx::query_scalar("SELECT jsonb_build_array(timeline_labels,action_labels,brief_labels,minute_labels)::text FROM episode_identity_presentations WHERE account_id=$1 AND episode_id=$2").bind(account).bind(retained).fetch_one(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let snapshot = repo
+        .next_source_settled_cohort(account, 4 * 60 * 60, None, 32, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    let claim = repo
+        .claim_reconciliation(&snapshot, 900)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut write = super::memory_reconciliation::test_provider_stage_write(
+        &snapshot,
+        "preserve-finalized-map",
+    )
+    .unwrap();
+    let template = write.planned_outputs[0].clone();
+    write.planned_outputs = snapshot
+        .drafts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, draft)| {
+            let mut output = template.clone();
+            output.output_ordinal = ordinal as i64;
+            output.retained_episode_id = Some(draft.id);
+            output.predecessor_episode_ids = vec![draft.id];
+            output.member_source_ids = draft.member_source_ids.clone();
+            output.started_at = draft.started_at.clone();
+            output.ended_at = draft.ended_at.clone();
+            output.authored_labels = AuthoredLabelMap::from_labels(
+                snapshot
+                    .authored_labels
+                    .labels
+                    .iter()
+                    .filter(|label| {
+                        label
+                            .utterance_ids
+                            .iter()
+                            .any(|id| draft.member_source_ids.contains(&format!("utterance:{id}")))
+                    })
+                    .cloned(),
+            );
+            output
+        })
+        .collect();
+    assert_eq!(
+        write
+            .planned_outputs
+            .iter()
+            .find(|output| output.retained_episode_id == Some(retained))
+            .unwrap()
+            .authored_labels
+            .labels[0]
+            .label,
+        "Speaker B",
+        "the new organizer input must use a different namespace from the retained memory"
+    );
+    let guard = repo
+        .acquire_provider_egress_guard(&claim)
+        .await
+        .unwrap()
+        .unwrap();
+    let staged = guard.stage_and_release(write).await.unwrap();
+    let published = repo
+        .publish_reconciliation(ReconciliationPublish {
+            claim,
+            reconciliation_id: "preserved-finalized-map".into(),
+            cohort_started_at: snapshot.cohort_started_at,
+            cohort_ended_at: snapshot.cohort_ended_at,
+            result_commitment: staged.result_commitment,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        published,
+        ReconciliationPublishResult::Published { .. }
+    ));
+    let after:String=sqlx::query_scalar("SELECT jsonb_build_array(timeline_labels,action_labels,brief_labels,minute_labels)::text FROM episode_identity_presentations WHERE account_id=$1 AND episode_id=$2").bind(account).bind(retained).fetch_one(repo.pool()).await.unwrap();
+    assert_eq!(
+        after, old_maps,
+        "retaining finalized authored bytes must preserve every original label map"
+    );
+    sqlx::query(
+        "INSERT INTO people(account_id,id,display_name,status) VALUES($1,20,'Ana','identified')",
+    )
+    .bind(account)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=20,attribution_state='person_bound' WHERE account_id=$1 AND id=2").bind(account).execute(repo.pool()).await.unwrap();
+    let page = repo
+        .list_episodes(
+            account,
+            &EpisodeListRequest {
+                from: None,
+                to: None,
+                limit: 50,
+                include_low: true,
+                episode_id: Some(retained),
+                before_started_at: None,
+                before_id: None,
+                probe_for_more: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.episodes[0]["title"], "Ana kept the plan");
+    assert_eq!(
+        page.episodes[0]["minute_summaries"][0]["gist"],
+        "Ana kept the minute"
+    );
     cleanup(fixture).await;
 }

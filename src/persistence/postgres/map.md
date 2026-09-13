@@ -88,3 +88,15 @@ for tenant isolation, type/time-zone behavior, search, concurrency, restart, exp
 Name-source erasure captures remote target profiles before frame/voter cascades, independently of biometric erasure targets. Sample withdrawal applies the same dependency refresh. Fact candidate admission stays paged while complete SQL history reconstruction uses stored canonical comparison keys, so large histories still replace and restore every surviving support.
 
 The paged and ordinary episode member purge capture name/fact dependencies before screenshot/utterance/member cascades. Erasure carries explicit fact-person targets independently of the candidate queue, so a deleted replacement restores surviving history in that transaction.
+
+`identity_presentation_schema.rs` owns the direct v34 authoring-map/semantic-state tables and successful identity-refinalization timestamp receipt. It verifies exact owned catalogs without changing prior schema receipts.
+
+`identity_presentation.rs` resolves frozen authored labels through surviving account-qualified turn anchors and the canonical speaker graph. Its semantic snapshot distinguishes participant changes from source additions/slot/acoustic bookkeeping and advances identity once per writer transaction without changing archive/source revisions.
+
+Identity writers initialize only missing semantic snapshots under the existing account lock before graph mutation, in bounded ID pages. Projection then compares committed participant meaning and coalesces repeated changes against the transaction-entry baseline; authored/source bytes and archive revisions remain unchanged.
+
+Phase 5 stores separate timeline, minute, action and brief authoring maps; read snapshots resolve copies from retained turn anchors. Formation and organizer context use one frozen temporary namespace, preserving v1 request recovery, staged maps and finalized retained maps. Search uses exclusive owner/person selectors and projects before highlighting; status, person memories and outbound freeze share current presentation. Embedding settlement serializes before comparing raw state and exact resolved input.
+
+Phase 5 speaker search preserves ordinary canonical-label REST filtering separately from
+opaque recurring-person selection; episode filters scope canonical members to the selected
+memory and admit old participant text only through the shared structural legacy guard.

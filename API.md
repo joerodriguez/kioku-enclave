@@ -1038,9 +1038,58 @@ finishes preparation before speaker filtering, and export before opening its sna
 Candidate selection and enrichment for utterance search use one read-only repeatable
 snapshot. Feed labels, screenshot rows, and memory association share one snapshot too.
 Episode/member participant details share their accompanying read snapshot.
-Preparation does not alter raw source labels, `identity_revision`, frozen provider
-requests, brief schemas, or existing generated brief text. Later brief label maps and
-identity-revision invalidation are separate work; no bulk regeneration is triggered.
+Preparation preserves raw source labels, frozen provider requests and authored brief
+bytes. A changed participant meaning (owner, accepted person/name, or recurring person)
+advances the affected memory's `identity_revision` once in the graph writer transaction.
+Repeated preparation, added sources, slot repair and acoustic bookkeeping do not advance
+it. `archive_revision`, source timestamps, membership and playback coordinates remain
+independent of identity presentation.
+
+### Identity-derived briefs and matching detail reads (ADR-0048 Phase 5)
+
+Episode list/detail entries, episode-member envelopes and capture-session memory entries
+carry numeric `identity_revision`. Clients combine a memory and its member page only when
+both refer to the requested memory and the revisions match; crossed pairs retry together.
+This revision does not replace the existing archive/handle fence. Playback's ordinary
+projection revision includes current labels/person attribution and the ordered per-memory
+identity revisions, so a label change uses the existing one-time projection refresh.
+
+Every new authoring request freezes a map from supplied reserved speaker labels to
+account-qualified retained utterance anchors and their profile/cluster targets. Forward
+context and organizer requests use a single temporary speaker namespace across all included
+memories. Each retained minute keeps its original map, and a reused finalized timeline
+keeps the maps belonging to its preserved bytes. New model output no longer supplies an
+attendee array; participants come from the current graph. Durable capture v1 requests retain
+their exact bytes during recovery; new v2 requests carry maps and omit model participants.
+
+Readers project copies of title, summary, action and final-brief human fields, including
+link explanations. Exact reserved `Me`/`Speaker A` tokens are replaced simultaneously;
+ordinary names, quotations, code, URLs, evidence references and unknown structured fields
+are preserved. Ambiguous or removed targets fall back to an anonymous label. Historical
+text without a map remains unchanged; new provider context neutralizes its unmapped
+reserved tokens. Authored data is never rewritten to substitute a name.
+
+Search selects accepted names or exact positive `id:<person-id>` in one snapshot.
+`Me` selects only owner attribution; reserved ID syntax never also matches a person's
+coincidental display name. Recurring people resolve globally by ID, not by a name.
+Ordinary REST label text still filters exact current non-owner labels, including local
+`Speaker A` slots and structurally valid legacy labels. A slot matches only where it
+currently renders; it never expands to every memory of a recurring person. Snippets project each authored block before highlighting. Embeddings bind the exact
+resolved input and source/identity state; a late result is rejected after serializing
+with graph, source and brief writers, without changing source timestamps.
+
+Identity lag queues a refresh but permits at most one successful identity-driven
+re-finalization per memory per 24 hours, measured by `identity_refinalized_at`.
+Initial and compiled-version finalization keep their existing eligibility. Stale results
+are discarded before brief, map, timestamp or delivery writes; failed attempts do not
+consume the identity interval. Current label substitution covers the wait without a
+provider call. Morning email and pending initial webhooks derive current participants and
+mapped prose before freezing their request; previously frozen disclosures stay exact.
+Identity refresh creates no additional email, webhook or APNs receipt.
+
+MCP tools retain their shapes, minimization and refusal rules and read current graph
+labels. ADR-0013 safe rows are not materialized by this implementation, and the full
+ADR-0047 natural-language query interpreter remains a separate feature.
 
 ### Content-specific final briefs
 

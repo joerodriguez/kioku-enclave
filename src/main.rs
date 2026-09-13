@@ -590,6 +590,11 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         && state.postgres.verify_identity_fusion_schema().await.is_ok()
         && state
             .postgres
+            .verify_identity_presentation_schema()
+            .await
+            .is_ok()
+        && state
+            .postgres
             .verify_voice_recurrence_schema()
             .await
             .is_ok()
@@ -1290,6 +1295,12 @@ async fn async_main() {
             panic!("PostgreSQL identity fusion schema is not release-ready: {error}")
         });
     postgres
+        .verify_identity_presentation_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("PostgreSQL identity presentation schema is not release-ready: {error}")
+        });
+    postgres
         .verify_voice_recurrence_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1623,6 +1634,7 @@ enum PostgresMigrationReleasePhase {
     InstallVoiceEnrollment,
     InstallVoiceRecurrence,
     InstallIdentityFusion,
+    InstallIdentityPresentation,
     SetVoiceIdentityCohort,
     PauseVoiceIdentity,
     ResumeVoiceIdentity,
@@ -1661,6 +1673,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("identity-presentation-v34-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallIdentityPresentation)
+        }
         Some("identity-fusion-v33-install") => {
             Ok(PostgresMigrationReleasePhase::InstallIdentityFusion)
         }
@@ -1948,6 +1963,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallVoiceEnrollment => persistence
             .install_voice_enrollment_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"voice_enrollment", "version":31})),
+        PostgresMigrationReleasePhase::InstallIdentityPresentation => persistence
+            .install_identity_presentation_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"identity_presentation", "version":34})),
         PostgresMigrationReleasePhase::InstallIdentityFusion => persistence
             .install_identity_fusion_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"identity_fusion", "version":33})),
@@ -2060,6 +2078,10 @@ mod postgres_migration_release_tests {
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
         for (confirmation, expected) in [
+            (
+                "identity-presentation-v34-install",
+                PostgresMigrationReleasePhase::InstallIdentityPresentation,
+            ),
             (
                 "identity-fusion-v33-install",
                 PostgresMigrationReleasePhase::InstallIdentityFusion,

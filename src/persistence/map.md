@@ -17,11 +17,12 @@ legacy adapter, backend selector, fallback, dual write, or shadow read.
 | `episode_deletion.rs` | Durable episode freeze, bounded resumable provider/inventory advancement, exact terminal structured purge, and replay receipt. |
 | `finalization.rs` | Claim and atomic recap/finalization/outbox settlement contract. |
 | `identity.rs` | Account/session and Apple-credential contract; account upserts return a receipt saying whether that call created the account, with the day's signup count. |
+| `identity_presentation.rs` | Immutable authored label maps and simultaneous reserved-speaker-token substitution for human brief/timeline fields, preserving literal quotes, source references, URLs and raw authored bytes. Graph targets are resolved by the PostgreSQL adapter. |
 | `lifecycle.rs` | Durable pre-fence deletion request, account tombstone/no-resurrection progress, deletion-owned expiry recovery for already-admitted provider disclosures, persistent reviewer-fixture protection, provider revocation, and final cleanup contract. |
 | `media_object.rs` | Provider-neutral encrypted-media object operations, exact-generation reads, account/episode purge, and all-generation reconciliation. |
 | `gcs_media.rs` | Live GCS media adapter joining PostgreSQL object identity to the provider semantics in `../gcs.rs`. It never stores structured state in GCS. |
 | `media_processing.rs` | Media job claim, usage, screen/audio projection, owner-source classification, literal own-turn name evidence with complete overlap and immediate own-name-question checks, voice evidence, frozen provider-result contracts, retry, and settlement contract. |
-| `memory_formation.rs` | Forward-window and exact capture-session revision/page claims, frozen bounded provider requests and stable attempt identities, turn-timed/reference-aware source evidence, evidence-free accepted-sequence tombstones, renewed deletion-fenced provider authorization and settlement, open-memory projection, explicit accounted/no-memory outcomes, atomic cursor/episode settlement, and embedding-source contract over memory text plus final-brief human values. |
+| `memory_formation.rs` | Forward-window and exact capture-session revision/page claims, frozen versioned provider requests (v2 graph-owned participants; v1 recovery) and stable attempt identities, turn-timed/reference-aware source evidence, evidence-free accepted-sequence tombstones, renewed deletion-fenced provider authorization and settlement, open-memory projection, explicit accounted/no-memory outcomes, atomic cursor/episode settlement, and embedding-source contract over memory text plus final-brief human values. |
 | `memory_reconciliation.rs` | Current-formation cohort snapshots, eight-hour capture context, fleet leases, staged partitions, bounded discovery/verification, atomic active-topology publication and durable handle resolution. |
 | `model_usage.rs` | Vertex intent/outcome, billing batch claim, and coverage reconciliation contract. |
 | `notification.rs` | Webhook, email consent and explicit account IANA timezone, and push configuration with redacted secret-bearing types. |
@@ -37,3 +38,5 @@ The media port is intentionally separate from structured repositories so useful 
 exercise handler/worker behavior without coupling to SQLx or making GCS an alternate database.
 
 `FinalizationSettlement.sections_json` carries nullable ordered brief sections atomically with the existing brief; NULL is legacy and an empty array is a summary-only brief.
+
+Identity presentation contracts carry immutable request/stage maps and per-memory semantic revisions independently of source/archive coordinates. Embedding writes include a commitment to the exact current resolved input; completed finalization differentiates successful identity refresh from initial/version reasons.

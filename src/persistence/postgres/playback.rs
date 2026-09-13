@@ -303,6 +303,22 @@ impl PostgresPersistence {
             .into_iter()
             .filter(|source| !blocked_observations.contains(&source.observation_id))
             .collect::<Vec<_>>();
+        let identity_revisions: Vec<(i64, i64)> = if capture_session_id.is_some() {
+            let utterance_ids = utterances
+                .iter()
+                .map(|turn| turn.utterance_id)
+                .collect::<Vec<_>>();
+            sqlx::query_as("SELECT e.id,e.identity_revision FROM episodes e WHERE e.account_id=$1 AND EXISTS(SELECT 1 FROM episode_members m WHERE m.account_id=e.account_id AND m.episode_id=e.id AND m.record_type='utterance' AND m.record_id=ANY($2)) ORDER BY e.id")
+                .bind(account_id).bind(&utterance_ids).fetch_all(&mut *transaction).await?
+        } else {
+            sqlx::query_as(
+                "SELECT id,identity_revision FROM episodes WHERE account_id=$1 AND id=$2",
+            )
+            .bind(account_id)
+            .bind(memory_id)
+            .fetch_all(&mut *transaction)
+            .await?
+        };
         transaction.commit().await?;
         let revision = projection_revision(
             memory_id,
@@ -311,6 +327,7 @@ impl PostgresPersistence {
             &segments,
             &utterances,
             &sources,
+            &identity_revisions,
         );
         Ok(Some(PlaybackDataset {
             owner_id: account_id.to_owned(),
@@ -434,7 +451,6 @@ impl PlaybackRepository for PostgresPersistence {
             .bind(fence_epoch)
             .fetch_all(&mut *transaction)
             .await?;
-        transaction.commit().await?;
         let mut memories = Vec::with_capacity(rows.len());
         for row in rows {
             let started_ms = epoch_millis(&row, "started_at_ms")?;
@@ -444,10 +460,21 @@ impl PlaybackRepository for PostgresPersistence {
             let pending_count = row.try_get("pending_count")?;
             let deleted_count = row.try_get("deleted_count")?;
             let pruned_count = row.try_get("pruned_count")?;
+            let id = row.try_get("id")?;
+            let projection = super::identity_presentation::episode_presentation(
+                &mut transaction,
+                account_id,
+                id,
+            )
+            .await?;
             memories.push(PersonMemorySummary {
-                memory_id: row.try_get("id")?,
-                title: row.try_get("title")?,
-                summary: row.try_get("summary")?,
+                memory_id: id,
+                title: row
+                    .try_get::<Option<String>, _>("title")?
+                    .map(|text| projection.timeline.text(&text)),
+                summary: row
+                    .try_get::<Option<String>, _>("summary")?
+                    .map(|text| projection.timeline.text(&text)),
                 started_at: isotime::format_epoch_millis(started_ms),
                 ended_at: isotime::format_epoch_millis(epoch_millis(&row, "ended_at_ms")?),
                 attributed_utterance_count: row.try_get("attributed_count")?,
@@ -464,6 +491,7 @@ impl PlaybackRepository for PostgresPersistence {
                 playback_utterance_id: row.try_get("playback_utterance_id")?,
             });
         }
+        transaction.commit().await?;
         let next_cursor = (memories.len() > limit).then(|| memories[limit - 1].memory_id);
         memories.truncate(limit);
         Ok(PersonMemoriesPage {

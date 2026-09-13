@@ -4346,6 +4346,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     persistence.install_voice_enrollment_schema().await?;
     persistence.install_voice_recurrence_schema().await?;
     persistence.install_identity_fusion_schema().await?;
+    persistence.install_identity_presentation_schema().await?;
     test_real_pg_terminal_media_claim_repair(persistence).await?;
     super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
     test_real_pg_seal_and_tombstone_contract(persistence).await?;
@@ -4641,6 +4642,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     .await?
     .is_none());
     let stale_settlement = FinalizationSettlement {
+        reused_timeline: false,
         claim: finalization.clone(),
         vertex_event_id: finalizer_usage.event_id.clone(),
         model_name: "contract-model".into(),

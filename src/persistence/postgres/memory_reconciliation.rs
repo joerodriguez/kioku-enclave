@@ -396,34 +396,43 @@ async fn present_atom_speakers(
     connection: &mut PgConnection,
     account_id: &str,
     atoms: &mut [ReconciliationEvidenceAtom],
-) -> Result<()> {
+) -> Result<crate::persistence::identity_presentation::AuthoredLabelMap> {
     let ids = atoms
         .iter()
         .filter(|atom| atom.record_type == "utterance")
         .map(|atom| atom.record_id)
         .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let identity = super::speaker_identity::speaker_identity_join(
-        super::speaker_identity::SpeakerUtteranceAlias::Utterance,
-        super::speaker_identity::SpeakerMemoryScope::LatestActive,
-    );
-    let query = format!("SELECT utterance.id,left(concat('[',speaker_identity.speaker_label,'] ',utterance.text),8000) AS context FROM utterances utterance {identity} WHERE utterance.account_id=$1 AND utterance.id=ANY($2)");
-    let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-        .bind(account_id)
-        .bind(ids)
-        .fetch_all(connection)
-        .await?;
+    let labels =
+        super::identity_presentation::authoring_context(connection, account_id, &ids, &[]).await?;
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id,text FROM utterances WHERE account_id=$1 AND id=ANY($2)")
+            .bind(account_id)
+            .bind(&ids)
+            .fetch_all(connection)
+            .await?;
+    let labels_by_id = labels
+        .labels
+        .iter()
+        .flat_map(|label| {
+            label
+                .utterance_ids
+                .iter()
+                .map(move |id| (*id, label.label.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
     let contexts = rows
         .into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<i64, _>("id")?,
-                row.try_get::<String, _>("context")?,
-            ))
+        .map(|(id, text)| {
+            let label = labels_by_id.get(&id).copied().unwrap_or("Speaker");
+            (
+                id,
+                format!("[{label}] {text}")
+                    .chars()
+                    .take(8000)
+                    .collect::<String>(),
+            )
         })
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<HashMap<_, _>>();
     for atom in atoms
         .iter_mut()
         .filter(|atom| atom.record_type == "utterance")
@@ -434,7 +443,7 @@ async fn present_atom_speakers(
             )
         })?;
     }
-    Ok(())
+    Ok(labels)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1773,13 +1782,21 @@ async fn read_snapshot(
         })
         .collect::<Vec<_>>();
     let archive_revision = archive_revision(connection, account_id).await?;
+    // Identity changes affect presentation, never source ownership or topology.
+    // Keep the historical serialized shape but normalize its presentation-only
+    // revision before committing raw source state. Frozen provider requests still
+    // commit the actual labels that were shown to their authoring attempt.
+    let mut source_drafts = drafts.clone();
+    for draft in &mut source_drafts {
+        draft.identity_revision = 0;
+    }
     let source_fingerprint = digest_json(
         b"kioku.memory-reconciliation.source.v1\0",
         &json!({
             "account_id": account_id,
             "cohort_started_at": cohort_started_at,
             "cohort_ended_at": cohort_ended_at,
-            "drafts": drafts,
+            "drafts": source_drafts,
             "atoms": atoms,
             "source_guard": guard,
             "outside_draft_owners": outside_drafts.episode_ids,
@@ -1796,12 +1813,50 @@ async fn read_snapshot(
             "source_fingerprint": source_fingerprint,
             "predecessor_episode_ids": predecessor_ids,
             "active_members": drafts.iter().map(|draft| (&draft.id,&draft.member_source_ids)).collect::<Vec<_>>(),
-            "episode_revisions": drafts.iter().map(|draft| (&draft.id,&draft.updated_at,draft.identity_revision)).collect::<Vec<_>>(),
+            "episode_revisions": source_drafts.iter().map(|draft| (&draft.id,&draft.updated_at,draft.identity_revision)).collect::<Vec<_>>(),
         }),
     )?;
-    present_atom_speakers(connection, account_id, &mut atoms).await?;
+    let authored_labels = present_atom_speakers(connection, account_id, &mut atoms).await?;
+    for draft in &mut drafts {
+        let projection = super::identity_presentation::episode_presentation_in_context(
+            connection,
+            account_id,
+            draft.id,
+            Some(&authored_labels),
+        )
+        .await?;
+        draft.title = projection.timeline.text(&draft.title);
+        draft.summary = draft
+            .summary
+            .as_deref()
+            .map(|text| projection.timeline.text(text));
+        draft.action_items = draft
+            .action_items
+            .iter()
+            .map(|text| projection.actions.text(text))
+            .collect();
+        draft.minutes_text = draft
+            .minutes_text
+            .as_deref()
+            .map(|text| projection.minutes_text(text, &draft.minute_summaries));
+        draft.minute_summaries = projection.minute_summaries(&draft.minute_summaries);
+        draft.participants = authored_labels
+            .labels
+            .iter()
+            .filter(|label| {
+                label
+                    .utterance_ids
+                    .iter()
+                    .any(|id| draft.member_source_ids.contains(&format!("utterance:{id}")))
+            })
+            .map(|label| label.label.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
     Ok(Some((
         ReconciliationSnapshot {
+            authored_labels,
             account_id: account_id.to_owned(),
             cohort_started_at,
             cohort_ended_at,
@@ -3943,6 +3998,34 @@ impl MemoryReconciliationRepository for PostgresPersistence {
             }
         }
 
+        for (output, id) in outputs.iter().zip(&successor_ids) {
+            // A finalized one-to-one retention keeps its authored bytes, so
+            // it must also keep the original namespaces for every field.
+            if protected_retained_ids.contains(id) {
+                continue;
+            }
+            let minutes = output
+                .minute_summaries
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|minute| {
+                    Some(crate::persistence::MinuteBucket {
+                        start: minute.get("start")?.as_str()?.to_owned(),
+                        gist: minute.get("gist")?.as_str()?.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            super::identity_presentation::save_formation_labels(
+                &mut transaction,
+                &command.claim.account_id,
+                *id,
+                &output.authored_labels,
+                &minutes,
+            )
+            .await?;
+        }
+
         let speaker_targets = outputs
             .iter()
             .zip(&successor_ids)
@@ -4184,6 +4267,7 @@ pub(super) fn test_provider_stage_write(
         normalized_partition: partition,
         result_commitment,
         planned_outputs: vec![ReconciledMemoryWrite {
+            authored_labels: Default::default(),
             output_ordinal: 0,
             retained_episode_id: None,
             predecessor_episode_ids: snapshot.predecessor_episode_ids.clone(),
@@ -4495,6 +4579,7 @@ mod tests {
     #[test]
     fn staged_output_commitment_binds_every_publication_field() {
         let output = ReconciledMemoryWrite {
+            authored_labels: Default::default(),
             output_ordinal: 0,
             retained_episode_id: Some(7),
             predecessor_episode_ids: vec![7],

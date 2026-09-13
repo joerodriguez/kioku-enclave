@@ -18,10 +18,10 @@ use std::time::Instant;
 use crate::{
     error::{EnclaveError, Result},
     persistence::{
-        capture_formation_response_schema_v1, media_provider_attempt_identity,
-        CaptureFormationProviderRequest, MediaProviderAttempt, MediaProviderStagedResponse,
-        VertexInvocationAdmission, CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS,
-        MAX_MEDIA_PROVIDER_RESPONSE_BYTES,
+        capture_formation_response_schema, capture_formation_response_schema_v2,
+        media_provider_attempt_identity, CaptureFormationProviderRequest, MediaProviderAttempt,
+        MediaProviderStagedResponse, VertexInvocationAdmission,
+        CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS, MAX_MEDIA_PROVIDER_RESPONSE_BYTES,
     },
 };
 
@@ -341,9 +341,9 @@ async fn access_token(http: &reqwest::Client) -> Result<String> {
     Ok(tok.access_token)
 }
 
-/// The constrained-decoding schema the model must emit (matches summarizer.js).
+/// Current constrained-decoding schema; participant identity belongs to the graph.
 fn response_schema() -> Value {
-    capture_formation_response_schema_v1()
+    capture_formation_response_schema_v2()
 }
 
 /// Call Gemini and return the raw response text (expected to be JSON per the
@@ -373,7 +373,8 @@ pub(crate) fn capture_formation_provider_request(
     user_message: &str,
 ) -> CaptureFormationProviderRequest {
     CaptureFormationProviderRequest {
-        contract_version: 1,
+        authored_labels: Default::default(),
+        contract_version: 2,
         vertex_project: state.config.vertex_project.clone(),
         vertex_location: state.config.vertex_location.clone(),
         api_version: GENERATE_CONTENT_API_VERSION.into(),
@@ -398,14 +399,14 @@ pub(crate) async fn generate_with_persisted_attempt(
     request: &CaptureFormationProviderRequest,
     attempt_identity: &[u8; 32],
 ) -> std::result::Result<TextGeneration, VertexGenerationFailure> {
-    if request.contract_version != 1
+    if capture_formation_response_schema(request.contract_version).as_ref()
+        != Some(&request.response_schema)
         || request.api_version != GENERATE_CONTENT_API_VERSION
         || request.publisher != GENERATE_CONTENT_PUBLISHER
         || request.method != GENERATE_CONTENT_METHOD
         || request.max_output_tokens != CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS
         || request.response_mime_type != JSON_RESPONSE_MIME_TYPE
         || request.thinking_budget != THINKING_BUDGET
-        || request.response_schema != response_schema()
     {
         return Err(VertexGenerationFailure::before_egress(
             EnclaveError::InvalidRequest(
@@ -1292,6 +1293,10 @@ mod tests {
             .as_object()
             .expect("episode properties");
 
+        assert!(
+            !properties.contains_key("participants"),
+            "current authoring schema must not ask the model to supply participants"
+        );
         assert!(properties.contains_key("summary"));
         assert!(properties.contains_key("action_items"));
         assert_eq!(
