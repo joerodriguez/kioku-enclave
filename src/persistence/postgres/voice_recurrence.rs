@@ -474,6 +474,55 @@ mod tests {
                 "owner and private person statuses must remain404 on memories"
             );
         }
+        // Local presentation text filters a slot, not a globally resolved recurring person.
+        sqlx::query("UPDATE episode_speaker_slots SET slot_ordinal=25 WHERE account_id=$1 AND episode_id=2 AND slot_ordinal=0")
+            .bind(account).execute(repo.pool()).await.unwrap();
+        let vector = serde_json::to_string(&vec![1.0; 384]).unwrap();
+        sqlx::query(
+            "UPDATE episodes SET title='Synthetic filter',embedding=$2::vector WHERE account_id=$1",
+        )
+        .bind(account)
+        .bind(&vector)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE utterances SET text='Synthetic filter',embedding=$2::vector WHERE account_id=$1")
+            .bind(account).bind(&vector).execute(repo.pool()).await.unwrap();
+        for kind in ["episode", "utterance"] {
+            for (query, embedding) in [
+                ("", None),
+                ("Synthetic", None),
+                ("unmatchedlexicalfixture", Some(vec![1.0; 384])),
+            ] {
+                for (selector, expected) in [
+                    ("Speaker A".to_owned(), vec![1, 3, 4, 5, 6]),
+                    ("Speaker Z".to_owned(), vec![2]),
+                    (format!("id:{}", recurring_ids[0]), vec![1, 2, 3]),
+                    ("Unnamed voice".to_owned(), vec![]),
+                ] {
+                    let request = crate::persistence::SearchRequest {
+                        query: query.into(),
+                        speaker: Some(selector.clone()),
+                        time_start: None,
+                        time_end: None,
+                        limit: 20,
+                        offset: 0,
+                        kinds: vec![kind.into()],
+                        query_embedding: embedding.clone(),
+                    };
+                    let hits = serde_json::to_value(repo.search(account, &request).await.unwrap())
+                        .unwrap();
+                    let mut actual = hits
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hit| hit["id"].as_i64().unwrap())
+                        .collect::<Vec<_>>();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "{kind} {query:?} {selector} must distinguish local recurring labels from opaque person selection");
+                }
+            }
+        }
         close(f).await;
     }
 

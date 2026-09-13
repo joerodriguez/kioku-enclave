@@ -224,6 +224,16 @@ pub(super) async fn test_signed_orphan_operator(
         expires_at: isotime::format_epoch_millis(now + 14 * 60 * 1000),
         action: ErasureAction::Inspect(targets.clone()),
     };
+    // Materialize reader presentation before freezing the signed survivor snapshot.
+    for session in ["session-a", "session-b", "session-keep"] {
+        assert!(
+            persistence
+                .session_dataset(ACCOUNT, session, None)
+                .await?
+                .is_some(),
+            "exact recordings are addressable before erasure preparation"
+        );
+    }
     let inspect = test_verified_request(request.clone())?;
     let report = persistence
         .execute_orphan_capture_erasure_inner(&inspect)
@@ -361,15 +371,6 @@ pub(super) async fn test_signed_orphan_operator(
         3
     );
 
-    for session in ["session-a", "session-b", "session-keep"] {
-        assert!(
-            persistence
-                .session_dataset(ACCOUNT, session, None)
-                .await?
-                .is_some(),
-            "exact recordings are addressable before erasure preparation"
-        );
-    }
     let prepare = test_verified_request(request.clone())?;
     // A real late cascade failure occurs after projection removal and journal
     // creation. All source rows, the protected control and the fence roll back.
@@ -381,10 +382,20 @@ pub(super) async fn test_signed_orphan_operator(
     )
     .execute(persistence.pool())
     .await?;
-    assert!(persistence
-        .execute_orphan_capture_erasure(&prepare)
+    // Only the synthetic probe inspects the raw driver error; the public
+    // controller deliberately redacts all database errors.
+    let failure = persistence
+        .execute_orphan_capture_erasure_inner(&prepare)
         .await
-        .is_err());
+        .err()
+        .expect("the synthetic late cascade must fail");
+    assert!(
+        matches!(&failure, crate::error::EnclaveError::Postgres(error)
+        if error.as_database_error().is_some_and(|error|
+            error.code().as_deref() == Some("55000")
+                && error.message() == "synthetic late erasure failure")),
+        "the rollback probe must reach the late cascade, not fail on a stale signed snapshot"
+    );
     sqlx::raw_sql("DROP TRIGGER erasure_test_late_failure ON capture_sessions; DROP FUNCTION erasure_test_late_failure();")
         .execute(persistence.pool()).await?;
     let restored = persistence

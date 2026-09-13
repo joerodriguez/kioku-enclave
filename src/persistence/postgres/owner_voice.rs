@@ -11,7 +11,8 @@ use sqlx::{Postgres, Row, Transaction};
 pub(super) async fn prepare_domains(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
+    let mut changed = Vec::new();
     let mut after = 0_i64;
     loop {
         let rows = sqlx::query("SELECT c.id,e.stream_kind,e.audio_role,e.audio_route FROM speaker_clusters c JOIN LATERAL(SELECT e.stream_kind,e.audio_role,e.audio_route FROM speaker_observations o JOIN capture_events e ON e.account_id=o.account_id AND e.event_id=o.event_id WHERE o.account_id=c.account_id AND o.cluster_id=c.id ORDER BY o.started_at,o.id LIMIT 1) e ON TRUE WHERE c.account_id=$1 AND c.channel_domain IS NULL AND c.id>$2 ORDER BY c.id LIMIT 512")
@@ -21,6 +22,7 @@ pub(super) async fn prepare_domains(
         }
         for row in rows {
             after = row.try_get("id")?;
+            changed.push(after);
             let domain = crate::cp::voice_identity::channel_domain(
                 &row.try_get::<String, _>("stream_kind")?,
                 row.try_get::<Option<String>, _>("audio_role")?.as_deref(),
@@ -30,7 +32,7 @@ pub(super) async fn prepare_domains(
                 .bind(account).bind(after).bind(domain).execute(&mut **tx).await?;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 pub(super) async fn domain_recognized(
@@ -172,8 +174,12 @@ pub(super) async fn refresh_domains(
     account: &str,
     domains: &[String],
 ) -> Result<()> {
-    prepare_domains(tx, account).await?;
-    let clusters:Vec<i64>=sqlx::query_scalar("SELECT id FROM speaker_clusters WHERE account_id=$1 AND channel_domain=ANY($2::text[]) ORDER BY id")
+    super::identity_presentation::initialize_account_semantics(tx, account).await?;
+    let prepared = prepare_domains(tx, account).await?;
+    let mut clusters:Vec<i64>=sqlx::query_scalar("SELECT id FROM speaker_clusters WHERE account_id=$1 AND channel_domain=ANY($2::text[]) ORDER BY id")
         .bind(account).bind(domains).fetch_all(&mut **tx).await?;
+    clusters.extend(prepared);
+    clusters.sort_unstable();
+    clusters.dedup();
     voice_identity::refresh_affected_speaker_projections(tx, account, &clusters, &[], &[]).await
 }

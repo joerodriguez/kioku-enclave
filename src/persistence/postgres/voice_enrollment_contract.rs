@@ -167,8 +167,8 @@ async fn owner_enrollment_finishes_without_four_hour_seal_and_preserves_source_b
             .fetch_one(repo.pool())
             .await
             .unwrap(),
-        7,
-        "Phase 2 must not advance future Phase 5 identity revisions"
+        8,
+        "accepted owner enrollment must advance the memory semantic identity revision once"
     );
     cleanup(fixture).await;
 }

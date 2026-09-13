@@ -102,9 +102,16 @@ async fn load_episode(
         WHERE e.account_id=$1 AND e.id=$2 AND e.finalization_status='complete' AND e.finalized_at IS NOT NULL \
         FOR SHARE OF e,b,h")
         .bind(account_id).bind(episode_id).fetch_optional(&mut **tx).await?;
-    row.as_ref()
+    match row
+        .as_ref()
         .map(super::delivery_outbox::episode_from_row)
-        .transpose()
+        .transpose()?
+    {
+        Some(episode) => Ok(Some(
+            super::delivery_outbox::present_episode(tx, account_id, episode).await?,
+        )),
+        None => Ok(None),
+    }
 }
 
 async fn sources(

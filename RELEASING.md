@@ -630,3 +630,8 @@ The Phase 4 source likewise requires `identity-fusion-v33-install` after v32 in 
 same companion lane. It adds typed name evidence, separate binding/claim state and scored
 fact candidates. Historical staged responses keep their recorded interpretation; source
 delivery does not run the installer or change the serving image.
+
+Phase 5 adds `identity-presentation-v34-install` after v33 through the same dedicated
+migrator. It installs exact authored-map/semantic-state storage and the successful
+identity-refresh timestamp; serving startup and readiness require its verified receipt.
+Source merge does not run this phase, publish an image, or complete owner acceptance.

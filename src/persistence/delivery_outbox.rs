@@ -67,6 +67,7 @@ impl std::fmt::Debug for EmailDeliveryClaim {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WebhookDeliveryCandidate {
+    pub(crate) identity_revision: i64,
     pub(crate) account_id: String,
     pub(crate) episode_id: i64,
     pub(crate) subscription_id: String,

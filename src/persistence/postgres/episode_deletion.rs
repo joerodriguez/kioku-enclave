@@ -2332,6 +2332,8 @@ impl EpisodeDeletionRepository for PostgresPersistence {
             ));
         }
 
+        super::identity_presentation::initialize_account_semantics(&mut transaction, account_id)
+            .await?;
         super::memory_reconciliation::scrub_ancestor_snapshots_for_deletion(
             &mut transaction,
             account_id,

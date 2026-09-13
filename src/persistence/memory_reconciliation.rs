@@ -1,3 +1,4 @@
+use super::identity_presentation::AuthoredLabelMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +66,8 @@ pub(crate) struct ReconciliationEvidenceAtom {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReconciliationSnapshot {
+    #[serde(default, skip_serializing_if = "AuthoredLabelMap::is_empty")]
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) account_id: String,
     pub(crate) cohort_started_at: String,
     pub(crate) cohort_ended_at: String,
@@ -147,6 +150,8 @@ pub(crate) struct StagedReconciliation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReconciledMemoryWrite {
+    #[serde(default, skip_serializing_if = "AuthoredLabelMap::is_empty")]
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) output_ordinal: i64,
     /// One-to-one reconciliation keeps this id. Merge, split, and repartition
     /// outputs use `None` and receive a fresh tenant-local episode id.

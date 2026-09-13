@@ -254,6 +254,7 @@ pub(in super::super) async fn test_real_pg_interrupted_capture_recovery(
     // settlement must complete the revision without a fabricated model result.
     assert!(persistence
         .settle_capture_formation(CaptureFormationSettlement {
+            authored_labels: Default::default(),
             claim,
             episodes: Vec::new(),
         })
@@ -341,6 +342,7 @@ pub(in super::super) async fn test_real_pg_interrupted_capture_recovery(
         })?;
     persistence
         .settle_capture_formation(CaptureFormationSettlement {
+            authored_labels: Default::default(),
             claim: late_claim,
             episodes: Vec::new(),
         })

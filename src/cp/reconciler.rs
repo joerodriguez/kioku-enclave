@@ -30,8 +30,8 @@ use super::{isotime, vertex, CpState};
 // considers eight-hour capture-time continuations; validator v2 keeps an ID only
 // for exact unchanged membership. Older stages cannot cross this boundary.
 const RECONCILIATION_VERSION: i64 = 3;
-const PROMPT_VERSION: i64 = 2;
-const PARTITION_SCHEMA_VERSION: i64 = 1;
+const PROMPT_VERSION: i64 = 3;
+const PARTITION_SCHEMA_VERSION: i64 = 2;
 const VALIDATOR_VERSION: i64 = 2;
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
 pub(crate) const MAX_COHORT_DRAFTS: i64 = 32;
@@ -56,7 +56,7 @@ const SYSTEM_PROMPT: &str = r#"You organize currently available personal-memory 
 
 Recording sessions are transport boundaries, never automatic memory boundaries. Group evidence by the same concrete objective, conversation, decision, or workflow. Prefer extending an existing memory for a clear continuation, including a two-hour interruption or device switch. Consider preceding and following eight-hour capture-time context, including finalized memories, without treating that window as a waiting period or a maximum memory duration. Offline arrival order must not determine boundaries. A shared broad topic alone is not enough: separate distinct goals even when the people, application, or subject overlap. One recording may contain several memories.
 
-Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Keep distinct activities separate when continuity is ambiguous. Prefer the existing memory partition when the evidence does not clearly justify a change. An already published memory cannot be deleted merely because the model considers it unimportant. Titles, summaries, actions, people, languages, and timeline gists must be grounded in the assigned evidence. Timeline entries cite only source_ids assigned to their memory."#;
+Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Keep distinct activities separate when continuity is ambiguous. Prefer the existing memory partition when the evidence does not clearly justify a change. An already published memory cannot be deleted merely because the model considers it unimportant. Titles, summaries, actions, languages, and timeline gists must be grounded in the assigned evidence. Use supplied speaker labels exactly as given; never rename, merge, or infer a name for a labeled speaker, and never list a mentioned name as an attendee. Do not output participants; the identity graph supplies participant presentation. Timeline entries cite only source_ids assigned to their memory."#;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,7 +73,6 @@ struct ModelMemory {
     episode_type: String,
     title: String,
     summary: String,
-    participants: Vec<String>,
     languages: Vec<String>,
     action_items: Vec<String>,
     timeline: Vec<ModelTimelineItem>,
@@ -163,7 +162,6 @@ fn response_schema() -> Value {
                         "type": {"type":"STRING", "enum":["meeting","lesson","call","coding","browsing","break","other"]},
                         "title": {"type":"STRING"},
                         "summary": {"type":"STRING"},
-                        "participants": {"type":"ARRAY", "items":{"type":"STRING"}},
                         "languages": {"type":"ARRAY", "items":{"type":"STRING"}},
                         "action_items": {"type":"ARRAY", "items":{"type":"STRING"}},
                         "timeline": {
@@ -178,7 +176,7 @@ fn response_schema() -> Value {
                             }
                         }
                     },
-                    "required":["source_ids","type","title","summary","participants","languages","action_items","timeline"]
+                    "required":["source_ids","type","title","summary","languages","action_items","timeline"]
                 }
             }
         },
@@ -632,7 +630,7 @@ fn validate_partition(
             episode_type: memory.episode_type.clone(),
             title: bounded(&memory.title, MAX_TITLE_CHARS),
             summary: bounded(&memory.summary, MAX_SUMMARY_CHARS),
-            participants: canonical_strings(&memory.participants, 120, 64),
+            participants: Vec::new(),
             languages: canonical_strings(&memory.languages, 32, 16),
             action_items: canonical_strings(&memory.action_items, 500, 64),
             minute_summaries,
@@ -663,7 +661,6 @@ fn conservative_partition(snapshot: &ReconciliationSnapshot) -> Result<ModelPart
             episode_type: draft.episode_type.clone().unwrap_or_else(|| "other".into()),
             title: draft.title.clone(),
             summary: draft.summary.clone().unwrap_or_default(),
-            participants: draft.participants.clone(),
             languages: draft.languages.clone(),
             action_items: draft.action_items.clone(),
             timeline: Vec::new(),
@@ -849,7 +846,24 @@ fn validate_stage(
             "memory reconciliation staged commitment mismatch".into(),
         ));
     }
-    let expected_outputs = publication_outputs(partition.clone(), &staged.model)?;
+    let mut expected_outputs =
+        publication_outputs(partition.clone(), &staged.model, &Default::default())?;
+    // The stage commits the original provider namespace. A later identity
+    // upgrade cannot replace that map with the current request's labels.
+    for (expected, frozen) in expected_outputs.iter_mut().zip(&staged.planned_outputs) {
+        if frozen.authored_labels.labels.iter().any(|label| {
+            label.utterance_ids.iter().any(|id| {
+                !expected
+                    .member_source_ids
+                    .contains(&format!("utterance:{id}"))
+            })
+        }) {
+            return Err(EnclaveError::Store(
+                "staged authoring map escapes its output sources".into(),
+            ));
+        }
+        expected.authored_labels = frozen.authored_labels.clone();
+    }
     if expected_outputs != staged.planned_outputs
         || reconciliation_outputs_commitment(&expected_outputs)?
             != staged.planned_outputs_commitment
@@ -892,13 +906,26 @@ fn producer_contract_is_current(
 fn publication_outputs(
     partition: ValidatedPartition,
     model: &str,
+    authored_labels: &crate::persistence::identity_presentation::AuthoredLabelMap,
 ) -> Result<Vec<ReconciledMemoryWrite>> {
     partition
         .outputs
         .into_iter()
         .enumerate()
         .map(|(ordinal, output)| {
+            let mut labels = authored_labels.clone();
+            for label in &mut labels.labels {
+                label.utterance_ids.retain(|id| {
+                    output
+                        .member_source_ids
+                        .contains(&format!("utterance:{id}"))
+                });
+            }
+            labels
+                .labels
+                .retain(|label| !label.utterance_ids.is_empty());
             Ok(ReconciledMemoryWrite {
+                authored_labels: labels,
                 output_ordinal: i64::try_from(ordinal).map_err(|_| {
                     EnclaveError::Config("memory reconciliation output ordinal overflow".into())
                 })?,
@@ -1281,7 +1308,11 @@ pub async fn reconcile_user_episodes(state: &CpState, account_id: &str) -> Resul
         }
     };
 
-    let planned_outputs = publication_outputs(partition.clone(), &selected_model)?;
+    let planned_outputs = publication_outputs(
+        partition.clone(),
+        &selected_model,
+        &snapshot.authored_labels,
+    )?;
     let stage = ReconciliationStageWrite {
         normalized_partition: serde_json::to_value(&partition.model)?,
         result_commitment: partition.result_commitment.clone(),
@@ -1354,6 +1385,7 @@ mod tests {
         atoms: Vec<ReconciliationEvidenceAtom>,
     ) -> ReconciliationSnapshot {
         ReconciliationSnapshot {
+            authored_labels: Default::default(),
             account_id: "account".into(),
             cohort_started_at: "2026-08-30T12:00:00.000Z".into(),
             cohort_ended_at: "2026-08-30T13:00:00.000Z".into(),
@@ -1373,11 +1405,83 @@ mod tests {
             episode_type: "other".into(),
             title: title.into(),
             summary: format!("{title} summary"),
-            participants: Vec::new(),
             languages: Vec::new(),
             action_items: Vec::new(),
             timeline: Vec::new(),
         }
+    }
+
+    #[test]
+    fn identity_presentation_staged_organizer_map_remains_frozen_across_identity_updates() {
+        use crate::persistence::identity_presentation::{
+            AuthoredLabel, AuthoredLabelMap, LabelTarget,
+        };
+        let mut source = snapshot(vec![draft(10, &["utterance:1"])], vec![atom(1, 1)]);
+        source.authored_labels = AuthoredLabelMap {
+            labels: vec![AuthoredLabel {
+                label: "Speaker A".into(),
+                target: LabelTarget::Cluster(1),
+                fallback_label: "Speaker A".into(),
+                utterance_ids: vec![1, 99],
+            }],
+        };
+        let partition = validate_partition(
+            &source,
+            ModelPartition {
+                memories: vec![memory(&["utterance:1"], "Speaker A planned work")],
+            },
+        )
+        .unwrap();
+        let outputs = publication_outputs(
+            partition.clone(),
+            CONSERVATIVE_MODEL,
+            &source.authored_labels,
+        )
+        .unwrap();
+        assert_eq!(
+            outputs[0].authored_labels.labels[0].utterance_ids,
+            vec![1],
+            "organizer authoring maps must be restricted to actual output evidence"
+        );
+        let mut stage = StagedReconciliation {
+            account_id: source.account_id.clone(),
+            source_fingerprint: source.source_fingerprint.clone(),
+            topology_fingerprint: source.topology_fingerprint.clone(),
+            predecessor_episode_ids: source.predecessor_episode_ids.clone(),
+            normalized_partition: serde_json::to_value(&partition.model).unwrap(),
+            result_commitment: partition.result_commitment.clone(),
+            planned_outputs_commitment: reconciliation_outputs_commitment(&outputs).unwrap(),
+            planned_outputs: outputs,
+            model: CONSERVATIVE_MODEL.into(),
+            vertex_event_id: None,
+            provider_attempt_identity: None,
+            provider_invocation_fingerprint: None,
+            reconciliation_version: RECONCILIATION_VERSION,
+            prompt_version: PROMPT_VERSION,
+            partition_schema_version: PARTITION_SCHEMA_VERSION,
+            validator_version: VALIDATOR_VERSION,
+            activation_generation: 1,
+            producer_contract_sha256: vec![8; 32],
+            reconciliation_model: "synthetic".into(),
+            vertex_location: "synthetic".into(),
+        };
+        source.authored_labels.labels[0].label = "Ana".into();
+        assert!(validate_stage(&source,&stage).is_ok(),"organizer recovery must retain the original provider namespace after a later identity change");
+        stage.planned_outputs[0].authored_labels.labels[0].label = "Speaker B".into();
+        assert!(
+            validate_stage(&source, &stage).is_err(),
+            "staged output commitments must bind the frozen authoring map"
+        );
+        stage.planned_outputs[0].authored_labels.labels[0]
+            .utterance_ids
+            .push(99);
+        stage.planned_outputs_commitment =
+            reconciliation_outputs_commitment(&stage.planned_outputs).unwrap();
+        let error = validate_stage(&source, &stage).unwrap_err();
+        assert!(
+            error.to_string().contains("staged authoring map escapes"),
+            "even a recommitted stage cannot map a voice outside its output evidence"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ main.rs
 
 | Path | Responsibility |
 |---|---|
-| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email, interrupted-capture, voice-identity and name-evidence companion installs, voice cohort/pause operator phases, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
+| `main.rs` | PostgreSQL-only composition, phase-confirmed schema/activation/erasure migrator plus morning-email, interrupted-capture, voice-identity, name-evidence and identity-presentation companion installs, voice cohort/pause operator phases, baked configuration, KMS/media construction, TLS, routing, workers, readiness and bounded drain. |
 | `attestation.rs` | Bounded Confidential Space launcher protocol, internal attestation-derived STS/KMS credential path, and separately audience-bound public attestation tokens. |
 | `auth.rs` | Google service-account ID-token verification retained for authenticated `410 Gone` compatibility routes. |
 | [`cp/`](cp/map.md) | Product API, OAuth, capture, query, MCP, retention, export/deletion, inference, and horizontally coordinated workers. |
@@ -60,3 +60,5 @@ Serving startup/readiness verify the additive brief-sections v29 companion; only
 Serving startup/readiness also verify the v30 voice-identity companion. Its cohort defaults to `none`; only digest-pinned migrator phases change cohort or pause state.
 
 Serving startup/readiness verify the direct v32 voice-recurrence proposal companion; only `voice-recurrence-v32-install` applies its DDL.
+
+Serving startup/readiness verify the direct v34 identity-presentation companion; only `identity-presentation-v34-install` applies its DDL.

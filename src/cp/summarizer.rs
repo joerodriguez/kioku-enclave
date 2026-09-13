@@ -751,7 +751,6 @@ fn exact_episode_inputs(
         type_: Option<String>,
         title: String,
         summary: Option<String>,
-        participants: Option<Vec<String>>,
         languages: Option<Vec<String>>,
         action_items: Option<Vec<String>>,
         substance: Option<String>,
@@ -815,7 +814,6 @@ fn exact_episode_inputs(
                 .get("summary")
                 .and_then(Value::as_str)
                 .map(String::from),
-            participants: str_arr(episode.get("participants")),
             languages: str_arr(episode.get("languages")),
             action_items: str_arr(episode.get("action_items")),
             substance: episode
@@ -876,7 +874,7 @@ fn exact_episode_inputs(
             episode_type: episode.type_.clone(),
             title: episode.title.clone(),
             summary: episode.summary.clone(),
-            participants: episode.participants.clone(),
+            participants: None,
             languages: episode.languages.clone(),
             action_items: episode.action_items.clone(),
             substance: episode.substance.clone(),
@@ -972,6 +970,7 @@ async fn summarize_capture_formation_locked(
             .repositories
             .memory_formation()
             .settle_capture_formation(CaptureFormationSettlement {
+                authored_labels: UttRow::authored_labels(&utterances),
                 claim: claim.clone(),
                 episodes: Vec::new(),
             })
@@ -1016,8 +1015,9 @@ async fn summarize_capture_formation_locked(
         "none"
     };
     let mut conservative = false;
-    let current_request =
+    let mut current_request =
         super::vertex::capture_formation_provider_request(state, &system_prompt, &user_message);
+    current_request.authored_labels = UttRow::authored_labels(&utterances);
     let mut provider_model = claim
         .provider_request
         .as_ref()
@@ -1141,6 +1141,7 @@ async fn summarize_capture_formation_locked(
         .repositories
         .memory_formation()
         .settle_capture_formation(CaptureFormationSettlement {
+            authored_labels: UttRow::authored_labels(&utterances),
             claim: claim.clone(),
             episodes,
         })
@@ -1212,7 +1213,8 @@ async fn summarize_user_window(
     let new_to_iso = format_epoch_millis(new_to);
 
     // Fetch range records (with ids) from the user's index.
-    let (utterances, screenshots) = fetch_range(state, user_id, &new_from_iso, &new_to_iso).await?;
+    let (mut utterances, screenshots) =
+        fetch_range(state, user_id, &new_from_iso, &new_to_iso).await?;
 
     if utterances.is_empty() && screenshots.is_empty() {
         // An empty span may still be waiting on recoverable media work (in
@@ -1280,8 +1282,15 @@ async fn summarize_user_window(
     // Open episodes (digests the model can extend by ref).
     let open_cutoff = new_from - OPEN_WINDOW_MS;
     let list_start = format_epoch_millis(new_from - OPEN_WINDOW_MS - 4 * 60 * 60 * 1000);
-    let open_episodes =
-        fetch_open_episodes(state, user_id, &list_start, &new_to_iso, open_cutoff).await?;
+    let open_episodes = fetch_open_episodes(
+        state,
+        user_id,
+        &list_start,
+        &new_to_iso,
+        open_cutoff,
+        &mut utterances,
+    )
+    .await?;
 
     let capture_text = render_capture_text(&utterances, &screenshots);
     let open_text = render_open_episodes(&open_episodes);
@@ -1463,7 +1472,6 @@ async fn summarize_user_window(
         type_: Option<String>,
         title: String,
         summary: Option<String>,
-        participants: Option<Vec<String>>,
         languages: Option<Vec<String>>,
         action_items: Option<Vec<String>>,
         substance: Option<String>,
@@ -1524,7 +1532,6 @@ async fn summarize_user_window(
             type_: e.get("type").and_then(|v| v.as_str()).map(String::from),
             title: title.to_string(),
             summary: e.get("summary").and_then(|v| v.as_str()).map(String::from),
-            participants: str_arr(e.get("participants")),
             languages: str_arr(e.get("languages")),
             action_items: str_arr(e.get("action_items")),
             substance,
@@ -1573,7 +1580,7 @@ async fn summarize_user_window(
             episode_type: ep.type_.clone(),
             title: ep.title.clone(),
             summary: ep.summary.clone(),
-            participants: ep.participants.clone(),
+            participants: None,
             languages: ep.languages.clone(),
             action_items: ep.action_items.clone(),
             substance: ep.substance.clone(),
@@ -1610,6 +1617,17 @@ async fn summarize_user_window(
         .repositories
         .memory_formation()
         .settle_summary_window(SummaryWindowSettlement {
+            authored_labels:
+                crate::persistence::identity_presentation::AuthoredLabelMap::from_labels(
+                    UttRow::authored_labels(&utterances)
+                        .labels
+                        .into_iter()
+                        .chain(
+                            open_episodes
+                                .iter()
+                                .flat_map(|episode| episode.authored_labels.labels.clone()),
+                        ),
+                ),
             claim: summary_claim.clone(),
             episodes: to_upsert,
             cursor: Some(cursor.clone()),
@@ -1671,6 +1689,7 @@ pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) 
         let engine = Arc::clone(&engine);
         match tokio::task::spawn_blocking(move || engine.embed(&text)).await {
             Ok(Ok(embedding)) => writes.push(EpisodeEmbeddingWrite {
+                source_revision: row.source_revision,
                 id: episode_id,
                 embedding,
             }),
@@ -1803,11 +1822,12 @@ async fn fetch_open_episodes(
     list_start: &str,
     list_end: &str,
     open_cutoff_ms: i64,
+    utterances: &mut [UttRow],
 ) -> Result<Vec<OpenEp>> {
     let mut episodes = state
         .repositories
         .memory_formation()
-        .open_episodes(user_id, list_start, list_end, 100)
+        .open_episodes(user_id, list_start, list_end, 100, utterances)
         .await?;
     episodes.retain(|episode| ms(&episode.ended_at) >= open_cutoff_ms);
     let excess = episodes.len().saturating_sub(30);
@@ -2077,7 +2097,7 @@ PRINCIPLES (in priority order):
 1. EXTEND vs NEW. For each episode you output, set "episode_ref" to the "E<n>" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or "") to open a NEW episode. A continuous activity is exactly ONE episode. For an extension, preserve still-valid concrete takeaways and current actions/requirements from the open-episode digest while incorporating the new evidence.
 2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between "Me" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only "Me" speaking sporadically + screen activity → coding/browsing per the apps.
 3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit "Break"/"Idle"/"Misc" filler. A break is the silence between episodes — leave it out.
-4. ATTENDEES: use only the supplied speaker labels for people actually speaking in the episode; never list a mentioned name as an attendee. Do not rename speakers from names spoken aloud or visible on screen. A solo speaker saying "send Sarah the contract" has only that supplied speaker as an attendee, not Sarah. Repeated or mirrored transcript rows are corroboration, not separate statements or takeaways.
+4. SPEAKER IDENTITY: use only the supplied speaker labels exactly as given for people actually speaking in the episode; never list a mentioned name as an attendee. Never rename, merge, or infer a name for a labeled speaker from names spoken aloud or visible on screen. Do not output a participants field; participant presentation is supplied by the identity graph. A solo speaker saying "send Sarah the contract" has only that supplied speaker as an attendee, not Sarah. Repeated or mirrored transcript rows are corroboration, not separate statements or takeaways.
 5. Titles identify the activity, purpose, and people when known ("Spanish lesson with Ana: past tense"). Do not make a title a comma-separated sample of topics, and never use a generic title.
 6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.
 7. SUMMARY QUALITY. summary is 1–10 Markdown bullets, one per line and each beginning "- ". Every bullet must state a concrete takeaway, instruction, requirement, decision, result, constraint, or fact that helps the device owner remember or act. Prioritize, in order: (a) steps or requirements directed at the owner, (b) decisions, commitments, owners, deadlines and dates, (c) exact amounts, limits, logistics and named resources, services or URLs, (d) substantive outcomes or explanations. Omit greetings, atmosphere and promotional color before compressing any high-value detail. Never write topic-inventory prose such as "X was discussed", "information was provided/shared", "details about X", or "the conversation covered X"; state the actual detail instead. Do not pad to reach a bullet count.
@@ -2089,7 +2109,7 @@ PRINCIPLES (in priority order):
 12. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.
 13. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.
 
-Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"<ISO>","ended_at":"<ISO>","type":"<type>","title":"...","summary":"- concrete takeaway\n- concrete requirement","participants":["Me","Speaker B"],"languages":["fr"],"action_items":[],"substance":"normal","visual_evidence":"none","minutes":[{"start":"<ISO>","gist":"..."}]}]}"#;
+Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"<ISO>","ended_at":"<ISO>","type":"<type>","title":"...","summary":"- concrete takeaway\n- concrete requirement","languages":["fr"],"action_items":[],"substance":"normal","visual_evidence":"none","minutes":[{"start":"<ISO>","gist":"..."}]}]}"#;
 
 #[cfg(test)]
 mod tests {
@@ -2117,6 +2137,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, minute)| UttRow {
+                authored_label: None,
                 id: index as i64 + 1,
                 started_at: format_epoch_millis(1_800_000_000_000 + minute * 60_000),
                 speaker_label: "Me".into(),
@@ -2488,6 +2509,7 @@ mod tests {
         assert!(episode_is_significant(0, 0, 1.0, SIG_MIN_SCREEN_MS, true));
 
         let words = |text: &str| UttRow {
+            authored_label: None,
             id: 1,
             started_at: format_epoch_millis(1_800_000_000_000),
             speaker_label: "Me".into(),
@@ -2515,6 +2537,7 @@ mod tests {
         let from = 1_800_000_000_000;
         let to = from + 60_000;
         let utterances = vec![UttRow {
+            authored_label: None,
             id: 7,
             started_at: format_epoch_millis(from + 5_000),
             speaker_label: "Me".into(),
@@ -2632,6 +2655,7 @@ mod tests {
     #[test]
     fn open_episode_digest_preserves_workflow_context() {
         let rendered = render_open_episodes(&[OpenEp {
+            authored_labels: Default::default(),
             id: 307,
             started_at: "2026-07-21T16:39:04Z".into(),
             ended_at: "2026-07-21T16:47:09Z".into(),
@@ -2710,6 +2734,7 @@ mod tests {
 
     fn episode_312_fixture() -> (Vec<UttRow>, Vec<ScrRow>) {
         let utterances = vec![UttRow {
+            authored_label: None,
             id: 1,
             started_at: "2026-07-22T12:39:59Z".into(),
             speaker_label: "Speaker 2".into(),
@@ -2817,6 +2842,7 @@ mod tests {
         let (_, screenshots) = episode_312_fixture();
         let utterances = vec![
             UttRow {
+                authored_label: None,
                 id: 1,
                 started_at: "2026-07-22T12:39:59Z".into(),
                 speaker_label: "Speaker 2".into(),
@@ -2824,6 +2850,7 @@ mod tests {
                 text: "This one here".into(),
             },
             UttRow {
+                authored_label: None,
                 id: 2,
                 started_at: "2026-07-22T12:40:04Z".into(),
                 speaker_label: "Speaker 2".into(),

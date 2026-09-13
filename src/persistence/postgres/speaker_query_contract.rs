@@ -709,3 +709,391 @@ async fn canonical_reader_identity_is_tenant_qualified() {
     }
     cleanup(fixture).await;
 }
+
+#[tokio::test]
+async fn identity_presentation_memory_list_and_members_share_current_revision_without_rewriting_authored_text(
+) {
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "41000000-0000-0000-0000-000000000005";
+    for id in 1..=2 {
+        seed_voice_observation(repo, account, "session", &format!("event-{id}"), id, id).await;
+        seed_voice_memory(repo, account, id, 1).await;
+    }
+    let minutes = json!([{"start":"2026-09-01T12:00:00Z","gist":"Speaker A planned work"}]);
+    sqlx::query("UPDATE episodes SET title='Speaker A spoke',summary='Speaker A mentioned Sarah from accounting',participants='[\"Sarah from accounting\"]',minute_summaries=$2::jsonb,minutes_text='Speaker A planned work',action_items='[\"Speaker A will follow up\"]' WHERE account_id=$1 AND id=1")
+        .bind(account).bind(minutes.to_string()).execute(repo.pool()).await.unwrap();
+    repo.list_episodes(account, &list_request()).await.unwrap();
+    let mut tx = repo.pool().begin().await.unwrap();
+    assert!(super::voice_identity::lock_account(&mut tx, account)
+        .await
+        .unwrap());
+    let labels = super::identity_presentation::authored_labels(&mut tx, account, Some(1), &[1, 2])
+        .await
+        .unwrap();
+    let labels = serde_json::to_value(labels).unwrap();
+    let minute_labels = json!({"2026-09-01T12:00:00Z":labels});
+    sqlx::query("UPDATE episode_identity_presentations SET timeline_labels=$2::jsonb,action_labels=$2::jsonb,brief_labels=$2::jsonb,minute_labels=$3::jsonb WHERE account_id=$1 AND episode_id=1")
+        .bind(account).bind(labels.to_string()).bind(minute_labels.to_string()).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions,sections) VALUES($1,1,'Speaker A planned work','[]','[]','[]','[]',$2::jsonb)")
+        .bind(account).bind(json!([{"kind":"tasks","title":"Speaker A's next step","items":[{"text":"Speaker A said \"Speaker A agrees\"","owner":"Speaker A","evidence":[{"record_type":"utterance","record_id":1,"quote":"Speaker A agrees"}]}]}]).to_string()).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let raw_sql="SELECT jsonb_build_array(e.title,e.summary,e.minute_summaries,e.minutes_text,e.action_items,e.participants,(SELECT to_jsonb(b) FROM episode_final_briefs b WHERE b.account_id=e.account_id AND b.episode_id=e.id))::text FROM episodes e WHERE e.account_id=$1 AND e.id=1";
+    let raw: String = sqlx::query_scalar(raw_sql)
+        .bind(account)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO people(account_id,id,display_name,status) VALUES($1,20,'Ana','identified')",
+    )
+    .bind(account)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=20,attribution_state='person_bound' WHERE account_id=$1 AND id=1").bind(account).execute(repo.pool()).await.unwrap();
+    let page = repo.list_episodes(account, &list_request()).await.unwrap();
+    let memory = &page.episodes[0];
+    assert_eq!(
+        memory["title"], "Ana spoke",
+        "memory readers must project authored tokens through the current account graph"
+    );
+    assert_eq!(memory["summary"], "Ana mentioned Sarah from accounting");
+    assert_eq!(memory["minute_summaries"][0]["gist"], "Ana planned work");
+    assert_eq!(memory["action_items"][0], "Ana will follow up");
+    assert_eq!(memory["final_brief"]["overview"], "Ana planned work");
+    let item = &memory["final_brief"]["sections"][0]["items"][0];
+    assert_eq!(item["owner"], "Ana");
+    assert_eq!(item["text"], "Ana said \"Speaker A agrees\"");
+    assert_eq!(item["evidence"][0]["quote"], "Speaker A agrees");
+    assert_eq!(memory["participants"],json!(["Ana","Speaker B"]),"public participant strings must come from current graph participants, never model-mentioned attendees");
+    let members = repo.episode_members(account, 1).await.unwrap();
+    assert_eq!(
+        memory["identity_revision"],
+        json!(8),
+        "memory list must expose its current semantic identity revision"
+    );
+    assert_eq!(
+        members["identity_revision"], memory["identity_revision"],
+        "member and detail envelopes must expose the same snapshot revision"
+    );
+    assert_eq!(page.archive_revision, 9);
+    assert_eq!(sqlx::query_scalar::<_,String>(raw_sql).bind(account).fetch_one(repo.pool()).await.unwrap(),raw,"read-time identity changes must leave stored authored text and literal evidence byte-identical");
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_search_status_and_outbound_freeze_use_current_graph() {
+    use crate::persistence::{CaptureRepository, DeliveryRepository, FrozenWebhookDelivery};
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "41000000-0000-0000-0000-000000000006";
+    for id in 1..=2 {
+        seed_voice_observation(repo, account, "session", &format!("event-{id}"), id, id).await;
+        seed_voice_memory(repo, account, id, 1).await;
+    }
+    repo.list_episodes(account, &list_request()).await.unwrap();
+    let mut tx = repo.pool().begin().await.unwrap();
+    let labels = super::identity_presentation::authored_labels(&mut tx, account, Some(1), &[1, 2])
+        .await
+        .unwrap();
+    let labels = serde_json::to_string(&labels).unwrap();
+    sqlx::query("UPDATE episode_identity_presentations SET timeline_labels=$2::jsonb,brief_labels=$2::jsonb WHERE account_id=$1 AND episode_id=1")
+        .bind(account).bind(&labels).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE episodes SET title='Speaker A planned travel',summary='Speaker A discussed travel',participants='[\"Imagined attendee\"]',finalized_at=clock_timestamp(),finalization_status='complete' WHERE account_id=$1 AND id=1")
+        .bind(account).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO episode_final_briefs(account_id,episode_id,overview,decisions,action_items,important_links,open_questions) VALUES($1,1,'Speaker A planned travel','[]','[]','[{\"url\":\"https://example.test/Speaker_A\",\"label\":\"Speaker A itinerary\",\"why_it_matters\":\"Speaker A recommended this\"}]','[]')")
+        .bind(account).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "INSERT INTO people(account_id,id,display_name,status) VALUES($1,20,'Ana','identified')",
+    )
+    .bind(account)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=20,attribution_state='person_bound' WHERE account_id=$1 AND id=1")
+        .bind(account).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut search = search_request("travel", Some("Ana"));
+    search.kinds = vec!["episode".into()];
+    let hits = serde_json::to_value(repo.search(account, &search).await.unwrap()).unwrap();
+    assert_eq!(
+        hits[0]["title"], "Ana planned travel",
+        "search must select accepted people and project current authored labels"
+    );
+    assert_eq!(hits[0]["final_brief"]["overview"], "Ana planned travel");
+    search.query.clear();
+    search.speaker = Some("Imagined attendee".into());
+    assert!(
+        repo.search(account, &search).await.unwrap().is_empty(),
+        "cached model attendees must never authorize a speaker filter"
+    );
+    search.speaker = Some("Speaker B".into());
+    assert_eq!(
+        repo.search(account, &search).await.unwrap().len(),
+        1,
+        "ordinary REST speaker text must retain canonical anonymous-label matching"
+    );
+    search.speaker = Some("id:20".into());
+    assert_eq!(
+        repo.search(account, &search).await.unwrap().len(),
+        1,
+        "opaque public person selectors must resolve by exact id"
+    );
+    let status = repo
+        .session_status(account, "session", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.memories[0].title.as_deref(),
+        Some("Ana planned travel"),
+        "capture status must project titles through structured source membership"
+    );
+    assert_eq!(
+        status.memories[0].identity_revision, 8,
+        "capture status must carry the matching memory identity revision"
+    );
+    sqlx::query("INSERT INTO webhook_subscriptions(account_id,id,name,endpoint_url,signing_secret,include_content) VALUES($1,'identity','Synthetic','https://example.com/webhook','synthetic-secret',true)")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("INSERT INTO webhook_deliveries(account_id,episode_id,subscription_id,delivery_version,event_id,state) VALUES($1,1,'identity',1,'identity-event','pending')")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    let candidate = repo.next_webhook_candidate(account).await.unwrap().unwrap();
+    assert_eq!(
+        candidate.episode.participants,
+        vec!["Ana", "Speaker B"],
+        "outbound participants must come from graph speakers at freeze time"
+    );
+    assert_eq!(
+        candidate.episode.overview, "Ana planned travel",
+        "outbound briefs must use the frozen authored map and current graph"
+    );
+    assert_eq!(
+        candidate.episode.important_links[0].why_it_matters, "Ana recommended this",
+        "delivery link explanations must use the current mapped speaker"
+    );
+    assert_eq!(
+        candidate.episode.important_links[0].url,
+        "https://example.test/Speaker_A"
+    );
+    sqlx::query("UPDATE people SET display_name='Bao' WHERE account_id=$1 AND id=20")
+        .bind(account)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+    repo.list_episodes(account, &list_request()).await.unwrap();
+    let request = FrozenWebhookDelivery {
+        endpoint_url: candidate.endpoint_url.clone(),
+        signing_secret: candidate.signing_secret.clone(),
+        include_content: true,
+        event_body: serde_json::to_string(&candidate.episode).unwrap(),
+    };
+    assert!(
+        repo.claim_webhook(&candidate, request, 60)
+            .await
+            .unwrap()
+            .is_none(),
+        "a candidate crossing an identity revision must not freeze stale webhook content"
+    );
+    let current = repo.next_webhook_candidate(account).await.unwrap().unwrap();
+    assert_eq!(current.episode.overview, "Bao planned travel");
+    sqlx::query("INSERT INTO episode_email_preferences(account_id,enabled,include_content) VALUES($1,true,true)").bind(account).execute(repo.pool()).await.unwrap();
+    super::morning_email::seed_candidate_for_contract(repo, account, 1, "2026-09-13").await;
+    let email = repo.next_email_candidate(account).await.unwrap().unwrap();
+    let delivered = &email.daily.as_ref().unwrap().episodes[0];
+    assert_eq!(
+        delivered.overview, "Bao planned travel",
+        "morning email must freeze current mapped prose before its first send"
+    );
+    assert_eq!(delivered.participants, vec!["Bao", "Speaker B"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT title FROM episodes WHERE account_id=$1 AND id=1")
+            .bind(account)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+        "Speaker A planned travel"
+    );
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_search_reserves_selectors_and_projects_before_highlighting() {
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "41000000-0000-0000-0000-000000000007";
+    for id in 1..=4 {
+        seed_voice_observation(repo, account, "session", &format!("event-{id}"), id, id).await;
+        seed_voice_memory(repo, account, id, id).await;
+    }
+    sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,20,'Ana','identified'),($1,21,'id:20','identified'),($1,22,'Me','identified')").bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=id+19,attribution_state='person_bound' WHERE account_id=$1 AND id<=3").bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("UPDATE speaker_clusters SET attribution_state='owner_transmit' WHERE account_id=$1 AND id=4").bind(account).execute(repo.pool()).await.unwrap();
+    let vector = serde_json::to_string(&vec![1.0; 384]).unwrap();
+    sqlx::query(
+        "UPDATE episodes SET title='Synthetic selector',embedding=$2::vector WHERE account_id=$1",
+    )
+    .bind(account)
+    .bind(&vector)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE utterances SET text='Synthetic selector',embedding=$2::vector WHERE account_id=$1",
+    )
+    .bind(account)
+    .bind(&vector)
+    .execute(repo.pool())
+    .await
+    .unwrap();
+    for kind in ["episode", "utterance"] {
+        for (query, embedding) in [
+            ("", None),
+            ("Synthetic", None),
+            ("Synthetic", Some(vec![1.0; 384])),
+        ] {
+            for (selector, id) in [("id:20", 1), ("Me", 4), ("Ana", 1)] {
+                let mut request = search_request(query, Some(selector));
+                request.kinds = vec![kind.into()];
+                request.query_embedding = embedding.clone();
+                let hits =
+                    serde_json::to_value(repo.search(account, &request).await.unwrap()).unwrap();
+                assert_eq!(
+                    hits.as_array().unwrap().len(),
+                    1,
+                    "{kind} {query:?} {selector} must use an exclusive selector"
+                );
+                assert_eq!(
+                    hits[0]["id"], id,
+                    "reserved selector syntax must not also select a coincidental name"
+                );
+            }
+        }
+    }
+    // A retained minute's local Speaker A is a different voice from the
+    // current timeline's Speaker A. Project both before snippet flattening.
+    sqlx::query("UPDATE speaker_clusters SET person_id=NULL,attribution_state='request_local' WHERE account_id=$1 AND id IN(1,2)").bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("UPDATE episode_members SET episode_id=1 WHERE account_id=$1 AND record_type='utterance' AND record_id=2").bind(account).execute(repo.pool()).await.unwrap();
+    repo.list_episodes(account, &list_request()).await.unwrap();
+    let mut tx = repo.pool().begin().await.unwrap();
+    let mut labels =
+        super::identity_presentation::authored_labels(&mut tx, account, Some(1), &[1, 2])
+            .await
+            .unwrap();
+    let timeline = serde_json::to_string(&labels).unwrap();
+    labels
+        .labels
+        .retain(|label| label.utterance_ids.contains(&2));
+    labels.labels[0].label = "Speaker A".into();
+    let minutes = serde_json::json!({"minute":labels});
+    sqlx::query("UPDATE episode_identity_presentations SET timeline_labels=$2::jsonb,minute_labels=$3::jsonb WHERE account_id=$1 AND episode_id=1").bind(account).bind(timeline).bind(minutes.to_string()).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE episodes SET title='Speaker A planned work',summary='Speaker A discussed work',minute_summaries='[{\"start\":\"minute\",\"gist\":\"Speaker A booked comet tickets\"}]',minutes_text='Speaker A booked comet tickets' WHERE account_id=$1 AND id=1").bind(account).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE people SET display_name='Bao' WHERE account_id=$1 AND id=21")
+        .bind(account)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE speaker_clusters SET person_id=id+19,attribution_state='person_bound' WHERE account_id=$1 AND id IN(1,2)").bind(account).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    for query in ["comet", "Speaker"] {
+        let mut request = search_request(query, Some("Ana"));
+        request.kinds = vec!["episode".into()];
+        let hits = serde_json::to_value(repo.search(account, &request).await.unwrap()).unwrap();
+        let snippet = hits[0]["snippet"].as_str().unwrap();
+        if query == "comet" {
+            assert!(
+                snippet.contains("Bao booked"),
+                "minute snippets must preserve their own authored namespace: {snippet}"
+            );
+        }
+        assert!(
+            !snippet.contains("Speaker") && !snippet.contains("Ana booked"),
+            "highlighting must follow complete-field projection: {snippet}"
+        );
+        assert_eq!(
+            hits[0]["minute_summaries"][0]["gist"],
+            "Bao booked comet tickets"
+        );
+    }
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn identity_presentation_search_preserves_anonymous_and_legacy_labels() {
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "41000000-0000-0000-0000-000000000008";
+    for id in [1, 2, 3, 5, 6] {
+        seed_voice_observation(repo, account, "session", &format!("event-{id}"), id, id).await;
+        seed_voice_memory(repo, account, id, id).await;
+    }
+    for (id, label) in [(2, "Legacy Label"), (5, "Me"), (6, "id:20")] {
+        sqlx::query("UPDATE utterances SET speaker_observation_id=NULL,speaker_label=$3 WHERE account_id=$1 AND id=$2")
+            .bind(account).bind(id).bind(label).execute(repo.pool()).await.unwrap();
+    }
+    sqlx::query("UPDATE speaker_observations SET cluster_id=NULL WHERE account_id=$1 AND id=3")
+        .bind(account)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO episodes(account_id,id,started_at,ended_at,substance) VALUES($1,4,now(),now(),'normal')")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("INSERT INTO episode_participants(account_id,id,episode_id,participant_key,source_claimed_name,attribution_kind,derivation_version) VALUES($1,400,4,'legacy:attendee','Historical attendee','direct_identity_evidence',1)")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    let vector = serde_json::to_string(&vec![1.0; 384]).unwrap();
+    sqlx::query("UPDATE episodes SET title='Synthetic compatibility',embedding=$2::vector WHERE account_id=$1")
+        .bind(account).bind(&vector).execute(repo.pool()).await.unwrap();
+    sqlx::query("UPDATE utterances SET text='Synthetic compatibility',embedding=$2::vector WHERE account_id=$1")
+        .bind(account).bind(&vector).execute(repo.pool()).await.unwrap();
+    for kind in ["episode", "utterance"] {
+        for (query, embedding) in [
+            ("", None),
+            ("Synthetic", None),
+            ("unmatchedlexicalfixture", Some(vec![1.0; 384])),
+        ] {
+            for (selector, expected) in [
+                ("Speaker A", vec![1]),
+                ("legacy label", vec![2]),
+                ("Speaker", vec![3]),
+                (
+                    "Historical attendee",
+                    if kind == "episode" { vec![4] } else { vec![] },
+                ),
+                ("Me", vec![]),
+                ("id:20", vec![]),
+            ] {
+                let mut request = search_request(query, Some(selector));
+                request.kinds = vec![kind.into()];
+                request.query_embedding = embedding.clone();
+                let hits =
+                    serde_json::to_value(repo.search(account, &request).await.unwrap()).unwrap();
+                let mut actual = hits
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{kind} {query:?} {selector} must preserve canonical labels without reserved-selector fallback");
+            }
+        }
+    }
+    // A stale historical attendee must disappear once this memory has observed source.
+    sqlx::query("UPDATE episode_members SET episode_id=4 WHERE account_id=$1 AND record_type='utterance' AND record_id=1")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    let mut request = search_request("", Some("Historical attendee"));
+    request.kinds = vec!["episode".into()];
+    assert!(
+        repo.search(account, &request).await.unwrap().is_empty(),
+        "observed memories must never revive legacy participant labels"
+    );
+    cleanup(fixture).await;
+}

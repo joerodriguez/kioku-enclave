@@ -1,3 +1,4 @@
+use super::identity_presentation::{AuthoredLabel, AuthoredLabelMap};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,6 +55,25 @@ pub(crate) fn capture_formation_response_schema_v1() -> Value {
     })
 }
 
+/// New authoring has graph-owned participants; v1 stays frozen for already
+/// admitted attempts and is never rewritten during recovery.
+pub(crate) fn capture_formation_response_schema_v2() -> Value {
+    let mut schema = capture_formation_response_schema_v1();
+    schema["properties"]["episodes"]["items"]["properties"]
+        .as_object_mut()
+        .expect("static episode properties")
+        .remove("participants");
+    schema
+}
+
+pub(crate) fn capture_formation_response_schema(version: i64) -> Option<Value> {
+    match version {
+        1 => Some(capture_formation_response_schema_v1()),
+        2 => Some(capture_formation_response_schema_v2()),
+        _ => None,
+    }
+}
+
 /// Structural classification of the exact staged provider bytes. Only an
 /// object that explicitly contains an empty `episodes` array is a provider-
 /// declared no-memory result. Missing, mistyped, or non-empty arrays must not
@@ -83,6 +103,8 @@ pub(crate) fn parse_capture_formation_provider_response(
 #[serde(deny_unknown_fields)]
 pub(crate) struct CaptureFormationProviderRequest {
     pub(crate) contract_version: i64,
+    #[serde(default, skip_serializing_if = "AuthoredLabelMap::is_empty")]
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) vertex_project: String,
     pub(crate) vertex_location: String,
     pub(crate) api_version: String,
@@ -99,11 +121,18 @@ pub(crate) struct CaptureFormationProviderRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryUtterance {
+    pub(crate) authored_label: Option<AuthoredLabel>,
     pub(crate) id: i64,
     pub(crate) started_at: String,
     pub(crate) speaker_label: String,
     pub(crate) language: Option<String>,
     pub(crate) text: String,
+}
+
+impl SummaryUtterance {
+    pub(crate) fn authored_labels(rows: &[Self]) -> AuthoredLabelMap {
+        AuthoredLabelMap::from_labels(rows.iter().filter_map(|row| row.authored_label.clone()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +149,7 @@ pub(crate) struct SummaryScreenshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenEpisode {
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) id: i64,
     pub(crate) started_at: String,
     pub(crate) ended_at: String,
@@ -143,6 +173,7 @@ pub(crate) struct SummaryWindowClaim {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SummaryWindowSettlement {
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) claim: SummaryWindowClaim,
     pub(crate) episodes: Vec<EpisodeInput>,
     /// `None` deliberately holds the forward-only cursor. A value advances it
@@ -193,18 +224,21 @@ pub(crate) enum CaptureFormationRetryDisposition {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureFormationSettlement {
+    pub(crate) authored_labels: AuthoredLabelMap,
     pub(crate) claim: CaptureFormationClaim,
     pub(crate) episodes: Vec<EpisodeInput>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EpisodeEmbeddingSource {
+    pub(crate) source_revision: String,
     pub(crate) id: i64,
     pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EpisodeEmbeddingWrite {
+    pub(crate) source_revision: String,
     pub(crate) id: i64,
     pub(crate) embedding: Vec<f32>,
 }
@@ -310,6 +344,7 @@ pub(crate) trait MemoryFormationRepository: Send + Sync {
         from: &str,
         to: &str,
         limit: i64,
+        utterances: &mut [SummaryUtterance],
     ) -> Result<Vec<OpenEpisode>>;
 
     async fn settle_summary_window(&self, settlement: SummaryWindowSettlement) -> Result<Vec<i64>>;

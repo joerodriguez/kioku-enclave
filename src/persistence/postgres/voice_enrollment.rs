@@ -84,6 +84,7 @@ pub(super) async fn erase_samples(
     if samples.is_empty() {
         return Ok(());
     }
+    super::identity_presentation::initialize_account_semantics(tx, account).await?;
     let profiles:Vec<i64>=sqlx::query_scalar("SELECT profile_id FROM voice_sample_profile_assignments WHERE account_id=$1 AND sample_id=ANY($2::bigint[]) UNION SELECT voice_profile_id FROM voice_samples WHERE account_id=$1 AND id=ANY($2::bigint[]) AND voice_profile_id IS NOT NULL ORDER BY profile_id")
         .bind(account).bind(samples).fetch_all(&mut **tx).await?;
     let clusters:Vec<i64>=sqlx::query_scalar("SELECT DISTINCT o.cluster_id FROM speaker_observations o JOIN voice_samples sample ON sample.account_id=o.account_id AND sample.speaker_observation_id=o.id WHERE sample.account_id=$1 AND sample.id=ANY($2::bigint[]) AND o.cluster_id IS NOT NULL ORDER BY o.cluster_id")

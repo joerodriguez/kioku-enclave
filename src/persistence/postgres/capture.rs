@@ -1509,6 +1509,10 @@ async fn postgres_session_status(
     capture_session_id: &str,
     summarized_until_ms: Option<i64>,
 ) -> Result<Option<CaptureSessionStatus>> {
+    let mut transaction = persistence.pool().begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *transaction)
+        .await?;
     let session = sqlx::query(
         "SELECT id,device_id, \
                 floor(extract(epoch FROM started_at)*1000)::bigint AS started_at_ms, \
@@ -1518,7 +1522,7 @@ async fn postgres_session_status(
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_optional(persistence.pool())
+    .fetch_optional(&mut *transaction)
     .await?;
     let Some(session) = session else {
         return Ok(None);
@@ -1541,7 +1545,7 @@ async fn postgres_session_status(
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_one(persistence.pool())
+    .fetch_one(&mut *transaction)
     .await?;
     let event_count: i64 = processing.try_get("event_count")?;
     let queued: i64 = processing.try_get("queued")?;
@@ -1551,7 +1555,7 @@ async fn postgres_session_status(
     let failed: i64 = processing.try_get("failed")?;
 
     let memory_rows = sqlx::query(
-        "SELECT DISTINCT e.id,e.title,e.finalization_status, \
+        "SELECT DISTINCT e.id,e.title,e.finalization_status,e.identity_revision, \
                 floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
                 floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
                 floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms \
@@ -1562,20 +1566,21 @@ async fn postgres_session_status(
            LEFT JOIN screenshots s ON s.account_id=m.account_id \
              AND m.record_type='screenshot' AND s.id=m.record_id \
            JOIN capture_events ce ON ce.account_id=e.account_id AND ce.capture_session_id=$2 \
-             AND ((u.source_key LIKE 'cloud-v2:'||ce.event_id||':%') \
+             AND ((EXISTS(SELECT 1 FROM speaker_observation_sources src WHERE src.account_id=u.account_id AND src.speaker_observation_id=u.speaker_observation_id AND src.event_id=ce.event_id) OR (u.speaker_observation_id IS NULL AND u.source_key LIKE 'cloud-v2:'||ce.event_id||':%')) \
                OR s.source_key='cloud-v2:'||ce.event_id) \
           WHERE e.account_id=$1 AND e.substance!='none' \
           ORDER BY started_at_ms DESC,e.id DESC",
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_all(persistence.pool())
+    .fetch_all(&mut *transaction)
     .await?;
-    let memories = memory_rows
+    let mut memories = memory_rows
         .iter()
         .map(|row| {
             Ok(CaptureSessionMemory {
                 id: row.try_get("id")?,
+                identity_revision: row.try_get("identity_revision")?,
                 title: row.try_get("title")?,
                 started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
                 ended_at: isotime::format_epoch_millis(row.try_get("ended_at_ms")?),
@@ -1587,6 +1592,19 @@ async fn postgres_session_status(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    for memory in &mut memories {
+        let presentation = super::identity_presentation::episode_presentation(
+            &mut transaction,
+            account_id,
+            memory.id,
+        )
+        .await?;
+        memory.title = memory
+            .title
+            .as_deref()
+            .map(|title| presentation.timeline.text(title));
+    }
+
     let audio_minutes = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT round(max(kind_seconds)/60.0)::bigint FROM ( \
            SELECT sum(extract(epoch FROM (ended_at-started_at))) AS kind_seconds \
@@ -1595,7 +1613,7 @@ async fn postgres_session_status(
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_one(persistence.pool())
+    .fetch_one(&mut *transaction)
     .await?;
     let voice_count = sqlx::query_scalar::<_, i64>(
         "SELECT count(DISTINCT u.speaker_label)::bigint FROM capture_events ce JOIN utterances u \
@@ -1604,7 +1622,7 @@ async fn postgres_session_status(
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_one(persistence.pool())
+    .fetch_one(&mut *transaction)
     .await?;
     let top_contexts = sqlx::query_scalar::<_, String>(
         "SELECT s.active_app FROM capture_events ce JOIN screenshots s \
@@ -1615,7 +1633,7 @@ async fn postgres_session_status(
     )
     .bind(account_id)
     .bind(capture_session_id)
-    .fetch_all(persistence.pool())
+    .fetch_all(&mut *transaction)
     .await?;
 
     let has_ready_memory = memories
@@ -1634,6 +1652,9 @@ async fn postgres_session_status(
         ended_at.is_some(),
         summarized_past_end,
     );
+    let enrollment =
+        super::capture_enrollment::status(&mut transaction, account_id, capture_session_id).await?;
+    transaction.commit().await?;
     Ok(Some(CaptureSessionStatus {
         capture_session_id: session.try_get("id")?,
         device_id: session.try_get("device_id")?,
@@ -1655,12 +1676,7 @@ async fn postgres_session_status(
             top_contexts,
         },
         memories,
-        enrollment: super::capture_enrollment::status(
-            &mut *persistence.pool().acquire().await?,
-            account_id,
-            capture_session_id,
-        )
-        .await?,
+        enrollment,
     }))
 }
 

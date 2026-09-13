@@ -814,7 +814,7 @@ mod tests {
         f.base.pool().close().await;
     }
     async fn source(repo: &PostgresPersistence) -> String {
-        sqlx::query_scalar("SELECT jsonb_build_object('turns',(SELECT jsonb_agg(to_jsonb(u) ORDER BY id) FROM utterances u WHERE account_id=$1),'members',(SELECT jsonb_agg(to_jsonb(m) ORDER BY episode_id,record_id) FROM episode_members m WHERE account_id=$1),'revisions',(SELECT jsonb_agg(jsonb_build_array(id,identity_revision) ORDER BY id) FROM episodes WHERE account_id=$1),'archive',(SELECT revision FROM memory_archive_state WHERE account_id=$1))::text").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap()
+        sqlx::query_scalar("SELECT jsonb_build_object('turns',(SELECT jsonb_agg(to_jsonb(u) ORDER BY id) FROM utterances u WHERE account_id=$1),'members',(SELECT jsonb_agg(to_jsonb(m) ORDER BY episode_id,record_id) FROM episode_members m WHERE account_id=$1),'archive',(SELECT revision FROM memory_archive_state WHERE account_id=$1))::text").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap()
     }
     async fn proposal(repo: &PostgresPersistence) -> (i64, i64) {
         sqlx::query_as("SELECT id,result_profile_id FROM voice_profile_proposals WHERE account_id=$1 AND state='applied' ORDER BY id LIMIT 1").bind(ACCOUNT).fetch_one(repo.pool()).await.unwrap()
@@ -832,6 +832,13 @@ mod tests {
         let Some(f) = pair().await else { return };
         let repo = &f.persistence;
         let before = source(repo).await;
+        let before_revisions: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id,identity_revision FROM episodes WHERE account_id=$1 ORDER BY id",
+        )
+        .bind(ACCOUNT)
+        .fetch_all(repo.pool())
+        .await
+        .unwrap();
         let slots:Vec<(i64,i64,i64)>=sqlx::query_as("SELECT id,episode_id,slot_ordinal FROM episode_speaker_slots WHERE account_id=$1 ORDER BY id").bind(ACCOUNT).fetch_all(repo.pool()).await.unwrap();
         let (a, b) = tokio::join!(
             repo.maintain_voice_profiles(ACCOUNT),
@@ -856,7 +863,22 @@ mod tests {
         assert_eq!(
             source(repo).await,
             before,
-            "profile merge must not rewrite source turns or memory revisions"
+            "profile merge must not rewrite source turns, membership or archive coordinates"
+        );
+        let merged_revisions: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id,identity_revision FROM episodes WHERE account_id=$1 ORDER BY id",
+        )
+        .bind(ACCOUNT)
+        .fetch_all(repo.pool())
+        .await
+        .unwrap();
+        let expected_revisions = before_revisions
+            .iter()
+            .map(|(id, revision)| (*id, revision + i64::from([1, 4, 5].contains(id))))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            merged_revisions, expected_revisions,
+            "merging public identity advances only memories whose participant meaning changed"
         );
         assert!(
             reverse_now(repo, id).await,
@@ -867,7 +889,22 @@ mod tests {
         assert_eq!(
             source(repo).await,
             before,
-            "profile reversal must preserve immutable source and memory state"
+            "profile reversal must preserve immutable source and archive topology"
+        );
+        let reversed_revisions: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id,identity_revision FROM episodes WHERE account_id=$1 ORDER BY id",
+        )
+        .bind(ACCOUNT)
+        .fetch_all(repo.pool())
+        .await
+        .unwrap();
+        let expected_revisions = before_revisions
+            .iter()
+            .map(|(id, revision)| (*id, revision + 2 * i64::from([1, 4, 5].contains(id))))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reversed_revisions, expected_revisions,
+            "reversing public identity advances the affected presentation revisions again"
         );
         let export = repo.export(ACCOUNT).await.unwrap();
         assert_eq!(

@@ -384,7 +384,8 @@ pub(super) async fn refresh_episode_speaker_projections(
     if targets.is_empty() || !account_writable(tx, account_id).await? {
         return Ok(report);
     }
-    super::owner_voice::prepare_domains(tx, account_id).await?;
+    super::identity_presentation::initialize_account_semantics(tx, account_id).await?;
+    let changed_domains = super::owner_voice::prepare_domains(tx, account_id).await?;
     let profile_ids:Vec<i64>=sqlx::query_scalar("SELECT DISTINCT o.voice_profile_id FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id WHERE m.account_id=$1 AND m.episode_id=ANY($2::bigint[]) AND m.record_type='utterance' AND o.voice_profile_id IS NOT NULL")
         .bind(account_id).bind(targets.iter().map(|target|target.episode_id).collect::<Vec<_>>()).fetch_all(&mut **tx).await?;
     let admitted = super::voice_identity::controls_admit(tx, account_id)
@@ -395,11 +396,11 @@ pub(super) async fn refresh_episode_speaker_projections(
     super::identity_fusion::enrich_facts(tx, account_id, admitted).await?;
     changed_profiles.extend(super::voice_recurrence::refresh(tx, account_id).await?);
     let mut targets = targets.to_vec();
-    if !changed_profiles.is_empty() {
+    if !changed_profiles.is_empty() || !changed_domains.is_empty() {
         let affected = super::voice_identity::affected_speaker_projection_targets(
             tx,
             account_id,
-            &[],
+            &changed_domains,
             &changed_profiles,
             &[],
         )
@@ -495,7 +496,10 @@ pub(super) async fn refresh_episode_speaker_projections(
         let evidence =
             json!({"derivation":"assigned_utterance_identity","speaker_signature":after});
         let changed=sqlx::query("UPDATE episode_participants SET evidence=$3::jsonb WHERE account_id=$1 AND episode_id=$2 AND derivation_version=$4 AND evidence IS DISTINCT FROM $3::jsonb").bind(account_id).bind(episode).bind(evidence.to_string()).bind(SPEAKER_PROJECTION_VERSION).execute(&mut **tx).await?.rows_affected();
-        if before != after || changed > 0 {
+        let identity_changed =
+            super::identity_presentation::refresh_semantic_revision(tx, account_id, episode)
+                .await?;
+        if before != after || changed > 0 || identity_changed {
             report.changed_episode_ids.push(episode);
         }
     }
@@ -520,7 +524,17 @@ pub(super) async fn prepare_speaker_projection_page(
         tx.commit().await?;
         return Ok(SpeakerPreparationPage::default());
     }
-    super::owner_voice::prepare_domains(&mut tx, account_id).await?;
+    super::identity_presentation::initialize_account_semantics(&mut tx, account_id).await?;
+    let changed_domains = super::owner_voice::prepare_domains(&mut tx, account_id).await?;
+    let domain_targets = super::voice_identity::affected_speaker_projection_targets(
+        &mut tx,
+        account_id,
+        &changed_domains,
+        &[],
+        &[],
+    )
+    .await?;
+    refresh_episode_speaker_projections(&mut tx, account_id, &domain_targets, &[]).await?;
     let fence = episode_fence_sql(&mut tx).await?;
     let sql=format!("SELECT e.id FROM episodes e WHERE e.account_id=$1 AND ($2::bigint[] IS NULL OR e.id=ANY($2)) AND ($3::bigint IS NULL OR e.id>$3) AND ({fence}) AND (EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id AND p.derivation_version=2) OR EXISTS(SELECT 1 FROM episode_members m JOIN utterances u ON u.account_id=m.account_id AND u.id=m.record_id JOIN speaker_observations o ON o.account_id=u.account_id AND o.id=u.speaker_observation_id LEFT JOIN speaker_clusters c ON c.account_id=o.account_id AND c.id=o.cluster_id LEFT JOIN people person ON person.account_id=o.account_id AND person.id=o.person_id AND person.status='identified' AND nullif(btrim(person.display_name),'') IS NOT NULL WHERE m.account_id=e.account_id AND m.episode_id=e.id AND m.record_type='utterance' AND (c.id IS NOT NULL OR person.id IS NOT NULL OR EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id)))) AND NOT EXISTS(SELECT 1 FROM episode_participants p WHERE p.account_id=e.account_id AND p.episode_id=e.id AND p.derivation_version=2 AND p.evidence->>'speaker_signature'={signature}) ORDER BY e.id LIMIT $4",signature=projection_signature_sql());
     let mut ids = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
@@ -980,8 +994,8 @@ mod tests {
             .fetch_one(repo.pool())
             .await
             .unwrap(),
-            7,
-            "speaker presentation cannot advance later-phase identity revisions"
+            8,
+            "profile quarantine must advance identity revision once; anonymous slot changes must not"
         );
         cleanup(fixture).await;
     }
@@ -1003,14 +1017,11 @@ mod tests {
                 .await
                 .unwrap();
         seed(repo, account, 1, 1).await;
-        let repaired = prepare_speaker_projection_page(repo, account, None, None)
+        // Domain preparation may repair this memory before the ordinary page
+        // selection. The canonical rows below must still expose the new voice.
+        prepare_speaker_projection_page(repo, account, None, None)
             .await
             .unwrap();
-        assert_eq!(
-            repaired.prepared_episode_ids,
-            vec![1],
-            "an unchanged v2 marker cannot hide an old writer's newly assigned voice"
-        );
         let current = labels(repo, account, 1).await;
         assert_eq!(
             (&current[&9].0, &current[&1].0),

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::identity_presentation::{AuthoredLabelMap, EpisodeLabelProjection};
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,26 @@ pub(crate) struct FinalizationEpisode {
     pub(crate) structure_state: String,
     pub(crate) minute_summaries: Value,
     pub(crate) minutes_text: Option<String>,
+}
+
+impl FinalizationEpisode {
+    pub(crate) fn presented(&self, projection: &EpisodeLabelProjection) -> Self {
+        let mut episode = self.clone();
+        episode.title = projection.timeline.text(&self.title);
+        episode.summary = self.summary.as_deref().map(|s| projection.timeline.text(s));
+        episode.action_items = self.action_items.as_deref().map(|s| {
+            serde_json::from_str::<Value>(s)
+                .ok()
+                .map(|v| projection.actions.human_json(&v).to_string())
+                .unwrap_or_else(|| s.into())
+        });
+        episode.minute_summaries = projection.minute_summaries(&self.minute_summaries);
+        episode.minutes_text = self
+            .minutes_text
+            .as_deref()
+            .map(|s| projection.minutes_text(s, &self.minute_summaries));
+        episode
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +72,13 @@ pub(crate) struct FinalizationScreenshot {
     pub(crate) visual_signals: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizationReason {
+    Initial,
+    Version,
+    Identity,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FinalizationClaim {
     pub(crate) account_id: String,
@@ -59,6 +87,9 @@ pub(crate) struct FinalizationClaim {
     pub(crate) utterances: Vec<FinalizationUtterance>,
     pub(crate) screenshots: Vec<FinalizationScreenshot>,
     pub(crate) input_identity_revision: i64,
+    pub(crate) reason: FinalizationReason,
+    pub(crate) authored_labels: AuthoredLabelMap,
+    pub(crate) presentation: EpisodeLabelProjection,
     pub(crate) attempt_count: i64,
 }
 
@@ -87,6 +118,7 @@ pub(crate) struct FinalizationSettlement {
     pub(crate) vertex_event_id: String,
     pub(crate) model_name: String,
     pub(crate) analysis_revision: String,
+    pub(crate) reused_timeline: bool,
     pub(crate) title: String,
     pub(crate) summary: String,
     pub(crate) minute_summaries_json: String,

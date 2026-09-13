@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -14,7 +14,7 @@ use crate::{
     },
     error::{EnclaveError, Result},
     persistence::{
-        capture_formation_response_schema_v1, merge_minute_summaries, merge_substance,
+        capture_formation_response_schema, merge_minute_summaries, merge_substance,
         merge_visual_evidence, normalized_substance, normalized_visual_evidence,
         parse_capture_formation_provider_response, CaptureFormationClaim,
         CaptureFormationProviderRequest, CaptureFormationProviderResponse,
@@ -31,11 +31,78 @@ use super::{
     allocate_content_id, duration_seconds, PostgresPersistence,
 };
 
+// Exact source bytes plus semantic identity revision fence a late encoder result.
+// Embeddings are derived data and never advance an episode's source timestamp.
+const EMBEDDING_REVISION_SQL: &str = "encode(sha256(convert_to(jsonb_build_array(e.identity_revision,e.title,e.summary,e.minute_summaries,e.minutes_text,e.action_items,(SELECT to_jsonb(b) FROM episode_final_briefs b WHERE b.account_id=e.account_id AND b.episode_id=e.id))::text,'UTF8')),'hex')";
+
+// The commitment includes the exact resolved encoder input, including anonymous
+// slot changes that intentionally do not advance semantic identity_revision.
+async fn embedding_sources_in_snapshot(
+    connection: &mut sqlx::PgConnection,
+    account_id: &str,
+    ids: &[i64],
+) -> Result<Vec<EpisodeEmbeddingSource>> {
+    let sql = format!("SELECT e.id,{EMBEDDING_REVISION_SQL} AS source_revision,jsonb_build_object('title',e.title,'summary',e.summary,'minutes_text',e.minutes_text,'minute_summaries',e.minute_summaries,'final_brief',jsonb_build_object('overview',fb.overview,'sections',fb.sections,'decisions',fb.decisions,'action_items',fb.action_items,'important_links',fb.important_links,'open_questions',fb.open_questions))::text AS presentation FROM episodes e LEFT JOIN episode_final_briefs fb ON fb.account_id=e.account_id AND fb.episode_id=e.id WHERE e.account_id=$1 AND e.id=ANY($2) ORDER BY e.id");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(account_id)
+        .bind(ids)
+        .fetch_all(&mut *connection)
+        .await?;
+    fn strings(value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::String(text) => output.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    strings(item, output);
+                }
+            }
+            Value::Object(fields) => {
+                for value in fields.values() {
+                    strings(value, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.try_get("id")?;
+        let mut presentation: Value =
+            serde_json::from_str(&row.try_get::<String, _>("presentation")?)?;
+        super::identity_presentation::episode_presentation(connection, account_id, id)
+            .await?
+            .episode_json(&mut presentation);
+        // Minute gists already occur in the plain-text mirror; timestamps
+        // and JSON field names are not semantic embedding input.
+        let mut parts = Vec::new();
+        for field in ["title", "summary", "minutes_text", "final_brief"] {
+            if let Some(value) = presentation.get(field) {
+                strings(value, &mut parts);
+            }
+        }
+        let text = parts.join("\n");
+        if !text.trim().is_empty() {
+            sources.push(EpisodeEmbeddingSource {
+                id,
+                text: text.clone(),
+                source_revision: {
+                    let mut digest = Sha256::new();
+                    digest.update(row.try_get::<String, _>("source_revision")?);
+                    digest.update([0]);
+                    digest.update(text.as_bytes());
+                    format!("{:x}", digest.finalize())
+                },
+            });
+        }
+    }
+    Ok(sources)
+}
+
 const OPEN_EPISODES_SQL: &str =
     "SELECT e.id,floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms,\
             floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms,\
             e.type,e.title,e.summary,e.participants::text AS participants,\
-            e.action_items::text AS action_items,e.minutes_text,\
+            e.action_items::text AS action_items,e.minutes_text,e.minute_summaries::text AS minute_summaries,\
             count(*) FILTER (WHERE m.record_type='utterance')::bigint AS utterance_count,\
             count(*) FILTER (WHERE m.record_type='screenshot')::bigint AS screenshot_count \
        FROM episodes e JOIN memory_handles h \
@@ -99,7 +166,9 @@ struct CaptureFormationPage {
 fn capture_formation_provider_request_bytes(
     request: &CaptureFormationProviderRequest,
 ) -> Result<Vec<u8>> {
-    if request.contract_version != 1
+    if capture_formation_response_schema(request.contract_version).as_ref()
+        != Some(&request.response_schema)
+        || (request.contract_version == 1 && !request.authored_labels.is_empty())
         || request.vertex_project.is_empty()
         || request.vertex_project.len() > 256
         || request.vertex_location.is_empty()
@@ -112,7 +181,6 @@ fn capture_formation_provider_request_bytes(
         || request.response_mime_type != "application/json"
         || request.max_output_tokens != CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS
         || request.thinking_budget != 0
-        || request.response_schema != capture_formation_response_schema_v1()
         || [
             &request.vertex_project,
             &request.vertex_location,
@@ -2062,7 +2130,10 @@ impl MemoryFormationRepository for PostgresPersistence {
                 "summary evidence bounds are invalid".into(),
             ));
         }
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *connection)
+            .await?;
         let formation_receipts_installed =
             capture_formation_contract_installed(&mut connection).await?;
         let identity = super::speaker_identity::speaker_identity_join(
@@ -2121,7 +2192,7 @@ impl MemoryFormationRepository for PostgresPersistence {
               ORDER BY coalesce(o.started_at,s.started_at + (u.start_offset_seconds * interval '1 second')),u.id \
               LIMIT $4")
         };
-        let utterances = sqlx::query(sqlx::AssertSqlSafe(utterance_sql))
+        let mut utterances = sqlx::query(sqlx::AssertSqlSafe(utterance_sql))
             .bind(account_id)
             .bind(from_ms)
             .bind(to_ms)
@@ -2131,6 +2202,7 @@ impl MemoryFormationRepository for PostgresPersistence {
             .into_iter()
             .map(|row| {
                 Ok(SummaryUtterance {
+                    authored_label: None,
                     id: row.try_get("id")?,
                     started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
                     speaker_label: row.try_get("speaker_label")?,
@@ -2194,6 +2266,13 @@ impl MemoryFormationRepository for PostgresPersistence {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        super::identity_presentation::prepare_authoring_utterances(
+            &mut connection,
+            account_id,
+            &mut utterances,
+        )
+        .await?;
+        connection.commit().await?;
         Ok((utterances, screenshots))
     }
 
@@ -2686,10 +2765,11 @@ impl MemoryFormationRepository for PostgresPersistence {
                 "capture formation page evidence changed".into(),
             ));
         }
-        let utterances = utterance_rows
+        let mut utterances = utterance_rows
             .into_iter()
             .map(|row| {
                 Ok(SummaryUtterance {
+                    authored_label: None,
                     id: row.try_get("id")?,
                     started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
                     speaker_label: row.try_get("speaker_label")?,
@@ -2713,6 +2793,12 @@ impl MemoryFormationRepository for PostgresPersistence {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        super::identity_presentation::prepare_authoring_utterances(
+            &mut transaction,
+            &claim.account_id,
+            &mut utterances,
+        )
+        .await?;
         transaction.commit().await?;
         Ok((utterances, screenshots))
     }
@@ -3304,6 +3390,22 @@ impl MemoryFormationRepository for PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
             }
+            let labels = if episode.model.as_deref() == Some("conservative-capture-page-keep-v1") {
+                &settlement.authored_labels
+            } else {
+                page.provider_request
+                    .as_ref()
+                    .map(|request| &request.authored_labels)
+                    .unwrap_or(&settlement.authored_labels)
+            };
+            super::identity_presentation::save_formation_labels(
+                &mut transaction,
+                &settlement.claim.account_id,
+                id,
+                labels,
+                episode.minute_summaries.as_deref().unwrap_or_default(),
+            )
+            .await?;
             ids.push(id);
         }
         super::speaker_identity::refresh_episode_speaker_projections(
@@ -3448,35 +3550,97 @@ impl MemoryFormationRepository for PostgresPersistence {
         from: &str,
         to: &str,
         limit: i64,
+        utterances: &mut [SummaryUtterance],
     ) -> Result<Vec<OpenEpisode>> {
         let from_ms = timestamp(from, "open episode start")?;
         let to_ms = timestamp(to, "open episode end")?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query(OPEN_EPISODES_SQL)
             .bind(account_id)
             .bind(from_ms)
             .bind(to_ms)
             .bind(limit)
-            .fetch_all(self.pool())
+            .fetch_all(&mut *tx)
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(OpenEpisode {
-                    id: row.try_get("id")?,
-                    started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
-                    ended_at: isotime::format_epoch_millis(row.try_get("ended_at_ms")?),
-                    episode_type: row.try_get("type")?,
-                    title: row
-                        .try_get::<Option<String>, _>("title")?
+        let episode_ids = rows
+            .iter()
+            .map(|row| row.try_get::<i64, _>("id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
+        let namespace = super::identity_presentation::authoring_context(
+            &mut tx,
+            account_id,
+            &utterance_ids,
+            &episode_ids,
+        )
+        .await?;
+        super::identity_presentation::apply_authoring_context(utterances, &namespace);
+        let members: Vec<(i64,i64)> = sqlx::query_as("SELECT episode_id,record_id FROM episode_members WHERE account_id=$1 AND episode_id=ANY($2) AND record_type='utterance'")
+            .bind(account_id).bind(&episode_ids).fetch_all(&mut *tx).await?;
+        let mut member_ids =
+            std::collections::BTreeMap::<i64, std::collections::BTreeSet<i64>>::new();
+        for (episode, utterance) in members {
+            member_ids.entry(episode).or_default().insert(utterance);
+        }
+        let mut episodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let mut labels = namespace.clone();
+            for label in &mut labels.labels {
+                label.utterance_ids.retain(|utterance| {
+                    member_ids
+                        .get(&id)
+                        .is_some_and(|ids| ids.contains(utterance))
+                });
+            }
+            labels
+                .labels
+                .retain(|label| !label.utterance_ids.is_empty());
+            let projection = super::identity_presentation::episode_presentation_in_context(
+                &mut tx,
+                account_id,
+                id,
+                Some(&namespace),
+            )
+            .await?;
+            let minutes: Value =
+                serde_json::from_str(&row.try_get::<String, _>("minute_summaries")?)?;
+            episodes.push(OpenEpisode {
+                participants: labels
+                    .labels
+                    .iter()
+                    .map(|label| label.label.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                authored_labels: labels,
+                id,
+                started_at: isotime::format_epoch_millis(row.try_get("started_at_ms")?),
+                ended_at: isotime::format_epoch_millis(row.try_get("ended_at_ms")?),
+                episode_type: row.try_get("type")?,
+                title: projection.timeline.text(
+                    &row.try_get::<Option<String>, _>("title")?
                         .unwrap_or_else(|| "untitled".into()),
-                    summary: row.try_get("summary")?,
-                    participants: string_array(row.try_get("participants")?),
-                    action_items: string_array(row.try_get("action_items")?),
-                    recent_minutes: row.try_get("minutes_text")?,
-                    utt_count: row.try_get("utterance_count")?,
-                    scr_count: row.try_get("screenshot_count")?,
-                })
-            })
-            .collect()
+                ),
+                summary: row
+                    .try_get::<Option<String>, _>("summary")?
+                    .map(|text| projection.timeline.text(&text)),
+                action_items: string_array(row.try_get("action_items")?)
+                    .iter()
+                    .map(|text| projection.actions.text(text))
+                    .collect(),
+                recent_minutes: row
+                    .try_get::<Option<String>, _>("minutes_text")?
+                    .map(|text| projection.minutes_text(&text, &minutes)),
+                utt_count: row.try_get("utterance_count")?,
+                scr_count: row.try_get("screenshot_count")?,
+            });
+        }
+        tx.commit().await?;
+        Ok(episodes)
     }
 
     async fn settle_summary_window(&self, settlement: SummaryWindowSettlement) -> Result<Vec<i64>> {
@@ -3661,6 +3825,15 @@ impl MemoryFormationRepository for PostgresPersistence {
                 .execute(&mut *transaction)
                 .await?;
             }
+            let labels = &settlement.authored_labels;
+            super::identity_presentation::save_formation_labels(
+                &mut transaction,
+                &settlement.claim.account_id,
+                id,
+                labels,
+                episode.minute_summaries.as_deref().unwrap_or_default(),
+            )
+            .await?;
             ids.push(id);
         }
         super::speaker_identity::refresh_episode_speaker_projections(
@@ -3724,33 +3897,13 @@ impl MemoryFormationRepository for PostgresPersistence {
         account_id: &str,
         ids: &[i64],
     ) -> Result<Vec<EpisodeEmbeddingSource>> {
-        let rows = sqlx::query(
-            "SELECT e.id,concat_ws(E'\\n',e.title,e.summary,e.minutes_text,fb.overview, \
-                    (SELECT string_agg(value #>> '{}',E'\\n' ORDER BY ordinal) \
-                       FROM jsonb_path_query( \
-                         fb.decisions||fb.action_items||fb.important_links||fb.open_questions||coalesce(fb.sections,'[]'::jsonb), \
-                         'strict $.** ? (@.type() == \"string\")' \
-                       ) WITH ORDINALITY AS strings(value,ordinal))) AS text \
-               FROM episodes e LEFT JOIN episode_final_briefs fb \
-                 ON fb.account_id=e.account_id AND fb.episode_id=e.id \
-              WHERE e.account_id=$1 AND e.id=ANY($2) ORDER BY e.id",
-        )
-        .bind(account_id)
-        .bind(ids)
-        .fetch_all(self.pool())
-        .await?;
-        rows.into_iter()
-            .filter_map(|row| {
-                let text = row.try_get::<String, _>("text").ok()?;
-                if text.trim().is_empty() {
-                    return None;
-                }
-                Some(Ok(EpisodeEmbeddingSource {
-                    id: row.get("id"),
-                    text,
-                }))
-            })
-            .collect()
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let sources = embedding_sources_in_snapshot(&mut tx, account_id, ids).await?;
+        tx.commit().await?;
+        Ok(sources)
     }
 
     async fn write_episode_embeddings(
@@ -3759,8 +3912,21 @@ impl MemoryFormationRepository for PostgresPersistence {
         writes: &[EpisodeEmbeddingWrite],
     ) -> Result<()> {
         let mut transaction = self.pool().begin().await?;
+        // Serialize with formation, finalization and graph writers before any
+        // comparison. The read after the wait must see the committed brief as
+        // well as the episode row; a correlated UPDATE snapshot cannot do this.
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
+        let ids = writes.iter().map(|write| write.id).collect::<Vec<_>>();
+        let current = embedding_sources_in_snapshot(&mut transaction, account_id, &ids)
+            .await?
+            .into_iter()
+            .map(|source| (source.id, source.source_revision))
+            .collect::<std::collections::HashMap<_, _>>();
         for write in writes {
-            sqlx::query("UPDATE episodes SET embedding=$3::vector,updated_at=now() WHERE account_id=$1 AND id=$2")
+            if current.get(&write.id) != Some(&write.source_revision) {
+                continue;
+            }
+            sqlx::query("UPDATE episodes SET embedding=$3::vector WHERE account_id=$1 AND id=$2")
                 .bind(account_id)
                 .bind(write.id)
                 .bind(vector_literal(&write.embedding)?)
@@ -3815,8 +3981,9 @@ pub(super) async fn test_real_pg_oversized_formation_and_neighborhood(
     use crate::{
         cp::vertex::VertexOperation,
         persistence::{
-            MemoryReconciliationRepository as _, ModelUsageRepository as _,
-            OversizedKeepPromotionPolicy, OversizedKeepPromotionResult, VertexInvocationAdmission,
+            capture_formation_response_schema_v1, MemoryReconciliationRepository as _,
+            ModelUsageRepository as _, OversizedKeepPromotionPolicy, OversizedKeepPromotionResult,
+            VertexInvocationAdmission,
         },
     };
 
@@ -3998,6 +4165,7 @@ pub(super) async fn test_real_pg_oversized_formation_and_neighborhood(
     .await?;
 
     let request = |tag: &str| CaptureFormationProviderRequest {
+        authored_labels: Default::default(),
         contract_version: 1,
         vertex_project: "kioku-test".into(),
         vertex_location: "us-central1".into(),
@@ -4403,6 +4571,7 @@ pub(super) async fn test_real_pg_oversized_formation_and_neighborhood(
     .execute(persistence.pool())
     .await?;
     let page0_settlement = CaptureFormationSettlement {
+        authored_labels: Default::default(),
         claim: second_attempt.clone(),
         episodes: Vec::new(),
     };
@@ -4598,6 +4767,7 @@ pub(super) async fn test_real_pg_oversized_formation_and_neighborhood(
     );
     assert!(persistence
         .settle_capture_formation(CaptureFormationSettlement {
+            authored_labels: Default::default(),
             claim: lost_response.clone(),
             episodes: Vec::new(),
         })
@@ -4637,12 +4807,14 @@ pub(super) async fn test_real_pg_oversized_formation_and_neighborhood(
     };
     assert!(persistence
         .settle_capture_formation(CaptureFormationSettlement {
+            authored_labels: Default::default(),
             claim: lost_response.clone(),
             episodes: vec![episode(last_utterance_ids.clone(), Vec::new())],
         })
         .await
         .is_err());
     let final_settlement = CaptureFormationSettlement {
+        authored_labels: Default::default(),
         claim: lost_response,
         episodes: vec![episode(
             last_utterance_ids.clone(),
@@ -4994,6 +5166,48 @@ mod tests {
     }
 
     #[test]
+    fn identity_presentation_request_recovery_preserves_original_v1_bytes() {
+        use crate::persistence::identity_presentation::{
+            AuthoredLabel, AuthoredLabelMap, LabelTarget,
+        };
+        let old = format!(
+            r#"{{"contract_version":1,"vertex_project":"synthetic-project","vertex_location":"synthetic-location","api_version":"v1","publisher":"google","model":"synthetic-model","method":"generateContent","system_prompt":"Frozen old prompt","user_message":"Frozen [Speaker A] evidence","response_schema":{},"max_output_tokens":8192,"response_mime_type":"application/json","thinking_budget":0}}"#,
+            serde_json::to_string(&crate::persistence::capture_formation_response_schema_v1())
+                .unwrap()
+        );
+        let mut request: super::CaptureFormationProviderRequest =
+            serde_json::from_str(&old).unwrap();
+        assert_eq!(super::capture_formation_provider_request_bytes(&request).unwrap(),old.as_bytes(),"old admitted formation requests must retain their exact original bytes without invented label metadata");
+        request.authored_labels = AuthoredLabelMap {
+            labels: vec![AuthoredLabel {
+                label: "Speaker A".into(),
+                target: LabelTarget::Cluster(1),
+                fallback_label: "Speaker A".into(),
+                utterance_ids: vec![1],
+            }],
+        };
+        assert!(
+            super::capture_formation_provider_request_bytes(&request).is_err(),
+            "a v1 attempt must not acquire a newly invented identity map during recovery"
+        );
+        request.contract_version = 2;
+        request.response_schema = crate::persistence::capture_formation_response_schema_v2();
+        let frozen = super::capture_formation_provider_request_bytes(&request).unwrap();
+        let recovered: super::CaptureFormationProviderRequest =
+            serde_json::from_slice(&frozen).unwrap();
+        assert_eq!(
+            recovered.authored_labels, request.authored_labels,
+            "new formation recovery must preserve the original authoring map"
+        );
+        assert!(
+            !request.response_schema["properties"]["episodes"]["items"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("participants")
+        );
+    }
+
+    #[test]
     fn open_episode_projection_exposes_only_extendable_drafts() {
         requires_active_unfinalized_draft(OPEN_EPISODES_SQL);
     }
@@ -5006,6 +5220,7 @@ mod tests {
 
     fn provider_request(user_message: String) -> CaptureFormationProviderRequest {
         CaptureFormationProviderRequest {
+            authored_labels: Default::default(),
             contract_version: 1,
             vertex_project: "kioku-prod".into(),
             vertex_location: "us-central1".into(),

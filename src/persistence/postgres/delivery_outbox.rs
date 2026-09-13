@@ -71,6 +71,41 @@ pub(super) fn episode_from_row(row: &sqlx::postgres::PgRow) -> Result<FinalizedE
     })
 }
 
+/// Project a copied delivery model while the caller holds its existing account
+/// snapshot/lock. The durable authored brief and any already sent bytes stay intact.
+pub(super) async fn present_episode(
+    connection: &mut sqlx::PgConnection,
+    account: &str,
+    episode: FinalizedEpisode,
+) -> Result<FinalizedEpisode> {
+    let projection =
+        super::identity_presentation::episode_presentation(connection, account, episode.episode_id)
+            .await?;
+    let mut presented: FinalizedEpisode = serde_json::from_value(
+        projection
+            .brief
+            .human_json(&serde_json::to_value(&episode)?),
+    )?;
+    presented.title = projection.timeline.text(&episode.title);
+    presented.participants = super::speaker_identity::load_episode_participant_details(
+        connection,
+        account,
+        &[episode.episode_id],
+    )
+    .await?
+    .remove(&episode.episode_id)
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|person| {
+        person
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
+    .collect();
+    Ok(presented)
+}
+
 pub(super) async fn recover_expired_email_claims(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
@@ -511,6 +546,7 @@ impl DeliveryRepository for PostgresPersistence {
     ) -> Result<Option<WebhookDeliveryCandidate>> {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "account-lifecycle", account_id).await?;
+        advisory_transaction_lock(&mut transaction, "memory-reconciliation", account_id).await?;
         advisory_transaction_lock(&mut transaction, "webhook-registry", account_id).await?;
         recover_expired_webhook_claims(&mut transaction, account_id).await?;
         sqlx::query(
@@ -552,7 +588,7 @@ impl DeliveryRepository for PostgresPersistence {
                     floor(extract(epoch FROM e.started_at)*1000)::bigint AS started_at_ms, \
                     floor(extract(epoch FROM e.ended_at)*1000)::bigint AS ended_at_ms, \
                     floor(extract(epoch FROM e.finalized_at)*1000)::bigint AS finalized_at_ms, \
-                    e.type AS episode_type,e.title,e.participants::text AS participants, \
+                    e.type AS episode_type,e.title,e.identity_revision,e.participants::text AS participants, \
                     b.overview,b.sections::text AS sections,b.decisions::text AS decisions,b.action_items::text AS action_items, \
                     b.important_links::text AS important_links,b.open_questions::text AS open_questions \
                FROM webhook_deliveries d JOIN accounts a ON a.id=d.account_id \
@@ -572,7 +608,7 @@ impl DeliveryRepository for PostgresPersistence {
         .bind(account_id)
         .fetch_optional(&mut *transaction)
         .await?;
-        let candidate = row
+        let mut candidate = row
             .as_ref()
             .map(|row| -> Result<WebhookDeliveryCandidate> {
                 Ok(WebhookDeliveryCandidate {
@@ -585,10 +621,15 @@ impl DeliveryRepository for PostgresPersistence {
                     include_content: row.try_get("include_content")?,
                     endpoint_url: row.try_get("endpoint_url")?,
                     signing_secret: row.try_get("signing_secret")?,
+                    identity_revision: row.try_get("identity_revision")?,
                     episode: episode_from_row(row)?,
                 })
             })
             .transpose()?;
+        if let Some(candidate) = &mut candidate {
+            candidate.episode =
+                present_episode(&mut transaction, account_id, candidate.episode.clone()).await?;
+        }
         transaction.commit().await?;
         Ok(candidate)
     }
@@ -621,6 +662,12 @@ impl DeliveryRepository for PostgresPersistence {
         let mut transaction = self.pool().begin().await?;
         advisory_transaction_lock(&mut transaction, "account-lifecycle", &candidate.account_id)
             .await?;
+        advisory_transaction_lock(
+            &mut transaction,
+            "memory-reconciliation",
+            &candidate.account_id,
+        )
+        .await?;
         advisory_transaction_lock(&mut transaction, "webhook-registry", &candidate.account_id)
             .await?;
         recover_expired_webhook_claims(&mut transaction, &candidate.account_id).await?;
@@ -636,7 +683,7 @@ impl DeliveryRepository for PostgresPersistence {
             return Ok(None);
         }
         let current = sqlx::query(
-            "SELECT d.attempt_count,a.status,s.enabled,s.endpoint_url,s.signing_secret,s.include_content \
+            "SELECT d.attempt_count,a.status,s.enabled,s.endpoint_url,s.signing_secret,s.include_content, (SELECT e.identity_revision FROM episodes e WHERE e.account_id=d.account_id AND e.id=d.episode_id) AS identity_revision \
                FROM webhook_deliveries d JOIN accounts a ON a.id=d.account_id \
                JOIN webhook_subscriptions s ON s.account_id=d.account_id AND s.id=d.subscription_id \
               WHERE d.account_id=$1 AND d.episode_id=$2 AND d.subscription_id=$3 \
@@ -659,7 +706,9 @@ impl DeliveryRepository for PostgresPersistence {
             && current.try_get::<String, _>("endpoint_url")? == request.endpoint_url
             && current.try_get::<String, _>("signing_secret")? == request.signing_secret
             && current.try_get::<bool, _>("include_content")? == request.include_content
-            && current.try_get::<i64, _>("attempt_count")? == candidate.attempt_count;
+            && current.try_get::<i64, _>("attempt_count")? == candidate.attempt_count
+            && current.try_get::<Option<i64>, _>("identity_revision")?
+                == Some(candidate.identity_revision);
         if !authorized {
             transaction.rollback().await?;
             return Ok(None);
