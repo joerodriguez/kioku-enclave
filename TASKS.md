@@ -189,7 +189,7 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
   reconciler's committed producer contract with the tag as `memory_language` input so a language
   change re-fingerprints the source instead of altering an admitted provider attempt.
 - [ ] Release: install v35 after v34, re-pin `MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256`
-  (`sha256:613b1736…`), and serve this revision before any companion stamps the field.
+  (`sha256:65909856…`), and serve this revision before any companion stamps the field.
 - [ ] Acceptance with the real model: a French recording on an English device authors an English
   title, bullets, gists, and brief with a quoted instruction, an amount, and a URL preserved and
   the transcript byte-identical.

@@ -177,8 +177,8 @@ it writes — titles, summary bullets, timeline gists, brief sections, screen de
 in the language of the newest stamped recording, English when none exists. It never
 changes the transcript, the evidence-level `languages` codes, names, URLs, or on-screen
 text. A malformed tag is refused with 400; an absent field keeps a pre-companion
-manifest's exact bytes and digest. Enclave revisions before v35 deny the field, so
-companions that stamp it require the enclave to be released first.
+manifest's exact bytes and digest. Enclave releases before the one that installs the v35
+companion deny the field, so companions that stamp it require that enclave release first.
 
 `session_finished` is optional (false by default) and valid only on audio. A client sets
 it on its last currently known durable audio event. Acceptance atomically records a

@@ -41,7 +41,7 @@ const RELEASE_PROTOCOL_VERSION: i64 = 1;
 /// producer match, and there is still no version-scoped escape.
 #[cfg(test)]
 const EXPECTED_RECONCILIATION_PRODUCER_CONTRACT: &str =
-    "sha256:613b1736ad12cd230f1f3bdf6d483b13a44fbd446dcb442801df180dcf370811";
+    "sha256:65909856a63d372d2ad6db8dd9285f6cbf61eaf4c602ae2e39c1523ec43d70f0";
 const BACKFILL_BATCH_SIZE: i64 = 250;
 const MAX_BACKFILL_BATCHES_PER_RUN: usize = 100;
 const FLEET_RECEIPT_MAX_VALIDITY_MILLIS: i64 = 15 * 60 * 1_000;

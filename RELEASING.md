@@ -640,14 +640,18 @@ Source merge does not run this phase, publish an image, or complete owner accept
 
 The reviewed source requires `memory-language-v35-install` after v34 through the same
 dedicated migrator. It adds the nullable `capture_events.locale_id` column with its
-BCP-47 check and the `authoring_language_schema` receipt; serving startup and readiness
-verify that receipt and never execute DDL. Pre-companion rows stay NULL and are
-authored in English until a newer stamped recording arrives.
+BCP-47 check, the partial `capture_events_locale_idx` newest-stamp index, and the
+`authoring_language_schema` receipt; serving startup and readiness verify that receipt and
+never execute DDL. Pre-companion rows stay NULL and are authored in English until a newer
+stamped recording arrives. The install validates the check and builds the index in one
+transaction while holding `capture_events` against writes; at today's row counts that is
+sub-second, so run it in a quiet moment rather than assuming it is instant.
 
 Order matters for the companions: `CaptureEventManifest` denies unknown fields, so an
 iPhone or Mac build that stamps `locale_id` must not reach an enclave revision older
 than this source — its uploads would be refused with 400 and its queue would stall.
-Release the enclave first, then the companions. The summarizer, finalizer, and
-reconciler prompts change with this source, so the reconciliation producer contract
+Release the enclave first, then the companions. The reconciler system prompt (and its
+`PROMPT_VERSION`) change with this source, so the reconciliation producer contract
 SHA-256 changes and the operator configuration's
-`MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256` must be re-pinned per ADR-0046.
+`MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256` must be re-pinned per ADR-0046; the
+summarizer and finalizer prompt changes are outside that commitment.

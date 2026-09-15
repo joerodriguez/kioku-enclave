@@ -1394,6 +1394,14 @@ async fn finalize_user_episodes_scoped(
         }
     };
     let analysis_revision = episode_analysis_revision(&model_input);
+    let memory_language =
+        match super::memory_language::resolve_memory_language(state, user_id).await {
+            Ok(language) => language,
+            Err(error) => {
+                defer_finalization(state, &claim, &error.to_string(), false).await;
+                return Ok(());
+            }
+        };
     if reserve_finalizer_output(state, user_id).await.is_err() {
         defer_finalization(
             state,
@@ -1404,14 +1412,6 @@ async fn finalize_user_episodes_scoped(
         .await;
         return Ok(());
     }
-    let memory_language =
-        match super::memory_language::resolve_memory_language(state, user_id).await {
-            Ok(language) => language,
-            Err(error) => {
-                defer_finalization(state, &claim, &error.to_string(), false).await;
-                return Ok(());
-            }
-        };
     let system_prompt = finalizer_system_prompt(reusable.as_ref(), &memory_language);
     let response_schema = if reusable.is_some() {
         reused_timeline_brief_response_schema()

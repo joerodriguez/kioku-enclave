@@ -1,6 +1,7 @@
 //! Direct ADR-0049 memory-language companion, installed only by the explicit
 //! v35 migrator. Serving verifies immutable SQL and the owned catalog objects:
-//! the `capture_events.locale_id` column, its BCP-47 check, and the receipt.
+//! the `capture_events.locale_id` column, its BCP-47 check, the partial
+//! newest-stamp index, and the receipt.
 use super::{current_schema_relation_exists, PostgresPersistence};
 use crate::error::{EnclaveError, Result};
 use sha2::{Digest, Sha256};
@@ -9,6 +10,7 @@ use sqlx::{PgConnection, Row};
 const INSTALL_SQL: &str = include_str!("../../../migrations/0035_memory_language.sql");
 const RECEIPT_TABLE: &str = "authoring_language_schema";
 const COLUMN_CONSTRAINT: &str = "capture_events_locale_id_bcp47";
+const LOCALE_INDEX: &str = "capture_events_locale_idx";
 
 fn contract_digest() -> String {
     format!("{:x}", Sha256::digest(INSTALL_SQL.as_bytes()))
@@ -24,6 +26,9 @@ async fn catalog_digest(connection: &mut PgConnection) -> Result<String> {
         .fetch_optional(&mut *connection).await?;
     let constraint: Option<String> = sqlx::query_scalar("SELECT jsonb_build_array(pg_get_constraintdef(oid),convalidated)::text FROM pg_constraint WHERE conrelid='capture_events'::regclass AND conname=$1")
         .bind(COLUMN_CONSTRAINT)
+        .fetch_optional(&mut *connection).await?;
+    let index: Option<String> = sqlx::query_scalar("SELECT jsonb_build_array(pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready,i.indislive)::text FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1 AND i.indrelid='capture_events'::regclass")
+        .bind(LOCALE_INDEX)
         .fetch_optional(&mut *connection).await?;
     let receipt: Option<String> = sqlx::query_scalar(
         "SELECT jsonb_build_object('kind',c.relkind,'persistence',c.relpersistence, \
@@ -43,10 +48,10 @@ async fn catalog_digest(connection: &mut PgConnection) -> Result<String> {
     .bind(RECEIPT_TABLE)
     .fetch_optional(connection)
     .await?;
-    match (column, constraint, receipt) {
-        (Some(column), Some(constraint), Some(receipt)) => Ok(format!(
+    match (column, constraint, index, receipt) {
+        (Some(column), Some(constraint), Some(index), Some(receipt)) => Ok(format!(
             "{:x}",
-            Sha256::digest(format!("{column}\0{constraint}\0{receipt}"))
+            Sha256::digest(format!("{column}\0{constraint}\0{index}\0{receipt}"))
         )),
         _ => Err(EnclaveError::Config(
             "memory language schema is incomplete".into(),
@@ -156,7 +161,15 @@ mod tests {
             legacy.get::<Option<String>, _>("locale_id").is_none(),
             "a pre-companion capture event carries no language"
         );
-        for rejected in ["", "e", "en_US", "english language", "en-", "-en"] {
+        for rejected in [
+            "",
+            "e",
+            "en_US",
+            "english language",
+            "en-",
+            "-en",
+            "en-abcdefgh-abcdefgh-abcdefgh-abcdefgh",
+        ] {
             assert!(
                 sqlx::query(
                     "UPDATE capture_events SET locale_id=$1 WHERE account_id='language-schema'"
@@ -179,8 +192,9 @@ mod tests {
         }
         for (change, restore) in [
             ("ALTER TABLE capture_events ALTER COLUMN locale_id SET DEFAULT 'en'", "ALTER TABLE capture_events ALTER COLUMN locale_id DROP DEFAULT"),
-            ("ALTER TABLE capture_events DROP CONSTRAINT capture_events_locale_id_bcp47", "ALTER TABLE capture_events ADD CONSTRAINT capture_events_locale_id_bcp47 CHECK (locale_id IS NULL OR locale_id ~ '^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$')"),
+            ("ALTER TABLE capture_events DROP CONSTRAINT capture_events_locale_id_bcp47", "ALTER TABLE capture_events ADD CONSTRAINT capture_events_locale_id_bcp47 CHECK (locale_id IS NULL OR (octet_length(locale_id)<=35 AND locale_id ~ '^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$'))"),
             ("ALTER TABLE authoring_language_schema ADD COLUMN unexpected text", "ALTER TABLE authoring_language_schema DROP COLUMN unexpected"),
+            ("DROP INDEX capture_events_locale_idx", "CREATE INDEX capture_events_locale_idx ON capture_events (account_id, started_at DESC, event_id DESC) WHERE locale_id IS NOT NULL"),
         ] {
             sqlx::raw_sql(change).execute(repo.pool()).await.unwrap();
             assert!(repo.verify_memory_language_schema().await.is_err(),
@@ -202,7 +216,7 @@ mod tests {
             repo.verify_memory_language_schema().await.is_err(),
             "memory language readiness must require its exact singleton receipt"
         );
-        sqlx::raw_sql("ALTER TABLE capture_events DROP CONSTRAINT capture_events_locale_id_bcp47; ALTER TABLE capture_events DROP COLUMN locale_id; DROP TABLE authoring_language_schema;")
+        sqlx::raw_sql("DROP INDEX capture_events_locale_idx; ALTER TABLE capture_events DROP CONSTRAINT capture_events_locale_id_bcp47; ALTER TABLE capture_events DROP COLUMN locale_id; DROP TABLE authoring_language_schema;")
             .execute(repo.pool()).await.unwrap();
         assert!(
             repo.verify_memory_language_schema().await.is_err(),

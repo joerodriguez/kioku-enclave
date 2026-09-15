@@ -19,9 +19,10 @@ pub(crate) const DEFAULT_MEMORY_LANGUAGE: &str = "en";
 /// RFC 5646 recommends that implementations accept tags of at least 35 bytes.
 pub(crate) const MAX_LOCALE_ID_BYTES: usize = 35;
 
-/// BCP-47 syntax accepted from a companion manifest: a 2–8 letter primary
-/// language subtag followed by optional 1–8 character alphanumeric subtags.
-/// Mirrors the `capture_events_locale_id_bcp47` check in migration 0035.
+/// BCP-47 syntax accepted from a companion manifest: at most 35 bytes, a 2–8
+/// letter primary language subtag followed by optional 1–8 character
+/// alphanumeric subtags. Mirrors the `capture_events_locale_id_bcp47` check
+/// in migration 0035 exactly.
 pub(crate) fn is_bcp47_language_tag(tag: &str) -> bool {
     if tag.is_empty() || tag.len() > MAX_LOCALE_ID_BYTES {
         return false;
@@ -66,6 +67,8 @@ pub(crate) fn output_language_rule(language: &str) -> String {
 Write every field you author — title, summary, gists, headings, section items, action items, and descriptions — in that language, \
 regardless of the language spoken or shown in the evidence. Report languages as the BCP-47 codes actually heard, never the output language. \
 Keep personal names, organization and product names, URLs, and captured on-screen text in their original form. \
+Use the supplied speaker labels (\"Me\", \"Speaker A\", established names) exactly as given, as untranslated tokens. \
+Every entity named by a GROUNDING REQUIREMENT or listed under grounding_requirements must appear exactly as supplied, untranslated; a gloss may follow it. \
 Render instructions and requirements directed at the owner in the output language; when the exact original wording of a phrase matters, \
 quote it in the original language and add a gloss. Never translate or rewrite the transcript itself."
     )
@@ -108,6 +111,7 @@ mod tests {
             "en-abcdefghi",
             "en\0",
             "en-US-x-private-use-subtags-longer-than-limit",
+            "en-abcdefgh-abcdefgh-abcdefgh-abcdefgh",
         ] {
             assert!(!is_bcp47_language_tag(tag), "{tag:?}");
         }
@@ -130,6 +134,8 @@ mod tests {
             "personal names",
             "URLs",
             "on-screen text",
+            "speaker labels (\"Me\", \"Speaker A\"",
+            "grounding_requirements must appear exactly as supplied",
             "quote it in the original language",
             "Never translate or rewrite the transcript",
         ] {
