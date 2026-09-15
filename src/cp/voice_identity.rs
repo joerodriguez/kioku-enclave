@@ -1,6 +1,8 @@
 //! Pure Phase 1 acoustic-domain, binary-codec and conservative continuity rules.
 use super::{
-    voice_memory::{MATCH_THRESHOLD, MAX_TURN_SAMPLES, MIN_DECISION_MARGIN, NEW_PROFILE_THRESHOLD},
+    voice_memory::{
+        MATCH_THRESHOLD, MAX_TURN_SCAN_SAMPLES, MIN_DECISION_MARGIN, NEW_PROFILE_THRESHOLD,
+    },
     voice_quality::{self, SampleDecision, OUTLIER_SIMILARITY},
 };
 use crate::error::{EnclaveError, Result};
@@ -67,7 +69,8 @@ pub(crate) fn channel_domain(
 }
 
 /// Reject reversed/negative/outside boundaries instead of indexing past decoded
-/// media. Valid long turns are capped at the model's 30-second policy bound.
+/// media. Valid long turns are capped at the audio window bound; the embedded
+/// chunk is chosen from that span afterwards.
 pub(crate) fn guarded_samples(samples: &[f32], start_ms: i64, end_ms: i64) -> Result<&[f32]> {
     if start_ms < 0 || end_ms <= start_ms {
         return Err(EnclaveError::Embedding(
@@ -80,7 +83,7 @@ pub(crate) fn guarded_samples(samples: &[f32], start_ms: i64, end_ms: i64) -> Re
     let end = usize::try_from(end_ms).ok().and_then(|v| v.checked_mul(16));
     match (start, end) {
         (Some(start), Some(end)) if start < samples.len() && end <= samples.len() => {
-            Ok(&samples[start..end.min(start.saturating_add(MAX_TURN_SAMPLES))])
+            Ok(&samples[start..end.min(start.saturating_add(MAX_TURN_SCAN_SAMPLES))])
         }
         _ => Err(EnclaveError::Embedding(
             "voice source slice exceeds decoded media".into(),

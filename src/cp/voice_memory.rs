@@ -32,7 +32,12 @@ use super::voice_quality::{self, SampleDecision};
 pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
 pub const MODEL_SHA256: &str = "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012";
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
+/// The model's per-sample bound: the embedded chunk is at most thirty seconds.
 pub(crate) const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
+/// How much of a longer turn is reconstructed to choose that chunk: the whole
+/// turn up to the audio window bound, which is the longest turn Gemini can emit.
+pub(crate) const MAX_TURN_SCAN_SAMPLES: usize =
+    TARGET_SAMPLE_RATE as usize * (super::media_planner::MAX_AUDIO_WINDOW_MS / 1_000) as usize;
 pub(crate) const MATCH_THRESHOLD: f32 = 0.60;
 pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.45;
 pub(crate) const MIN_DECISION_MARGIN: f32 = 0.08;
@@ -100,8 +105,10 @@ impl VoiceEngine {
             let end = ((turn.end_ms.max(0) as u64 * TARGET_SAMPLE_RATE as u64) / 1000) as usize;
             let end = end
                 .min(samples.len())
-                .min(start.saturating_add(MAX_TURN_SAMPLES));
-            let chunk = samples.get(start..end).unwrap_or(&[]);
+                .min(start.saturating_add(MAX_TURN_SCAN_SAMPLES));
+            let whole = samples.get(start..end).unwrap_or(&[]);
+            let (offset, length) = voice_quality::best_span(whole, MAX_TURN_SAMPLES);
+            let chunk = &whole[offset..offset + length];
             let diagnostics = voice_quality::diagnose(chunk, turn.overlap, &turn.quality_flags);
             let embedding = if diagnostics.decision == SampleDecision::NoEmbedding {
                 None
