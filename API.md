@@ -1499,16 +1499,23 @@ rows or owned media generations remain.
   profile. Other samples remain unassigned. One-to-three-second samples can match but
   never create or update a representative; overlap and failed quality gates quarantine.
   A turn longer than the thirty-second model bound is reconstructed whole (up to the
-  audio window bound) and the thirty seconds holding the most speech frames are
-  embedded, so a paragraph-long turn that opens with a pause is no longer judged by its
-  opening; the diagnostics record the chosen offset and the turn length. Quality policy 1
-  uses speech-frame detector 2: a 20 ms frame counts as speech when its RMS reaches
-  15% of the chunk's loud (95th percentile) frames, never below -50 dBFS and never
-  above the former absolute -40 dBFS rule, which a chunk without dynamic range (steady
-  noise or a tone) keeps; the mean-level floor is -54 dBFS. Detector 1 quarantined a
-  phone on a table in a quiet room as silence. Every stored sample stays comparable:
-  the detector only decides admission, and per-utterance mean normalization makes the
-  embedding gain-invariant.
+  audio window bound) and the thirty-second window that the level gate admits with the
+  highest speech ratio is embedded, each candidate window judged by its own frame
+  levels and clipping (candidates start every second, earliest wins ties, and when no
+  window passes the highest speech ratio still wins), so a paragraph-long turn that
+  opens with a pause is no longer judged by its opening and a loud, clipped or noisy
+  passage cannot win on loudness alone; the diagnostics record the chosen offset and
+  the turn length. Quality policy 1 uses speech-frame detector 2: a 20 ms frame counts
+  as speech when its RMS reaches 15% of the chunk's loud (95th percentile) frames,
+  never below -50 dBFS and never above the former absolute -40 dBFS rule, which a chunk
+  without dynamic range keeps (loud frames less than 12 dB above the quiet 20th
+  percentile of non-silent frames: steady or slowly wandering noise, a hum, a tone);
+  the mean-level floor is -54 dBFS. Detector 1 quarantined a phone on a table in a
+  quiet room as silence. Every stored sample stays comparable: the detector only
+  decides admission, and per-utterance mean normalization makes the embedding
+  gain-invariant. Samples already quarantined under detector 1 are not re-diagnosed;
+  only new turns benefit. The evaluation evidence pins `quality_version` but not yet
+  the detector or span policy (tracked in `TASKS.md`).
   Profiles use a medoid and normalized trimmed centroid, with 0.50 outlier rejection.
   Ordinary route hints never create an owner profile; owner enrollment requires the
   explicit marked-session evidence described above. Mixed owner/non-owner clusters retain
