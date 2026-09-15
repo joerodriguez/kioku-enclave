@@ -197,7 +197,7 @@ fn validate_provider_attempt(
         media_provider_attempt_identity(account_id, work_unit_id, attempt.number, &request_sha256);
     if identity_sha256 != expected_identity
         || attempt.event_id != vertex_attempt_event_id(&identity_sha256)
-        || !matches!(attempt.result_contract_version, 1 | 2 | 3)
+        || !matches!(attempt.result_contract_version, 1..=3)
     {
         return Err(EnclaveError::Store(
             "media provider journal identity commitment is invalid".into(),
