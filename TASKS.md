@@ -1,3 +1,16 @@
+# Voice sample yield (2026-09-15)
+
+- [x] Embed a long turn's gate-admitted, speech-densest thirty seconds instead of its first
+      thirty; judge frame levels relative to the chunk with a -50 dBFS floor and a 12 dB
+      dynamic-range guard (detector 2 inside quality policy 1).
+- [ ] Add `detector_version` and the span policy to the voice evaluation run-evidence pins
+      (`voice_eval_evidence.rs`, `eval/voice/run-evidence-schema-v3.json`) before any
+      real-corpus evidence is produced; today the evidence cannot distinguish detector 1 /
+      first-thirty-seconds from detector 2 / best-span at the same `quality_version`.
+- [ ] Decide whether samples quarantined under detector 1 are re-diagnosed (a bounded
+      providerless maintenance pass over `accepted=false` samples with retained media) or
+      left as history; today only new turns benefit.
+
 # ADR-0048 one identity source (2026-09-13)
 
 - [x] Implement immutable per-field maps, current label projection, transaction-coalesced
