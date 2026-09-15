@@ -1500,7 +1500,13 @@ rows or owned media generations remain.
   far-field turns and minted one profile per paragraph; a create is undone only by a later
   merge or absorption, while an abstained sample is re-scored every sweep, and the margin
   is what separates two similar voices under one microphone, so creation and margin are the
-  values spent — the match threshold is not, per ADR-0006's real-capture calibration). One-to-three-second samples can match but
+  values spent — the match threshold is not, per ADR-0006's real-capture calibration).
+  Reconsideration re-judges every applied merge and absorption under the current
+  constants, so the first sweeps after a margin change reverse any untouched proposal
+  whose recorded margin fell between the old and new values (recorded as
+  `new_competitor`), re-fragmenting an ambiguous merge rather than keeping it; the
+  fragment-absorption tolerance (a sibling fragment must beat the stable voice by more
+  than the margin to hold) widens by the same amount. One-to-three-second samples can match but
   never create or update a representative; overlap and failed quality gates quarantine.
   A turn longer than the thirty-second model bound is reconstructed whole (up to the
   audio window bound) and the thirty-second window that the level gate admits with the

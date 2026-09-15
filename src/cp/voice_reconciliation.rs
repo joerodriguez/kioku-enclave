@@ -26,6 +26,11 @@ pub(crate) const ABSORPTION_REASON: &str = "tentative_absorbed";
 /// this is deliberately stricter than the creation threshold and must stay
 /// below `OUTLIER_SIMILARITY`, from whose complement the second mode is drawn.
 pub(crate) const MODE_SEPARATION_THRESHOLD: f32 = 0.45;
+const _: () = assert!(
+    MODE_SEPARATION_THRESHOLD > super::voice_memory::NEW_PROFILE_THRESHOLD
+        && MODE_SEPARATION_THRESHOLD < super::voice_quality::OUTLIER_SIMILARITY,
+    "mode separation must sit between the creation threshold and the outlier bound"
+);
 
 #[derive(Clone)]
 pub(crate) struct Profile {
@@ -579,10 +584,6 @@ mod tests {
         // voices even though 0.40 is above the creation threshold.
         let mut near = (1..=3).map(|id| (id, vector(1., 0.))).collect::<Vec<_>>();
         near.extend((4..=6).map(|id| (id, vector(0.4, 0.9165))));
-        assert!(
-            MODE_SEPARATION_THRESHOLD > super::super::voice_memory::NEW_PROFILE_THRESHOLD
-                && MODE_SEPARATION_THRESHOLD < super::super::voice_quality::OUTLIER_SIMILARITY
-        );
         assert!(
             has_distinct_modes(&near).unwrap(),
             "two-voice contamination above the creation threshold still quarantines"
