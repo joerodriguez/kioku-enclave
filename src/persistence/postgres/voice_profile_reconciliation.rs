@@ -64,7 +64,8 @@ async fn load_support(
                        AND media.deleted_at IS NULL AND media.processing_state IN ('queued','processing','retry_wait')) \
                AND NOT EXISTS(SELECT 1 FROM voice_embedding_jobs job JOIN speaker_observations pending ON pending.account_id=job.account_id AND pending.id=job.speaker_observation_id \
                      JOIN capture_events later ON later.account_id=pending.account_id AND later.event_id=pending.event_id \
-                     WHERE later.account_id=session.account_id AND later.capture_session_id=session.id AND job.state IN ('pending','processing','retry_wait'))) AS settled, \
+                     WHERE later.account_id=session.account_id AND later.capture_session_id=session.id AND job.state IN ('pending','processing','retry_wait') \
+                       AND job.embedding_space=p.embedding_space AND job.quality_version=$3 AND job.scorer_version=p.scorer_version AND job.processor_version=1)) AS settled, \
       (s.accepted AND NOT o.overlap AND s.eligibility IN ('enroll','match_only') AND s.quality_version=$3 \
        AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain \
        AND s.voice_profile_id=p.id AND o.voice_profile_id=p.id AND o.voice_sample_id=s.id \
@@ -844,17 +845,8 @@ pub(super) async fn reconcile(
             outcomes.push("profile_absorb_population_held");
             break;
         }
-        // Every examined fragment goes to the back of the window, absorbed or
-        // held, so an old absorbable fragment is never shadowed by newer holds.
-        let examined = candidates
-            .iter()
-            .filter(|c| !c.policy.stable && c.policy.person_status.as_deref() != Some("owner"))
-            .map(|c| c.policy.id)
-            .collect::<Vec<_>>();
-        sqlx::query("UPDATE voice_profiles SET updated_at=clock_timestamp() WHERE account_id=$1 AND id=ANY($2::bigint[])")
-            .bind(account).bind(&examined).execute(&mut **tx).await?;
         let held = held_name_profiles(tx, account).await?;
-        let Some(pair) = policy::absorption_pairs(&profiles)
+        let scheduled = policy::absorption_pairs(&profiles)
             .into_iter()
             .find(|pair| {
                 !held.contains(&pair.left)
@@ -865,26 +857,44 @@ pub(super) async fn reconcile(
                         .map(|c| c.members.len())
                         .sum::<usize>()
                         <= policy::MAX_SAMPLES
-            })
-        else {
-            break;
-        };
-        let left = candidates
-            .iter()
-            .find(|c| c.policy.id == pair.left)
-            .expect("policy candidate");
-        let right = candidates
-            .iter()
-            .find(|c| c.policy.id == pair.right)
-            .expect("policy candidate");
-        if apply(tx, account, left, right, ProposalPolicy::Absorb)
-            .await?
-            .is_some()
-        {
-            outcomes.push("profile_absorbed");
+            });
+        let applied = if let Some(pair) = &scheduled {
+            let left = candidates
+                .iter()
+                .find(|c| c.policy.id == pair.left)
+                .expect("policy candidate");
+            let right = candidates
+                .iter()
+                .find(|c| c.policy.id == pair.right)
+                .expect("policy candidate");
+            apply(tx, account, left, right, ProposalPolicy::Absorb)
+                .await?
+                .is_some()
         } else {
-            outcomes.push("profile_absorb_state_held");
-            break;
+            false
+        };
+        // Only after the exact recheck inside `apply` re-read the same window:
+        // every examined fragment goes to the back, absorbed or held, so an
+        // old absorbable fragment is never shadowed by newer holds. Fragments
+        // still awaiting current-policy adoption keep adoption's own cursor.
+        let examined = candidates
+            .iter()
+            .filter(|c| {
+                !c.policy.stable
+                    && c.policy.person_status.as_deref() != Some("owner")
+                    && c.derivation == voice_identity::IDENTITY_DERIVATION_VERSION
+            })
+            .map(|c| c.policy.id)
+            .collect::<Vec<_>>();
+        sqlx::query("UPDATE voice_profiles SET updated_at=clock_timestamp() WHERE account_id=$1 AND id=ANY($2::bigint[])")
+            .bind(account).bind(&examined).execute(&mut **tx).await?;
+        match (scheduled, applied) {
+            (None, _) => break,
+            (Some(_), true) => outcomes.push("profile_absorbed"),
+            (Some(_), false) => {
+                outcomes.push("profile_absorb_state_held");
+                break;
+            }
         }
     }
     Ok(outcomes)
@@ -1550,6 +1560,57 @@ mod tests {
         .unwrap();
         assert_eq!((status.as_str(), slot), ("tentative", 3));
         let _ = result;
+        close(f).await;
+    }
+
+    #[tokio::test]
+    async fn the_fragment_window_rotates_and_absorbs_beyond_sixteen_live_fragments() {
+        let Some(f) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &f.persistence;
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for n in 1..=3 {
+            sample(repo, 1, 100 + n, n, &vector(1., 0.)).await;
+        }
+        // Forty short appearances of the same voice: more than two windows'
+        // worth, so the scheduled pair must survive apply's own recheck and
+        // the window must rotate past held-or-absorbed fragments.
+        let fragments = (0..40_i64).collect::<Vec<_>>();
+        for n in &fragments {
+            sample(repo, 10 + n, 1000 + n, 100 + n, &vector(0.98, 0.199)).await;
+        }
+        finish_recording(repo).await;
+        let mut applied = 0_i64;
+        for _pass in 0..12 {
+            repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+            applied = sqlx::query_scalar(
+                "SELECT count(*) FROM voice_profile_proposals WHERE account_id=$1 AND state='applied' AND reason=$2",
+            )
+            .bind(ACCOUNT)
+            .bind(policy::ABSORPTION_REASON)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+            if applied == fragments.len() as i64 {
+                break;
+            }
+        }
+        assert_eq!(
+            applied,
+            fragments.len() as i64,
+            "every fragment is absorbed within the proposal budget over successive sweeps"
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM voice_profiles WHERE account_id=$1 AND status='tentative'",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
         close(f).await;
     }
 
