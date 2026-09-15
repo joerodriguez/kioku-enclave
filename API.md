@@ -1498,6 +1498,17 @@ rows or owned media generations remain.
   0.08 permits attachment; below 0.45 an enrollment-eligible sample may create an anonymous
   profile. Other samples remain unassigned. One-to-three-second samples can match but
   never create or update a representative; overlap and failed quality gates quarantine.
+  A turn longer than the thirty-second model bound is reconstructed whole (up to the
+  audio window bound) and the thirty seconds holding the most speech frames are
+  embedded, so a paragraph-long turn that opens with a pause is no longer judged by its
+  opening; the diagnostics record the chosen offset and the turn length. Quality policy 1
+  uses speech-frame detector 2: a 20 ms frame counts as speech when its RMS reaches
+  15% of the chunk's loud (95th percentile) frames, never below -50 dBFS and never
+  above the former absolute -40 dBFS rule, which a chunk without dynamic range (steady
+  noise or a tone) keeps; the mean-level floor is -54 dBFS. Detector 1 quarantined a
+  phone on a table in a quiet room as silence. Every stored sample stays comparable:
+  the detector only decides admission, and per-utterance mean normalization makes the
+  embedding gain-invariant.
   Profiles use a medoid and normalized trimmed centroid, with 0.50 outlier rejection.
   Ordinary route hints never create an owner profile; owner enrollment requires the
   explicit marked-session evidence described above. Mixed owner/non-owner clusters retain

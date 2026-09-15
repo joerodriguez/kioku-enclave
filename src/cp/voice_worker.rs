@@ -2,7 +2,7 @@
 use super::{
     media_worker::load_retained_media,
     voice_identity::{channel_domain, guarded_samples},
-    voice_memory::{decode_mono_16khz, VoiceEngine, MAX_TURN_SAMPLES},
+    voice_memory::{decode_mono_16khz, VoiceEngine, MAX_TURN_SAMPLES, MAX_TURN_SCAN_SAMPLES},
     voice_quality::{self, SampleDecision},
     CpState,
 };
@@ -121,12 +121,18 @@ pub(crate) async fn infer_claim(
                 guarded_samples(samples, source.event_start_ms, source.event_end_ms)?,
             ));
         }
-        let chunk = reconstruct_timeline(&chunks)?;
-        let diagnostics = voice_quality::diagnose(&chunk, overlap, &[]);
+        let turn = reconstruct_timeline(&chunks)?;
+        // Gemini often emits one turn per paragraph. Embed the thirty seconds
+        // holding the most speech rather than whichever thirty opened the turn.
+        let (offset, length) = voice_quality::best_span(&turn, MAX_TURN_SAMPLES);
+        let chunk = &turn[offset..offset + length];
+        let mut diagnostics = voice_quality::diagnose(chunk, overlap, &[]);
+        diagnostics.span_offset_ms = (offset / 16) as i64;
+        diagnostics.turn_duration_ms = (turn.len() / 16) as i64;
         let outcome = if diagnostics.decision == SampleDecision::NoEmbedding {
             VoiceEmbeddingOutcome::NoEmbedding { diagnostics }
         } else {
-            let embedding = engine.embed(&chunk)?;
+            let embedding = engine.embed(chunk)?;
             VoiceEmbeddingOutcome::Sample {
                 embedding,
                 diagnostics,
@@ -143,7 +149,9 @@ pub(crate) async fn infer_claim(
 
 /// Projected event spans can overlap or have gaps. Use their original window
 /// coordinates, as Gemini window assembly does: never concatenate duplicate
-/// acoustic time into artificial enrollment evidence.
+/// acoustic time into artificial enrollment evidence. The whole turn is
+/// reconstructed up to the audio window bound so the embedded chunk can be
+/// chosen from it.
 fn reconstruct_timeline(chunks: &[(i64, &[f32])]) -> Result<Vec<f32>> {
     let Some(start) = chunks.iter().map(|(start, _)| *start).min() else {
         return Ok(Vec::new());
@@ -163,7 +171,7 @@ fn reconstruct_timeline(chunks: &[(i64, &[f32])]) -> Result<Vec<f32>> {
         let end = offset
             .checked_add(samples.len())
             .ok_or_else(|| EnclaveError::Embedding("voice timeline span is invalid".into()))?;
-        length = length.max(end.min(MAX_TURN_SAMPLES));
+        length = length.max(end.min(MAX_TURN_SCAN_SAMPLES));
         spans.push((offset, *samples));
     }
     let mut sums = vec![0.0_f64; length];
@@ -374,11 +382,23 @@ mod tests {
             SampleDecision::Quarantine,
             "a sparse timeline must not be treated as clean continuous speech"
         );
+        let long = reconstruct_timeline(&[(0, &source), (31000, &source)]).unwrap();
         assert_eq!(
-            reconstruct_timeline(&[(0, &source), (31000, &source)])
+            long.len(),
+            32_000 * 16,
+            "the whole turn is reconstructed so the embedded chunk can be chosen from it"
+        );
+        assert_eq!(
+            voice_quality::best_span(&long, MAX_TURN_SAMPLES).1,
+            MAX_TURN_SAMPLES,
+            "the embedded chunk never exceeds the model bound"
+        );
+        assert_eq!(
+            reconstruct_timeline(&[(0, &source), (400_000, &source)])
                 .unwrap()
                 .len(),
-            MAX_TURN_SAMPLES
+            MAX_TURN_SCAN_SAMPLES,
+            "reconstruction stops at the audio window bound"
         );
     }
     #[test]
