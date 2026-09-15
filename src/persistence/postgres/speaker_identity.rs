@@ -578,17 +578,20 @@ pub(super) async fn prepare_account_speaker_projections(
     }
 }
 
-/// Read-only. Graph-backed memories never fall back to stale cached identities.
-/// Call on the same repeatable snapshot as the associated turns/header.
 /// A memory's participants are the voices the identity graph can vouch for: owner
 /// attribution, an accepted person, or a voice profile. Gemini restarts speaker labels
 /// on every audio window, so a request-local cluster that no profile has claimed is one
 /// window's view of some voice, not evidence of another participant; a recording whose
 /// samples were too short or quarantined would otherwise surface one phantom participant
 /// per window. Such turns keep their lettered transcript slot and stay filterable by it.
+/// Presence here is acoustic bookkeeping: a cluster gaining a profile adds a participant
+/// without advancing the memory's semantic identity revision, exactly as its key and
+/// slot could already change without one.
 pub(super) fn is_graph_backed_participant(attribution_kind: &str) -> bool {
     attribution_kind != "context_inferred"
 }
+/// Read-only. Graph-backed memories never fall back to stale cached identities.
+/// Call on the same repeatable snapshot as the associated turns/header.
 pub(super) async fn load_episode_participant_details(
     connection: &mut PgConnection,
     account_id: &str,

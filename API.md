@@ -1126,9 +1126,14 @@ labels on every audio window, so a request-local cluster that no profile has cla
 one window's view of some voice, not another participant; its turns keep their lettered
 slot in `members`, transcript search, and playback, and remain filterable by that label,
 but they do not appear in `participants` or `participant_details`. A memory whose
-voices were all too short or quarantined for voice continuity therefore reports no
-participants rather than one phantom participant per window. The morning email and
-webhook snapshots use the same participant list.
+voice samples were all too short or quarantined therefore reports no participants
+rather than one phantom participant per window. The morning email and webhook
+snapshots use the same participant list; authored brief prose, minute summaries, and
+the organizer's input still carry every lettered slot, and export still dumps the
+durable projection of every cluster. A participant appearing because its cluster
+gained a voice profile is acoustic bookkeeping and does not advance
+`identity_revision`, so a list page and a later member read can differ in
+`participants` at the same revision, as their keys and slots already could.
 
 ## People learned automatically
 
