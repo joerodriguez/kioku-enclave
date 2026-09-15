@@ -108,6 +108,58 @@ pub(crate) struct ReconciliationClaim {
     pub(crate) vertex_location: String,
 }
 
+pub(crate) const RECONCILIATION_PROVIDER_REQUEST_CONTRACT_VERSION: i64 = 1;
+/// Exact byte bound of a serialized frozen request. The rendered model input
+/// is separately bounded at one MiB and at most doubles under JSON string
+/// escaping; the namespace map is small beside it.
+pub(crate) const RECONCILIATION_PROVIDER_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The organizer's model-visible input for one durable provider attempt. The
+/// first try of an attempt freezes it; every later try of the same attempt
+/// identity replays these exact bytes, so a speaker-presentation change in
+/// between can never re-render a different body under an admitted attempt.
+/// Everything else the request depends on (prompt, schema, model, location,
+/// generation settings) is committed by the claim's producer contract.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReconciliationProviderRequest {
+    pub(crate) contract_version: i64,
+    /// Temporary authoring namespace whose labels the body shows. Outputs of
+    /// a successful attempt carry this map, never the labels current at
+    /// publication.
+    #[serde(default, skip_serializing_if = "AuthoredLabelMap::is_empty")]
+    pub(crate) authored_labels: AuthoredLabelMap,
+    pub(crate) user_message: String,
+}
+
+/// Canonical bytes of a frozen request, refused outside the exact contract.
+pub(crate) fn reconciliation_provider_request_bytes(
+    request: &ReconciliationProviderRequest,
+) -> Result<Vec<u8>> {
+    if request.contract_version != RECONCILIATION_PROVIDER_REQUEST_CONTRACT_VERSION
+        || request.user_message.is_empty()
+    {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "memory reconciliation provider request contract is invalid".into(),
+        ));
+    }
+    let bytes = serde_json::to_vec(request)?;
+    if bytes.len() > RECONCILIATION_PROVIDER_REQUEST_MAX_BYTES {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "memory reconciliation provider request exceeds its exact byte bound".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Request bound to the claim's attempt identity by `freeze_reconciliation_provider_request`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FrozenReconciliationProviderRequest {
+    pub(crate) request: ReconciliationProviderRequest,
+    /// `true` when an earlier try of this attempt froze the request, so the
+    /// caller's current rendering was discarded in favour of the stored bytes.
+    pub(crate) replayed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReconciliationStageWrite {
     pub(crate) normalized_partition: Value,
@@ -321,6 +373,21 @@ pub(crate) trait MemoryReconciliationRepository: Send + Sync {
         &self,
         claim: &ReconciliationClaim,
     ) -> Result<Option<Box<dyn ReconciliationEgressGuard>>>;
+
+    /// Bind the exact model-visible request to the claim's durable attempt
+    /// identity before the usage ledger admits that attempt. The first try of
+    /// an attempt stores `current`; every later try of the same attempt
+    /// identity receives the stored bytes instead of its own rendering, as
+    /// capture formation replays its persisted page request. A stored request
+    /// for a different (older) attempt identity is replaced. Without a
+    /// `current` rendering only a stored request for this attempt is
+    /// returned; `None` means nothing is frozen. Fails with `Conflict` when
+    /// the claim is no longer authoritative.
+    async fn freeze_reconciliation_provider_request(
+        &self,
+        claim: &ReconciliationClaim,
+        current: Option<&ReconciliationProviderRequest>,
+    ) -> Result<Option<FrozenReconciliationProviderRequest>>;
 
     async fn claim_reconciliation(
         &self,

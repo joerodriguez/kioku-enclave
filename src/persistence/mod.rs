@@ -92,19 +92,23 @@ pub(crate) use memory_formation::{
     CAPTURE_FORMATION_PROVIDER_MAX_OUTPUT_TOKENS, CAPTURE_FORMATION_PROVIDER_REQUEST_MAX_BYTES,
     CAPTURE_FORMATION_SCREENSHOT_PAGE_SIZE, CAPTURE_FORMATION_UTTERANCE_PAGE_SIZE,
 };
+#[cfg(test)]
+pub(crate) use memory_reconciliation::RECONCILIATION_PROVIDER_REQUEST_MAX_BYTES;
 pub(crate) use memory_reconciliation::{
     oversized_keep_policy_commitment, reconciliation_outputs_commitment,
-    reconciliation_provider_attempt_identity, MemoryHandleResolution, MemoryHandleState,
+    reconciliation_provider_attempt_identity, reconciliation_provider_request_bytes,
+    FrozenReconciliationProviderRequest, MemoryHandleResolution, MemoryHandleState,
     MemoryReconciliationRepository, OversizedKeepPromotionPolicy, OversizedKeepPromotionResult,
     ReconciledMemoryWrite, ReconciliationClaim, ReconciliationDraft, ReconciliationEgressGuard,
-    ReconciliationEvidenceAtom, ReconciliationPublish, ReconciliationPublishResult,
-    ReconciliationSnapshot, ReconciliationStageWrite, StagedReconciliation,
-    MAX_OVERSIZED_KEEP_SOURCES, OVERSIZED_KEEP_MODEL, OVERSIZED_KEEP_SOURCE_PAGE_SIZE,
+    ReconciliationEvidenceAtom, ReconciliationProviderRequest, ReconciliationPublish,
+    ReconciliationPublishResult, ReconciliationSnapshot, ReconciliationStageWrite,
+    StagedReconciliation, MAX_OVERSIZED_KEEP_SOURCES, OVERSIZED_KEEP_MODEL,
+    OVERSIZED_KEEP_SOURCE_PAGE_SIZE, RECONCILIATION_PROVIDER_REQUEST_CONTRACT_VERSION,
 };
 pub(crate) use model_usage::{
     vertex_attempt_event_id, vertex_invocation_fingerprint, ClaimedVertexCoverage,
-    ClaimedVertexUsageBatch, ModelUsageRepository, VertexInvocationAdmission,
-    VertexInvocationAttempt,
+    ClaimedVertexUsageBatch, ModelUsageRepository, VertexDurableAttemptProvenance,
+    VertexInvocationAdmission, VertexInvocationAttempt,
 };
 pub(crate) use notification::NotificationRepository;
 pub use notification::{PushInstallation, WebhookSubscription};

@@ -50,6 +50,9 @@ mod owner_enrollment_policy;
 mod owner_voice;
 mod playback;
 mod query;
+#[cfg(test)]
+mod reconciliation_provider_request_contract;
+mod reconciliation_provider_request_schema;
 mod reconciliation_source_audit;
 mod recording_retention;
 #[cfg(test)]
@@ -288,7 +291,8 @@ impl PostgresPersistence {
         self.install_voice_recurrence_schema().await?;
         self.install_identity_fusion_schema().await?;
         self.install_identity_presentation_schema().await?;
-        self.install_memory_language_schema().await
+        self.install_memory_language_schema().await?;
+        self.install_reconciliation_provider_request_schema().await
     }
 
     #[cfg(test)]
@@ -1000,6 +1004,10 @@ mod tests {
             .await
             .unwrap();
         persistence.install_memory_language_schema().await.unwrap();
+        persistence
+            .install_reconciliation_provider_request_schema()
+            .await
+            .unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -1016,7 +1024,7 @@ mod tests {
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
                       'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema', \
-                      'voice_identity_schema','voice_identity_controls','voice_enrollment_schema','voice_recurrence_schema','identity_fusion_schema','identity_presentation_schema','authoring_language_schema');
+                      'voice_identity_schema','voice_identity_controls','voice_enrollment_schema','voice_recurrence_schema','identity_fusion_schema','identity_presentation_schema','authoring_language_schema','reconciliation_provider_request_schema');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;
@@ -5656,6 +5664,19 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO reconciliation_provider_requests(\
+                 account_id,source_fingerprint,provider_attempt_identity,\
+                 provider_request,provider_request_sha256) \
+             VALUES($1,$2,$3,'frozen organizer input',$4)",
+        )
+        .bind(&account_id)
+        .bind(&staged_source_fingerprint)
+        .bind(vec![0x44_u8; 32])
+        .bind(vec![0x45_u8; 32])
+        .execute(&mut *reconciliation_fixture)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO memory_reconciliations(\
                  account_id,id,reconciliation_version,model,prompt_version,\
                  cohort_started_at,cohort_ended_at,source_fingerprint,topology_fingerprint,\
@@ -5739,6 +5760,17 @@ mod tests {
             .unwrap(),
             0,
             "staged reconciliation content must cascade with the account"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM reconciliation_provider_requests WHERE account_id=$1",
+            )
+            .bind(&account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "frozen organizer input must cascade with the account"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

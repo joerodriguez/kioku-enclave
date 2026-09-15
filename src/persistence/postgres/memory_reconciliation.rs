@@ -19,13 +19,15 @@ use crate::{
     error::{EnclaveError, Result},
     persistence::{
         oversized_keep_policy_commitment, reconciliation_outputs_commitment,
-        reconciliation_provider_attempt_identity, vertex_attempt_event_id,
-        ActiveReconciliationAuthority, MemoryHandleResolution, MemoryHandleState,
+        reconciliation_provider_attempt_identity, reconciliation_provider_request_bytes,
+        vertex_attempt_event_id, ActiveReconciliationAuthority,
+        FrozenReconciliationProviderRequest, MemoryHandleResolution, MemoryHandleState,
         MemoryReconciliationRepository, OversizedKeepPromotionPolicy, OversizedKeepPromotionResult,
         ReconciledMemoryWrite, ReconciliationClaim, ReconciliationDraft, ReconciliationEgressGuard,
-        ReconciliationEvidenceAtom, ReconciliationPublish, ReconciliationPublishResult,
-        ReconciliationSnapshot, ReconciliationStageWrite, StagedReconciliation,
-        MAX_OVERSIZED_KEEP_SOURCES, OVERSIZED_KEEP_MODEL, OVERSIZED_KEEP_SOURCE_PAGE_SIZE,
+        ReconciliationEvidenceAtom, ReconciliationProviderRequest, ReconciliationPublish,
+        ReconciliationPublishResult, ReconciliationSnapshot, ReconciliationStageWrite,
+        StagedReconciliation, MAX_OVERSIZED_KEEP_SOURCES, OVERSIZED_KEEP_MODEL,
+        OVERSIZED_KEEP_SOURCE_PAGE_SIZE,
     },
 };
 
@@ -3354,6 +3356,159 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         })))
     }
 
+    async fn freeze_reconciliation_provider_request(
+        &self,
+        claim: &ReconciliationClaim,
+        current: Option<&ReconciliationProviderRequest>,
+    ) -> Result<Option<FrozenReconciliationProviderRequest>> {
+        if !valid_digest(&claim.source_fingerprint)
+            || !valid_digest(&claim.topology_fingerprint)
+            || claim.predecessor_episode_ids.is_empty()
+            || claim.claim_token.trim().is_empty()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "memory reconciliation provider request claim is invalid".into(),
+            ));
+        }
+        let expected_attempt = reconciliation_provider_attempt_identity(
+            &claim.source_fingerprint,
+            claim.activation_generation,
+            &claim.producer_contract_sha256,
+            claim.model_attempt_count,
+        )?;
+        let current_commitment = current
+            .map(|current| -> Result<(String, Vec<u8>)> {
+                let json = String::from_utf8(reconciliation_provider_request_bytes(current)?)
+                    .map_err(|_| {
+                        EnclaveError::Store(
+                            "memory reconciliation provider request is not UTF-8".into(),
+                        )
+                    })?;
+                let sha256 = Sha256::digest(json.as_bytes()).to_vec();
+                Ok((json, sha256))
+            })
+            .transpose()?;
+        let mut transaction = self.pool().begin().await?;
+        // The claim row lock serializes this write with release, publication
+        // and re-claim. No advisory lock is taken: the usage ledger's
+        // account-lifecycle lock follows in a separate transaction, and the
+        // egress guard's reconciliation lock is acquired only after that.
+        let authoritative = sqlx::query_scalar::<_, i64>(
+            "SELECT model_attempt_count FROM memory_reconciliation_jobs \
+              WHERE account_id=$1 AND source_fingerprint=$2 AND topology_fingerprint=$3 \
+                AND predecessor_episode_ids=$4 AND state='processing' AND claim_token=$5 \
+                AND claim_until>clock_timestamp() FOR UPDATE",
+        )
+        .bind(&claim.account_id)
+        .bind(&claim.source_fingerprint)
+        .bind(&claim.topology_fingerprint)
+        .bind(&claim.predecessor_episode_ids)
+        .bind(&claim.claim_token)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if authoritative != Some(claim.model_attempt_count) {
+            return Err(EnclaveError::Conflict(
+                "memory reconciliation claim is no longer authoritative".into(),
+            ));
+        }
+        // First writer wins. A stored request for a different attempt identity
+        // belongs to an attempt this producer can no longer admit (advanced
+        // attempt, later activation generation or producer contract), so the
+        // current rendering replaces it; the ledger has no row under the new
+        // identity yet because the freeze precedes admission.
+        let mut frozen_now = false;
+        if let Some((current_json, current_sha256)) = &current_commitment {
+            frozen_now = sqlx::query(
+                "INSERT INTO reconciliation_provider_requests( \
+                     account_id,source_fingerprint,provider_attempt_identity, \
+                     provider_request,provider_request_sha256) \
+                 VALUES($1,$2,$3,$4,$5) \
+                 ON CONFLICT(account_id,source_fingerprint) DO UPDATE SET \
+                     provider_attempt_identity=excluded.provider_attempt_identity, \
+                     provider_request=excluded.provider_request, \
+                     provider_request_sha256=excluded.provider_request_sha256, \
+                     frozen_at=clock_timestamp() \
+                 WHERE reconciliation_provider_requests.provider_attempt_identity \
+                       <>excluded.provider_attempt_identity",
+            )
+            .bind(&claim.account_id)
+            .bind(&claim.source_fingerprint)
+            .bind(expected_attempt.as_slice())
+            .bind(current_json)
+            .bind(current_sha256)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1;
+        }
+        let Some(stored) = sqlx::query(
+            "SELECT provider_attempt_identity,provider_request,provider_request_sha256 \
+               FROM reconciliation_provider_requests \
+              WHERE account_id=$1 AND source_fingerprint=$2",
+        )
+        .bind(&claim.account_id)
+        .bind(&claim.source_fingerprint)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let stored_attempt: Vec<u8> = stored.try_get("provider_attempt_identity")?;
+        let stored_json: String = stored.try_get("provider_request")?;
+        let stored_sha256: Vec<u8> = stored.try_get("provider_request_sha256")?;
+        if Sha256::digest(stored_json.as_bytes()).as_slice() != stored_sha256.as_slice() {
+            return Err(EnclaveError::Store(
+                "memory reconciliation frozen provider request commitment changed".into(),
+            ));
+        }
+        if stored_attempt != expected_attempt {
+            // Only reachable without a current rendering: a stale row waits
+            // for the next rendering to replace it.
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let readable = serde_json::from_str::<ReconciliationProviderRequest>(&stored_json)
+            .ok()
+            .filter(|stored| reconciliation_provider_request_bytes(stored).is_ok());
+        let frozen = match (readable, current, current_commitment) {
+            (Some(stored), _, _) => FrozenReconciliationProviderRequest {
+                request: stored,
+                replayed: !frozen_now,
+            },
+            (None, Some(current), Some((current_json, current_sha256))) => {
+                // An intact row this build can no longer read (a superseded
+                // request contract) is replaced rather than refused: refusing
+                // on every try would wedge the lane exactly as a re-rendered
+                // body did. If the ledger already admitted the unreadable
+                // bytes, admission reports the reused identity and the
+                // reconciler settles against the stored attempt.
+                sqlx::query(
+                    "UPDATE reconciliation_provider_requests \
+                        SET provider_request=$3,provider_request_sha256=$4, \
+                            frozen_at=clock_timestamp() \
+                      WHERE account_id=$1 AND source_fingerprint=$2",
+                )
+                .bind(&claim.account_id)
+                .bind(&claim.source_fingerprint)
+                .bind(&current_json)
+                .bind(&current_sha256)
+                .execute(&mut *transaction)
+                .await?;
+                FrozenReconciliationProviderRequest {
+                    request: current.clone(),
+                    replayed: false,
+                }
+            }
+            (None, _, _) => {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+        };
+        transaction.commit().await?;
+        Ok(Some(frozen))
+    }
+
     async fn claim_reconciliation(
         &self,
         snapshot: &ReconciliationSnapshot,
@@ -3544,6 +3699,7 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "memory reconciliation release is invalid".into(),
             ));
         }
+        let mut transaction = self.pool().begin().await?;
         let changed = sqlx::query(
             "UPDATE memory_reconciliation_jobs SET state=$4,claim_token=NULL,claim_until=NULL, \
                     next_attempt_at=CASE WHEN $5::bigint IS NULL THEN NULL \
@@ -3559,7 +3715,7 @@ impl MemoryReconciliationRepository for PostgresPersistence {
         .bind(retry_delay_seconds)
         .bind(error_code)
         .bind(consume_model_attempt)
-        .execute(self.pool())
+        .execute(&mut *transaction)
         .await?
         .rows_affected();
         if changed != 1 {
@@ -3567,6 +3723,20 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "memory reconciliation claim is no longer authoritative".into(),
             ));
         }
+        // A retry of the same attempt replays the frozen request. An advanced
+        // attempt renders and freezes afresh under its new identity; a
+        // terminal job keeps no plaintext working state.
+        if consume_model_attempt || terminal {
+            sqlx::query(
+                "DELETE FROM reconciliation_provider_requests \
+                  WHERE account_id=$1 AND source_fingerprint=$2",
+            )
+            .bind(&claim.account_id)
+            .bind(&claim.source_fingerprint)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -4093,6 +4263,16 @@ impl MemoryReconciliationRepository for PostgresPersistence {
                 "memory reconciliation claim expired before publication".into(),
             ));
         }
+        // Completed history is content-free: the frozen model input leaves
+        // with the consumed stage.
+        sqlx::query(
+            "DELETE FROM reconciliation_provider_requests \
+              WHERE account_id=$1 AND source_fingerprint=$2",
+        )
+        .bind(&command.claim.account_id)
+        .bind(&command.claim.source_fingerprint)
+        .execute(&mut *transaction)
+        .await?;
         let provenance_committed = sqlx::query(
             "UPDATE persistence_feature_reconciliation_stage_contracts \
                 SET reconciliation_id=$3,committed_at=clock_timestamp() \

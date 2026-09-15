@@ -596,6 +596,11 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         && state.postgres.verify_memory_language_schema().await.is_ok()
         && state
             .postgres
+            .verify_reconciliation_provider_request_schema()
+            .await
+            .is_ok()
+        && state
+            .postgres
             .verify_voice_recurrence_schema()
             .await
             .is_ok()
@@ -1308,6 +1313,14 @@ async fn async_main() {
             panic!("PostgreSQL memory language schema is not release-ready: {error}")
         });
     postgres
+        .verify_reconciliation_provider_request_schema()
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "PostgreSQL reconciliation provider request schema is not release-ready: {error}"
+            )
+        });
+    postgres
         .verify_voice_recurrence_schema()
         .await
         .unwrap_or_else(|error| {
@@ -1643,6 +1656,7 @@ enum PostgresMigrationReleasePhase {
     InstallIdentityFusion,
     InstallIdentityPresentation,
     InstallMemoryLanguage,
+    InstallReconciliationProviderRequest,
     SetVoiceIdentityCohort,
     PauseVoiceIdentity,
     ResumeVoiceIdentity,
@@ -1681,6 +1695,9 @@ fn postgres_migration_release_phase(
     confirmation: Option<&str>,
 ) -> Result<PostgresMigrationReleasePhase, &'static str> {
     match confirmation {
+        Some("reconciliation-provider-request-v36-install") => {
+            Ok(PostgresMigrationReleasePhase::InstallReconciliationProviderRequest)
+        }
         Some("memory-language-v35-install") => {
             Ok(PostgresMigrationReleasePhase::InstallMemoryLanguage)
         }
@@ -1980,6 +1997,9 @@ async fn migrate_postgres_release_schema() {
         PostgresMigrationReleasePhase::InstallMemoryLanguage => persistence
             .install_memory_language_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"memory_language", "version":35})),
+        PostgresMigrationReleasePhase::InstallReconciliationProviderRequest => persistence
+            .install_reconciliation_provider_request_schema().await
+            .map(|()| serde_json::json!({"status":"installed", "feature":"reconciliation_provider_request", "version":36})),
         PostgresMigrationReleasePhase::InstallIdentityFusion => persistence
             .install_identity_fusion_schema().await
             .map(|()| serde_json::json!({"status":"installed", "feature":"identity_fusion", "version":33})),
@@ -2092,6 +2112,10 @@ mod postgres_migration_release_tests {
             PostgresMigrationReleasePhase::FinalizeMemoryReconciliation
         );
         for (confirmation, expected) in [
+            (
+                "reconciliation-provider-request-v36-install",
+                PostgresMigrationReleasePhase::InstallReconciliationProviderRequest,
+            ),
             (
                 "memory-language-v35-install",
                 PostgresMigrationReleasePhase::InstallMemoryLanguage,

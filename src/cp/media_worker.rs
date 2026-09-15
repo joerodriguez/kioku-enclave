@@ -443,6 +443,13 @@ fn mapped_provider_disposition(
         vertex::VertexGenerationFailureDisposition::ConfirmedInvalid => {
             MediaFailureDisposition::ConfirmedInvalid
         }
+        // Only durable text admission reports a reused identity; a media
+        // request body is a function of its attempt. Should it ever surface
+        // here, the identity cannot be resent and the earlier body may have
+        // crossed egress, which is exactly the ambiguous-terminal class.
+        vertex::VertexGenerationFailureDisposition::AttemptIdentityReused => {
+            MediaFailureDisposition::AmbiguousTerminal
+        }
     }
 }
 

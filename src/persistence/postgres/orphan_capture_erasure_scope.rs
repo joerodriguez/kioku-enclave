@@ -177,6 +177,7 @@ pub(super) async fn require_quiescent(connection: &mut PgConnection, account: &s
           OR EXISTS(SELECT 1 FROM memory_reconciliation_jobs WHERE account_id=$1 AND (state='processing' \
              OR claim_token IS NOT NULL OR claim_until IS NOT NULL OR state NOT IN ('complete','failed_terminal'))) \
           OR EXISTS(SELECT 1 FROM memory_reconciliation_stages WHERE account_id=$1) \
+          OR EXISTS(SELECT 1 FROM reconciliation_provider_requests WHERE account_id=$1) \
           OR EXISTS(SELECT 1 FROM episodes WHERE account_id=$1 AND (finalization_status='processing' \
              OR finalization_claim_token IS NOT NULL OR finalization_claim_until IS NOT NULL)) \
           OR EXISTS(SELECT 1 FROM outbox_events WHERE account_id=$1 AND (state='publishing' \

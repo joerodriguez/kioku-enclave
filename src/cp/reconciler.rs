@@ -20,8 +20,9 @@ use crate::persistence::{
     reconciliation_provider_attempt_identity, vertex_invocation_fingerprint,
     OversizedKeepPromotionPolicy, OversizedKeepPromotionResult, ReconciledMemoryWrite,
     ReconciliationClaim, ReconciliationDraft, ReconciliationEgressGuard,
-    ReconciliationEvidenceAtom, ReconciliationPublish, ReconciliationPublishResult,
-    ReconciliationSnapshot, ReconciliationStageWrite, StagedReconciliation,
+    ReconciliationEvidenceAtom, ReconciliationProviderRequest, ReconciliationPublish,
+    ReconciliationPublishResult, ReconciliationSnapshot, ReconciliationStageWrite,
+    StagedReconciliation, RECONCILIATION_PROVIDER_REQUEST_CONTRACT_VERSION,
 };
 
 use super::{isotime, vertex, CpState};
@@ -359,18 +360,28 @@ pub(crate) fn test_reconciliation_provider_commitments(
     snapshot: &ReconciliationSnapshot,
     claim: &ReconciliationClaim,
 ) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
-    let input = render_model_input(snapshot)?;
+    test_reconciliation_provider_commitments_for_input(&render_model_input(snapshot)?, claim)
+}
+
+/// The exact durable commitments the reconciler binds when it sends
+/// `user_message` under `claim`: attempt identity, request-body anchor and
+/// the ledger's invocation fingerprint.
+#[cfg(test)]
+pub(crate) fn test_reconciliation_provider_commitments_for_input(
+    user_message: &str,
+    claim: &ReconciliationClaim,
+) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
     let request = vertex::CustomTextGenerationRequest {
         operation: vertex::VertexOperation::EpisodeReconciliation,
         system: SYSTEM_PROMPT,
-        user_message: &input,
+        user_message,
         schema: response_schema(),
         max_output_tokens: RECONCILIATION_OUTPUT_TOKENS,
         model: &claim.reconciliation_model,
     };
     let caller_anchor = vertex::custom_text_request_caller_anchor(&request)?;
     let attempt_identity = reconciliation_provider_attempt_identity(
-        &snapshot.source_fingerprint,
+        &claim.source_fingerprint,
         claim.activation_generation,
         &claim.producer_contract_sha256,
         claim.model_attempt_count,
@@ -733,6 +744,15 @@ enum ProviderFailureAction {
     RetrySameAttempt,
     RetryWithNewAttempt,
     ConservativeKeep,
+    /// The ledger holds this attempt identity under different request
+    /// bytes. The frozen request makes that unreachable for this producer's
+    /// own attempts; should it still happen (an attempt admitted by a build
+    /// without the freeze, or a defect), retrying the same identity would
+    /// repeat the refusal forever. Settle exactly as a same-bytes replay
+    /// would, from the ledger's stored outcome: a confirmed not-billed
+    /// attempt advances to a fresh identity, anything else is the
+    /// conservative keep — never a resend.
+    SettleReusedIdentity,
 }
 
 fn provider_failure_action(
@@ -748,6 +768,9 @@ fn provider_failure_action(
         }
         vertex::VertexGenerationFailureDisposition::AmbiguousTerminal => {
             ProviderFailureAction::ConservativeKeep
+        }
+        vertex::VertexGenerationFailureDisposition::AttemptIdentityReused => {
+            ProviderFailureAction::SettleReusedIdentity
         }
     }
 }
@@ -1142,6 +1165,7 @@ pub async fn reconcile_user_episodes(state: &CpState, account_id: &str) -> Resul
         vertex_event_id,
         provider_attempt_identity,
         provider_invocation_fingerprint,
+        output_labels,
     ) = if claim.model_attempt_count >= MODEL_ATTEMPTS_BEFORE_CONSERVATIVE_KEEP {
         (
             validate_partition(&snapshot, conservative_partition(&snapshot)?)?,
@@ -1149,16 +1173,55 @@ pub async fn reconcile_user_episodes(state: &CpState, account_id: &str) -> Resul
             None,
             None,
             None,
+            snapshot.authored_labels.clone(),
         )
     } else {
-        let input = match render_model_input(&snapshot) {
-            Ok(input) => input,
+        // A rendering this build refuses can still have a frozen predecessor
+        // from an earlier try of this attempt; only its absence releases.
+        let current = match render_model_input(&snapshot) {
+            Ok(input) => Some(ReconciliationProviderRequest {
+                contract_version: RECONCILIATION_PROVIDER_REQUEST_CONTRACT_VERSION,
+                authored_labels: snapshot.authored_labels.clone(),
+                user_message: input,
+            }),
             Err(error) => {
-                release_for_retry(state, &claim, "input_encoding_failed", false).await?;
                 warn!(account_id, error = %error, "memory reconciliation input refused");
-                return Ok(false);
+                None
             }
         };
+        // Speaker identity changes presentation without moving the source
+        // fingerprint, so the attempt identity alone does not determine the
+        // rendered body. Bind the exact input (and the namespace it shows) to
+        // this attempt before the ledger admits it; every later try of the
+        // same attempt replays these bytes instead of its own rendering.
+        let frozen = match repository
+            .freeze_reconciliation_provider_request(&claim, current.as_ref())
+            .await
+        {
+            Ok(Some(frozen)) => frozen,
+            Ok(None) => {
+                release_for_retry(state, &claim, "input_encoding_failed", false).await?;
+                return Ok(false);
+            }
+            Err(EnclaveError::InvalidRequest(error)) => {
+                release_for_retry(state, &claim, "input_encoding_failed", false).await?;
+                warn!(account_id, error = %error, "memory reconciliation provider request refused");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if frozen.replayed {
+            info!(
+                account_id,
+                model_attempt = claim.model_attempt_count,
+                "memory reconciliation replays the request frozen by an earlier try of this attempt"
+            );
+        }
+        let ReconciliationProviderRequest {
+            authored_labels: frozen_labels,
+            user_message: input,
+            ..
+        } = frozen.request;
         if let Err(error) = reserve_output(state, account_id).await {
             release_for_retry(state, &claim, "quota_unavailable", false).await?;
             warn!(account_id, error = %error, "memory reconciliation quota unavailable");
@@ -1268,6 +1331,9 @@ pub async fn reconcile_user_episodes(state: &CpState, account_id: &str) -> Resul
                     Some(generation.event_id),
                     Some(attempt_identity.to_vec()),
                     Some(invocation_fingerprint.to_vec()),
+                    // The model wrote against the frozen namespace, not the
+                    // labels current at publication.
+                    frozen_labels,
                 )
             }
             Err(error) => match provider_failure_action(error.disposition) {
@@ -1310,17 +1376,73 @@ pub async fn reconcile_user_episodes(state: &CpState, account_id: &str) -> Resul
                         Some(event_id),
                         Some(attempt_identity.to_vec()),
                         Some(invocation_fingerprint.to_vec()),
+                        // The conservative text is the drafts' current
+                        // presentation, so it keeps the current namespace.
+                        snapshot.authored_labels.clone(),
+                    )
+                }
+                ProviderFailureAction::SettleReusedIdentity => {
+                    abort_provider_egress_guard(&mut provider_egress_guard).await?;
+                    let stored = state
+                        .repositories
+                        .model_usage()
+                        .durable_attempt_provenance(account_id, &attempt_identity)
+                        .await?
+                        .ok_or_else(|| {
+                            EnclaveError::Store(
+                                "reused reconciliation attempt identity has no usage event".into(),
+                            )
+                        })?;
+                    if stored.outcome == "not_billed" {
+                        release_for_retry(state, &claim, "provider_attempt_input_mismatch", true)
+                            .await?;
+                        warn!(
+                            account_id,
+                            vertex_event_id = stored.event_id,
+                            error = %error,
+                            "memory reconciliation attempt identity was admitted with different input and confirmed not billed"
+                        );
+                        return Ok(false);
+                    }
+                    // Persist the keep under the same source/topology fence
+                    // as an ambiguous attempt of this process, not through
+                    // the providerless staging path.
+                    match repository.acquire_provider_egress_guard(&claim).await? {
+                        Some(guard) => provider_egress_guard = Some(guard),
+                        None => {
+                            // Nothing of this try was admitted, so the
+                            // attempt is not consumed: the next try re-enters,
+                            // is refused again and settles once the guard
+                            // holds.
+                            release_for_retry(state, &claim, "source_changed_before_egress", false)
+                                .await?;
+                            return Ok(false);
+                        }
+                    }
+                    warn!(
+                        account_id,
+                        vertex_event_id = stored.event_id,
+                        outcome = stored.outcome,
+                        error = %error,
+                        "memory reconciliation attempt identity was admitted with different input; settling without a resend"
+                    );
+                    (
+                        validate_partition(&snapshot, conservative_partition(&snapshot)?)?,
+                        CONSERVATIVE_AMBIGUITY_MODEL.to_string(),
+                        Some(stored.event_id),
+                        Some(attempt_identity.to_vec()),
+                        // Stage provenance is checked against the ledger row,
+                        // so it must carry the stored request's fingerprint,
+                        // not this try's.
+                        Some(stored.request_fingerprint),
+                        snapshot.authored_labels.clone(),
                     )
                 }
             },
         }
     };
 
-    let planned_outputs = publication_outputs(
-        partition.clone(),
-        &selected_model,
-        &snapshot.authored_labels,
-    )?;
+    let planned_outputs = publication_outputs(partition.clone(), &selected_model, &output_labels)?;
     let stage = ReconciliationStageWrite {
         normalized_partition: serde_json::to_value(&partition.model)?,
         result_commitment: partition.result_commitment.clone(),
@@ -1863,6 +1985,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_is_frozen_before_admission_and_its_namespace_reaches_the_outputs() {
+        let source = include_str!("reconciler.rs");
+        let render_call = ["render_model_", "input(&snapshot)"].concat();
+        let freeze_call = [
+            ".freeze_reconciliation_provider_",
+            "request(&claim, current.as_ref())",
+        ]
+        .concat();
+        let frozen_input = [
+            "user_message: ",
+            "input,\n            ..\n        } = frozen.request;",
+        ]
+        .concat();
+        let prepare_call = ["vertex::prepare_custom_", "with_model_attempt("].concat();
+        let render = source
+            .find(&render_call)
+            .expect("worker renders the current input");
+        let freeze = source
+            .find(&freeze_call)
+            .expect("worker binds the rendering to the attempt identity");
+        let destructure = source
+            .find(&frozen_input)
+            .expect("worker sends the frozen request, not its own rendering");
+        let prepare = source
+            .find(&prepare_call)
+            .expect("worker durably admits the provider attempt");
+        assert!(
+            render < freeze && freeze < destructure && destructure < prepare,
+            "the frozen request must be bound before the ledger admits the attempt"
+        );
+        let after_freeze = &source[freeze..];
+        let send_body = ["user_message: &", "input,"].concat();
+        assert!(
+            after_freeze.contains(&send_body),
+            "the provider request body must be the frozen input"
+        );
+        let success_labels = [
+            "// labels current at publication.\n",
+            "                    frozen_labels,\n",
+        ]
+        .concat();
+        assert!(
+            after_freeze.contains(&success_labels),
+            "a successful attempt's outputs must carry the frozen namespace"
+        );
+    }
+
+    #[test]
     fn obsolete_staged_producer_contract_requires_fresh_inference() {
         assert!(producer_contract_is_current(
             RECONCILIATION_VERSION,
@@ -1925,6 +2095,15 @@ mod tests {
         assert_eq!(
             provider_failure_action(vertex::VertexGenerationFailureDisposition::AmbiguousTerminal),
             ProviderFailureAction::ConservativeKeep
+        );
+        // Never a same-attempt retry (that would repeat the ledger's refusal
+        // on every try and wedge the account's lane) and never a blind
+        // resend: the stored outcome decides, as for a same-bytes replay.
+        assert_eq!(
+            provider_failure_action(
+                vertex::VertexGenerationFailureDisposition::AttemptIdentityReused
+            ),
+            ProviderFailureAction::SettleReusedIdentity
         );
 
         let source = vec![0x42; 32];

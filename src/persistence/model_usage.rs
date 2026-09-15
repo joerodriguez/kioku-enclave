@@ -41,6 +41,17 @@ pub(crate) struct VertexInvocationAttempt {
     pub(crate) admission: VertexInvocationAdmission,
 }
 
+/// Durable coordinates of an attempt identity the ledger already holds, for
+/// an owner whose own request bytes it refused. The stored request is not
+/// recoverable, but its fingerprint and outcome let the owner settle against
+/// the admitted attempt exactly as a same-bytes replay would.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VertexDurableAttemptProvenance {
+    pub(crate) event_id: String,
+    pub(crate) request_fingerprint: Vec<u8>,
+    pub(crate) outcome: String,
+}
+
 pub(crate) fn vertex_attempt_event_id(attempt_identity: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut digest = Sha256::new();
@@ -103,6 +114,10 @@ pub(crate) trait ModelUsageRepository: Send + Sync {
     /// confirmed retry must use a new attempt identity while retaining the
     /// same caller anchor. Replaying an identity returns a non-`Send`
     /// admission and therefore cannot duplicate an ambiguous provider call.
+    /// Re-entering an identity with different request bytes is refused with
+    /// `Conflict` after the same owner-lost rule settles a started row as
+    /// ambiguous; `durable_attempt_provenance` then reports the stored
+    /// attempt.
     async fn begin_invocation_attempt(
         &self,
         account_id: &str,
@@ -112,6 +127,14 @@ pub(crate) trait ModelUsageRepository: Send + Sync {
         caller_anchor: &[u8; 32],
         attempt_identity: &[u8; 32],
     ) -> Result<VertexInvocationAttempt>;
+
+    /// The stored attempt behind an identity, or `None` when the ledger never
+    /// admitted it.
+    async fn durable_attempt_provenance(
+        &self,
+        account_id: &str,
+        attempt_identity: &[u8; 32],
+    ) -> Result<Option<VertexDurableAttemptProvenance>>;
 
     async fn settle_response(
         &self,

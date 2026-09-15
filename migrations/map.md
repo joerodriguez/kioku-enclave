@@ -5,6 +5,15 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0036_reconciliation_provider_request.sql` adds the job-cascaded
+  `reconciliation_provider_requests` relation and its
+  `reconciliation_provider_request_schema` receipt through the direct
+  `reconciliation-provider-request-v36-install` companion. The organizer freezes the
+  exact model input of a durable provider attempt there and replays it on every later
+  try of the same attempt identity, so a speaker-presentation change can no longer
+  re-render a different body under an admitted attempt. Named outside the reserved
+  `memory_%` family digested by the base `cold_objects` release step; no base or prior
+  companion receipt changes.
 - `0035_memory_language.sql` adds the nullable `capture_events.locale_id` column with
   its BCP-47 check and the `authoring_language_schema` receipt through the direct
   `memory-language-v35-install` companion (ADR-0049). Pre-companion rows stay NULL
