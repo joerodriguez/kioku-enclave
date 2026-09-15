@@ -655,3 +655,31 @@ Release the enclave first, then the companions. The reconciler system prompt (an
 SHA-256 changes and the operator configuration's
 `MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256` must be re-pinned per ADR-0046; the
 summarizer and finalizer prompt changes are outside that commitment.
+
+### Organizer frozen provider request companion (v36)
+
+The reviewed source requires `reconciliation-provider-request-v36-install` after v35
+through the same dedicated migrator. It adds the job-cascaded
+`reconciliation_provider_requests` relation and the
+`reconciliation_provider_request_schema` receipt; serving startup and readiness verify
+that receipt and never execute DDL. The relation holds the organizer's exact model
+input for one durable provider attempt (the same plaintext class as
+`memory_reconciliation_stages`, in the same private Cloud SQL boundary), written by the
+first try of the attempt and replayed by every later try, so a speaker-presentation
+change between tries can no longer re-render a different request body under an
+already admitted attempt identity — the usage ledger refuses such a body forever, and
+the previous reconciler retried that refusal indefinitely. Rows leave with their job,
+when the model attempt advances, at terminal failure and at publication. The install is
+sub-second, but creating the foreign key takes a brief `SHARE ROW EXCLUSIVE` lock on
+`memory_reconciliation_jobs`; under its 5 s `lock_timeout` it can fail behind a busy
+reconciliation writer and must then simply be re-run. Orphan-capture erasure from this
+image also names the relation in its quiescence gate, so dispatching an erasure before
+the install fails closed with a missing-relation error rather than proceeding.
+
+The producer contract does not change: the attempt identity, prompt, schema, body
+commitment and the no-resend rule for ambiguous attempts are the same, so staged results
+and admitted attempts survive the release and no re-pin is needed. During a mixed window
+an attempt admitted by the previous image without a frozen request can still meet the
+ledger's refusal once; this source then settles exactly as a same-bytes replay would —
+a confirmed not-billed attempt advances to a fresh identity, anything else becomes the
+conservative-ambiguity keep against the stored attempt — instead of wedging or resending.

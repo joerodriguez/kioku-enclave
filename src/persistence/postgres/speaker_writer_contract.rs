@@ -13,7 +13,7 @@ use crate::persistence::{
 const FROM: &str = "2026-08-01T10:00:00.000Z";
 const TO: &str = "2026-08-01T10:10:00.000Z";
 
-async fn cleanup(fixture: ControlPlaneContractFixture) {
+pub(super) async fn cleanup(fixture: ControlPlaneContractFixture) {
     fixture.persistence.pool().close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP SCHEMA {} CASCADE",
@@ -84,7 +84,11 @@ async fn seed_capture_ready(repo: &PostgresPersistence, account: &str, count: i6
     sqlx::query("INSERT INTO capture_formation_receipts(account_id,capture_session_id,source_revision,finish_requested_at,finish_request_provenance) VALUES($1,'writer-session',1,clock_timestamp()-interval '1 hour','finish_endpoint_v1') ON CONFLICT(account_id,capture_session_id) DO UPDATE SET finish_requested_at=excluded.finish_requested_at,finish_request_provenance=excluded.finish_request_provenance").bind(account).execute(repo.pool()).await.unwrap();
 }
 
-async fn form_capture(repo: &PostgresPersistence, account: &str, count: i64) -> Vec<i64> {
+pub(super) async fn form_capture(
+    repo: &PostgresPersistence,
+    account: &str,
+    count: i64,
+) -> Vec<i64> {
     seed_capture_ready(repo, account, count).await;
     let claim = repo
         .claim_capture_formation(account, 900)

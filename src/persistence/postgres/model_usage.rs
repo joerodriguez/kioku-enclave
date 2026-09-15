@@ -11,7 +11,8 @@ use crate::{
     error::{EnclaveError, Result},
     persistence::{
         vertex_attempt_event_id, ClaimedVertexCoverage, ClaimedVertexUsageBatch,
-        ModelUsageRepository, VertexInvocationAdmission, VertexInvocationAttempt,
+        ModelUsageRepository, VertexDurableAttemptProvenance, VertexInvocationAdmission,
+        VertexInvocationAttempt,
     },
 };
 
@@ -318,17 +319,13 @@ impl ModelUsageRepository for PostgresPersistence {
             .fetch_one(&mut *transaction)
             .await?;
             let stored: Vec<u8> = row.try_get("request_fingerprint")?;
-            if stored.as_slice() != request_fingerprint {
-                return Err(EnclaveError::Conflict(
-                    "Vertex invocation attempt id was reused with different input".into(),
-                ));
-            }
             let outcome: String = row.try_get("outcome")?;
             let admission = replay_admission(&outcome)?;
             if outcome == "started" {
                 // Re-entry means the previous owner was lost after intent
                 // durability. Whether it crossed egress is unknowable, so
                 // make ambiguity terminal before returning to the caller.
+                // This holds whatever bytes the re-entrant carries.
                 sqlx::query(
                     "UPDATE vertex_usage_events
                         SET outcome='ambiguous',updated_at=CURRENT_TIMESTAMP
@@ -340,6 +337,12 @@ impl ModelUsageRepository for PostgresPersistence {
                 .await?;
                 refresh_coverage(&mut transaction, account_id).await?;
             }
+            if stored.as_slice() != request_fingerprint {
+                transaction.commit().await?;
+                return Err(EnclaveError::Conflict(
+                    "Vertex invocation attempt id was reused with different input".into(),
+                ));
+            }
             admission
         };
         transaction.commit().await?;
@@ -347,6 +350,32 @@ impl ModelUsageRepository for PostgresPersistence {
             event_id,
             admission,
         })
+    }
+
+    async fn durable_attempt_provenance(
+        &self,
+        account_id: &str,
+        attempt_identity: &[u8; 32],
+    ) -> Result<Option<VertexDurableAttemptProvenance>> {
+        let event_id = vertex_attempt_event_id(attempt_identity);
+        let row = sqlx::query(
+            "SELECT request_fingerprint,outcome FROM vertex_usage_events
+              WHERE account_id=$1 AND event_id=$2",
+        )
+        .bind(account_id)
+        .bind(&event_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let outcome: String = row.try_get("outcome")?;
+            replay_admission(&outcome)?;
+            Ok(VertexDurableAttemptProvenance {
+                event_id: event_id.clone(),
+                request_fingerprint: row.try_get("request_fingerprint")?,
+                outcome,
+            })
+        })
+        .transpose()
     }
 
     async fn settle_response(

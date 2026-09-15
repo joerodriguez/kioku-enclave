@@ -203,6 +203,19 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
   bytes and account/episode deletion inventories every exact live and noncurrent recording
   generation. The cleanup preserves the live recordings bucket and its KMS/media boundary.
 
+## Organizer provider request frozen per attempt
+
+- [x] Reproduce on real PostgreSQL that an accepted speaker name between two tries of one
+  durable reconciliation attempt re-renders a different model input under the unchanged
+  attempt identity, which the usage ledger refuses (`reconciliation_provider_request_contract`).
+- [x] Freeze the exact rendered input and its speaker namespace on the first try
+  (`reconciliation_provider_requests`, v36 companion) and replay it on every later try of
+  the attempt, as capture formation replays its persisted page request; a ledger refusal of
+  a reused attempt identity now settles from the stored outcome (not-billed advances,
+  anything else is the conservative keep) instead of retrying the same identity forever.
+- [ ] Release: install v36 after v35 (`reconciliation-provider-request-v36-install`); no
+  producer contract re-pin.
+
 ## ADR-0049 memory language follows the reader
 
 - [x] Accept an optional BCP-47 `locale_id` on the capture manifest, persist it through the

@@ -136,6 +136,13 @@ pub(crate) enum VertexGenerationFailureDisposition {
     RetryableNotBilled,
     AmbiguousTerminal,
     ConfirmedInvalid,
+    /// The durable ledger already binds this attempt identity to a different
+    /// request body, so no try of this identity can ever be admitted with the
+    /// caller's bytes. Nothing was sent now; whether the earlier body crossed
+    /// egress is unknown. Retrying the same identity would repeat this
+    /// refusal forever, so callers must advance to a fresh attempt identity
+    /// or settle without the provider.
+    AttemptIdentityReused,
 }
 
 #[derive(Debug)]
@@ -151,6 +158,21 @@ impl VertexGenerationFailure {
             disposition: VertexGenerationFailureDisposition::RetryableBeforeEgress,
             event_id: None,
             error,
+        }
+    }
+
+    /// Durable admission refused the attempt before any provider-visible
+    /// action. The ledger's only `Conflict` is an attempt identity that
+    /// already commits different request bytes; every other failure is an
+    /// ordinary pre-egress retry of the same attempt.
+    fn durable_admission_refused(error: EnclaveError) -> Self {
+        match error {
+            EnclaveError::Conflict(_) => Self {
+                disposition: VertexGenerationFailureDisposition::AttemptIdentityReused,
+                event_id: None,
+                error,
+            },
+            error => Self::before_egress(error),
         }
     }
 
@@ -858,7 +880,7 @@ async fn prepare_custom_with_model_inner(
                     attempt_identity,
                 )
                 .await
-                .map_err(VertexGenerationFailure::before_egress)?;
+                .map_err(VertexGenerationFailure::durable_admission_refused)?;
             match attempt.admission {
                 VertexInvocationAdmission::Send => attempt.event_id,
                 VertexInvocationAdmission::ConfirmedNotBilled => {
@@ -1309,6 +1331,27 @@ mod tests {
             assert!(
                 required.iter().any(|value| value.as_str() == Some(field)),
                 "{field} must be required by constrained decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reused_attempt_identity_is_never_a_same_attempt_retry() {
+        let reused = VertexGenerationFailure::durable_admission_refused(EnclaveError::Conflict(
+            "Vertex invocation attempt id was reused with different input".into(),
+        ));
+        assert_eq!(
+            reused.disposition,
+            VertexGenerationFailureDisposition::AttemptIdentityReused
+        );
+        assert!(reused.event_id.is_none(), "nothing was sent");
+        for error in [
+            EnclaveError::Store("ledger unavailable".into()),
+            EnclaveError::Auth("account inactive".into()),
+        ] {
+            assert_eq!(
+                VertexGenerationFailure::durable_admission_refused(error).disposition,
+                VertexGenerationFailureDisposition::RetryableBeforeEgress
             );
         }
     }

@@ -1119,10 +1119,16 @@ async fn summarize_capture_formation_locked(
                             "provider_egress": "confirmed_not_billed"
                         })));
                     }
-                    Disposition::AmbiguousTerminal | Disposition::ConfirmedInvalid => {
+                    Disposition::AmbiguousTerminal
+                    | Disposition::ConfirmedInvalid
+                    | Disposition::AttemptIdentityReused => {
                         // The durable attempt row makes this identity non-send
                         // forever. Preserve every source in a providerless
                         // draft instead of losing evidence or duplicating I/O.
+                        // A reused identity cannot happen for a persisted page
+                        // request; it is handled as the same terminal class
+                        // rather than as a same-attempt retry that would
+                        // repeat the refusal forever.
                         provider_egress = "possible_terminal";
                         conservative = true;
                         String::new()
