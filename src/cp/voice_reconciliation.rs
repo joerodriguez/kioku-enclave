@@ -213,8 +213,14 @@ pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
 /// proposal at a time instead of holding each other hostage. The target must
 /// be merge-eligible and durably stable; a named fragment joins only a profile
 /// already bound to the same person, so one sample never names a voice.
+/// The profiles a fragment is judged against; the population bound counts
+/// these and never the fragments themselves.
+pub(crate) fn competitor_count(profiles: &[Profile]) -> usize {
+    profiles.iter().filter(|p| !fragment_like(p)).count()
+}
+
 pub(crate) fn absorption_pairs(profiles: &[Profile]) -> Vec<Merge> {
-    if profiles.iter().filter(|p| !fragment_like(p)).count() > MAX_PROFILES {
+    if competitor_count(profiles) > MAX_PROFILES {
         return Vec::new();
     }
     let mut pairs = Vec::new();

@@ -1545,20 +1545,25 @@ rows or owned media generations remain.
   quarantine a profile for matching; they never trigger an automatic split.
 - Reciprocal merges keep policy version 1; absorption proposals carry policy version 2.
   A tentative fragment — complete, clean, non-owner support from fewer than three
-  observations whose recordings have all finished, what a two-sentence appearance leaves
-  behind — is absorbed by the durably stable, merge-eligible profile that every one of its
-  clean samples would have matched under the ordinary decision had that profile existed
-  when the sample arrived: the owner's profiles are tried first exactly as live matching
-  tries them (a sample the owner path would claim holds the fragment), then the 0.60 score
-  with the 0.08 runner-up margin against every compatible non-fragment profile, so an
-  owner profile can block an absorption but never receives one. Other fragments are
+  observations whose recordings have all finished with no audio or voice work still in
+  flight, what a two-sentence appearance leaves behind — is absorbed by the durably
+  stable, merge-eligible profile that every one of its clean samples would have matched
+  under the ordinary decision had that profile existed when the sample arrived: the
+  owner's profiles are tried first as live matching tries them (a sample the owner path
+  would claim holds the fragment), then the 0.60 score with the 0.08 runner-up margin
+  against every compatible non-fragment profile including the owner's (stricter than the
+  live non-owner scope, which excludes owner profiles), so an owner profile can block an
+  absorption but never receives one. Other fragments are
   runner-ups with tolerance rather than competitors: one that beats the stable profile by
   more than the margin holds the decision, while the fragments one voice leaves across
   short recordings are absorbed one proposal at a time instead of holding each other
   hostage. A named fragment joins only a profile already bound to the same person, so one
-  sample never names a voice, and the stable side keeps its public identity. Each pass
-  examines the sixteen newest fragments after reciprocal merges within the same proposal
-  budget; the 64-profile bound counts competitors, never fragments. Absorptions carry the
+  sample never names a voice, and the stable side keeps its public identity (an unnamed
+  fragment's private person node never becomes the result's). Each pass examines the
+  sixteen least recently examined fragments after reciprocal merges within the same
+  proposal budget and rotates them to the back of the window whether absorbed or held,
+  so no held fragment shadows an older absorbable one; the 64-profile bound counts
+  competitors, never fragments. Absorptions carry the
   reason `tentative_absorbed`, are reconsidered under their own rule, and reverse like any
   merge when a new competitor appears — with the existing limitation that only the newest
   proposal on a result profile is exactly reversible, so a chain of absorptions into one

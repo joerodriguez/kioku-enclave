@@ -57,7 +57,14 @@ async fn load_support(
         .bind(account).bind(id).fetch_optional(&mut **tx).await? else {return Ok(None)};
     let fence = store::source_fence(tx).await?;
     let sql=format!("SELECT s.id,s.speaker_observation_id,s.embedding,s.eligibility,o.cluster_id,a.id assignment, \
-      EXISTS(SELECT 1 FROM capture_events e JOIN capture_sessions session ON session.account_id=e.account_id AND session.id=e.capture_session_id WHERE e.account_id=o.account_id AND e.event_id=o.event_id AND session.ended_at IS NOT NULL) AS settled, \
+      EXISTS(SELECT 1 FROM capture_events e JOIN capture_sessions session ON session.account_id=e.account_id AND session.id=e.capture_session_id \
+             WHERE e.account_id=o.account_id AND e.event_id=o.event_id AND session.ended_at IS NOT NULL \
+               AND NOT EXISTS(SELECT 1 FROM capture_events later JOIN media_objects media ON media.account_id=later.account_id AND media.event_id=later.event_id \
+                     WHERE later.account_id=session.account_id AND later.capture_session_id=session.id AND later.stream_kind IN ('mic','system_audio','ios_mic') \
+                       AND media.deleted_at IS NULL AND media.processing_state IN ('queued','processing','retry_wait')) \
+               AND NOT EXISTS(SELECT 1 FROM voice_embedding_jobs job JOIN speaker_observations pending ON pending.account_id=job.account_id AND pending.id=job.speaker_observation_id \
+                     JOIN capture_events later ON later.account_id=pending.account_id AND later.event_id=pending.event_id \
+                     WHERE later.account_id=session.account_id AND later.capture_session_id=session.id AND job.state IN ('pending','processing','retry_wait'))) AS settled, \
       (s.accepted AND NOT o.overlap AND s.eligibility IN ('enroll','match_only') AND s.quality_version=$3 \
        AND s.embedding_space=p.embedding_space AND s.scorer_version=p.scorer_version AND s.channel_domain=p.channel_domain \
        AND s.voice_profile_id=p.id AND o.voice_profile_id=p.id AND o.voice_sample_id=s.id \
@@ -183,9 +190,11 @@ async fn population(tx: &mut Transaction<'_, Postgres>, account: &str) -> Result
 }
 
 /// The merge population is stable profiles plus the owner's. Absorption adds
-/// the newest tentative profiles with support as candidate fragments, bounded
-/// separately from the competitors they are judged against; stable merges
-/// never see them, so their competitor sets are unchanged.
+/// the least recently examined tentative profiles with support as candidate
+/// fragments, bounded separately from the competitors they are judged
+/// against; stable merges never see them, so their competitor sets are
+/// unchanged. The absorb loop touches every examined fragment so the window
+/// rotates and no held fragment shadows an older absorbable one.
 async fn population_for(
     tx: &mut Transaction<'_, Postgres>,
     account: &str,
@@ -194,7 +203,7 @@ async fn population_for(
     let mut ids:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status<>'quarantined' AND (p.status='stable' OR person.status='owner') AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id LIMIT $4")
         .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind((policy::MAX_PROFILES+1) as i64).fetch_all(&mut **tx).await?;
     if proposal == ProposalPolicy::Absorb {
-        let fragments:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status='tentative' AND coalesce(person.status,'')<>'owner' AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id DESC LIMIT $4")
+        let fragments:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status='tentative' AND coalesce(person.status,'')<>'owner' AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.updated_at,p.id LIMIT $4")
             .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind(policy::MAX_FRAGMENTS as i64).fetch_all(&mut **tx).await?;
         ids.extend(fragments);
     }
@@ -465,13 +474,12 @@ async fn apply(
                     .min()
             }),
         // The stable voice keeps its public identity; a fragment brings none
-        // the policy did not already require to agree.
+        // the policy did not already require to agree, and an unnamed
+        // fragment's private person node never becomes the result's.
         ProposalPolicy::Absorb => [left, right]
             .into_iter()
             .find(|c| c.policy.stable)
-            .and_then(|c| c.policy.person)
-            .or(left.policy.person)
-            .or(right.policy.person),
+            .and_then(|c| c.policy.person),
     };
     sqlx::query("INSERT INTO voice_profiles(account_id,id,person_id,label,embedding_space,channel_domain,centroid,scorer_version) VALUES($1,$2,$3,$4,$5,$6,''::bytea,$7)")
         .bind(account).bind(result).bind(person).bind(format!("voice-profile-{result}")).bind(&left.policy.space).bind(&left.policy.domain).bind(left.policy.scorer).execute(&mut **tx).await?;
@@ -713,11 +721,12 @@ async fn reconsider(
     let proposal_policy = ProposalPolicy::of(&decision, &row.try_get::<String, _>("reason")?);
     let candidates = population_for(tx, account, proposal_policy).await?;
     // Fragments are never competitors, so they never crowd out reconsideration.
-    if candidates
-        .iter()
-        .filter(|c| c.policy.stable || c.policy.person_status.as_deref() == Some("owner"))
-        .count()
-        > policy::MAX_PROFILES - 1
+    if policy::competitor_count(
+        &candidates
+            .iter()
+            .map(|c| c.policy.clone())
+            .collect::<Vec<_>>(),
+    ) > policy::MAX_PROFILES - 1
     {
         return Ok(false);
     }
@@ -831,15 +840,19 @@ pub(super) async fn reconcile(
             .iter()
             .map(|c| c.policy.clone())
             .collect::<Vec<_>>();
-        if profiles
-            .iter()
-            .filter(|p| p.stable || p.person_status.as_deref() == Some("owner"))
-            .count()
-            > policy::MAX_PROFILES
-        {
+        if policy::competitor_count(&profiles) > policy::MAX_PROFILES {
             outcomes.push("profile_absorb_population_held");
             break;
         }
+        // Every examined fragment goes to the back of the window, absorbed or
+        // held, so an old absorbable fragment is never shadowed by newer holds.
+        let examined = candidates
+            .iter()
+            .filter(|c| !c.policy.stable && c.policy.person_status.as_deref() != Some("owner"))
+            .map(|c| c.policy.id)
+            .collect::<Vec<_>>();
+        sqlx::query("UPDATE voice_profiles SET updated_at=clock_timestamp() WHERE account_id=$1 AND id=ANY($2::bigint[])")
+            .bind(account).bind(&examined).execute(&mut **tx).await?;
         let held = held_name_profiles(tx, account).await?;
         let Some(pair) = policy::absorption_pairs(&profiles)
             .into_iter()
@@ -1390,6 +1403,20 @@ mod tests {
             slot_profile, result,
             "the fragment's memory now presents the merged voice"
         );
+        let (result_person, stable_person, status): (Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT r.person_id,s.person_id,person.status FROM voice_profiles r JOIN voice_profiles s ON s.account_id=r.account_id AND s.id=1 \
+               LEFT JOIN people person ON person.account_id=s.account_id AND person.id=s.person_id WHERE r.account_id=$1 AND r.id=$2",
+        )
+        .bind(ACCOUNT)
+        .bind(result)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (result_person, status.as_deref()),
+            (stable_person, Some("recurring")),
+            "the stable voice's public recurring identity is the result's; the fragment brings none"
+        );
         assert_eq!(
             source(repo).await,
             before,
@@ -1449,6 +1476,80 @@ mod tests {
             ("tentative", 3),
             "reversal restores the fragment and its memory slot"
         );
+        close(f).await;
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_fragment_joins_a_named_voice_and_a_named_rival_reverses_it() {
+        let Some(f) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &f.persistence;
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for n in 1..=3 {
+            sample(repo, 1, 100 + n, n, &vector(1., 0.)).await;
+        }
+        sqlx::query("INSERT INTO people(account_id,id,display_name,status) VALUES($1,71,'Ana','identified'),($1,72,'Bo','identified')")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE voice_profiles SET person_id=71 WHERE account_id=$1 AND id=1")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sample(repo, 3, 301, 7, &vector(0.98, 0.199)).await;
+        finish_recording(repo).await;
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        let (result, person): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT p.result_profile_id,r.person_id FROM voice_profile_proposals p JOIN voice_profiles r ON r.account_id=p.account_id AND r.id=p.result_profile_id WHERE p.account_id=$1 AND p.state='applied'",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            person,
+            Some(71),
+            "an unnamed fragment joins the named voice, which keeps its person"
+        );
+        // A rival stable voice bound to a different person, as close to the
+        // fragment's sample as the merged voice: the two never merge (different
+        // accepted people) and the absorption is reversed as ambiguous.
+        for n in 1..=3 {
+            sample(repo, 9, 900 + n, 30 + n, &vector(0.98, 0.199)).await;
+        }
+        sqlx::query("UPDATE voice_profiles SET person_id=72 WHERE account_id=$1 AND id=9")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        finish_recording(repo).await;
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM voice_profile_proposals WHERE account_id=$1 ORDER BY id",
+        )
+        .bind(ACCOUNT)
+        .fetch_all(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec!["reversed"],
+            "a new non-owner competitor within the margin reverses the absorption and nothing else is proposed"
+        );
+        let (status, slot): (String, i64) = sqlx::query_as(
+            "SELECT p.status,(SELECT voice_profile_id FROM episode_speaker_slots s WHERE s.account_id=p.account_id AND s.episode_id=7 AND s.status='active') FROM voice_profiles p WHERE p.account_id=$1 AND p.id=3",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), slot), ("tentative", 3));
+        let _ = result;
         close(f).await;
     }
 
