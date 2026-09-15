@@ -2770,30 +2770,31 @@ fn quality_flag_is_valid(flag: &str) -> bool {
     flag.len() <= MAX_QUALITY_FLAG_LEN && !flag.bytes().any(|byte| byte == 0)
 }
 
-/// Deterministic identifier repair: keep the model's own characters where the
-/// id grammar allows them, replace the rest, and fall back to the turn's
-/// position when nothing survives.
-fn salvaged_id(value: &str, fallback: &str, index: usize) -> String {
-    let mut repaired = value
+/// Deterministic identifier repair: trim, then keep only the characters the id
+/// grammar allows so a stray space or punctuation mark collapses onto the id the
+/// model used elsewhere (`"S1 "` and `"S1!"` both become `S1`) instead of
+/// minting a second speaker. Empty when nothing survives.
+fn salvaged_id(value: &str) -> String {
+    value
+        .trim()
         .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-                byte as char
-            } else {
-                '-'
-            }
-        })
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        .map(|byte| byte as char)
         .take(MAX_ID_LEN)
-        .collect::<String>();
-    if repaired.bytes().all(|byte| byte == b'-') {
-        repaired = format!("{fallback}-{index}");
-    }
-    repaired
+        .collect()
 }
 
-fn unique_turn_id(ids: &mut HashSet<String>, turn_id: String) -> (String, bool) {
-    if ids.insert(turn_id.clone()) {
-        return (turn_id, false);
+/// Ids the model emitted validly are never renamed except when they duplicate an
+/// earlier valid id; a repaired id steers around every reserved valid id and every
+/// id already kept, so repair cannot displace the model's own references.
+fn unique_turn_id(
+    reserved: &HashSet<String>,
+    used: &mut HashSet<String>,
+    turn_id: String,
+    repaired: bool,
+) -> (String, bool) {
+    if (!repaired || !reserved.contains(&turn_id)) && used.insert(turn_id.clone()) {
+        return (turn_id, repaired);
     }
     let mut suffix = 2_usize;
     loop {
@@ -2801,7 +2802,7 @@ fn unique_turn_id(ids: &mut HashSet<String>, turn_id: String) -> (String, bool) 
         let mut candidate = turn_id.clone();
         candidate.truncate(MAX_ID_LEN.saturating_sub(tail.len()));
         candidate.push_str(&tail);
-        if ids.insert(candidate.clone()) {
+        if !reserved.contains(&candidate) && used.insert(candidate.clone()) {
             return (candidate, true);
         }
         suffix += 1;
@@ -2852,6 +2853,17 @@ pub(crate) fn parse_audio_result_with_salvage(
     }
     let mut report = AudioResultSalvage::default();
     let mut turns = Vec::with_capacity(result.turns.len());
+    // Valid ids are reserved up front so a repaired id can never take one.
+    let reserved = if salvage {
+        result
+            .turns
+            .iter()
+            .filter(|turn| validate_id("turn_id", &turn.turn_id).is_ok())
+            .map(|turn| turn.turn_id.clone())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let mut ids = HashSet::new();
     let mut previous_start = -1;
     let mut previous_end = 0;
@@ -2879,24 +2891,65 @@ pub(crate) fn parse_audio_result_with_salvage(
                 continue;
             }
         }
+        let raw_turn_id = turn.turn_id.clone();
+        let mut repaired_turn_id = false;
         if let Err(error) = validate_id("turn_id", &turn.turn_id) {
             if !salvage {
                 return Err(error);
             }
-            turn.turn_id = salvaged_id(&turn.turn_id, "turn", index);
-            adjusted = true;
+            let mut repaired = salvaged_id(&turn.turn_id);
+            if repaired.is_empty() {
+                repaired = format!("turn-{index}");
+            }
+            turn.turn_id = repaired;
+            repaired_turn_id = true;
         }
         if let Err(error) = validate_id("speaker_local_id", &turn.speaker_local_id) {
             if !salvage {
                 return Err(error);
             }
-            turn.speaker_local_id = salvaged_id(&turn.speaker_local_id, "speaker", index);
+            turn.speaker_local_id = salvaged_id(&turn.speaker_local_id);
+            if turn.speaker_local_id.is_empty() {
+                // Inventing a speaker would split one voice into two and can
+                // flip a single-voice window's owner-source classification.
+                report.dropped_turns += 1;
+                continue;
+            }
             adjusted = true;
         }
         if salvage {
-            let (turn_id, renamed) = unique_turn_id(&mut ids, std::mem::take(&mut turn.turn_id));
+            let (turn_id, renamed) = unique_turn_id(
+                &reserved,
+                &mut ids,
+                std::mem::take(&mut turn.turn_id),
+                repaired_turn_id,
+            );
+            if turn_id != raw_turn_id {
+                // A turn's own name evidence points at itself; keep it attached.
+                for reference in [
+                    &mut turn.speaker_name_subject_turn_id,
+                    &mut turn.speaker_name_target_turn_id,
+                ] {
+                    if reference.as_deref() == Some(raw_turn_id.as_str()) {
+                        *reference = Some(turn_id.clone());
+                    }
+                }
+            }
             turn.turn_id = turn_id;
             adjusted |= renamed;
+            // Flags are repaired before a boundary repair may add one, so the
+            // marker that keeps the voice worker away can never be truncated off.
+            if turn.quality_flags.len() > MAX_QUALITY_FLAGS
+                || !turn
+                    .quality_flags
+                    .iter()
+                    .all(|flag| quality_flag_is_valid(flag))
+            {
+                turn.quality_flags
+                    .retain(|flag| quality_flag_is_valid(flag));
+                turn.quality_flags.truncate(MAX_QUALITY_FLAGS);
+                adjusted = true;
+            }
         } else if !ids.insert(turn.turn_id.clone()) {
             return Err(EnclaveError::InvalidRequest(
                 "audio result has duplicate turn_id".into(),
@@ -2998,21 +3051,16 @@ pub(crate) fn parse_audio_result_with_salvage(
             turn.speaker_name_target_turn_id = None;
             adjusted = true;
         }
-        if turn.quality_flags.len() > MAX_QUALITY_FLAGS
-            || !turn
-                .quality_flags
-                .iter()
-                .all(|flag| quality_flag_is_valid(flag))
+        if !salvage
+            && (turn.quality_flags.len() > MAX_QUALITY_FLAGS
+                || !turn
+                    .quality_flags
+                    .iter()
+                    .all(|flag| quality_flag_is_valid(flag)))
         {
-            if !salvage {
-                return Err(EnclaveError::InvalidRequest(
-                    "audio turn quality flags are invalid".into(),
-                ));
-            }
-            turn.quality_flags
-                .retain(|flag| quality_flag_is_valid(flag));
-            turn.quality_flags.truncate(MAX_QUALITY_FLAGS);
-            adjusted = true;
+            return Err(EnclaveError::InvalidRequest(
+                "audio turn quality flags are invalid".into(),
+            ));
         }
         if adjusted {
             report.adjusted_turns += 1;
@@ -3220,7 +3268,10 @@ mod audio_turn_tests {
         assert_eq!(report.adjusted_turns, 2);
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].turn_id, "t1");
-        assert_eq!(kept[0].speaker_local_id, "S-1-");
+        assert_eq!(
+            kept[0].speaker_local_id, "S1",
+            "stray punctuation collapses onto the id the model used elsewhere"
+        );
         assert_eq!(kept[0].text, "hithere");
         assert_eq!(kept[0].language, None);
         assert!(
@@ -3255,6 +3306,51 @@ mod audio_turn_tests {
                 .is_empty(),
             "an empty window stays empty"
         );
+    }
+
+    #[test]
+    fn contract_three_never_renames_a_valid_id_and_never_invents_a_speaker() {
+        // A repaired id collapsing onto a later valid id steers around it, and a
+        // renamed turn keeps its own name evidence attached.
+        let raw = r#"{"turns":[
+            {"turn_id":"t 1","start_ms":0,"end_ms":1000,"speaker_local_id":"S1","text":"I am Sam","overlap":false,"quality_flags":[],"speaker_name":"Sam","speaker_name_confidence":0.9,"speaker_name_evidence":"I am Sam","speaker_name_kind":"self_identification","speaker_name_subject_turn_id":"t 1"},
+            {"turn_id":"t1","start_ms":1000,"end_ms":2000,"speaker_local_id":"S1","text":"ok","overlap":false,"quality_flags":[]},
+            {"turn_id":"t2","start_ms":2000,"end_ms":3000,"speaker_local_id":"S1 ","text":"same voice","overlap":false,"quality_flags":[]},
+            {"turn_id":"t3","start_ms":3000,"end_ms":4000,"speaker_local_id":" ","text":"nobody","overlap":false,"quality_flags":[]}
+        ]}"#;
+        let (kept, report) = salvage(raw, 4_000);
+        assert_eq!(
+            kept.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(),
+            vec!["t1-2", "t1", "t2"],
+            "the model's valid id survives; the repaired one moves aside"
+        );
+        assert_eq!(
+            kept[0].speaker_name_subject_turn_id.as_deref(),
+            Some("t1-2"),
+            "self-referencing name evidence follows the renamed turn"
+        );
+        assert!(
+            kept.iter().all(|t| t.speaker_local_id == "S1"),
+            "a trailing space must not split one voice into two speakers"
+        );
+        assert_eq!(
+            report.dropped_turns, 1,
+            "a turn with no speaker id is dropped rather than attributed to an invented voice"
+        );
+        assert_eq!(report.adjusted_turns, 2);
+        let many_flags = (0..17)
+            .map(|i| format!("\"f{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            r#"{{"turns":[{{"turn_id":"t1","start_ms":0,"end_ms":0,"speaker_local_id":"S1","text":"x","overlap":false,"quality_flags":[{many_flags}]}}]}}"#
+        );
+        let (kept, _) = salvage(&raw, 4_000);
+        assert!(
+            kept[0].quality_flags.iter().any(|flag| flag == "invalid_boundary"),
+            "a boundary repair keeps its voice-worker marker even when the model overfilled the flags"
+        );
+        assert_eq!(kept[0].quality_flags.len(), super::MAX_QUALITY_FLAGS);
     }
 
     #[test]
