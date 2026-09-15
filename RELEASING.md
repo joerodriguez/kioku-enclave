@@ -635,3 +635,19 @@ Phase 5 adds `identity-presentation-v34-install` after v33 through the same dedi
 migrator. It installs exact authored-map/semantic-state storage and the successful
 identity-refresh timestamp; serving startup and readiness require its verified receipt.
 Source merge does not run this phase, publish an image, or complete owner acceptance.
+
+### ADR-0049 memory language companion (v35)
+
+The reviewed source requires `memory-language-v35-install` after v34 through the same
+dedicated migrator. It adds the nullable `capture_events.locale_id` column with its
+BCP-47 check and the `authoring_language_schema` receipt; serving startup and readiness
+verify that receipt and never execute DDL. Pre-companion rows stay NULL and are
+authored in English until a newer stamped recording arrives.
+
+Order matters for the companions: `CaptureEventManifest` denies unknown fields, so an
+iPhone or Mac build that stamps `locale_id` must not reach an enclave revision older
+than this source — its uploads would be refused with 400 and its queue would stall.
+Release the enclave first, then the companions. The summarizer, finalizer, and
+reconciler prompts change with this source, so the reconciliation producer contract
+SHA-256 changes and the operator configuration's
+`MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256` must be re-pinned per ADR-0046.

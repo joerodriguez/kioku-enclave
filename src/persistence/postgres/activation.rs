@@ -4347,6 +4347,7 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     persistence.install_voice_recurrence_schema().await?;
     persistence.install_identity_fusion_schema().await?;
     persistence.install_identity_presentation_schema().await?;
+    persistence.install_memory_language_schema().await?;
     test_real_pg_terminal_media_claim_repair(persistence).await?;
     super::media_processing::test_real_pg_media_provider_deletion_contract(persistence).await?;
     test_real_pg_seal_and_tombstone_contract(persistence).await?;
@@ -5727,11 +5728,19 @@ async fn test_real_pg_activation_contract_inner(persistence: &PostgresPersistenc
     );
     super::memory_formation::test_real_pg_oversized_formation_and_neighborhood(persistence).await?;
     super::capture_recovery::test_real_pg_interrupted_capture_recovery(persistence).await?;
+    super::capture_recovery::test_real_pg_capture_locale_round_trip(persistence).await?;
     let status = persistence
         .memory_reconciliation_activation_status()
         .await?;
     assert_eq!(status.phase, MemoryReconciliationActivationPhase::Active);
     assert_eq!(status.rollout_basis_points, 10_000);
+    // Full-rollout Active: any account is inside the authority the language
+    // contract needs.
+    super::memory_reconciliation::test_memory_language_is_committed_by_the_source(persistence)
+        .await
+        .map_err(|error| {
+            EnclaveError::Store(format!("memory language source contract: {error:?}"))
+        })?;
     assert!(
         persistence
             .repair_memory_reconciliation_draining_scope(&global_drain)

@@ -30,7 +30,7 @@ use super::{isotime, vertex, CpState};
 // considers eight-hour capture-time continuations; validator v2 keeps an ID only
 // for exact unchanged membership. Older stages cannot cross this boundary.
 const RECONCILIATION_VERSION: i64 = 3;
-const PROMPT_VERSION: i64 = 3;
+const PROMPT_VERSION: i64 = 4;
 const PARTITION_SCHEMA_VERSION: i64 = 2;
 const VALIDATOR_VERSION: i64 = 2;
 const QUIET_HORIZON_SECONDS: i64 = 4 * 60 * 60;
@@ -56,7 +56,9 @@ const SYSTEM_PROMPT: &str = r#"You organize currently available personal-memory 
 
 Recording sessions are transport boundaries, never automatic memory boundaries. Group evidence by the same concrete objective, conversation, decision, or workflow. Prefer extending an existing memory for a clear continuation, including a two-hour interruption or device switch. Consider preceding and following eight-hour capture-time context, including finalized memories, without treating that window as a waiting period or a maximum memory duration. Offline arrival order must not determine boundaries. A shared broad topic alone is not enough: separate distinct goals even when the people, application, or subject overlap. One recording may contain several memories.
 
-Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Keep distinct activities separate when continuity is ambiguous. Prefer the existing memory partition when the evidence does not clearly justify a change. An already published memory cannot be deleted merely because the model considers it unimportant. Titles, summaries, actions, languages, and timeline gists must be grounded in the assigned evidence. Use supplied speaker labels exactly as given; never rename, merge, or infer a name for a labeled speaker, and never list a mentioned name as an attendee. Do not output participants; the identity graph supplies participant presentation. Timeline entries cite only source_ids assigned to their memory."#;
+Return one complete partition of the supplied opaque source_ids. Every source_id must occur exactly once in one memory. Never invent an id, duplicate evidence, omit evidence, or infer facts not supported by the supplied atoms. Keep distinct activities separate when continuity is ambiguous. Prefer the existing memory partition when the evidence does not clearly justify a change. An already published memory cannot be deleted merely because the model considers it unimportant. Titles, summaries, actions, languages, and timeline gists must be grounded in the assigned evidence. Use supplied speaker labels exactly as given; never rename, merge, or infer a name for a labeled speaker, and never list a mentioned name as an attendee. Do not output participants; the identity graph supplies participant presentation. Timeline entries cite only source_ids assigned to their memory.
+
+OUTPUT LANGUAGE RULE: the input's memory_language is the BCP-47 tag of the language the device owner reads in. Write every title, summary, action item, and timeline gist in that language regardless of the language spoken or shown in the evidence. Report languages as the BCP-47 codes actually heard, never the output language. Keep personal names, organization and product names, URLs, and captured on-screen text in their original form. Render instructions and requirements directed at the owner in the output language; when the exact original wording of a phrase matters, quote it in the original language and add a gloss."#;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -335,6 +337,7 @@ fn render_model_input(snapshot: &ReconciliationSnapshot) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let encoded = serde_json::to_string(&json!({
+        "memory_language": snapshot.memory_language,
         "provisional_drafts": drafts,
         "evidence_atoms": atoms,
     }))?;
@@ -344,6 +347,11 @@ fn render_model_input(snapshot: &ReconciliationSnapshot) -> Result<String> {
         ));
     }
     Ok(encoded)
+}
+
+#[cfg(test)]
+pub(crate) fn test_render_model_input(snapshot: &ReconciliationSnapshot) -> Result<String> {
+    render_model_input(snapshot)
 }
 
 #[cfg(test)]
@@ -1396,6 +1404,7 @@ mod tests {
             source_fingerprint: vec![6; 32],
             topology_fingerprint: vec![7; 32],
             archive_revision: 0,
+            memory_language: "en".into(),
         }
     }
 

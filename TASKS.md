@@ -179,3 +179,17 @@ dual-write, shadow-read, import, or reverse-rollback machinery.
 - [ ] Keep external durable-recording/playback activation blocked until export includes all media
   bytes and account/episode deletion inventories every exact live and noncurrent recording
   generation. The cleanup preserves the live recordings bucket and its KMS/media boundary.
+
+## ADR-0049 memory language follows the reader
+
+- [x] Accept an optional BCP-47 `locale_id` on the capture manifest, persist it through the
+  receipted v35 `memory-language-v35-install` companion, and resolve the authoring language from
+  the newest stamped recording (English when none) without persisting anything derived.
+- [x] Append the output-language rule to the summarizer and finalizer prompts; carry it in the
+  reconciler's committed producer contract with the tag as `memory_language` input so a language
+  change re-fingerprints the source instead of altering an admitted provider attempt.
+- [ ] Release: install v35 after v34, re-pin `MEMORY_RECONCILIATION_PRODUCER_CONTRACT_SHA256`
+  (`sha256:613b1736…`), and serve this revision before any companion stamps the field.
+- [ ] Acceptance with the real model: a French recording on an English device authors an English
+  title, bullets, gists, and brief with a quoted instruction, an amount, and a URL preserved and
+  the transcript byte-identical.

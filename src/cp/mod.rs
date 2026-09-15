@@ -27,6 +27,7 @@ pub(crate) mod mcp_safety;
 pub mod media;
 pub mod media_planner;
 pub mod media_worker;
+pub(crate) mod memory_language;
 pub mod model_usage;
 pub mod oauth;
 pub mod playback;

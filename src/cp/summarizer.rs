@@ -1001,8 +1001,20 @@ async fn summarize_capture_formation_locked(
         format_epoch_millis(range_from_ms),
         format_epoch_millis(range_to_ms)
     );
-    let system_prompt =
-        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}");
+    // ADR-0049: authored text follows the owner's reading language. The exact
+    // request is persisted at first egress, so a later language change cannot
+    // alter a replayed attempt.
+    let output_language_rule =
+        match super::memory_language::resolve_memory_language(state, user_id).await {
+            Ok(language) => super::memory_language::output_language_rule(&language),
+            Err(error) => {
+                release_capture_claim(state, &claim, Some("memory_language")).await;
+                return Err(error);
+            }
+        };
+    let system_prompt = format!(
+        "{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}\n\n{output_language_rule}"
+    );
     let utterance_ids = utterances.iter().map(|row| row.id).collect::<Vec<_>>();
     let screenshot_ids = screenshots.iter().map(|row| row.id).collect::<Vec<_>>();
     // This is deliberately not a boolean: an admitted attempt can become
@@ -1337,10 +1349,21 @@ async fn summarize_user_window(
     // Call Vertex. Failed windows return an `error` status carrying
     // `window_to` so the sweep can skip past a window that fails
     // deterministically (see summarize_all) instead of stalling forever.
+    // ADR-0049: authored text follows the owner's reading language.
+    let output_language_rule =
+        match super::memory_language::resolve_memory_language(state, user_id).await {
+            Ok(language) => super::memory_language::output_language_rule(&language),
+            Err(error) => {
+                release_summary_claim(state, &summary_claim, Some("memory_language")).await;
+                return Err(error);
+            }
+        };
     let system_prompt = if settled {
-        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}")
+        format!(
+            "{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{SETTLED_EVIDENCE_RULE}\n\n{output_language_rule}"
+        )
     } else {
-        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}")
+        format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}\n\n{output_language_rule}")
     };
     if let Err(error) =
         reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await

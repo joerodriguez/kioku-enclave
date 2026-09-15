@@ -151,4 +151,6 @@ pub(super) async fn recover_inactive_sessions(
 mod tests;
 
 #[cfg(test)]
-pub(super) use tests::test_real_pg_interrupted_capture_recovery;
+pub(super) use tests::{
+    test_real_pg_capture_locale_round_trip, test_real_pg_interrupted_capture_recovery,
+};

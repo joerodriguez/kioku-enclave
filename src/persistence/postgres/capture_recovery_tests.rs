@@ -30,6 +30,16 @@ async fn upload(
     session: &str,
     sequence: i64,
 ) -> Result<CaptureCommit> {
+    upload_with_locale(persistence, account_id, session, sequence, None).await
+}
+
+async fn upload_with_locale(
+    persistence: &PostgresPersistence,
+    account_id: &str,
+    session: &str,
+    sequence: i64,
+    locale_id: Option<&str>,
+) -> Result<CaptureCommit> {
     let event = format!("{session}-event-{sequence}");
     let asset = format!("{session}-asset-{sequence}");
     let manifest: CaptureEventManifest = serde_json::from_value(serde_json::json!({
@@ -46,6 +56,7 @@ async fn upload(
         "started_at": "2026-08-01T10:00:00.000Z",
         "ended_at": "2026-08-01T10:01:00.000Z",
         "timezone_id": "UTC",
+        "locale_id": locale_id,
         "utc_offset_minutes": 0,
         "clock_uncertainty_ms": 0,
         "media": {
@@ -438,5 +449,48 @@ pub(in super::super) async fn test_real_pg_interrupted_capture_recovery(
             .execute(persistence.pool())
             .await?;
     }
+    Ok(())
+}
+
+/// ADR-0049: a companion-stamped `locale_id` survives ingest and is what the
+/// authoring resolver reads back; unstamped uploads leave the account English.
+pub(in super::super) async fn test_real_pg_capture_locale_round_trip(
+    persistence: &PostgresPersistence,
+) -> Result<()> {
+    const ACCOUNT: &str = "capture-locale-round-trip";
+    const SESSION: &str = "stamped-session";
+    account(persistence, ACCOUNT).await?;
+    assert_eq!(persistence.newest_recording_locale(ACCOUNT).await?, None);
+    let unstamped = upload(persistence, ACCOUNT, SESSION, 0).await?;
+    assert!(unstamped.manifest.locale_id.is_none());
+    assert!(!persistence.commit_event(unstamped).await?.duplicate);
+    assert_eq!(
+        persistence.newest_recording_locale(ACCOUNT).await?,
+        None,
+        "an unstamped recording carries no language"
+    );
+    let stamped = upload_with_locale(persistence, ACCOUNT, SESSION, 1, Some("fr-CA")).await?;
+    assert_eq!(stamped.manifest.locale_id.as_deref(), Some("fr-CA"));
+    assert!(!persistence.commit_event(stamped.clone()).await?.duplicate);
+    assert_eq!(
+        persistence
+            .newest_recording_locale(ACCOUNT)
+            .await?
+            .as_deref(),
+        Some("fr-CA"),
+        "the stamped language is persisted exactly as the companion sent it"
+    );
+    assert!(
+        persistence.commit_event(stamped).await?.duplicate,
+        "a replayed stamped manifest stays idempotent"
+    );
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT locale_id FROM capture_events WHERE account_id=$1 AND event_id=$2",
+    )
+    .bind(ACCOUNT)
+    .bind(format!("{SESSION}-event-1"))
+    .fetch_one(persistence.pool())
+    .await?;
+    assert_eq!(stored.as_deref(), Some("fr-CA"));
     Ok(())
 }

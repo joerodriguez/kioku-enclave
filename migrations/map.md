@@ -5,6 +5,11 @@ structured-state authority. A dedicated release operation applies these files un
 PostgreSQL schema advisory lock; serving instances only verify a finalized version or an exact
 receipted expand declared compatible by the candidate.
 
+- `0035_memory_language.sql` adds the nullable `capture_events.locale_id` column with
+  its BCP-47 check and the `authoring_language_schema` receipt through the direct
+  `memory-language-v35-install` companion (ADR-0049). Pre-companion rows stay NULL
+  and author in English; the receipt relation deliberately avoids the reserved
+  `memory_%` family digested by the base `cold_objects` release step.
 - `0032_voice_recurrence.sql` adds tenant-owned profile reconciliation proposals,
   exact assignment membership and original letter reservations through the direct
   `voice-recurrence-v32-install` companion. Its selective receipt preserves earlier

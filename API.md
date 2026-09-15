@@ -97,6 +97,7 @@ screenshot.
   "timezone_id": "America/New_York",
   "utc_offset_minutes": -240,
   "clock_uncertainty_ms": 24,
+  "locale_id": "en-US",
   "media_disposition": "canonical",
   "media": {
     "asset_id": "019fbab2-8413-7053-9117-eb249b72b161",
@@ -169,6 +170,15 @@ bounded by UTF-8 byte length. When ambient collection is false, a granted snapsh
 only the active tab. Non-granted snapshots carry no tab or active-URL evidence. Older
 browser-v1 manifests remain replay-compatible, but new clients always send the explicit v2
 consent bit.
+
+`locale_id` is optional: the device's reading language as a BCP-47 tag (iPhone and Mac
+send the first preferred language). Per ADR-0049 the enclave authors every memory field
+it writes — titles, summary bullets, timeline gists, brief sections, screen descriptions —
+in the language of the newest stamped recording, English when none exists. It never
+changes the transcript, the evidence-level `languages` codes, names, URLs, or on-screen
+text. A malformed tag is refused with 400; an absent field keeps a pre-companion
+manifest's exact bytes and digest. Enclave revisions before v35 deny the field, so
+companions that stamp it require the enclave to be released first.
 
 `session_finished` is optional (false by default) and valid only on audio. A client sets
 it on its last currently known durable audio event. Acceptance atomically records a

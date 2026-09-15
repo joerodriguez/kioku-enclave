@@ -62,3 +62,5 @@ Serving startup/readiness also verify the v30 voice-identity companion. Its coho
 Serving startup/readiness verify the direct v32 voice-recurrence proposal companion; only `voice-recurrence-v32-install` applies its DDL.
 
 Serving startup/readiness verify the direct v34 identity-presentation companion; only `identity-presentation-v34-install` applies its DDL.
+
+Serving startup/readiness verify the direct v35 memory-language companion (ADR-0049); only `memory-language-v35-install` applies its DDL. Companions must not stamp `locale_id` before this revision serves.

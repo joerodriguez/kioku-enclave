@@ -270,6 +270,10 @@ pub struct CaptureEventManifest {
     pub timezone_id: String,
     pub utc_offset_minutes: i32,
     pub clock_uncertainty_ms: u32,
+    /// ADR-0049: the device's reading language (BCP-47), stamped by companions
+    /// that know it. Optional so pre-companion manifests keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale_id: Option<String>,
     #[serde(default, skip_serializing_if = "MediaDisposition::is_canonical")]
     pub media_disposition: MediaDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,6 +433,15 @@ impl CaptureEventManifest {
         if !(-14 * 60..=14 * 60).contains(&self.utc_offset_minutes) {
             return Err(EnclaveError::InvalidRequest(
                 "utc_offset_minutes is invalid".into(),
+            ));
+        }
+        if self
+            .locale_id
+            .as_deref()
+            .is_some_and(|locale| !super::memory_language::is_bcp47_language_tag(locale))
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "locale_id must be a BCP-47 language tag".into(),
             ));
         }
         match self.media_disposition {
@@ -3213,6 +3226,68 @@ mod lost_response_adoption_tests {
             .await,
             Err(EnclaveError::Conflict(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod locale_manifest_tests {
+    use super::*;
+
+    const LEGACY: &str = r#"{"schema_version":2,"event_id":"event","device_id":"device","install_id":"install","capture_session_id":"session","stream_id":"stream","stream_kind":"mic","sequence":0,"source_wall_at":"2026-09-01T12:00:00Z","source_monotonic_ns":0,"started_at":"2026-09-01T12:00:00Z","ended_at":"2026-09-01T12:00:04Z","timezone_id":"UTC","utc_offset_minutes":0,"clock_uncertainty_ms":0,"context":null,"audio_role":"ambient","audio_route":"builtin_mic"}"#;
+
+    fn reference_event(locale: Option<&str>) -> CaptureEventManifest {
+        let mut event: CaptureEventManifest = serde_json::from_str(LEGACY).unwrap();
+        event.stream_kind = StreamKind::MacScreen;
+        event.media_disposition = MediaDisposition::Reference;
+        event.audio_role = None;
+        event.audio_route = None;
+        event.reference = Some(serde_json::from_value(json!({
+            "canonical_event_id":"canonical", "canonical_asset_id":"asset", "canonical_media_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "perceptual_hash":"0000000000000000", "hamming_distance":0,"pixel_change_ratio":0.0,"context_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","dedupe_version":1
+        })).unwrap());
+        event.context = Some(serde_json::from_value(json!({"capture_status":"stable"})).unwrap());
+        event.locale_id = locale.map(str::to_owned);
+        event
+    }
+
+    #[test]
+    fn locale_is_optional_and_absent_manifests_keep_their_bytes_and_digest() {
+        let manifest: CaptureEventManifest = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(manifest.locale_id, None);
+        assert_eq!(
+            serde_json::to_string(&manifest).unwrap(),
+            LEGACY,
+            "a pre-companion manifest must serialize to the same receipt bytes"
+        );
+        let unstamped = manifest_digest(&manifest).unwrap();
+        let stamped: CaptureEventManifest = serde_json::from_str(
+            &LEGACY.replace("\"timezone_id\"", "\"locale_id\":\"fr-CA\",\"timezone_id\""),
+        )
+        .unwrap();
+        assert_eq!(stamped.locale_id.as_deref(), Some("fr-CA"));
+        assert_ne!(
+            manifest_digest(&stamped).unwrap(),
+            unstamped,
+            "the stamped language participates in the capture digest"
+        );
+    }
+
+    #[test]
+    fn locale_must_be_a_bcp47_tag() {
+        reference_event(None).validate().unwrap();
+        for accepted in ["en", "fr-CA", "zh-Hant-TW"] {
+            reference_event(Some(accepted)).validate().unwrap();
+        }
+        for rejected in ["", "en_US", "en US", "e", "-en"] {
+            let error = reference_event(Some(rejected))
+                .validate()
+                .expect_err("malformed locale refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("locale_id must be a BCP-47 language tag"),
+                "{rejected:?}: {error}"
+            );
+        }
     }
 }
 
