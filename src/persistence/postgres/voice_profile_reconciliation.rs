@@ -201,12 +201,32 @@ async fn population_for(
     account: &str,
     proposal: ProposalPolicy,
 ) -> Result<Vec<Candidate>> {
+    population_with(tx, account, proposal, &[]).await
+}
+
+/// `pinned` fragments join the window regardless of their rotation position,
+/// so an application recheck always sees the exact pair it was scheduled with
+/// even if another maintenance step touched a fragment's `updated_at` in the
+/// meantime. Pinned ids are still loaded and filtered like any candidate.
+async fn population_with(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+    proposal: ProposalPolicy,
+    pinned: &[i64],
+) -> Result<Vec<Candidate>> {
     let mut ids:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status<>'quarantined' AND (p.status='stable' OR person.status='owner') AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id LIMIT $4")
         .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind((policy::MAX_PROFILES+1) as i64).fetch_all(&mut **tx).await?;
     if proposal == ProposalPolicy::Absorb {
         let fragments:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status='tentative' AND coalesce(person.status,'')<>'owner' AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.updated_at,p.id LIMIT $4")
             .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind(policy::MAX_FRAGMENTS as i64).fetch_all(&mut **tx).await?;
         ids.extend(fragments);
+        let pinned_fragments:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.id=ANY($4::bigint[]) AND p.status='tentative' AND coalesce(person.status,'')<>'owner' AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id")
+            .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind(pinned).fetch_all(&mut **tx).await?;
+        for id in pinned_fragments {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
     }
     let mut candidates = Vec::new();
     for id in ids {
@@ -396,7 +416,13 @@ async fn apply(
     }
     // Re-read exact revisions and memberships even though normal workers hold
     // the account lock: a saved proposal can never authorize a later graph.
-    let current = population_for(tx, account, proposal_policy).await?;
+    let current = population_with(
+        tx,
+        account,
+        proposal_policy,
+        &[expected_left.policy.id, expected_right.policy.id],
+    )
+    .await?;
     let Some(left) = current
         .iter()
         .find(|c| c.policy.id == expected_left.policy.id)
