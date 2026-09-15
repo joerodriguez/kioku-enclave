@@ -198,6 +198,12 @@ pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
         .collect()
 }
 
+/// The profiles a fragment is judged against; the population bound counts
+/// these and never the fragments themselves.
+pub(crate) fn competitor_count(profiles: &[Profile]) -> usize {
+    profiles.iter().filter(|p| !fragment_like(p)).count()
+}
+
 /// A tentative fragment is absorbed by the stable profile that every one of its
 /// clean samples would have matched under the ordinary decision had that
 /// profile existed when the sample arrived: the owner's profiles are tried
@@ -213,12 +219,6 @@ pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
 /// proposal at a time instead of holding each other hostage. The target must
 /// be merge-eligible and durably stable; a named fragment joins only a profile
 /// already bound to the same person, so one sample never names a voice.
-/// The profiles a fragment is judged against; the population bound counts
-/// these and never the fragments themselves.
-pub(crate) fn competitor_count(profiles: &[Profile]) -> usize {
-    profiles.iter().filter(|p| !fragment_like(p)).count()
-}
-
 pub(crate) fn absorption_pairs(profiles: &[Profile]) -> Vec<Merge> {
     if competitor_count(profiles) > MAX_PROFILES {
         return Vec::new();
