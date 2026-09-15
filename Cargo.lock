@@ -1840,7 +1840,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "flate2",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "hyper",
  "hyper-util",
  "jpeg-decoder",

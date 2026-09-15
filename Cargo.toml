@@ -38,7 +38,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 hyper = { version = "1.10", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 # Detached schema-finalization receipts use the same audited ring Ed25519 path
 # as the image's rustls stack. The public SPKI trust anchor is image-baked;
 # private signing material never enters the enclave image.
