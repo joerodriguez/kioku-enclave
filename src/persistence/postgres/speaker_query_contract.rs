@@ -979,6 +979,34 @@ async fn memory_participants_are_only_graph_backed_voices() {
         projected, 3,
         "the durable projection still records every cluster; only the public participant list is limited"
     );
+    assert_eq!(
+        memory["identity_revision"],
+        json!(7),
+        "a profile-backed voice appearing is acoustic bookkeeping, not a semantic identity change"
+    );
+    // A memory whose voices never bound reports no participants and never
+    // resurrects the legacy name-only projection.
+    seed_voice_observation(repo, account, "session", "event-4", 4, 4).await;
+    seed_voice_memory(repo, account, 4, 2).await;
+    sqlx::query("INSERT INTO episode_participants(account_id,id,episode_id,participant_key,attribution_kind,source_claimed_name,derivation_version) VALUES($1,900,2,'legacy:stale','context_inferred','Stale Legacy Name',1)")
+        .bind(account).execute(repo.pool()).await.unwrap();
+    let page = repo.list_episodes(account, &list_request()).await.unwrap();
+    let unbound = page
+        .episodes
+        .iter()
+        .find(|episode| episode["id"] == 2)
+        .expect("the second memory is listed");
+    assert_eq!(unbound["participants"], json!([]));
+    assert!(unbound["participant_details"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let members = repo.episode_members(account, 2).await.unwrap();
+    assert!(members["participant_details"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(members["members"][0]["speaker_label"], "Speaker A");
     cleanup(fixture).await;
 }
 
