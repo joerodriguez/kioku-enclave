@@ -1,3 +1,13 @@
+# Voice fragment absorption (2026-09-15)
+
+- [x] Absorb settled tentative fragments into the durably stable voice every clean sample
+      matches (owner path first, runner-up margin, fragments as tolerant runner-ups, named
+      fragments only into the same person), reconsidered and reversed under their own rule.
+- [ ] Reversal depth: `reverse` requires the result's exact applied revision and membership,
+      so after a second absorption (or merge) into the same result only the newest proposal
+      is reversible and an earlier absorbed fragment cannot be unwound. Make reversal tolerant
+      of revisions and assignments introduced by later reversed proposals on the same result.
+
 # Voice sample yield (2026-09-15)
 
 - [x] Embed a long turn's gate-admitted, speech-densest thirty seconds instead of its first
