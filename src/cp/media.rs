@@ -2701,43 +2701,203 @@ struct AudioResult {
 /// turn routinely ends a rounded fraction of a second past the assembled
 /// window's exact length. Clamp that bounded overshoot to the window instead
 /// of discarding the whole window's transcript; anything beyond it is still
-/// an invalid model output.
+/// an invalid model output under the strict contracts.
 pub(crate) const AUDIO_TURN_END_TOLERANCE_MS: i64 = 2_000;
+
+/// The result contract stamped on new audio-window attempts. Contract 1 is the
+/// unscored legacy transcript, 2 added required fact confidence, and 3 keeps 2's
+/// shape but salvages a window whose result has one malformed turn: the turn is
+/// repaired or dropped deterministically instead of the whole window's paid
+/// transcript being discarded as terminal invalid model output. A recorded 1 or
+/// 2 attempt replays under its own strict rules, so history never changes.
+pub(crate) const AUDIO_RESULT_CONTRACT_VERSION: u32 = 3;
+
+/// Content-free summary of what contract-3 salvage changed in one window.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioResultSalvage {
+    /// Turns removed because nothing usable remained: no text, or a start at or
+    /// past the window end.
+    pub dropped_turns: usize,
+    /// Turns kept after repairing an id, timestamp, marker, or field. A repaired
+    /// timestamp also carries the `invalid_boundary` quality flag so the voice
+    /// worker never fingerprints audio the model did not actually attribute.
+    pub adjusted_turns: usize,
+}
+
+const ALLOWED_FACT_PREDICATES: [&str; 8] = [
+    "role",
+    "organization",
+    "relationship",
+    "preference",
+    "responsibility",
+    "contact",
+    "location",
+    "other",
+];
+const INVALID_BOUNDARY_FLAG: &str = "invalid_boundary";
+const MAX_QUALITY_FLAGS: usize = 16;
+const MAX_QUALITY_FLAG_LEN: usize = 64;
+const MAX_PERSON_FACTS: usize = 20;
+
+fn person_fact_is_valid(fact: &PersonFact) -> bool {
+    ALLOWED_FACT_PREDICATES.contains(&fact.predicate.as_str())
+        && !fact.value.trim().is_empty()
+        && fact.value.len() <= 2_000
+        && !fact.evidence.trim().is_empty()
+        && fact.evidence.len() <= 2_000
+        && !fact.replacement_of.as_ref().is_some_and(|value| {
+            value.is_empty() || value.len() > 2_000 || value.bytes().any(|b| b == 0)
+        })
+        && fact
+            .confidence
+            .is_some_and(|score| score.is_finite() && (0.0..=1.0).contains(&score))
+}
+
+fn speaker_name_fields_are_valid(turn: &AudioTurn) -> bool {
+    !turn
+        .speaker_name
+        .as_ref()
+        .is_some_and(|name| name.is_empty() || name.len() > 256 || name.bytes().any(|b| b == 0))
+        && !turn
+            .speaker_name_confidence
+            .is_some_and(|confidence| !(0.0..=1.0).contains(&confidence))
+        && !turn.speaker_name_evidence.as_ref().is_some_and(|evidence| {
+            evidence.is_empty() || evidence.len() > 2_000 || evidence.bytes().any(|b| b == 0)
+        })
+}
+
+fn quality_flag_is_valid(flag: &str) -> bool {
+    flag.len() <= MAX_QUALITY_FLAG_LEN && !flag.bytes().any(|byte| byte == 0)
+}
+
+/// Deterministic identifier repair: keep the model's own characters where the
+/// id grammar allows them, replace the rest, and fall back to the turn's
+/// position when nothing survives.
+fn salvaged_id(value: &str, fallback: &str, index: usize) -> String {
+    let mut repaired = value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                byte as char
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_ID_LEN)
+        .collect::<String>();
+    if repaired.bytes().all(|byte| byte == b'-') {
+        repaired = format!("{fallback}-{index}");
+    }
+    repaired
+}
+
+fn unique_turn_id(ids: &mut HashSet<String>, turn_id: String) -> (String, bool) {
+    if ids.insert(turn_id.clone()) {
+        return (turn_id, false);
+    }
+    let mut suffix = 2_usize;
+    loop {
+        let tail = format!("-{suffix}");
+        let mut candidate = turn_id.clone();
+        candidate.truncate(MAX_ID_LEN.saturating_sub(tail.len()));
+        candidate.push_str(&tail);
+        if ids.insert(candidate.clone()) {
+            return (candidate, true);
+        }
+        suffix += 1;
+    }
+}
+
+fn push_quality_flag(flags: &mut Vec<String>, flag: &str) {
+    if flags.iter().any(|existing| existing == flag) {
+        return;
+    }
+    flags.truncate(MAX_QUALITY_FLAGS - 1);
+    flags.push(flag.to_owned());
+}
 
 #[cfg(test)]
 pub fn parse_audio_result(raw: &str, duration_ms: i64) -> Result<Vec<AudioTurn>> {
     parse_audio_result_for_contract(raw, duration_ms, 2)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_audio_result_for_contract(
     raw: &str,
     duration_ms: i64,
     contract_version: u32,
 ) -> Result<Vec<AudioTurn>> {
-    if !matches!(contract_version, 1 | 2) {
+    parse_audio_result_with_salvage(raw, duration_ms, contract_version).map(|(turns, _)| turns)
+}
+
+/// Contracts 1 and 2 reject the whole result on the first malformed turn, exactly
+/// as recorded history was interpreted. Contract 3 repairs or drops only that
+/// turn; every repair is a pure function of the response bytes.
+pub(crate) fn parse_audio_result_with_salvage(
+    raw: &str,
+    duration_ms: i64,
+    contract_version: u32,
+) -> Result<(Vec<AudioTurn>, AudioResultSalvage)> {
+    if !matches!(contract_version, 1 | 2 | 3) {
         return Err(EnclaveError::InvalidRequest(
             "audio result contract is unsupported".into(),
         ));
     }
-    let mut result: AudioResult = serde_json::from_str(raw)?;
+    let salvage = contract_version >= 3;
+    let result: AudioResult = serde_json::from_str(raw)?;
     if result.turns.len() > MAX_TURNS {
         return Err(EnclaveError::InvalidRequest(
             "audio result has too many turns".into(),
         ));
     }
+    let mut report = AudioResultSalvage::default();
+    let mut turns = Vec::with_capacity(result.turns.len());
     let mut ids = HashSet::new();
     let mut previous_start = -1;
     let mut previous_end = 0;
     let mut previous_overlap = false;
-    for turn in &mut result.turns {
+    for (index, mut turn) in result.turns.into_iter().enumerate() {
+        let mut adjusted = false;
         if contract_version == 1 {
             // Preserve already-paid legacy transcription without inventing a
             // score or invoking the provider again to recover unscored facts.
             turn.person_facts.clear();
         }
-        validate_id("turn_id", &turn.turn_id)?;
-        validate_id("speaker_local_id", &turn.speaker_local_id)?;
-        if !ids.insert(turn.turn_id.clone()) {
+        if salvage {
+            // Decide drops before reserving an id, so a dropped turn never
+            // renames a later one and the kept ids stay the model's own.
+            if turn.text.bytes().any(|byte| byte == 0) {
+                turn.text = turn.text.replace('\0', "");
+                adjusted = true;
+            }
+            if turn.text.chars().count() > MAX_TEXT_LEN {
+                turn.text = turn.text.chars().take(MAX_TEXT_LEN).collect();
+                adjusted = true;
+            }
+            if turn.text.is_empty() || turn.start_ms >= duration_ms {
+                report.dropped_turns += 1;
+                continue;
+            }
+        }
+        if let Err(error) = validate_id("turn_id", &turn.turn_id) {
+            if !salvage {
+                return Err(error);
+            }
+            turn.turn_id = salvaged_id(&turn.turn_id, "turn", index);
+            adjusted = true;
+        }
+        if let Err(error) = validate_id("speaker_local_id", &turn.speaker_local_id) {
+            if !salvage {
+                return Err(error);
+            }
+            turn.speaker_local_id = salvaged_id(&turn.speaker_local_id, "speaker", index);
+            adjusted = true;
+        }
+        if salvage {
+            let (turn_id, renamed) = unique_turn_id(&mut ids, std::mem::take(&mut turn.turn_id));
+            turn.turn_id = turn_id;
+            adjusted |= renamed;
+        } else if !ids.insert(turn.turn_id.clone()) {
             return Err(EnclaveError::InvalidRequest(
                 "audio result has duplicate turn_id".into(),
             ));
@@ -2748,23 +2908,52 @@ pub(crate) fn parse_audio_result_for_contract(
         {
             turn.end_ms = duration_ms;
         }
-        if turn.start_ms < 0
-            || turn.end_ms <= turn.start_ms
-            || turn.end_ms > duration_ms
-            || turn.start_ms < previous_start
-        {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turn timestamps are invalid".into(),
-            ));
+        if salvage {
+            let mut boundary = false;
+            if turn.start_ms < 0 {
+                turn.start_ms = 0;
+                boundary = true;
+            }
+            if turn.start_ms < previous_start {
+                turn.start_ms = previous_start;
+                boundary = true;
+            }
+            if turn.end_ms > duration_ms {
+                turn.end_ms = duration_ms;
+                boundary = true;
+            }
+            if turn.end_ms <= turn.start_ms {
+                turn.end_ms = turn.start_ms.saturating_add(1_000).min(duration_ms);
+                boundary = true;
+            }
+            if turn.start_ms < previous_end && !turn.overlap && !previous_overlap {
+                turn.overlap = true;
+                adjusted = true;
+            }
+            if boundary {
+                push_quality_flag(&mut turn.quality_flags, INVALID_BOUNDARY_FLAG);
+                adjusted = true;
+            }
+        } else {
+            if turn.start_ms < 0
+                || turn.end_ms <= turn.start_ms
+                || turn.end_ms > duration_ms
+                || turn.start_ms < previous_start
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turn timestamps are invalid".into(),
+                ));
+            }
+            if turn.start_ms < previous_end && !turn.overlap && !previous_overlap {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turns overlap without an overlap marker".into(),
+                ));
+            }
         }
-        if turn.start_ms < previous_end && !turn.overlap && !previous_overlap {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turns overlap without an overlap marker".into(),
-            ));
-        }
-        if turn.text.is_empty()
-            || turn.text.chars().count() > MAX_TEXT_LEN
-            || turn.text.bytes().any(|byte| byte == 0)
+        if !salvage
+            && (turn.text.is_empty()
+                || turn.text.chars().count() > MAX_TEXT_LEN
+                || turn.text.bytes().any(|byte| byte == 0))
         {
             return Err(EnclaveError::InvalidRequest(
                 "audio turn text is invalid".into(),
@@ -2775,68 +2964,65 @@ pub(crate) fn parse_audio_result_for_contract(
             .as_ref()
             .is_some_and(|language| language.len() > 32 || language.bytes().any(|byte| byte == 0))
         {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turn language is invalid".into(),
-            ));
+            if !salvage {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turn language is invalid".into(),
+                ));
+            }
+            turn.language = None;
+            adjusted = true;
         }
-        if turn.person_facts.len() > 20
-            || turn.person_facts.iter().any(|fact| {
-                !matches!(
-                    fact.predicate.as_str(),
-                    "role"
-                        | "organization"
-                        | "relationship"
-                        | "preference"
-                        | "responsibility"
-                        | "contact"
-                        | "location"
-                        | "other"
-                ) || fact.value.trim().is_empty()
-                    || fact.value.len() > 2_000
-                    || fact.evidence.trim().is_empty()
-                    || fact.evidence.len() > 2_000
-                    || fact.replacement_of.as_ref().is_some_and(|value| {
-                        value.is_empty() || value.len() > 2_000 || value.bytes().any(|b| b == 0)
-                    })
-                    || fact
-                        .confidence
-                        .is_none_or(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
-            })
+        if turn.person_facts.len() > MAX_PERSON_FACTS
+            || !turn.person_facts.iter().all(person_fact_is_valid)
         {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turn person facts are invalid".into(),
-            ));
+            if !salvage {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turn person facts are invalid".into(),
+                ));
+            }
+            turn.person_facts.retain(person_fact_is_valid);
+            turn.person_facts.truncate(MAX_PERSON_FACTS);
+            adjusted = true;
         }
-        if turn
-            .speaker_name
-            .as_ref()
-            .is_some_and(|name| name.is_empty() || name.len() > 256 || name.bytes().any(|b| b == 0))
-            || turn
-                .speaker_name_confidence
-                .is_some_and(|confidence| !(0.0..=1.0).contains(&confidence))
-            || turn.speaker_name_evidence.as_ref().is_some_and(|evidence| {
-                evidence.is_empty() || evidence.len() > 2_000 || evidence.bytes().any(|b| b == 0)
-            })
-        {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turn speaker-name evidence is invalid".into(),
-            ));
+        if !speaker_name_fields_are_valid(&turn) {
+            if !salvage {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turn speaker-name evidence is invalid".into(),
+                ));
+            }
+            turn.speaker_name = None;
+            turn.speaker_name_confidence = None;
+            turn.speaker_name_evidence = None;
+            turn.speaker_name_kind = None;
+            turn.speaker_name_subject_turn_id = None;
+            turn.speaker_name_target_turn_id = None;
+            adjusted = true;
         }
-        if turn.quality_flags.len() > 16
-            || turn
+        if turn.quality_flags.len() > MAX_QUALITY_FLAGS
+            || !turn
                 .quality_flags
                 .iter()
-                .any(|flag| flag.len() > 64 || flag.bytes().any(|byte| byte == 0))
+                .all(|flag| quality_flag_is_valid(flag))
         {
-            return Err(EnclaveError::InvalidRequest(
-                "audio turn quality flags are invalid".into(),
-            ));
+            if !salvage {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio turn quality flags are invalid".into(),
+                ));
+            }
+            turn.quality_flags
+                .retain(|flag| quality_flag_is_valid(flag));
+            turn.quality_flags.truncate(MAX_QUALITY_FLAGS);
+            adjusted = true;
+        }
+        if adjusted {
+            report.adjusted_turns += 1;
         }
         previous_start = turn.start_ms;
         previous_end = turn.end_ms;
         previous_overlap = turn.overlap;
+        turns.push(turn);
     }
-    Ok(result.turns)
+    Ok((turns, report))
 }
 
 #[cfg(test)]
@@ -2886,7 +3072,7 @@ mod audio_turn_tests {
             "missing confidence must not silently downgrade a new recorded contract"
         );
         assert!(
-            super::parse_audio_result_for_contract(&value.to_string(), 1000, 3).is_err(),
+            super::parse_audio_result_for_contract(&value.to_string(), 1000, 4).is_err(),
             "unknown audio result contracts must not be interpreted as legacy"
         );
     }
@@ -2938,6 +3124,137 @@ mod audio_turn_tests {
         assert!(error
             .to_string()
             .contains("audio turn timestamps are invalid"));
+    }
+
+    fn salvage(raw: &str, duration_ms: i64) -> (Vec<super::AudioTurn>, super::AudioResultSalvage) {
+        super::parse_audio_result_with_salvage(
+            raw,
+            duration_ms,
+            super::AUDIO_RESULT_CONTRACT_VERSION,
+        )
+        .expect("contract 3 salvages malformed turns")
+    }
+
+    #[test]
+    fn contract_three_keeps_every_well_formed_result_byte_for_byte() {
+        let raw = result(&[turn("t1", 0, 4_000), turn("t2", 4_000, 77_000)]);
+        let strict = parse_audio_result(&raw, 77_779).unwrap();
+        let (kept, report) = salvage(&raw, 77_779);
+        assert_eq!(report, super::AudioResultSalvage::default());
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::to_value(&strict).unwrap(),
+            "salvage must be inert on a result the strict contract accepts"
+        );
+    }
+
+    #[test]
+    fn contract_three_repairs_timestamps_and_marks_them_unfit_for_voice() {
+        let duration_ms = 240_000;
+        let raw = result(&[
+            turn("t1", 0, 30_000),
+            turn("t2", 25_000, 60_000),
+            turn("t3", 50_000, 50_000),
+            turn("t4", 90_000, duration_ms + AUDIO_TURN_END_TOLERANCE_MS + 1),
+            turn("t5", duration_ms, duration_ms + 500),
+        ]);
+        assert!(
+            parse_audio_result(&raw, duration_ms).is_err(),
+            "the strict contract still discards this window"
+        );
+        let (kept, report) = salvage(&raw, duration_ms);
+        assert_eq!(
+            report.dropped_turns, 1,
+            "a turn starting at the window end has no audio"
+        );
+        assert_eq!(report.adjusted_turns, 3);
+        assert_eq!(kept.len(), 4);
+        assert!(
+            kept[1].overlap && kept[1].quality_flags.is_empty(),
+            "an unmarked overlap becomes an overlap marker, not a boundary repair"
+        );
+        assert_eq!(
+            (kept[2].start_ms, kept[2].end_ms),
+            (50_000, 51_000),
+            "a zero-length turn keeps its text on a minimal span"
+        );
+        assert_eq!(kept[2].quality_flags, vec!["invalid_boundary"]);
+        assert_eq!(
+            kept[3].end_ms, duration_ms,
+            "an overrun beyond the tolerance is clamped"
+        );
+        assert_eq!(kept[3].quality_flags, vec!["invalid_boundary"]);
+        let backwards = result(&[turn("t1", 10_000, 20_000), turn("t2", 5_000, 8_000)]);
+        let (kept, report) = salvage(&backwards, 30_000);
+        assert_eq!(report.adjusted_turns, 1);
+        assert_eq!(
+            (kept[1].start_ms, kept[1].end_ms, kept[1].overlap),
+            (10_000, 11_000, true),
+            "a turn that runs backwards is pinned after its predecessor and marked"
+        );
+        assert_eq!(
+            salvage(&backwards, 30_000)
+                .0
+                .iter()
+                .map(|t| t.turn_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2"],
+            "salvage is deterministic for the same bytes"
+        );
+    }
+
+    #[test]
+    fn contract_three_drops_only_empty_turns_and_repairs_ids_and_fields() {
+        let raw = format!(
+            r#"{{"turns":[
+                {{"turn_id":"t1","start_ms":0,"end_ms":1000,"speaker_local_id":"S1","text":"","overlap":false,"quality_flags":[]}},
+                {{"turn_id":"t1","start_ms":1000,"end_ms":2000,"speaker_local_id":"S 1!","text":"hi\u0000there","language":"{}","overlap":false,"quality_flags":["{}"],"person_facts":[{{"predicate":"organization","value":"Example","evidence":"at Example"}},{{"predicate":"role","value":"CTO","evidence":"I am CTO","confidence":0.9}}],"speaker_name":"","speaker_name_kind":"self_identification"}},
+                {{"turn_id":"","start_ms":2000,"end_ms":3000,"speaker_local_id":"S1","text":"ok","overlap":false,"quality_flags":[]}}
+            ]}}"#,
+            "x".repeat(40),
+            "f".repeat(70)
+        );
+        assert!(parse_audio_result(&raw, 3_000).is_err());
+        let (kept, report) = salvage(&raw, 3_000);
+        assert_eq!(report.dropped_turns, 1, "only the empty turn is lost");
+        assert_eq!(report.adjusted_turns, 2);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].turn_id, "t1");
+        assert_eq!(kept[0].speaker_local_id, "S-1-");
+        assert_eq!(kept[0].text, "hithere");
+        assert_eq!(kept[0].language, None);
+        assert!(
+            kept[0].quality_flags.is_empty(),
+            "an oversized flag is dropped"
+        );
+        assert_eq!(
+            kept[0].person_facts.len(),
+            1,
+            "only the unscored fact is dropped"
+        );
+        assert_eq!(kept[0].person_facts[0].predicate, "role");
+        assert_eq!(kept[0].speaker_name, None);
+        assert_eq!(
+            kept[0].speaker_name_kind, None,
+            "name evidence is cleared as a unit"
+        );
+        assert_eq!(
+            kept[1].turn_id, "turn-2",
+            "an empty id falls back to the turn position"
+        );
+        let duplicate = result(&[turn("dup", 0, 1_000), turn("dup", 1_000, 2_000)]);
+        let (kept, _) = salvage(&duplicate, 2_000);
+        assert_eq!(
+            kept.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(),
+            vec!["dup", "dup-2"]
+        );
+        assert!(
+            super::parse_audio_result_with_salvage(&result(&[]), 0, 3)
+                .unwrap()
+                .0
+                .is_empty(),
+            "an empty window stays empty"
+        );
     }
 
     #[test]

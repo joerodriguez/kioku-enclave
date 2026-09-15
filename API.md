@@ -623,7 +623,13 @@ The accepted event and its original clocks are immutable. The enclave plans
 canonical media into deterministic bounded work units before calling Gemini:
 
 - adjacent compatible audio events from one capture session and stream form a
-  window of at most five minutes, 20 MiB, and a one-second inter-event gap;
+  window of at most five minutes, 20 MiB, and a one-second inter-event gap; a
+  fragment shorter than five seconds (an iPhone recording's roughly one-second
+  provisional opening segment, sealed when its live lease arrives) is not planned
+  alone while its recording is still open and the fragment was received less than
+  three minutes ago, so its first real segment joins the same window and the same
+  request-local speaker labels instead of minting a speaker no later window can
+  stitch to; a finished recording's fragment plans at once;
 - a screen storyboard spans at most 90 seconds, 12 canonical frames, 16 MiB,
   and 24 million input pixels; and
 - reference observations have no media job, work-unit membership, output-token
@@ -633,7 +639,16 @@ Every work unit stores its ordered member events and exact window offsets.
 Every diarized turn stores its intersections with the original source-event
 intervals, including a turn that crosses an event boundary. Gemini offsets are
 validated against the assembled window; source timestamps, URLs, and literal
-device context always remain authoritative.
+device context always remain authoritative. Under audio result contract 3 (stamped on
+every new audio attempt) one malformed turn no longer discards the window's paid
+transcript: a turn with no text, or starting at or past the window end, is dropped;
+an id, timestamp, overlap marker, language, fact, name-evidence, or quality-flag
+defect is repaired deterministically from the response bytes, and a repaired
+timestamp also carries the `invalid_boundary` quality flag so the voice worker never
+fingerprints audio the model did not attribute. The enclave logs only the counts of
+dropped and adjusted turns. Recorded contract 1 and 2 attempts replay under their
+own strict rules, so already-projected history never changes; a response the strict
+rules accept is projected identically under contract 3.
 
 Gemini `speaker_local_id` values are request-local turn-grouping hints, not
 durable speaker identities. Existing source normalization removes exact local IDs such

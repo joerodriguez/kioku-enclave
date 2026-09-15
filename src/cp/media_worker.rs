@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::{EnclaveError, Result};
 use crate::persistence::{
@@ -628,7 +628,7 @@ async fn settle_staged_media(
                     response.attempt.clone(),
                 )
             })?;
-        let turns = super::media::parse_audio_result_for_contract(
+        let (turns, salvage) = super::media::parse_audio_result_with_salvage(
             &generation.text,
             window_end.saturating_sub(window_start),
             response.attempt.result_contract_version,
@@ -640,6 +640,17 @@ async fn settle_staged_media(
                 response.attempt.clone(),
             )
         })?;
+        if salvage != super::media::AudioResultSalvage::default() {
+            // Content-free: counts and the opaque work unit only.
+            info!(
+                user_id,
+                work_unit_id = claim.work_unit_id,
+                dropped_turns = salvage.dropped_turns,
+                adjusted_turns = salvage.adjusted_turns,
+                kept_turns = turns.len(),
+                "audio result salvaged"
+            );
+        }
         repository
             .settle_audio(AudioMediaSettlement {
                 claim: claim.clone(),

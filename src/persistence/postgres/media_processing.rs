@@ -197,7 +197,7 @@ fn validate_provider_attempt(
         media_provider_attempt_identity(account_id, work_unit_id, attempt.number, &request_sha256);
     if identity_sha256 != expected_identity
         || attempt.event_id != vertex_attempt_event_id(&identity_sha256)
-        || !matches!(attempt.result_contract_version, 1 | 2)
+        || !matches!(attempt.result_contract_version, 1 | 2 | 3)
     {
         return Err(EnclaveError::Store(
             "media provider journal identity commitment is invalid".into(),
@@ -663,6 +663,44 @@ async fn resolve_invalid_persisted_media_work(
         .await?;
     }
     Ok(PersistedMediaWorkResolution::Held)
+}
+
+/// Receipt age uses the enclave's own `received_at`, never device clocks, and
+/// a finished session (`ended_at` set) releases the hold immediately.
+async fn audio_fragment_must_wait(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    plan: &media_planner::WorkPlan,
+    selected: &[MediaProcessingJob],
+) -> Result<bool> {
+    if plan.class != media_planner::WorkClass::Audio
+        || plan.ended_ms.saturating_sub(plan.started_ms) >= media_planner::MIN_AUDIO_WINDOW_MS
+    {
+        return Ok(false);
+    }
+    let events = selected
+        .iter()
+        .map(|job| job.event_id.as_str())
+        .collect::<Vec<_>>();
+    let row = sqlx::query(
+        "SELECT bool_or(session.ended_at IS NOT NULL) AS session_finished, \
+                floor(extract(epoch FROM clock_timestamp()-max(e.received_at))*1000)::bigint \
+                    AS newest_receipt_age_ms \
+           FROM capture_events e \
+           JOIN capture_sessions session \
+             ON session.account_id=e.account_id AND session.id=e.capture_session_id \
+          WHERE e.account_id=$1 AND e.event_id=ANY($2::text[])",
+    )
+    .bind(account_id)
+    .bind(&events)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(media_planner::audio_fragment_hold(
+        plan,
+        row.try_get::<Option<bool>, _>("session_finished")?
+            .unwrap_or(false),
+        row.try_get::<Option<i64>, _>("newest_receipt_age_ms")?,
+    ))
 }
 
 /// A job can be bound to only one durable work unit. Reclaim that exact
@@ -1349,6 +1387,15 @@ impl MediaProcessingRepository for PostgresPersistence {
                 .filter(|job| member_ids.contains(&job.id))
                 .cloned()
                 .collect::<Vec<_>>();
+            // A fragment of an open recording waits, before any work unit is
+            // persisted, so its next contiguous segment can join the window.
+            // Legacy replans keep their recovered membership.
+            if compatibility_recovery.is_none()
+                && audio_fragment_must_wait(&mut transaction, account_id, &plan, &selected).await?
+            {
+                transaction.commit().await?;
+                return Ok(None);
+            }
             let work_unit_id = work_unit_id(class, &selected);
             (selected, work_unit_id, plan.started_ms, plan.ended_ms)
         };
@@ -4661,7 +4708,7 @@ pub(super) async fn test_begin_media_provider_attempt(
     Ok(MediaProviderAttempt {
         number: claim.provider_attempt_number,
         result_contract_version: if claim.class == MediaProcessingClass::Audio {
-            2
+            crate::cp::media::AUDIO_RESULT_CONTRACT_VERSION
         } else {
             1
         },
@@ -5958,6 +6005,172 @@ mod tests {
         fixture.base.pool().close().await;
     }
 
+    async fn insert_audio_fragment(
+        repo: &PostgresPersistence,
+        account: &str,
+        event_id: &str,
+        sequence: i64,
+        start_offset_seconds: f64,
+        duration_seconds: f64,
+        received_age_seconds: f64,
+    ) {
+        sqlx::query(
+            "INSERT INTO capture_events( \
+                 account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind, \
+                 sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id, \
+                 utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,context_json, \
+                 audio_role,audio_route,route_epoch,media_disposition,dedupe_version,received_at) \
+             VALUES($1,$2,'planner-device','planner-install','planner-session','planner-mic','mic',$3, \
+                    clock_timestamp()-make_interval(secs=>$4),$3::text, \
+                    clock_timestamp()-make_interval(secs=>$4), \
+                    clock_timestamp()-make_interval(secs=>$4-$5), \
+                    'UTC',0,0,'asset-'||$2,repeat('a',64),'{}','ambient','builtin_mic',0, \
+                    'canonical',1,clock_timestamp()-make_interval(secs=>$6))",
+        )
+        .bind(account)
+        .bind(event_id)
+        .bind(sequence)
+        .bind(start_offset_seconds)
+        .bind(duration_seconds)
+        .bind(received_age_seconds)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_objects( \
+                 account_id,asset_id,event_id,object_key,object_generation,object_backend,mime_type, \
+                 codec,byte_length,sha256,sample_rate,channels,processing_state) \
+             VALUES($1,'asset-'||$2,$2,'media/'||$2,1,'current','audio/mp4','aac',72000, \
+                    repeat('b',64),48000,1,'queued')",
+        )
+        .bind(account)
+        .bind(event_id)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_processing_jobs( \
+                 account_id,event_id,job_kind,input_revision,processor_version,state) \
+             VALUES($1,$2,'gemini_audio','planner-input-'||$2,1,'pending')",
+        )
+        .bind(account)
+        .bind(event_id)
+        .execute(repo.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn seed_fragment_account(repo: &PostgresPersistence, account: &str) {
+        super::super::voice_identity::tests::seed_voice_observation(
+            repo,
+            account,
+            "planner-session",
+            "bootstrap",
+            100,
+            100,
+        )
+        .await;
+        sqlx::query("INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind,committed_through_sequence) VALUES($1,'planner-mic','planner-session','planner-device','mic',0)").bind(account).execute(repo.pool()).await.unwrap();
+    }
+
+    async fn claim_audio(
+        repo: &PostgresPersistence,
+        account: &str,
+    ) -> Option<MediaProcessingClaim> {
+        repo.claim(
+            account,
+            MediaProcessingClass::Audio,
+            "2099-01-01T00:00:00.000Z",
+            300,
+            128,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_opening_fragment_of_an_open_recording_waits_for_its_first_segment() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const ACCOUNT: &str = "media-fragment-hold";
+        seed_fragment_account(repo, ACCOUNT).await;
+        // The ~1 s provisional segment an iPhone seals when its lease arrives.
+        insert_audio_fragment(repo, ACCOUNT, "stub", 0, 600.0, 1.6, 0.0).await;
+        assert!(
+            claim_audio(repo, ACCOUNT).await.is_none(),
+            "a fresh opening fragment of an open recording is not planned alone"
+        );
+        let (state, units): (String, i64) = sqlx::query_as(
+            "SELECT j.state,(SELECT count(*) FROM media_work_members m \
+                              WHERE m.account_id=j.account_id AND m.event_id=j.event_id) \
+               FROM media_processing_jobs j WHERE j.account_id=$1 AND j.event_id='stub'",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), units),
+            ("pending", 0),
+            "a held fragment is neither failed nor bound to a work unit"
+        );
+        // The first real segment starts exactly where the fragment ended.
+        insert_audio_fragment(repo, ACCOUNT, "segment", 1, 598.4, 120.0, 0.0).await;
+        let claim = claim_audio(repo, ACCOUNT)
+            .await
+            .expect("the fragment and its first segment plan together");
+        let mut events = claim
+            .jobs
+            .iter()
+            .map(|job| job.event_id.as_str())
+            .collect::<Vec<_>>();
+        events.sort_unstable();
+        assert_eq!(events, vec!["segment", "stub"]);
+        assert_eq!(
+            claim.jobs.len(),
+            2,
+            "one window carries both events so Gemini labels them together"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fragment_plans_alone_once_its_recording_finished_or_it_aged() {
+        let Some(fixture) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &fixture.persistence;
+        const FINISHED: &str = "media-fragment-finished";
+        seed_fragment_account(repo, FINISHED).await;
+        insert_audio_fragment(repo, FINISHED, "stub", 0, 600.0, 1.6, 0.0).await;
+        sqlx::query("UPDATE capture_sessions SET ended_at=clock_timestamp() WHERE account_id=$1 AND id='planner-session'")
+            .bind(FINISHED)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        let claim = claim_audio(repo, FINISHED)
+            .await
+            .expect("a finished recording's fragment is its whole transcript");
+        assert_eq!(claim.jobs.len(), 1);
+        const AGED: &str = "media-fragment-aged";
+        seed_fragment_account(repo, AGED).await;
+        insert_audio_fragment(
+            repo,
+            AGED,
+            "stub",
+            0,
+            600.0,
+            1.6,
+            (media_planner::AUDIO_FRAGMENT_HOLD_MS / 1_000) as f64 + 1.0,
+        )
+        .await;
+        let claim = claim_audio(repo, AGED)
+            .await
+            .expect("a fragment that waited its bound plans alone");
+        assert_eq!(claim.jobs.len(), 1);
+    }
+
     #[tokio::test]
     async fn media_speaker_projection_accepted_name_refreshes_existing_profile_memories() {
         use super::super::identity_fusion_contract::{intro, reduce, seed};
@@ -6179,6 +6392,14 @@ mod tests {
             "reclaim must preserve the frozen scored-fact contract"
         );
         recovered.result_contract_version = 3;
+        assert_eq!(
+            validate_provider_attempt("account", "work", &recovered)
+                .unwrap()
+                .result_contract_version,
+            3,
+            "the salvaging audio contract is a recorded result version"
+        );
+        recovered.result_contract_version = 4;
         assert!(
             validate_provider_attempt("account", "work", &recovered).is_err(),
             "unsupported recorded result versions must never silently downgrade"
