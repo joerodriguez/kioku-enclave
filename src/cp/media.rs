@@ -2758,9 +2758,9 @@ fn speaker_name_fields_are_valid(turn: &AudioTurn) -> bool {
         .speaker_name
         .as_ref()
         .is_some_and(|name| name.is_empty() || name.len() > 256 || name.bytes().any(|b| b == 0))
-        && !turn
+        && turn
             .speaker_name_confidence
-            .is_some_and(|confidence| !(0.0..=1.0).contains(&confidence))
+            .is_none_or(|confidence| (0.0..=1.0).contains(&confidence))
         && !turn.speaker_name_evidence.as_ref().is_some_and(|evidence| {
             evidence.is_empty() || evidence.len() > 2_000 || evidence.bytes().any(|b| b == 0)
         })
@@ -2839,7 +2839,7 @@ pub(crate) fn parse_audio_result_with_salvage(
     duration_ms: i64,
     contract_version: u32,
 ) -> Result<(Vec<AudioTurn>, AudioResultSalvage)> {
-    if !matches!(contract_version, 1 | 2 | 3) {
+    if !matches!(contract_version, 1..=3) {
         return Err(EnclaveError::InvalidRequest(
             "audio result contract is unsupported".into(),
         ));
