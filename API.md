@@ -1495,8 +1495,12 @@ rows or owned media generations remain.
   source spans. It compares only the same embedding space, scorer version, and acoustic
   domain, trying usable owner profiles first, then same-session continuity. A cosine
   score of at least 0.60 and a runner-up margin of at least
-  0.08 permits attachment; below 0.45 an enrollment-eligible sample may create an anonymous
-  profile. Other samples remain unassigned. One-to-three-second samples can match but
+  0.10 permits attachment; below 0.35 an enrollment-eligible sample may create an anonymous
+  profile. Other samples remain unassigned (0.45 sat inside the same-speaker mass on short
+  far-field turns and minted one profile per paragraph; a create is undone only by a later
+  merge or absorption, while an abstained sample is re-scored every sweep, and the margin
+  is what separates two similar voices under one microphone, so creation and margin are the
+  values spent — the match threshold is not, per ADR-0006's real-capture calibration). One-to-three-second samples can match but
   never create or update a representative; overlap and failed quality gates quarantine.
   A turn longer than the thirty-second model bound is reconstructed whole (up to the
   audio window bound) and the thirty-second window that the level gate admits with the
@@ -1540,9 +1544,11 @@ rows or owned media generations remain.
 - Profile maintenance uses derivation version 3. Up to 16 older assigned profiles per
   sweep adopt the current policy from complete retained samples, without new inference;
   owner and already-quarantined profiles are never revived by this pass. Cross-memory
-  matching and recurring People require the current derivation. Two separated modes with
-  at least three clean observations each, each at least one quarter of clean support,
-  quarantine a profile for matching; they never trigger an automatic split.
+  matching and recurring People require the current derivation. Two separated modes
+  (sub-centroid cosine below the dedicated 0.45 mode-separation constant, which no longer
+  follows the creation threshold) with at least three clean observations each, each at
+  least one quarter of clean support, quarantine a profile for matching; they never
+  trigger an automatic split.
 - Reciprocal merges keep policy version 1; absorption proposals carry policy version 2.
   A tentative fragment — complete, clean, non-owner support from fewer than three
   observations whose recordings have all finished with no audio or voice work still in
@@ -1550,7 +1556,7 @@ rows or owned media generations remain.
   stable, merge-eligible profile that every one of its clean samples would have matched
   under the ordinary decision had that profile existed when the sample arrived: the
   owner's profiles are tried first as live matching tries them (a sample the owner path
-  would claim holds the fragment), then the 0.60 score with the 0.08 runner-up margin
+  would claim holds the fragment), then the 0.60 score with the 0.10 runner-up margin
   against every compatible non-fragment profile including the owner's (stricter than the
   live non-owner scope, which excludes owner profiles), so an owner profile can block an
   absorption but never receives one. Other fragments are
@@ -1573,7 +1579,7 @@ rows or owned media generations remain.
   pending-adoption candidates.
   Adoption examines complete retained support independently of proposal-size bounds.
   Every clean observation on each side must choose the other profile at the ordinary
-  0.60 score and 0.08 margin; different identified person IDs conflict regardless of name.
+  0.60 score and 0.10 margin; different identified person IDs conflict regardless of name.
   The complete decision is bounded to 64 profiles, 256 assigned samples per proposal and
   four proposals per sweep; an incomplete population cannot authorize a merge. Oversized
   pairs remain competitors but do not block later applicable pairs.

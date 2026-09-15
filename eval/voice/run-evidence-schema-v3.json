@@ -80,8 +80,8 @@
         "scorer_version": {"const": 2},
         "quality_version": {"const": 1},
         "match_threshold": {"const": 0.6},
-        "new_profile_threshold": {"const": 0.45},
-        "minimum_decision_margin": {"const": 0.08},
+        "new_profile_threshold": {"const": 0.35},
+        "minimum_decision_margin": {"const": 0.1},
         "outlier_similarity": {"const": 0.5}
       }
     },

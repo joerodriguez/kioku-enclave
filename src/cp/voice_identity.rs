@@ -271,12 +271,18 @@ mod tests {
             ContinuityDecision::Match(1)
         );
         assert_eq!(
-            decide_continuity(&[(1, 0.44)], SampleDecision::Enroll).0,
+            decide_continuity(&[(1, 0.34)], SampleDecision::Enroll).0,
             ContinuityDecision::Create
         );
         assert_eq!(
-            decide_continuity(&[(1, 0.45)], SampleDecision::Enroll).0,
-            ContinuityDecision::Abstain
+            decide_continuity(&[(1, 0.35)], SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "a near-miss of the speaker's own profile waits instead of minting a duplicate"
+        );
+        assert_eq!(
+            decide_continuity(&[(1, 0.7), (2, 0.61)], SampleDecision::Enroll).0,
+            ContinuityDecision::Abstain,
+            "two candidates inside the margin stay ambiguous"
         );
         assert_eq!(
             decide_continuity(&[], SampleDecision::MatchOnly).0,
@@ -306,7 +312,7 @@ mod tests {
             "confident same-recording continuity must retain scope priority"
         );
         assert_eq!(
-            decide_scoped_continuity(&[(1, 0.44)], &[(1, 0.44), (2, 0.3)], SampleDecision::Enroll)
+            decide_scoped_continuity(&[(1, 0.34)], &[(1, 0.34), (2, 0.3)], SampleDecision::Enroll)
                 .0,
             ContinuityDecision::Create
         );

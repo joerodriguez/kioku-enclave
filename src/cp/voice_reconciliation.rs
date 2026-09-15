@@ -3,7 +3,7 @@ use super::{
     voice_identity::{
         decide_continuity, representative, ContinuityDecision, MIN_STABLE_OBSERVATIONS,
     },
-    voice_memory::{MATCH_THRESHOLD, MIN_DECISION_MARGIN, NEW_PROFILE_THRESHOLD},
+    voice_memory::{MATCH_THRESHOLD, MIN_DECISION_MARGIN},
     voice_quality::{cosine, SampleDecision},
 };
 use crate::error::Result;
@@ -21,6 +21,11 @@ pub(crate) const MAX_PROPOSALS: usize = 4;
 pub(crate) const MAX_FRAGMENTS: usize = 16;
 pub(crate) const MERGE_REASON: &str = "mutual_clean_support";
 pub(crate) const ABSORPTION_REASON: &str = "tentative_absorbed";
+/// Two clean sub-centroids further apart than this are distinct voices and
+/// quarantine the profile. Sub-centroids are far less noisy than chunks, so
+/// this is deliberately stricter than the creation threshold and must stay
+/// below `OUTLIER_SIMILARITY`, from whose complement the second mode is drawn.
+pub(crate) const MODE_SEPARATION_THRESHOLD: f32 = 0.45;
 
 #[derive(Clone)]
 pub(crate) struct Profile {
@@ -100,7 +105,7 @@ pub(crate) fn has_distinct_modes(samples: &[(i64, Vec<f32>)]) -> Result<bool> {
         |count: i64| count >= MIN_STABLE_OBSERVATIONS as i64 && count * 4 >= samples.len() as i64;
     Ok(enough(first.sample_count)
         && enough(second.sample_count)
-        && cosine(&first.centroid, &second.centroid) < NEW_PROFILE_THRESHOLD)
+        && cosine(&first.centroid, &second.centroid) < MODE_SEPARATION_THRESHOLD)
 }
 
 /// Every clean observation must pick the same other profile at the ordinary
@@ -569,6 +574,18 @@ mod tests {
         assert!(
             !has_distinct_modes(&clean).unwrap(),
             "one coherent voice must remain usable"
+        );
+        // Mode separation is its own constant: sub-centroids 0.40 apart are two
+        // voices even though 0.40 is above the creation threshold.
+        let mut near = (1..=3).map(|id| (id, vector(1., 0.))).collect::<Vec<_>>();
+        near.extend((4..=6).map(|id| (id, vector(0.4, 0.9165))));
+        assert!(
+            MODE_SEPARATION_THRESHOLD > super::super::voice_memory::NEW_PROFILE_THRESHOLD
+                && MODE_SEPARATION_THRESHOLD < super::super::voice_quality::OUTLIER_SIMILARITY
+        );
+        assert!(
+            has_distinct_modes(&near).unwrap(),
+            "two-voice contamination above the creation threshold still quarantines"
         );
     }
 

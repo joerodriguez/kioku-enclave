@@ -38,9 +38,22 @@ pub(crate) const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
 /// turn up to the audio window bound, which is the longest turn Gemini can emit.
 pub(crate) const MAX_TURN_SCAN_SAMPLES: usize =
     TARGET_SAMPLE_RATE as usize * (super::media_planner::MAX_AUDIO_WINDOW_MS / 1_000) as usize;
+/// Turn-versus-centroid attachment threshold. ADR-0006's real-capture
+/// calibration put different-speaker medians right under it; a wrong match
+/// is the unrecoverable error, so recall is never bought here.
 pub(crate) const MATCH_THRESHOLD: f32 = 0.60;
-pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.45;
-pub(crate) const MIN_DECISION_MARGIN: f32 = 0.08;
+/// Below this an enrollment-eligible sample creates an anonymous profile.
+/// 0.45 sat inside the same-speaker mass on short far-field turns, so a quiet
+/// recording minted one profile per paragraph; a create is undone only by a
+/// later merge or absorption, while an abstained sample is re-scored every
+/// sweep, so creation is the threshold to spend. Two-mode quarantine keeps its
+/// own separation constant (`voice_reconciliation::MODE_SEPARATION_THRESHOLD`).
+pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.35;
+/// Best-minus-runner-up margin. The difference is invariant to the common
+/// shift a shared room and microphone add to every score, so it is what
+/// separates two similar voices that both have profiles; it is vacuous (best
+/// against -1) whenever a scope holds one candidate.
+pub(crate) const MIN_DECISION_MARGIN: f32 = 0.10;
 const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct VoiceEngine {
