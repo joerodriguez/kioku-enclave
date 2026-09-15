@@ -624,12 +624,15 @@ canonical media into deterministic bounded work units before calling Gemini:
 
 - adjacent compatible audio events from one capture session and stream form a
   window of at most five minutes, 20 MiB, and a one-second inter-event gap; a
-  fragment shorter than five seconds (an iPhone recording's roughly one-second
-  provisional opening segment, sealed when its live lease arrives) is not planned
-  alone while its recording is still open and the fragment was received less than
-  three minutes ago, so its first real segment joins the same window and the same
-  request-local speaker labels instead of minting a speaker no later window can
-  stitch to; a finished recording's fragment plans at once;
+  fragment shorter than five seconds that opens its capture stream (an iPhone
+  recording's roughly one-second provisional opening segment, sealed when its live
+  lease arrives) is not planned alone while its recording is still open and the
+  fragment was received less than five minutes ago, so its first real segment joins
+  the same window and the same request-local speaker labels instead of minting a
+  speaker no later window can stitch to; a finished recording's fragment plans at
+  once, a short event later in a stream is never held, and because the planner
+  always takes the account's oldest audio head, a held opening fragment defers the
+  account's other pending audio windows for at most that bound;
 - a screen storyboard spans at most 90 seconds, 12 canonical frames, 16 MiB,
   and 24 million input pixels; and
 - reference observations have no media job, work-unit membership, output-token

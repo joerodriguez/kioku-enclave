@@ -10,19 +10,24 @@ pub enum WorkClass {
 pub const MAX_AUDIO_WINDOW_MS: i64 = 5 * 60 * 1_000;
 pub const MAX_AUDIO_GAP_MS: i64 = 1_000;
 pub const MAX_AUDIO_BYTES: i64 = 20 * 1024 * 1024;
-/// An audio window shorter than this is a fragment: the roughly one-second
-/// provisional segment an iPhone recording seals the instant its live lease
-/// arrives, or a recording stopped almost immediately. Planned alone it is a
-/// Vertex call whose turns are too short for voice continuity, so every such
-/// recording would mint a speaker that no later window can stitch to. While
-/// the recording is still open and the fragment is fresh, the claim holds it
-/// so the next contiguous segment joins the same window.
+/// An audio window shorter than this that opens its capture stream is a
+/// fragment: the roughly one-second provisional segment an iPhone recording
+/// seals the instant its live lease arrives, or a recording stopped almost
+/// immediately. Planned alone it is a Vertex call whose turns are too short
+/// for voice continuity, so every such recording would mint a speaker that no
+/// later window can stitch to. While the recording is still open and the
+/// fragment is fresh, the claim holds it so the next contiguous segment joins
+/// the same window. A short event later in a stream is not held: nothing
+/// contiguous is expected to follow it, and holding the account's audio head
+/// for it would only delay every other pending window.
 pub const MIN_AUDIO_WINDOW_MS: i64 = 5_000;
-/// How long a fragment may wait for its neighbor, measured from the enclave's
-/// own receipt of the fragment's newest member so a device clock can never
-/// extend the hold. An iPhone segment lasts at most 120 s and the tail of a
-/// stopped recording arrives with the finish, so this covers both.
-pub const AUDIO_FRAGMENT_HOLD_MS: i64 = 180_000;
+/// How long an opening fragment may wait for its neighbor, measured from the
+/// enclave's own receipt of the fragment's newest member so a device clock can
+/// never extend the hold. An iPhone segment lasts 120 s plus its upload, and
+/// the tail of a stopped recording arrives with the finish, which releases the
+/// hold on its own; the bound only matters when the first real segment never
+/// arrives, and it equals the longest window the planner would build anyway.
+pub const AUDIO_FRAGMENT_HOLD_MS: i64 = MAX_AUDIO_WINDOW_MS;
 pub const MAX_SCREEN_SPAN_MS: i64 = 90 * 1_000;
 /// Frames per storyboard. Eight frames keep a text-dense storyboard (bounded
 /// per-frame text plus up to six labeled people per frame) comfortably inside
@@ -134,16 +139,19 @@ pub fn plan_first(candidates: &[PlanningEvent]) -> WorkPlan {
 }
 
 /// Whether a freshly planned audio window must wait for a neighbor instead
-/// of being claimed now. A finished recording sends nothing more, and an old
-/// fragment has already waited its bound, so both plan immediately.
+/// of being claimed now. Only a window that opens its stream qualifies; a
+/// finished recording sends nothing more, and an old fragment has already
+/// waited its bound, so both plan immediately.
 pub fn audio_fragment_hold(
     plan: &WorkPlan,
+    opens_stream: bool,
     session_finished: bool,
     newest_receipt_age_ms: Option<i64>,
 ) -> bool {
     plan.class == WorkClass::Audio
         && !plan.member_job_ids.is_empty()
         && plan.ended_ms.saturating_sub(plan.started_ms) < MIN_AUDIO_WINDOW_MS
+        && opens_stream
         && !session_finished
         && newest_receipt_age_ms.is_some_and(|age| age < AUDIO_FRAGMENT_HOLD_MS)
 }
@@ -336,19 +344,23 @@ mod tests {
         let plan = plan_first(&stub);
         assert_eq!(plan.member_job_ids, vec![1]);
         assert!(
-            audio_fragment_hold(&plan, false, Some(0)),
+            audio_fragment_hold(&plan, true, false, Some(0)),
             "a one-second opening stub of an open recording must wait for the next segment"
         );
         assert!(
-            !audio_fragment_hold(&plan, true, Some(0)),
+            !audio_fragment_hold(&plan, false, false, Some(0)),
+            "a short event later in its stream expects no neighbor and plans at once"
+        );
+        assert!(
+            !audio_fragment_hold(&plan, true, true, Some(0)),
             "a finished recording cannot grow, so its fragment plans at once"
         );
         assert!(
-            !audio_fragment_hold(&plan, false, Some(AUDIO_FRAGMENT_HOLD_MS)),
+            !audio_fragment_hold(&plan, true, false, Some(AUDIO_FRAGMENT_HOLD_MS)),
             "a fragment that already waited its bound plans alone"
         );
         assert!(
-            !audio_fragment_hold(&plan, false, None),
+            !audio_fragment_hold(&plan, true, false, None),
             "an unknown receipt age never holds work"
         );
         let joined = vec![
@@ -361,10 +373,10 @@ mod tests {
             vec![1, 2],
             "the stub joins the first real segment in one window"
         );
-        assert!(!audio_fragment_hold(&plan, false, Some(0)));
+        assert!(!audio_fragment_hold(&plan, true, false, Some(0)));
         let screen = vec![event(3, WorkClass::Screen, "s", 0, 0, 1_000)];
         assert!(
-            !audio_fragment_hold(&plan_first(&screen), false, Some(0)),
+            !audio_fragment_hold(&plan_first(&screen), true, false, Some(0)),
             "storyboards never wait on audio fragment policy"
         );
     }

@@ -665,8 +665,10 @@ async fn resolve_invalid_persisted_media_work(
     Ok(PersistedMediaWorkResolution::Held)
 }
 
-/// Receipt age uses the enclave's own `received_at`, never device clocks, and
-/// a finished session (`ended_at` set) releases the hold immediately.
+/// Only a window whose members open their capture stream (no earlier
+/// sequence exists) is a candidate. Receipt age uses the enclave's own
+/// `received_at`, never device clocks, and a finished session (`ended_at`
+/// set) releases the hold immediately.
 async fn audio_fragment_must_wait(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
@@ -683,7 +685,11 @@ async fn audio_fragment_must_wait(
         .map(|job| job.event_id.as_str())
         .collect::<Vec<_>>();
     let row = sqlx::query(
-        "SELECT bool_or(session.ended_at IS NOT NULL) AS session_finished, \
+        "SELECT bool_and(NOT EXISTS(SELECT 1 FROM capture_events earlier \
+                    WHERE earlier.account_id=e.account_id AND earlier.stream_id=e.stream_id \
+                      AND earlier.sequence<e.sequence \
+                      AND NOT (earlier.event_id=ANY($2::text[])))) AS opens_stream, \
+                bool_or(session.ended_at IS NOT NULL) AS session_finished, \
                 floor(extract(epoch FROM clock_timestamp()-max(e.received_at))*1000)::bigint \
                     AS newest_receipt_age_ms \
            FROM capture_events e \
@@ -697,6 +703,8 @@ async fn audio_fragment_must_wait(
     .await?;
     Ok(media_planner::audio_fragment_hold(
         plan,
+        row.try_get::<Option<bool>, _>("opens_stream")?
+            .unwrap_or(false),
         row.try_get::<Option<bool>, _>("session_finished")?
             .unwrap_or(false),
         row.try_get::<Option<i64>, _>("newest_receipt_age_ms")?,
@@ -6169,6 +6177,23 @@ mod tests {
             .await
             .expect("a fragment that waited its bound plans alone");
         assert_eq!(claim.jobs.len(), 1);
+        const MID_STREAM: &str = "media-fragment-mid-stream";
+        seed_fragment_account(repo, MID_STREAM).await;
+        // An earlier, already-processed event opened this stream; a later
+        // short event expects no contiguous neighbor and must not stall the
+        // account's audio head.
+        insert_audio_fragment(repo, MID_STREAM, "opening", 0, 900.0, 120.0, 600.0).await;
+        sqlx::query("UPDATE media_processing_jobs SET state='succeeded' WHERE account_id=$1 AND event_id='opening'")
+            .bind(MID_STREAM)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        insert_audio_fragment(repo, MID_STREAM, "blip", 1, 600.0, 2.0, 0.0).await;
+        let claim = claim_audio(repo, MID_STREAM)
+            .await
+            .expect("a short event that does not open its stream plans at once");
+        assert_eq!(claim.jobs.len(), 1);
+        assert_eq!(claim.jobs[0].event_id, "blip");
     }
 
     #[tokio::test]
