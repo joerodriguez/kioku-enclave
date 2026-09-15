@@ -17,7 +17,7 @@ release migrator applies the append-only files under `migrations/`.
 
 | File | Responsibility |
 |---|---|
-| `speaker_identity.rs` / `speaker_identity.sql` | Shared current Me/name/lettered-slot presentation, provenance and person links; first-speech slot allocation, cluster/profile promotion and successor inheritance. Deletion-fenced preparation compares graph/projection signatures in bounded transactions; participant reads use the same graph snapshot and structural legacy fallback. |
+| `speaker_identity.rs` / `speaker_identity.sql` | Shared current Me/name/lettered-slot presentation, provenance and person links; first-speech slot allocation, cluster/profile promotion and successor inheritance. Deletion-fenced preparation compares graph/projection signatures in bounded transactions; participant reads use the same graph snapshot and structural legacy fallback, and list only graph-backed voices (owner, person, or voice profile) — an unclaimed request-local cluster keeps its lettered transcript slot but is never a participant. |
 | `speaker_writer_contract.rs` | Real PostgreSQL formation and signed-Active reconciliation contracts proving synchronous slot persistence, retained/successor stability, canonical organizer input and unchanged source commitments. |
 | `speaker_query_contract.rs` | Real PostgreSQL canonical label/participant parity across read surfaces, historical speaker-filter preparation, snapshot consistency, playback, export and tenant isolation. |
 | `voice_worker_contract.rs` | Test-only real PostgreSQL/encrypted fake-GCS serving exercise, decoded-cache reuse and provider-free missing-media expiry. |

@@ -768,7 +768,7 @@ async fn identity_presentation_memory_list_and_members_share_current_revision_wi
     assert_eq!(item["owner"], "Ana");
     assert_eq!(item["text"], "Ana said \"Speaker A agrees\"");
     assert_eq!(item["evidence"][0]["quote"], "Speaker A agrees");
-    assert_eq!(memory["participants"],json!(["Ana","Speaker B"]),"public participant strings must come from current graph participants, never model-mentioned attendees");
+    assert_eq!(memory["participants"],json!(["Ana"]),"public participant strings must come from current graph participants, never model-mentioned attendees or unclaimed request-local clusters");
     let members = repo.episode_members(account, 1).await.unwrap();
     assert_eq!(
         memory["identity_revision"],
@@ -865,8 +865,8 @@ async fn identity_presentation_search_status_and_outbound_freeze_use_current_gra
     let candidate = repo.next_webhook_candidate(account).await.unwrap().unwrap();
     assert_eq!(
         candidate.episode.participants,
-        vec!["Ana", "Speaker B"],
-        "outbound participants must come from graph speakers at freeze time"
+        vec!["Ana"],
+        "outbound participants must come from graph-backed speakers at freeze time"
     );
     assert_eq!(
         candidate.episode.overview, "Ana planned travel",
@@ -909,7 +909,7 @@ async fn identity_presentation_search_status_and_outbound_freeze_use_current_gra
         delivered.overview, "Bao planned travel",
         "morning email must freeze current mapped prose before its first send"
     );
-    assert_eq!(delivered.participants, vec!["Bao", "Speaker B"]);
+    assert_eq!(delivered.participants, vec!["Bao"]);
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT title FROM episodes WHERE account_id=$1 AND id=1")
             .bind(account)
@@ -917,6 +917,67 @@ async fn identity_presentation_search_status_and_outbound_freeze_use_current_gra
             .await
             .unwrap(),
         "Speaker A planned travel"
+    );
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn memory_participants_are_only_graph_backed_voices() {
+    let Some(fixture) = test_persistence().await else {
+        return;
+    };
+    let repo = &fixture.persistence;
+    let account = "41000000-0000-0000-0000-000000000016";
+    // One recording transcribed as three audio windows: Gemini restarted its
+    // speaker labels each time, so one voice became three request-local clusters.
+    // Only the first window's sample bound to a voice profile.
+    for id in 1..=3 {
+        seed_voice_observation(repo, account, "session", &format!("event-{id}"), id, id).await;
+        seed_voice_memory(repo, account, id, 1).await;
+    }
+    sqlx::query("INSERT INTO voice_profiles(account_id,id,label,embedding_space,channel_domain,centroid,status) VALUES($1,1,'Private profile label','reader-test','ambient_mic','\\x1234'::bytea,'stable')").bind(account).execute(repo.pool()).await.unwrap();
+    sqlx::query("UPDATE speaker_clusters SET voice_profile_id=1,attribution_state='anonymous_profile' WHERE account_id=$1 AND id=1").bind(account).execute(repo.pool()).await.unwrap();
+    let page = repo.list_episodes(account, &list_request()).await.unwrap();
+    let memory = &page.episodes[0];
+    assert_eq!(
+        memory["participants"],
+        json!(["Speaker A"]),
+        "an unclaimed request-local cluster is not a participant"
+    );
+    let members = repo.episode_members(account, 1).await.unwrap();
+    assert_eq!(
+        members["participant_details"], memory["participant_details"],
+        "list/member participant details must agree"
+    );
+    let details = members["participant_details"].as_array().unwrap();
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0]["participant_key"], "voice_profile:1");
+    assert_eq!(details[0]["attribution_kind"], "verified_voice");
+    let mut labels = members["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["speaker_label"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    labels.sort();
+    assert_eq!(
+        labels,
+        vec!["Speaker A", "Speaker B", "Speaker C"],
+        "unclaimed clusters keep their lettered transcript slots"
+    );
+    assert_eq!(
+        repo.search(account, &search_request("Synthetic", Some("Speaker C")))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a lettered slot stays filterable even though it is not a participant"
+    );
+    let projected: i64 = sqlx::query_scalar("SELECT count(*) FROM episode_participants WHERE account_id=$1 AND episode_id=1 AND state='active'")
+        .bind(account).fetch_one(repo.pool()).await.unwrap();
+    assert_eq!(
+        projected, 3,
+        "the durable projection still records every cluster; only the public participant list is limited"
     );
     cleanup(fixture).await;
 }
