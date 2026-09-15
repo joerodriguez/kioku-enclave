@@ -7,10 +7,13 @@ use super::{
 use crate::error::Result;
 use std::collections::BTreeSet;
 
-pub(crate) const POLICY_VERSION: i64 = 1;
+/// Policy 2 adds tentative-profile absorption to policy 1's reciprocal merges.
+pub(crate) const POLICY_VERSION: i64 = 2;
 pub(crate) const MAX_PROFILES: usize = 64;
 pub(crate) const MAX_SAMPLES: usize = 256;
 pub(crate) const MAX_PROPOSALS: usize = 4;
+pub(crate) const MERGE_REASON: &str = "mutual_clean_support";
+pub(crate) const ABSORPTION_REASON: &str = "tentative_absorbed";
 
 #[derive(Clone)]
 pub(crate) struct Profile {
@@ -41,6 +44,16 @@ fn eligible(p: &Profile) -> bool {
         && p.samples.len() <= MAX_SAMPLES
         && p.samples.iter().map(|s| s.0).collect::<BTreeSet<_>>().len() >= MIN_STABLE_OBSERVATIONS
         && !has_distinct_modes(&p.samples).unwrap_or(true)
+}
+/// A profile still short of stability: complete, clean, non-owner support from
+/// fewer than three observations — what a two-sentence appearance leaves behind.
+fn tentative(p: &Profile) -> bool {
+    !owner(p)
+        && p.person_status.as_deref() != Some("quarantined")
+        && p.membership_complete
+        && !p.samples.is_empty()
+        && p.samples.len() <= MAX_SAMPLES
+        && p.samples.iter().map(|s| s.0).collect::<BTreeSet<_>>().len() < MIN_STABLE_OBSERVATIONS
 }
 
 /// Three independent observations in each of two separated modes, with each
@@ -142,23 +155,96 @@ pub(crate) fn acoustic_pairs(profiles: &[Profile]) -> Vec<Merge> {
     pairs
 }
 
+fn name_compatible(profiles: &[Profile], pair: &Merge) -> bool {
+    let left = profiles
+        .iter()
+        .find(|p| p.id == pair.left)
+        .expect("acoustic member");
+    let right = profiles
+        .iter()
+        .find(|p| p.id == pair.right)
+        .expect("acoustic member");
+    !(named(left) && named(right) && left.person != right.person)
+}
+
 /// Acoustic qualification remains visible to name-conflict handling; identity
 /// permission is a separate filter and never changes the competitor population.
 pub(crate) fn merge_pairs(profiles: &[Profile]) -> Vec<Merge> {
     acoustic_pairs(profiles)
         .into_iter()
-        .filter(|pair| {
-            let left = profiles
-                .iter()
-                .find(|p| p.id == pair.left)
-                .expect("acoustic member");
-            let right = profiles
-                .iter()
-                .find(|p| p.id == pair.right)
-                .expect("acoustic member");
-            !(named(left) && named(right) && left.person != right.person)
-        })
+        .filter(|pair| name_compatible(profiles, pair))
         .collect()
+}
+
+/// A tentative profile is absorbed by the stable profile that every one of its
+/// clean samples would have matched under the ordinary decision (at least the
+/// match threshold, with the runner-up margin) had that profile existed when the
+/// sample arrived. Competitors are every compatible non-tentative profile —
+/// stable, owner or quarantined — so an owner profile can block an absorption
+/// but never receive one; other tentative profiles are not competitors, so the
+/// fragments one voice leaves across short recordings cannot hold each other
+/// hostage, and they are absorbed one proposal at a time. The stable side must
+/// itself be merge-eligible.
+pub(crate) fn absorption_pairs(profiles: &[Profile]) -> Vec<Merge> {
+    if profiles.len() > MAX_PROFILES {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    for fragment in profiles.iter().filter(|p| tentative(p)) {
+        let competitors = profiles
+            .iter()
+            .filter(|other| {
+                other.id != fragment.id && compatible(fragment, other) && !tentative(other)
+            })
+            .collect::<Vec<_>>();
+        let mut target = None;
+        let mut minimum_score = 1.0_f32;
+        let mut minimum_margin = 2.0_f32;
+        let mut unanimous = true;
+        for (_, sample) in &fragment.samples {
+            let mut scores = competitors
+                .iter()
+                .map(|other| (other.id, cosine(sample, &other.centroid)))
+                .collect::<Vec<_>>();
+            scores.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let Some(&(id, score)) = scores.first() else {
+                unanimous = false;
+                break;
+            };
+            let margin = score - scores.get(1).map_or(-1.0, |r| r.1);
+            if !score.is_finite()
+                || score < MATCH_THRESHOLD
+                || margin < MIN_DECISION_MARGIN
+                || target.is_some_and(|previous| previous != id)
+            {
+                unanimous = false;
+                break;
+            }
+            target = Some(id);
+            minimum_score = minimum_score.min(score);
+            minimum_margin = minimum_margin.min(margin);
+        }
+        if !unanimous {
+            continue;
+        }
+        let Some(stable) = target.and_then(|id| profiles.iter().find(|p| p.id == id)) else {
+            continue;
+        };
+        if !eligible(stable) {
+            continue;
+        }
+        let pair = Merge {
+            left: fragment.id.min(stable.id),
+            right: fragment.id.max(stable.id),
+            minimum_score,
+            minimum_margin,
+        };
+        if name_compatible(profiles, &pair) {
+            pairs.push(pair);
+        }
+    }
+    pairs.sort_by_key(|pair| (pair.left, pair.right));
+    pairs
 }
 
 #[cfg(test)]
@@ -274,6 +360,70 @@ mod tests {
             "scorer versions must never be compared for merging"
         );
     }
+    #[test]
+    fn a_tentative_fragment_is_absorbed_only_by_the_stable_voice_every_sample_matches() {
+        let stable = profile(1, 1., 0.);
+        let mut fragment = profile(2, 0.95, 0.312);
+        fragment.samples.truncate(1);
+        assert!(
+            merge_pairs(&[stable.clone(), fragment.clone()]).is_empty(),
+            "a one-sample profile can never be a reciprocal merge partner"
+        );
+        let pairs = absorption_pairs(&[stable.clone(), fragment.clone()]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((pairs[0].left, pairs[0].right), (1, 2));
+        assert!(pairs[0].minimum_score >= MATCH_THRESHOLD);
+        // A second stable voice close enough to erase the margin holds it.
+        let mut rival = profile(3, 0.8, 0.6);
+        rival.samples = (7..=9).map(|i| (i, vector(0.8, 0.6))).collect();
+        assert!(
+            absorption_pairs(&[stable.clone(), fragment.clone(), rival]).is_empty(),
+            "an ambiguous fragment stays where it is"
+        );
+        // Another fragment of the same voice is not a competitor, so both are
+        // proposed against the stable profile rather than blocking each other.
+        let mut twin = profile(4, 0.95, 0.312);
+        twin.samples = vec![(11, vector(0.95, 0.312)), (12, vector(0.95, 0.312))];
+        let pairs = absorption_pairs(&[stable.clone(), fragment.clone(), twin]);
+        assert_eq!(
+            pairs.iter().map(|p| (p.left, p.right)).collect::<Vec<_>>(),
+            vec![(1, 2), (1, 4)]
+        );
+        // The owner blocks but never receives; a quarantined target never receives.
+        let mut owner_profile = profile(5, 0.92, 0.39);
+        owner_profile.person_status = Some("owner".into());
+        owner_profile.person = Some(1);
+        assert!(
+            absorption_pairs(&[stable.clone(), fragment.clone(), owner_profile.clone()]).is_empty(),
+            "a fragment nearest the owner's voice is held, never absorbed by it"
+        );
+        let mut far_owner = owner_profile.clone();
+        far_owner.centroid = vector(0., 1.);
+        assert_eq!(
+            absorption_pairs(&[stable.clone(), fragment.clone(), far_owner]).len(),
+            1,
+            "a distant owner profile does not block an unambiguous absorption"
+        );
+        let mut held = stable.clone();
+        held.person_status = Some("quarantined".into());
+        assert!(absorption_pairs(&[held, fragment.clone()]).is_empty());
+        // Different accepted names never join, incomplete membership never applies,
+        // and a sample below the match threshold keeps the fragment separate.
+        let mut named_stable = stable.clone();
+        named_stable.person_status = Some("identified".into());
+        named_stable.person = Some(1);
+        let mut named_fragment = fragment.clone();
+        named_fragment.person_status = Some("identified".into());
+        named_fragment.person = Some(2);
+        assert!(absorption_pairs(&[named_stable, named_fragment]).is_empty());
+        let mut incomplete = fragment.clone();
+        incomplete.membership_complete = false;
+        assert!(absorption_pairs(&[stable.clone(), incomplete]).is_empty());
+        let mut weak = fragment.clone();
+        weak.samples = vec![(2, vector(0.5, 0.866))];
+        assert!(absorption_pairs(&[stable, weak]).is_empty());
+    }
+
     #[test]
     fn genuine_two_mode_profiles_are_held_without_splitting() {
         let mut samples = (1..=3).map(|id| (id, vector(1., 0.))).collect::<Vec<_>>();

@@ -130,9 +130,50 @@ async fn load_support(
     }))
 }
 
+/// Which proposal policy a pair was scheduled and validated under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProposalPolicy {
+    /// Two stable profiles with reciprocal complete support.
+    Merge,
+    /// A tentative fragment absorbed by the stable profile all its samples match.
+    Absorb,
+}
+impl ProposalPolicy {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Merge => policy::MERGE_REASON,
+            Self::Absorb => policy::ABSORPTION_REASON,
+        }
+    }
+    fn from_reason(reason: &str) -> Self {
+        if reason == policy::ABSORPTION_REASON {
+            Self::Absorb
+        } else {
+            Self::Merge
+        }
+    }
+    fn pairs(self, profiles: &[Profile]) -> Vec<policy::Merge> {
+        match self {
+            Self::Merge => policy::merge_pairs(profiles),
+            Self::Absorb => policy::absorption_pairs(profiles),
+        }
+    }
+}
+
 async fn population(tx: &mut Transaction<'_, Postgres>, account: &str) -> Result<Vec<Candidate>> {
-    let ids:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status<>'quarantined' AND (p.status='stable' OR person.status='owner') AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id LIMIT $4")
-        .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind((policy::MAX_PROFILES+1) as i64).fetch_all(&mut **tx).await?;
+    population_for(tx, account, ProposalPolicy::Merge).await
+}
+
+/// The merge population is stable profiles plus the owner's. Absorption adds
+/// every tentative profile with support as a candidate fragment; stable
+/// merges never see them, so their competitor sets are unchanged.
+async fn population_for(
+    tx: &mut Transaction<'_, Postgres>,
+    account: &str,
+    proposal: ProposalPolicy,
+) -> Result<Vec<Candidate>> {
+    let ids:Vec<i64>=sqlx::query_scalar("SELECT p.id FROM voice_profiles p JOIN voice_profile_revisions r ON r.account_id=p.account_id AND r.profile_id=p.id AND r.active LEFT JOIN people person ON person.account_id=p.account_id AND person.id=p.person_id WHERE p.account_id=$1 AND p.status<>'quarantined' AND (p.status='stable' OR person.status='owner' OR ($5 AND p.status='tentative')) AND p.embedding_space=$2 AND p.scorer_version=$3 AND p.sample_count>0 ORDER BY p.id LIMIT $4")
+        .bind(account).bind(EMBEDDING_SPACE).bind(SCORER_VERSION).bind((policy::MAX_PROFILES+1) as i64).bind(proposal==ProposalPolicy::Absorb).fetch_all(&mut **tx).await?;
     let mut candidates = Vec::new();
     for id in ids {
         if let Some(mut c) = load(tx, account, id).await? {
@@ -303,6 +344,7 @@ async fn apply(
     account: &str,
     expected_left: &Candidate,
     expected_right: &Candidate,
+    proposal_policy: ProposalPolicy,
 ) -> Result<Option<i64>> {
     // Re-evaluate current names before the exact application recheck, including
     // peer changes since the scheduling pass. Holds leave acoustic competitors.
@@ -320,7 +362,7 @@ async fn apply(
     }
     // Re-read exact revisions and memberships even though normal workers hold
     // the account lock: a saved proposal can never authorize a later graph.
-    let current = population(tx, account).await?;
+    let current = population_for(tx, account, proposal_policy).await?;
     let Some(left) = current
         .iter()
         .find(|c| c.policy.id == expected_left.policy.id)
@@ -343,7 +385,8 @@ async fn apply(
         return Ok(None);
     }
     let profiles = current.iter().map(|c| c.policy.clone()).collect::<Vec<_>>();
-    let Some(pair) = policy::merge_pairs(&profiles)
+    let Some(pair) = proposal_policy
+        .pairs(&profiles)
         .into_iter()
         .find(|p| p.left == left.policy.id && p.right == right.policy.id)
     else {
@@ -367,8 +410,8 @@ async fn apply(
     .collect::<Vec<_>>();
     let source_people = identity_commitment(tx, account, &people).await?;
     let proposal = allocate_voice_id(tx, account, "voice_profile_proposal").await?;
-    sqlx::query("INSERT INTO voice_profile_proposals(account_id,id,kind,policy_version,embedding_space,scorer_version,channel_domain,left_profile_id,right_profile_id,left_revision_id,right_revision_id,left_member_count,right_member_count,left_members_sha256,right_members_sha256,left_person_id,right_person_id,source_person_state,state,reason,decision) VALUES($1,$2,'merge',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,'proposed','mutual_clean_support',$18::jsonb)")
-        .bind(account).bind(proposal).bind(policy::POLICY_VERSION).bind(&left.policy.space).bind(left.policy.scorer).bind(&left.policy.domain).bind(pair.left).bind(pair.right).bind(left.revision).bind(right.revision).bind(left.members.len() as i64).bind(right.members.len() as i64).bind(membership(left)).bind(membership(right)).bind(left.bound_person).bind(right.bound_person).bind(source_people.to_string()).bind(json!({"minimum_score":pair.minimum_score,"minimum_margin":pair.minimum_margin}).to_string()).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO voice_profile_proposals(account_id,id,kind,policy_version,embedding_space,scorer_version,channel_domain,left_profile_id,right_profile_id,left_revision_id,right_revision_id,left_member_count,right_member_count,left_members_sha256,right_members_sha256,left_person_id,right_person_id,source_person_state,state,reason,decision) VALUES($1,$2,'merge',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,'proposed',$19,$18::jsonb)")
+        .bind(account).bind(proposal).bind(policy::POLICY_VERSION).bind(&left.policy.space).bind(left.policy.scorer).bind(&left.policy.domain).bind(pair.left).bind(pair.right).bind(left.revision).bind(right.revision).bind(left.members.len() as i64).bind(right.members.len() as i64).bind(membership(left)).bind(membership(right)).bind(left.bound_person).bind(right.bound_person).bind(source_people.to_string()).bind(json!({"minimum_score":pair.minimum_score,"minimum_margin":pair.minimum_margin,"policy":proposal_policy.reason()}).to_string()).bind(proposal_policy.reason()).execute(&mut **tx).await?;
     for candidate in [left, right] {
         for m in &candidate.members {
             sqlx::query("INSERT INTO voice_profile_proposal_samples(account_id,proposal_id,source_profile_id,sample_id,source_assignment_id) VALUES($1,$2,$3,$4,$5)")
@@ -620,7 +663,7 @@ async fn reconsider(
     account: &str,
     proposal: i64,
 ) -> Result<bool> {
-    let row=sqlx::query("SELECT left_profile_id,right_profile_id,result_profile_id FROM voice_profile_proposals WHERE account_id=$1 AND id=$2 AND state='applied'").bind(account).bind(proposal).fetch_one(&mut **tx).await?;
+    let row=sqlx::query("SELECT left_profile_id,right_profile_id,result_profile_id,reason FROM voice_profile_proposals WHERE account_id=$1 AND id=$2 AND state='applied'").bind(account).bind(proposal).fetch_one(&mut **tx).await?;
     let Some(result): Option<i64> = row.try_get("result_profile_id")? else {
         return Ok(false);
     };
@@ -630,7 +673,10 @@ async fn reconsider(
     if !current.policy.membership_complete {
         return Ok(false);
     }
-    let candidates = population(tx, account).await?;
+    // An applied proposal is re-judged under the policy that proposed it: an
+    // absorbed fragment never had reciprocal many-sample support to lose.
+    let proposal_policy = ProposalPolicy::from_reason(&row.try_get::<String, _>("reason")?);
+    let candidates = population_for(tx, account, proposal_policy).await?;
     if candidates.len() > policy::MAX_PROFILES - 1 {
         return Ok(false);
     }
@@ -661,7 +707,8 @@ async fn reconsider(
     }
     let left: i64 = row.try_get("left_profile_id")?;
     let right: i64 = row.try_get("right_profile_id")?;
-    if policy::merge_pairs(&profiles)
+    if proposal_policy
+        .pairs(&profiles)
         .iter()
         .any(|p| p.left == left && p.right == right)
     {
@@ -718,10 +765,63 @@ pub(super) async fn reconcile(
             .iter()
             .find(|c| c.policy.id == pair.right)
             .expect("policy candidate");
-        if apply(tx, account, left, right).await?.is_some() {
+        if apply(tx, account, left, right, ProposalPolicy::Merge)
+            .await?
+            .is_some()
+        {
             outcomes.push("profile_merge_applied");
         } else {
             outcomes.push("profile_merge_state_held");
+            break;
+        }
+    }
+    let budget = policy::MAX_PROPOSALS.saturating_sub(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == "profile_merge_applied")
+            .count(),
+    );
+    for _ in 0..budget {
+        let candidates = population_for(tx, account, ProposalPolicy::Absorb).await?;
+        let profiles = candidates
+            .iter()
+            .map(|c| c.policy.clone())
+            .collect::<Vec<_>>();
+        if profiles.len() > policy::MAX_PROFILES {
+            outcomes.push("profile_absorb_population_held");
+            break;
+        }
+        let held = held_name_profiles(tx, account).await?;
+        let Some(pair) = policy::absorption_pairs(&profiles)
+            .into_iter()
+            .find(|pair| {
+                !held.contains(&pair.left)
+                    && !held.contains(&pair.right)
+                    && candidates
+                        .iter()
+                        .filter(|c| c.policy.id == pair.left || c.policy.id == pair.right)
+                        .map(|c| c.members.len())
+                        .sum::<usize>()
+                        <= policy::MAX_SAMPLES
+            })
+        else {
+            break;
+        };
+        let left = candidates
+            .iter()
+            .find(|c| c.policy.id == pair.left)
+            .expect("policy candidate");
+        let right = candidates
+            .iter()
+            .find(|c| c.policy.id == pair.right)
+            .expect("policy candidate");
+        if apply(tx, account, left, right, ProposalPolicy::Absorb)
+            .await?
+            .is_some()
+        {
+            outcomes.push("profile_absorbed");
+        } else {
+            outcomes.push("profile_absorb_state_held");
             break;
         }
     }
@@ -992,7 +1092,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            apply(&mut tx, ACCOUNT, &left, &right)
+            apply(&mut tx, ACCOUNT, &left, &right, ProposalPolicy::Merge)
                 .await
                 .unwrap()
                 .is_none(),
@@ -1156,6 +1256,138 @@ mod tests {
             .await
             .unwrap(),
             "proposal erasure must preserve another tenant"
+        );
+        close(f).await;
+    }
+
+    #[tokio::test]
+    async fn a_tentative_fragment_is_absorbed_and_its_memory_slot_follows_the_stable_voice() {
+        let Some(f) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &f.persistence;
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for n in 1..=3 {
+            sample(repo, 1, 100 + n, n, &vector(1., 0.)).await;
+        }
+        for n in 1..=3 {
+            sample(repo, 2, 200 + n, 10 + n, &vector(0., 1.)).await;
+        }
+        // One two-sentence appearance of the first voice in a later memory.
+        sample(repo, 3, 301, 7, &vector(0.98, 0.199)).await;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM voice_profiles WHERE account_id=$1 AND id=3")
+                .bind(ACCOUNT)
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "tentative");
+        let before = source(repo).await;
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        let (reason, left, right, result, members): (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT reason,left_profile_id,right_profile_id,result_profile_id, \
+                    (SELECT count(*) FROM voice_sample_profile_assignments a \
+                      WHERE a.account_id=p.account_id AND a.profile_id=p.result_profile_id AND a.active) \
+               FROM voice_profile_proposals p WHERE account_id=$1 AND state='applied'",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (reason.as_str(), left, right, members),
+            (policy::ABSORPTION_REASON, 1, 3, 4),
+            "the fragment joins the stable voice under its own proposal reason"
+        );
+        let slot_profile: i64 = sqlx::query_scalar(
+            "SELECT voice_profile_id FROM episode_speaker_slots WHERE account_id=$1 AND episode_id=7 AND status='active'",
+        )
+        .bind(ACCOUNT)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            slot_profile, result,
+            "the fragment's memory now presents the merged voice"
+        );
+        assert_eq!(
+            source(repo).await,
+            before,
+            "absorption never rewrites sources"
+        );
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM voice_profile_proposals WHERE account_id=$1 AND result_profile_id=$2",
+        )
+        .bind(ACCOUNT)
+        .bind(result)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "applied",
+            "reconsideration judges an absorption under its own policy, not the reciprocal merge rule"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM voice_profile_proposals WHERE account_id=$1"
+            )
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            1,
+            "the two stable voices are far apart and never merge"
+        );
+        close(f).await;
+    }
+
+    #[tokio::test]
+    async fn a_fragment_nearest_the_owner_or_ambiguous_between_voices_is_never_absorbed() {
+        let Some(f) = super::super::tests::test_persistence().await else {
+            return;
+        };
+        let repo = &f.persistence;
+        repo.set_voice_identity_cohort(VoiceCohort::All, &[])
+            .await
+            .unwrap();
+        for n in 1..=3 {
+            sample(repo, 1, 100 + n, n, &vector(1., 0.)).await;
+        }
+        for n in 1..=3 {
+            sample(repo, 10, 1000 + n, 10 + n, &vector(0.98, 0.199)).await;
+        }
+        sqlx::query("INSERT INTO people(account_id,id,status) VALUES($1,55,'owner')")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE voice_profiles SET person_id=55 WHERE account_id=$1 AND id=10")
+            .bind(ACCOUNT)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE voice_profile_revisions SET person_id=55 WHERE account_id=$1 AND profile_id=10 AND active").bind(ACCOUNT).execute(repo.pool()).await.unwrap();
+        // Nearest the owner: the owner blocks and never receives.
+        sample(repo, 3, 301, 7, &vector(0.99, 0.141)).await;
+        // Ambiguous between two nonowner stable voices.
+        for n in 1..=3 {
+            sample(repo, 4, 400 + n, 20 + n, &vector(0.8, 0.6)).await;
+        }
+        sample(repo, 5, 501, 8, &vector(0.9, 0.436)).await;
+        repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM voice_profile_proposals WHERE account_id=$1"
+            )
+            .bind(ACCOUNT)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap(),
+            0,
+            "no fragment may be absorbed toward the owner or without a clear runner-up margin"
         );
         close(f).await;
     }
