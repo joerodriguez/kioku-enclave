@@ -30,6 +30,7 @@ mod interrupted_capture_schema;
 mod lifecycle;
 mod media_processing;
 mod memory_formation;
+mod memory_language_schema;
 mod memory_reconciliation;
 mod model_usage;
 mod morning_email;
@@ -286,7 +287,8 @@ impl PostgresPersistence {
         self.install_voice_enrollment_schema().await?;
         self.install_voice_recurrence_schema().await?;
         self.install_identity_fusion_schema().await?;
-        self.install_identity_presentation_schema().await
+        self.install_identity_presentation_schema().await?;
+        self.install_memory_language_schema().await
     }
 
     #[cfg(test)]
@@ -997,6 +999,7 @@ mod tests {
             .install_identity_presentation_schema()
             .await
             .unwrap();
+        persistence.install_memory_language_schema().await.unwrap();
         persistence.verify_schema().await.unwrap();
         // Reset every business table in the isolated contract schema. A
         // hand-maintained list silently missed newly added content and delivery
@@ -1013,7 +1016,7 @@ mod tests {
                   AND tablename NOT IN ( \
                       '_sqlx_migrations','persistence_schema','persistence_schema_releases', \
                       'persistence_schema_release_steps','orphan_capture_erasure_contract','morning_email_schema','brief_sections_schema', \
-                      'voice_identity_schema','voice_identity_controls','voice_enrollment_schema','voice_recurrence_schema','identity_fusion_schema','identity_presentation_schema');
+                      'voice_identity_schema','voice_identity_controls','voice_enrollment_schema','voice_recurrence_schema','identity_fusion_schema','identity_presentation_schema','authoring_language_schema');
                IF tables_to_reset IS NOT NULL THEN
                  EXECUTE 'TRUNCATE TABLE ' || tables_to_reset || ' RESTART IDENTITY CASCADE';
                END IF;

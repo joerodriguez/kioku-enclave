@@ -83,6 +83,11 @@ pub(crate) struct ReconciliationSnapshot {
     /// CAS over the active owners, episode revisions, and archive revision.
     pub(crate) topology_fingerprint: Vec<u8>,
     pub(crate) archive_revision: i64,
+    /// ADR-0049: the BCP-47 tag every authored field is written in. Committed
+    /// by `source_fingerprint` so a language change is a new source, never a
+    /// changed request body under an already admitted provider attempt.
+    #[serde(default)]
+    pub(crate) memory_language: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

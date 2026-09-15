@@ -91,6 +91,8 @@ The paged and ordinary episode member purge capture name/fact dependencies befor
 
 `identity_presentation_schema.rs` owns the direct v34 authoring-map/semantic-state tables and successful identity-refinalization timestamp receipt. It verifies exact owned catalogs without changing prior schema receipts.
 
+`memory_language_schema.rs` owns the direct v35 ADR-0049 companion: the nullable `capture_events.locale_id` column, its BCP-47 check, and the `authoring_language_schema` receipt (named outside the reserved `memory_%` family the base `cold_objects` step digests). `capture.rs` persists the stamp from the manifest and reads the newest one back; `memory_reconciliation.rs` commits the resolved language in the source and topology fingerprints.
+
 `identity_presentation.rs` resolves frozen authored labels through surviving account-qualified turn anchors and the canonical speaker graph. Its semantic snapshot distinguishes participant changes from source additions/slot/acoustic bookkeeping and advances identity once per writer transaction without changing archive/source revisions.
 
 Identity writers initialize only missing semantic snapshots under the existing account lock before graph mutation, in bounded ID pages. Projection then compares committed participant meaning and coalesces repeated changes against the transaction-entry baseline; authored/source bytes and archive revisions remain unchanged.

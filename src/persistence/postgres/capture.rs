@@ -1191,10 +1191,10 @@ async fn insert_event(
           clock_uncertainty_ms,asset_id,manifest_digest,context_json,media_disposition, \
           canonical_event_id,canonical_asset_id,canonical_media_sha256,perceptual_hash, \
           hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version, \
-          audio_role,audio_route,route_epoch,received_at) \
+          audio_role,audio_route,route_epoch,locale_id,received_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,to_timestamp($9::double precision/1000.0),$10, \
                  to_timestamp($11::double precision/1000.0),to_timestamp($12::double precision/1000.0), \
-                 $13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30, \
+                 $13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31, \
                  clock_timestamp())",
     )
     .bind(&command.account_id)
@@ -1234,6 +1234,7 @@ async fn insert_event(
     .bind(manifest.audio_role.as_deref())
     .bind(manifest.audio_route.as_deref())
     .bind(manifest.route_epoch.map(|value| value as i64))
+    .bind(manifest.locale_id.as_deref())
     .execute(&mut **transaction)
     .await?;
 
@@ -1680,6 +1681,24 @@ async fn postgres_session_status(
     }))
 }
 
+/// ADR-0049: the `locale_id` of the newest stamped recording. The far-future
+/// clock guard matches the morning-email timezone follower so a device whose
+/// clock runs ahead cannot pin the language forever.
+pub(super) async fn newest_recording_locale(
+    connection: &mut sqlx::PgConnection,
+    account_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT locale_id FROM capture_events \
+          WHERE account_id=$1 AND locale_id IS NOT NULL \
+            AND started_at<=clock_timestamp()+interval '1 day' \
+          ORDER BY started_at DESC,event_id DESC LIMIT 1",
+    )
+    .bind(account_id)
+    .fetch_optional(connection)
+    .await?)
+}
+
 #[async_trait]
 impl CaptureRepository for PostgresPersistence {
     async fn recover_inactive_sessions(&self, account_id: &str) -> Result<u64> {
@@ -1959,6 +1978,10 @@ impl CaptureRepository for PostgresPersistence {
         postgres_session_status(self, account_id, capture_session_id, summarized_until_ms).await
     }
 
+    async fn newest_recording_locale(&self, account_id: &str) -> Result<Option<String>> {
+        newest_recording_locale(&mut *self.pool().acquire().await?, account_id).await
+    }
+
     async fn recent_sessions(
         &self,
         account_id: &str,
@@ -2174,7 +2197,7 @@ mod tests {
             .split("fn capture_session_stage(")
             .next()
             .unwrap();
-        assert!(insert.contains("route_epoch,received_at"));
+        assert!(insert.contains("route_epoch,locale_id,received_at"));
         assert!(insert.contains("clock_timestamp())"));
         assert!(!insert.contains("CURRENT_TIMESTAMP)"));
         let audit = insert.find("record_capture_seal_reopen(").unwrap();

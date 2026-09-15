@@ -1209,11 +1209,16 @@ For important_links, return only candidate_id values from url_candidates. Never 
 
 const REUSED_TIMELINE_SYSTEM_SUFFIX: &str = r#"For this request, this rule overrides the earlier instruction to return a title, summary, and minute_summaries. The input contains a reconciled_timeline whose title, summary, minute_summaries, and minutes_text are already authored. Use it as compact provisional context, but do not return, rewrite, summarize, or correct those fields. Return only overview, sections, important_links, and screens. Continue to derive every brief item and screen result from the supplied raw utterance/screen evidence and cite that evidence exactly as instructed."#;
 
-fn finalizer_system_prompt(reusable: Option<&ReusableTimeline>) -> String {
+/// ADR-0049: every brief field the finalizer authors follows the owner's
+/// reading language; the rule is appended after any reused-timeline override.
+fn finalizer_system_prompt(reusable: Option<&ReusableTimeline>, memory_language: &str) -> String {
+    let output_language_rule = super::memory_language::output_language_rule(memory_language);
     if reusable.is_some() {
-        format!("{FINALIZER_SYSTEM_PROMPT}\n\n{REUSED_TIMELINE_SYSTEM_SUFFIX}")
+        format!(
+            "{FINALIZER_SYSTEM_PROMPT}\n\n{REUSED_TIMELINE_SYSTEM_SUFFIX}\n\n{output_language_rule}"
+        )
     } else {
-        FINALIZER_SYSTEM_PROMPT.to_string()
+        format!("{FINALIZER_SYSTEM_PROMPT}\n\n{output_language_rule}")
     }
 }
 
@@ -1399,7 +1404,15 @@ async fn finalize_user_episodes_scoped(
         .await;
         return Ok(());
     }
-    let system_prompt = finalizer_system_prompt(reusable.as_ref());
+    let memory_language =
+        match super::memory_language::resolve_memory_language(state, user_id).await {
+            Ok(language) => language,
+            Err(error) => {
+                defer_finalization(state, &claim, &error.to_string(), false).await;
+                return Ok(());
+            }
+        };
+    let system_prompt = finalizer_system_prompt(reusable.as_ref(), &memory_language);
     let response_schema = if reusable.is_some() {
         reused_timeline_brief_response_schema()
     } else {
@@ -1940,8 +1953,14 @@ mod tests {
         invalid.minutes_text = Some("Does not match the stored minute gists.".into());
         assert!(reusable_timeline(&invalid).is_none());
 
-        let full_prompt = finalizer_system_prompt(None);
-        assert_eq!(full_prompt, FINALIZER_SYSTEM_PROMPT);
+        let full_prompt = finalizer_system_prompt(None, "en");
+        assert!(full_prompt.starts_with(FINALIZER_SYSTEM_PROMPT));
+        assert!(full_prompt.ends_with(&super::super::memory_language::output_language_rule("en")));
+        assert!(!full_prompt.contains(REUSED_TIMELINE_SYSTEM_SUFFIX));
+        let reusable = reusable_timeline(&reconciled_episode()).unwrap();
+        let reused_prompt = finalizer_system_prompt(Some(&reusable), "fr");
+        assert!(reused_prompt.contains(REUSED_TIMELINE_SYSTEM_SUFFIX));
+        assert!(reused_prompt.ends_with(&super::super::memory_language::output_language_rule("fr")));
         let full_schema = brief_response_schema();
         assert!(full_schema["properties"].get("title").is_some());
         assert!(full_schema["properties"].get("minute_summaries").is_some());

@@ -199,4 +199,9 @@ pub(crate) trait CaptureRepository: Send + Sync {
     /// Recover a bounded batch of interrupted sessions using database receipt
     /// inactivity, preserving provisional finish and late-upload semantics.
     async fn recover_inactive_sessions(&self, account_id: &str) -> Result<u64>;
+
+    /// ADR-0049: the reading language stamped by the newest recording that
+    /// carries one, as the companion sent it. Presentation input for authoring;
+    /// never transcript evidence. `None` until a stamped recording exists.
+    async fn newest_recording_locale(&self, account_id: &str) -> Result<Option<String>>;
 }

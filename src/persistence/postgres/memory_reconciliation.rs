@@ -1790,6 +1790,12 @@ async fn read_snapshot(
     for draft in &mut source_drafts {
         draft.identity_revision = 0;
     }
+    // ADR-0049: the reading language is a producer input like the model, so it
+    // is committed with the source. A change re-fingerprints the cohort and
+    // supersedes any staged result instead of altering an admitted attempt.
+    let memory_language = crate::cp::memory_language::memory_language_from_locale(
+        super::capture::newest_recording_locale(&mut *connection, account_id).await?,
+    );
     let source_fingerprint = digest_json(
         b"kioku.memory-reconciliation.source.v1\0",
         &json!({
@@ -1804,6 +1810,7 @@ async fn read_snapshot(
             "producer_contract_sha256": authority.producer_contract_sha256,
             "reconciliation_model": authority.reconciliation_model,
             "vertex_location": authority.vertex_location,
+            "memory_language": memory_language,
         }),
     )?;
     let topology_fingerprint = digest_json(
@@ -1867,6 +1874,7 @@ async fn read_snapshot(
             source_fingerprint,
             topology_fingerprint,
             archive_revision,
+            memory_language,
         },
         settled,
     )))
@@ -4372,6 +4380,97 @@ pub(super) async fn scrub_ancestor_snapshots_for_deletion(
         .execute(&mut **tx)
         .await?;
     }
+    Ok(())
+}
+
+/// ADR-0049: the reading language is resolved from the newest stamped
+/// recording and committed by the source fingerprint, so a language change is
+/// a new reconciliation source rather than a changed body under an admitted
+/// provider attempt.
+#[cfg(test)]
+pub(super) async fn test_memory_language_is_committed_by_the_source(
+    persistence: &PostgresPersistence,
+) -> Result<()> {
+    use crate::persistence::CaptureRepository as _;
+    const ACCOUNT: &str = "memory-language-account";
+    const EPISODE: i64 = 700_000_001;
+    sqlx::raw_sql(
+        "INSERT INTO accounts(id,email,primary_provider,primary_subject) \
+         VALUES('memory-language-account','memory-language@example.com','google','memory-language'); \
+         INSERT INTO episodes(account_id,id,started_at,ended_at,type,title,summary) \
+         VALUES('memory-language-account',700000001,'2026-08-31T10:00:00Z','2026-08-31T10:30:00Z','meeting','Réunion','Synthetic'); \
+         INSERT INTO screenshots(account_id,id,captured_at) VALUES('memory-language-account',700000001,'2026-08-31T10:05:00Z'); \
+         INSERT INTO episode_members(account_id,episode_id,record_type,record_id) VALUES('memory-language-account',700000001,'screenshot',700000001); \
+         INSERT INTO capture_sessions(account_id,id,device_id,install_id,started_at,last_event_at,ended_at,schema_version,created_at) \
+         VALUES('memory-language-account','language-session','device','install','2026-08-31T10:00:00Z','2026-08-31T10:02:00Z','2026-08-31T10:02:00Z',2,'2026-08-31T10:00:00Z'); \
+         INSERT INTO capture_streams(account_id,id,capture_session_id,device_id,stream_kind) \
+         VALUES('memory-language-account','language-stream','language-session','device','ios_mic'); \
+         INSERT INTO capture_events(account_id,event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,clock_uncertainty_ms,asset_id,manifest_digest,media_disposition,received_at,locale_id) VALUES \
+           ('memory-language-account','language-event-0','device','install','language-session','language-stream','ios_mic',0,'2026-08-31T10:00:00Z','0','2026-08-31T10:00:00Z','2026-08-31T10:00:04Z','UTC',0,0,'language-asset-0',repeat('a',64),'canonical','2026-08-31T10:00:05Z','fr-CA'), \
+           ('memory-language-account','language-event-1','device','install','language-session','language-stream','ios_mic',1,'2026-08-31T10:01:00Z','0','2026-08-31T10:01:00Z','2026-08-31T10:01:04Z','UTC',0,0,'language-asset-1',repeat('b',64),'canonical','2026-08-31T10:01:05Z',NULL), \
+           ('memory-language-account','language-event-2','device','install','language-session','language-stream','ios_mic',2,'2026-08-31T10:02:00Z','0',clock_timestamp()+interval '3 days',clock_timestamp()+interval '3 days 4 seconds','UTC',0,0,'language-asset-2',repeat('c',64),'canonical','2026-08-31T10:02:05Z','de');",
+    )
+    .execute(persistence.pool())
+    .await?;
+    // The newest stamped recording wins; an unstamped newer row is skipped and
+    // a far-future device clock is ignored, as for the morning-email timezone.
+    assert_eq!(
+        persistence
+            .newest_recording_locale(ACCOUNT)
+            .await?
+            .as_deref(),
+        Some("fr-CA")
+    );
+    async fn snapshot(persistence: &PostgresPersistence) -> Result<ReconciliationSnapshot> {
+        let mut tx = persistence.pool().begin().await?;
+        let authority = active_reconciliation_authority(&mut tx, ACCOUNT, None)
+            .await?
+            .expect("memory-language account is inside the active cohort");
+        let component = source_closed_components(&mut tx, ACCOUNT)
+            .await?
+            .components
+            .into_iter()
+            .find(|component| component.draft_ids.contains(&EPISODE))
+            .expect("the synthetic draft forms a component");
+        let (snapshot, _) = read_snapshot(
+            &mut tx,
+            ACCOUNT,
+            &component.draft_ids,
+            MAX_ATOMS,
+            &authority,
+        )
+        .await?
+        .expect("the synthetic draft has a snapshot");
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+    let french = snapshot(persistence).await?;
+    assert_eq!(french.memory_language, "fr-CA");
+    assert_eq!(
+        snapshot(persistence).await?.source_fingerprint,
+        french.source_fingerprint,
+        "an unchanged language must not move the source fingerprint"
+    );
+    sqlx::query("UPDATE capture_events SET locale_id=NULL WHERE account_id=$1 AND event_id='language-event-0'")
+        .bind(ACCOUNT)
+        .execute(persistence.pool())
+        .await?;
+    assert_eq!(persistence.newest_recording_locale(ACCOUNT).await?, None);
+    let english = snapshot(persistence).await?;
+    assert_eq!(english.memory_language, "en");
+    assert_ne!(
+        english.source_fingerprint, french.source_fingerprint,
+        "a language change is a new source: it must supersede staged work instead of reusing an admitted attempt"
+    );
+    assert_ne!(
+        english.topology_fingerprint, french.topology_fingerprint,
+        "the topology CAS commits the source fingerprint and therefore the language"
+    );
+    let rendered = crate::cp::reconciler::test_render_model_input(&french)?;
+    assert!(
+        rendered.contains("\"memory_language\":\"fr-CA\""),
+        "the tag reaches the model as an input field: {rendered}"
+    );
     Ok(())
 }
 
