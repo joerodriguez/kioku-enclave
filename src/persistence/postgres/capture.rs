@@ -1681,9 +1681,10 @@ async fn postgres_session_status(
     }))
 }
 
-/// ADR-0049: the `locale_id` of the newest stamped recording. The far-future
-/// clock guard matches the morning-email timezone follower so a device whose
-/// clock runs ahead cannot pin the language forever.
+/// ADR-0049: the `locale_id` of the newest stamped recording, served by the
+/// partial `capture_events_locale_idx` so a long pre-stamp history is never
+/// walked. The far-future clock guard matches the morning-email timezone
+/// follower so a device whose clock runs ahead cannot pin the language forever.
 pub(super) async fn newest_recording_locale(
     connection: &mut sqlx::PgConnection,
     account_id: &str,
