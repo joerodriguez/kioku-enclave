@@ -1,3 +1,13 @@
+# Voice thresholds for the classroom test (2026-09-15)
+
+- [x] Creation threshold 0.45 → 0.35 and runner-up margin 0.08 → 0.10; match stays 0.60 per
+      ADR-0006's real-capture calibration; two-mode quarantine keeps its own 0.45 separation
+      constant instead of following the creation threshold.
+- [ ] Revisit all four values only with labeled data: a bounded owner review of matched turns
+      after the first classroom recording (wrong-person and same-name-merge counts must be zero),
+      then the licensed-corpus calibration (`voice_eval_similarity.rs`). The run-evidence schema
+      pins the new values; `MODE_SEPARATION_THRESHOLD` and `DETECTOR_VERSION` are not yet pinned.
+
 # Voice fragment absorption (2026-09-15)
 
 - [x] Absorb settled tentative fragments into the durably stable voice every clean sample
