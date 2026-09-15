@@ -1119,7 +1119,16 @@ brief-sections companion schema (see RELEASING.md).
 attribution metadata; `person_id` is present only for an identified or recurring non-owner
 person and is otherwise `null`. The server loads these details in one
 tenant-qualified batch for the page, so archive name chips never infer identity
-from display-text equality.
+from display-text equality. A participant is a voice the identity graph can vouch for:
+owner attribution (`Me`), an accepted person, or a voice profile (`verified_voice`, shown
+as its per-memory `Speaker A` slot until a person is bound). Gemini restarts speaker
+labels on every audio window, so a request-local cluster that no profile has claimed is
+one window's view of some voice, not another participant; its turns keep their lettered
+slot in `members`, transcript search, and playback, and remain filterable by that label,
+but they do not appear in `participants` or `participant_details`. A memory whose
+voices were all too short or quarantined for voice continuity therefore reports no
+participants rather than one phantom participant per window. The morning email and
+webhook snapshots use the same participant list.
 
 ## People learned automatically
 
