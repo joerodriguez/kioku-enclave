@@ -1703,7 +1703,7 @@ mod tests {
             .execute(repo.pool())
             .await
             .unwrap();
-        sample(repo, 7, 701, 9, &vector(0.1, 0.995)).await;
+        sample(repo, 7, 701, 9, &vector(0.05, 0.99875)).await;
         finish_recording(repo).await;
         repo.maintain_voice_profiles(ACCOUNT).await.unwrap();
         assert_eq!(
