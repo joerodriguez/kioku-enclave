@@ -1113,7 +1113,7 @@ async fn prepare_media_request(
     let attempt = MediaProviderAttempt {
         number: attempt_number,
         result_contract_version: if matches!(operation, VertexOperation::AudioWindow) {
-            2
+            super::media::AUDIO_RESULT_CONTRACT_VERSION
         } else {
             1
         },
